@@ -1,0 +1,30 @@
+[package]
+name = "crust"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "crust"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+anyhow = { workspace = true }
+reqwest = { workspace = true }
+image = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+smallvec = { workspace = true }
+crust-core = { path = "../core" }
+crust-ui = { path = "../ui" }
+crust-twitch = { path = "../twitch" }
+crust-emotes = { path = "../emotes" }
+crust-storage = { path = "../storage" }
+
+# Force wayland-data-control feature onto arboard (transitive via egui-winit)
+arboard = { workspace = true }

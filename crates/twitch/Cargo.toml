@@ -1,0 +1,17 @@
+[package]
+name = "crust-twitch"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+smallvec = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+crust-core = { path = "../core" }

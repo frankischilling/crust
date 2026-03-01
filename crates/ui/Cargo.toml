@@ -1,0 +1,12 @@
+[package]
+name = "crust-ui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+eframe = { workspace = true }
+egui = { workspace = true }
+egui_extras = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+crust-core = { path = "../core" }

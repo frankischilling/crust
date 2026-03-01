@@ -1,0 +1,63 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/app",
+    "crates/ui",
+    "crates/core",
+    "crates/twitch",
+    "crates/emotes",
+    "crates/storage",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["crust contributors"]
+license = "MIT"
+
+[workspace.dependencies]
+# async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+
+# serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# error handling
+thiserror = "2"
+anyhow = "1"
+
+# logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# HTTP
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# image decoding
+image = { version = "0.25", default-features = false, features = ["png", "gif", "webp"] }
+
+# LRU cache
+lru = "0.12"
+
+# GUI
+eframe = { version = "0.31", features = ["persistence", "wayland", "x11"] }
+egui = "0.31"
+egui_extras = { version = "0.31", features = ["image", "gif", "webp"] }
+
+# Force arboard to include the Wayland data-control clipboard backend.
+# Without this, egui-winit's arboard dep only has the X11 backend, which
+# crashes the event loop on pure-Wayland sessions (Broken pipe / Exit 1).
+arboard = { version = "3", features = ["wayland-data-control"] }
+
+# misc
+directories = "5"
+bytes = "1"
+smallvec = { version = "1", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+keyring = "3"
+url = "2"
+async-trait = "0.1"
