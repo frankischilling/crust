@@ -18,13 +18,43 @@ impl IrcTags {
         for pair in raw.split(';') {
             let mut parts = pair.splitn(2, '=');
             let key = parts.next().unwrap_or("").to_owned();
-            let val = parts.next().unwrap_or("").to_owned();
+            let val = parts.next().unwrap_or("");
             if !key.is_empty() {
-                map.insert(key, val);
+                map.insert(key, unescape_tag_value(val));
             }
         }
         Self(map)
     }
+}
+
+/// Unescape an IRCv3 tag value.
+///
+/// Twitch (and the IRCv3 spec) encode special characters in tag values:
+/// - `\s` → space
+/// - `\:` → `;`
+/// - `\\` → `\`
+/// - `\n` → newline
+/// - `\r` → carriage-return
+/// - Any other `\X` → `X` (passthrough)
+fn unescape_tag_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('s')  => out.push(' '),
+                Some(':')  => out.push(';'),
+                Some('\\') => out.push('\\'),
+                Some('n')  => out.push('\n'),
+                Some('r')  => out.push('\r'),
+                Some(x)    => out.push(x),
+                None       => {}
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 // ─── IrcMessage ──────────────────────────────────────────────────────────────

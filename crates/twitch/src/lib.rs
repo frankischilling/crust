@@ -1,7 +1,8 @@
 pub mod irc;
 pub mod session;
 
-pub use session::client::TwitchSession;
+pub use irc::parse_line;
+pub use session::client::{parse_privmsg_irc, TwitchSession};
 
 use thiserror::Error;
 

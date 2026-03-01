@@ -9,4 +9,5 @@ egui = { workspace = true }
 egui_extras = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+image = { workspace = true }
 crust-core = { path = "../core" }

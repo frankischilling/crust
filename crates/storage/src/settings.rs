@@ -28,6 +28,9 @@ pub struct AppSettings {
     /// Message timestamps on/off.
     #[serde(default = "bool_true")]
     pub show_timestamps: bool,
+    /// OAuth token stored as a fallback when the OS keyring is unavailable.
+    #[serde(default)]
+    pub oauth_token: String,
 }
 
 fn default_theme() -> String { "dark".to_owned() }
@@ -44,6 +47,7 @@ impl Default for AppSettings {
             highlights: Vec::new(),
             ignores: Vec::new(),
             show_timestamps: true,
+            oauth_token: String::new(),
         }
     }
 }
@@ -90,23 +94,48 @@ impl SettingsStore {
     // ─── Token / keyring ─────────────────────────────────────────────────
 
     pub fn save_token(&self, token: &str) -> Result<(), StorageError> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ENTRY)
-            .map_err(|e| StorageError::Keyring(e.to_string()))?;
-        entry
-            .set_password(token)
-            .map_err(|e| StorageError::Keyring(e.to_string()))
+        // Try OS keyring first; fall back silently to settings file.
+        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ENTRY) {
+            if let Err(e) = entry.set_password(token) {
+                tracing::warn!("Keyring unavailable ({e}), storing token in settings file");
+            }
+        }
+        // Always persist to settings file as a reliable fallback.
+        let mut settings = self.load();
+        settings.oauth_token = token.to_owned();
+        self.save(&settings)
+    }
+
+    /// Try to save the token to the OS keyring only — does not touch the settings file.
+    pub fn try_save_keyring(&self, token: &str) {
+        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ENTRY) {
+            if let Err(e) = entry.set_password(token) {
+                tracing::debug!("Keyring save skipped: {e}");
+            }
+        }
     }
 
     pub fn load_token(&self) -> Option<String> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ENTRY).ok()?;
-        entry.get_password().ok()
+        // Try OS keyring first.
+        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ENTRY) {
+            if let Ok(token) = entry.get_password() {
+                if !token.is_empty() {
+                    return Some(token);
+                }
+            }
+        }
+        // Fall back to settings file.
+        let token = self.load().oauth_token;
+        if token.is_empty() { None } else { Some(token) }
     }
 
     pub fn delete_token(&self) -> Result<(), StorageError> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ENTRY)
-            .map_err(|e| StorageError::Keyring(e.to_string()))?;
-        entry
-            .delete_credential()
-            .map_err(|e| StorageError::Keyring(e.to_string()))
+        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ENTRY) {
+            let _ = entry.delete_credential();
+        }
+        // Also clear from settings file.
+        let mut settings = self.load();
+        settings.oauth_token = String::new();
+        self.save(&settings)
     }
 }

@@ -891,6 +891,7 @@ dependencies = [
  "eframe",
  "egui",
  "egui_extras",
+ "image",
  "tokio",
  "tracing",
 ]

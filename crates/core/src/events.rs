@@ -1,7 +1,18 @@
 use serde::{Deserialize, Serialize};
 
-use crate::model::{ChannelId, ChatMessage, SystemNotice};
+use crate::model::{ChannelId, ChatMessage, EmoteCatalogEntry, SystemNotice, UserProfile};
+// ─── LinkPreview ────────────────────────────────────────────────────────────────
 
+/// Open Graph / Twitter Card metadata fetched for a URL.
+#[derive(Debug, Clone)]
+pub struct LinkPreview {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    /// og:image URL (thumbnail). The image is fetched into `emote_bytes`.
+    pub thumbnail_url: Option<String>,
+    /// True once the fetch attempt has completed (even if it returned nothing).
+    pub fetched: bool,
+}
 // ─── Commands (UI → runtime) ─────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,7 +30,28 @@ pub enum AppCommand {
     /// Log out and switch back to anonymous mode.
     Logout,
     /// Send a chat message to a channel (requires auth).
-    SendMessage { channel: ChannelId, text: String },
+    SendMessage {
+        channel: ChannelId,
+        text: String,
+        /// If set, the message is a reply to this server-assigned message ID.
+        reply_to_msg_id: Option<String>,
+    },
+    /// Request a Twitch user profile lookup by login name.
+    FetchUserProfile { login: String },
+    /// Timeout a user in a channel (sends /timeout IRC command).
+    TimeoutUser { channel: ChannelId, login: String, seconds: u32 },
+    /// Permanently ban a user from a channel (sends /ban IRC command).
+    BanUser { channel: ChannelId, login: String },
+    /// Clears all messages in the channel display (visual-only, not sent to Twitch).
+    ClearLocalMessages { channel: ChannelId },
+    /// Opens a URL in the system default browser.
+    OpenUrl { url: String },
+    /// Injects a local informational message into a channel's feed (not sent to Twitch).
+    InjectLocalMessage { channel: ChannelId, text: String },
+    /// Opens the user-card popup for the given login in a channel.
+    ShowUserCard { login: String, channel: ChannelId },
+    /// Fetch Open-Graph / Twitter-Card metadata for a URL to show a hover preview.
+    FetchLinkPreview { url: String },
 }
 
 // ─── Events (runtime → UI) ───────────────────────────────────────────────────
@@ -56,11 +88,37 @@ pub enum AppEvent {
         username: String,
         user_id: String,
     },
+    /// Full snapshot of the emote catalog (sent after each load).
+    EmoteCatalogUpdated {
+        emotes: Vec<EmoteCatalogEntry>,
+    },
     /// Logged out / reverted to anonymous.
     LoggedOut,
     Error {
         context: String,
         message: String,
+    },
+    /// Historical messages loaded from an external API (e.g. recent-messages).
+    /// Should be prepended to the channel's message buffer.
+    HistoryLoaded {
+        channel: ChannelId,
+        messages: Vec<ChatMessage>,
+    },
+    /// Twitch user profile loaded from the IVR API.
+    UserProfileLoaded { profile: UserProfile },
+    /// Mark all visible messages from a user as deleted (timeout / ban).
+    UserMessagesCleared { channel: ChannelId, login: String },
+    /// USERSTATE received — whether the logged-in user is a mod in this channel.
+    UserStateUpdated { channel: ChannelId, is_mod: bool },
+    /// Clear all messages from the given channel's UI buffer (response to ClearLocalMessages).
+    ChannelMessagesCleared { channel: ChannelId },
+    /// Open-Graph / Twitter-Card metadata is ready for a URL.
+    LinkPreviewReady {
+        url: String,
+        title: Option<String>,
+        description: Option<String>,
+        /// og:image URL; the image bytes land in emote_bytes under this key.
+        thumbnail_url: Option<String>,
     },
 }
 

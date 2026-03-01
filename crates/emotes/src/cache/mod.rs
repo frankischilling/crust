@@ -126,10 +126,53 @@ impl EmoteCache {
     /// Fetch image bytes for a URL; return `(width, height, raw_bytes)`.
     /// Image dimensions are read from the file header only — no full RGBA decode.
     /// egui's built-in loaders (WebP / GIF / Image) handle decoding + animation.
+    ///
+    /// Checks memory → disk → network in order, writing through on a cache miss.
     pub async fn fetch_and_decode(&self, url: &str) -> Result<(u32, u32, Vec<u8>), EmoteError> {
+        // Derive a stable disk path from a hash of the URL.
+        let disk_path = self.disk_dir.join("url").join(format!("{:016x}.bin", url_hash(url)));
+
+        // 1. Memory cache (keyed by a synthetic AssetKey derived from the URL hash).
+        let mem_key = AssetKey {
+            provider: "url".into(),
+            id: format!("{:016x}", url_hash(url)),
+            scale: 1,
+        };
+        {
+            let mut guard = self.inner.lock().unwrap();
+            if let Some((bytes, ts)) = guard.bytes.get(&mem_key) {
+                if ts.elapsed() < DISK_TTL {
+                    let raw: Vec<u8> = bytes.to_vec();
+                    let (w, h) = read_header_dims(&raw);
+                    return Ok((w, h, raw));
+                }
+            }
+        }
+
+        // 2. Disk cache.
+        if disk_path.exists() {
+            if let Ok(data) = tokio::fs::read(&disk_path).await {
+                let (w, h) = read_header_dims(&data);
+                let bytes: Bytes = data.clone().into();
+                self.inner.lock().unwrap().bytes.put(mem_key, (bytes, Instant::now()));
+                return Ok((w, h, data));
+            }
+        }
+
+        // 3. Network.
         debug!("Fetching emote image: {url}");
         let resp = self.client.get(url).send().await?;
         let raw_bytes = resp.bytes().await?.to_vec();
+
+        // Write through to disk.
+        if let Some(parent) = disk_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        let _ = tokio::fs::write(&disk_path, &raw_bytes).await;
+
+        let bytes: Bytes = raw_bytes.clone().into();
+        self.inner.lock().unwrap().bytes.put(mem_key, (bytes, Instant::now()));
+
         let (w, h) = read_header_dims(&raw_bytes);
         Ok((w, h, raw_bytes))
     }
@@ -150,6 +193,16 @@ impl EmoteCache {
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
+
+/// Stable 64-bit hash of a URL string (FNV-1a).
+fn url_hash(url: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in url.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
 
 /// Read image dimensions from the file header without full RGBA decoding.
 /// Falls back to (1, 1) for unrecognized formats.
