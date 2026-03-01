@@ -338,8 +338,6 @@ impl<'a> MessageList<'a> {
             Color32::from_rgba_unmultiplied(145, 70, 255, 20)
         } else if msg.flags.custom_reward_id.is_some() {
             Color32::from_rgba_unmultiplied(100, 65, 165, 16)
-        } else if msg.flags.is_first_msg {
-            Color32::from_rgba_unmultiplied(46, 120, 178, 16)
         } else {
             Color32::TRANSPARENT
         };
@@ -369,7 +367,14 @@ impl<'a> MessageList<'a> {
                 }
 
                 // Center-align all items vertically so images don't sit above text baseline.
-                ui.with_layout(
+                // Use allocate_ui_with_layout with a constrained height hint
+                // (one emote row) instead of with_layout, because Align::Center
+                // in a horizontal layout causes egui to expand frame_size.y to
+                // fill the full available height — which for the first message
+                // in a ScrollArea means the entire viewport, creating huge gaps.
+                let wrap_width = ui.available_width();
+                ui.allocate_ui_with_layout(
+                    egui::vec2(wrap_width, EMOTE_SIZE),
                     egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
                     |ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(3.0, 1.0);
@@ -675,9 +680,7 @@ fn provider_label(provider: &str) -> &'static str {
 /// Return `(label_text, stripe_color)` for messages with a chat notification.
 /// Returns `None` for ordinary messages.
 fn notification_label(flags: &MessageFlags) -> Option<(&'static str, Color32)> {
-    if flags.is_first_msg {
-        Some(("First message", Color32::from_rgb(46, 120, 178)))
-    } else if flags.is_highlighted {
+    if flags.is_highlighted {
         Some(("Highlighted Message", Color32::from_rgb(145, 70, 255)))
     } else if flags.custom_reward_id.is_some() {
         Some(("Channel Points Reward", Color32::from_rgb(100, 65, 165)))
