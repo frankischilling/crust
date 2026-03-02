@@ -101,6 +101,10 @@ pub struct TwitchSession {
     /// If set, we connect with authentication.
     auth_token: Option<String>,
     auth_nick: Option<String>,
+    /// Set to true when Twitch explicitly rejects our auth credentials via NOTICE.
+    /// Used by `run()` to break the reconnect loop rather than retrying with a
+    /// token that will never work.
+    auth_failed: bool,
 }
 
 impl TwitchSession {
@@ -115,6 +119,7 @@ impl TwitchSession {
             next_msg_id: 1,
             auth_token: None,
             auth_nick: None,
+            auth_failed: false,
         }
     }
 
@@ -133,6 +138,9 @@ impl TwitchSession {
     /// Main entry point: runs the connect/reconnect loop.
     pub async fn run(mut self) {
         let mut attempt: u32 = 0;
+        // Count consecutive quick failures (connection established but reset before
+        // getting any IRC data). Several in a row often indicates an auth problem.
+        let mut quick_fail_streak: u32 = 0;
         loop {
             self.emit(if attempt == 0 {
                 TwitchEvent::Connected // optimistic; real Connected sent after 001
@@ -141,8 +149,21 @@ impl TwitchSession {
             })
             .await;
 
+            let started = std::time::Instant::now();
             match self.connect_once().await {
                 Ok(should_reconnect) => {
+                    // If Twitch explicitly rejected our credentials via NOTICE,
+                    // stop retrying — the token is definitively invalid.
+                    if self.auth_failed {
+                        let msg = "Authentication failed: Twitch rejected the token. \
+                                   Please re-login with a valid token.";
+                        error!("{msg}");
+                        self.auth_failed = false;
+                        self.auth_token = None;
+                        self.emit(TwitchEvent::Error(msg.to_owned())).await;
+                        // Fall through to reconnect loop but now anonymous.
+                    }
+                    quick_fail_streak = 0;
                     if !should_reconnect {
                         info!("Session disconnected cleanly");
                         self.emit(TwitchEvent::Disconnected).await;
@@ -151,8 +172,51 @@ impl TwitchSession {
                     warn!("Session ended unexpectedly, will reconnect");
                 }
                 Err(e) => {
-                    error!("Session error: {e}");
-                    self.emit(TwitchEvent::Error(e.to_string())).await;
+                    // Check if an auth failure preceded this connection error.
+                    // Twitch sometimes RSTs the TCP connection immediately after
+                    // sending the "Login authentication failed" NOTICE.
+                    if self.auth_failed {
+                        let msg = "Authentication failed: Twitch rejected the token. \
+                                   Please re-login with a valid token.";
+                        error!("{msg}");
+                        self.auth_failed = false;
+                        self.auth_token = None;
+                        quick_fail_streak = 0;
+                        self.emit(TwitchEvent::Error(msg.to_owned())).await;
+                        // Continue loop; next attempt will be anonymous.
+                    } else {
+                        // Classify: transient IO errors (network drop, server-side RST)
+                        // vs non-transient errors (programming bugs, bad URL, etc.).
+                        let is_transient = is_transient_error(&e);
+                        let elapsed = started.elapsed();
+
+                        if is_transient {
+                            // Connection was reset before any data was exchanged (< 3s)
+                            // — could be auth rejection, rate limit, or flaky network.
+                            if elapsed < Duration::from_secs(3) {
+                                quick_fail_streak += 1;
+                            } else {
+                                quick_fail_streak = 0;
+                            }
+                            warn!("Connection error (attempt {attempt}): {e}");
+                            // Surface a real error after several quick consecutive failures
+                            // so the user knows something persistent is wrong.
+                            if quick_fail_streak >= 4 {
+                                let msg = format!(
+                                    "Connection keeps failing — check your token or network. ({})",
+                                    e
+                                );
+                                warn!("{msg}");
+                                self.emit(TwitchEvent::Error(msg)).await;
+                                quick_fail_streak = 0;
+                            }
+                        } else {
+                            // Non-transient: surface immediately.
+                            quick_fail_streak = 0;
+                            error!("Session error: {e}");
+                            self.emit(TwitchEvent::Error(e.to_string())).await;
+                        }
+                    }
                 }
             }
 
@@ -211,7 +275,7 @@ impl TwitchSession {
                             return Ok(true);
                         }
                         Some(Err(e)) => {
-                            error!("WebSocket error: {e}");
+                            warn!("WebSocket read error: {e}");
                             return Err(TwitchError::WebSocket(e));
                         }
                         Some(Ok(Message::Text(txt))) => {
@@ -269,6 +333,7 @@ impl TwitchSession {
                             info!("Auth requested, reconnecting as {nick}");
                             self.auth_token = Some(token);
                             self.auth_nick = Some(nick);
+                            self.auth_failed = false; // fresh credentials, clear any previous rejection
                             // Close current connection; the run() loop will reconnect with auth
                             let _ = sink.send(Message::Text("QUIT".into())).await;
                             return Ok(true); // triggers reconnect
@@ -277,6 +342,7 @@ impl TwitchSession {
                             info!("Logout requested, reconnecting anonymously");
                             self.auth_token = None;
                             self.auth_nick = None;
+                            self.auth_failed = false;
                             let _ = sink.send(Message::Text("QUIT".into())).await;
                             return Ok(true); // triggers reconnect
                         }
@@ -308,6 +374,7 @@ impl TwitchSession {
                     .unwrap_or(self.auth_nick.as_deref().unwrap_or(""))
                     .to_owned();
                 if !user_id.is_empty() {
+                    self.auth_failed = false; // token was accepted
                     info!("Authenticated as {display_name} (user-id {user_id})");
                     self.emit(TwitchEvent::Authenticated {
                         username: display_name,
@@ -430,6 +497,18 @@ impl TwitchSession {
             "NOTICE" | "HOSTTARGET" => {
                 if let Some(text) = msg.trailing() {
                     let ch = msg.params.first().map(|s| ChannelId::new(s.as_str()));
+                    // Detect explicit auth-failure notices from Twitch so the
+                    // reconnect loop can stop rather than retrying indefinitely.
+                    let lower = text.to_lowercase();
+                    if self.auth_token.is_some()
+                        && (lower.contains("login authentication failed")
+                            || lower.contains("improperly formatted auth")
+                            || lower.contains("invalid nick")
+                            || lower.contains("authentication failed"))
+                    {
+                        warn!("Auth rejected by Twitch: {text}");
+                        self.auth_failed = true;
+                    }
                     self.emit(TwitchEvent::SystemNotice(SystemNotice {
                         channel: ch,
                         text: text.to_owned(),
@@ -753,6 +832,42 @@ fn decode_sub_plan(plan: &str) -> String {
         "2000"  => "Tier 2".to_owned(),
         "3000"  => "Tier 3".to_owned(),
         other   => other.to_owned(),
+    }
+}
+
+/// Returns `true` for network-level errors that are transient and recoverable
+/// (connection reset, refused, timed out, broken pipe, etc.).  These are
+/// expected during normal reconnect cycles and should NOT be surfaced as
+/// permanent errors in the UI.
+fn is_transient_error(e: &crate::TwitchError) -> bool {
+    use std::io::ErrorKind;
+    use tokio_tungstenite::tungstenite::Error as WsErr;
+    match e {
+        crate::TwitchError::WebSocket(ws_err) => match ws_err {
+            WsErr::Io(io_err) => matches!(
+                io_err.kind(),
+                ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::ConnectionRefused
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::TimedOut
+                    | ErrorKind::UnexpectedEof
+                    | ErrorKind::WouldBlock
+            ),
+            // Protocol-level close from the server is also recoverable.
+            WsErr::ConnectionClosed | WsErr::AlreadyClosed => true,
+            _ => false,
+        },
+        crate::TwitchError::Io(io_err) => matches!(
+            io_err.kind(),
+            ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::ConnectionRefused
+                | ErrorKind::BrokenPipe
+                | ErrorKind::TimedOut
+                | ErrorKind::UnexpectedEof
+        ),
+        _ => false,
     }
 }
 

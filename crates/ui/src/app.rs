@@ -148,14 +148,24 @@ impl CrustApp {
             AppEvent::MessageReceived { channel, message } => {
                 let is_active = self.state.active_channel.as_ref() == Some(&channel);
                 if let Some(ch) = self.state.channels.get_mut(&channel) {
-                    // Only count unreads for live messages in background channels.
-                    if !is_active && !message.flags.is_history {
-                        ch.unread_count += 1;
-                        if message.flags.is_mention || message.flags.is_highlighted {
-                            ch.unread_mentions += 1;
+                    // If this is Twitch's echo of our own sent message, update
+                    // the existing local echo in-place instead of adding a
+                    // duplicate entry.  absorb_own_echo returns true when an
+                    // unconfirmed local echo was found and stamped with the
+                    // real server_id; in that case we skip the normal push.
+                    let absorbed = message.flags.is_self
+                        && message.server_id.is_some()
+                        && ch.absorb_own_echo(&message);
+                    if !absorbed {
+                        // Only count unreads for live messages in background channels.
+                        if !is_active && !message.flags.is_history {
+                            ch.unread_count += 1;
+                            if message.flags.is_mention || message.flags.is_highlighted {
+                                ch.unread_mentions += 1;
+                            }
                         }
+                        ch.push_message(message);
                     }
-                    ch.push_message(message);
                 }
             }
             AppEvent::MessageDeleted { channel, server_id } => {
@@ -181,6 +191,9 @@ impl CrustApp {
                 self.emote_catalog = emotes;
             }
             AppEvent::Authenticated { username, user_id } => {
+                // Clear the previous account's avatar so it doesn't flash
+                // while the new one is fetched.
+                self.state.auth.avatar_url = None;
                 self.state.auth.logged_in = true;
                 self.state.auth.username = Some(username);
                 self.state.auth.user_id = Some(user_id);
@@ -193,6 +206,14 @@ impl CrustApp {
             }
             AppEvent::Error { context, message } => {
                 tracing::error!("[{context}] {message}");
+                // Inject a visible error notice into the active channel so the
+                // user doesn't have to watch the terminal to see what went wrong.
+                if let Some(ch_id) = self.state.active_channel.clone() {
+                    self.send_cmd(AppCommand::InjectLocalMessage {
+                        channel: ch_id,
+                        text: format!("[{context}] {message}"),
+                    });
+                }
             }
             AppEvent::HistoryLoaded { channel, messages } => {
                 if let Some(ch) = self.state.channels.get_mut(&channel) {
@@ -248,6 +269,10 @@ impl CrustApp {
                     fetched: true,
                 });
             }
+            AppEvent::AccountListUpdated { accounts, active, default } => {
+                self.state.accounts = accounts.clone();
+                self.login_dialog.update_accounts(accounts, active, default);
+            }
         }
     }
 
@@ -283,11 +308,14 @@ impl eframe::App for CrustApp {
         // Render profile popup and dispatch any moderation action.
         if let Some(action) = self.user_profile_popup.show(ctx, &self.emote_bytes) {
             match action {
-                PopupAction::Timeout { channel, login, seconds } => {
-                    self.send_cmd(AppCommand::TimeoutUser { channel, login, seconds });
+                PopupAction::Timeout { channel, login, user_id, seconds, reason } => {
+                    self.send_cmd(AppCommand::TimeoutUser { channel, login, user_id, seconds, reason });
                 }
-                PopupAction::Ban { channel, login } => {
-                    self.send_cmd(AppCommand::BanUser { channel, login });
+                PopupAction::Ban { channel, login, user_id, reason } => {
+                    self.send_cmd(AppCommand::BanUser { channel, login, user_id, reason });
+                }
+                PopupAction::Unban { channel, login, user_id } => {
+                    self.send_cmd(AppCommand::UnbanUser { channel, login, user_id });
                 }
             }
         }
@@ -306,6 +334,15 @@ impl eframe::App for CrustApp {
             match action {
                 LoginAction::Login(token) => self.send_cmd(AppCommand::Login { token }),
                 LoginAction::Logout => self.send_cmd(AppCommand::Logout),
+                LoginAction::SwitchAccount(username) => {
+                    self.send_cmd(AppCommand::SwitchAccount { username });
+                }
+                LoginAction::RemoveAccount(username) => {
+                    self.send_cmd(AppCommand::RemoveAccount { username });
+                }
+                LoginAction::SetDefaultAccount(username) => {
+                    self.send_cmd(AppCommand::SetDefaultAccount { username });
+                }
             }
         }
 
@@ -494,7 +531,9 @@ impl eframe::App for CrustApp {
                                 .add_sized(
                                     [68.0, t::BAR_H],
                                     egui::Button::new(
-                                        RichText::new("Log in").font(t::small()),
+                                        RichText::new(
+                                            if self.state.accounts.is_empty() { "Log in" } else { "Accounts" }
+                                        ).font(t::small()),
                                     ),
                                 )
                                 .on_hover_text("Log in with a Twitch OAuth token")
@@ -597,15 +636,20 @@ impl eframe::App for CrustApp {
                                 self.pending_reply = None;
                                 let is_mod = self.state.channels
                                     .get(&active_ch).map(|c| c.is_mod).unwrap_or(false);
+                                // Broadcaster has full mod powers in their own channel.
+                                let is_broadcaster = self.state.auth.username.as_deref()
+                                    .map(|u| u.eq_ignore_ascii_case(active_ch.as_str()))
+                                    .unwrap_or(false);
+                                let can_moderate = is_mod || is_broadcaster;
                                 let chatters_count = self.state.channels
                                     .get(&active_ch).map(|c| c.chatters.len()).unwrap_or(0);
                                 if let Some(cmd) = parse_slash_command(
                                     &text, &active_ch, reply_to_msg_id.clone(),
-                                    is_mod, chatters_count,
+                                    can_moderate, chatters_count,
                                 ) {
                                     // Some slash commands manipulate the popup directly.
                                     if let AppCommand::ShowUserCard { ref login, ref channel } = cmd {
-                                        self.user_profile_popup.set_loading(login, vec![], Some(channel.clone()), is_mod);
+                                        self.user_profile_popup.set_loading(login, vec![], Some(channel.clone()), can_moderate);
                                     }
                                     self.send_cmd(cmd);
                                 } else {
@@ -639,7 +683,10 @@ impl eframe::App for CrustApp {
 
                     // Messages above the input
                     if let Some(state) = self.state.channels.get(&active_ch) {
-                        let is_mod = state.is_mod;
+                        let is_broadcaster = self.state.auth.username.as_deref()
+                            .map(|u| u.eq_ignore_ascii_case(active_ch.as_str()))
+                            .unwrap_or(false);
+                        let is_mod = state.is_mod || is_broadcaster;
                         let ml_result = MessageList::new(
                             &state.messages,
                             &self.emote_bytes,

@@ -326,8 +326,6 @@ impl<'a> ChatInput<'a> {
                         ui.ctx().data_mut(|d| d.insert_temp(Id::new("msg_history_state"), HistState::default()));
                         ui.ctx().data_mut(|d| d.insert_temp(Id::new("tab_complete_state"), TabState::default()));
                         resp.request_focus();
-                    } else if resp.lost_focus() {
-                        resp.request_focus();
                     }
 
                     // Emote picker button

@@ -108,7 +108,22 @@ fn main() -> Result<()> {
 
     // Settings / token storage
     let settings_store = SettingsStore::new().ok();
-    let saved_token = settings_store.as_ref().and_then(|s| s.load_token());
+    // Determine which account to auto-login as on startup:
+    // prefer the explicitly pinned default_account, fall back to the last
+    // active username, and finally fall back to the legacy single token.
+    let saved_token = settings_store.as_ref().and_then(|s| {
+        let cfg = s.load();
+        let startup_user = if !cfg.default_account.is_empty() {
+            cfg.default_account.clone()
+        } else {
+            cfg.username.clone()
+        };
+        if !startup_user.is_empty() {
+            s.load_account_token(&startup_user).or_else(|| s.load_token())
+        } else {
+            s.load_token()
+        }
+    });
 
     // Build tokio runtime on background threads (eframe needs main thread)
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -213,6 +228,11 @@ async fn reducer_loop(
     let mut auth_username: Option<String> = None;
     let mut auth_user_id: Option<String> = None;
     let mut local_msg_id: u64 = 1_000_000; // offset to avoid collisions with session IDs
+    // Helix API credentials extracted from the validate response.
+    // Required for moderation calls (timeout / ban) via POST /helix/moderation/bans.
+    let mut helix_client_id: Option<String> = None;
+    // Room-ids for every joined channel (broadcaster_id used by Helix API).
+    let mut channel_room_ids: std::collections::HashMap<ChannelId, String> = std::collections::HashMap::new();
 
     // Per-channel cache of the logged-in user's badges + color (from USERSTATE).
     let mut self_badges: HashMap<ChannelId, Vec<Badge>> = HashMap::new();
@@ -224,6 +244,16 @@ async fn reducer_loop(
         .map(|s| s.load())
         .unwrap_or_default();
     let mut joined_channels: HashSet<String> = settings.auto_join.iter().cloned().collect();
+
+    // Set to `true` whenever we explicitly send `SessionCommand::Authenticate`.
+    // While this flag is set, `TwitchEvent::Connected` will skip re-joining
+    // channels because the connection is either anonymous (about to be
+    // replaced) or mid-reconnect.  The channels are joined instead from
+    // `TwitchEvent::Authenticated` once the correct identity is confirmed.
+    // For passive reconnects (network drop on an already-authenticated
+    // session) this flag stays `false`, so `Connected` handles the rejoin
+    // as before.
+    let mut auth_in_progress = false;
 
     /// Persist the current `joined_channels` set back to disk.
     fn save_channels(store: &Option<SettingsStore>, settings: &mut AppSettings, channels: &HashSet<String>) {
@@ -239,10 +269,15 @@ async fn reducer_loop(
     // If we have a saved token AND a saved username, immediately tell the UI
     // the user is logged in (optimistic) so they don't see the login prompt.
     // We will validate the token in the background; if invalid we undo it.
-    if let (Some(token), username) = (&saved_token, &settings.username) {
-        if !token.is_empty() && !username.is_empty() {
+    let startup_username = if !settings.default_account.is_empty() {
+        settings.default_account.clone()
+    } else {
+        settings.username.clone()
+    };
+    if let (Some(token), uname) = (&saved_token, &startup_username) {
+        if !token.is_empty() && !uname.is_empty() {
             let _ = evt_tx.send(AppEvent::Authenticated {
-                username: username.clone(),
+                username: uname.to_string(),
                 user_id: String::new(), // filled in properly when GLOBALUSERSTATE arrives
             }).await;
         }
@@ -252,8 +287,12 @@ async fn reducer_loop(
     if let Some(token) = saved_token {
         info!("Found saved token, attempting auto-login…");
         match validate_token(&token).await {
-            Ok(login) => {
+            Ok(info) => {
+                let login = info.login;
                 info!("Saved token valid for user: {login}");
+                if !info.client_id.is_empty() {
+                    helix_client_id = Some(info.client_id);
+                }
                 // Update saved username in case it changed.
                 if settings.username != login {
                     settings.username = login.clone();
@@ -261,20 +300,37 @@ async fn reducer_loop(
                         let _ = store.save(&settings);
                     }
                 }
+                auth_in_progress = true;
                 let _ = sess_tx.send(SessionCommand::Authenticate {
                     token,
                     nick: login,
                 }).await;
             }
-            Err(e) => {
-                warn!("Saved token invalid ({e}), starting as anonymous");
+            Err(ValidateError::Unauthorized) => {
+                // Token explicitly rejected by Twitch — safe to delete.
+                warn!("Saved token rejected by Twitch, clearing and starting anonymous");
                 if let Some(store) = &settings_store {
                     let _ = store.delete_token();
                 }
                 // Undo the optimistic login we sent earlier.
                 let _ = evt_tx.send(AppEvent::LoggedOut).await;
             }
+            Err(ValidateError::Transient(e)) => {
+                // Network error, server hiccup, etc. — keep the token so
+                // the next launch can try again.  Just start anonymous.
+                warn!("Token validation failed ({e}), keeping token and starting anonymous");
+                let _ = evt_tx.send(AppEvent::LoggedOut).await;
+            }
         }
+    }
+
+    // Broadcast the initial account list so the UI knows about all saved
+    // accounts immediately (e.g. after auto-login on startup).
+    {
+        let account_names: Vec<String> = settings.accounts.iter().map(|a| a.username.clone()).collect();
+        let active = if settings.username.is_empty() { None } else { Some(settings.username.clone()) };
+        let default = if settings.default_account.is_empty() { None } else { Some(settings.default_account.clone()) };
+        let _ = evt_tx.send(AppEvent::AccountListUpdated { accounts: account_names, active, default }).await;
     }
 
     loop {
@@ -286,15 +342,17 @@ async fn reducer_loop(
                         let _ = evt_tx.send(AppEvent::ConnectionStateChanged {
                             state: ConnectionState::Connected,
                         }).await;
-                        // Re-join all saved channels after every (re)connect.
-                        // Use the sorted auto_join Vec so channel tabs always
-                        // open in a stable order (first entry becomes active).
-                        // Emit ChannelJoined proactively so the tab appears
-                        // immediately without waiting for the IRC confirmation.
-                        for ch in &settings.auto_join {
-                            let id = ChannelId(ch.clone());
-                            let _ = evt_tx.send(AppEvent::ChannelJoined { channel: id.clone() }).await;
-                            let _ = sess_tx.send(SessionCommand::JoinChannel(id)).await;
+                        // Re-join channels only for passive reconnects (network
+                        // drops).  When auth_in_progress is true, the connection
+                        // is either anonymous or mid-auth-switch; joining channels
+                        // would be premature and creates a double-join (the real
+                        // rejoin happens from TwitchEvent::Authenticated below).
+                        if !auth_in_progress {
+                            for ch in &settings.auto_join {
+                                let id = ChannelId(ch.clone());
+                                let _ = evt_tx.send(AppEvent::ChannelJoined { channel: id.clone() }).await;
+                                let _ = sess_tx.send(SessionCommand::JoinChannel(id)).await;
+                            }
                         }
                     }
                     TwitchEvent::Disconnected => {
@@ -309,11 +367,18 @@ async fn reducer_loop(
                     }
                     TwitchEvent::Error(e) => {
                         let _ = evt_tx.send(AppEvent::ConnectionStateChanged {
-                            state: ConnectionState::Error(e),
+                            state: ConnectionState::Error(e.clone()),
+                        }).await;
+                        // Also surface as a chat-visible error so the user
+                        // doesn't have to notice the subtle status-bar change.
+                        let _ = evt_tx.send(AppEvent::Error {
+                            context: "Connection".into(),
+                            message: e,
                         }).await;
                     }
                     TwitchEvent::RoomState { channel, room_id } => {
                         info!("Got room-id {room_id} for #{channel}");
+                        channel_room_ids.insert(channel.clone(), room_id.clone());
                         // Load channel-specific emotes
                         let idx = emote_index.clone();
                         let cache_clone = emote_cache.clone();
@@ -350,12 +415,29 @@ async fn reducer_loop(
                         });
                     }
                     TwitchEvent::Authenticated { username, user_id } => {
+                        // If we got here because of an explicit Authenticate
+                        // command (auth_in_progress = true), we need to rejoin
+                        // channels now that the correct identity is confirmed.
+                        // For passive reconnects the flag is false and channels
+                        // were already re-joined from TwitchEvent::Connected.
+                        let join_now = auth_in_progress;
+                        auth_in_progress = false;
+
                         auth_username = Some(username.clone());
                         auth_user_id = Some(user_id.clone());
                         let _ = evt_tx.send(AppEvent::Authenticated {
                             username,
                             user_id: user_id.clone(),
                         }).await;
+
+                        if join_now {
+                            for ch in &settings.auto_join {
+                                let id = ChannelId(ch.clone());
+                                let _ = evt_tx.send(AppEvent::ChannelJoined { channel: id.clone() }).await;
+                                let _ = sess_tx.send(SessionCommand::JoinChannel(id)).await;
+                            }
+                        }
+
                         // Load the authenticated user's personal 7TV emote set
                         let uid = user_id.clone();
                         let idx2 = emote_index.clone();
@@ -657,23 +739,57 @@ async fn reducer_loop(
                         let token_clone = token.clone();
                         // Validate the token via Twitch API, then authenticate
                         match validate_token(&token).await {
-                            Ok(login) => {
+                            Ok(info) => {
+                                let login = info.login;
                                 info!("Token valid for user: {login}");
+                                if !info.client_id.is_empty() {
+                                    helix_client_id = Some(info.client_id);
+                                }
                                 // Set both username and token on the in-memory settings
                                 // struct, then do ONE save so neither field overwrites
                                 // the other.
                                 settings.username = login.clone();
                                 settings.oauth_token = token_clone.clone();
+                                // Also add / update the account entry in the accounts list.
+                                if let Some(acc) = settings.accounts.iter_mut().find(|a| a.username == login) {
+                                    acc.oauth_token = token_clone.clone();
+                                } else {
+                                    settings.accounts.push(crust_storage::AccountEntry {
+                                        username: login.clone(),
+                                        oauth_token: token_clone.clone(),
+                                    });
+                                }
                                 if let Some(store) = &settings_store {
+                                    // ONE consolidated save — accounts list AND oauth_token
+                                    // are both in `settings` already.  A separate
+                                    // save_account_token() call would do a redundant
+                                    // load→modify→save cycle that can race with other saves.
                                     if let Err(e) = store.save(&settings) {
                                         warn!("Failed to save settings: {e}");
                                     }
-                                    // Best-effort keyring (non-fatal).
-                                    store.try_save_keyring(&token_clone);
+                                    // Best-effort: also cache in the per-account keyring slot
+                                    // for fast/offline lookup (no disk read/write involved).
+                                    store.try_save_account_keyring(&login, &token_clone);
                                 }
+                                // If we're replacing an active session, flush the old
+                                // auth state so the UI clears the previous avatar.
+                                if auth_username.is_some() {
+                                    auth_username = None;
+                                    auth_user_id = None;
+                                    let _ = evt_tx.send(AppEvent::LoggedOut).await;
+                                }
+                                auth_in_progress = true;
                                 let _ = sess_tx.send(SessionCommand::Authenticate {
                                     token: token_clone,
-                                    nick: login,
+                                    nick: login.clone(),
+                                }).await;
+                                // Broadcast updated account list.
+                                let account_names: Vec<String> = settings.accounts.iter().map(|a| a.username.clone()).collect();
+                                let default = if settings.default_account.is_empty() { None } else { Some(settings.default_account.clone()) };
+                                let _ = evt_tx.send(AppEvent::AccountListUpdated {
+                                    accounts: account_names,
+                                    active: Some(login),
+                                    default,
                                 }).await;
                             }
                             Err(e) => {
@@ -700,6 +816,173 @@ async fn reducer_loop(
                         auth_user_id = None;
                         let _ = sess_tx.send(SessionCommand::LogoutAndReconnect).await;
                         let _ = evt_tx.send(AppEvent::LoggedOut).await;
+                        // Broadcast updated account list.
+                        let account_names: Vec<String> = settings.accounts.iter().map(|a| a.username.clone()).collect();
+                        let default = if settings.default_account.is_empty() { None } else { Some(settings.default_account.clone()) };
+                        let _ = evt_tx.send(AppEvent::AccountListUpdated {
+                            accounts: account_names,
+                            active: None,
+                            default,
+                        }).await;
+                    }
+                    AppCommand::AddAccount { token } => {
+                        info!("AddAccount requested, validating token…");
+                        match validate_token(&token).await {
+                            Ok(info) => {
+                                let login = info.login;
+                                info!("AddAccount: token valid for {login}");
+                                if !info.client_id.is_empty() {
+                                    helix_client_id = Some(info.client_id);
+                                }
+                                // Update in-memory settings FIRST so that the single
+                                // store.save() call below captures everything atomically.
+                                if let Some(acc) = settings.accounts.iter_mut().find(|a| a.username == login) {
+                                    acc.oauth_token = token.clone();
+                                } else {
+                                    settings.accounts.push(crust_storage::AccountEntry {
+                                        username: login.clone(),
+                                        oauth_token: token.clone(),
+                                    });
+                                }
+                                // Switch to this new account.
+                                settings.username = login.clone();
+                                settings.oauth_token = token.clone(); // keep legacy field in sync
+                                if let Some(store) = &settings_store {
+                                    if let Err(e) = store.save(&settings) {
+                                        warn!("Failed to save settings for AddAccount {login}: {e}");
+                                    }
+                                    store.try_save_account_keyring(&login, &token);
+                                }
+                                // Flush old auth state so the UI transitions cleanly.
+                                if auth_username.is_some() {
+                                    auth_username = None;
+                                    auth_user_id = None;
+                                    let _ = evt_tx.send(AppEvent::LoggedOut).await;
+                                }
+                                auth_in_progress = true;
+                                let _ = sess_tx.send(SessionCommand::Authenticate {
+                                    token,
+                                    nick: login.clone(),
+                                }).await;
+                                let account_names: Vec<String> = settings.accounts.iter().map(|a| a.username.clone()).collect();
+                                let default = if settings.default_account.is_empty() { None } else { Some(settings.default_account.clone()) };
+                                let _ = evt_tx.send(AppEvent::AccountListUpdated {
+                                    accounts: account_names,
+                                    active: Some(login),
+                                    default,
+                                }).await;
+                            }
+                            Err(e) => {
+                                warn!("AddAccount token validation failed: {e}");
+                                let _ = evt_tx.send(AppEvent::Error {
+                                    context: "AddAccount".into(),
+                                    message: format!("Invalid token: {e}"),
+                                }).await;
+                            }
+                        }
+                    }
+                    AppCommand::SwitchAccount { username } => {
+                        info!("SwitchAccount to {username}");
+                        let token_opt = settings_store.as_ref().and_then(|s| s.load_account_token(&username));
+                        if let Some(token) = token_opt {
+                            settings.username = username.clone();
+                            // Keep the legacy oauth_token field in sync so that
+                            // load_token() fallback always returns the right token.
+                            settings.oauth_token = token.clone();
+                            if let Some(store) = &settings_store {
+                                let _ = store.save(&settings);
+                                // Refresh per-account keyring slot too.
+                                store.try_save_account_keyring(&username, &token);
+                            }
+                            // Reset auth state before re-authenticating so the
+                            // UI clears the old avatar immediately.
+                            auth_username = None;
+                            auth_user_id = None;
+                            let _ = evt_tx.send(AppEvent::LoggedOut).await;
+                            auth_in_progress = true;
+                            let _ = sess_tx.send(SessionCommand::Authenticate {
+                                token,
+                                nick: username.clone(),
+                            }).await;
+                            let account_names: Vec<String> = settings.accounts.iter().map(|a| a.username.clone()).collect();
+                            let default = if settings.default_account.is_empty() { None } else { Some(settings.default_account.clone()) };
+                            let _ = evt_tx.send(AppEvent::AccountListUpdated {
+                                accounts: account_names,
+                                active: Some(username),
+                                default,
+                            }).await;
+                        } else {
+                            warn!("SwitchAccount: no saved token for {username}");
+                            let _ = evt_tx.send(AppEvent::Error {
+                                context: "SwitchAccount".into(),
+                                message: format!("No saved token for {username}. Please add the account again."),
+                            }).await;
+                        }
+                    }
+                    AppCommand::RemoveAccount { username } => {
+                        info!("RemoveAccount {username}");
+                        let was_active = auth_username.as_deref() == Some(username.as_str());
+                        if let Some(store) = &settings_store {
+                            let _ = store.delete_account(&username);
+                        }
+                        settings.accounts.retain(|a| a.username != username);
+                        // Clear default_account if the removed account was the default.
+                        if settings.default_account == username {
+                            settings.default_account = String::new();
+                        }
+                        if was_active {
+                            // Try to switch to the first remaining account.
+                            let next = settings.accounts.first().cloned();
+                            if let Some(acc) = next {
+                                let token_opt = settings_store.as_ref().and_then(|s| s.load_account_token(&acc.username));
+                                if let Some(token) = token_opt {
+                                    settings.username = acc.username.clone();
+                                    auth_in_progress = true;
+                                    let _ = sess_tx.send(SessionCommand::Authenticate {
+                                        token,
+                                        nick: acc.username.clone(),
+                                    }).await;
+                                } else {
+                                    auth_username = None;
+                                    auth_user_id = None;
+                                    settings.username = String::new();
+                                    let _ = sess_tx.send(SessionCommand::LogoutAndReconnect).await;
+                                    let _ = evt_tx.send(AppEvent::LoggedOut).await;
+                                }
+                            } else {
+                                auth_username = None;
+                                auth_user_id = None;
+                                settings.username = String::new();
+                                let _ = sess_tx.send(SessionCommand::LogoutAndReconnect).await;
+                                let _ = evt_tx.send(AppEvent::LoggedOut).await;
+                            }
+                            if let Some(store) = &settings_store {
+                                let _ = store.save(&settings);
+                            }
+                        }
+                        let account_names: Vec<String> = settings.accounts.iter().map(|a| a.username.clone()).collect();
+                        let active = if settings.username.is_empty() { None } else { Some(settings.username.clone()) };
+                        let default = if settings.default_account.is_empty() { None } else { Some(settings.default_account.clone()) };
+                        let _ = evt_tx.send(AppEvent::AccountListUpdated {
+                            accounts: account_names,
+                            active,
+                            default,
+                        }).await;
+                    }
+                    AppCommand::SetDefaultAccount { username } => {
+                        info!("SetDefaultAccount → {}", if username.is_empty() { "(none)" } else { &username });
+                        settings.default_account = username.clone();
+                        if let Some(store) = &settings_store {
+                            let _ = store.save(&settings);
+                        }
+                        let account_names: Vec<String> = settings.accounts.iter().map(|a| a.username.clone()).collect();
+                        let active = if settings.username.is_empty() { None } else { Some(settings.username.clone()) };
+                        let default = if username.is_empty() { None } else { Some(username) };
+                        let _ = evt_tx.send(AppEvent::AccountListUpdated {
+                            accounts: account_names,
+                            active,
+                            default,
+                        }).await;
                     }
                     AppCommand::SendMessage { channel, text, reply_to_msg_id } => {
                         debug!("Sending message to #{channel}: {text}");
@@ -788,13 +1071,54 @@ async fn reducer_loop(
                         let etx = evt_tx.clone();
                         tokio::spawn(async move { fetch_user_profile(&login, etx).await; });
                     }
-                    AppCommand::TimeoutUser { channel, login, seconds } => {
-                        let cmd = format!("/timeout {login} {seconds}");
-                        let _ = sess_tx.send(SessionCommand::SendMessage(channel, cmd, None)).await;
+                    AppCommand::TimeoutUser { channel, login, user_id, seconds, reason } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let moderator_id   = auth_user_id.clone();
+                        let token          = settings.oauth_token.clone();
+                        let client_id      = helix_client_id.clone();
+                        let evt_tx2        = evt_tx.clone();
+                        let ch_name        = channel.clone();
+                        tokio::spawn(async move {
+                            helix_ban_user(
+                                &token, client_id.as_deref(),
+                                broadcaster_id.as_deref(), moderator_id.as_deref(),
+                                &user_id, Some(seconds),
+                                reason.as_deref(),
+                                &login, &ch_name, evt_tx2,
+                            ).await;
+                        });
                     }
-                    AppCommand::BanUser { channel, login } => {
-                        let cmd = format!("/ban {login}");
-                        let _ = sess_tx.send(SessionCommand::SendMessage(channel, cmd, None)).await;
+                    AppCommand::BanUser { channel, login, user_id, reason } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let moderator_id   = auth_user_id.clone();
+                        let token          = settings.oauth_token.clone();
+                        let client_id      = helix_client_id.clone();
+                        let evt_tx2        = evt_tx.clone();
+                        let ch_name        = channel.clone();
+                        tokio::spawn(async move {
+                            helix_ban_user(
+                                &token, client_id.as_deref(),
+                                broadcaster_id.as_deref(), moderator_id.as_deref(),
+                                &user_id, None,
+                                reason.as_deref(),
+                                &login, &ch_name, evt_tx2,
+                            ).await;
+                        });
+                    }
+                    AppCommand::UnbanUser { channel, login, user_id } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let moderator_id   = auth_user_id.clone();
+                        let token          = settings.oauth_token.clone();
+                        let client_id      = helix_client_id.clone();
+                        let evt_tx2        = evt_tx.clone();
+                        let ch_name        = channel.clone();
+                        tokio::spawn(async move {
+                            helix_unban_user(
+                                &token, client_id.as_deref(),
+                                broadcaster_id.as_deref(), moderator_id.as_deref(),
+                                &user_id, &login, &ch_name, evt_tx2,
+                            ).await;
+                        });
                     }
                     AppCommand::ClearLocalMessages { channel } => {
                         let _ = evt_tx.send(AppEvent::ChannelMessagesCleared { channel }).await;
@@ -1351,8 +1675,199 @@ async fn load_recent_messages(
 
 // Token validation
 
+/// Call `POST /helix/moderation/bans` to timeout or permanently ban a user.
+///
+/// `duration_secs` = `None` → permanent ban; `Some(n)` → timeout for `n` seconds.
+/// On failure, injects a local error message into the channel so the user can see what went wrong.
+async fn helix_ban_user(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    moderator_id: Option<&str>,
+    target_user_id: &str,
+    duration_secs: Option<u32>,
+    reason: Option<&str>,
+    target_login: &str,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (Some(cid), Some(bid), Some(mid)) = (client_id, broadcaster_id, moderator_id) else {
+        warn!("helix_ban_user: missing credentials (cid={:?} bid={:?} mid={:?})", client_id, broadcaster_id, moderator_id);
+        let _ = evt_tx.send(AppEvent::Error {
+            context: "Moderation".into(),
+            message: "Cannot moderate: missing Twitch credentials. Reconnect and try again.".into(),
+        }).await;
+        return;
+    };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    let url = format!(
+        "https://api.twitch.tv/helix/moderation/bans?broadcaster_id={bid}&moderator_id={mid}"
+    );
+
+    #[derive(serde::Serialize)]
+    struct BanData<'a> {
+        user_id: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<&'a str>,
+    }
+    #[derive(serde::Serialize)]
+    struct BanBody<'a> { data: BanData<'a> }
+
+    let body = BanBody {
+        data: BanData {
+            user_id: target_user_id,
+            duration: duration_secs,
+            reason,
+        },
+    };
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .post(&url)
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("helix_ban_user: request failed: {e}");
+            let _ = evt_tx.send(AppEvent::Error {
+                context: "Moderation".into(),
+                message: format!("Moderation request failed: {e}"),
+            }).await;
+            return;
+        }
+    };
+
+    let status = resp.status();
+    if status.is_success() {
+        let verb = if duration_secs.is_some() {
+            let secs = duration_secs.unwrap();
+            let (n, unit) = if secs < 60 { (secs, "s") }
+                else if secs < 3600 { (secs / 60, "m") }
+                else if secs < 86400 { (secs / 3600, "h") }
+                else { (secs / 86400, "d") };
+            format!("timed out for {n}{unit}")
+        } else {
+            "permanently banned".into()
+        };
+        info!("Moderation: {target_login} {verb} in #{channel}");
+    } else {
+        let body_text = resp.text().await.unwrap_or_default();
+        warn!("helix_ban_user: HTTP {status} — {body_text}");
+        // Extract a human-readable message from the Helix error response.
+        let helix_msg = serde_json::from_str::<serde_json::Value>(&body_text)
+            .ok()
+            .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_owned))
+            .unwrap_or_else(|| format!("HTTP {status}"));
+        let action = if duration_secs.is_some() { "timeout" } else { "ban" };
+        let _ = evt_tx.send(AppEvent::Error {
+            context: "Moderation".into(),
+            message: format!("Could not {action} {target_login}: {helix_msg}"),
+        }).await;
+    }
+}
+
+/// Call `DELETE /helix/moderation/bans` to lift a ban or active timeout.
+async fn helix_unban_user(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    moderator_id: Option<&str>,
+    target_user_id: &str,
+    target_login: &str,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (Some(cid), Some(bid), Some(mid)) = (client_id, broadcaster_id, moderator_id) else {
+        warn!("helix_unban_user: missing credentials");
+        let _ = evt_tx.send(AppEvent::Error {
+            context: "Moderation".into(),
+            message: "Cannot unban: missing Twitch credentials. Reconnect and try again.".into(),
+        }).await;
+        return;
+    };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    let url = format!(
+        "https://api.twitch.tv/helix/moderation/bans\
+         ?broadcaster_id={bid}&moderator_id={mid}&user_id={target_user_id}"
+    );
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .delete(&url)
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("helix_unban_user: request failed: {e}");
+            let _ = evt_tx.send(AppEvent::Error {
+                context: "Moderation".into(),
+                message: format!("Unban request failed: {e}"),
+            }).await;
+            return;
+        }
+    };
+
+    let status = resp.status();
+    if status.is_success() || status.as_u16() == 204 {
+        info!("Moderation: {target_login} unbanned/untimedout in #{channel}");
+    } else {
+        let body_text = resp.text().await.unwrap_or_default();
+        warn!("helix_unban_user: HTTP {status} — {body_text}");
+        let helix_msg = serde_json::from_str::<serde_json::Value>(&body_text)
+            .ok()
+            .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_owned))
+            .unwrap_or_else(|| format!("HTTP {status}"));
+        let _ = evt_tx.send(AppEvent::Error {
+            context: "Moderation".into(),
+            message: format!("Could not unban {target_login}: {helix_msg}"),
+        }).await;
+    }
+}
+
+/// Error returned by [`validate_token`].
+#[derive(Debug)]
+enum ValidateError {
+    /// The Twitch API explicitly rejected the token (HTTP 401 / 403).
+    /// The token should be deleted from storage.
+    Unauthorized,
+    /// A transient problem (network error, server 5xx, parse failure, …).
+    /// The token should be kept so it can be retried next launch.
+    Transient(String),
+}
+
+impl std::fmt::Display for ValidateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unauthorized => write!(f, "token rejected by Twitch (unauthorized)"),
+            Self::Transient(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Information returned by a successful token validation.
+struct ValidateInfo {
+    /// Twitch login name (always lowercase).
+    login: String,
+    /// Twitch user-id string for the token owner (available for future use).
+    #[allow(dead_code)]
+    user_id: String,
+    /// Client-id of the application the token was issued to.
+    client_id: String,
+}
+
 /// Validate a Twitch OAuth token via the Twitch API and return the login name.
-async fn validate_token(token: &str) -> Result<String, String> {
+async fn validate_token(token: &str) -> Result<ValidateInfo, ValidateError> {
     let bare = token.strip_prefix("oauth:").unwrap_or(token);
     let client = reqwest::Client::new();
     let resp = client
@@ -1360,23 +1875,35 @@ async fn validate_token(token: &str) -> Result<String, String> {
         .header("Authorization", format!("OAuth {bare}"))
         .send()
         .await
-        .map_err(|e| format!("HTTP error: {e}"))?;
+        .map_err(|e| ValidateError::Transient(format!("HTTP error: {e}")))?;
 
-    if !resp.status().is_success() {
-        return Err(format!("Token rejected (HTTP {})", resp.status()));
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(ValidateError::Unauthorized);
+    }
+    if !status.is_success() {
+        return Err(ValidateError::Transient(format!("Token rejected (HTTP {status})")));
     }
 
     #[derive(serde::Deserialize)]
     struct ValidateResponse {
         login: String,
+        #[serde(default)]
+        user_id: String,
+        #[serde(default)]
+        client_id: String,
     }
 
     let body = resp
         .json::<ValidateResponse>()
         .await
-        .map_err(|e| format!("Failed to parse validation response: {e}"))?;
+        .map_err(|e| ValidateError::Transient(format!("Failed to parse validation response: {e}")))?;
 
-    Ok(body.login)
+    Ok(ValidateInfo {
+        login:     body.login,
+        user_id:   body.user_id,
+        client_id: body.client_id,
+    })
 }
 
 // User profile
@@ -1391,6 +1918,32 @@ async fn fetch_user_profile(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
         is_partner: bool,
         #[serde(rename = "isAffiliate", default)]
         is_affiliate: bool,
+        #[serde(rename = "isBanned", default)]
+        is_banned: bool,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct IvrStream {
+        #[serde(default)]
+        title: String,
+        #[serde(default)]
+        game: String,
+        /// IVR uses "viewersCount" in v2.
+        #[serde(rename = "viewersCount", default)]
+        viewers_count: u64,
+        #[serde(rename = "startedAt")]
+        started_at: Option<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct IvrBroadcast {
+        #[serde(rename = "startedAt")]
+        started_at: Option<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct IvrBanStatus {
+        reason: Option<String>,
     }
 
     #[derive(serde::Deserialize)]
@@ -1410,6 +1963,17 @@ async fn fetch_user_profile(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
         followers: Option<u64>,
         #[serde(default)]
         roles: Option<IvrRoles>,
+        /// User's chosen chat colour, e.g. `"#FF6905"`.
+        #[serde(rename = "chatColor")]
+        chat_color: Option<String>,
+        /// Non-null while the channel is live.
+        stream: Option<IvrStream>,
+        /// Info about the most recent broadcast.
+        #[serde(rename = "lastBroadcast")]
+        last_broadcast: Option<IvrBroadcast>,
+        /// Non-null if the account is banned/suspended.
+        #[serde(rename = "banStatus")]
+        ban_status: Option<IvrBanStatus>,
     }
 
     let url = format!("https://api.ivr.fi/v2/twitch/user?login={login}");
@@ -1432,6 +1996,17 @@ async fn fetch_user_profile(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
 
     let avatar_url = user.logo.clone();
 
+    let is_live          = user.stream.is_some();
+    let stream_title     = user.stream.as_ref().map(|s| s.title.clone()).filter(|s| !s.is_empty());
+    let stream_game      = user.stream.as_ref().map(|s| s.game.clone()).filter(|s| !s.is_empty());
+    let stream_viewers   = user.stream.as_ref().map(|s| s.viewers_count);
+    let stream_started   = user.stream.as_ref().and_then(|s| s.started_at.clone());
+    let last_broadcast_at = stream_started
+        .or_else(|| user.last_broadcast.and_then(|b| b.started_at));
+    let is_banned        = user.roles.as_ref().map_or(false, |r| r.is_banned)
+        || user.ban_status.is_some();
+    let ban_reason       = user.ban_status.and_then(|b| b.reason);
+
     let profile = UserProfile {
         id: user.id,
         login: user.login,
@@ -1442,6 +2017,14 @@ async fn fetch_user_profile(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
         followers: user.followers,
         is_partner: user.roles.as_ref().map_or(false, |r| r.is_partner),
         is_affiliate: user.roles.as_ref().map_or(false, |r| r.is_affiliate),
+        chat_color: user.chat_color,
+        is_live,
+        stream_title,
+        stream_game,
+        stream_viewers,
+        last_broadcast_at,
+        is_banned,
+        ban_reason,
     };
 
     // Pre-fetch avatar bytes so egui can display them right away.

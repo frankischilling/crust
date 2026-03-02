@@ -38,10 +38,12 @@ pub enum AppCommand {
     },
     /// Request a Twitch user profile lookup by login name.
     FetchUserProfile { login: String },
-    /// Timeout a user in a channel (sends /timeout IRC command).
-    TimeoutUser { channel: ChannelId, login: String, seconds: u32 },
-    /// Permanently ban a user from a channel (sends /ban IRC command).
-    BanUser { channel: ChannelId, login: String },
+    /// Timeout a user in a channel via the Twitch Helix API.
+    TimeoutUser { channel: ChannelId, login: String, user_id: String, seconds: u32, reason: Option<String> },
+    /// Permanently ban a user from a channel via the Twitch Helix API.
+    BanUser { channel: ChannelId, login: String, user_id: String, reason: Option<String> },
+    /// Lift an active ban or timeout for a user via the Twitch Helix API.
+    UnbanUser { channel: ChannelId, login: String, user_id: String },
     /// Clears all messages in the channel display (visual-only, not sent to Twitch).
     ClearLocalMessages { channel: ChannelId },
     /// Opens a URL in the system default browser.
@@ -52,6 +54,14 @@ pub enum AppCommand {
     ShowUserCard { login: String, channel: ChannelId },
     /// Fetch Open-Graph / Twitter-Card metadata for a URL to show a hover preview.
     FetchLinkPreview { url: String },
+    /// Add a new account by validating and saving the given OAuth token.
+    AddAccount { token: String },
+    /// Switch the active session to an already-saved account.
+    SwitchAccount { username: String },
+    /// Remove a saved account (and its token) permanently.
+    RemoveAccount { username: String },
+    /// Mark an account as the one to auto-login on next startup.
+    SetDefaultAccount { username: String },
 }
 
 // Events (runtime to UI): notifications sent from runtime to UI
@@ -126,6 +136,15 @@ pub enum AppEvent {
         description: Option<String>,
         /// og:image URL; the image bytes land in emote_bytes under this key.
         thumbnail_url: Option<String>,
+    },
+    /// The set of saved accounts or the active account changed.
+    AccountListUpdated {
+        /// Ordered list of all saved account usernames.
+        accounts: Vec<String>,
+        /// Username of the currently active (authenticated) account, if any.
+        active: Option<String>,
+        /// Username of the account that auto-logs in on startup, if set.
+        default: Option<String>,
     },
 }
 
