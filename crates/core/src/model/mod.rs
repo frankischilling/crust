@@ -270,6 +270,41 @@ impl ChannelState {
         self.messages.push_back(msg);
     }
 
+    /// Try to absorb a Twitch echo of one of our own sent messages.
+    ///
+    /// Twitch echoes every PRIVMSG back to the sender.  We also add a local
+    /// echo immediately on send (with `server_id = None`).  When the real
+    /// echo arrives we should update the local copy in-place rather than
+    /// pushing a second copy of the same message.
+    ///
+    /// Returns `true` if a local echo was found and updated (caller should
+    /// NOT push a new message).  Returns `false` if no match was found
+    /// (caller should push normally).
+    pub fn absorb_own_echo(&mut self, msg: &ChatMessage) -> bool {
+        // Only applies to own messages with a real server_id from Twitch.
+        let Some(ref echo_id) = msg.server_id else { return false; };
+        // Look for the most recent local echo: same sender login, same text,
+        // server_id = None (i.e. not yet confirmed by Twitch).
+        let sender_login = msg.sender.login.to_lowercase();
+        let raw_text = &msg.raw_text;
+        // Iterate from newest to oldest so we grab the closest pending echo.
+        if let Some(existing) = self.messages.iter_mut().rev().find(|m| {
+            m.server_id.is_none()
+                && m.flags.is_self
+                && m.sender.login.to_lowercase() == sender_login
+                && m.raw_text == *raw_text
+        }) {
+            // Stamp the local echo with the real server id and any Twitch-side
+            // metadata we now know (badges, colour, timestamp, …).
+            existing.server_id = Some(echo_id.clone());
+            existing.timestamp = msg.timestamp;
+            existing.sender.color = msg.sender.color.clone();
+            existing.sender.badges = msg.sender.badges.clone();
+            return true;
+        }
+        false
+    }
+
     /// Clear unread counters (call when the user switches to this channel).
     pub fn mark_read(&mut self) {
         self.unread_count = 0;
@@ -347,6 +382,24 @@ pub struct UserProfile {
     pub followers: Option<u64>,
     pub is_partner: bool,
     pub is_affiliate: bool,
+
+    // ── Extended fields (IVR v2) ──────────────────────────────────────────────
+    /// The user's chosen chat-message colour as a CSS hex string, e.g. `"#FF6905"`.
+    pub chat_color: Option<String>,
+    /// `true` if the user is currently live.
+    pub is_live: bool,
+    /// Title of the active stream (only populated when `is_live`).
+    pub stream_title: Option<String>,
+    /// Game / category of the active stream.
+    pub stream_game: Option<String>,
+    /// Live viewer count.
+    pub stream_viewers: Option<u64>,
+    /// ISO 8601 timestamp when the current (or last) broadcast started.
+    pub last_broadcast_at: Option<String>,
+    /// `true` if the account is suspended / permanently banned on Twitch.
+    pub is_banned: bool,
+    /// Reason the account was banned (if known).
+    pub ban_reason: Option<String>,
 }
 
 // SystemNotice: system notice event structure

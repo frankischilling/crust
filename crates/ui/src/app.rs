@@ -23,6 +23,18 @@ use crate::widgets::{
     user_profile_popup::{PopupAction, UserProfilePopup},
 };
 
+// Channel layout mode
+
+/// Controls where the channel list is rendered.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelLayout {
+    /// Classic left sidebar (default).
+    #[default]
+    Sidebar,
+    /// Compact horizontal tab strip pinned to the top of the window.
+    TopTabs,
+}
+
 // CrustApp struct and implementation
 
 pub struct CrustApp {
@@ -47,6 +59,10 @@ pub struct CrustApp {
     emote_ram_bytes: usize,
     /// Chat message history for Up/Down arrow recall.
     message_history: Vec<String>,
+    /// Controls whether the left channel sidebar is visible (Sidebar mode only).
+    sidebar_visible: bool,
+    /// Where channel tabs are rendered: left sidebar or top strip.
+    channel_layout: ChannelLayout,
 }
 
 impl CrustApp {
@@ -122,6 +138,8 @@ impl CrustApp {
             link_previews: HashMap::new(),
             emote_ram_bytes: 0,
             message_history: Vec::new(),
+            sidebar_visible: true,
+            channel_layout: ChannelLayout::default(),
         }
     }
 
@@ -148,14 +166,24 @@ impl CrustApp {
             AppEvent::MessageReceived { channel, message } => {
                 let is_active = self.state.active_channel.as_ref() == Some(&channel);
                 if let Some(ch) = self.state.channels.get_mut(&channel) {
-                    // Only count unreads for live messages in background channels.
-                    if !is_active && !message.flags.is_history {
-                        ch.unread_count += 1;
-                        if message.flags.is_mention || message.flags.is_highlighted {
-                            ch.unread_mentions += 1;
+                    // If this is Twitch's echo of our own sent message, update
+                    // the existing local echo in-place instead of adding a
+                    // duplicate entry.  absorb_own_echo returns true when an
+                    // unconfirmed local echo was found and stamped with the
+                    // real server_id; in that case we skip the normal push.
+                    let absorbed = message.flags.is_self
+                        && message.server_id.is_some()
+                        && ch.absorb_own_echo(&message);
+                    if !absorbed {
+                        // Only count unreads for live messages in background channels.
+                        if !is_active && !message.flags.is_history {
+                            ch.unread_count += 1;
+                            if message.flags.is_mention || message.flags.is_highlighted {
+                                ch.unread_mentions += 1;
+                            }
                         }
+                        ch.push_message(message);
                     }
-                    ch.push_message(message);
                 }
             }
             AppEvent::MessageDeleted { channel, server_id } => {
@@ -181,6 +209,9 @@ impl CrustApp {
                 self.emote_catalog = emotes;
             }
             AppEvent::Authenticated { username, user_id } => {
+                // Clear the previous account's avatar so it doesn't flash
+                // while the new one is fetched.
+                self.state.auth.avatar_url = None;
                 self.state.auth.logged_in = true;
                 self.state.auth.username = Some(username);
                 self.state.auth.user_id = Some(user_id);
@@ -193,6 +224,14 @@ impl CrustApp {
             }
             AppEvent::Error { context, message } => {
                 tracing::error!("[{context}] {message}");
+                // Inject a visible error notice into the active channel so the
+                // user doesn't have to watch the terminal to see what went wrong.
+                if let Some(ch_id) = self.state.active_channel.clone() {
+                    self.send_cmd(AppCommand::InjectLocalMessage {
+                        channel: ch_id,
+                        text: format!("[{context}] {message}"),
+                    });
+                }
             }
             AppEvent::HistoryLoaded { channel, messages } => {
                 if let Some(ch) = self.state.channels.get_mut(&channel) {
@@ -248,6 +287,10 @@ impl CrustApp {
                     fetched: true,
                 });
             }
+            AppEvent::AccountListUpdated { accounts, active, default } => {
+                self.state.accounts = accounts.clone();
+                self.login_dialog.update_accounts(accounts, active, default);
+            }
         }
     }
 
@@ -283,11 +326,14 @@ impl eframe::App for CrustApp {
         // Render profile popup and dispatch any moderation action.
         if let Some(action) = self.user_profile_popup.show(ctx, &self.emote_bytes) {
             match action {
-                PopupAction::Timeout { channel, login, seconds } => {
-                    self.send_cmd(AppCommand::TimeoutUser { channel, login, seconds });
+                PopupAction::Timeout { channel, login, user_id, seconds, reason } => {
+                    self.send_cmd(AppCommand::TimeoutUser { channel, login, user_id, seconds, reason });
                 }
-                PopupAction::Ban { channel, login } => {
-                    self.send_cmd(AppCommand::BanUser { channel, login });
+                PopupAction::Ban { channel, login, user_id, reason } => {
+                    self.send_cmd(AppCommand::BanUser { channel, login, user_id, reason });
+                }
+                PopupAction::Unban { channel, login, user_id } => {
+                    self.send_cmd(AppCommand::UnbanUser { channel, login, user_id });
                 }
             }
         }
@@ -306,6 +352,15 @@ impl eframe::App for CrustApp {
             match action {
                 LoginAction::Login(token) => self.send_cmd(AppCommand::Login { token }),
                 LoginAction::Logout => self.send_cmd(AppCommand::Logout),
+                LoginAction::SwitchAccount(username) => {
+                    self.send_cmd(AppCommand::SwitchAccount { username });
+                }
+                LoginAction::RemoveAccount(username) => {
+                    self.send_cmd(AppCommand::RemoveAccount { username });
+                }
+                LoginAction::SetDefaultAccount(username) => {
+                    self.send_cmd(AppCommand::SetDefaultAccount { username });
+                }
             }
         }
 
@@ -365,6 +420,64 @@ impl eframe::App for CrustApp {
                         .clicked()
                     {
                         self.join_dialog.toggle();
+                    }
+
+                    ui.separator();
+
+                    // Sidebar visibility toggle (◧ = open, □ = closed)
+                    let sidebar_open =
+                        self.channel_layout == ChannelLayout::Sidebar && self.sidebar_visible;
+                    let vis_icon = if sidebar_open { "◧" } else { "□" };
+                    let vis_tip = if sidebar_open {
+                        "Hide channel sidebar"
+                    } else {
+                        "Show channel sidebar"
+                    };
+                    if ui
+                        .add_sized(
+                            [26.0, t::BAR_H],
+                            egui::Button::new(RichText::new(vis_icon).font(t::small())),
+                        )
+                        .on_hover_text(vis_tip)
+                        .clicked()
+                    {
+                        match self.channel_layout {
+                            ChannelLayout::TopTabs => {
+                                // Return to sidebar
+                                self.channel_layout = ChannelLayout::Sidebar;
+                                self.sidebar_visible = true;
+                            }
+                            ChannelLayout::Sidebar => {
+                                self.sidebar_visible = !self.sidebar_visible;
+                            }
+                        }
+                    }
+
+                    // Layout mode toggle (Sidebar ↔ Top tabs)
+                    let mode_icon = if self.channel_layout == ChannelLayout::Sidebar {
+                        "⬚ Top"
+                    } else {
+                        "◧ Side"
+                    };
+                    let mode_tip = if self.channel_layout == ChannelLayout::Sidebar {
+                        "Move channels to top bar"
+                    } else {
+                        "Move channels to sidebar"
+                    };
+                    if ui
+                        .add_sized(
+                            [52.0, t::BAR_H],
+                            egui::Button::new(RichText::new(mode_icon).font(t::small())),
+                        )
+                        .on_hover_text(mode_tip)
+                        .clicked()
+                    {
+                        if self.channel_layout == ChannelLayout::Sidebar {
+                            self.channel_layout = ChannelLayout::TopTabs;
+                        } else {
+                            self.channel_layout = ChannelLayout::Sidebar;
+                            self.sidebar_visible = true;
+                        }
                     }
 
                     // Right-side items
@@ -494,7 +607,9 @@ impl eframe::App for CrustApp {
                                 .add_sized(
                                     [68.0, t::BAR_H],
                                     egui::Button::new(
-                                        RichText::new("Log in").font(t::small()),
+                                        RichText::new(
+                                            if self.state.accounts.is_empty() { "Log in" } else { "Accounts" }
+                                        ).font(t::small()),
                                     ),
                                 )
                                 .on_hover_text("Log in with a Twitch OAuth token")
@@ -507,54 +622,150 @@ impl eframe::App for CrustApp {
                 });
             });
 
-        // -- Left sidebar ------------------------------------------------------
-        // Dynamically cap sidebar width so the central panel always gets
-        // at least 350 px — prevents chat from being hidden on narrow windows.
-        let sidebar_max = (ctx.screen_rect().width() - 350.0)
-            .clamp(t::SIDEBAR_MIN_W, t::SIDEBAR_MAX_W);
+        // -- Channel list: left sidebar OR top tab strip ----------------------
+        // Accumulate actions outside the panel closure so we can call &mut self
+        // methods after the panel is done drawing.
+        let mut ch_selected: Option<ChannelId> = None;
+        let mut ch_closed: Option<ChannelId> = None;
+        let mut ch_reordered: Option<Vec<ChannelId>> = None;
 
-        SidePanel::left("channel_list")
-            .resizable(true)
-            .default_width(t::SIDEBAR_W)
-            .min_width(t::SIDEBAR_MIN_W)
-            .max_width(sidebar_max)
-            .frame(
-                Frame::new()
-                    .fill(t::BG_SURFACE)
-                    .inner_margin(t::SIDEBAR_MARGIN)
-                    .stroke(egui::Stroke::new(1.0, t::BORDER_SUBTLE)),
-            )
-            .show(ctx, |ui| {
-                ui.label(
-                    RichText::new("CHANNELS")
-                        .font(t::heading())
-                        .strong()
-                        .color(t::TEXT_MUTED),
-                );
-                ui.add_space(4.0);
-                ui.add(egui::Separator::default().spacing(6.0));
+        match self.channel_layout {
+            // ── Top-tab strip ────────────────────────────────────────────────
+            ChannelLayout::TopTabs => {
+                TopBottomPanel::top("channel_tabs")
+                    .exact_height(32.0)
+                    .frame(
+                        Frame::new()
+                            .fill(t::BG_SURFACE)
+                            .inner_margin(egui::Margin::symmetric(6, 0))
+                            .stroke(egui::Stroke::new(1.0, t::BORDER_SUBTLE)),
+                    )
+                    .show(ctx, |ui| {
+                        egui::ScrollArea::horizontal()
+                            .id_salt("channel_tabs_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.horizontal_centered(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 2.0;
+                                    for ch in self.state.channel_order.iter() {
+                                        let is_active =
+                                            self.state.active_channel.as_ref() == Some(ch);
+                                        let (unread, mentions) = self
+                                            .state
+                                            .channels
+                                            .get(ch)
+                                            .map(|s| (s.unread_count, s.unread_mentions))
+                                            .unwrap_or((0, 0));
 
-                let mut list = ChannelList {
-                    channels: &self.state.channel_order,
-                    active: self.state.active_channel.as_ref(),
-                    channel_states: &self.state.channels,
-                };
-                let res = list.show(ui);
-                if let Some(ch) = res.selected {
-                    // Clear unread counters when the user opens the channel.
-                    if let Some(state) = self.state.channels.get_mut(&ch) {
-                        state.mark_read();
-                    }
-                    self.state.active_channel = Some(ch);
-                }
-                if let Some(ch) = res.closed {
-                    self.send_cmd(AppCommand::LeaveChannel { channel: ch.clone() });
-                    self.state.leave_channel(&ch);
-                }
-                if let Some(new_order) = res.reordered {
-                    self.state.channel_order = new_order;
-                }
-            });
+                                        // Build tab label with optional badge.
+                                        let label = if mentions > 0 {
+                                            format!("{} ●{}", ch.as_str(), mentions)
+                                        } else if unread > 0 {
+                                            format!("{} {}", ch.as_str(), unread)
+                                        } else {
+                                            ch.as_str().to_owned()
+                                        };
+
+                                        let (fg, bg) = if is_active {
+                                            (t::TEXT_PRIMARY, t::ACCENT_DIM)
+                                        } else if mentions > 0 {
+                                            (t::ACCENT, t::BG_SURFACE)
+                                        } else if unread > 0 {
+                                            (t::TEXT_PRIMARY, t::BG_SURFACE)
+                                        } else {
+                                            (t::TEXT_SECONDARY, t::BG_SURFACE)
+                                        };
+
+                                        let resp = ui.add(
+                                            egui::Button::new(
+                                                RichText::new(&label)
+                                                    .font(t::small())
+                                                    .color(fg),
+                                            )
+                                            .fill(bg),
+                                        );
+
+                                        if resp.clicked() {
+                                            ch_selected = Some(ch.clone());
+                                        }
+
+                                        // Context menu: close channel
+                                        resp.context_menu(|ui| {
+                                            if ui
+                                                .button(
+                                                    RichText::new("Close channel")
+                                                        .font(t::small()),
+                                                )
+                                                .clicked()
+                                            {
+                                                ch_closed = Some(ch.clone());
+                                                ui.close_menu();
+                                            }
+                                        });
+                                    }
+                                });
+                            });
+                    });
+            }
+
+            // ── Left sidebar (default) ────────────────────────────────────────
+            ChannelLayout::Sidebar if self.sidebar_visible => {
+                // Dynamically cap sidebar width so the central panel always gets
+                // at least 350 px — prevents chat from being hidden on narrow windows.
+                let sidebar_max = (ctx.screen_rect().width() - 350.0)
+                    .clamp(t::SIDEBAR_MIN_W, t::SIDEBAR_MAX_W);
+
+                SidePanel::left("channel_list")
+                    .resizable(true)
+                    .default_width(t::SIDEBAR_W)
+                    .min_width(t::SIDEBAR_MIN_W)
+                    .max_width(sidebar_max)
+                    .frame(
+                        Frame::new()
+                            .fill(t::BG_SURFACE)
+                            .inner_margin(t::SIDEBAR_MARGIN)
+                            .stroke(egui::Stroke::new(1.0, t::BORDER_SUBTLE)),
+                    )
+                    .show(ctx, |ui| {
+                        ui.label(
+                            RichText::new("CHANNELS")
+                                .font(t::heading())
+                                .strong()
+                                .color(t::TEXT_MUTED),
+                        );
+                        ui.add_space(4.0);
+                        ui.add(egui::Separator::default().spacing(6.0));
+
+                        let mut list = ChannelList {
+                            channels: &self.state.channel_order,
+                            active: self.state.active_channel.as_ref(),
+                            channel_states: &self.state.channels,
+                        };
+                        let res = list.show(ui);
+                        ch_selected = res.selected;
+                        ch_closed = res.closed;
+                        ch_reordered = res.reordered;
+                    });
+            }
+
+            // Sidebar hidden — render nothing; CentralPanel fills the space.
+            ChannelLayout::Sidebar => {}
+        }
+
+        // Apply channel-list actions gathered above.
+        if let Some(ch) = ch_selected {
+            if let Some(state) = self.state.channels.get_mut(&ch) {
+                state.mark_read();
+            }
+            self.state.active_channel = Some(ch);
+        }
+        if let Some(ch) = ch_closed {
+            self.send_cmd(AppCommand::LeaveChannel { channel: ch.clone() });
+            self.state.leave_channel(&ch);
+        }
+        if let Some(new_order) = ch_reordered {
+            self.state.channel_order = new_order;
+        }
 
         // -- Central area: messages + input ------------------------------------
         CentralPanel::default()
@@ -597,15 +808,20 @@ impl eframe::App for CrustApp {
                                 self.pending_reply = None;
                                 let is_mod = self.state.channels
                                     .get(&active_ch).map(|c| c.is_mod).unwrap_or(false);
+                                // Broadcaster has full mod powers in their own channel.
+                                let is_broadcaster = self.state.auth.username.as_deref()
+                                    .map(|u| u.eq_ignore_ascii_case(active_ch.as_str()))
+                                    .unwrap_or(false);
+                                let can_moderate = is_mod || is_broadcaster;
                                 let chatters_count = self.state.channels
                                     .get(&active_ch).map(|c| c.chatters.len()).unwrap_or(0);
                                 if let Some(cmd) = parse_slash_command(
                                     &text, &active_ch, reply_to_msg_id.clone(),
-                                    is_mod, chatters_count,
+                                    can_moderate, chatters_count,
                                 ) {
                                     // Some slash commands manipulate the popup directly.
                                     if let AppCommand::ShowUserCard { ref login, ref channel } = cmd {
-                                        self.user_profile_popup.set_loading(login, vec![], Some(channel.clone()), is_mod);
+                                        self.user_profile_popup.set_loading(login, vec![], Some(channel.clone()), can_moderate);
                                     }
                                     self.send_cmd(cmd);
                                 } else {
@@ -639,7 +855,10 @@ impl eframe::App for CrustApp {
 
                     // Messages above the input
                     if let Some(state) = self.state.channels.get(&active_ch) {
-                        let is_mod = state.is_mod;
+                        let is_broadcaster = self.state.auth.username.as_deref()
+                            .map(|u| u.eq_ignore_ascii_case(active_ch.as_str()))
+                            .unwrap_or(false);
+                        let is_mod = state.is_mod || is_broadcaster;
                         let ml_result = MessageList::new(
                             &state.messages,
                             &self.emote_bytes,

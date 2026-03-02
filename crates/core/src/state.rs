@@ -28,6 +28,8 @@ pub struct AppState {
     pub active_channel: Option<ChannelId>,
     /// Ordered list so tabs render in a stable order.
     pub channel_order: Vec<ChannelId>,
+    /// All saved account usernames (used by the account switcher UI).
+    pub accounts: Vec<String>,
 }
 
 impl Default for AppState {
@@ -38,6 +40,7 @@ impl Default for AppState {
             channels: HashMap::new(),
             active_channel: None,
             channel_order: Vec::new(),
+            accounts: Vec::new(),
         }
     }
 }

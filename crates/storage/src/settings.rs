@@ -6,6 +6,17 @@ use tracing::{error, info};
 
 use crate::StorageError;
 
+// AccountEntry: one saved Twitch account
+
+/// A single saved Twitch account (username + optional fallback token).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AccountEntry {
+    pub username: String,
+    /// OAuth token stored as fallback when the OS keyring is unavailable.
+    #[serde(default)]
+    pub oauth_token: String,
+}
+
 // AppSettings: user configuration structure
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,6 +25,7 @@ pub struct AppSettings {
     pub theme: String,
     #[serde(default = "default_font_size")]
     pub font_size: f32,
+    /// Username of the currently active account (mirrors `accounts[n].username`).
     #[serde(default)]
     pub username: String,
     /// Channels to auto-join on connect.
@@ -28,9 +40,16 @@ pub struct AppSettings {
     /// Message timestamps on/off.
     #[serde(default = "bool_true")]
     pub show_timestamps: bool,
-    /// OAuth token stored as a fallback when the OS keyring is unavailable.
+    /// OAuth token for the *active* account (legacy/fallback field kept for
+    /// backward compatibility with configs that pre-date multi-account support).
     #[serde(default)]
     pub oauth_token: String,
+    /// All saved accounts.  The active one is identified by `username`.
+    #[serde(default)]
+    pub accounts: Vec<AccountEntry>,
+    /// Account that auto-logs in on next startup.  Empty string = use last active.
+    #[serde(default)]
+    pub default_account: String,
 }
 
 fn default_theme() -> String { "dark".to_owned() }
@@ -48,6 +67,8 @@ impl Default for AppSettings {
             ignores: Vec::new(),
             show_timestamps: true,
             oauth_token: String::new(),
+            accounts: Vec::new(),
+            default_account: String::new(),
         }
     }
 }
@@ -56,6 +77,10 @@ impl Default for AppSettings {
 
 const KEYRING_SERVICE: &str = "crust-twitch-client";
 const KEYRING_ENTRY: &str = "oauth-token";
+
+fn account_keyring_key(username: &str) -> String {
+    format!("oauth-token-{}", username.to_lowercase())
+}
 
 pub struct SettingsStore {
     config_path: PathBuf,
@@ -75,10 +100,21 @@ impl SettingsStore {
 
     pub fn load(&self) -> AppSettings {
         match std::fs::read_to_string(&self.config_path) {
-            Ok(s) => toml::from_str(&s).unwrap_or_else(|e| {
-                error!("Failed to parse settings ({e}), using defaults");
-                AppSettings::default()
-            }),
+            Ok(s) => {
+                let mut cfg: AppSettings = toml::from_str(&s).unwrap_or_else(|e| {
+                    error!("Failed to parse settings ({e}), using defaults");
+                    AppSettings::default()
+                });
+                // Migration: if `accounts` is empty but the legacy single-account
+                // fields are populated, seed the accounts list from them.
+                if cfg.accounts.is_empty() && !cfg.username.is_empty() {
+                    cfg.accounts.push(AccountEntry {
+                        username: cfg.username.clone(),
+                        oauth_token: cfg.oauth_token.clone(),
+                    });
+                }
+                cfg
+            }
             Err(_) => AppSettings::default(),
         }
     }
@@ -90,6 +126,80 @@ impl SettingsStore {
         info!("Settings saved to {:?}", self.config_path);
         Ok(())
     }
+
+    // --- Per-account token management ---
+
+    /// Best-effort: write the token for `username` to the per-account keyring
+    /// slot only — does NOT touch the settings file.  Use this after
+    /// `save()` has already persisted the full settings struct so we avoid a
+    /// second load→modify→save cycle.
+    pub fn try_save_account_keyring(&self, username: &str, token: &str) {
+        let key = account_keyring_key(username);
+        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &key) {
+            if let Err(e) = entry.set_password(token) {
+                tracing::debug!("Keyring write skipped for {username}: {e}");
+            }
+        }
+    }
+
+    /// Save a token for the given account in the OS keyring and settings file.
+    pub fn save_account_token(&self, username: &str, token: &str) -> Result<(), StorageError> {
+        let key = account_keyring_key(username);
+        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &key) {
+            if let Err(e) = entry.set_password(token) {
+                tracing::warn!("Keyring write failed for {username} ({e}), using settings file");
+            }
+        }
+        let mut settings = self.load();
+        if let Some(acc) = settings.accounts.iter_mut().find(|a| a.username == username) {
+            acc.oauth_token = token.to_owned();
+        } else {
+            settings.accounts.push(AccountEntry {
+                username: username.to_owned(),
+                oauth_token: token.to_owned(),
+            });
+        }
+        self.save(&settings)
+    }
+
+    /// Load a token for the given account from keyring or settings file.
+    pub fn load_account_token(&self, username: &str) -> Option<String> {
+        let key = account_keyring_key(username);
+        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &key) {
+            if let Ok(t) = entry.get_password() {
+                if !t.is_empty() {
+                    return Some(t);
+                }
+            }
+        }
+        let settings = self.load();
+        let t = settings.accounts.iter()
+            .find(|a| a.username == username)
+            .map(|a| a.oauth_token.clone())
+            .unwrap_or_default();
+        if t.is_empty() { None } else { Some(t) }
+    }
+
+    /// Delete a saved account and its token entirely.
+    pub fn delete_account(&self, username: &str) -> Result<(), StorageError> {
+        // Remove from keyring
+        let key = account_keyring_key(username);
+        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &key) {
+            let _ = entry.delete_credential();
+        }
+        let mut settings = self.load();
+        settings.accounts.retain(|a| a.username != username);
+        // If the deleted account was the active one, point to the next available.
+        if settings.username == username {
+            settings.username = settings.accounts.first()
+                .map(|a| a.username.clone())
+                .unwrap_or_default();
+            settings.oauth_token = String::new();
+        }
+        self.save(&settings)
+    }
+
+    // --- Legacy single-account token management (kept for backward compatibility) ---
 
     // Token / keyring management
 
