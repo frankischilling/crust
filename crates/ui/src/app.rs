@@ -259,6 +259,31 @@ impl CrustApp {
                 }
             }
             AppEvent::UserProfileLoaded { profile } => {
+                // Collect this user's recent messages from the channel the
+                // popup was opened for (most-recent first, capped at 200).
+                let ch = self.user_profile_popup.channel.clone();
+                let login_lc = profile.login.to_lowercase();
+                let logs: Vec<_> = ch
+                    .as_ref()
+                    .and_then(|c| self.state.channels.get(c))
+                    .map(|s| {
+                        s.messages
+                            .iter()
+                            .rev()
+                            .filter(|m| {
+                                m.sender.login.to_lowercase() == login_lc
+                                    && matches!(
+                                        m.msg_kind,
+                                        crust_core::model::MsgKind::Chat
+                                            | crust_core::model::MsgKind::Bits { .. }
+                                    )
+                            })
+                            .take(200)
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.user_profile_popup.set_logs(logs);
                 self.user_profile_popup.set_profile(profile);
             }
             AppEvent::UserMessagesCleared { channel, login } => {
@@ -424,10 +449,10 @@ impl eframe::App for CrustApp {
 
                     ui.separator();
 
-                    // Sidebar visibility toggle (◧ = open, □ = closed)
+                    // Sidebar visibility toggle
                     let sidebar_open =
                         self.channel_layout == ChannelLayout::Sidebar && self.sidebar_visible;
-                    let vis_icon = if sidebar_open { "◧" } else { "□" };
+                    let vis_icon = if sidebar_open { "[|" } else { "|]" };
                     let vis_tip = if sidebar_open {
                         "Hide channel sidebar"
                     } else {
@@ -453,11 +478,11 @@ impl eframe::App for CrustApp {
                         }
                     }
 
-                    // Layout mode toggle (Sidebar ↔ Top tabs)
+                    // Layout mode toggle (Sidebar <-> Top tabs)
                     let mode_icon = if self.channel_layout == ChannelLayout::Sidebar {
-                        "⬚ Top"
+                        "Tabs"
                     } else {
-                        "◧ Side"
+                        "Side"
                     };
                     let mode_tip = if self.channel_layout == ChannelLayout::Sidebar {
                         "Move channels to top bar"
@@ -466,7 +491,7 @@ impl eframe::App for CrustApp {
                     };
                     if ui
                         .add_sized(
-                            [52.0, t::BAR_H],
+                            [38.0, t::BAR_H],
                             egui::Button::new(RichText::new(mode_icon).font(t::small())),
                         )
                         .on_hover_text(mode_tip)
