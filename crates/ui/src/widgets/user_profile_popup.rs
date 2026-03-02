@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use egui::{Color32, CornerRadius, RichText, Vec2};
 
-use crust_core::model::{Badge, ChannelId, UserProfile};
+use crust_core::model::{Badge, ChannelId, ChatMessage, UserProfile};
 
 use crate::theme as t;
 
@@ -24,6 +24,7 @@ enum ProfileTab {
     #[default]
     Profile,
     Moderation,
+    Logs,
 }
 
 // ─── Struct ───────────────────────────────────────────────────────────────────
@@ -41,7 +42,7 @@ pub struct UserProfilePopup {
     /// Badges from the most-recently clicked message sender.
     badges: Vec<Badge>,
     /// Channel the sender was seen in (used for mod actions).
-    channel: Option<ChannelId>,
+    pub channel: Option<ChannelId>,
     /// Whether the logged-in user is a moderator in that channel.
     is_mod: bool,
     /// Active tab (Profile / Moderation).
@@ -52,6 +53,8 @@ pub struct UserProfilePopup {
     timeout_custom: String,
     /// Whether the ban button has been pressed once (confirmation pending).
     ban_confirm: bool,
+    /// Recent messages from this user in the current channel (most-recent first).
+    logs: Vec<ChatMessage>,
 }
 
 impl UserProfilePopup {
@@ -74,6 +77,13 @@ impl UserProfilePopup {
         self.mod_reason.clear();
         self.timeout_custom.clear();
         self.ban_confirm = false;
+        self.logs.clear();
+    }
+
+    /// Store pre-filtered chat logs for this user (called from `app.rs` when
+    /// the profile is loaded).  Expects messages in most-recent-first order.
+    pub fn set_logs(&mut self, logs: Vec<ChatMessage>) {
+        self.logs = logs;
     }
 
     /// Called when `AppEvent::UserProfileLoaded` arrives.
@@ -350,6 +360,7 @@ impl UserProfilePopup {
                         for (tab_label, tab_val) in [
                             ("Profile",    ProfileTab::Profile),
                             ("Moderation", ProfileTab::Moderation),
+                            ("Logs",       ProfileTab::Logs),
                         ] {
                             let active = self.active_tab == tab_val;
                             let fg = if active { t::TEXT_PRIMARY } else { t::TEXT_SECONDARY };
@@ -370,13 +381,103 @@ impl UserProfilePopup {
                                 .response;
                             if resp.interact(egui::Sense::click()).clicked() {
                                 self.active_tab = tab_val;
-                                if tab_val != ProfileTab::Moderation {
-                                    self.ban_confirm = false;
-                                }
+                                self.ban_confirm = false;
                             }
                         }
                     });
                     ui.add_space(4.0);
+                }
+
+                // ── Logs tab ─────────────────────────────────────────────
+                if self.is_mod && self.active_tab == ProfileTab::Logs {
+                    let log_count = self.logs.len();
+                    egui::Frame::new()
+                        .fill(Color32::from_rgba_unmultiplied(0, 0, 0, 60))
+                        .corner_radius(t::RADIUS_SM)
+                        .inner_margin(egui::Margin::symmetric(6, 4))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(
+                                    if log_count == 0 {
+                                        "No messages from this user in the current session.".to_owned()
+                                    } else {
+                                        format!("{log_count} message{} (current session, newest first)",
+                                            if log_count == 1 { "" } else { "s" })
+                                    }
+                                )
+                                .color(t::TEXT_MUTED)
+                                .small(),
+                            );
+                        });
+
+                    ui.add_space(4.0);
+
+                    egui::ScrollArea::vertical()
+                        .id_salt("user_logs_scroll")
+                        .max_height(320.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            if self.logs.is_empty() {
+                                ui.add_space(8.0);
+                                ui.centered_and_justified(|ui| {
+                                    ui.label(RichText::new("No recent messages.").color(t::TEXT_MUTED).small());
+                                });
+                            }
+                            for msg in &self.logs {
+                                let time_str = msg.timestamp.format("%H:%M:%S").to_string();
+                                let text = if msg.raw_text.is_empty() {
+                                    // Fallback: reconstruct from spans
+                                    msg.spans.iter().filter_map(|s| match s {
+                                        crust_core::model::Span::Text { text, .. } => Some(text.as_str()),
+                                        crust_core::model::Span::Mention { login } => Some(login.as_str()),
+                                        _ => None,
+                                    }).collect::<Vec<_>>().join(" ")
+                                } else {
+                                    msg.raw_text.clone()
+                                };
+
+                                let is_action = msg.flags.is_action;
+                                let is_deleted = msg.flags.is_deleted;
+
+                                egui::Frame::new()
+                                    .fill(if is_deleted {
+                                        Color32::from_rgba_unmultiplied(150, 30, 30, 20)
+                                    } else {
+                                        Color32::TRANSPARENT
+                                    })
+                                    .inner_margin(egui::Margin::symmetric(4, 2))
+                                    .show(ui, |ui| {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 4.0;
+                                            ui.add(egui::Label::new(
+                                                RichText::new(&time_str)
+                                                    .color(t::TEXT_MUTED)
+                                                    .small()
+                                                    .monospace(),
+                                            ));
+                                            let msg_color = if is_deleted {
+                                                t::TEXT_MUTED
+                                            } else if is_action {
+                                                Color32::from_rgba_unmultiplied(200, 200, 255, 230)
+                                            } else {
+                                                t::TEXT_PRIMARY
+                                            };
+                                            let rich = RichText::new(&text)
+                                                .color(msg_color)
+                                                .small();
+                                            let rich = if is_action || is_deleted {
+                                                rich.italics()
+                                            } else {
+                                                rich
+                                            };
+                                            ui.add(
+                                                egui::Label::new(rich).wrap(),
+                                            );
+                                        });
+                                    });
+                                ui.add_space(1.0);
+                            }
+                        });
                 }
 
                 // ── Profile tab ──────────────────────────────────────────
