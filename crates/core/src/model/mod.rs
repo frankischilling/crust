@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
-// ─── Identifiers ────────────────────────────────────────────────────────────
+// Identifiers: types for channel, user, and message IDs
 
 /// Normalized lowercase Twitch channel name (without the leading '#').
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -37,7 +37,7 @@ pub struct UserId(pub String);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MessageId(pub u64);
 
-// ─── Badge ──────────────────────────────────────────────────────────────────
+// Badge: Twitch badge metadata
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Badge {
@@ -48,7 +48,7 @@ pub struct Badge {
     pub url: Option<String>,
 }
 
-// ─── Sender ─────────────────────────────────────────────────────────────────
+// Sender: chat message sender metadata
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Sender {
@@ -62,7 +62,7 @@ pub struct Sender {
     pub badges: Vec<Badge>,
 }
 
-// ─── Span / Token ───────────────────────────────────────────────────────────
+// Span / Token: parsed chat message chunks
 
 /// A pre-parsed chunk of a chat message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,7 +103,7 @@ pub enum Span {
     },
 }
 
-// ─── MsgKind ────────────────────────────────────────────────────────────────
+// MsgKind: chat message classification
 
 /// Classifies a chat-line for special rendering.  `Chat` is the default.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -143,7 +143,7 @@ pub enum MsgKind {
     Bits { amount: u32 },
 }
 
-// ─── TwitchEmotePos ──────────────────────────────────────────────────────────
+// TwitchEmotePos: Twitch emote position metadata
 
 /// One occurrence of a Twitch-native emote parsed from the `emotes` IRC tag.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,7 +155,7 @@ pub struct TwitchEmotePos {
     pub end: usize,
 }
 
-// ─── ChatMessage ─────────────────────────────────────────────────────────────
+// ChatMessage: chat message structure and flags
 
 /// Flags that modify how a message is displayed.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -207,7 +207,7 @@ pub struct ChatMessage {
     pub msg_kind: MsgKind,
 }
 
-// ─── EmoteCatalogEntry ───────────────────────────────────────────────────────
+// EmoteCatalogEntry: lightweight emote entry for UI catalog
 
 /// Lightweight emote entry for the UI catalog (autocomplete / picker).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -219,7 +219,7 @@ pub struct EmoteCatalogEntry {
     pub scope: String,
 }
 
-// ─── RoomState ───────────────────────────────────────────────────────────────
+// RoomState: Twitch room state metadata
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RoomState {
@@ -230,7 +230,7 @@ pub struct RoomState {
     pub r9k: bool,
 }
 
-// ─── ChannelState ────────────────────────────────────────────────────────────
+// ChannelState: state and message buffer for a channel
 
 const MAX_MESSAGES: usize = 1500;
 
@@ -330,7 +330,7 @@ impl ChannelState {
     }
 }
 
-// ─── UserProfile ────────────────────────────────────────────────────────────
+// UserProfile: Twitch user profile metadata
 
 /// Twitch user profile fetched from the IVR API (no auth required).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -349,7 +349,7 @@ pub struct UserProfile {
     pub is_affiliate: bool,
 }
 
-// ─── SystemNotice ────────────────────────────────────────────────────────────
+// SystemNotice: system notice event structure
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemNotice {

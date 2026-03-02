@@ -3,7 +3,7 @@
 /// One place to change colours/metrics so every widget stays in sync.
 use egui::{Color32, CornerRadius, FontId, Margin, Stroke, Vec2};
 
-// ─── Palette ─────────────────────────────────────────────────────────────────
+// Palette colors
 
 /// Deepest background — window body, sidebar.
 pub const BG_BASE: Color32 = Color32::from_rgb(13, 13, 18);
@@ -43,12 +43,12 @@ pub const YELLOW: Color32 = Color32::from_rgb(235, 195, 55);
 /// Error / disconnected red.
 pub const RED: Color32 = Color32::from_rgb(220, 65, 65);
 
-// ─── Strokes ─────────────────────────────────────────────────────────────────
+// Stroke styles
 
 pub const STROKE_SUBTLE: Stroke = Stroke { width: 1.0, color: BORDER_SUBTLE };
 pub const STROKE_ACCENT: Stroke = Stroke { width: 1.0, color: BORDER_ACCENT };
 
-// ─── Metrics ─────────────────────────────────────────────────────────────────
+// Layout metrics
 
 /// Corner radius shared across most interactive elements.
 pub const RADIUS: CornerRadius = CornerRadius::same(5);
@@ -78,7 +78,7 @@ pub const ITEM_SPACING: Vec2 = Vec2::new(4.0, 3.0);
 /// Channel row vertical gap.
 pub const CHANNEL_ROW_GAP: f32 = 2.0;
 
-// ─── Typography ──────────────────────────────────────────────────────────────
+// Typography styles
 
 /// Body text — chat messages, general labels.
 pub fn body() -> FontId {

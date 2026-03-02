@@ -14,7 +14,7 @@ const AUTOCOMPLETE_EMOTE_SIZE: f32 = 20.0;
 /// Maximum number of Tab-completion matches to cycle through.
 const TAB_COMPLETE_MAX: usize = 50;
 
-// ── Persistent state stored in egui temp data ────────────────────────────────
+// Persistent state stored in egui temp data
 
 /// Tab-completion state for bare-word emote completion (no `:` prefix).
 #[derive(Clone, Default)]
@@ -80,7 +80,7 @@ impl<'a> ChatInput<'a> {
         // Persistent autocomplete state via egui temp storage
         let ac_id = Id::new("emote_autocomplete");
 
-        // ── Reply banner ────────────────────────────────────────────────────
+        // Reply banner
         if let Some(rep) = self.pending_reply {
             egui::Frame::new()
                 .fill(t::BG_RAISED)

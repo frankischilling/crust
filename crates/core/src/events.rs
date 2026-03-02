@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::model::{ChannelId, ChatMessage, EmoteCatalogEntry, SystemNotice, UserProfile};
-// ─── LinkPreview ────────────────────────────────────────────────────────────────
+// LinkPreview: Open Graph / Twitter Card metadata for a URL
 
 /// Open Graph / Twitter Card metadata fetched for a URL.
 #[derive(Debug, Clone)]
@@ -13,7 +13,7 @@ pub struct LinkPreview {
     /// True once the fetch attempt has completed (even if it returned nothing).
     pub fetched: bool,
 }
-// ─── Commands (UI → runtime) ─────────────────────────────────────────────────
+// Commands (UI to runtime): actions initiated by the UI
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AppCommand {
@@ -54,7 +54,7 @@ pub enum AppCommand {
     FetchLinkPreview { url: String },
 }
 
-// ─── Events (runtime → UI) ───────────────────────────────────────────────────
+// Events (runtime to UI): notifications sent from runtime to UI
 
 #[derive(Debug, Clone)]
 pub enum AppEvent {
@@ -129,7 +129,7 @@ pub enum AppEvent {
     },
 }
 
-// ─── ConnectionState ─────────────────────────────────────────────────────────
+// ConnectionState: connection status enumeration
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConnectionState {

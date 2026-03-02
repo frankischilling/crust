@@ -7,7 +7,7 @@ use crust_core::model::{Badge, ChannelId, UserProfile};
 
 use crate::theme as t;
 
-// ─── Public action returned from show() ──────────────────────────────────────
+// Public action returned from show()
 
 /// Action emitted by the popup when a moderation button is pressed.
 #[derive(Debug, Clone)]
@@ -113,7 +113,7 @@ impl UserProfilePopup {
 
                 ui.add_space(6.0);
 
-                // ── Header: avatar + name + badges ────────────────────────
+                // Header: avatar + name + badges
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 12.0;
 

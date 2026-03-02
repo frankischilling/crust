@@ -1,11 +1,11 @@
 //! Real-time performance overlay for debug builds.
 //!
 //! Tracks:
-//!   • Frame time & FPS (rolling 120-frame window)
-//!   • Events processed per frame
-//!   • Repaint efficiency (event-driven repaints vs. total frames)
-//!   • Emote cache size (entries + estimated RAM)
-//!   • Image-fetch commands in flight
+//!   - Frame time & FPS (rolling 120-frame window)
+//!   - Events processed per frame
+//!   - Repaint efficiency (event-driven repaints vs. total frames)
+//!   - Emote cache size (entries + estimated RAM)
+//!   - Image-fetch commands in flight
 
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -169,7 +169,7 @@ impl PerfOverlay {
     }
 }
 
-// ─── helpers ─────────────────────────────────────────────────────────────────
+// Helpers
 
 fn push_ring<T>(buf: &mut VecDeque<T>, val: T, cap: usize) {
     if buf.len() == cap {

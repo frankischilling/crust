@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::TwitchError;
 
-// ─── IrcTags ─────────────────────────────────────────────────────────────────
+// IrcTags: IRCv3 tag parsing and storage
 
 #[derive(Debug, Clone, Default)]
 pub struct IrcTags(pub HashMap<String, String>);
@@ -57,7 +57,7 @@ fn unescape_tag_value(s: &str) -> String {
     out
 }
 
-// ─── IrcMessage ──────────────────────────────────────────────────────────────
+// IrcMessage: parsed IRC message structure
 
 #[derive(Debug, Clone)]
 pub struct IrcMessage {
@@ -84,7 +84,7 @@ impl IrcMessage {
     }
 }
 
-// ─── Parser ──────────────────────────────────────────────────────────────────
+// Parser: IRC line and frame parsing utilities
 
 /// Parse a single IRC line (no leading \r\n).
 pub fn parse_line(line: &str) -> Result<IrcMessage, TwitchError> {

@@ -9,7 +9,7 @@ pub fn ffz_fix_url(url: String) -> String {
         url
     }
 }
-// ─── EmoteInfo ───────────────────────────────────────────────────────────────
+// EmoteInfo: structure for emote metadata
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmoteInfo {
@@ -27,7 +27,7 @@ pub struct EmoteInfo {
     pub provider: String,
 }
 
-// ─── EmoteProvider trait ─────────────────────────────────────────────────────
+// EmoteProvider trait: implemented by each emote provider
 
 /// Implement this for each emote provider (Twitch, BTTV, FFZ, 7TV).
 #[async_trait::async_trait]
@@ -37,7 +37,7 @@ pub trait EmoteProvider: Send + Sync {
     async fn load_channel(&self, channel_id: &str) -> Vec<EmoteInfo>;
 }
 
-// ─── BTTV ────────────────────────────────────────────────────────────────────
+// BTTV: BetterTTV emote provider implementation
 
 pub struct BttvProvider {
     client: reqwest::Client,
@@ -128,7 +128,7 @@ impl EmoteProvider for BttvProvider {
     }
 }
 
-// ─── FFZ ─────────────────────────────────────────────────────────────────────
+// FFZ: FrankerFaceZ emote provider implementation
 
 pub struct FfzProvider {
     client: reqwest::Client,
@@ -235,7 +235,7 @@ impl EmoteProvider for FfzProvider {
     }
 }
 
-// ─── SevenTV ─────────────────────────────────────────────────────────────────
+// SevenTV: 7TV emote provider implementation
 
 pub struct SevenTvProvider {
     client: reqwest::Client,

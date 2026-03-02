@@ -16,7 +16,7 @@ use crate::{EmoteError, EmoteInfo};
 const IN_MEMORY_CAPACITY: usize = 256;
 const DISK_TTL: Duration = Duration::from_secs(24 * 3600); // 24 h for global
 
-// ─── AssetKey ────────────────────────────────────────────────────────────────
+// AssetKey: identifies emote assets by provider, id, and scale
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AssetKey {
@@ -25,7 +25,7 @@ pub struct AssetKey {
     pub scale: u8, // 1, 2, or 4
 }
 
-// ─── EmoteCache ──────────────────────────────────────────────────────────────
+// EmoteCache: manages in-memory and disk caching for emotes
 
 /// Stores:
 /// 1. An LRU in-memory byte cache (raw image bytes ready to decode).
@@ -192,7 +192,7 @@ impl EmoteCache {
     }
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// Helpers: utility functions for hashing and image dimension reading
 
 /// Stable 64-bit hash of a URL string (FNV-1a).
 fn url_hash(url: &str) -> u64 {

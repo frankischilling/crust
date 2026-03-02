@@ -58,7 +58,7 @@ impl LoginDialog {
                 ui.set_min_width(max_w.min(360.0));
 
                 if logged_in {
-                    // ── Profile card ────────────────────────────────
+                    // Profile card
                     let name = username.unwrap_or("User");
                     let initial = name.chars().next().unwrap_or('?')
                         .to_uppercase().next().unwrap_or('?');
@@ -188,7 +188,7 @@ impl LoginDialog {
 
                     ui.add_space(4.0);
                 } else {
-                    // ── Login view ──────────────────────────────────
+                    // Login view
                     ui.label("Paste your Twitch OAuth token to send messages.");
                     ui.add_space(4.0);
                     ui.label(

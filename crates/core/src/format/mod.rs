@@ -31,15 +31,15 @@ where
         return SmallVec::new();
     }
 
-    // ── 1. Build a sorted list of Twitch-native emote ranges ────────────
+    // Step 1: Build a sorted list of Twitch-native emote ranges
     let mut tw_sorted: Vec<&TwitchEmotePos> = twitch_emotes.iter().collect();
     tw_sorted.sort_by_key(|e| e.start);
 
-    // ── 2. Split text into segments: twitch-emote vs. free-text ─────────
+    // Step 2: Split text into segments: twitch-emote vs. free-text
     let chars: Vec<char> = text.chars().collect();
     let segments = split_by_twitch_emotes(&chars, &tw_sorted);
 
-    // ── 3. Process each segment ─────────────────────────────────────────
+    // Step 3: Process each segment
     let mut spans: SmallVec<[Span; 8]> = SmallVec::new();
 
     for seg in segments {
@@ -64,7 +64,7 @@ where
     spans
 }
 
-// ─── Internal helpers ────────────────────────────────────────────────────────
+// Internal helpers: utility functions for tokenization
 
 enum Segment {
     TwitchEmote { id: String, code: String },

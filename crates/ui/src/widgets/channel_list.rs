@@ -84,7 +84,7 @@ impl<'a> ChannelList<'a> {
                         egui::Sense::click_and_drag(),
                     );
 
-                    // ── Drag start ────────────────────────────────────────
+                    // Drag start
                     if row_resp.drag_started() {
                         ui.data_mut(|d| {
                             d.insert_temp(drag_id, DragState {
@@ -94,7 +94,7 @@ impl<'a> ChannelList<'a> {
                         });
                     }
 
-                    // ── Drag update: recompute insert position ────────────
+                    // Drag update: recompute insert position
                     if row_resp.dragged() {
                         if let Some(pos) = ui.ctx().pointer_latest_pos() {
                             let rel_y = pos.y - list_top;
@@ -111,7 +111,7 @@ impl<'a> ChannelList<'a> {
                         ui.ctx().request_repaint();
                     }
 
-                    // ── Drag release: build new order ─────────────────────
+                    // Drag release: build new order
                     if row_resp.drag_stopped() {
                         if let Some(ds) = ui.data(|d| d.get_temp::<DragState>(drag_id)) {
                             let raw = ds.insert_before;

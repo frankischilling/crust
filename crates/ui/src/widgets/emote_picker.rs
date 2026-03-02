@@ -152,7 +152,7 @@ impl EmotePicker {
                 self.ensure_cache(catalog);
                 let view = self.cache.as_ref().unwrap();
 
-                // ── Tab bar ──────────────────────────────────────────
+                // Tab bar
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
                     for (ti, &(_, label)) in TABS.iter().enumerate() {
@@ -171,7 +171,7 @@ impl EmotePicker {
                 });
                 ui.separator();
 
-                // ── Content ──────────────────────────────────────────
+                // Content
                 let tab_data = match self.active_tab {
                     Some(ti) => &view.tabs[ti],
                     None => {

@@ -6,7 +6,7 @@ use tracing::{error, info};
 
 use crate::StorageError;
 
-// ─── AppSettings ─────────────────────────────────────────────────────────────
+// AppSettings: user configuration structure
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
@@ -52,7 +52,7 @@ impl Default for AppSettings {
     }
 }
 
-// ─── SettingsStore ───────────────────────────────────────────────────────────
+// SettingsStore: persistent settings and token management
 
 const KEYRING_SERVICE: &str = "crust-twitch-client";
 const KEYRING_ENTRY: &str = "oauth-token";
@@ -91,7 +91,7 @@ impl SettingsStore {
         Ok(())
     }
 
-    // ─── Token / keyring ─────────────────────────────────────────────────
+    // Token / keyring management
 
     pub fn save_token(&self, token: &str) -> Result<(), StorageError> {
         // Try OS keyring first; fall back silently to settings file.

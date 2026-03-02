@@ -23,7 +23,7 @@ use crate::widgets::{
     user_profile_popup::{PopupAction, UserProfilePopup},
 };
 
-// --- CrustApp -----------------------------------------------------------------
+// CrustApp struct and implementation
 
 pub struct CrustApp {
     pub state: AppState,
@@ -258,7 +258,7 @@ impl CrustApp {
     }
 }
 
-// --- eframe::App --------------------------------------------------------------
+// eframe::App implementation
 
 impl eframe::App for CrustApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
@@ -673,7 +673,7 @@ impl eframe::App for CrustApp {
     }
 }
 
-// --- Helpers ------------------------------------------------------------------
+// Helper functions
 
 fn connection_indicator(
     state: &ConnectionState,
@@ -752,7 +752,7 @@ fn install_system_fallback_fonts(ctx: &Context) {
     ctx.set_fonts(fonts);
 }
 
-// ─── Slash-command parser ────────────────────────────────────────────────────
+// Slash-command parser
 
 /// Parse a typed message that starts with `/`.  Returns an `AppCommand` to
 /// dispatch for known commands, or `None` to fall through as a normal chat
@@ -780,7 +780,7 @@ fn parse_slash_command(
     let cmd_lower = cmd.to_ascii_lowercase();
 
     match cmd_lower.as_str() {
-        // ── Purely local commands ──────────────────────────────────────────
+        // Purely local commands
         "help" => {
             let msg = "\
 Crust built-in commands\n\
@@ -858,7 +858,7 @@ Any other /command is forwarded directly to Twitch.".to_owned();
             Some(AppCommand::OpenUrl { url })
         }
 
-        // ── Mod-only shorthand helpers (validated client-side) ─────────────
+        // Mod-only shorthand helpers (validated client-side)
         // NOTE: the actual enforcement is server-side; we just show a
         // usage hint so non-mods don't waste a round-trip.
         "banid" if !rest.is_empty() => {
@@ -878,7 +878,7 @@ Any other /command is forwarded directly to Twitch.".to_owned();
             reply_to_msg_id,
         }),
 
-        // ── Everything else falls through to IRC ───────────────────────────
+        // Everything else falls through to IRC
         // Standard Twitch chat commands (/ban, /timeout, /unban, /slow,
         // /subscribers, /emoteonly, /clear, /mod, /vip, /color, /delete,
         // /raid, /host, /commercial, /uniquechat, /marker, /block, /unblock,

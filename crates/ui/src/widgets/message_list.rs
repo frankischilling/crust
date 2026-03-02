@@ -73,7 +73,7 @@ impl<'a> MessageList<'a> {
         // Use a per-channel scroll area ID so offset doesn't leak
         let scroll_id = egui::Id::new("message_list").with(self.channel.as_str());
 
-        // ── Reset stale scroll state on first render of a channel ────
+        // Reset stale scroll state on first render of a channel
         // egui persists scroll offsets across sessions.  When we
         // (re-)enter a channel whose old state carried a large offset,
         // the first frame would render content at the wrong position.
@@ -93,7 +93,7 @@ impl<'a> MessageList<'a> {
         // scrolling kicks in early and only visible rows are rendered.
         const VIRTUAL_THRESHOLD: usize = 40;
 
-        // ── Height cache ────────────────────────────────────────────────
+        // Height cache
         // Keyed by MessageId (u64). Persisted in egui temp storage so that
         // off-screen rows are not re-measured every frame.  Shared between
         // the simple and virtual paths so the transition is seamless.
@@ -124,7 +124,7 @@ impl<'a> MessageList<'a> {
             ui.ctx().data_mut(|d| d.insert_temp::<bool>(init_key, false));
         }
 
-        // ── Scroll-to-reply target ───────────────────────────────────────
+        // Scroll-to-reply target
         // Written by the reply-header click handler; read and cleared here so
         // it only fires once.
         let scroll_to_key = egui::Id::new("ml_scroll_to").with(self.channel.as_str());

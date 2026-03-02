@@ -39,7 +39,7 @@ type BadgeMap = Arc<RwLock<std::collections::HashMap<(String, String), String>>>
 
 
 fn main() -> Result<()> {
-    // ── SIGPIPE ──────────────────────────────────────────────────────────
+    // SIGPIPE: handle broken pipe signals on Wayland
     // On Wayland, when a protocol socket (compositor, XWayland, portal)
     // dies, writes produce SIGPIPE. With Rust edition 2021 the default
     // disposition is SIG_DFL → terminate.  Ignore it so the IO layer
@@ -49,7 +49,7 @@ fn main() -> Result<()> {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
 
-    // ── Wayland compatibility ────────────────────────────────────────────
+    // Wayland compatibility: handle XDG Settings Portal and clipboard issues
     // On pure-Wayland sessions the XDG Settings Portal may not be running.
     // sctk-adwaita (client-side decorations in winit) queries it for the
     // color-scheme and may time out.
@@ -152,7 +152,7 @@ fn main() -> Result<()> {
         reducer_loop(cmd_rx, tw_evt_rx, evt_tx, sess_cmd_tx, idx, cache, bm, gc, settings_store, saved_token)
     });
 
-    // ── eframe / egui ────────────────────────────────────────────────────
+    // eframe / egui: UI framework initialization
     let native_opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Crust – Twitch Chat")
@@ -188,7 +188,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-// ─── Reducer ─────────────────────────────────────────────────────────────────
+// Reducer: application state reducer
 
 /// Central reducer: receives raw Twitch events + UI commands, tokenizes
 /// messages using the emote index, and forwards AppEvents to the UI.
@@ -399,7 +399,7 @@ async fn reducer_loop(
                             },
                         );
 
-                        // ── Resolve badge image URLs ─────────────────
+                        // Resolve badge image URLs
                         {
                             let bm = badge_map.read().unwrap();
                             for badge in &mut msg.sender.badges {
@@ -407,7 +407,7 @@ async fn reducer_loop(
                             }
                         }
 
-                        // ── Mention / reply-to-me detection ──────────
+                        // Mention / reply-to-me detection
                         if let Some(ref uname) = auth_username {
                             let uname_lower = uname.to_lowercase();
                             // Direct @mention in message body
@@ -421,7 +421,7 @@ async fn reducer_loop(
                             msg.flags.is_mention = has_mention || is_reply_to_me;
                         }
 
-                        // ── Queue image fetches for emotes/emoji/badges
+                        // Queue image fetches for emotes/emoji/badges
                         // Only fetch the 1x/normal URL eagerly. HD (url_hd)
                         // is fetched on-demand when the user hovers.
                         for span in &msg.spans {
@@ -705,7 +705,7 @@ async fn reducer_loop(
                         debug!("Sending message to #{channel}: {text}");
                         let _ = sess_tx.send(SessionCommand::SendMessage(channel.clone(), text.clone(), reply_to_msg_id)).await;
 
-                        // ── Local echo: show the sent message immediately ──
+                        // Local echo: show the sent message immediately
                         if let (Some(uname), Some(uid)) = (&auth_username, &auth_user_id) {
                             local_msg_id += 1;
                             let mut echo = ChatMessage {
@@ -830,7 +830,7 @@ async fn reducer_loop(
     info!("Reducer loop exiting");
 }
 
-// ─── Emote loading ───────────────────────────────────────────────────────────
+// Emote loading
 
 /// Load global emotes from BTTV, FFZ, 7TV and register in the shared index.
 type GlobalCodes = Arc<RwLock<std::collections::HashSet<String>>>;
@@ -1031,8 +1031,7 @@ fn prefetch_all_emote_images(
     }
 }
 
-// ─── Badge loading ───────────────────────────────────────────────────────────
-
+// Badge loading
 /// Parse IVR badge response (flat JSON array) and insert into the badge map.
 fn parse_ivr_badge_response(
     body: &str,
@@ -1188,7 +1187,7 @@ async fn fetch_and_decode_raw(url: &str) -> Result<(u32, u32, Vec<u8>), crust_em
     Ok((w, h, raw_vec))
 }
 
-// ─── Recent message history ──────────────────────────────────────────────────
+// Recent message history
 
 /// Fetch recent messages for a channel and send `AppEvent::HistoryLoaded`.
 /// Primary source: recent-messages.robotty.de (covers all channels, correct
@@ -1350,7 +1349,7 @@ async fn load_recent_messages(
     let _ = evt_tx.send(AppEvent::HistoryLoaded { channel: channel_id, messages }).await;
 }
 
-// ─── Token validation ────────────────────────────────────────────────────────
+// Token validation
 
 /// Validate a Twitch OAuth token via the Twitch API and return the login name.
 async fn validate_token(token: &str) -> Result<String, String> {
@@ -1380,7 +1379,7 @@ async fn validate_token(token: &str) -> Result<String, String> {
     Ok(body.login)
 }
 
-// ─── User profile ─────────────────────────────────────────────────────────────
+// User profile
 
 /// Fetch a Twitch user profile from the IVR API (no auth required) and send
 /// `AppEvent::UserProfileLoaded`.  Also pre-fetches avatar bytes so the popup
@@ -1495,7 +1494,7 @@ async fn fetch_self_avatar(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
     let _ = evt_tx.send(AppEvent::SelfAvatarLoaded { avatar_url }).await;
 }
 
-// ─── System-message helpers ───────────────────────────────────────────────────
+// System-message helpers
 
 /// Construct a system (non-chat) ChatMessage for inline display in a channel.
 fn make_system_message(
@@ -1569,7 +1568,7 @@ fn open_url_in_browser(url: &str) {
     { let _ = std::process::Command::new("cmd").args(["/c", "start", url]).spawn(); }
 }
 
-// ─── Link preview fetch ───────────────────────────────────────────────────────────
+// Link preview fetch
 
 async fn fetch_link_preview(
     url: &str,

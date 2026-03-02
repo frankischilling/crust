@@ -20,7 +20,7 @@ use crate::{
 const WS_URL: &str = "wss://irc-ws.chat.twitch.tv:443";
 const BACKOFF_SECS: &[u64] = &[1, 2, 5, 10, 30];
 
-// ─── Events emitted by the session ──────────────────────────────────────────
+// Events emitted by the session
 
 /// Events produced by the Twitch IRC session (consumed by the app reducer).
 #[derive(Debug, Clone)]
@@ -75,7 +75,7 @@ pub enum TwitchEvent {
     Raid { channel: ChannelId, display_name: String, viewer_count: u32 },
 }
 
-// ─── Commands consumed by the session ────────────────────────────────────────
+// Commands consumed by the session
 
 #[derive(Debug)]
 pub enum SessionCommand {
@@ -90,7 +90,7 @@ pub enum SessionCommand {
     Disconnect,
 }
 
-// ─── TwitchSession ───────────────────────────────────────────────────────────
+// TwitchSession: manages Twitch IRC session (anonymous and authenticated modes)
 
 /// Twitch IRC session — supports both anonymous (justinfan) and authenticated modes.
 pub struct TwitchSession {
@@ -130,7 +130,7 @@ impl TwitchSession {
         }
     }
 
-    /// Main entry point – runs the connect/reconnect loop.
+    /// Main entry point: runs the connect/reconnect loop.
     pub async fn run(mut self) {
         let mut attempt: u32 = 0;
         loop {
@@ -182,7 +182,7 @@ impl TwitchSession {
             };
         }
 
-        // ─── Handshake ──────────────────────────────────────────────────
+        // Handshake: capability negotiation and authentication
         send_raw!("CAP REQ :twitch.tv/membership twitch.tv/tags twitch.tv/commands");
 
         if let Some(token) = &self.auth_token {
@@ -201,7 +201,7 @@ impl TwitchSession {
             send_raw!(format!("NICK {nick}"));
         }
 
-        // ─── Event loop ──────────────────────────────────────────────────
+        // Event loop: handle incoming frames and commands
         loop {
             tokio::select! {
                 maybe_frame = stream.next() => {
@@ -286,7 +286,7 @@ impl TwitchSession {
         }
     }
 
-    /// Handle one IRC message. May return a raw line to send back (e.g. PONG).
+    /// Handle one IRC message. May return a raw line to send back (e.g., PONG).
     async fn handle_irc(&mut self, msg: &IrcMessage) -> Option<String> {
         match msg.command.as_str() {
             "PING" => {
@@ -573,11 +573,11 @@ impl TwitchSession {
 
         let is_own = self.is_own_nick(msg);
 
-        // ── Bits detection ───────────────────────────────────────────────
+        // Bits detection
         let bits: u32 = tags.get("bits").and_then(|s| s.parse().ok()).unwrap_or(0);
         let msg_kind = if bits > 0 { MsgKind::Bits { amount: bits } } else { MsgKind::Chat };
 
-        // ── Reply metadata ──────────────────────────────────────────────
+        // Reply metadata
         let reply = if let Some(parent_id) = tags.get("reply-parent-msg-id") {
             if !parent_id.is_empty() {
                 Some(ReplyInfo {
@@ -623,12 +623,11 @@ impl TwitchSession {
     }
 }
 
-/// Parse a single raw IRC PRIVMSG line into a [`ChatMessage`] without a live
-/// session.  Intended for processing history messages from external APIs.
+/// Parse a single raw IRC PRIVMSG line into a ChatMessage without a live session.
+/// Intended for processing history messages from external APIs.
 ///
-/// * `id`          – caller-assigned unique message ID
-/// * `local_nick`  – the authenticated user's login (lowercase), used to set
-///                   `is_self`; pass `None` when not authenticated
+/// * `id` - caller-assigned unique message ID
+/// * `local_nick` - the authenticated user's login (lowercase), used to set `is_self`; pass `None` when not authenticated
 pub fn parse_privmsg_irc(
     msg: &IrcMessage,
     local_nick: Option<&str>,
@@ -757,7 +756,7 @@ fn decode_sub_plan(plan: &str) -> String {
     }
 }
 
-/// Unescape IRC tag value escaping (\\s → space, \\: → semicolon, etc.).
+/// Unescape IRC tag value escaping (\\s = space, \\: = semicolon, etc.).
 pub fn unescape_irc_tag(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
