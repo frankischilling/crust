@@ -108,10 +108,17 @@ pub enum AppEvent {
     UserProfileLoaded { profile: UserProfile },
     /// Mark all visible messages from a user as deleted (timeout / ban).
     UserMessagesCleared { channel: ChannelId, login: String },
-    /// USERSTATE received — whether the logged-in user is a mod in this channel.
-    UserStateUpdated { channel: ChannelId, is_mod: bool },
+    /// USERSTATE received — badges, color and mod status for the logged-in user.
+    UserStateUpdated {
+        channel: ChannelId,
+        is_mod: bool,
+        badges: Vec<crate::model::Badge>,
+        color: Option<String>,
+    },
     /// Clear all messages from the given channel's UI buffer (response to ClearLocalMessages).
     ChannelMessagesCleared { channel: ChannelId },
+    /// The logged-in user's avatar URL has been resolved.
+    SelfAvatarLoaded { avatar_url: String },
     /// Open-Graph / Twitter-Card metadata is ready for a URL.
     LinkPreviewReady {
         url: String,

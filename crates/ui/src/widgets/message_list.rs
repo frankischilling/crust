@@ -11,6 +11,8 @@ use crust_core::{
     model::{Badge, ChannelId, ChatMessage, MessageFlags, MsgKind, ReplyInfo, Span},
 };
 
+use crate::theme as t;
+
 /// Returned from [`MessageList::show`].
 pub struct MessageListResult {
     /// Set when the user right-clicked a message and chose "Reply".
@@ -101,6 +103,17 @@ impl<'a> MessageList<'a> {
 
         // Fallback height for rows we have never rendered before.
         const EST_H: f32 = 26.0;
+
+        // Invalidate height cache when available width changes significantly
+        // (e.g. window resize or sidebar drag), since messages re-wrap to
+        // different heights at different widths.
+        let avail_width = ui.available_width();
+        let width_key = egui::Id::new("msg_list_width").with(self.channel.as_str());
+        let prev_width: f32 = ui.ctx().data_mut(|d| d.get_temp(width_key).unwrap_or(0.0));
+        if (avail_width - prev_width).abs() > 2.0 {
+            height_cache.clear();
+            ui.ctx().data_mut(|d| d.insert_temp(width_key, avail_width));
+        }
 
         // Clear stale height cache when the channel has no messages
         // (e.g. after leaving and re-joining a channel).
@@ -446,7 +459,7 @@ impl<'a> MessageList<'a> {
                                     "↩ @{}: {}",
                                     rep.parent_display_name, body
                                 ))
-                                .small()
+                                .font(t::small())
                                 .color(Color32::from_rgb(130, 130, 155))
                                 .italics(),
                             )
@@ -476,7 +489,7 @@ impl<'a> MessageList<'a> {
                         ui.painter().rect_filled(rect, 1.0, stripe_color);
                         ui.add(Label::new(
                             RichText::new(label)
-                                .small()
+                                .font(t::small())
                                 .color(stripe_color),
                         ));
                     });
@@ -500,14 +513,14 @@ impl<'a> MessageList<'a> {
                         ui.add(Label::new(
                             RichText::new(ts)
                                 .color(Color32::from_rgb(90, 90, 90))
-                                .small(),
+                                .font(t::small()),
                         ));
 
                         // Separator dot between timestamp and badges/name
                         ui.add(Label::new(
                             RichText::new("·")
                                 .color(Color32::from_rgb(70, 70, 70))
-                                .small(),
+                                .font(t::small()),
                         ));
 
                         // Badges: image if loaded, else text fallback
@@ -539,7 +552,7 @@ impl<'a> MessageList<'a> {
                             ui.add(Label::new(
                                 RichText::new(format!("[{}]", badge.name))
                                     .color(Color32::from_rgb(100, 100, 100))
-                                    .small(),
+                                    .font(t::small()),
                             ))
                             .on_hover_text(&tooltip_label);
                         }
@@ -610,7 +623,6 @@ impl<'a> MessageList<'a> {
     /// These are centred italic lines with a coloured left stripe and icon,
     /// similar to Chatterino's system-message style.
     fn render_system_event(&self, ui: &mut Ui, msg: &ChatMessage) {
-        use crate::theme as t;
         let (accent, label_override): (Color32, Option<String>) = match &msg.msg_kind {
             MsgKind::Sub { display_name, months, plan, is_gift, .. } => {
                 let text = if *is_gift {
@@ -673,7 +685,7 @@ impl<'a> MessageList<'a> {
                     // Timestamp
                     let ts = msg.timestamp.format("%H:%M").to_string();
                     ui.add(Label::new(
-                        RichText::new(ts).color(Color32::from_rgb(90, 90, 90)).small(),
+                        RichText::new(ts).color(Color32::from_rgb(90, 90, 90)).font(t::small()),
                     ));
 
                     // Message text
@@ -681,7 +693,7 @@ impl<'a> MessageList<'a> {
                         RichText::new(text)
                             .italics()
                             .color(accent)
-                            .small(),
+                            .font(t::small()),
                     ).wrap());
                 });
             });
@@ -752,7 +764,7 @@ impl<'a> MessageList<'a> {
                     ui.add(Label::new(
                         RichText::new(code)
                             .italics()
-                            .small()
+                            .font(t::small())
                             .color(Color32::from_rgb(110, 150, 110)),
                     ));
                 }
@@ -894,7 +906,7 @@ impl<'a> MessageList<'a> {
                 ui.add(Label::new(
                     RichText::new(format!("[{name}]"))
                         .color(Color32::GRAY)
-                        .small(),
+                        .font(t::small()),
                 ));
             }
         }

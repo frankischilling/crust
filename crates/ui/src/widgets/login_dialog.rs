@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use egui::RichText;
 
 use crate::theme as t;
@@ -32,7 +35,14 @@ impl LoginDialog {
     }
 
     /// Show the dialog. Returns `Some(LoginAction)` when the user acts.
-    pub fn show(&mut self, ctx: &egui::Context, logged_in: bool, username: Option<&str>) -> Option<LoginAction> {
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        logged_in: bool,
+        username: Option<&str>,
+        avatar_url: Option<&str>,
+        emote_bytes: &HashMap<String, (u32, u32, Arc<[u8]>)>,
+    ) -> Option<LoginAction> {
         if !self.open {
             return None;
         }
@@ -44,7 +54,8 @@ impl LoginDialog {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.set_min_width(360.0);
+                let max_w = ui.ctx().screen_rect().width() - 40.0;
+                ui.set_min_width(max_w.min(360.0));
 
                 if logged_in {
                     // ── Profile card ────────────────────────────────
@@ -61,20 +72,38 @@ impl LoginDialog {
                             egui::vec2(avatar_size, avatar_size),
                             egui::Sense::hover(),
                         );
-                        let painter = ui.painter();
-                        painter.circle_filled(rect.center(), avatar_size * 0.5, t::ACCENT_DIM);
-                        painter.circle_stroke(
-                            rect.center(),
-                            avatar_size * 0.5,
-                            egui::Stroke::new(2.0, t::ACCENT),
-                        );
-                        painter.text(
-                            rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            initial.to_string(),
-                            egui::FontId::proportional(24.0),
-                            t::TEXT_PRIMARY,
-                        );
+
+                        // Try real avatar image, fall back to initial letter.
+                        let avatar_data = avatar_url
+                            .and_then(|url| emote_bytes.get(url).map(|(_, _, raw)| (url, raw.clone())));
+
+                        if let Some((logo, raw)) = avatar_data {
+                            let uri = format!("bytes://{logo}");
+                            ui.painter().circle_filled(rect.center(), avatar_size * 0.5, t::BG_RAISED);
+                            ui.put(
+                                rect,
+                                egui::Image::from_bytes(
+                                    uri,
+                                    egui::load::Bytes::Shared(raw),
+                                )
+                                .fit_to_exact_size(egui::vec2(avatar_size, avatar_size))
+                                .corner_radius(egui::CornerRadius::same((avatar_size / 2.0) as u8)),
+                            );
+                        } else {
+                            ui.painter().circle_filled(rect.center(), avatar_size * 0.5, t::ACCENT_DIM);
+                            ui.painter().circle_stroke(
+                                rect.center(),
+                                avatar_size * 0.5,
+                                egui::Stroke::new(2.0, t::ACCENT),
+                            );
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                initial.to_string(),
+                                egui::FontId::proportional(24.0),
+                                t::TEXT_PRIMARY,
+                            );
+                        }
 
                         ui.add_space(10.0);
 

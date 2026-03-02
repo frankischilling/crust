@@ -54,6 +54,7 @@ egui_extras = { version = "0.31", features = ["image", "gif", "webp"] }
 arboard = { version = "3", features = ["wayland-data-control"] }
 
 # misc
+libc = "0.2"
 directories = "5"
 bytes = "1"
 smallvec = { version = "1", features = ["serde"] }

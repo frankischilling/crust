@@ -59,6 +59,8 @@ pub const RADIUS_SM: CornerRadius = CornerRadius::same(3);
 pub const BAR_H: f32 = 28.0;
 /// Minimum sidebar width.
 pub const SIDEBAR_MIN_W: f32 = 110.0;
+/// Maximum sidebar width.
+pub const SIDEBAR_MAX_W: f32 = 300.0;
 /// Default sidebar width.
 pub const SIDEBAR_W: f32 = 160.0;
 
@@ -83,12 +85,12 @@ pub fn body() -> FontId {
     FontId::proportional(13.5)
 }
 
-/// Small label — hints, counts, secondary info.
+/// Small label — timestamps, system messages, secondary info.
 pub fn small() -> FontId {
-    FontId::proportional(11.5)
+    FontId::proportional(12.5)
 }
 
 /// Heading / section label (all-caps sidebar header etc).
 pub fn heading() -> FontId {
-    FontId::proportional(10.5)
+    FontId::proportional(11.5)
 }

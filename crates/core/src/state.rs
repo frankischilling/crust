@@ -14,6 +14,8 @@ pub struct AuthState {
     pub username: Option<String>,
     /// The Twitch user-id.
     pub user_id: Option<String>,
+    /// CDN URL for the user's avatar image.
+    pub avatar_url: Option<String>,
 }
 
 /// The single source of truth for the whole application.

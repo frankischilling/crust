@@ -45,6 +45,8 @@ pub struct CrustApp {
     /// Running total of raw emote bytes — updated incrementally on EmoteImageReady
     /// so we don't iterate the entire map every frame.
     emote_ram_bytes: usize,
+    /// Chat message history for Up/Down arrow recall.
+    message_history: Vec<String>,
 }
 
 impl CrustApp {
@@ -119,6 +121,7 @@ impl CrustApp {
             user_profile_popup: UserProfilePopup::default(),
             link_previews: HashMap::new(),
             emote_ram_bytes: 0,
+            message_history: Vec::new(),
         }
     }
 
@@ -186,6 +189,7 @@ impl CrustApp {
                 self.state.auth.logged_in = false;
                 self.state.auth.username = None;
                 self.state.auth.user_id = None;
+                self.state.auth.avatar_url = None;
             }
             AppEvent::Error { context, message } => {
                 tracing::error!("[{context}] {message}");
@@ -223,7 +227,7 @@ impl CrustApp {
                     ch.delete_messages_from(&login);
                 }
             }
-            AppEvent::UserStateUpdated { channel, is_mod } => {
+            AppEvent::UserStateUpdated { channel, is_mod, .. } => {
                 if let Some(ch) = self.state.channels.get_mut(&channel) {
                     ch.is_mod = is_mod;
                 }
@@ -232,6 +236,9 @@ impl CrustApp {
                 if let Some(ch) = self.state.channels.get_mut(&channel) {
                     ch.messages.clear();
                 }
+            }
+            AppEvent::SelfAvatarLoaded { avatar_url } => {
+                self.state.auth.avatar_url = Some(avatar_url);
             }
             AppEvent::LinkPreviewReady { url, title, description, thumbnail_url } => {
                 self.link_previews.insert(url, LinkPreview {
@@ -293,6 +300,8 @@ impl eframe::App for CrustApp {
             ctx,
             self.state.auth.logged_in,
             self.state.auth.username.as_deref(),
+            self.state.auth.avatar_url.as_deref(),
+            &self.emote_bytes,
         ) {
             match action {
                 LoginAction::Login(token) => self.send_cmd(AppCommand::Login { token }),
@@ -310,6 +319,7 @@ impl eframe::App for CrustApp {
                     .stroke(egui::Stroke::new(1.0, t::BORDER_SUBTLE)),
             )
             .show(ctx, |ui| {
+                let bar_width = ui.available_width();
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing = t::TOOLBAR_SPACING;
 
@@ -334,11 +344,14 @@ impl eframe::App for CrustApp {
                         self.state.auth.logged_in,
                     );
                     ui.painter().circle_filled(dot_rect.center(), dot_r, dot_color);
-                    ui.label(
-                        RichText::new(conn_label)
-                            .font(t::small())
-                            .color(t::TEXT_SECONDARY),
-                    );
+                    // Hide connection label text at narrow widths; dot is sufficient
+                    if bar_width > 500.0 {
+                        ui.label(
+                            RichText::new(conn_label)
+                                .font(t::small())
+                                .color(t::TEXT_SECONDARY),
+                        );
+                    }
 
                     ui.separator();
 
@@ -360,34 +373,39 @@ impl eframe::App for CrustApp {
                         |ui| {
                             ui.spacing_mut().item_spacing = t::TOOLBAR_SPACING;
 
-                            // Perf overlay toggle
-                            let perf_label =
-                                if self.perf.visible { "Perf: on" } else { "Perf: off" };
-                            if ui
-                                .add_sized(
-                                    [66.0, t::BAR_H],
-                                    egui::Button::new(
-                                        RichText::new(perf_label).font(t::small()),
-                                    ),
-                                )
-                                .on_hover_text("Toggle performance overlay")
-                                .clicked()
-                            {
-                                self.perf.visible = !self.perf.visible;
+                            // Perf overlay toggle — hide at narrow widths
+                            if bar_width > 650.0 {
+                                let perf_label =
+                                    if self.perf.visible { "Perf: on" } else { "Perf: off" };
+                                if ui
+                                    .add_sized(
+                                        [66.0, t::BAR_H],
+                                        egui::Button::new(
+                                            RichText::new(perf_label).font(t::small()),
+                                        ),
+                                    )
+                                    .on_hover_text("Toggle performance overlay")
+                                    .clicked()
+                                {
+                                    self.perf.visible = !self.perf.visible;
+                                }
+
+                                ui.separator();
                             }
 
-                            ui.separator();
+                            // Emote count — hide at narrow widths
+                            if bar_width > 550.0 {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} emotes",
+                                        self.emote_bytes.len()
+                                    ))
+                                    .font(t::small())
+                                    .color(t::TEXT_MUTED),
+                                );
 
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} emotes",
-                                    self.emote_bytes.len()
-                                ))
-                                .font(t::small())
-                                .color(t::TEXT_MUTED),
-                            );
-
-                            ui.separator();
+                                ui.separator();
+                            }
 
                             // Login / Account button
                             if self.state.auth.logged_in {
@@ -419,25 +437,48 @@ impl eframe::App for CrustApp {
                                 resp.clone().on_hover_text("Account");
 
                                 if ui.is_rect_visible(rect) {
-                                    let painter = ui.painter();
                                     let bg = if resp.hovered() { t::BG_RAISED } else { t::BG_SURFACE };
                                     let border = if resp.hovered() { t::BORDER_ACCENT } else { t::BORDER_SUBTLE };
-                                    painter.rect(rect, t::RADIUS, bg, egui::Stroke::new(1.0, border), egui::StrokeKind::Outside);
+                                    ui.painter().rect(rect, t::RADIUS, bg, egui::Stroke::new(1.0, border), egui::StrokeKind::Outside);
 
                                     // Avatar circle
                                     let avatar_r = btn_h * 0.34;
                                     let avatar_c = egui::pos2(rect.left() + btn_h * 0.5, rect.center().y);
-                                    painter.circle_filled(avatar_c, avatar_r, t::ACCENT_DIM);
-                                    painter.text(
-                                        avatar_c,
-                                        egui::Align2::CENTER_CENTER,
-                                        initial.to_string(),
-                                        egui::FontId::proportional(avatar_r * 1.15),
-                                        t::TEXT_PRIMARY,
-                                    );
+
+                                    // Try to render the real avatar image; fall back to initial letter.
+                                    let avatar_bytes = self.state.auth.avatar_url.as_deref()
+                                        .and_then(|url| self.emote_bytes.get(url).map(|(_, _, raw)| (url, raw.clone())));
+
+                                    if let Some((logo, raw)) = avatar_bytes {
+                                        let uri = format!("bytes://{logo}");
+                                        let av_size = avatar_r * 2.0;
+                                        let av_rect = egui::Rect::from_center_size(
+                                            avatar_c,
+                                            egui::vec2(av_size, av_size),
+                                        );
+                                        ui.painter().circle_filled(avatar_c, avatar_r, t::BG_RAISED);
+                                        ui.put(
+                                            av_rect,
+                                            egui::Image::from_bytes(
+                                                uri,
+                                                egui::load::Bytes::Shared(raw),
+                                            )
+                                            .fit_to_exact_size(egui::vec2(av_size, av_size))
+                                            .corner_radius(egui::CornerRadius::same(avatar_r as u8)),
+                                        );
+                                    } else {
+                                        ui.painter().circle_filled(avatar_c, avatar_r, t::ACCENT_DIM);
+                                        ui.painter().text(
+                                            avatar_c,
+                                            egui::Align2::CENTER_CENTER,
+                                            initial.to_string(),
+                                            egui::FontId::proportional(avatar_r * 1.15),
+                                            t::TEXT_PRIMARY,
+                                        );
+                                    }
 
                                     // Username
-                                    painter.text(
+                                    ui.painter().text(
                                         egui::pos2(avatar_c.x + btn_h * 0.5 + 4.0, rect.center().y),
                                         egui::Align2::LEFT_CENTER,
                                         name,
@@ -467,10 +508,16 @@ impl eframe::App for CrustApp {
             });
 
         // -- Left sidebar ------------------------------------------------------
+        // Dynamically cap sidebar width so the central panel always gets
+        // at least 350 px — prevents chat from being hidden on narrow windows.
+        let sidebar_max = (ctx.screen_rect().width() - 350.0)
+            .clamp(t::SIDEBAR_MIN_W, t::SIDEBAR_MAX_W);
+
         SidePanel::left("channel_list")
             .resizable(true)
             .default_width(t::SIDEBAR_W)
             .min_width(t::SIDEBAR_MIN_W)
+            .max_width(sidebar_max)
             .frame(
                 Frame::new()
                     .fill(t::BG_SURFACE)
@@ -511,7 +558,7 @@ impl eframe::App for CrustApp {
 
         // -- Central area: messages + input ------------------------------------
         CentralPanel::default()
-            .frame(Frame::new().fill(t::BG_BASE).inner_margin(Margin::ZERO))
+            .frame(Frame::new().fill(t::BG_BASE).inner_margin(Margin { left: 6, right: 0, top: 0, bottom: 0 }))
             .show(ctx, |ui| {
                 if let Some(active_ch) = self.state.active_channel.clone() {
                     // Input tray pinned to bottom
@@ -530,12 +577,20 @@ impl eframe::App for CrustApp {
                                 emote_catalog: &self.emote_catalog,
                                 emote_bytes: &self.emote_bytes,
                                 pending_reply: self.pending_reply.as_ref(),
+                                message_history: &self.message_history,
                             };
                             let result = chat.show(ui, &mut self.chat_input_buf);
                             if result.dismiss_reply {
                                 self.pending_reply = None;
                             }
                             if let Some(text) = result.send {
+                                // Push to history (cap at 100)
+                                if self.message_history.last().map(|s| s.as_str()) != Some(&text) {
+                                    self.message_history.push(text.clone());
+                                    if self.message_history.len() > 100 {
+                                        self.message_history.remove(0);
+                                    }
+                                }
                                 let reply_to_msg_id = self.pending_reply
                                     .as_ref()
                                     .map(|r| r.parent_msg_id.clone());

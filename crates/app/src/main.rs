@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
@@ -9,7 +9,7 @@ use tracing_subscriber::EnvFilter;
 use chrono::Utc;
 use crust_core::events::{AppCommand, AppEvent, ConnectionState};
 use crust_core::model::{
-    ChannelId, ChatMessage, EmoteCatalogEntry, MessageFlags, MessageId, MsgKind, Sender, UserId,
+    Badge, ChannelId, ChatMessage, EmoteCatalogEntry, MessageFlags, MessageId, MsgKind, Sender, UserId,
     UserProfile,
 };
 use crust_emotes::{
@@ -39,12 +39,42 @@ type BadgeMap = Arc<RwLock<std::collections::HashMap<(String, String), String>>>
 
 
 fn main() -> Result<()> {
+    // ── SIGPIPE ──────────────────────────────────────────────────────────
+    // On Wayland, when a protocol socket (compositor, XWayland, portal)
+    // dies, writes produce SIGPIPE. With Rust edition 2021 the default
+    // disposition is SIG_DFL → terminate.  Ignore it so the IO layer
+    // returns EPIPE normally and libraries can handle the error.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+
     // ── Wayland compatibility ────────────────────────────────────────────
     // On pure-Wayland sessions the XDG Settings Portal may not be running.
     // sctk-adwaita (client-side decorations in winit) queries it for the
-    // color-scheme and may time out.  The "Io error: Broken pipe" that
-    // follows is a known issue and does not affect functionality — we
-    // handle it as a benign winit exit below.
+    // color-scheme and may time out.
+    //
+    // A more severe issue: arboard (system clipboard, pulled in by
+    // egui-winit) tries the Wayland data-control protocol first. If the
+    // compositor doesn't implement it, arboard falls back to X11 clipboard
+    // via XWayland. That X11 worker thread can crash when the XWayland
+    // connection is closed or times out, which takes down the entire
+    // winit event loop ("Io error: Broken pipe" → Exit Failure: 1).
+    //
+    // Fix: on Wayland, clear DISPLAY so arboard never attempts the X11
+    // fallback. The window itself is rendered via Wayland — DISPLAY is
+    // only needed for XWayland clipboard, which is the thing crashing.
+    // Clipboard copy/paste may not work if the compositor lacks
+    // data-control, but at least the app stays alive.
+    if std::env::var("WAYLAND_DISPLAY").is_ok() {
+        // Only clear DISPLAY if arboard's Wayland clipboard is likely to
+        // fail (we can't easily probe the protocol list, so we preemptively
+        // remove the X11 fallback — the worst outcome is no system
+        // clipboard, which is better than an instant crash).
+        if std::env::var("DISPLAY").is_ok() {
+            std::env::remove_var("DISPLAY");
+        }
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -183,6 +213,10 @@ async fn reducer_loop(
     let mut auth_username: Option<String> = None;
     let mut auth_user_id: Option<String> = None;
     let mut local_msg_id: u64 = 1_000_000; // offset to avoid collisions with session IDs
+
+    // Per-channel cache of the logged-in user's badges + color (from USERSTATE).
+    let mut self_badges: HashMap<ChannelId, Vec<Badge>> = HashMap::new();
+    let mut self_color: Option<String> = None;
 
     // Load persisted settings; track which channels are joined so we can
     // keep auto_join up to date and restore them after reconnects.
@@ -331,6 +365,14 @@ async fn reducer_loop(
                         tokio::spawn(async move {
                             load_personal_7tv_emotes(&uid, &idx2, &cache2, &etx2, &gc2).await;
                         });
+                        // Fetch the user's own avatar for the top-bar profile pill.
+                        {
+                            let login = auth_username.clone().unwrap_or_default().to_lowercase();
+                            let etx3 = evt_tx.clone();
+                            tokio::spawn(async move {
+                                fetch_self_avatar(&login, etx3).await;
+                            });
+                        }
                     }
                     TwitchEvent::ChatMessage(mut msg) => {
                         // Snapshot the emote index
@@ -517,8 +559,20 @@ async fn reducer_loop(
                             message: msg,
                         }).await;
                     }
-                    TwitchEvent::UserStateUpdated { channel, is_mod } => {
-                        let _ = evt_tx.send(AppEvent::UserStateUpdated { channel, is_mod }).await;
+                    TwitchEvent::UserStateUpdated { channel, is_mod, mut badges, color } => {
+                        // Resolve badge image URLs
+                        {
+                            let bm = badge_map.read().unwrap();
+                            for badge in &mut badges {
+                                badge.url = bm.get(&(badge.name.clone(), badge.version.clone())).cloned();
+                            }
+                        }
+                        // Cache for local echo messages
+                        self_badges.insert(channel.clone(), badges.clone());
+                        if color.is_some() {
+                            self_color = color.clone();
+                        }
+                        let _ = evt_tx.send(AppEvent::UserStateUpdated { channel, is_mod, badges, color }).await;
                     }
                 }
             }
@@ -663,8 +717,8 @@ async fn reducer_loop(
                                     user_id: UserId(uid.clone()),
                                     login: uname.to_lowercase(),
                                     display_name: uname.clone(),
-                                    color: None,
-                                    badges: Vec::new(),
+                                    color: self_color.clone(),
+                                    badges: self_badges.get(&channel).cloned().unwrap_or_default(),
                                 },
                                 raw_text: text.clone(),
                                 spans: smallvec::SmallVec::new(),
@@ -1404,6 +1458,41 @@ async fn fetch_user_profile(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
     }
 
     let _ = evt_tx.send(AppEvent::UserProfileLoaded { profile }).await;
+}
+
+/// Fetch the logged-in user's avatar URL and image bytes for the top-bar pill.
+async fn fetch_self_avatar(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
+    if login.is_empty() { return; }
+
+    #[derive(serde::Deserialize)]
+    struct IvrUserMin {
+        logo: Option<String>,
+    }
+
+    let url = format!("https://api.ivr.fi/v2/twitch/user?login={login}");
+    let client = reqwest::Client::new();
+    let resp = match client.get(&url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return,
+    };
+    let users: Vec<IvrUserMin> = match resp.json().await {
+        Ok(u) => u,
+        Err(_) => return,
+    };
+    let Some(user) = users.into_iter().next() else { return };
+    let Some(avatar_url) = user.logo else { return };
+
+    // Pre-fetch image bytes
+    if let Ok((w, h, raw)) = fetch_and_decode_raw(&avatar_url).await {
+        let _ = evt_tx.send(AppEvent::EmoteImageReady {
+            uri: avatar_url.clone(),
+            width: w,
+            height: h,
+            raw_bytes: raw,
+        }).await;
+    }
+
+    let _ = evt_tx.send(AppEvent::SelfAvatarLoaded { avatar_url }).await;
 }
 
 // ─── System-message helpers ───────────────────────────────────────────────────

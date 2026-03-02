@@ -25,6 +25,7 @@ crust-ui = { path = "../ui" }
 crust-twitch = { path = "../twitch" }
 crust-emotes = { path = "../emotes" }
 crust-storage = { path = "../storage" }
+libc = { workspace = true }
 
 # Force wayland-data-control feature onto arboard (transitive via egui-winit)
 arboard = { workspace = true }

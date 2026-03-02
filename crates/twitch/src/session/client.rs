@@ -51,8 +51,13 @@ pub enum TwitchEvent {
     UserBanned { channel: ChannelId, login: String },
     /// A moderator cleared the entire chat.
     ChatCleared { channel: ChannelId },
-    /// USERSTATE received — whether the logged-in user is a mod in this channel.
-    UserStateUpdated { channel: ChannelId, is_mod: bool },
+    /// USERSTATE received — badges, color and mod status for the logged-in user.
+    UserStateUpdated {
+        channel: ChannelId,
+        is_mod: bool,
+        badges: Vec<Badge>,
+        color: Option<String>,
+    },
     /// Sub / resub / giftsub notification (USERNOTICE).
     SubAlert {
         channel: ChannelId,
@@ -393,14 +398,33 @@ impl TwitchSession {
                 }
             }
             "USERSTATE" => {
-                // Fired after every send and on channel join. Extract is_mod.
+                // Fired after every send and on channel join.
+                // Extract mod status, badges, and color.
                 if let Some(ch_raw) = msg.params.first() {
                     let channel = ChannelId::new(ch_raw.as_str());
                     let is_mod = matches!(
                         msg.tags.get("mod"),
                         Some("1")
                     );
-                    self.emit(TwitchEvent::UserStateUpdated { channel, is_mod }).await;
+                    let badges: Vec<Badge> = msg.tags
+                        .get("badges")
+                        .unwrap_or("")
+                        .split(',')
+                        .filter(|s| !s.is_empty())
+                        .filter_map(|b| {
+                            let mut parts = b.splitn(2, '/');
+                            Some(Badge {
+                                name: parts.next()?.to_owned(),
+                                version: parts.next().unwrap_or("0").to_owned(),
+                                url: None,
+                            })
+                        })
+                        .collect();
+                    let color = msg.tags
+                        .get("color")
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    self.emit(TwitchEvent::UserStateUpdated { channel, is_mod, badges, color }).await;
                 }
             }
             "NOTICE" | "HOSTTARGET" => {

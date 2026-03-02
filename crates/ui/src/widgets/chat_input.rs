@@ -11,6 +11,34 @@ use crate::theme as t;
 
 const AUTOCOMPLETE_MAX: usize = 10;
 const AUTOCOMPLETE_EMOTE_SIZE: f32 = 20.0;
+/// Maximum number of Tab-completion matches to cycle through.
+const TAB_COMPLETE_MAX: usize = 50;
+
+// ── Persistent state stored in egui temp data ────────────────────────────────
+
+/// Tab-completion state for bare-word emote completion (no `:` prefix).
+#[derive(Clone, Default)]
+struct TabState {
+    /// Text before the word being completed.
+    prefix: String,
+    /// Matching emote codes.
+    matches: Vec<String>,
+    /// Current index in `matches`.
+    index: usize,
+    /// The buffer content we last set (to detect external changes).
+    expected_buf: String,
+}
+
+/// Message-history recall state (Up / Down arrows).
+#[derive(Clone, Default)]
+struct HistState {
+    /// -1 = normal input, 0 = most recent sent msg, 1 = second-most-recent, …
+    idx: i32,
+    /// The original unsent input saved when history navigation started.
+    saved_input: String,
+    /// What we set the buffer to (to detect user edits → reset).
+    expected_buf: String,
+}
 
 /// Chat input bar shown at the bottom of the message area.
 pub struct ChatInput<'a> {
@@ -26,6 +54,8 @@ pub struct ChatInput<'a> {
     pub emote_bytes: &'a HashMap<String, (u32, u32, Arc<[u8]>)>,
     /// If set, show a dismissable "Replying to @name" banner above the input.
     pub pending_reply: Option<&'a ReplyInfo>,
+    /// Previously-sent messages for Up/Down recall.
+    pub message_history: &'a [String],
 }
 
 /// Result from showing the chat input.
@@ -118,24 +148,26 @@ impl<'a> ChatInput<'a> {
                         );
                     }
 
-                    // Pre-check: if autocomplete has results, consume
-                    // Tab / Enter / Arrow keys BEFORE TextEdit sees them.
+                    // Pre-check colon-autocomplete
                     let pre_matches = find_autocomplete_matches(buf, self.emote_catalog);
-                    let pre_ac_active = !pre_matches.is_empty();
+                    let colon_ac_active = !pre_matches.is_empty();
 
+                    // Always consume Tab / Up / Down before TextEdit so they
+                    // don't cause focus changes or unwanted behaviour.
+                    // Enter is only consumed when the colon-popup needs it.
                     let mut consumed_tab = false;
                     let mut consumed_enter = false;
                     let mut consumed_up = false;
                     let mut consumed_down = false;
 
-                    if pre_ac_active {
-                        ui.input_mut(|i| {
-                            consumed_tab = i.consume_key(egui::Modifiers::NONE, Key::Tab);
+                    ui.input_mut(|i| {
+                        consumed_tab = i.consume_key(egui::Modifiers::NONE, Key::Tab);
+                        consumed_up = i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
+                        consumed_down = i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
+                        if colon_ac_active {
                             consumed_enter = i.consume_key(egui::Modifiers::NONE, Key::Enter);
-                            consumed_up = i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
-                            consumed_down = i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
-                        });
-                    }
+                        }
+                    });
 
                     // Text input — reserve space for emote button + Send button + 2 gaps
                     let reserve = t::BAR_H + 58.0 + t::TOOLBAR_SPACING.x * 2.0;
@@ -160,6 +192,7 @@ impl<'a> ChatInput<'a> {
                     let mut accepted_emote: Option<String> = None;
 
                     if !matches.is_empty() {
+                        // ── Colon-autocomplete active ──
                         let n = matches.len() as i32;
                         ac_sel = ac_sel.clamp(0, n - 1);
 
@@ -174,6 +207,102 @@ impl<'a> ChatInput<'a> {
                         }
                     } else {
                         ac_sel = 0;
+
+                        // ── Bare-word Tab completion ──
+                        let tab_id = Id::new("tab_complete_state");
+                        if consumed_tab {
+                            let mut ts: TabState =
+                                ui.ctx().data_mut(|d| d.get_temp(tab_id).unwrap_or_default());
+
+                            let continuing =
+                                !ts.matches.is_empty() && ts.expected_buf == *buf;
+
+                            if continuing {
+                                // Cycle to next match
+                                ts.index = (ts.index + 1) % ts.matches.len();
+                            } else {
+                                // Start new tab session
+                                let (pfx, word) = extract_last_word(buf);
+                                if !word.is_empty() {
+                                    let wl = word.to_lowercase();
+                                    let mut m: Vec<String> = self
+                                        .emote_catalog
+                                        .iter()
+                                        .filter(|e| e.code.to_lowercase().starts_with(&wl))
+                                        .map(|e| e.code.clone())
+                                        .collect();
+                                    m.sort_by(|a, b| {
+                                        a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+                                    });
+                                    m.truncate(TAB_COMPLETE_MAX);
+                                    if !m.is_empty() {
+                                        ts = TabState {
+                                            prefix: pfx.to_owned(),
+                                            matches: m,
+                                            index: 0,
+                                            expected_buf: String::new(),
+                                        };
+                                    } else {
+                                        ts = TabState::default();
+                                    }
+                                } else {
+                                    ts = TabState::default();
+                                }
+                            }
+
+                            if !ts.matches.is_empty() {
+                                let code = &ts.matches[ts.index];
+                                *buf = format!("{}{} ", ts.prefix, code);
+                                ts.expected_buf = buf.clone();
+                                ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
+                            }
+
+                            ui.ctx().data_mut(|d| d.insert_temp(tab_id, ts));
+                        } else {
+                            // Any non-Tab keystroke invalidates the tab session
+                            if consumed_up || consumed_down || resp.changed() {
+                                ui.ctx().data_mut(|d| d.insert_temp(tab_id, TabState::default()));
+                            }
+                        }
+
+                        // ── Message history (Up / Down) ──
+                        let hist_id = Id::new("msg_history_state");
+                        if (consumed_up || consumed_down) && !self.message_history.is_empty() {
+                            let mut hs: HistState =
+                                ui.ctx().data_mut(|d| d.get_temp(hist_id).unwrap_or_default());
+
+                            // Detect user edits → reset history position
+                            if hs.idx >= 0 && *buf != hs.expected_buf {
+                                hs.idx = -1;
+                            }
+
+                            let hlen = self.message_history.len() as i32;
+
+                            if consumed_up {
+                                if hs.idx == -1 {
+                                    hs.saved_input = buf.clone();
+                                    hs.idx = 0;
+                                } else if hs.idx < hlen - 1 {
+                                    hs.idx += 1;
+                                }
+                                let i = (hlen - 1 - hs.idx) as usize;
+                                *buf = self.message_history[i].clone();
+                            }
+                            if consumed_down {
+                                if hs.idx > 0 {
+                                    hs.idx -= 1;
+                                    let i = (hlen - 1 - hs.idx) as usize;
+                                    *buf = self.message_history[i].clone();
+                                } else if hs.idx == 0 {
+                                    hs.idx = -1;
+                                    *buf = hs.saved_input.clone();
+                                }
+                            }
+
+                            hs.expected_buf = buf.clone();
+                            ui.ctx().data_mut(|d| d.insert_temp(hist_id, hs));
+                            ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
+                        }
                     }
 
                     // Replace the :query token with the accepted emote
@@ -193,6 +322,9 @@ impl<'a> ChatInput<'a> {
                     if enter_pressed && !buf.trim().is_empty() {
                         result.send = Some(buf.trim().to_owned());
                         buf.clear();
+                        // Reset history navigation on send
+                        ui.ctx().data_mut(|d| d.insert_temp(Id::new("msg_history_state"), HistState::default()));
+                        ui.ctx().data_mut(|d| d.insert_temp(Id::new("tab_complete_state"), TabState::default()));
                         resp.request_focus();
                     } else if resp.lost_focus() {
                         resp.request_focus();
@@ -549,4 +681,18 @@ fn dynamic_image_to_color_image(img: DynamicImage) -> Option<egui::ColorImage> {
     let h = usize::try_from(rgba.height()).ok()?;
     let pixels = rgba.into_raw();
     Some(egui::ColorImage::from_rgba_unmultiplied([w, h], &pixels))
+}
+
+/// Extract the last whitespace-delimited word from the buffer.
+/// Returns `(prefix_before_word, word)`.
+fn extract_last_word(buf: &str) -> (&str, &str) {
+    let trimmed = buf.trim_end_matches(' ');
+    if trimmed.is_empty() {
+        return (buf, "");
+    }
+    if let Some(pos) = trimmed.rfind(' ') {
+        (&buf[..pos + 1], &trimmed[pos + 1..])
+    } else {
+        ("", trimmed)
+    }
 }

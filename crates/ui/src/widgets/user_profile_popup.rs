@@ -87,8 +87,8 @@ impl UserProfilePopup {
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .min_width(300.0)
-            .max_width(360.0)
+            .min_width((ctx.screen_rect().width() - 40.0).min(300.0))
+            .max_width((ctx.screen_rect().width() - 40.0).min(360.0))
             .open(&mut self.open)
             .show(ctx, |ui| {
                 if self.loading {
