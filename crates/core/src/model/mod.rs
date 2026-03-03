@@ -244,7 +244,7 @@ pub struct ChannelState {
     pub chatters: std::collections::HashSet<String>,
     /// Total new messages received while this channel was not active (excluding history).
     pub unread_count: u32,
-    /// Subset of unread_count that are mentions or Twitch highlights — shown in amber.
+    /// Subset of unread_count that are mentions or Twitch highlights - shown in amber.
     pub unread_mentions: u32,
     /// Whether the logged-in user is a moderator in this channel.
     pub is_mod: bool,
@@ -349,19 +349,22 @@ impl ChannelState {
                 .map(|id| !existing_ids.contains(id))
                 .unwrap_or(true)
         });
+        if msgs.is_empty() { return; }
 
-        // Respect the ring-buffer cap.
+        // Respect the ring-buffer cap: drop oldest history entries when
+        // the combined count would exceed MAX_MESSAGES.
         let available = MAX_MESSAGES.saturating_sub(self.messages.len());
         if msgs.len() > available {
-            // Drop the oldest history (the beginning of the slice) when we
-            // would exceed MAX_MESSAGES.
             msgs.drain(0..msgs.len() - available);
         }
 
-        // Push oldest-first to the front so chronological order is preserved.
-        for msg in msgs.into_iter().rev() {
-            self.messages.push_front(msg);
-        }
+        // Build a new deque in one allocation: [history…] ++ [live…].
+        // This is faster than iterating msgs in reverse with push_front.
+        let total = msgs.len() + self.messages.len();
+        let mut new_deque = std::collections::VecDeque::with_capacity(total);
+        new_deque.extend(msgs);
+        new_deque.extend(self.messages.drain(..));
+        self.messages = new_deque;
     }
 }
 

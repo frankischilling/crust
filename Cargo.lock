@@ -810,6 +810,7 @@ dependencies = [
  "eframe",
  "egui",
  "image",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
@@ -887,11 +888,15 @@ dependencies = [
 name = "crust-ui"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "crust-core",
+ "directories",
  "eframe",
  "egui",
  "egui_extras",
  "image",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]

@@ -62,14 +62,14 @@ fn main() -> Result<()> {
     // winit event loop ("Io error: Broken pipe" → Exit Failure: 1).
     //
     // Fix: on Wayland, clear DISPLAY so arboard never attempts the X11
-    // fallback. The window itself is rendered via Wayland — DISPLAY is
+    // fallback. The window itself is rendered via Wayland - DISPLAY is
     // only needed for XWayland clipboard, which is the thing crashing.
     // Clipboard copy/paste may not work if the compositor lacks
     // data-control, but at least the app stays alive.
     if std::env::var("WAYLAND_DISPLAY").is_ok() {
         // Only clear DISPLAY if arboard's Wayland clipboard is likely to
         // fail (we can't easily probe the protocol list, so we preemptively
-        // remove the X11 fallback — the worst outcome is no system
+        // remove the X11 fallback - the worst outcome is no system
         // clipboard, which is better than an instant crash).
         if std::env::var("DISPLAY").is_ok() {
             std::env::remove_var("DISPLAY");
@@ -307,7 +307,7 @@ async fn reducer_loop(
                 }).await;
             }
             Err(ValidateError::Unauthorized) => {
-                // Token explicitly rejected by Twitch — safe to delete.
+                // Token explicitly rejected by Twitch - safe to delete.
                 warn!("Saved token rejected by Twitch, clearing and starting anonymous");
                 if let Some(store) = &settings_store {
                     let _ = store.delete_token();
@@ -316,7 +316,7 @@ async fn reducer_loop(
                 let _ = evt_tx.send(AppEvent::LoggedOut).await;
             }
             Err(ValidateError::Transient(e)) => {
-                // Network error, server hiccup, etc. — keep the token so
+                // Network error, server hiccup, etc. - keep the token so
                 // the next launch can try again.  Just start anonymous.
                 warn!("Token validation failed ({e}), keeping token and starting anonymous");
                 let _ = evt_tx.send(AppEvent::LoggedOut).await;
@@ -760,7 +760,7 @@ async fn reducer_loop(
                                     });
                                 }
                                 if let Some(store) = &settings_store {
-                                    // ONE consolidated save — accounts list AND oauth_token
+                                    // ONE consolidated save - accounts list AND oauth_token
                                     // are both in `settings` already.  A separate
                                     // save_account_token() call would do a redundant
                                     // load→modify→save cycle that can race with other saves.
@@ -1176,6 +1176,13 @@ async fn load_global_emotes(
     let total = b.len() + f.len() + s.len();
     info!("Loaded {total} global emotes (BTTV={}, FFZ={}, 7TV={})", b.len(), f.len(), s.len());
 
+    // Collect URLs of the newly-loaded emotes for prefetching.
+    let new_urls: Vec<String> = f.iter()
+        .chain(b.iter())
+        .chain(s.iter())
+        .map(|e| e.url_1x.clone())
+        .collect();
+
     // Insert in priority order: FFZ < BTTV < 7TV (later overwrites earlier)
     {
         let mut idx = index.write().unwrap();
@@ -1210,8 +1217,8 @@ async fn load_global_emotes(
     // Send catalog snapshot to the UI
     send_emote_catalog(index, evt_tx, global_codes).await;
 
-    // Eagerly prefetch all emote images so they're ready for the picker / autocomplete
-    prefetch_all_emote_images(index, cache, evt_tx);
+    // Eagerly prefetch only the newly-loaded emote images
+    prefetch_emote_images(new_urls, cache, evt_tx);
 }
 
 /// Load channel-specific emotes from BTTV, FFZ, 7TV.
@@ -1231,6 +1238,7 @@ async fn load_personal_7tv_emotes(
         return;
     }
     info!("Loaded {} personal 7TV emotes for user-id {user_id}", emotes.len());
+    let new_urls: Vec<String> = emotes.iter().map(|e| e.url_1x.clone()).collect();
     {
         let mut idx = index.write().unwrap();
         for e in emotes {
@@ -1238,7 +1246,7 @@ async fn load_personal_7tv_emotes(
         }
     }
     send_emote_catalog(index, evt_tx, global_codes).await;
-    prefetch_all_emote_images(index, cache, evt_tx);
+    prefetch_emote_images(new_urls, cache, evt_tx);
 }
 
 async fn load_channel_emotes(
@@ -1264,6 +1272,10 @@ async fn load_channel_emotes(
     let total = b.len() + f.len() + s.len();
     if total == 0 {
         warn!("No channel emotes found for #{channel_name}");
+        let _ = evt_tx.send(AppEvent::ChannelEmotesLoaded {
+            channel: ChannelId::new(channel_name),
+            count: 0,
+        }).await;
         return;
     }
     info!(
@@ -1272,6 +1284,13 @@ async fn load_channel_emotes(
         f.len(),
         s.len()
     );
+
+    // Collect URLs of the newly-loaded emotes for prefetching.
+    let new_urls: Vec<String> = f.iter()
+        .chain(b.iter())
+        .chain(s.iter())
+        .map(|e| e.url_1x.clone())
+        .collect();
 
     {
         let mut idx = index.write().unwrap();
@@ -1296,8 +1315,13 @@ async fn load_channel_emotes(
     // Send catalog snapshot to the UI
     send_emote_catalog(index, evt_tx, global_codes).await;
 
-    // Eagerly prefetch all emote images so they're ready for the picker / autocomplete
-    prefetch_all_emote_images(index, cache, evt_tx);
+    let _ = evt_tx.send(AppEvent::ChannelEmotesLoaded {
+        channel: ChannelId::new(channel_name),
+        count: total,
+    }).await;
+
+    // Eagerly prefetch only the newly-loaded channel emote images
+    prefetch_emote_images(new_urls, cache, evt_tx);
 }
 
 /// Build a catalog snapshot from the emote index and send it to the UI.
@@ -1328,19 +1352,16 @@ async fn send_emote_catalog(
     let _ = evt_tx.send(AppEvent::EmoteCatalogUpdated { emotes: entries }).await;
 }
 
-/// Eagerly prefetch all emote images in the background so they're available
+/// Eagerly prefetch emote images in the background so they're available
 /// in the emote picker and `:` autocomplete without waiting for lazy fetch.
-fn prefetch_all_emote_images(
-    index: &EmoteIndex,
+fn prefetch_emote_images(
+    urls: Vec<String>,
     cache: &Option<EmoteCache>,
     evt_tx: &mpsc::Sender<AppEvent>,
 ) {
-    let urls: Vec<String> = {
-        let idx = index.read().unwrap();
-        idx.values().map(|e| e.url_1x.clone()).collect()
-    };
-
+    if urls.is_empty() { return; }
     info!("Prefetching {} emote images…", urls.len());
+    let _ = evt_tx.try_send(AppEvent::ImagePrefetchQueued { count: urls.len() });
 
     let sem = Arc::new(tokio::sync::Semaphore::new(20));
 
@@ -1456,6 +1477,7 @@ fn prefetch_badge_images(
 ) {
     if urls.is_empty() { return; }
     info!("Prefetching {} badge images…", urls.len());
+    let _ = evt_tx.try_send(AppEvent::ImagePrefetchQueued { count: urls.len() });
     let sem = Arc::new(tokio::sync::Semaphore::new(20));
     for url in urls {
         let sem = sem.clone();
@@ -1493,6 +1515,16 @@ async fn fetch_emote_image(
         }
         Err(e) => {
             debug!("Failed to fetch emote image {url}: {e}");
+            // Emit a zero-byte stub so the loading screen can count this
+            // fetch as settled (prevents hanging on failures).
+            let _ = evt_tx
+                .send(AppEvent::EmoteImageReady {
+                    uri: url.to_owned(),
+                    width: 0,
+                    height: 0,
+                    raw_bytes: vec![],
+                })
+                .await;
         }
     }
 }
@@ -1502,7 +1534,7 @@ async fn fetch_and_decode_raw(url: &str) -> Result<(u32, u32, Vec<u8>), crust_em
     let resp = client.get(url).send().await?;
     let raw = resp.bytes().await?;
     let raw_vec = raw.to_vec();
-    // Read dimensions from header only — no full RGBA decode needed
+    // Read dimensions from header only - no full RGBA decode needed
     let (w, h) = image::ImageReader::new(std::io::Cursor::new(&raw_vec))
         .with_guessed_format()
         .ok()
@@ -1581,94 +1613,110 @@ async fn load_recent_messages(
 
     if raw_lines.is_empty() { return; }
 
-    let emote_snapshot: std::collections::HashMap<String, EmoteInfo> = {
+    // ── Snapshot shared state once before the parse loop ────────────────────
+    // Taking these locks inside the loop (800+ times) is expensive; snapshot
+    // once and release immediately so other tasks aren't blocked.
+    let emote_snapshot: HashMap<String, EmoteInfo> = {
         let guard = emote_index.read().unwrap();
         guard.clone()
     };
+    let badge_snapshot: HashMap<(String, String), String> = {
+        let bm = badge_map.read().unwrap();
+        bm.clone()
+    };
+    let local_nick_owned = local_nick.map(str::to_owned);
 
-    let mut messages: Vec<ChatMessage> = Vec::with_capacity(raw_lines.len());
+    // ── Move the CPU-bound parse + tokenize loop off the async executor ──────
+    // Tokenization and IRC parsing are synchronous CPU work.  Running them
+    // directly on the tokio thread pool starves other async tasks; moving to
+    // spawn_blocking gives those threads back.
+    let (messages, image_urls) = tokio::task::spawn_blocking(move || {
+        let mut messages: Vec<ChatMessage> = Vec::with_capacity(raw_lines.len());
+        // Deduplicate image fetch URLs across all history messages.
+        let mut seen_urls: HashSet<String> = HashSet::new();
+        let mut image_urls: Vec<String> = Vec::new();
 
-    for line in &raw_lines {
-        let irc_msg = match parse_line(line) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        if irc_msg.command != "PRIVMSG" { continue; }
-
-        let id = HISTORY_MSG_ID.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        let mut msg = match parse_privmsg_irc(&irc_msg, local_nick, id) {
-            Some(m) => m,
-            None => continue,
-        };
-
-        // Tokenize
-        msg.spans = crust_core::format::tokenize(
-            &msg.raw_text,
-            msg.flags.is_action,
-            &msg.twitch_emotes,
-            &|code| {
-                emote_snapshot.get(code).map(|info| {
-                    (
-                        info.id.clone(),
-                        info.code.clone(),
-                        info.url_1x.clone(),
-                        info.provider.clone(),
-                        info.url_4x.clone().or_else(|| info.url_2x.clone()),
-                    )
-                })
-            },
-        );
-
-        // Resolve badge URLs
-        {
-            let bm = badge_map.read().unwrap();
-            for badge in &mut msg.sender.badges {
-                badge.url = bm.get(&(badge.name.clone(), badge.version.clone())).cloned();
-            }
-        }
-
-        // Mention detection
-        if let Some(nick) = local_nick {
-            let nick_lower = nick.to_lowercase();
-            let has_mention = msg.raw_text.to_lowercase().contains(&format!("@{nick_lower}"));
-            let is_reply_to_me = msg.reply.as_ref()
-                .map(|r| r.parent_user_login.to_lowercase() == nick_lower)
-                .unwrap_or(false);
-            msg.flags.is_mention = has_mention || is_reply_to_me;
-        }
-
-        // Queue image fetches for new emotes/badges
-        for span in &msg.spans {
-            let img_url = match span {
-                crust_core::Span::Emote { url, .. } => Some(url.clone()),
-                crust_core::Span::Emoji { url, .. } => Some(url.clone()),
-                _ => None,
+        for line in &raw_lines {
+            let irc_msg = match parse_line(line) {
+                Ok(m) => m,
+                Err(_) => continue,
             };
-            if let Some(img_url) = img_url {
-                let evt_tx = evt_tx.clone();
-                let cache = emote_cache.clone();
-                tokio::spawn(async move {
-                    fetch_emote_image(&img_url, &cache, &evt_tx).await;
-                });
-            }
-        }
-        for badge in &msg.sender.badges {
-            if let Some(badge_url) = &badge.url {
-                let badge_url = badge_url.clone();
-                let evt_tx = evt_tx.clone();
-                let cache = emote_cache.clone();
-                tokio::spawn(async move {
-                    fetch_emote_image(&badge_url, &cache, &evt_tx).await;
-                });
-            }
-        }
+            if irc_msg.command != "PRIVMSG" { continue; }
 
-        messages.push(msg);
-    }
+            let id = HISTORY_MSG_ID.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            let mut msg = match parse_privmsg_irc(&irc_msg, local_nick_owned.as_deref(), id) {
+                Some(m) => m,
+                None => continue,
+            };
+
+            // Tokenize spans
+            msg.spans = crust_core::format::tokenize(
+                &msg.raw_text,
+                msg.flags.is_action,
+                &msg.twitch_emotes,
+                &|code| {
+                    emote_snapshot.get(code).map(|info| {
+                        (
+                            info.id.clone(),
+                            info.code.clone(),
+                            info.url_1x.clone(),
+                            info.provider.clone(),
+                            info.url_4x.clone().or_else(|| info.url_2x.clone()),
+                        )
+                    })
+                },
+            );
+
+            // Resolve badge URLs from the snapshot (no lock needed)
+            for badge in &mut msg.sender.badges {
+                badge.url = badge_snapshot
+                    .get(&(badge.name.clone(), badge.version.clone()))
+                    .cloned();
+            }
+
+            // Mention detection
+            if let Some(ref nick) = local_nick_owned {
+                let nick_lower = nick.to_lowercase();
+                let has_mention = msg.raw_text.to_lowercase().contains(&format!("@{nick_lower}"));
+                let is_reply_to_me = msg.reply.as_ref()
+                    .map(|r| r.parent_user_login.to_lowercase() == nick_lower)
+                    .unwrap_or(false);
+                msg.flags.is_mention = has_mention || is_reply_to_me;
+            }
+
+            // Collect unique image URLs (emotes, emoji, badges) for batch prefetch
+            for span in &msg.spans {
+                let url = match span {
+                    crust_core::Span::Emote { url, .. } => Some(url.clone()),
+                    crust_core::Span::Emoji { url, .. } => Some(url.clone()),
+                    _ => None,
+                };
+                if let Some(u) = url {
+                    if seen_urls.insert(u.clone()) { image_urls.push(u); }
+                }
+            }
+            for badge in &msg.sender.badges {
+                if let Some(ref u) = badge.url {
+                    if seen_urls.insert(u.clone()) { image_urls.push(u.clone()); }
+                }
+            }
+
+            messages.push(msg);
+        }
+        (messages, image_urls)
+    }).await.unwrap_or_default();
 
     if messages.is_empty() { return; }
 
     info!("Loaded {} historical messages for #{ch}", messages.len());
+
+    // Batch-prefetch all unique image URLs with a semaphore (same path as
+    // emote/badge prefetch, which also emits ImagePrefetchQueued for the
+    // loading screen counter).
+    if !image_urls.is_empty() {
+        prefetch_emote_images(image_urls, emote_cache, evt_tx);
+    }
+
     let channel_id = crust_core::model::ChannelId::new(ch);
     let _ = evt_tx.send(AppEvent::HistoryLoaded { channel: channel_id, messages }).await;
 }
@@ -1759,7 +1807,7 @@ async fn helix_ban_user(
         info!("Moderation: {target_login} {verb} in #{channel}");
     } else {
         let body_text = resp.text().await.unwrap_or_default();
-        warn!("helix_ban_user: HTTP {status} — {body_text}");
+        warn!("helix_ban_user: HTTP {status} - {body_text}");
         // Extract a human-readable message from the Helix error response.
         let helix_msg = serde_json::from_str::<serde_json::Value>(&body_text)
             .ok()
@@ -1823,7 +1871,7 @@ async fn helix_unban_user(
         info!("Moderation: {target_login} unbanned/untimedout in #{channel}");
     } else {
         let body_text = resp.text().await.unwrap_or_default();
-        warn!("helix_unban_user: HTTP {status} — {body_text}");
+        warn!("helix_unban_user: HTTP {status} - {body_text}");
         let helix_msg = serde_json::from_str::<serde_json::Value>(&body_text)
             .ok()
             .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_owned))
@@ -1923,11 +1971,17 @@ async fn fetch_user_profile(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
     }
 
     #[derive(serde::Deserialize)]
+    struct IvrStreamGame {
+        #[serde(rename = "displayName", default)]
+        display_name: String,
+    }
+
+    #[derive(serde::Deserialize)]
     struct IvrStream {
         #[serde(default)]
         title: String,
-        #[serde(default)]
-        game: String,
+        /// IVR v2 returns game as an object {displayName: "..."}.
+        game: Option<IvrStreamGame>,
         /// IVR uses "viewersCount" in v2.
         #[serde(rename = "viewersCount", default)]
         viewers_count: u64,
@@ -1998,7 +2052,10 @@ async fn fetch_user_profile(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
 
     let is_live          = user.stream.is_some();
     let stream_title     = user.stream.as_ref().map(|s| s.title.clone()).filter(|s| !s.is_empty());
-    let stream_game      = user.stream.as_ref().map(|s| s.game.clone()).filter(|s| !s.is_empty());
+    let stream_game      = user.stream.as_ref()
+        .and_then(|s| s.game.as_ref())
+        .map(|g| g.display_name.clone())
+        .filter(|s| !s.is_empty());
     let stream_viewers   = user.stream.as_ref().map(|s| s.viewers_count);
     let stream_started   = user.stream.as_ref().and_then(|s| s.started_at.clone());
     let last_broadcast_at = stream_started

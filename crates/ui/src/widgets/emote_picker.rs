@@ -337,7 +337,7 @@ impl EmotePicker {
                             }
                         }
 
-                        // Single hovered cell — click + tooltip
+                        // Single hovered cell - click + tooltip
                         if let Some((cat_idx, rect)) = hovered_entry {
                             let entry = &catalog[cat_idx];
                             let click_resp = ui.interact(

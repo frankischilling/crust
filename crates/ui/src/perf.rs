@@ -144,7 +144,7 @@ impl PerfOverlay {
                         ui.label(
                             RichText::new(format!("{repaint_pct:.1}% event-driven"))
                                 .color(if repaint_pct < 5.0 {
-                                    Color32::GREEN   // mostly idle — good
+                                    Color32::GREEN   // mostly idle - good
                                 } else {
                                     Color32::WHITE
                                 }),

@@ -5,13 +5,13 @@ use egui::{Color32, CornerRadius, FontId, Margin, Stroke, Vec2};
 
 // Palette colors
 
-/// Deepest background — window body, sidebar.
+/// Deepest background - window body, sidebar.
 pub const BG_BASE: Color32 = Color32::from_rgb(13, 13, 18);
-/// Slightly elevated surface — top bar, input tray.
+/// Slightly elevated surface - top bar, input tray.
 pub const BG_SURFACE: Color32 = Color32::from_rgb(20, 20, 28);
-/// Raised surface — popup backgrounds, autocomplete.
+/// Raised surface - popup backgrounds, autocomplete.
 pub const BG_RAISED: Color32 = Color32::from_rgb(28, 28, 40);
-/// Deeply elevated — dialog / window fill.
+/// Deeply elevated - dialog / window fill.
 pub const BG_DIALOG: Color32 = Color32::from_rgb(22, 22, 32);
 
 /// Subtle/default border.
@@ -21,17 +21,17 @@ pub const BORDER_ACCENT: Color32 = Color32::from_rgb(80, 70, 120);
 
 /// Primary text.
 pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(225, 225, 235);
-/// Secondary text — timestamps, hints, labels.
+/// Secondary text - timestamps, hints, labels.
 pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(130, 130, 148);
-/// Muted — very low-contrast information.
+/// Muted - very low-contrast information.
 pub const TEXT_MUTED: Color32 = Color32::from_rgb(72, 72, 90);
 
-/// Twitch-ish purple accent — buttons, highlights, username.
+/// Twitch-ish purple accent - buttons, highlights, username.
 pub const ACCENT: Color32 = Color32::from_rgb(145, 95, 255);
 /// Hover tint for accent buttons.
 pub const ACCENT_DIM: Color32 = Color32::from_rgb(100, 65, 190);
 
-/// Active channel row fill — translucent purple.
+/// Active channel row fill - translucent purple.
 pub const ACTIVE_CHANNEL_BG: Color32 = Color32::from_rgba_premultiplied(55, 38, 100, 100);
 /// Hover row fill for channel list.
 pub const HOVER_ROW_BG: Color32 = Color32::from_rgba_premultiplied(40, 40, 60, 80);
@@ -80,12 +80,12 @@ pub const CHANNEL_ROW_GAP: f32 = 2.0;
 
 // Typography styles
 
-/// Body text — chat messages, general labels.
+/// Body text - chat messages, general labels.
 pub fn body() -> FontId {
     FontId::proportional(13.5)
 }
 
-/// Small label — timestamps, system messages, secondary info.
+/// Small label - timestamps, system messages, secondary info.
 pub fn small() -> FontId {
     FontId::proportional(12.5)
 }

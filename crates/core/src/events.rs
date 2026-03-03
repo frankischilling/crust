@@ -118,7 +118,7 @@ pub enum AppEvent {
     UserProfileLoaded { profile: UserProfile },
     /// Mark all visible messages from a user as deleted (timeout / ban).
     UserMessagesCleared { channel: ChannelId, login: String },
-    /// USERSTATE received — badges, color and mod status for the logged-in user.
+    /// USERSTATE received - badges, color and mod status for the logged-in user.
     UserStateUpdated {
         channel: ChannelId,
         is_mod: bool,
@@ -146,6 +146,14 @@ pub enum AppEvent {
         /// Username of the account that auto-logs in on startup, if set.
         default: Option<String>,
     },
+    /// Channel emote catalog loaded (including 0 when none exist).
+    ChannelEmotesLoaded {
+        channel: ChannelId,
+        count: usize,
+    },
+    /// A batch of image prefetch tasks has been queued.  The loading screen
+    /// uses this to track progress vs `EmoteImageReady` completions.
+    ImagePrefetchQueued { count: usize },
 }
 
 // ConnectionState: connection status enumeration

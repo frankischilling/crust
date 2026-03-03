@@ -37,7 +37,7 @@ pub struct MessageList<'a> {
     emote_bytes: &'a HashMap<String, (u32, u32, Arc<[u8]>)>,
     /// For sending on-demand image-fetch requests (e.g. HD emote on hover).
     cmd_tx: &'a mpsc::Sender<AppCommand>,
-    /// Channel identifier — used for per-channel scroll state.
+    /// Channel identifier - used for per-channel scroll state.
     channel: &'a ChannelId,
     /// Cached link previews keyed by URL.
     link_previews: &'a HashMap<String, LinkPreview>,
@@ -152,10 +152,13 @@ impl<'a> MessageList<'a> {
             // ── Simple path: render every message, let egui handle layout ─
             // We also measure row heights here so the cache is pre-populated
             // when the channel crosses VIRTUAL_THRESHOLD.
+            let paused_key = egui::Id::new("scroll_paused").with(self.channel.as_str());
+            let scroll_paused: bool =
+                ui.ctx().data_mut(|d| d.get_temp(paused_key).unwrap_or(false));
             let mut sa = ScrollArea::vertical()
                 .id_salt(scroll_id)
                 .auto_shrink([false; 2])
-                .stick_to_bottom(forced_offset.is_none());
+                .stick_to_bottom(!scroll_paused && forced_offset.is_none());
             if let Some(offset) = forced_offset {
                 sa = sa.vertical_scroll_offset(offset);
             } else if first_render {
@@ -197,10 +200,13 @@ impl<'a> MessageList<'a> {
         // show_viewport gives us the currently-visible rect in content-local
         // coordinates.  We allocate dead space for off-screen rows and only
         // call render_message for rows whose y-range overlaps the viewport.
+        let paused_key = egui::Id::new("scroll_paused").with(self.channel.as_str());
+        let scroll_paused: bool =
+            ui.ctx().data_mut(|d| d.get_temp(paused_key).unwrap_or(false));
         let mut sa = ScrollArea::vertical()
             .id_salt(scroll_id)
             .auto_shrink([false; 2])
-            .stick_to_bottom(forced_offset.is_none());
+            .stick_to_bottom(!scroll_paused && forced_offset.is_none());
         if let Some(offset) = forced_offset {
             sa = sa.vertical_scroll_offset(offset);
         } else if first_render {
@@ -326,15 +332,20 @@ impl<'a> MessageList<'a> {
     }
 
     /// Show the floating "Resume scrolling" button when the user has scrolled up.
+    /// Also updates the per-channel `scroll_paused` flag used to gate `stick_to_bottom`.
     fn show_resume_button(
         &self,
         ui: &mut Ui,
         output: &egui::scroll_area::ScrollAreaOutput<()>,
         panel_rect: egui::Rect,
     ) {
+        let paused_key = egui::Id::new("scroll_paused").with(self.channel.as_str());
         let viewport_h = output.inner_rect.height();
         let max_scroll = (output.content_size.y - viewport_h).max(0.0);
         let at_bottom = max_scroll < 1.0 || output.state.offset.y >= max_scroll - 20.0;
+
+        // Keep the paused flag in sync with where the scroll actually is.
+        ui.ctx().data_mut(|d| d.insert_temp(paused_key, !at_bottom));
 
         if !at_bottom {
             // Paint a floating button on a foreground layer (no Area/Window needed)
@@ -362,6 +373,8 @@ impl<'a> MessageList<'a> {
             // Detect click on the painted rect
             let btn_response = ui.interact(btn_rect, Id::new("resume_scroll_btn"), egui::Sense::click());
             if btn_response.clicked() {
+                // Clear paused so stick_to_bottom re-engages next frame.
+                ui.ctx().data_mut(|d| d.insert_temp(paused_key, false));
                 // Immediately write the real max_scroll to the correct egui
                 // scroll-state key (output.id, not the salt), and set the
                 // snap flag so apply_snap keeps rewriting every frame until
@@ -401,7 +414,7 @@ impl<'a> MessageList<'a> {
             Color32::TRANSPARENT
         };
 
-        egui::Frame::new()
+        let msg_frame = egui::Frame::new()
             .fill(bg)
             .inner_margin(egui::Margin::symmetric(ROW_PAD_X as i8, ROW_PAD_Y as i8))
             .show(ui, |ui| {
@@ -410,7 +423,7 @@ impl<'a> MessageList<'a> {
                 if msg.flags.is_history {
                     ui.set_opacity(0.55);
                 }
-                // ── Context menu — registered FIRST so child widgets (images,
+                // ── Context menu - registered FIRST so child widgets (images,
                 // labels) have higher registration order and win egui's hover
                 // hit-test, keeping emote/badge tooltips functional.
                 // `ui.interact` does NOT move the cursor / allocate space.
@@ -448,8 +461,14 @@ impl<'a> MessageList<'a> {
                             egui::Sense::hover(),
                         );
                         ui.painter().rect_filled(stripe, 0.0, Color32::from_rgb(100, 65, 190));
-                        let body = if rep.parent_msg_body.len() > 80 {
-                            format!("{}…", &rep.parent_msg_body[..80])
+                        let body = if rep.parent_msg_body.chars().count() > 80 {
+                            // Find the byte offset of the 80th char boundary.
+                            let cut = rep.parent_msg_body
+                                .char_indices()
+                                .nth(80)
+                                .map(|(i, _)| i)
+                                .unwrap_or(rep.parent_msg_body.len());
+                            format!("{}…", &rep.parent_msg_body[..cut])
                         } else {
                             rep.parent_msg_body.clone()
                         };
@@ -499,7 +518,7 @@ impl<'a> MessageList<'a> {
                 // Use allocate_ui_with_layout with a constrained height hint
                 // (one emote row) instead of with_layout, because Align::Center
                 // in a horizontal layout causes egui to expand frame_size.y to
-                // fill the full available height — which for the first message
+                // fill the full available height - which for the first message
                 // in a ScrollArea means the entire viewport, creating huge gaps.
                 let wrap_width = ui.available_width();
                 ui.allocate_ui_with_layout(
@@ -509,7 +528,7 @@ impl<'a> MessageList<'a> {
                         ui.spacing_mut().item_spacing = egui::vec2(3.0, 1.0);
 
                     // Timestamp
-                        let ts = msg.timestamp.format("%H:%M").to_string();
+                        let ts = msg.timestamp.with_timezone(&chrono::Local).format("%H:%M").to_string();
                         ui.add(Label::new(
                             RichText::new(ts)
                                 .color(Color32::from_rgb(90, 90, 90))
@@ -531,7 +550,7 @@ impl<'a> MessageList<'a> {
                                     let size = fit_size(w, h, BADGE_SIZE);
                                     let tooltip_size = fit_size(w, h, TOOLTIP_BADGE_SIZE);
                                     let url_key = format!("bytes://{url}");
-                                    // Closures capture by reference — clones
+                                    // Closures capture by reference - clones
                                     // only happen when the tooltip is actually
                                     // shown (on hover), not every frame.
                                     self.show_image(ui, &url_key, raw, size)
@@ -557,7 +576,7 @@ impl<'a> MessageList<'a> {
                             .on_hover_text(&tooltip_label);
                         }
 
-                        // Sender name — clickable to open user profile card.
+                        // Sender name - clickable to open user profile card.
                         let name_color = sender_color(&msg.sender.color);
                         let name = if msg.flags.is_action {
                             format!("* {}", msg.sender.display_name)
@@ -573,7 +592,7 @@ impl<'a> MessageList<'a> {
                             )
                             .on_hover_text(format!("@{}", msg.sender.login));
                         if name_resp.clicked() {
-                            // Clone only when clicked — not every frame.
+                            // Clone only when clicked - not every frame.
                             let _ = self.cmd_tx.try_send(
                                 AppCommand::FetchUserProfile {
                                     login: msg.sender.login.clone(),
@@ -596,7 +615,7 @@ impl<'a> MessageList<'a> {
                             ));
                         }
 
-                        // Message spans — for deleted messages show the
+                        // Message spans - for deleted messages show the
                         // original content with strikethrough so moderator
                         // actions are visible without being prominent.
                         if msg.flags.is_deleted {
@@ -617,6 +636,15 @@ impl<'a> MessageList<'a> {
                     },
                 );
             });
+
+        // Left accent strip for mentions and highlights — a vivid 3 px bar on
+        // the left edge of the row so the eye finds them instantly in fast chat.
+        if msg.flags.is_mention || msg.flags.is_highlighted {
+            let r = msg_frame.response.rect;
+            let bar_col = if msg.flags.is_mention { t::ACCENT } else { Color32::from_rgb(255, 210, 30) };
+            let strip = egui::Rect::from_min_size(r.left_top(), egui::vec2(3.0, r.height()));
+            ui.painter().rect_filled(strip, 0.0, bar_col);
+        }
     }
 
     /// Render a compact system-event row (mod action, sub alert, raid, notice).
@@ -715,10 +743,10 @@ impl<'a> MessageList<'a> {
                     let size = fit_size(w, h, EMOTE_SIZE);
                     let url_key = format!("bytes://{url}");
 
-                    // Capture shared references — string/Arc clones only
+                    // Capture shared references - string/Arc clones only
                     // happen when the tooltip is actually shown (on hover).
-                    let emote_bytes = self.emote_bytes;  // &HashMap — Copy
-                    let cmd_tx      = self.cmd_tx;       // &Sender  — Copy
+                    let emote_bytes = self.emote_bytes;  // &HashMap - Copy
+                    let cmd_tx      = self.cmd_tx;       // &Sender  - Copy
 
                     self.show_image(ui, &url_key, raw, size)
                         .on_hover_ui(|ui| {
@@ -760,7 +788,7 @@ impl<'a> MessageList<'a> {
                             });
                         });
                 } else {
-                    // Image not yet loaded — show text code as placeholder
+                    // Image not yet loaded - show text code as placeholder
                     ui.add(Label::new(
                         RichText::new(code)
                             .italics()
@@ -832,7 +860,7 @@ impl<'a> MessageList<'a> {
                     ui.vertical(|ui| {
                         match preview {
                             None => {
-                                // Not yet fetched — show hostname + spinner.
+                                // Not yet fetched - show hostname + spinner.
                                 let host = url_hostname(url);
                                 ui.label(
                                     RichText::new(host)

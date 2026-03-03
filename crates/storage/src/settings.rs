@@ -130,7 +130,7 @@ impl SettingsStore {
     // --- Per-account token management ---
 
     /// Best-effort: write the token for `username` to the per-account keyring
-    /// slot only — does NOT touch the settings file.  Use this after
+    /// slot only - does NOT touch the settings file.  Use this after
     /// `save()` has already persisted the full settings struct so we avoid a
     /// second load→modify→save cycle.
     pub fn try_save_account_keyring(&self, username: &str, token: &str) {
@@ -216,7 +216,7 @@ impl SettingsStore {
         self.save(&settings)
     }
 
-    /// Try to save the token to the OS keyring only — does not touch the settings file.
+    /// Try to save the token to the OS keyring only - does not touch the settings file.
     pub fn try_save_keyring(&self, token: &str) {
         if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ENTRY) {
             if let Err(e) = entry.set_password(token) {

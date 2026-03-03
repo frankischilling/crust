@@ -108,6 +108,10 @@ impl EmoteProvider for BttvProvider {
             shared_emotes: Vec<BttvEmote>,
         }
         match self.client.get(&url).send().await {
+            Ok(resp) if !resp.status().is_success() => {
+                tracing::debug!("BTTV channel returned HTTP {} for {channel_id}", resp.status());
+                vec![]
+            }
             Ok(resp) => match resp.json::<BttvChannel>().await {
                 Ok(ch) => ch
                     .channel_emotes
@@ -208,6 +212,10 @@ impl EmoteProvider for FfzProvider {
 
         let url = format!("https://api.frankerfacez.com/v1/room/id/{channel_id}");
         match self.client.get(&url).send().await {
+            Ok(resp) if !resp.status().is_success() => {
+                tracing::debug!("FFZ channel returned HTTP {} for {channel_id}", resp.status());
+                vec![]
+            }
             Ok(resp) => match resp.json::<FfzRoom>().await {
                 Ok(r) => r
                     .sets
@@ -263,6 +271,10 @@ impl EmoteProvider for SevenTvProvider {
             emote_set: Option<EmoteSetResp>,
         }
         match self.client.get(&url).send().await {
+            Ok(r) if !r.status().is_success() => {
+                tracing::debug!("7TV channel returned HTTP {} for {channel_id}", r.status());
+                vec![]
+            }
             Ok(r) => match r.json::<UserResp>().await {
                 Ok(u) => {
                     if let Some(set) = u.emote_set {

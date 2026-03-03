@@ -169,7 +169,7 @@ impl<'a> ChatInput<'a> {
                         }
                     });
 
-                    // Text input — reserve space for emote button + Send button + 2 gaps
+                    // Text input - reserve space for emote button + Send button + 2 gaps
                     let reserve = t::BAR_H + 58.0 + t::TOOLBAR_SPACING.x * 2.0;
                     let text_width = (ui.available_width() - reserve).max(40.0);
                     let resp = ui.add_sized(
@@ -178,7 +178,10 @@ impl<'a> ChatInput<'a> {
                             .hint_text("Send a message...")
                             .text_color(t::TEXT_PRIMARY)
                             .margin(egui::Margin::symmetric(6, 6))
-                            .frame(true),
+                            .frame(true)
+                            // Prevent egui from cycling keyboard focus away on Tab;
+                            // we handle Tab ourselves for autocomplete.
+                            .lock_focus(true),
                     );
                     let text_edit_id = resp.id;
 
@@ -204,6 +207,10 @@ impl<'a> ChatInput<'a> {
                         }
                         if consumed_tab || consumed_enter {
                             accepted_emote = Some(matches[ac_sel as usize].code.clone());
+                        }
+                        // Keep focus on the text field while cycling through the AC list.
+                        if consumed_tab || consumed_up || consumed_down {
+                            ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                         }
                     } else {
                         ac_sel = 0;
@@ -254,6 +261,7 @@ impl<'a> ChatInput<'a> {
                                 let code = &ts.matches[ts.index];
                                 *buf = format!("{}{} ", ts.prefix, code);
                                 ts.expected_buf = buf.clone();
+                                move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
                                 ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                             }
 
@@ -301,6 +309,7 @@ impl<'a> ChatInput<'a> {
 
                             hs.expected_buf = buf.clone();
                             ui.ctx().data_mut(|d| d.insert_temp(hist_id, hs));
+                            move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
                             ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                         }
                     }
@@ -308,6 +317,7 @@ impl<'a> ChatInput<'a> {
                     // Replace the :query token with the accepted emote
                     if let Some(ref code) = accepted_emote {
                         replace_autocomplete_token(buf, code);
+                        move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
                         ui.ctx()
                             .memory_mut(|m| m.request_focus(text_edit_id));
                         ac_sel = 0;
@@ -365,6 +375,7 @@ impl<'a> ChatInput<'a> {
                             ui, &resp, &matches, ac_sel,
                         ) {
                             replace_autocomplete_token(buf, &clicked);
+                            move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
                             ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                             ui.ctx().data_mut(|d| d.insert_temp(ac_id, 0i32));
                         }
@@ -405,7 +416,7 @@ impl<'a> ChatInput<'a> {
             egui::epaint::StrokeKind::Outside,
         );
 
-        // Interactive child UI on the foreground layer — force vertical layout
+        // Interactive child UI on the foreground layer - force vertical layout
         let mut popup_ui = ui.new_child(
             egui::UiBuilder::new()
                 .layer_id(layer_id)
@@ -625,6 +636,16 @@ fn extract_colon_query(buf: &str) -> Option<&str> {
         }
     }
     None
+}
+
+/// Move the TextEdit cursor to `char_pos` (pass `buf.len()` for end-of-input).
+fn move_cursor_to_end(ctx: &egui::Context, id: egui::Id, char_pos: usize) {
+    use egui::text::{CCursor, CCursorRange};
+    if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
+        let cursor = CCursor::new(char_pos);
+        state.set_ccursor_range(Some(CCursorRange::one(cursor)));
+        egui::TextEdit::store_state(ctx, id, state);
+    }
 }
 
 /// Replace the `:query` at the end of the buffer with the emote code.

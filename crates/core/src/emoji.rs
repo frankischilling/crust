@@ -1,6 +1,6 @@
 //! Lightweight emoji detection and Twemoji URL generation.
 //!
-//! Does not aim to cover every emoji spec edge case — just the common
+//! Does not aim to cover every emoji spec edge case - just the common
 //! pictographic ranges that appear in Twitch chat.
 
 /// Returns `true` if `c` is a likely start of an emoji sequence.

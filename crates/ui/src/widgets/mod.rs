@@ -1,4 +1,6 @@
+pub mod analytics;
 pub mod channel_list;
+pub mod loading_screen;
 pub mod chat_input;
 pub mod emote_picker;
 pub mod join_dialog;

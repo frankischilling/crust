@@ -10,6 +10,8 @@ pub struct ChannelList<'a> {
     pub channels: &'a [ChannelId],
     pub active: Option<&'a ChannelId>,
     pub channel_states: &'a HashMap<ChannelId, ChannelState>,
+    /// Optional map of channel-login → is_live for drawing live status dots.
+    pub live_channels: Option<&'a HashMap<String, bool>>,
 }
 
 pub struct ChannelListResult {
@@ -151,6 +153,27 @@ impl<'a> ChannelList<'a> {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 4.0;
 
+                                // Live-status indicator dot (animated pulse when live)
+                                if let Some(live_map) = self.live_channels {
+                                    let login = ch.as_str().to_lowercase();
+                                    if let Some(&is_live) = live_map.get(&login) {
+                                        let dot_r = 3.5_f32;
+                                        let (dot_rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(dot_r * 2.0 + 2.0, dot_r * 2.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        let dot_col = if is_live {
+                                            let t = ui.input(|i| i.time) as f32;
+                                            let p = (t * 2.5_f32).sin() * 0.5 + 0.5;
+                                            let a = (160.0_f32 + p * 95.0) as u8;
+                                            Color32::from_rgba_unmultiplied(220, 65, 65, a)
+                                        } else {
+                                            Color32::from_rgba_unmultiplied(90, 90, 110, 70)
+                                        };
+                                        ui.painter().circle_filled(dot_rect.center(), dot_r, dot_col);
+                                    }
+                                }
+
                                 // Channel name label
                                 let name_text = if unread_mentions > 0 {
                                     RichText::new(format!("# {}", ch.as_str()))
@@ -186,7 +209,7 @@ impl<'a> ChannelList<'a> {
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
                                         if unread_mentions > 0 {
-                                            // Mentions / highlights badge — amber
+                                            // Mentions / highlights badge - amber
                                             let label = if unread_count > 99 {
                                                 "99+".to_owned()
                                             } else {
@@ -199,7 +222,7 @@ impl<'a> ChannelList<'a> {
                                                     .color(t::YELLOW),
                                             );
                                         } else if unread_count > 0 {
-                                            // Plain unreads badge — muted
+                                            // Plain unreads badge - muted
                                             let label = if unread_count > 99 {
                                                 "99+".to_owned()
                                             } else {
@@ -235,7 +258,7 @@ impl<'a> ChannelList<'a> {
                     }
                 }
 
-                // Trailing insert indicator — drop after the last row.
+                // Trailing insert indicator - drop after the last row.
                 if let Some(ref ds) = drag {
                     if ds.insert_before >= n {
                         let y = ui.cursor().min.y - t::CHANNEL_ROW_GAP * 0.5;

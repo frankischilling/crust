@@ -6,6 +6,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use tokio::sync::broadcast;
+
 use bytes::Bytes;
 use directories::ProjectDirs;
 use lru::LruCache;
@@ -41,6 +43,10 @@ pub struct EmoteCache {
 struct CacheInner {
     bytes: LruCache<AssetKey, (Bytes, Instant)>,
     index: HashMap<String, EmoteInfo>, // code → info
+    /// In-flight request coalescing: URL → broadcast sender.
+    /// While a network fetch is in progress for a URL, subsequent callers
+    /// subscribe to the same broadcast instead of issuing a duplicate request.
+    in_flight: HashMap<String, broadcast::Sender<Result<(u32, u32, Vec<u8>), String>>>,
 }
 
 impl EmoteCache {
@@ -56,6 +62,7 @@ impl EmoteCache {
                     std::num::NonZeroUsize::new(IN_MEMORY_CAPACITY).unwrap(),
                 ),
                 index: HashMap::new(),
+                in_flight: HashMap::new(),
             })),
             disk_dir,
             client: reqwest::Client::new(),
@@ -124,7 +131,7 @@ impl EmoteCache {
     }
 
     /// Fetch image bytes for a URL; return `(width, height, raw_bytes)`.
-    /// Image dimensions are read from the file header only — no full RGBA decode.
+    /// Image dimensions are read from the file header only - no full RGBA decode.
     /// egui's built-in loaders (WebP / GIF / Image) handle decoding + animation.
     ///
     /// Checks memory → disk → network in order, writing through on a cache miss.
@@ -159,22 +166,65 @@ impl EmoteCache {
             }
         }
 
-        // 3. Network.
-        debug!("Fetching emote image: {url}");
-        let resp = self.client.get(url).send().await?;
-        let raw_bytes = resp.bytes().await?.to_vec();
+        // 3. Network - with in-flight request coalescing.
+        //    If another task is already fetching this URL, subscribe to its
+        //    broadcast instead of issuing a duplicate request.
+        let url_key = url.to_owned();
+        let maybe_rx = {
+            let mut guard = self.inner.lock().unwrap();
+            if let Some(tx) = guard.in_flight.get(&url_key) {
+                Some(tx.subscribe())
+            } else {
+                // Register ourselves as the in-flight fetcher.
+                let (tx, _) = broadcast::channel(1);
+                guard.in_flight.insert(url_key.clone(), tx);
+                None
+            }
+            // guard dropped here - before any .await
+        };
 
-        // Write through to disk.
-        if let Some(parent) = disk_path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
+        if let Some(mut rx) = maybe_rx {
+            // Another task is already fetching this URL - just wait for its result.
+            return match rx.recv().await {
+                Ok(Ok(result)) => Ok(result),
+                Ok(Err(e)) => Err(EmoteError::Io(std::io::Error::other(e))),
+                Err(_) => Err(EmoteError::Io(std::io::Error::other("in-flight fetch dropped"))),
+            };
         }
-        let _ = tokio::fs::write(&disk_path, &raw_bytes).await;
 
-        let bytes: Bytes = raw_bytes.clone().into();
-        self.inner.lock().unwrap().bytes.put(mem_key, (bytes, Instant::now()));
+        debug!("Fetching emote image: {url}");
+        let fetch_result: Result<(u32, u32, Vec<u8>), EmoteError> = async {
+            let resp = self.client.get(url).send().await?;
+            let raw_bytes = resp.bytes().await?.to_vec();
 
-        let (w, h) = read_header_dims(&raw_bytes);
-        Ok((w, h, raw_bytes))
+            // Write through to disk.
+            if let Some(parent) = disk_path.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            let _ = tokio::fs::write(&disk_path, &raw_bytes).await;
+
+            {
+                let bytes: Bytes = raw_bytes.clone().into();
+                self.inner.lock().unwrap().bytes.put(mem_key, (bytes, Instant::now()));
+            }
+
+            let (w, h) = read_header_dims(&raw_bytes);
+            Ok((w, h, raw_bytes))
+        }.await;
+
+        // Notify waiters and remove in-flight entry.
+        {
+            let mut guard = self.inner.lock().unwrap();
+            if let Some(tx) = guard.in_flight.remove(&url_key) {
+                let broadcast_val = match &fetch_result {
+                    Ok(v) => Ok(v.clone()),
+                    Err(e) => Err(e.to_string()),
+                };
+                let _ = tx.send(broadcast_val);
+            }
+        }
+
+        fetch_result
     }
 
     /// Look up an emote by code – returns `(id, code, url, provider)` tuple
