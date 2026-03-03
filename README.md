@@ -1,8 +1,8 @@
 # crust
 
-A native Twitch chat client written in Rust.
+A native Twitch + Kick chat client written in Rust.
 
-`crust` is a hobby project inspired by Chatterino, built as a multi-crate Rust workspace with an `egui` desktop UI, a Twitch IRC/WebSocket session layer, emote provider integrations, and local settings/log storage.
+`crust` is a hobby project inspired by Chatterino, built as a multi-crate Rust workspace with an `egui` desktop UI, Twitch and Kick session layers, emote/badge integrations, and local settings/log storage.
 
 ## Screenshots
 
@@ -21,20 +21,24 @@ Active early-stage project. The app builds and runs, and core chat workflows are
 ## Features
 
 - Twitch IRC over WebSocket - anonymous and authenticated modes
-- Multi-channel tabs - join, leave, reorder channels
+- Kick chat over Pusher WebSocket (read-only)
+- Multi-channel tabs - join, leave, reorder channels (Twitch + Kick)
 - Multi-account support - add, switch, remove, and set a default account
 - Message rendering:
   - Twitch native emotes
   - Third-party emotes: BTTV, FFZ, 7TV (global + channel + personal sets)
+  - Kick emotes (Kick-native + inline tag fallback)
   - Animated emote support (GIF, WebP)
   - Emoji tokenization via Twemoji URLs
-  - Badge rendering (global + channel badges via IVR)
+  - Badge rendering:
+    - Twitch global + channel badges via IVR
+    - Kick badge image rendering with channel-level API fallback
   - URL and @mention detection
   - Highlighted and first-message indicators
 - Emote picker and `:` autocomplete with Tab completion
 - Reply flow (threaded replies)
 - Basic moderation: timeout, ban, unban
-- User profile popup with avatar, badges, account metadata, and recent messages
+- User profile popup with avatar, badges, account metadata, and recent messages (Twitch + Kick)
 - Link preview metadata fetch (Open Graph / Twitter card)
 - Message input history (arrow-key recall)
 - Local settings persistence and optional keyring-backed token storage
@@ -47,6 +51,7 @@ Active early-stage project. The app builds and runs, and core chat workflows are
 - `crates/ui` - `egui` application and widgets
 - `crates/core` - shared domain models, events, tokenizer/highlight/state
 - `crates/twitch` - IRC parser + Twitch session client/reconnect/rate limiting
+- `crates/kick` - Kick session client (Pusher), channel metadata and chat event parsing
 - `crates/emotes` - provider loaders and image cache (memory + disk)
 - `crates/storage` - settings/token + log storage
 
@@ -96,6 +101,11 @@ cargo run -p crust --release
 - To send messages, log in with a Twitch OAuth token in-app.
 - Multiple accounts are supported - switch accounts without restarting.
 - Token storage uses the OS keyring when available, with a settings-file fallback.
+- Kick currently runs in read-only mode (sending messages to Kick is not yet implemented).
+
+## Notes
+
+- Kick profile lookups use Kick public APIs. If a profile endpoint is temporarily unavailable/forbidden, the app falls back to a minimal profile card instead of hanging on loading.
 
 ## Data paths
 
