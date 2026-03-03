@@ -49,7 +49,12 @@ impl LoginDialog {
     }
 
     /// Keep the dialog's account list in sync with the application state.
-    pub fn update_accounts(&mut self, accounts: Vec<String>, active: Option<String>, default: Option<String>) {
+    pub fn update_accounts(
+        &mut self,
+        accounts: Vec<String>,
+        active: Option<String>,
+        default: Option<String>,
+    ) {
         self.accounts = accounts;
         self.active_account = active;
         self.default_account = default;
@@ -78,8 +83,13 @@ impl LoginDialog {
         // legacy `username` param so the dialog works even before the first
         // event arrives.
         let mut shown_accounts: Vec<String> = self.accounts.clone();
-        let active = self.active_account.clone()
-            .or_else(|| if logged_in { username.map(|s| s.to_owned()) } else { None });
+        let active = self.active_account.clone().or_else(|| {
+            if logged_in {
+                username.map(|s| s.to_owned())
+            } else {
+                None
+            }
+        });
         if let Some(ref uname) = active {
             if !shown_accounts.iter().any(|a| a == uname) {
                 shown_accounts.insert(0, uname.clone());
@@ -331,11 +341,9 @@ fn draw_account_row(
             if ui
                 .add_sized(
                     [56.0, t::BAR_H],
-                    egui::Button::new(
-                        RichText::new("Remove").font(t::small()).color(t::RED),
-                    )
-                    .fill(t::RED.gamma_multiply(0.08))
-                    .stroke(egui::Stroke::new(1.0, t::RED.gamma_multiply(0.3))),
+                    egui::Button::new(RichText::new("Remove").font(t::small()).color(t::RED))
+                        .fill(t::RED.gamma_multiply(0.08))
+                        .stroke(egui::Stroke::new(1.0, t::RED.gamma_multiply(0.3))),
                 )
                 .on_hover_text(format!("Remove {acc_name} from saved accounts"))
                 .clicked()

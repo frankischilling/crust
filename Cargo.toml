@@ -5,6 +5,7 @@ members = [
     "crates/ui",
     "crates/core",
     "crates/twitch",
+    "crates/kick",
     "crates/emotes",
     "crates/storage",
 ]
@@ -19,6 +20,8 @@ license = "MIT"
 # async runtime
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+tokio-native-tls = "0.3"
+native-tls = "0.2"
 futures-util = "0.3"
 
 # serialization

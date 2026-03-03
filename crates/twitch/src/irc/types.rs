@@ -42,13 +42,13 @@ fn unescape_tag_value(s: &str) -> String {
     while let Some(c) = chars.next() {
         if c == '\\' {
             match chars.next() {
-                Some('s')  => out.push(' '),
-                Some(':')  => out.push(';'),
+                Some('s') => out.push(' '),
+                Some(':') => out.push(';'),
                 Some('\\') => out.push('\\'),
-                Some('n')  => out.push('\n'),
-                Some('r')  => out.push('\r'),
-                Some(x)    => out.push(x),
-                None       => {}
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some(x) => out.push(x),
+                None => {}
             }
         } else {
             out.push(c);
@@ -78,9 +78,7 @@ impl IrcMessage {
 
     /// Extract nick from "nick!user@host" prefix.
     pub fn nick(&self) -> Option<&str> {
-        self.prefix
-            .as_deref()
-            .and_then(|p| p.split('!').next())
+        self.prefix.as_deref().and_then(|p| p.split('!').next())
     }
 }
 
@@ -117,7 +115,11 @@ pub fn parse_line(line: &str) -> Result<IrcMessage, TwitchError> {
     // Command
     let cmd_end = rest.find(' ').unwrap_or(rest.len());
     let command = rest[..cmd_end].to_owned();
-    rest = if cmd_end < rest.len() { &rest[cmd_end + 1..] } else { "" };
+    rest = if cmd_end < rest.len() {
+        &rest[cmd_end + 1..]
+    } else {
+        ""
+    };
 
     // Params
     let mut params = Vec::new();
@@ -129,10 +131,19 @@ pub fn parse_line(line: &str) -> Result<IrcMessage, TwitchError> {
         }
         let end = rest.find(' ').unwrap_or(rest.len());
         params.push(rest[..end].to_owned());
-        rest = if end < rest.len() { &rest[end + 1..] } else { "" };
+        rest = if end < rest.len() {
+            &rest[end + 1..]
+        } else {
+            ""
+        };
     }
 
-    Ok(IrcMessage { tags, prefix, command, params })
+    Ok(IrcMessage {
+        tags,
+        prefix,
+        command,
+        params,
+    })
 }
 
 /// Split a raw WebSocket text frame into individual IRC lines, then parse each.
@@ -172,7 +183,10 @@ mod tests {
     #[test]
     fn multi_frame() {
         let frame = "PING :tmi.twitch.tv\r\nPONG :tmi.twitch.tv\r\n";
-        let msgs: Vec<_> = split_and_parse(frame).into_iter().map(|r| r.unwrap()).collect();
+        let msgs: Vec<_> = split_and_parse(frame)
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
         assert_eq!(msgs.len(), 2);
     }
 }

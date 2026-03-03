@@ -58,9 +58,7 @@ impl EmoteCache {
 
         Ok(Self {
             inner: Arc::new(Mutex::new(CacheInner {
-                bytes: LruCache::new(
-                    std::num::NonZeroUsize::new(IN_MEMORY_CAPACITY).unwrap(),
-                ),
+                bytes: LruCache::new(std::num::NonZeroUsize::new(IN_MEMORY_CAPACITY).unwrap()),
                 index: HashMap::new(),
                 in_flight: HashMap::new(),
             })),
@@ -104,7 +102,9 @@ impl EmoteCache {
             if let Ok(data) = tokio::fs::read(&disk_path).await {
                 let bytes: Bytes = data.into();
                 let mut guard = self.inner.lock().unwrap();
-                guard.bytes.put(key.clone(), (bytes.clone(), Instant::now()));
+                guard
+                    .bytes
+                    .put(key.clone(), (bytes.clone(), Instant::now()));
                 return Ok(bytes);
             }
         }
@@ -121,7 +121,9 @@ impl EmoteCache {
         let _ = tokio::fs::write(&disk_path, &bytes).await;
 
         let mut guard = self.inner.lock().unwrap();
-        guard.bytes.put(key.clone(), (bytes.clone(), Instant::now()));
+        guard
+            .bytes
+            .put(key.clone(), (bytes.clone(), Instant::now()));
 
         Ok(bytes)
     }
@@ -137,7 +139,10 @@ impl EmoteCache {
     /// Checks memory → disk → network in order, writing through on a cache miss.
     pub async fn fetch_and_decode(&self, url: &str) -> Result<(u32, u32, Vec<u8>), EmoteError> {
         // Derive a stable disk path from a hash of the URL.
-        let disk_path = self.disk_dir.join("url").join(format!("{:016x}.bin", url_hash(url)));
+        let disk_path = self
+            .disk_dir
+            .join("url")
+            .join(format!("{:016x}.bin", url_hash(url)));
 
         // 1. Memory cache (keyed by a synthetic AssetKey derived from the URL hash).
         let mem_key = AssetKey {
@@ -161,7 +166,11 @@ impl EmoteCache {
             if let Ok(data) = tokio::fs::read(&disk_path).await {
                 let (w, h) = read_header_dims(&data);
                 let bytes: Bytes = data.clone().into();
-                self.inner.lock().unwrap().bytes.put(mem_key, (bytes, Instant::now()));
+                self.inner
+                    .lock()
+                    .unwrap()
+                    .bytes
+                    .put(mem_key, (bytes, Instant::now()));
                 return Ok((w, h, data));
             }
         }
@@ -188,7 +197,9 @@ impl EmoteCache {
             return match rx.recv().await {
                 Ok(Ok(result)) => Ok(result),
                 Ok(Err(e)) => Err(EmoteError::Io(std::io::Error::other(e))),
-                Err(_) => Err(EmoteError::Io(std::io::Error::other("in-flight fetch dropped"))),
+                Err(_) => Err(EmoteError::Io(std::io::Error::other(
+                    "in-flight fetch dropped",
+                ))),
             };
         }
 
@@ -205,12 +216,17 @@ impl EmoteCache {
 
             {
                 let bytes: Bytes = raw_bytes.clone().into();
-                self.inner.lock().unwrap().bytes.put(mem_key, (bytes, Instant::now()));
+                self.inner
+                    .lock()
+                    .unwrap()
+                    .bytes
+                    .put(mem_key, (bytes, Instant::now()));
             }
 
             let (w, h) = read_header_dims(&raw_bytes);
             Ok((w, h, raw_bytes))
-        }.await;
+        }
+        .await;
 
         // Notify waiters and remove in-flight entry.
         {

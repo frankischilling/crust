@@ -1,19 +1,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use egui::{
-    Color32, Id, Key, LayerId, Order, RichText, Ui, Vec2,
-};
+use egui::{Color32, Id, Key, LayerId, Order, RichText, Ui, Vec2};
 use image::DynamicImage;
 
-use crust_core::model::{ChannelId, EmoteCatalogEntry, ReplyInfo};
 use crate::commands::{
-    extract_slash_query,
-    replace_slash_token,
-    slash_command_matches,
-    SlashCommandInfo,
+    extract_slash_query, replace_slash_token, slash_command_matches, SlashCommandInfo,
 };
 use crate::theme as t;
+use crust_core::model::{ChannelId, EmoteCatalogEntry, ReplyInfo, IRC_SERVER_CONTROL_CHANNEL};
 
 const AUTOCOMPLETE_MAX: usize = 10;
 const AUTOCOMPLETE_EMOTE_SIZE: f32 = 20.0;
@@ -63,6 +58,8 @@ pub struct ChatInput<'a> {
     pub pending_reply: Option<&'a ReplyInfo>,
     /// Previously-sent messages for Up/Down recall.
     pub message_history: &'a [String],
+    /// All open channel tabs (used for `/join` channel suggestions on IRC).
+    pub known_channels: &'a [ChannelId],
 }
 
 /// Result from showing the chat input.
@@ -96,10 +93,8 @@ impl<'a> ChatInput<'a> {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         // Left accent stripe
-                        let (rect, _) = ui.allocate_exact_size(
-                            egui::vec2(2.0, 14.0),
-                            egui::Sense::hover(),
-                        );
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(2.0, 14.0), egui::Sense::hover());
                         ui.painter().rect_filled(rect, 0.0, t::ACCENT);
                         ui.label(
                             RichText::new(format!("↩  Replying to @{}", rep.parent_display_name))
@@ -112,17 +107,16 @@ impl<'a> ChatInput<'a> {
                         } else {
                             format!("\"{}\"", rep.parent_msg_body)
                         };
-                        ui.label(
-                            RichText::new(body).font(t::small()).color(t::TEXT_MUTED),
-                        );
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if ui.small_button("✕").on_hover_text("Dismiss reply").clicked() {
-                                    result.dismiss_reply = true;
-                                }
-                            },
-                        );
+                        ui.label(RichText::new(body).font(t::small()).color(t::TEXT_MUTED));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .small_button("✕")
+                                .on_hover_text("Dismiss reply")
+                                .clicked()
+                            {
+                                result.dismiss_reply = true;
+                            }
+                        });
                     });
                 });
         }
@@ -158,12 +152,15 @@ impl<'a> ChatInput<'a> {
                     // Pre-check autocompletes before TextEdit consumes keys.
                     let pre_emote_matches = find_autocomplete_matches(buf, self.emote_catalog);
                     let pre_slash_matches = find_slash_matches(buf);
-                    let autocomplete_active =
-                        !pre_emote_matches.is_empty() || !pre_slash_matches.is_empty();
+                    let pre_join_matches =
+                        find_join_channel_matches(buf, self.channel, self.known_channels);
+                    let autocomplete_active = !pre_emote_matches.is_empty()
+                        || !pre_slash_matches.is_empty()
+                        || !pre_join_matches.is_empty();
 
                     // Always consume Tab / Up / Down before TextEdit so they
                     // don't cause focus changes or unwanted behaviour.
-                    // Enter is only consumed when the colon-popup needs it.
+                    // Enter is only consumed when an autocomplete popup is active.
                     let mut consumed_tab = false;
                     let mut consumed_enter = false;
                     let mut consumed_up = false;
@@ -195,8 +192,7 @@ impl<'a> ChatInput<'a> {
                     let text_edit_id = resp.id;
 
                     // Read autocomplete selection index
-                    let mut ac_sel: i32 =
-                        ui.ctx().data_mut(|d| d.get_temp(ac_id).unwrap_or(0i32));
+                    let mut ac_sel: i32 = ui.ctx().data_mut(|d| d.get_temp(ac_id).unwrap_or(0i32));
 
                     // Recompute matches after TextEdit may have changed buf.
                     // Emote autocomplete takes priority over slash autocomplete.
@@ -206,9 +202,15 @@ impl<'a> ChatInput<'a> {
                     } else {
                         Vec::new()
                     };
+                    let join_matches = if matches.is_empty() && slash_matches.is_empty() {
+                        find_join_channel_matches(buf, self.channel, self.known_channels)
+                    } else {
+                        Vec::new()
+                    };
 
                     let mut accepted_emote: Option<String> = None;
                     let mut accepted_slash_cmd: Option<String> = None;
+                    let mut accepted_join_channel: Option<String> = None;
 
                     if !matches.is_empty() {
                         // ── Colon-autocomplete active ──
@@ -246,17 +248,34 @@ impl<'a> ChatInput<'a> {
                         if consumed_tab || consumed_up || consumed_down {
                             ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                         }
+                    } else if !join_matches.is_empty() {
+                        // ── `/join` channel autocomplete active ──
+                        let n = join_matches.len() as i32;
+                        ac_sel = ac_sel.clamp(0, n - 1);
+
+                        if consumed_up {
+                            ac_sel = (ac_sel - 1).rem_euclid(n);
+                        }
+                        if consumed_down {
+                            ac_sel = (ac_sel + 1).rem_euclid(n);
+                        }
+                        if consumed_tab || consumed_enter {
+                            accepted_join_channel = Some(join_matches[ac_sel as usize].clone());
+                        }
+                        if consumed_tab || consumed_up || consumed_down {
+                            ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
+                        }
                     } else {
                         ac_sel = 0;
 
                         // ── Bare-word Tab completion ──
                         let tab_id = Id::new("tab_complete_state");
                         if consumed_tab {
-                            let mut ts: TabState =
-                                ui.ctx().data_mut(|d| d.get_temp(tab_id).unwrap_or_default());
+                            let mut ts: TabState = ui
+                                .ctx()
+                                .data_mut(|d| d.get_temp(tab_id).unwrap_or_default());
 
-                            let continuing =
-                                !ts.matches.is_empty() && ts.expected_buf == *buf;
+                            let continuing = !ts.matches.is_empty() && ts.expected_buf == *buf;
 
                             if continuing {
                                 // Cycle to next match
@@ -272,9 +291,7 @@ impl<'a> ChatInput<'a> {
                                         .filter(|e| e.code.to_lowercase().starts_with(&wl))
                                         .map(|e| e.code.clone())
                                         .collect();
-                                    m.sort_by(|a, b| {
-                                        a.len().cmp(&b.len()).then_with(|| a.cmp(b))
-                                    });
+                                    m.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
                                     m.truncate(TAB_COMPLETE_MAX);
                                     if !m.is_empty() {
                                         ts = TabState {
@@ -303,15 +320,17 @@ impl<'a> ChatInput<'a> {
                         } else {
                             // Any non-Tab keystroke invalidates the tab session
                             if consumed_up || consumed_down || resp.changed() {
-                                ui.ctx().data_mut(|d| d.insert_temp(tab_id, TabState::default()));
+                                ui.ctx()
+                                    .data_mut(|d| d.insert_temp(tab_id, TabState::default()));
                             }
                         }
 
                         // ── Message history (Up / Down) ──
                         let hist_id = Id::new("msg_history_state");
                         if (consumed_up || consumed_down) && !self.message_history.is_empty() {
-                            let mut hs: HistState =
-                                ui.ctx().data_mut(|d| d.get_temp(hist_id).unwrap_or_default());
+                            let mut hs: HistState = ui
+                                .ctx()
+                                .data_mut(|d| d.get_temp(hist_id).unwrap_or_default());
 
                             // Detect user edits → reset history position
                             if hs.idx >= 0 && *buf != hs.expected_buf {
@@ -352,30 +371,38 @@ impl<'a> ChatInput<'a> {
                     if let Some(ref code) = accepted_emote {
                         replace_autocomplete_token(buf, code);
                         move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
-                        ui.ctx()
-                            .memory_mut(|m| m.request_focus(text_edit_id));
+                        ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                         ac_sel = 0;
                     }
                     if let Some(ref command) = accepted_slash_cmd {
                         replace_slash_token(buf, command);
                         move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
-                        ui.ctx()
-                            .memory_mut(|m| m.request_focus(text_edit_id));
+                        ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
+                        ac_sel = 0;
+                    }
+                    if let Some(ref channel_name) = accepted_join_channel {
+                        replace_join_arg_token(buf, channel_name);
+                        move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
+                        ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                         ac_sel = 0;
                     }
 
                     ui.ctx().data_mut(|d| d.insert_temp(ac_id, ac_sel));
 
                     // ── Send on Enter (only fires when we did NOT consume it) ──
-                    let enter_pressed = resp.lost_focus()
-                        && ui.input(|i| i.key_pressed(Key::Enter));
+                    let enter_pressed =
+                        resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
 
                     if enter_pressed && !buf.trim().is_empty() {
                         result.send = Some(buf.trim().to_owned());
                         buf.clear();
                         // Reset history navigation on send
-                        ui.ctx().data_mut(|d| d.insert_temp(Id::new("msg_history_state"), HistState::default()));
-                        ui.ctx().data_mut(|d| d.insert_temp(Id::new("tab_complete_state"), TabState::default()));
+                        ui.ctx().data_mut(|d| {
+                            d.insert_temp(Id::new("msg_history_state"), HistState::default())
+                        });
+                        ui.ctx().data_mut(|d| {
+                            d.insert_temp(Id::new("tab_complete_state"), TabState::default())
+                        });
                         resp.request_focus();
                     }
 
@@ -383,9 +410,7 @@ impl<'a> ChatInput<'a> {
                     if ui
                         .add_sized(
                             [t::BAR_H, t::BAR_H],
-                            egui::Button::new(
-                                RichText::new(":)").font(t::small()),
-                            ),
+                            egui::Button::new(RichText::new(":)").font(t::small())),
                         )
                         .on_hover_text("Emote picker")
                         .clicked()
@@ -397,9 +422,7 @@ impl<'a> ChatInput<'a> {
                     if ui
                         .add_sized(
                             [58.0, t::BAR_H],
-                            egui::Button::new(
-                                RichText::new("Send").font(t::small()),
-                            ),
+                            egui::Button::new(RichText::new("Send").font(t::small())),
                         )
                         .clicked()
                         && !buf.trim().is_empty()
@@ -409,22 +432,34 @@ impl<'a> ChatInput<'a> {
                     }
 
                     // ── Draw autocomplete popup above input ──────────
-                    let show_popup = (!matches.is_empty() || !slash_matches.is_empty())
-                        && (resp.has_focus() || accepted_emote.is_some() || accepted_slash_cmd.is_some());
+                    let show_popup = (!matches.is_empty()
+                        || !slash_matches.is_empty()
+                        || !join_matches.is_empty())
+                        && (resp.has_focus()
+                            || accepted_emote.is_some()
+                            || accepted_slash_cmd.is_some()
+                            || accepted_join_channel.is_some());
                     if show_popup {
                         if !matches.is_empty() {
-                            if let Some(clicked) = self.show_autocomplete_popup(
-                                ui, &resp, &matches, ac_sel,
-                            ) {
+                            if let Some(clicked) =
+                                self.show_autocomplete_popup(ui, &resp, &matches, ac_sel)
+                            {
                                 replace_autocomplete_token(buf, &clicked);
                                 move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
                                 ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                                 ui.ctx().data_mut(|d| d.insert_temp(ac_id, 0i32));
                             }
-                        } else if let Some(clicked) = self.show_slash_autocomplete_popup(
-                            ui, &resp, &slash_matches, ac_sel,
-                        ) {
+                        } else if let Some(clicked) =
+                            self.show_slash_autocomplete_popup(ui, &resp, &slash_matches, ac_sel)
+                        {
                             replace_slash_token(buf, &clicked);
+                            move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
+                            ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
+                            ui.ctx().data_mut(|d| d.insert_temp(ac_id, 0i32));
+                        } else if let Some(clicked) =
+                            self.show_join_autocomplete_popup(ui, &resp, &join_matches, ac_sel)
+                        {
+                            replace_join_arg_token(buf, &clicked);
                             move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
                             ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                             ui.ctx().data_mut(|d| d.insert_temp(ac_id, 0i32));
@@ -446,15 +481,13 @@ impl<'a> ChatInput<'a> {
         let input_rect = text_resp.rect;
         let popup_width = input_rect.width().min(350.0);
         let row_h = 28.0;
-        let popup_h =
-            (matches.len() as f32 * row_h).min(AUTOCOMPLETE_MAX as f32 * row_h) + 8.0;
+        let popup_h = (matches.len() as f32 * row_h).min(AUTOCOMPLETE_MAX as f32 * row_h) + 8.0;
         let popup_rect = egui::Rect::from_min_size(
             egui::pos2(input_rect.left(), input_rect.top() - popup_h - 4.0),
             egui::vec2(popup_width, popup_h),
         );
 
-        let layer_id =
-            LayerId::new(Order::Foreground, Id::new("emote_autocomplete_popup"));
+        let layer_id = LayerId::new(Order::Foreground, Id::new("emote_autocomplete_popup"));
         let painter = ui.ctx().layer_painter(layer_id);
 
         // Background + border
@@ -477,10 +510,12 @@ impl<'a> ChatInput<'a> {
 
         let mut clicked_emote: Option<String> = None;
         let static_id = Id::new("ac_static_frames");
-        let mut static_frames: HashMap<String, egui::TextureHandle> =
-            ui.ctx().data_mut(|d| d.get_temp(static_id).unwrap_or_default());
+        let mut static_frames: HashMap<String, egui::TextureHandle> = ui
+            .ctx()
+            .data_mut(|d| d.get_temp(static_id).unwrap_or_default());
 
         egui::ScrollArea::vertical()
+            .id_salt(text_resp.id.with("emote_ac_scroll"))
             .auto_shrink([false; 2])
             .show(&mut popup_ui, |ui| {
                 for (i, entry) in matches.iter().enumerate() {
@@ -528,16 +563,11 @@ impl<'a> ChatInput<'a> {
                                         }
 
                                         if let Some(tex) = static_frames.get(&entry.url) {
-                                            let size = fit_size(
-                                                w,
-                                                h,
-                                                AUTOCOMPLETE_EMOTE_SIZE,
+                                            let size = fit_size(w, h, AUTOCOMPLETE_EMOTE_SIZE);
+                                            let image_rect = egui::Rect::from_center_size(
+                                                slot_rect.center(),
+                                                size,
                                             );
-                                            let image_rect =
-                                                egui::Rect::from_center_size(
-                                                    slot_rect.center(),
-                                                    size,
-                                                );
                                             ui.painter().image(
                                                 tex.id(),
                                                 image_rect,
@@ -550,10 +580,8 @@ impl<'a> ChatInput<'a> {
                                         }
                                     } else {
                                         let size = fit_size(w, h, AUTOCOMPLETE_EMOTE_SIZE);
-                                        let image_rect = egui::Rect::from_center_size(
-                                            slot_rect.center(),
-                                            size,
-                                        );
+                                        let image_rect =
+                                            egui::Rect::from_center_size(slot_rect.center(), size);
                                         let url_key = format!("bytes://{}", entry.url);
                                         ui.put(
                                             image_rect,
@@ -579,7 +607,11 @@ impl<'a> ChatInput<'a> {
                                 } else {
                                     t::TEXT_SECONDARY
                                 };
-                                ui.label(RichText::new(&entry.code).color(code_color).font(t::small()));
+                                ui.label(
+                                    RichText::new(&entry.code)
+                                        .color(code_color)
+                                        .font(t::small()),
+                                );
 
                                 // Provider tag (right-aligned)
                                 ui.with_layout(
@@ -597,22 +629,16 @@ impl<'a> ChatInput<'a> {
 
                     // Make the row clickable on the foreground layer
                     let row_rect = frame_resp.response.rect;
-                    let click_resp =
-                        ui.interact(row_rect, row_id, egui::Sense::click());
+                    let click_resp = ui.interact(row_rect, row_id, egui::Sense::click());
 
                     // If an animated emote row is hovered, render its animated preview.
                     if click_resp.hovered() {
-                        if let Some(&(w, h, ref raw)) =
-                            self.emote_bytes.get(entry.url.as_str())
-                        {
+                        if let Some(&(w, h, ref raw)) = self.emote_bytes.get(entry.url.as_str()) {
                             if is_likely_animated_url(&entry.url) {
                                 let size = fit_size(w, h, AUTOCOMPLETE_EMOTE_SIZE);
                                 let preview_rect = egui::Rect::from_min_size(
                                     egui::pos2(row_rect.left() + 4.0, row_rect.top() + 2.0),
-                                    egui::vec2(
-                                        AUTOCOMPLETE_EMOTE_SIZE,
-                                        AUTOCOMPLETE_EMOTE_SIZE,
-                                    ),
+                                    egui::vec2(AUTOCOMPLETE_EMOTE_SIZE, AUTOCOMPLETE_EMOTE_SIZE),
                                 );
                                 let image_rect =
                                     egui::Rect::from_center_size(preview_rect.center(), size);
@@ -634,7 +660,8 @@ impl<'a> ChatInput<'a> {
                 }
             });
 
-        ui.ctx().data_mut(|d| d.insert_temp(static_id, static_frames));
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(static_id, static_frames));
 
         clicked_emote
     }
@@ -656,8 +683,7 @@ impl<'a> ChatInput<'a> {
             egui::vec2(popup_width, popup_h),
         );
 
-        let layer_id =
-            LayerId::new(Order::Foreground, Id::new("slash_autocomplete_popup"));
+        let layer_id = LayerId::new(Order::Foreground, Id::new("slash_autocomplete_popup"));
         let painter = ui.ctx().layer_painter(layer_id);
         painter.rect_filled(popup_rect, 6.0, t::BG_RAISED);
         painter.rect_stroke(
@@ -677,6 +703,7 @@ impl<'a> ChatInput<'a> {
 
         let mut clicked_cmd: Option<String> = None;
         egui::ScrollArea::vertical()
+            .id_salt(text_resp.id.with("slash_ac_scroll"))
             .auto_shrink([false; 2])
             .show(&mut popup_ui, |ui| {
                 for (i, entry) in matches.iter().enumerate() {
@@ -721,8 +748,7 @@ impl<'a> ChatInput<'a> {
                         });
 
                     let row_rect = frame_resp.response.rect;
-                    let click_resp =
-                        ui.interact(row_rect, row_id, egui::Sense::click());
+                    let click_resp = ui.interact(row_rect, row_id, egui::Sense::click());
                     if click_resp.clicked() {
                         clicked_cmd = Some(entry.name.to_owned());
                     }
@@ -730,6 +756,88 @@ impl<'a> ChatInput<'a> {
             });
 
         clicked_cmd
+    }
+
+    fn show_join_autocomplete_popup(
+        &self,
+        ui: &mut Ui,
+        text_resp: &egui::Response,
+        matches: &[String],
+        selected: i32,
+    ) -> Option<String> {
+        let input_rect = text_resp.rect;
+        let popup_width = input_rect.width().min(420.0);
+        let row_h = 22.0;
+        let popup_h =
+            (matches.len() as f32 * row_h).min(SLASH_AUTOCOMPLETE_MAX as f32 * row_h) + 8.0;
+        let popup_rect = egui::Rect::from_min_size(
+            egui::pos2(input_rect.left(), input_rect.top() - popup_h - 4.0),
+            egui::vec2(popup_width, popup_h),
+        );
+
+        let layer_id = LayerId::new(Order::Foreground, Id::new("join_autocomplete_popup"));
+        let painter = ui.ctx().layer_painter(layer_id);
+        painter.rect_filled(popup_rect, 6.0, t::BG_RAISED);
+        painter.rect_stroke(
+            popup_rect,
+            6.0,
+            egui::Stroke::new(1.0, t::BORDER_SUBTLE),
+            egui::epaint::StrokeKind::Outside,
+        );
+
+        let mut popup_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .layer_id(layer_id)
+                .max_rect(popup_rect.shrink(4.0))
+                .layout(egui::Layout::top_down(egui::Align::LEFT)),
+        );
+        popup_ui.set_clip_rect(popup_rect);
+
+        let mut clicked: Option<String> = None;
+        egui::ScrollArea::vertical()
+            .id_salt(text_resp.id.with("join_ac_scroll"))
+            .auto_shrink([false; 2])
+            .show(&mut popup_ui, |ui| {
+                for (i, channel) in matches.iter().enumerate() {
+                    let is_selected = i as i32 == selected;
+                    let row_id = Id::new("join_ac_row").with(i);
+                    let row_bg = if is_selected {
+                        t::ACTIVE_CHANNEL_BG
+                    } else {
+                        Color32::TRANSPARENT
+                    };
+
+                    let frame_resp = egui::Frame::new()
+                        .fill(row_bg)
+                        .corner_radius(3.0)
+                        .inner_margin(egui::Margin::symmetric(6, 2))
+                        .show(ui, |ui| {
+                            let col = if is_selected {
+                                t::TEXT_PRIMARY
+                            } else {
+                                t::ACCENT
+                            };
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(channel).font(t::small()).color(col).strong(),
+                                );
+                                ui.label(
+                                    RichText::new("Known IRC channel on this server")
+                                        .font(t::small())
+                                        .color(t::TEXT_MUTED),
+                                );
+                            });
+                        });
+
+                    let row_rect = frame_resp.response.rect;
+                    let click_resp = ui.interact(row_rect, row_id, egui::Sense::click());
+                    if click_resp.clicked() {
+                        clicked = Some(channel.clone());
+                    }
+                }
+            });
+
+        clicked
     }
 }
 
@@ -769,6 +877,100 @@ fn find_slash_matches(buf: &str) -> Vec<&'static SlashCommandInfo> {
         return Vec::new();
     };
     slash_command_matches(query, SLASH_AUTOCOMPLETE_MAX)
+}
+
+/// Find channel suggestions for `/join <channel>` on IRC server tabs.
+fn find_join_channel_matches(
+    buf: &str,
+    current_channel: &ChannelId,
+    known_channels: &[ChannelId],
+) -> Vec<String> {
+    if !current_channel.is_irc() {
+        return Vec::new();
+    }
+    let Some(query) = extract_join_query(buf) else {
+        return Vec::new();
+    };
+    let Some(current_target) = current_channel.irc_target() else {
+        return Vec::new();
+    };
+
+    let query_lower = query.trim_start_matches('#').to_ascii_lowercase();
+    let mut channels: Vec<String> = known_channels
+        .iter()
+        .filter_map(|ch| {
+            let t = ch.irc_target()?;
+            if t.host != current_target.host
+                || t.port != current_target.port
+                || t.tls != current_target.tls
+            {
+                return None;
+            }
+            if t.channel == IRC_SERVER_CONTROL_CHANNEL {
+                return None;
+            }
+            Some(t.channel)
+        })
+        .collect();
+
+    channels.sort();
+    channels.dedup();
+
+    if !query_lower.is_empty() {
+        channels.retain(|name| name.to_ascii_lowercase().contains(&query_lower));
+    }
+
+    channels.sort_by(|a, b| {
+        let a_lower = a.to_ascii_lowercase();
+        let b_lower = b.to_ascii_lowercase();
+        let a_prefix = a_lower.starts_with(&query_lower);
+        let b_prefix = b_lower.starts_with(&query_lower);
+        b_prefix
+            .cmp(&a_prefix)
+            .then_with(|| a.len().cmp(&b.len()))
+            .then_with(|| a_lower.cmp(&b_lower))
+    });
+
+    channels.truncate(SLASH_AUTOCOMPLETE_MAX);
+    channels
+        .into_iter()
+        .map(|name| format!("#{name}"))
+        .collect()
+}
+
+/// Extract the in-progress `/join` query token (without validation).
+fn extract_join_query(buf: &str) -> Option<&str> {
+    let trimmed_start = buf.trim_start();
+    if !trimmed_start.starts_with('/') {
+        return None;
+    }
+    let without_slash = &trimmed_start[1..];
+    let (cmd, rest) = without_slash.split_once(char::is_whitespace)?;
+    if !cmd.eq_ignore_ascii_case("join") {
+        return None;
+    }
+
+    let rest = rest.trim_start();
+    if rest.is_empty() {
+        return Some("");
+    }
+
+    // Stop suggesting after the first argument is complete.
+    if buf
+        .chars()
+        .last()
+        .map(|c| c.is_whitespace())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    let mut args = rest.split_whitespace();
+    let first = args.next()?;
+    if args.next().is_some() {
+        return None;
+    }
+    Some(first)
 }
 
 /// Extract the partial query after the last `:` in the buffer.
@@ -813,6 +1015,33 @@ fn replace_autocomplete_token(buf: &mut String, code: &str) {
             }
         }
     }
+}
+
+/// Replace the argument token of `/join` with the selected `#channel`.
+fn replace_join_arg_token(buf: &mut String, channel: &str) {
+    let leading_len = buf.len() - buf.trim_start().len();
+    let trimmed = &buf[leading_len..];
+    if !trimmed.starts_with('/') {
+        *buf = format!("/join {channel} ");
+        return;
+    }
+
+    let without_slash = &trimmed[1..];
+    if let Some((cmd, _rest)) = without_slash.split_once(char::is_whitespace) {
+        if cmd.eq_ignore_ascii_case("join") {
+            let mut out = String::with_capacity(buf.len() + channel.len() + 4);
+            out.push_str(&buf[..leading_len]);
+            out.push('/');
+            out.push_str(cmd);
+            out.push(' ');
+            out.push_str(channel);
+            out.push(' ');
+            *buf = out;
+            return;
+        }
+    }
+
+    *buf = format!("/join {channel} ");
 }
 
 fn provider_label(provider: &str) -> &'static str {

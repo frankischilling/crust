@@ -116,8 +116,7 @@ fn tokenize_free_text<F>(
     is_action: bool,
     emote_lookup: &F,
     out: &mut SmallVec<[Span; 8]>,
-)
-where
+) where
     F: Fn(&str) -> Option<(String, String, String, String, Option<String>)>,
 {
     // Split preserving whitespace so that spaces are kept in output
@@ -170,8 +169,7 @@ where
 
         // @mention?
         if trimmed.starts_with('@') && trimmed.len() > 1 {
-            let login = trimmed[1..]
-                .trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_');
+            let login = trimmed[1..].trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_');
             if !login.is_empty() {
                 out.push(Span::Mention {
                     login: login.to_owned(),
@@ -229,10 +227,15 @@ fn tokenize_with_emoji(word: &str, is_action: bool, out: &mut SmallVec<[Span; 8]
                     });
                 }
 
-                let emoji_text: String =
-                    codepoints.iter().filter_map(|&cp| char::from_u32(cp)).collect();
+                let emoji_text: String = codepoints
+                    .iter()
+                    .filter_map(|&cp| char::from_u32(cp))
+                    .collect();
                 let url = emoji::twemoji_url(&codepoints);
-                out.push(Span::Emoji { text: emoji_text, url });
+                out.push(Span::Emoji {
+                    text: emoji_text,
+                    url,
+                });
                 found_emoji = true;
             } else {
                 // Ambiguous BMP symbol (geometric shape, arrow, etc.) – plain text
@@ -262,16 +265,12 @@ fn tokenize_with_emoji(word: &str, is_action: bool, out: &mut SmallVec<[Span; 8]
 
 /// Build Twitch-native emote CDN URL (2x).
 pub fn twitch_emote_url(id: &str) -> String {
-    format!(
-        "https://static-cdn.jtvnw.net/emoticons/v2/{id}/default/dark/2.0"
-    )
+    format!("https://static-cdn.jtvnw.net/emoticons/v2/{id}/default/dark/2.0")
 }
 
 /// Build Twitch-native emote CDN URL at 4x scale for HD tooltips.
 pub fn twitch_emote_url_hd(id: &str) -> String {
-    format!(
-        "https://static-cdn.jtvnw.net/emoticons/v2/{id}/default/dark/4.0"
-    )
+    format!("https://static-cdn.jtvnw.net/emoticons/v2/{id}/default/dark/4.0")
 }
 
 /// Parse the raw `emotes` IRC tag value into structured positions.
@@ -294,14 +293,8 @@ pub fn parse_twitch_emotes_tag(tag: &str) -> Vec<TwitchEmotePos> {
         };
         for range in ranges.split(',') {
             let mut bounds = range.splitn(2, '-');
-            let start: usize = bounds
-                .next()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            let end: usize = bounds
-                .next()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(start);
+            let start: usize = bounds.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let end: usize = bounds.next().and_then(|s| s.parse().ok()).unwrap_or(start);
             out.push(TwitchEmotePos {
                 id: id.to_owned(),
                 start,
@@ -341,7 +334,10 @@ mod tests {
                 None
             }
         });
-        let emote_count = spans.iter().filter(|s| matches!(s, Span::Emote { .. })).count();
+        let emote_count = spans
+            .iter()
+            .filter(|s| matches!(s, Span::Emote { .. }))
+            .count();
         assert_eq!(emote_count, 1);
     }
 
@@ -359,11 +355,22 @@ mod tests {
     fn twitch_emotes_inline() {
         let text = "Kappa test Kappa";
         let emotes = vec![
-            TwitchEmotePos { id: "25".into(), start: 0, end: 4 },
-            TwitchEmotePos { id: "25".into(), start: 11, end: 15 },
+            TwitchEmotePos {
+                id: "25".into(),
+                start: 0,
+                end: 4,
+            },
+            TwitchEmotePos {
+                id: "25".into(),
+                start: 11,
+                end: 15,
+            },
         ];
         let spans = tokenize(text, false, &emotes, &|_| None);
-        let emote_count = spans.iter().filter(|s| matches!(s, Span::Emote { .. })).count();
+        let emote_count = spans
+            .iter()
+            .filter(|s| matches!(s, Span::Emote { .. }))
+            .count();
         assert_eq!(emote_count, 2);
     }
 }

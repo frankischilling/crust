@@ -1,8 +1,8 @@
 # crust
 
-A native Twitch + Kick chat client written in Rust.
+A native Twitch + Kick + IRC chat client written in Rust.
 
-`crust` is a hobby project inspired by Chatterino, built as a multi-crate Rust workspace with an `egui` desktop UI, Twitch and Kick session layers, emote/badge integrations, and local settings/log storage.
+`crust` is a hobby project inspired by Chatterino, built as a multi-crate Rust workspace with an `egui` desktop UI, Twitch/Kick/IRC session layers, emote/badge integrations, and local settings/log storage.
 
 ## Screenshots
 
@@ -22,7 +22,8 @@ Active early-stage project. The app builds and runs, and core chat workflows are
 
 - Twitch IRC over WebSocket - anonymous and authenticated modes
 - Kick chat over Pusher WebSocket (read-only)
-- Multi-channel tabs - join, leave, reorder channels (Twitch + Kick)
+- Generic IRC support (plain + TLS) via `irc://host[:port]/channel` and `ircs://host[:port]/channel`
+- Multi-channel tabs - join, leave, reorder channels (Twitch + Kick + IRC)
 - Multi-account support - add, switch, remove, and set a default account
 - Message rendering:
   - Twitch native emotes
@@ -102,6 +103,12 @@ cargo run -p crust --release
 - Multiple accounts are supported - switch accounts without restarting.
 - Token storage uses the OS keyring when available, with a settings-file fallback.
 - Kick currently runs in read-only mode (sending messages to Kick is not yet implemented).
+
+## Joining channels
+
+- Twitch: `channelname` or `twitch:channelname`
+- Kick: `kick:channelname`
+- IRC: `irc://host[:port]/channel` or `ircs://host[:port]/channel`
 
 ## Notes
 

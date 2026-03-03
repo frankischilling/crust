@@ -50,11 +50,26 @@ pub struct AppSettings {
     /// Account that auto-logs in on next startup.  Empty string = use last active.
     #[serde(default)]
     pub default_account: String,
+    /// Preferred nickname for generic IRC servers.
+    #[serde(default)]
+    pub irc_nick: String,
+    /// Enable Kick support (beta).
+    #[serde(default)]
+    pub enable_kick_beta: bool,
+    /// Enable generic IRC support (beta).
+    #[serde(default)]
+    pub enable_irc_beta: bool,
 }
 
-fn default_theme() -> String { "dark".to_owned() }
-fn default_font_size() -> f32 { 13.0 }
-fn bool_true() -> bool { true }
+fn default_theme() -> String {
+    "dark".to_owned()
+}
+fn default_font_size() -> f32 {
+    13.0
+}
+fn bool_true() -> bool {
+    true
+}
 
 impl Default for AppSettings {
     fn default() -> Self {
@@ -69,6 +84,9 @@ impl Default for AppSettings {
             oauth_token: String::new(),
             accounts: Vec::new(),
             default_account: String::new(),
+            irc_nick: String::new(),
+            enable_kick_beta: false,
+            enable_irc_beta: false,
         }
     }
 }
@@ -120,8 +138,7 @@ impl SettingsStore {
     }
 
     pub fn save(&self, settings: &AppSettings) -> Result<(), StorageError> {
-        let s = toml::to_string_pretty(settings)
-            .map_err(|e| StorageError::Serde(e.to_string()))?;
+        let s = toml::to_string_pretty(settings).map_err(|e| StorageError::Serde(e.to_string()))?;
         std::fs::write(&self.config_path, s)?;
         info!("Settings saved to {:?}", self.config_path);
         Ok(())
@@ -151,7 +168,11 @@ impl SettingsStore {
             }
         }
         let mut settings = self.load();
-        if let Some(acc) = settings.accounts.iter_mut().find(|a| a.username == username) {
+        if let Some(acc) = settings
+            .accounts
+            .iter_mut()
+            .find(|a| a.username == username)
+        {
             acc.oauth_token = token.to_owned();
         } else {
             settings.accounts.push(AccountEntry {
@@ -173,11 +194,17 @@ impl SettingsStore {
             }
         }
         let settings = self.load();
-        let t = settings.accounts.iter()
+        let t = settings
+            .accounts
+            .iter()
             .find(|a| a.username == username)
             .map(|a| a.oauth_token.clone())
             .unwrap_or_default();
-        if t.is_empty() { None } else { Some(t) }
+        if t.is_empty() {
+            None
+        } else {
+            Some(t)
+        }
     }
 
     /// Delete a saved account and its token entirely.
@@ -191,7 +218,9 @@ impl SettingsStore {
         settings.accounts.retain(|a| a.username != username);
         // If the deleted account was the active one, point to the next available.
         if settings.username == username {
-            settings.username = settings.accounts.first()
+            settings.username = settings
+                .accounts
+                .first()
                 .map(|a| a.username.clone())
                 .unwrap_or_default();
             settings.oauth_token = String::new();
@@ -236,7 +265,11 @@ impl SettingsStore {
         }
         // Fall back to settings file.
         let token = self.load().oauth_token;
-        if token.is_empty() { None } else { Some(token) }
+        if token.is_empty() {
+            None
+        } else {
+            Some(token)
+        }
     }
 
     pub fn delete_token(&self) -> Result<(), StorageError> {

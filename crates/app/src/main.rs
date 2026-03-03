@@ -9,23 +9,30 @@ use tracing_subscriber::EnvFilter;
 use chrono::Utc;
 use crust_core::events::{AppCommand, AppEvent, ConnectionState};
 use crust_core::model::{
-    Badge, ChannelId, ChatMessage, EmoteCatalogEntry, MessageFlags, MessageId, MsgKind, Sender, UserId,
-    UserProfile,
+    Badge, ChannelId, ChatMessage, EmoteCatalogEntry, MessageFlags, MessageId, MsgKind, Sender,
+    UserId, UserProfile,
 };
 use crust_emotes::{
     cache::EmoteCache,
     providers::{BttvProvider, EmoteInfo, FfzProvider, KickProvider, SevenTvProvider},
     EmoteProvider,
 };
-use crust_storage::{AppSettings, SettingsStore};
-use crust_twitch::{parse_line, parse_privmsg_irc, session::client::{SessionCommand, TwitchEvent, TwitchSession}};
 use crust_kick::session::{KickEvent, KickSession, KickSessionCommand};
+use crust_storage::{AppSettings, SettingsStore};
+use crust_twitch::session::generic_irc::{
+    is_raw_irc_protocol_line, GenericIrcEvent, GenericIrcSession, GenericIrcSessionCommand,
+};
+use crust_twitch::{
+    parse_line, parse_privmsg_irc,
+    session::client::{SessionCommand, TwitchEvent, TwitchSession},
+};
 use crust_ui::CrustApp;
 
 const CMD_CHANNEL_SIZE: usize = 128;
 const EVT_CHANNEL_SIZE: usize = 4096;
 const TWITCH_EVT_SIZE: usize = 4096;
 const KICK_EVT_SIZE: usize = 4096;
+const IRC_EVT_SIZE: usize = 4096;
 
 /// Counter for assigning unique IDs to history messages loaded from external APIs.
 /// Starts at u64::MAX/2 so it never clashes with live session IDs (which count up from 0).
@@ -37,8 +44,6 @@ type EmoteIndex = Arc<RwLock<std::collections::HashMap<String, EmoteInfo>>>;
 
 /// Shared badge map: (set_name, version) → image URL.
 type BadgeMap = Arc<RwLock<std::collections::HashMap<(String, String), String>>>;
-
-
 
 fn main() -> Result<()> {
     // SIGPIPE: handle broken pipe signals on Wayland
@@ -99,6 +104,10 @@ fn main() -> Result<()> {
     let (kick_evt_tx, kick_evt_rx) = mpsc::channel::<KickEvent>(KICK_EVT_SIZE);
     let (kick_cmd_tx, kick_cmd_rx) = mpsc::channel::<KickSessionCommand>(64);
 
+    // Generic IRC session channels
+    let (irc_evt_tx, irc_evt_rx) = mpsc::channel::<GenericIrcEvent>(IRC_EVT_SIZE);
+    let (irc_cmd_tx, irc_cmd_rx) = mpsc::channel::<GenericIrcSessionCommand>(128);
+
     // Emote index shared between loaders and reducer
     let emote_index: EmoteIndex = Arc::new(RwLock::new(std::collections::HashMap::new()));
 
@@ -114,18 +123,24 @@ fn main() -> Result<()> {
 
     // Settings / token storage
     let settings_store = SettingsStore::new().ok();
+    let initial_settings: AppSettings = settings_store
+        .as_ref()
+        .map(|s| s.load())
+        .unwrap_or_default();
+    let kick_runtime_enabled = initial_settings.enable_kick_beta;
+    let irc_runtime_enabled = initial_settings.enable_irc_beta;
     // Determine which account to auto-login as on startup:
     // prefer the explicitly pinned default_account, fall back to the last
     // active username, and finally fall back to the legacy single token.
     let saved_token = settings_store.as_ref().and_then(|s| {
-        let cfg = s.load();
-        let startup_user = if !cfg.default_account.is_empty() {
-            cfg.default_account.clone()
+        let startup_user = if !initial_settings.default_account.is_empty() {
+            initial_settings.default_account.clone()
         } else {
-            cfg.username.clone()
+            initial_settings.username.clone()
         };
         if !startup_user.is_empty() {
-            s.load_account_token(&startup_user).or_else(|| s.load_token())
+            s.load_account_token(&startup_user)
+                .or_else(|| s.load_token())
         } else {
             s.load_token()
         }
@@ -143,11 +158,21 @@ fn main() -> Result<()> {
         session.run()
     });
 
-    // Spawn Kick Pusher session
-    rt.spawn({
-        let session = KickSession::new(kick_evt_tx, kick_cmd_rx);
-        session.run()
-    });
+    // Spawn Kick Pusher session (beta, opt-in).
+    if kick_runtime_enabled {
+        rt.spawn({
+            let session = KickSession::new(kick_evt_tx, kick_cmd_rx);
+            session.run()
+        });
+    }
+
+    // Spawn generic IRC session manager (beta, opt-in).
+    if irc_runtime_enabled {
+        rt.spawn({
+            let session = GenericIrcSession::new(irc_evt_tx, irc_cmd_rx);
+            session.run()
+        });
+    }
 
     // Load global emotes in background
     rt.spawn({
@@ -177,16 +202,29 @@ fn main() -> Result<()> {
         let bm = badge_map.clone();
         let gc = global_emote_codes.clone();
         reducer_loop(
-            cmd_rx, tw_evt_rx, kick_evt_rx, evt_tx,
-            sess_cmd_tx, kick_cmd_tx,
-            idx, cache, bm, gc, settings_store, saved_token,
+            cmd_rx,
+            tw_evt_rx,
+            kick_evt_rx,
+            irc_evt_rx,
+            evt_tx,
+            sess_cmd_tx,
+            kick_cmd_tx,
+            irc_cmd_tx,
+            idx,
+            cache,
+            bm,
+            gc,
+            settings_store,
+            saved_token,
+            kick_runtime_enabled,
+            irc_runtime_enabled,
         )
     });
 
     // eframe / egui: UI framework initialization
     let native_opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Crust – Twitch & Kick Chat")
+            .with_title("Crust – Twitch, Kick & IRC Chat")
             .with_inner_size([1100.0, 700.0])
             .with_min_inner_size([600.0, 400.0])
             .with_app_id("crust"),
@@ -227,15 +265,19 @@ async fn reducer_loop(
     mut cmd_rx: mpsc::Receiver<AppCommand>,
     mut tw_rx: mpsc::Receiver<TwitchEvent>,
     mut kick_rx: mpsc::Receiver<KickEvent>,
+    mut irc_rx: mpsc::Receiver<GenericIrcEvent>,
     evt_tx: mpsc::Sender<AppEvent>,
     sess_tx: mpsc::Sender<SessionCommand>,
     kick_tx: mpsc::Sender<KickSessionCommand>,
+    irc_tx: mpsc::Sender<GenericIrcSessionCommand>,
     emote_index: EmoteIndex,
     emote_cache: Option<EmoteCache>,
     badge_map: BadgeMap,
     global_emote_codes: GlobalCodes,
     settings_store: Option<SettingsStore>,
     saved_token: Option<String>,
+    kick_runtime_enabled: bool,
+    irc_runtime_enabled: bool,
 ) {
     // Track URLs we've already queued for image download
     let mut pending_images: HashSet<String> = HashSet::new();
@@ -246,11 +288,12 @@ async fn reducer_loop(
     let mut auth_username: Option<String> = None;
     let mut auth_user_id: Option<String> = None;
     let mut local_msg_id: u64 = 1_000_000; // offset to avoid collisions with session IDs
-    // Helix API credentials extracted from the validate response.
-    // Required for moderation calls (timeout / ban) via POST /helix/moderation/bans.
+                                           // Helix API credentials extracted from the validate response.
+                                           // Required for moderation calls (timeout / ban) via POST /helix/moderation/bans.
     let mut helix_client_id: Option<String> = None;
     // Room-ids for every joined channel (broadcaster_id used by Helix API).
-    let mut channel_room_ids: std::collections::HashMap<ChannelId, String> = std::collections::HashMap::new();
+    let mut channel_room_ids: std::collections::HashMap<ChannelId, String> =
+        std::collections::HashMap::new();
 
     // Per-channel cache of the logged-in user's badges + color (from USERSTATE).
     let mut self_badges: HashMap<ChannelId, Vec<Badge>> = HashMap::new();
@@ -258,25 +301,14 @@ async fn reducer_loop(
 
     // Load persisted settings; track which channels are joined so we can
     // keep auto_join up to date and restore them after reconnects.
-    let mut settings: AppSettings = settings_store.as_ref()
+    let mut settings: AppSettings = settings_store
+        .as_ref()
         .map(|s| s.load())
         .unwrap_or_default();
+    let mut kick_beta_enabled = settings.enable_kick_beta;
+    let mut irc_beta_enabled = settings.enable_irc_beta;
     fn parse_saved_channel(raw: &str) -> Option<ChannelId> {
-        let entry = raw.trim();
-        if entry.is_empty() {
-            return None;
-        }
-        let id = if let Some((prefix, rest)) = entry.split_once(':') {
-            if prefix.eq_ignore_ascii_case("kick") {
-                ChannelId::kick(rest.trim().trim_start_matches('#'))
-            } else if prefix.eq_ignore_ascii_case("twitch") {
-                ChannelId::new(rest.trim())
-            } else {
-                ChannelId::new(entry)
-            }
-        } else {
-            ChannelId::new(entry)
-        };
+        let id = ChannelId::parse_user_input(raw)?;
         if id.display_name().is_empty() {
             None
         } else {
@@ -299,10 +331,31 @@ async fn reducer_loop(
         out
     }
 
-    let mut joined_channels: HashSet<String> = parsed_auto_join_channels(&settings)
-        .into_iter()
-        .map(|id| id.0)
+    let parsed_initial_channels = parsed_auto_join_channels(&settings);
+    let mut canonical_auto_join: Vec<String> = parsed_initial_channels
+        .iter()
+        .map(|id| id.0.clone())
         .collect();
+    canonical_auto_join.sort();
+    let mut existing_auto_join = settings.auto_join.clone();
+    existing_auto_join.sort();
+
+    // Rewrite auto-join on startup when invalid/legacy entries are present.
+    if canonical_auto_join != existing_auto_join {
+        info!(
+            "Sanitizing auto-join entries: {} -> {}",
+            existing_auto_join.len(),
+            canonical_auto_join.len()
+        );
+        settings.auto_join = canonical_auto_join.clone();
+        if let Some(store) = &settings_store {
+            if let Err(e) = store.save(&settings) {
+                warn!("Failed to save sanitized auto-join settings: {e}");
+            }
+        }
+    }
+
+    let mut joined_channels: HashSet<String> = canonical_auto_join.into_iter().collect();
 
     // Set to `true` whenever we explicitly send `SessionCommand::Authenticate`.
     // While this flag is set, `TwitchEvent::Connected` will skip re-joining
@@ -315,7 +368,11 @@ async fn reducer_loop(
     let mut auth_in_progress = false;
 
     /// Persist the current `joined_channels` set back to disk.
-    fn save_channels(store: &Option<SettingsStore>, settings: &mut AppSettings, channels: &HashSet<String>) {
+    fn save_channels(
+        store: &Option<SettingsStore>,
+        settings: &mut AppSettings,
+        channels: &HashSet<String>,
+    ) {
         settings.auto_join = channels.iter().cloned().collect();
         settings.auto_join.sort();
         if let Some(s) = store {
@@ -335,10 +392,12 @@ async fn reducer_loop(
     };
     if let (Some(token), uname) = (&saved_token, &startup_username) {
         if !token.is_empty() && !uname.is_empty() {
-            let _ = evt_tx.send(AppEvent::Authenticated {
-                username: uname.to_string(),
-                user_id: String::new(), // filled in properly when GLOBALUSERSTATE arrives
-            }).await;
+            let _ = evt_tx
+                .send(AppEvent::Authenticated {
+                    username: uname.to_string(),
+                    user_id: String::new(), // filled in properly when GLOBALUSERSTATE arrives
+                })
+                .await;
         }
     }
 
@@ -360,10 +419,9 @@ async fn reducer_loop(
                     }
                 }
                 auth_in_progress = true;
-                let _ = sess_tx.send(SessionCommand::Authenticate {
-                    token,
-                    nick: login,
-                }).await;
+                let _ = sess_tx
+                    .send(SessionCommand::Authenticate { token, nick: login })
+                    .await;
             }
             Err(ValidateError::Unauthorized) => {
                 // Token explicitly rejected by Twitch - safe to delete.
@@ -386,10 +444,72 @@ async fn reducer_loop(
     // Broadcast the initial account list so the UI knows about all saved
     // accounts immediately (e.g. after auto-login on startup).
     {
-        let account_names: Vec<String> = settings.accounts.iter().map(|a| a.username.clone()).collect();
-        let active = if settings.username.is_empty() { None } else { Some(settings.username.clone()) };
-        let default = if settings.default_account.is_empty() { None } else { Some(settings.default_account.clone()) };
-        let _ = evt_tx.send(AppEvent::AccountListUpdated { accounts: account_names, active, default }).await;
+        let account_names: Vec<String> = settings
+            .accounts
+            .iter()
+            .map(|a| a.username.clone())
+            .collect();
+        let active = if settings.username.is_empty() {
+            None
+        } else {
+            Some(settings.username.clone())
+        };
+        let default = if settings.default_account.is_empty() {
+            None
+        } else {
+            Some(settings.default_account.clone())
+        };
+        let _ = evt_tx
+            .send(AppEvent::AccountListUpdated {
+                accounts: account_names,
+                active,
+                default,
+            })
+            .await;
+    }
+
+    let _ = evt_tx
+        .send(AppEvent::BetaFeaturesUpdated {
+            kick_enabled: kick_beta_enabled,
+            irc_enabled: irc_beta_enabled,
+        })
+        .await;
+
+    // Configure preferred IRC nickname (if set).
+    if irc_runtime_enabled && irc_beta_enabled && !settings.irc_nick.trim().is_empty() {
+        let _ = irc_tx
+            .send(GenericIrcSessionCommand::SetNick(
+                settings.irc_nick.trim().to_owned(),
+            ))
+            .await;
+    }
+
+    // Restore IRC channels immediately. Generic IRC connections are opened
+    // lazily per-server as soon as join commands are sent.
+    if irc_runtime_enabled && irc_beta_enabled {
+        let irc_restore: Vec<ChannelId> = parsed_auto_join_channels(&settings)
+            .into_iter()
+            .filter(|id| id.is_irc())
+            .collect();
+        if !irc_restore.is_empty() {
+            info!(
+                "Restoring {} IRC channels from auto-join",
+                irc_restore.len()
+            );
+        }
+        for id in irc_restore {
+            let _ = evt_tx
+                .send(AppEvent::ChannelJoined {
+                    channel: id.clone(),
+                })
+                .await;
+            let _ = irc_tx
+                .send(GenericIrcSessionCommand::JoinChannel {
+                    channel: id,
+                    key: None,
+                })
+                .await;
+        }
     }
 
     loop {
@@ -732,6 +852,9 @@ async fn reducer_loop(
 
             // Kick Pusher event
             Some(kick_evt) = kick_rx.recv() => {
+                if !kick_runtime_enabled || !kick_beta_enabled {
+                    continue;
+                }
                 match kick_evt {
                     KickEvent::Connected => {
                         info!("Kick session connected");
@@ -918,13 +1041,182 @@ async fn reducer_loop(
                 }
             }
 
+            // Generic IRC event
+            Some(irc_evt) = irc_rx.recv() => {
+                if !irc_runtime_enabled || !irc_beta_enabled {
+                    continue;
+                }
+                match irc_evt {
+                    GenericIrcEvent::Connected { server } => {
+                        info!("IRC connected: {server}");
+                        if let Some(ch) = ChannelId::parse_user_input(&server) {
+                            let msg = make_system_message(
+                                local_msg_id,
+                                ch,
+                                format!("IRC connected: {server}"),
+                                Utc::now(),
+                                MsgKind::SystemInfo,
+                            );
+                            local_msg_id += 1;
+                            let _ = evt_tx
+                                .send(AppEvent::MessageReceived {
+                                    channel: msg.channel.clone(),
+                                    message: msg,
+                                })
+                                .await;
+                        }
+                    }
+                    GenericIrcEvent::Disconnected { server } => {
+                        info!("IRC disconnected: {server}");
+                        if let Some(ch) = ChannelId::parse_user_input(&server) {
+                            let msg = make_system_message(
+                                local_msg_id,
+                                ch,
+                                format!("IRC disconnected: {server}"),
+                                Utc::now(),
+                                MsgKind::SystemInfo,
+                            );
+                            local_msg_id += 1;
+                            let _ = evt_tx
+                                .send(AppEvent::MessageReceived {
+                                    channel: msg.channel.clone(),
+                                    message: msg,
+                                })
+                                .await;
+                        }
+                    }
+                    GenericIrcEvent::Reconnecting { server, attempt } => {
+                        info!("IRC reconnecting ({server}) attempt {attempt}");
+                        if let Some(ch) = ChannelId::parse_user_input(&server) {
+                            let msg = make_system_message(
+                                local_msg_id,
+                                ch,
+                                format!("IRC reconnecting ({server}) attempt {attempt}"),
+                                Utc::now(),
+                                MsgKind::SystemInfo,
+                            );
+                            local_msg_id += 1;
+                            let _ = evt_tx
+                                .send(AppEvent::MessageReceived {
+                                    channel: msg.channel.clone(),
+                                    message: msg,
+                                })
+                                .await;
+                        }
+                    }
+                    GenericIrcEvent::Error { server, message } => {
+                        warn!("IRC error ({server}): {message}");
+                        let _ = evt_tx.send(AppEvent::Error {
+                            context: format!("IRC ({server})"),
+                            message,
+                        }).await;
+                    }
+                    GenericIrcEvent::SystemNotice(notice) => {
+                        if let Some(ch) = notice.channel.clone() {
+                            let msg = make_system_message(
+                                local_msg_id, ch, notice.text.clone(), notice.timestamp,
+                                MsgKind::SystemInfo,
+                            );
+                            local_msg_id += 1;
+                            let _ = evt_tx.send(AppEvent::MessageReceived {
+                                channel: msg.channel.clone(),
+                                message: msg,
+                            }).await;
+                        }
+                    }
+                    GenericIrcEvent::ChatMessage(mut msg) => {
+                        // Tokenize for emotes/emoji/URLs
+                        let snapshot: std::collections::HashMap<String, EmoteInfo> = {
+                            let guard = emote_index.read().unwrap();
+                            guard.clone()
+                        };
+
+                        msg.spans = crust_core::format::tokenize(
+                            &msg.raw_text,
+                            msg.flags.is_action,
+                            &msg.twitch_emotes,
+                            &|code| {
+                                snapshot.get(code).map(|info| {
+                                    (
+                                        info.id.clone(),
+                                        info.code.clone(),
+                                        info.url_1x.clone(),
+                                        info.provider.clone(),
+                                        info.url_4x.clone().or_else(|| info.url_2x.clone()),
+                                    )
+                                })
+                            },
+                        );
+
+                        // Mention detection
+                        if let Some(ref uname) = auth_username {
+                            let uname_lower = uname.to_lowercase();
+                            let has_mention = msg.raw_text
+                                .to_lowercase()
+                                .contains(&format!("@{uname_lower}"));
+                            msg.flags.is_mention = has_mention;
+                        }
+
+                        for span in &msg.spans {
+                            let url = match span {
+                                crust_core::Span::Emote { url, .. } => Some(url.clone()),
+                                crust_core::Span::Emoji { url, .. } => Some(url.clone()),
+                                _ => None,
+                            };
+                            if let Some(url) = url {
+                                if !pending_images.contains(&url) {
+                                    pending_images.insert(url.clone());
+                                    let evt_tx = evt_tx.clone();
+                                    let cache = emote_cache.clone();
+                                    tokio::spawn(async move {
+                                        fetch_emote_image(&url, &cache, &evt_tx).await;
+                                    });
+                                }
+                            }
+                        }
+
+                        let channel = msg.channel.clone();
+                        let _ = evt_tx.send(AppEvent::MessageReceived {
+                            channel,
+                            message: msg,
+                        }).await;
+                    }
+                }
+            }
+
             // UI command
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
                     AppCommand::JoinChannel { channel } => {
                         if channel.is_kick() {
+                            if !kick_beta_enabled || !kick_runtime_enabled {
+                                let _ = evt_tx.send(AppEvent::Error {
+                                    context: "Kick".into(),
+                                    message: "Kick compatibility is disabled in Settings (beta).".into(),
+                                }).await;
+                                continue;
+                            }
                             info!("Joining Kick channel {}", channel.display_name());
                             let _ = kick_tx.send(KickSessionCommand::JoinChannel(channel.clone())).await;
+                        } else if channel.is_irc() {
+                            if !irc_beta_enabled || !irc_runtime_enabled {
+                                let _ = evt_tx.send(AppEvent::Error {
+                                    context: "IRC".into(),
+                                    message: "IRC compatibility is disabled in Settings (beta).".into(),
+                                }).await;
+                                continue;
+                            }
+                            let label = channel
+                                .irc_target()
+                                .map(|t| format!("{}:{} #{}", t.host, t.port, t.channel))
+                                .unwrap_or_else(|| channel.as_str().to_owned());
+                            info!("Joining IRC channel {label}");
+                            let _ = irc_tx
+                                .send(GenericIrcSessionCommand::JoinChannel {
+                                    channel: channel.clone(),
+                                    key: None,
+                                })
+                                .await;
                         } else {
                             info!("Joining #{channel}");
                             let _ = sess_tx.send(SessionCommand::JoinChannel(channel.clone())).await;
@@ -934,7 +1226,13 @@ async fn reducer_loop(
                             channel: channel.clone(),
                         }).await;
                         // Inject a single join confirmation into the feed.
-                        let platform_label = if channel.is_kick() { "Kick" } else { "Twitch" };
+                        let platform_label = if channel.is_kick() {
+                            "Kick"
+                        } else if channel.is_irc() {
+                            "IRC"
+                        } else {
+                            "Twitch"
+                        };
                         let join_msg = make_system_message(
                             local_msg_id,
                             channel.clone(),
@@ -951,10 +1249,64 @@ async fn reducer_loop(
                         joined_channels.insert(channel.0.to_lowercase());
                         save_channels(&settings_store, &mut settings, &joined_channels);
                     }
+                    AppCommand::JoinIrcChannel { channel, key } => {
+                        if !channel.is_irc() {
+                            continue;
+                        }
+                        if !irc_beta_enabled || !irc_runtime_enabled {
+                            let _ = evt_tx.send(AppEvent::Error {
+                                context: "IRC".into(),
+                                message: "IRC compatibility is disabled in Settings (beta).".into(),
+                            }).await;
+                            continue;
+                        }
+                        let label = channel
+                            .irc_target()
+                            .map(|t| format!("{}:{} #{}", t.host, t.port, t.channel))
+                            .unwrap_or_else(|| channel.as_str().to_owned());
+                        info!(
+                            "Joining IRC channel {}{}",
+                            label,
+                            key.as_deref()
+                                .filter(|k| !k.is_empty())
+                                .map(|_| " (keyed)")
+                                .unwrap_or("")
+                        );
+                        let _ = irc_tx
+                            .send(GenericIrcSessionCommand::JoinChannel {
+                                channel: channel.clone(),
+                                key: key.clone(),
+                            })
+                            .await;
+                        let _ = evt_tx
+                            .send(AppEvent::ChannelJoined {
+                                channel: channel.clone(),
+                            })
+                            .await;
+                        let join_msg = make_system_message(
+                            local_msg_id,
+                            channel.clone(),
+                            format!("Joined IRC channel: {}", channel.display_name()),
+                            chrono::Utc::now(),
+                            MsgKind::SystemInfo,
+                        );
+                        local_msg_id += 1;
+                        let _ = evt_tx
+                            .send(AppEvent::MessageReceived {
+                                channel: join_msg.channel.clone(),
+                                message: join_msg,
+                            })
+                            .await;
+                        joined_channels.insert(channel.0.to_lowercase());
+                        save_channels(&settings_store, &mut settings, &joined_channels);
+                    }
                     AppCommand::LeaveChannel { channel } => {
                         if channel.is_kick() {
                             info!("Leaving Kick channel {}", channel.display_name());
                             let _ = kick_tx.send(KickSessionCommand::LeaveChannel(channel.clone())).await;
+                        } else if channel.is_irc() {
+                            info!("Leaving IRC channel {}", channel.as_str());
+                            let _ = irc_tx.send(GenericIrcSessionCommand::LeaveChannel(channel.clone())).await;
                         } else {
                             info!("Leaving #{channel}");
                             let _ = sess_tx.send(SessionCommand::LeaveChannel(channel.clone())).await;
@@ -1254,21 +1606,121 @@ async fn reducer_loop(
                             default,
                         }).await;
                     }
+                    AppCommand::SetIrcNick { nick } => {
+                        let trimmed = nick.trim();
+                        if trimmed.is_empty() {
+                            let _ = evt_tx.send(AppEvent::Error {
+                                context: "IRC".into(),
+                                message: "Nickname cannot be empty.".into(),
+                            }).await;
+                            continue;
+                        }
+                        settings.irc_nick = trimmed.to_owned();
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save IRC nickname: {e}");
+                            }
+                        }
+                        if irc_beta_enabled && irc_runtime_enabled {
+                            let _ = irc_tx
+                                .send(GenericIrcSessionCommand::SetNick(trimmed.to_owned()))
+                                .await;
+                        }
+                    }
+                    AppCommand::SetBetaFeatures {
+                        kick_enabled,
+                        irc_enabled,
+                    } => {
+                        kick_beta_enabled = kick_enabled;
+                        irc_beta_enabled = irc_enabled;
+                        settings.enable_kick_beta = kick_enabled;
+                        settings.enable_irc_beta = irc_enabled;
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save beta feature flags: {e}");
+                            }
+                        }
+                        let _ = evt_tx
+                            .send(AppEvent::BetaFeaturesUpdated {
+                                kick_enabled,
+                                irc_enabled,
+                            })
+                            .await;
+
+                        if (kick_enabled && !kick_runtime_enabled)
+                            || (irc_enabled && !irc_runtime_enabled)
+                        {
+                            let _ = evt_tx.send(AppEvent::Error {
+                                context: "Settings".into(),
+                                message: "Restart Crust to apply newly enabled beta transports.".into(),
+                            }).await;
+                        }
+                    }
                     AppCommand::SendMessage { channel, text, reply_to_msg_id } => {
                         debug!("Sending message to #{channel}: {text}");
-                        if channel.is_kick() {
+                        if channel.is_irc_server_tab() {
+                            if !irc_beta_enabled || !irc_runtime_enabled {
+                                let _ = evt_tx.send(AppEvent::Error {
+                                    context: "IRC".into(),
+                                    message: "IRC compatibility is disabled in Settings (beta).".into(),
+                                }).await;
+                                continue;
+                            }
+                            if text.trim_start().starts_with('/')
+                                || is_raw_irc_protocol_line(&text)
+                            {
+                                // Allow IRC protocol slash commands (e.g. /list, /whois, /raw)
+                                // and raw lines (e.g. PRIVMSG #chan :text) directly from
+                                // the server tab.
+                                let _ = irc_tx
+                                    .send(GenericIrcSessionCommand::SendMessage(
+                                        channel.clone(),
+                                        text.clone(),
+                                    ))
+                                    .await;
+                            } else {
+                                let msg = make_system_message(
+                                    local_msg_id,
+                                    channel.clone(),
+                                    "Connected to IRC server. Use /join #channel to enter chat rooms.".to_owned(),
+                                    Utc::now(),
+                                    MsgKind::SystemInfo,
+                                );
+                                local_msg_id += 1;
+                                let _ = evt_tx.send(AppEvent::MessageReceived {
+                                    channel: channel.clone(),
+                                    message: msg,
+                                }).await;
+                            }
+                        } else if channel.is_kick() {
+                            if !kick_beta_enabled || !kick_runtime_enabled {
+                                let _ = evt_tx.send(AppEvent::Error {
+                                    context: "Kick".into(),
+                                    message: "Kick compatibility is disabled in Settings (beta).".into(),
+                                }).await;
+                                continue;
+                            }
                             // Kick message sending is not yet supported (requires OAuth)
                             let _ = evt_tx.send(AppEvent::Error {
                                 context: "Kick".into(),
                                 message: "Sending messages to Kick channels is not yet supported.".into(),
                             }).await;
+                        } else if channel.is_irc() {
+                            if !irc_beta_enabled || !irc_runtime_enabled {
+                                let _ = evt_tx.send(AppEvent::Error {
+                                    context: "IRC".into(),
+                                    message: "IRC compatibility is disabled in Settings (beta).".into(),
+                                }).await;
+                                continue;
+                            }
+                            let _ = irc_tx.send(GenericIrcSessionCommand::SendMessage(channel.clone(), text.clone())).await;
                         } else {
                             let _ = sess_tx.send(SessionCommand::SendMessage(channel.clone(), text.clone(), reply_to_msg_id)).await;
                         }
 
-                        // Local echo: show the sent message immediately (Twitch only for now)
+                        // Local echo: show the sent message immediately (Twitch only).
                         if let (Some(uname), Some(uid)) = (&auth_username, &auth_user_id) {
-                        if !channel.is_kick() {
+                        if channel.is_twitch() {
                             local_msg_id += 1;
                             let mut echo = ChatMessage {
                                 id: MessageId(local_msg_id),
@@ -1341,10 +1793,95 @@ async fn reducer_loop(
                             }
 
                             let _ = evt_tx.send(AppEvent::MessageReceived {
-                                channel,
+                                channel: channel.clone(),
                                 message: echo,
                             }).await;
                         }
+                        }
+
+                        // Local echo for generic IRC channels (servers may not echo PRIVMSG).
+                        if channel.is_irc()
+                            && !channel.is_irc_server_tab()
+                            && !text.trim_start().starts_with('/')
+                            && !is_raw_irc_protocol_line(&text)
+                        {
+                            local_msg_id += 1;
+                            let irc_nick = settings.irc_nick.trim();
+                            let display = if irc_nick.is_empty() { "you" } else { irc_nick };
+                            let mut echo = ChatMessage {
+                                id: MessageId(local_msg_id),
+                                server_id: None,
+                                timestamp: Utc::now(),
+                                channel: channel.clone(),
+                                sender: Sender {
+                                    user_id: UserId(display.to_owned()),
+                                    login: display.to_lowercase(),
+                                    display_name: display.to_owned(),
+                                    color: None,
+                                    badges: Vec::new(),
+                                },
+                                raw_text: text.clone(),
+                                spans: smallvec::SmallVec::new(),
+                                twitch_emotes: Vec::new(),
+                                flags: MessageFlags {
+                                    is_action: false,
+                                    is_highlighted: false,
+                                    is_deleted: false,
+                                    is_first_msg: false,
+                                    is_self: true,
+                                    is_mention: false,
+                                    custom_reward_id: None,
+                                    is_history: false,
+                                },
+                                reply: None,
+                                msg_kind: MsgKind::Chat,
+                            };
+
+                            let snapshot: std::collections::HashMap<String, EmoteInfo> = {
+                                let guard = emote_index.read().unwrap();
+                                guard.clone()
+                            };
+                            echo.spans = crust_core::format::tokenize(
+                                &echo.raw_text,
+                                false,
+                                &echo.twitch_emotes,
+                                &|code| {
+                                    snapshot.get(code).map(|info| {
+                                        (
+                                            info.id.clone(),
+                                            info.code.clone(),
+                                            info.url_1x.clone(),
+                                            info.provider.clone(),
+                                            info.url_4x.clone().or_else(|| info.url_2x.clone()),
+                                        )
+                                    })
+                                },
+                            );
+
+                            for span in &echo.spans {
+                                let url = match span {
+                                    crust_core::Span::Emote { url, .. } => Some(url.clone()),
+                                    crust_core::Span::Emoji { url, .. } => Some(url.clone()),
+                                    _ => None,
+                                };
+                                if let Some(url) = url {
+                                    if !pending_images.contains(&url) {
+                                        pending_images.insert(url.clone());
+                                        let evt_tx = evt_tx.clone();
+                                        let cache = emote_cache.clone();
+                                        tokio::spawn(async move {
+                                            fetch_emote_image(&url, &cache, &evt_tx).await;
+                                        });
+                                    }
+                                }
+                            }
+
+                            let _ = evt_tx
+                                .send(AppEvent::MessageReceived {
+                                    channel: channel.clone(),
+                                    message: echo,
+                                })
+                                .await;
                         }
                     }
                     AppCommand::FetchUserProfile { login } => {
@@ -1529,10 +2066,16 @@ async fn load_global_emotes(
     let (b, f, s) = tokio::join!(bttv.load_global(), ffz.load_global(), stv.load_global());
 
     let total = b.len() + f.len() + s.len();
-    info!("Loaded {total} global emotes (BTTV={}, FFZ={}, 7TV={})", b.len(), f.len(), s.len());
+    info!(
+        "Loaded {total} global emotes (BTTV={}, FFZ={}, 7TV={})",
+        b.len(),
+        f.len(),
+        s.len()
+    );
 
     // Collect URLs of the newly-loaded emotes for prefetching.
-    let new_urls: Vec<String> = f.iter()
+    let new_urls: Vec<String> = f
+        .iter()
         .chain(b.iter())
         .chain(s.iter())
         .map(|e| e.url_1x.clone())
@@ -1592,7 +2135,10 @@ async fn load_personal_7tv_emotes(
         info!("No personal 7TV emotes found for user-id {user_id}");
         return;
     }
-    info!("Loaded {} personal 7TV emotes for user-id {user_id}", emotes.len());
+    info!(
+        "Loaded {} personal 7TV emotes for user-id {user_id}",
+        emotes.len()
+    );
     let new_urls: Vec<String> = emotes.iter().map(|e| e.url_1x.clone()).collect();
     {
         let mut idx = index.write().unwrap();
@@ -1627,10 +2173,12 @@ async fn load_channel_emotes(
     let total = b.len() + f.len() + s.len();
     if total == 0 {
         warn!("No channel emotes found for #{channel_name}");
-        let _ = evt_tx.send(AppEvent::ChannelEmotesLoaded {
-            channel: ChannelId::new(channel_name),
-            count: 0,
-        }).await;
+        let _ = evt_tx
+            .send(AppEvent::ChannelEmotesLoaded {
+                channel: ChannelId::new(channel_name),
+                count: 0,
+            })
+            .await;
         return;
     }
     info!(
@@ -1641,7 +2189,8 @@ async fn load_channel_emotes(
     );
 
     // Collect URLs of the newly-loaded emotes for prefetching.
-    let new_urls: Vec<String> = f.iter()
+    let new_urls: Vec<String> = f
+        .iter()
         .chain(b.iter())
         .chain(s.iter())
         .map(|e| e.url_1x.clone())
@@ -1670,10 +2219,12 @@ async fn load_channel_emotes(
     // Send catalog snapshot to the UI
     send_emote_catalog(index, evt_tx, global_codes).await;
 
-    let _ = evt_tx.send(AppEvent::ChannelEmotesLoaded {
-        channel: ChannelId::new(channel_name),
-        count: total,
-    }).await;
+    let _ = evt_tx
+        .send(AppEvent::ChannelEmotesLoaded {
+            channel: ChannelId::new(channel_name),
+            count: total,
+        })
+        .await;
 
     // Eagerly prefetch only the newly-loaded channel emote images
     prefetch_emote_images(new_urls, cache, evt_tx);
@@ -1689,29 +2240,31 @@ async fn load_kick_channel_emotes(
     global_codes: &GlobalCodes,
 ) {
     let slug = channel.display_name().to_owned();
-    info!("Loading Kick emotes for {} (kick user-id {kick_user_id})", channel.display_name());
+    info!(
+        "Loading Kick emotes for {} (kick user-id {kick_user_id})",
+        channel.display_name()
+    );
 
     let kick = KickProvider::new();
     let stv = SevenTvProvider::new();
 
-    let (kick_emotes, stv_emotes) = tokio::join!(
-        kick.load_channel(&slug),
-        async {
-            if kick_user_id > 0 {
-                stv.load_kick_channel(&kick_user_id.to_string()).await
-            } else {
-                vec![]
-            }
-        },
-    );
+    let (kick_emotes, stv_emotes) = tokio::join!(kick.load_channel(&slug), async {
+        if kick_user_id > 0 {
+            stv.load_kick_channel(&kick_user_id.to_string()).await
+        } else {
+            vec![]
+        }
+    },);
 
     let total = kick_emotes.len() + stv_emotes.len();
     if total == 0 {
         warn!("No Kick emotes found for {}", channel.display_name());
-        let _ = evt_tx.send(AppEvent::ChannelEmotesLoaded {
-            channel: channel.clone(),
-            count: 0,
-        }).await;
+        let _ = evt_tx
+            .send(AppEvent::ChannelEmotesLoaded {
+                channel: channel.clone(),
+                count: 0,
+            })
+            .await;
         return;
     }
 
@@ -1722,7 +2275,8 @@ async fn load_kick_channel_emotes(
         stv_emotes.len(),
     );
 
-    let new_urls: Vec<String> = kick_emotes.iter()
+    let new_urls: Vec<String> = kick_emotes
+        .iter()
         .chain(stv_emotes.iter())
         .map(|e| e.url_1x.clone())
         .collect();
@@ -1746,10 +2300,12 @@ async fn load_kick_channel_emotes(
 
     send_emote_catalog(index, evt_tx, global_codes).await;
 
-    let _ = evt_tx.send(AppEvent::ChannelEmotesLoaded {
-        channel: channel.clone(),
-        count: total,
-    }).await;
+    let _ = evt_tx
+        .send(AppEvent::ChannelEmotesLoaded {
+            channel: channel.clone(),
+            count: total,
+        })
+        .await;
 
     prefetch_emote_images(new_urls, cache, evt_tx);
 }
@@ -1779,7 +2335,9 @@ async fn send_emote_catalog(
             })
             .collect()
     };
-    let _ = evt_tx.send(AppEvent::EmoteCatalogUpdated { emotes: entries }).await;
+    let _ = evt_tx
+        .send(AppEvent::EmoteCatalogUpdated { emotes: entries })
+        .await;
 }
 
 /// Eagerly prefetch emote images in the background so they're available
@@ -1789,7 +2347,9 @@ fn prefetch_emote_images(
     cache: &Option<EmoteCache>,
     evt_tx: &mpsc::Sender<AppEvent>,
 ) {
-    if urls.is_empty() { return; }
+    if urls.is_empty() {
+        return;
+    }
     info!("Prefetching {} emote images…", urls.len());
     let _ = evt_tx.try_send(AppEvent::ImagePrefetchQueued { count: urls.len() });
 
@@ -1849,11 +2409,15 @@ async fn load_global_badges(
                     let before: std::collections::HashSet<String> = map.values().cloned().collect();
                     parse_ivr_badge_response(&text, &mut map);
                     let after_count = map.len();
-                    let new: Vec<String> = map.values()
+                    let new: Vec<String> = map
+                        .values()
                         .filter(|u| !before.contains(*u))
                         .cloned()
                         .collect();
-                    info!("Loaded {} global badges via IVR", after_count - before.len());
+                    info!(
+                        "Loaded {} global badges via IVR",
+                        after_count - before.len()
+                    );
                     new
                 };
                 prefetch_badge_images(new_urls, cache, evt_tx);
@@ -1880,7 +2444,8 @@ async fn load_channel_badges(
                     let mut map = badge_map.write().unwrap();
                     let before: std::collections::HashSet<String> = map.values().cloned().collect();
                     parse_ivr_badge_response(&text, &mut map);
-                    let new: Vec<String> = map.values()
+                    let new: Vec<String> = map
+                        .values()
                         .filter(|u| !before.contains(*u))
                         .cloned()
                         .collect();
@@ -1893,7 +2458,10 @@ async fn load_channel_badges(
                 prefetch_badge_images(new_urls, cache, evt_tx);
             }
         }
-        Ok(resp) => warn!("IVR channel badges returned HTTP {} for room {room_id}", resp.status()),
+        Ok(resp) => warn!(
+            "IVR channel badges returned HTTP {} for room {room_id}",
+            resp.status()
+        ),
         Err(e) => warn!("Failed to load channel badges for room {room_id}: {e}"),
     }
 }
@@ -1905,7 +2473,9 @@ fn prefetch_badge_images(
     cache: &Option<EmoteCache>,
     evt_tx: &mpsc::Sender<AppEvent>,
 ) {
-    if urls.is_empty() { return; }
+    if urls.is_empty() {
+        return;
+    }
     info!("Prefetching {} badge images…", urls.len());
     let _ = evt_tx.try_send(AppEvent::ImagePrefetchQueued { count: urls.len() });
     let sem = Arc::new(tokio::sync::Semaphore::new(20));
@@ -1921,11 +2491,7 @@ fn prefetch_badge_images(
 }
 
 /// Fetch a single emote/emoji/badge image and send raw bytes to UI.
-async fn fetch_emote_image(
-    url: &str,
-    cache: &Option<EmoteCache>,
-    evt_tx: &mpsc::Sender<AppEvent>,
-) {
+async fn fetch_emote_image(url: &str, cache: &Option<EmoteCache>, evt_tx: &mpsc::Sender<AppEvent>) {
     let result = if let Some(cache) = cache {
         cache.fetch_and_decode(url).await
     } else {
@@ -1988,28 +2554,30 @@ async fn load_recent_messages(
     evt_tx: &mpsc::Sender<AppEvent>,
 ) {
     let ch = channel.trim_start_matches('#');
+    let channel_id = crust_core::model::ChannelId::new(ch);
 
     // NOTE: the correct path is /recent-messages/ (hyphen), not /recent_messages/.
-    let robotty_url = format!(
-        "https://recent-messages.robotty.de/api/v2/recent-messages/{ch}?limit=800"
-    );
-    let ivr_url = format!(
-        "https://logs.ivr.fi/channel/{ch}?json=1&reverse=true&limit=800"
-    );
+    let robotty_url =
+        format!("https://recent-messages.robotty.de/api/v2/recent-messages/{ch}?limit=800");
+    let ivr_url = format!("https://logs.ivr.fi/channel/{ch}?json=1&reverse=true&limit=800");
 
     let client = reqwest::Client::new();
 
     // Try robotty first; it covers all channels (including small ones).
     // Fall back to IVR if robotty fails or returns nothing.
     let raw_lines: Vec<String> = 'fetch: {
-        if let Ok(resp) = client.get(&robotty_url)
+        if let Ok(resp) = client
+            .get(&robotty_url)
             .header("Accept", "application/json")
-            .send().await
+            .send()
+            .await
         {
             if resp.status().is_success() {
                 if let Ok(text) = resp.text().await {
                     #[derive(serde::Deserialize)]
-                    struct RobottyResponse { messages: Vec<String> }
+                    struct RobottyResponse {
+                        messages: Vec<String>,
+                    }
                     if let Ok(p) = serde_json::from_str::<RobottyResponse>(&text) {
                         if !p.messages.is_empty() {
                             break 'fetch p.messages;
@@ -2019,16 +2587,22 @@ async fn load_recent_messages(
             }
         }
         // IVR fallback
-        match client.get(&ivr_url)
+        match client
+            .get(&ivr_url)
             .header("Accept", "application/json")
-            .send().await
+            .send()
+            .await
         {
             Ok(resp) if resp.status().is_success() => {
                 if let Ok(text) = resp.text().await {
                     #[derive(serde::Deserialize)]
-                    struct IvrMsg { raw: String }
+                    struct IvrMsg {
+                        raw: String,
+                    }
                     #[derive(serde::Deserialize)]
-                    struct IvrResp { messages: Vec<IvrMsg> }
+                    struct IvrResp {
+                        messages: Vec<IvrMsg>,
+                    }
                     if let Ok(mut p) = serde_json::from_str::<IvrResp>(&text) {
                         p.messages.reverse(); // IVR is newest-first
                         break 'fetch p.messages.into_iter().map(|m| m.raw).collect();
@@ -2036,12 +2610,30 @@ async fn load_recent_messages(
                 }
                 Vec::new()
             }
-            Ok(resp) => { warn!("chat-history: both sources failed for #{ch} (IVR HTTP {})", resp.status()); Vec::new() }
-            Err(e)   => { warn!("chat-history: both sources failed for #{ch}: {e}"); Vec::new() }
+            Ok(resp) => {
+                warn!(
+                    "chat-history: both sources failed for #{ch} (IVR HTTP {})",
+                    resp.status()
+                );
+                Vec::new()
+            }
+            Err(e) => {
+                warn!("chat-history: both sources failed for #{ch}: {e}");
+                Vec::new()
+            }
         }
     };
 
-    if raw_lines.is_empty() { return; }
+    if raw_lines.is_empty() {
+        info!("Loaded 0 historical messages for #{ch}");
+        let _ = evt_tx
+            .send(AppEvent::HistoryLoaded {
+                channel: channel_id,
+                messages: Vec::new(),
+            })
+            .await;
+        return;
+    }
 
     // ── Snapshot shared state once before the parse loop ────────────────────
     // Taking these locks inside the loop (800+ times) is expensive; snapshot
@@ -2071,7 +2663,9 @@ async fn load_recent_messages(
                 Ok(m) => m,
                 Err(_) => continue,
             };
-            if irc_msg.command != "PRIVMSG" { continue; }
+            if irc_msg.command != "PRIVMSG" {
+                continue;
+            }
 
             let id = HISTORY_MSG_ID.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             let mut msg = match parse_privmsg_irc(&irc_msg, local_nick_owned.as_deref(), id) {
@@ -2107,8 +2701,13 @@ async fn load_recent_messages(
             // Mention detection
             if let Some(ref nick) = local_nick_owned {
                 let nick_lower = nick.to_lowercase();
-                let has_mention = msg.raw_text.to_lowercase().contains(&format!("@{nick_lower}"));
-                let is_reply_to_me = msg.reply.as_ref()
+                let has_mention = msg
+                    .raw_text
+                    .to_lowercase()
+                    .contains(&format!("@{nick_lower}"));
+                let is_reply_to_me = msg
+                    .reply
+                    .as_ref()
                     .map(|r| r.parent_user_login.to_lowercase() == nick_lower)
                     .unwrap_or(false);
                 msg.flags.is_mention = has_mention || is_reply_to_me;
@@ -2122,21 +2721,36 @@ async fn load_recent_messages(
                     _ => None,
                 };
                 if let Some(u) = url {
-                    if seen_urls.insert(u.clone()) { image_urls.push(u); }
+                    if seen_urls.insert(u.clone()) {
+                        image_urls.push(u);
+                    }
                 }
             }
             for badge in &msg.sender.badges {
                 if let Some(ref u) = badge.url {
-                    if seen_urls.insert(u.clone()) { image_urls.push(u.clone()); }
+                    if seen_urls.insert(u.clone()) {
+                        image_urls.push(u.clone());
+                    }
                 }
             }
 
             messages.push(msg);
         }
         (messages, image_urls)
-    }).await.unwrap_or_default();
+    })
+    .await
+    .unwrap_or_default();
 
-    if messages.is_empty() { return; }
+    if messages.is_empty() {
+        info!("Loaded 0 historical messages for #{ch}");
+        let _ = evt_tx
+            .send(AppEvent::HistoryLoaded {
+                channel: channel_id,
+                messages,
+            })
+            .await;
+        return;
+    }
 
     info!("Loaded {} historical messages for #{ch}", messages.len());
 
@@ -2147,8 +2761,12 @@ async fn load_recent_messages(
         prefetch_emote_images(image_urls, emote_cache, evt_tx);
     }
 
-    let channel_id = crust_core::model::ChannelId::new(ch);
-    let _ = evt_tx.send(AppEvent::HistoryLoaded { channel: channel_id, messages }).await;
+    let _ = evt_tx
+        .send(AppEvent::HistoryLoaded {
+            channel: channel_id,
+            messages,
+        })
+        .await;
 }
 
 // Token validation
@@ -2170,11 +2788,17 @@ async fn helix_ban_user(
     evt_tx: mpsc::Sender<AppEvent>,
 ) {
     let (Some(cid), Some(bid), Some(mid)) = (client_id, broadcaster_id, moderator_id) else {
-        warn!("helix_ban_user: missing credentials (cid={:?} bid={:?} mid={:?})", client_id, broadcaster_id, moderator_id);
-        let _ = evt_tx.send(AppEvent::Error {
-            context: "Moderation".into(),
-            message: "Cannot moderate: missing Twitch credentials. Reconnect and try again.".into(),
-        }).await;
+        warn!(
+            "helix_ban_user: missing credentials (cid={:?} bid={:?} mid={:?})",
+            client_id, broadcaster_id, moderator_id
+        );
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Moderation".into(),
+                message: "Cannot moderate: missing Twitch credentials. Reconnect and try again."
+                    .into(),
+            })
+            .await;
         return;
     };
 
@@ -2192,7 +2816,9 @@ async fn helix_ban_user(
         reason: Option<&'a str>,
     }
     #[derive(serde::Serialize)]
-    struct BanBody<'a> { data: BanData<'a> }
+    struct BanBody<'a> {
+        data: BanData<'a>,
+    }
 
     let body = BanBody {
         data: BanData {
@@ -2214,10 +2840,12 @@ async fn helix_ban_user(
         Ok(r) => r,
         Err(e) => {
             warn!("helix_ban_user: request failed: {e}");
-            let _ = evt_tx.send(AppEvent::Error {
-                context: "Moderation".into(),
-                message: format!("Moderation request failed: {e}"),
-            }).await;
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Moderation".into(),
+                    message: format!("Moderation request failed: {e}"),
+                })
+                .await;
             return;
         }
     };
@@ -2226,10 +2854,15 @@ async fn helix_ban_user(
     if status.is_success() {
         let verb = if duration_secs.is_some() {
             let secs = duration_secs.unwrap();
-            let (n, unit) = if secs < 60 { (secs, "s") }
-                else if secs < 3600 { (secs / 60, "m") }
-                else if secs < 86400 { (secs / 3600, "h") }
-                else { (secs / 86400, "d") };
+            let (n, unit) = if secs < 60 {
+                (secs, "s")
+            } else if secs < 3600 {
+                (secs / 60, "m")
+            } else if secs < 86400 {
+                (secs / 3600, "h")
+            } else {
+                (secs / 86400, "d")
+            };
             format!("timed out for {n}{unit}")
         } else {
             "permanently banned".into()
@@ -2243,11 +2876,17 @@ async fn helix_ban_user(
             .ok()
             .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_owned))
             .unwrap_or_else(|| format!("HTTP {status}"));
-        let action = if duration_secs.is_some() { "timeout" } else { "ban" };
-        let _ = evt_tx.send(AppEvent::Error {
-            context: "Moderation".into(),
-            message: format!("Could not {action} {target_login}: {helix_msg}"),
-        }).await;
+        let action = if duration_secs.is_some() {
+            "timeout"
+        } else {
+            "ban"
+        };
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Moderation".into(),
+                message: format!("Could not {action} {target_login}: {helix_msg}"),
+            })
+            .await;
     }
 }
 
@@ -2264,10 +2903,13 @@ async fn helix_unban_user(
 ) {
     let (Some(cid), Some(bid), Some(mid)) = (client_id, broadcaster_id, moderator_id) else {
         warn!("helix_unban_user: missing credentials");
-        let _ = evt_tx.send(AppEvent::Error {
-            context: "Moderation".into(),
-            message: "Cannot unban: missing Twitch credentials. Reconnect and try again.".into(),
-        }).await;
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Moderation".into(),
+                message: "Cannot unban: missing Twitch credentials. Reconnect and try again."
+                    .into(),
+            })
+            .await;
         return;
     };
 
@@ -2288,10 +2930,12 @@ async fn helix_unban_user(
         Ok(r) => r,
         Err(e) => {
             warn!("helix_unban_user: request failed: {e}");
-            let _ = evt_tx.send(AppEvent::Error {
-                context: "Moderation".into(),
-                message: format!("Unban request failed: {e}"),
-            }).await;
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Moderation".into(),
+                    message: format!("Unban request failed: {e}"),
+                })
+                .await;
             return;
         }
     };
@@ -2306,10 +2950,12 @@ async fn helix_unban_user(
             .ok()
             .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_owned))
             .unwrap_or_else(|| format!("HTTP {status}"));
-        let _ = evt_tx.send(AppEvent::Error {
-            context: "Moderation".into(),
-            message: format!("Could not unban {target_login}: {helix_msg}"),
-        }).await;
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Moderation".into(),
+                message: format!("Could not unban {target_login}: {helix_msg}"),
+            })
+            .await;
     }
 }
 
@@ -2360,7 +3006,9 @@ async fn validate_token(token: &str) -> Result<ValidateInfo, ValidateError> {
         return Err(ValidateError::Unauthorized);
     }
     if !status.is_success() {
-        return Err(ValidateError::Transient(format!("Token rejected (HTTP {status})")));
+        return Err(ValidateError::Transient(format!(
+            "Token rejected (HTTP {status})"
+        )));
     }
 
     #[derive(serde::Deserialize)]
@@ -2372,14 +3020,13 @@ async fn validate_token(token: &str) -> Result<ValidateInfo, ValidateError> {
         client_id: String,
     }
 
-    let body = resp
-        .json::<ValidateResponse>()
-        .await
-        .map_err(|e| ValidateError::Transient(format!("Failed to parse validation response: {e}")))?;
+    let body = resp.json::<ValidateResponse>().await.map_err(|e| {
+        ValidateError::Transient(format!("Failed to parse validation response: {e}"))
+    })?;
 
     Ok(ValidateInfo {
-        login:     body.login,
-        user_id:   body.user_id,
+        login: body.login,
+        user_id: body.user_id,
         client_id: body.client_id,
     })
 }
@@ -2394,6 +3041,12 @@ async fn fetch_user_profile_for_channel(
 ) {
     if channel.is_kick() {
         fetch_kick_user_profile(login, evt_tx).await;
+    } else if channel.is_irc() {
+        let _ = evt_tx
+            .send(AppEvent::UserProfileUnavailable {
+                login: login.to_owned(),
+            })
+            .await;
     } else {
         fetch_twitch_user_profile(login, evt_tx).await;
     }
@@ -2479,16 +3132,20 @@ async fn fetch_twitch_user_profile(login: &str, evt_tx: mpsc::Sender<AppEvent>) 
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
             warn!("IVR user fetch returned HTTP {} for {login}", r.status());
-            let _ = evt_tx.send(AppEvent::UserProfileUnavailable {
-                login: login.to_owned(),
-            }).await;
+            let _ = evt_tx
+                .send(AppEvent::UserProfileUnavailable {
+                    login: login.to_owned(),
+                })
+                .await;
             return;
         }
         Err(e) => {
             warn!("IVR user fetch failed for {login}: {e}");
-            let _ = evt_tx.send(AppEvent::UserProfileUnavailable {
-                login: login.to_owned(),
-            }).await;
+            let _ = evt_tx
+                .send(AppEvent::UserProfileUnavailable {
+                    login: login.to_owned(),
+                })
+                .await;
             return;
         }
     };
@@ -2497,36 +3154,45 @@ async fn fetch_twitch_user_profile(login: &str, evt_tx: mpsc::Sender<AppEvent>) 
         Ok(u) => u,
         Err(e) => {
             warn!("IVR user response parse failed for {login}: {e}");
-            let _ = evt_tx.send(AppEvent::UserProfileUnavailable {
-                login: login.to_owned(),
-            }).await;
+            let _ = evt_tx
+                .send(AppEvent::UserProfileUnavailable {
+                    login: login.to_owned(),
+                })
+                .await;
             return;
         }
     };
 
     let Some(user) = users.into_iter().next() else {
         warn!("IVR returned no user for {login}");
-        let _ = evt_tx.send(AppEvent::UserProfileUnavailable {
-            login: login.to_owned(),
-        }).await;
+        let _ = evt_tx
+            .send(AppEvent::UserProfileUnavailable {
+                login: login.to_owned(),
+            })
+            .await;
         return;
     };
 
     let avatar_url = user.logo.clone();
 
-    let is_live          = user.stream.is_some();
-    let stream_title     = user.stream.as_ref().map(|s| s.title.clone()).filter(|s| !s.is_empty());
-    let stream_game      = user.stream.as_ref()
+    let is_live = user.stream.is_some();
+    let stream_title = user
+        .stream
+        .as_ref()
+        .map(|s| s.title.clone())
+        .filter(|s| !s.is_empty());
+    let stream_game = user
+        .stream
+        .as_ref()
         .and_then(|s| s.game.as_ref())
         .map(|g| g.display_name.clone())
         .filter(|s| !s.is_empty());
-    let stream_viewers   = user.stream.as_ref().map(|s| s.viewers_count);
-    let stream_started   = user.stream.as_ref().and_then(|s| s.started_at.clone());
-    let last_broadcast_at = stream_started
-        .or_else(|| user.last_broadcast.and_then(|b| b.started_at));
-    let is_banned        = user.roles.as_ref().map_or(false, |r| r.is_banned)
-        || user.ban_status.is_some();
-    let ban_reason       = user.ban_status.and_then(|b| b.reason);
+    let stream_viewers = user.stream.as_ref().map(|s| s.viewers_count);
+    let stream_started = user.stream.as_ref().and_then(|s| s.started_at.clone());
+    let last_broadcast_at =
+        stream_started.or_else(|| user.last_broadcast.and_then(|b| b.started_at));
+    let is_banned = user.roles.as_ref().map_or(false, |r| r.is_banned) || user.ban_status.is_some();
+    let ban_reason = user.ban_status.and_then(|b| b.reason);
 
     let profile = UserProfile {
         id: user.id,
@@ -2551,12 +3217,14 @@ async fn fetch_twitch_user_profile(login: &str, evt_tx: mpsc::Sender<AppEvent>) 
     // Pre-fetch avatar bytes so egui can display them right away.
     if let Some(ref logo) = avatar_url {
         if let Ok((w, h, raw)) = fetch_and_decode_raw(logo).await {
-            let _ = evt_tx.send(AppEvent::EmoteImageReady {
-                uri: logo.clone(),
-                width: w,
-                height: h,
-                raw_bytes: raw,
-            }).await;
+            let _ = evt_tx
+                .send(AppEvent::EmoteImageReady {
+                    uri: logo.clone(),
+                    width: w,
+                    height: h,
+                    raw_bytes: raw,
+                })
+                .await;
         }
     }
 
@@ -2567,7 +3235,13 @@ async fn fetch_twitch_user_profile(login: &str, evt_tx: mpsc::Sender<AppEvent>) 
 async fn fetch_kick_user_profile(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
     #[derive(serde::Deserialize)]
     struct KickCategory {
-        #[serde(default, alias = "display_name", alias = "displayName", alias = "slug", alias = "name")]
+        #[serde(
+            default,
+            alias = "display_name",
+            alias = "displayName",
+            alias = "slug",
+            alias = "name"
+        )]
         name: Option<String>,
     }
 
@@ -2606,7 +3280,12 @@ async fn fetch_kick_user_profile(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
         avatar_url: Option<String>,
         #[serde(default, alias = "createdAt")]
         created_at: Option<String>,
-        #[serde(default, alias = "followersCount", alias = "follower_count", alias = "followers_count")]
+        #[serde(
+            default,
+            alias = "followersCount",
+            alias = "follower_count",
+            alias = "followers_count"
+        )]
         followers_count: Option<u64>,
         #[serde(default, alias = "isVerified", alias = "verified")]
         is_verified: Option<bool>,
@@ -2624,7 +3303,12 @@ async fn fetch_kick_user_profile(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
         livestream: Option<KickLivestream>,
         #[serde(default, alias = "description", alias = "bio")]
         description: Option<String>,
-        #[serde(default, alias = "followersCount", alias = "follower_count", alias = "followers_count")]
+        #[serde(
+            default,
+            alias = "followersCount",
+            alias = "follower_count",
+            alias = "followers_count"
+        )]
         followers_count: Option<u64>,
     }
 
@@ -2725,9 +3409,7 @@ async fn fetch_kick_user_profile(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
         .and_then(|u| u.description.clone())
         .or(channel.description)
         .unwrap_or_default();
-    let created_at = user
-        .as_ref()
-        .and_then(|u| u.created_at.clone());
+    let created_at = user.as_ref().and_then(|u| u.created_at.clone());
 
     let is_live = channel
         .livestream
@@ -2745,10 +3427,7 @@ async fn fetch_kick_user_profile(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
         .and_then(|s| s.category.as_ref())
         .and_then(|c| c.name.clone())
         .filter(|s| !s.is_empty());
-    let stream_viewers = channel
-        .livestream
-        .as_ref()
-        .and_then(|s| s.viewers_count);
+    let stream_viewers = channel.livestream.as_ref().and_then(|s| s.viewers_count);
     let last_broadcast_at = channel
         .livestream
         .as_ref()
@@ -2781,12 +3460,14 @@ async fn fetch_kick_user_profile(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
 
     if let Some(ref logo) = avatar_url {
         if let Ok((w, h, raw)) = fetch_and_decode_raw(logo).await {
-            let _ = evt_tx.send(AppEvent::EmoteImageReady {
-                uri: logo.clone(),
-                width: w,
-                height: h,
-                raw_bytes: raw,
-            }).await;
+            let _ = evt_tx
+                .send(AppEvent::EmoteImageReady {
+                    uri: logo.clone(),
+                    width: w,
+                    height: h,
+                    raw_bytes: raw,
+                })
+                .await;
         }
     }
 
@@ -2795,7 +3476,9 @@ async fn fetch_kick_user_profile(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
 
 /// Fetch the logged-in user's avatar URL and image bytes for the top-bar pill.
 async fn fetch_self_avatar(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
-    if login.is_empty() { return; }
+    if login.is_empty() {
+        return;
+    }
 
     #[derive(serde::Deserialize)]
     struct IvrUserMin {
@@ -2812,17 +3495,21 @@ async fn fetch_self_avatar(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
         Ok(u) => u,
         Err(_) => return,
     };
-    let Some(user) = users.into_iter().next() else { return };
+    let Some(user) = users.into_iter().next() else {
+        return;
+    };
     let Some(avatar_url) = user.logo else { return };
 
     // Pre-fetch image bytes
     if let Ok((w, h, raw)) = fetch_and_decode_raw(&avatar_url).await {
-        let _ = evt_tx.send(AppEvent::EmoteImageReady {
-            uri: avatar_url.clone(),
-            width: w,
-            height: h,
-            raw_bytes: raw,
-        }).await;
+        let _ = evt_tx
+            .send(AppEvent::EmoteImageReady {
+                uri: avatar_url.clone(),
+                width: w,
+                height: h,
+                raw_bytes: raw,
+            })
+            .await;
     }
 
     let _ = evt_tx.send(AppEvent::SelfAvatarLoaded { avatar_url }).await;
@@ -2839,7 +3526,10 @@ fn make_system_message(
     kind: MsgKind,
 ) -> ChatMessage {
     use smallvec::smallvec;
-    let spans = smallvec![crust_core::model::Span::Text { text: text.clone(), is_action: false }];
+    let spans = smallvec![crust_core::model::Span::Text {
+        text: text.clone(),
+        is_action: false
+    }];
     ChatMessage {
         id: MessageId(id),
         server_id: None,
@@ -2877,7 +3567,11 @@ fn format_timeout_text(login: &str, seconds: u32) -> String {
     } else if seconds < 3600 {
         format!("{login} was timed out for {}m.", seconds / 60)
     } else {
-        format!("{login} was timed out for {}h {}m.", seconds / 3600, (seconds % 3600) / 60)
+        format!(
+            "{login} was timed out for {}h {}m.",
+            seconds / 3600,
+            (seconds % 3600) / 60
+        )
     }
 }
 
@@ -2895,11 +3589,19 @@ fn build_sub_text(display_name: &str, months: u32, plan: &str, is_gift: bool) ->
 /// Uses `xdg-open` on Linux, `open` on macOS, `cmd /c start` on Windows.
 fn open_url_in_browser(url: &str) {
     #[cfg(target_os = "linux")]
-    { let _ = std::process::Command::new("xdg-open").arg(url).spawn(); }
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
     #[cfg(target_os = "macos")]
-    { let _ = std::process::Command::new("open").arg(url).spawn(); }
+    {
+        let _ = std::process::Command::new("open").arg(url).spawn();
+    }
     #[cfg(target_os = "windows")]
-    { let _ = std::process::Command::new("cmd").args(["/c", "start", url]).spawn(); }
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(["/c", "start", url])
+            .spawn();
+    }
 }
 
 // Link preview fetch
@@ -2909,11 +3611,11 @@ async fn fetch_link_preview(
     cache: &Option<EmoteCache>,
     evt_tx: &mpsc::Sender<AppEvent>,
 ) {
-    let send_empty = |url: &str| {
-        AppEvent::LinkPreviewReady {
-            url: url.to_owned(),
-            title: None, description: None, thumbnail_url: None,
-        }
+    let send_empty = |url: &str| AppEvent::LinkPreviewReady {
+        url: url.to_owned(),
+        title: None,
+        description: None,
+        thumbnail_url: None,
     };
 
     let client = match reqwest::Client::builder()
@@ -2923,16 +3625,23 @@ async fn fetch_link_preview(
         .build()
     {
         Ok(c) => c,
-        Err(_) => { let _ = evt_tx.send(send_empty(url)).await; return; }
+        Err(_) => {
+            let _ = evt_tx.send(send_empty(url)).await;
+            return;
+        }
     };
 
     let resp = match client.get(url).send().await {
         Ok(r) if r.status().is_success() => r,
-        _ => { let _ = evt_tx.send(send_empty(url)).await; return; }
+        _ => {
+            let _ = evt_tx.send(send_empty(url)).await;
+            return;
+        }
     };
 
     // Only parse HTML
-    let ct = resp.headers()
+    let ct = resp
+        .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
@@ -2944,7 +3653,10 @@ async fn fetch_link_preview(
 
     let bytes = match resp.bytes().await {
         Ok(b) => b,
-        Err(_) => { let _ = evt_tx.send(send_empty(url)).await; return; }
+        Err(_) => {
+            let _ = evt_tx.send(send_empty(url)).await;
+            return;
+        }
     };
     // Only read the first 64 KB to avoid processing megabyte HTML files.
     let html = String::from_utf8_lossy(&bytes[..bytes.len().min(65_536)]);
@@ -2952,22 +3664,23 @@ async fn fetch_link_preview(
     let title = og_meta(&html, "og:title")
         .or_else(|| og_meta(&html, "twitter:title"))
         .or_else(|| html_title(&html));
-    let description = og_meta(&html, "og:description")
-        .or_else(|| og_meta(&html, "twitter:description"));
-    let thumbnail_url = og_meta(&html, "og:image")
-        .or_else(|| og_meta(&html, "twitter:image"));
+    let description =
+        og_meta(&html, "og:description").or_else(|| og_meta(&html, "twitter:description"));
+    let thumbnail_url = og_meta(&html, "og:image").or_else(|| og_meta(&html, "twitter:image"));
 
     // Kick off thumbnail image fetch so bytes land in emote_bytes.
     if let Some(ref img) = thumbnail_url {
         fetch_emote_image(img, cache, evt_tx).await;
     }
 
-    let _ = evt_tx.send(AppEvent::LinkPreviewReady {
-        url: url.to_owned(),
-        title,
-        description,
-        thumbnail_url,
-    }).await;
+    let _ = evt_tx
+        .send(AppEvent::LinkPreviewReady {
+            url: url.to_owned(),
+            title,
+            description,
+            thumbnail_url,
+        })
+        .await;
 }
 
 /// Extract the content of a `<meta property="{prop}" ...>` or `<meta name="{prop}" ...>` tag.
@@ -2982,11 +3695,10 @@ fn og_meta(html: &str, prop: &str) -> Option<String> {
         let tag = &rest[..tag_end];
         let tag_lower = tag.to_lowercase();
 
-        let has_prop =
-            tag_lower.contains(&format!("property=\"{prop_lower}\"")) ||
-            tag_lower.contains(&format!("property='{prop_lower}'")) ||
-            tag_lower.contains(&format!("name=\"{prop_lower}\"")) ||
-            tag_lower.contains(&format!("name='{prop_lower}'"));
+        let has_prop = tag_lower.contains(&format!("property=\"{prop_lower}\""))
+            || tag_lower.contains(&format!("property='{prop_lower}'"))
+            || tag_lower.contains(&format!("name=\"{prop_lower}\""))
+            || tag_lower.contains(&format!("name='{prop_lower}'"));
 
         if has_prop {
             if let Some(val) = html_attr(tag, "content") {
@@ -3023,16 +3735,20 @@ fn html_title(html: &str) -> Option<String> {
     let body_start = s + tag_end + 1;
     let body_end = lower[body_start..].find("</title>")?;
     let text = html[body_start..body_start + body_end].trim().to_owned();
-    if text.is_empty() { None } else { Some(html_entities(&text)) }
+    if text.is_empty() {
+        None
+    } else {
+        Some(html_entities(&text))
+    }
 }
 
 /// Decode common HTML entities.
 fn html_entities(s: &str) -> String {
     s.replace("&amp;", "&")
-     .replace("&lt;", "<")
-     .replace("&gt;", ">")
-     .replace("&quot;", "\"")
-     .replace("&#39;", "'")
-     .replace("&apos;", "'")
-     .replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&nbsp;", " ")
 }

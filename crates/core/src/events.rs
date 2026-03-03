@@ -19,6 +19,11 @@ pub struct LinkPreview {
 pub enum AppCommand {
     /// Join a channel.
     JoinChannel { channel: ChannelId },
+    /// Join an IRC channel with an optional channel key.
+    JoinIrcChannel {
+        channel: ChannelId,
+        key: Option<String>,
+    },
     /// Leave / close a tab.
     LeaveChannel { channel: ChannelId },
     /// Request emote loading for a channel (by Twitch user-id).
@@ -39,11 +44,26 @@ pub enum AppCommand {
     /// Request a Twitch user profile lookup by login name.
     FetchUserProfile { login: String },
     /// Timeout a user in a channel via the Twitch Helix API.
-    TimeoutUser { channel: ChannelId, login: String, user_id: String, seconds: u32, reason: Option<String> },
+    TimeoutUser {
+        channel: ChannelId,
+        login: String,
+        user_id: String,
+        seconds: u32,
+        reason: Option<String>,
+    },
     /// Permanently ban a user from a channel via the Twitch Helix API.
-    BanUser { channel: ChannelId, login: String, user_id: String, reason: Option<String> },
+    BanUser {
+        channel: ChannelId,
+        login: String,
+        user_id: String,
+        reason: Option<String>,
+    },
     /// Lift an active ban or timeout for a user via the Twitch Helix API.
-    UnbanUser { channel: ChannelId, login: String, user_id: String },
+    UnbanUser {
+        channel: ChannelId,
+        login: String,
+        user_id: String,
+    },
     /// Clears all messages in the channel display (visual-only, not sent to Twitch).
     ClearLocalMessages { channel: ChannelId },
     /// Opens a URL in the system default browser.
@@ -62,6 +82,13 @@ pub enum AppCommand {
     RemoveAccount { username: String },
     /// Mark an account as the one to auto-login on next startup.
     SetDefaultAccount { username: String },
+    /// Set the IRC nickname used for generic IRC servers.
+    SetIrcNick { nick: String },
+    /// Persist beta transport feature toggles.
+    SetBetaFeatures {
+        kick_enabled: bool,
+        irc_enabled: bool,
+    },
 }
 
 // Events (runtime to UI): notifications sent from runtime to UI
@@ -115,11 +142,18 @@ pub enum AppEvent {
         messages: Vec<ChatMessage>,
     },
     /// Twitch user profile loaded from the IVR API.
-    UserProfileLoaded { profile: UserProfile },
+    UserProfileLoaded {
+        profile: UserProfile,
+    },
     /// A user profile lookup finished without data (network/API/user not found).
-    UserProfileUnavailable { login: String },
+    UserProfileUnavailable {
+        login: String,
+    },
     /// Mark all visible messages from a user as deleted (timeout / ban).
-    UserMessagesCleared { channel: ChannelId, login: String },
+    UserMessagesCleared {
+        channel: ChannelId,
+        login: String,
+    },
     /// USERSTATE received - badges, color and mod status for the logged-in user.
     UserStateUpdated {
         channel: ChannelId,
@@ -128,9 +162,13 @@ pub enum AppEvent {
         color: Option<String>,
     },
     /// Clear all messages from the given channel's UI buffer (response to ClearLocalMessages).
-    ChannelMessagesCleared { channel: ChannelId },
+    ChannelMessagesCleared {
+        channel: ChannelId,
+    },
     /// The logged-in user's avatar URL has been resolved.
-    SelfAvatarLoaded { avatar_url: String },
+    SelfAvatarLoaded {
+        avatar_url: String,
+    },
     /// Open-Graph / Twitter-Card metadata is ready for a URL.
     LinkPreviewReady {
         url: String,
@@ -153,9 +191,16 @@ pub enum AppEvent {
         channel: ChannelId,
         count: usize,
     },
+    /// Beta transport feature toggles loaded/updated from settings.
+    BetaFeaturesUpdated {
+        kick_enabled: bool,
+        irc_enabled: bool,
+    },
     /// A batch of image prefetch tasks has been queued.  The loading screen
     /// uses this to track progress vs `EmoteImageReady` completions.
-    ImagePrefetchQueued { count: usize },
+    ImagePrefetchQueued {
+        count: usize,
+    },
 }
 
 // ConnectionState: connection status enumeration

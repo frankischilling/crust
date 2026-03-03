@@ -45,8 +45,14 @@ pub const RED: Color32 = Color32::from_rgb(220, 65, 65);
 
 // Stroke styles
 
-pub const STROKE_SUBTLE: Stroke = Stroke { width: 1.0, color: BORDER_SUBTLE };
-pub const STROKE_ACCENT: Stroke = Stroke { width: 1.0, color: BORDER_ACCENT };
+pub const STROKE_SUBTLE: Stroke = Stroke {
+    width: 1.0,
+    color: BORDER_SUBTLE,
+};
+pub const STROKE_ACCENT: Stroke = Stroke {
+    width: 1.0,
+    color: BORDER_ACCENT,
+};
 
 // Layout metrics
 
@@ -65,11 +71,26 @@ pub const SIDEBAR_MAX_W: f32 = 300.0;
 pub const SIDEBAR_W: f32 = 160.0;
 
 /// Inner margin for toolbar panels.
-pub const BAR_MARGIN: Margin = Margin { left: 10, right: 10, top: 4, bottom: 4 };
+pub const BAR_MARGIN: Margin = Margin {
+    left: 10,
+    right: 10,
+    top: 4,
+    bottom: 4,
+};
 /// Inner margin for sidebar panels.
-pub const SIDEBAR_MARGIN: Margin = Margin { left: 8, right: 6, top: 8, bottom: 8 };
+pub const SIDEBAR_MARGIN: Margin = Margin {
+    left: 8,
+    right: 6,
+    top: 8,
+    bottom: 8,
+};
 /// Inner margin for the chat input tray.
-pub const INPUT_MARGIN: Margin = Margin { left: 10, right: 10, top: 4, bottom: 4 };
+pub const INPUT_MARGIN: Margin = Margin {
+    left: 10,
+    right: 10,
+    top: 4,
+    bottom: 4,
+};
 
 /// Horizontal spacing inside toolbars.
 pub const TOOLBAR_SPACING: Vec2 = Vec2::new(6.0, 0.0);

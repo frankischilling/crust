@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use egui::{Color32, Id, RichText, ScrollArea, Ui};
 
-use crust_core::model::{ChannelId, ChannelState};
 use crate::theme as t;
+use crust_core::model::{ChannelId, ChannelState};
 
 /// Left-sidebar channel list.
 pub struct ChannelList<'a> {
@@ -33,7 +33,11 @@ struct DragState {
 
 impl<'a> ChannelList<'a> {
     pub fn show(&mut self, ui: &mut Ui) -> ChannelListResult {
-        let mut result = ChannelListResult { selected: None, closed: None, reordered: None };
+        let mut result = ChannelListResult {
+            selected: None,
+            closed: None,
+            reordered: None,
+        };
 
         let drag_id = Id::new("channel_list_drag");
         const ROW_H: f32 = 28.0;
@@ -66,7 +70,8 @@ impl<'a> ChannelList<'a> {
                         if ds.dragging_idx != idx && ds.insert_before == idx {
                             let y = ui.cursor().min.y - t::CHANNEL_ROW_GAP * 0.5;
                             let x_range = ui.max_rect().x_range();
-                            ui.painter().hline(x_range, y, egui::Stroke::new(2.0, t::ACCENT));
+                            ui.painter()
+                                .hline(x_range, y, egui::Stroke::new(2.0, t::ACCENT));
                         }
                     }
 
@@ -75,24 +80,21 @@ impl<'a> ChannelList<'a> {
                     // Allocate the full-width row rect.
                     let row_rect = {
                         let avail = ui.available_rect_before_wrap();
-                        egui::Rect::from_min_size(
-                            avail.min,
-                            egui::vec2(avail.width(), ROW_H),
-                        )
+                        egui::Rect::from_min_size(avail.min, egui::vec2(avail.width(), ROW_H))
                     };
-                    let row_resp = ui.interact(
-                        row_rect,
-                        interact_id,
-                        egui::Sense::click_and_drag(),
-                    );
+                    let row_resp =
+                        ui.interact(row_rect, interact_id, egui::Sense::click_and_drag());
 
                     // Drag start
                     if row_resp.drag_started() {
                         ui.data_mut(|d| {
-                            d.insert_temp(drag_id, DragState {
-                                dragging_idx: idx,
-                                insert_before: idx,
-                            })
+                            d.insert_temp(
+                                drag_id,
+                                DragState {
+                                    dragging_idx: idx,
+                                    insert_before: idx,
+                                },
+                            )
                         });
                     }
 
@@ -128,13 +130,57 @@ impl<'a> ChannelList<'a> {
                         ui.data_mut(|d| d.remove::<DragState>(drag_id));
                     }
 
-                    let is_dragging_this =
-                        drag.as_ref().map(|ds| ds.dragging_idx == idx).unwrap_or(false);
+                    // Right-click menu for quick channel actions.
+                    row_resp.context_menu(|ui| {
+                        if ui
+                            .button(RichText::new("Switch to channel").font(t::small()))
+                            .clicked()
+                        {
+                            result.selected = Some(ch.clone());
+                            ui.close_menu();
+                        }
+
+                        if ui
+                            .button(RichText::new("Copy channel").font(t::small()))
+                            .clicked()
+                        {
+                            let copy = if ch.is_kick() {
+                                format!("kick:{}", ch.display_name())
+                            } else if ch.is_irc() {
+                                if let Some(t) = ch.irc_target() {
+                                    let scheme = if t.tls { "ircs" } else { "irc" };
+                                    format!("{scheme}://{}:{}/{}", t.host, t.port, t.channel)
+                                } else {
+                                    ch.as_str().to_owned()
+                                }
+                            } else {
+                                format!("twitch:{}", ch.display_name())
+                            };
+                            ui.ctx().copy_text(copy);
+                            ui.close_menu();
+                        }
+
+                        ui.separator();
+
+                        if ui
+                            .button(RichText::new("Remove channel").font(t::small()))
+                            .clicked()
+                        {
+                            result.closed = Some(ch.clone());
+                            ui.close_menu();
+                        }
+                    });
+
+                    let is_dragging_this = drag
+                        .as_ref()
+                        .map(|ds| ds.dragging_idx == idx)
+                        .unwrap_or(false);
                     // Suppress hover style while a drag is in progress.
                     let is_hovered = row_resp.contains_pointer() && drag.is_none();
 
                     if is_hovered && !is_active {
-                        ui.painter().rect_filled(row_rect, t::RADIUS_SM, t::HOVER_ROW_BG);
+                        ui.painter()
+                            .rect_filled(row_rect, t::RADIUS_SM, t::HOVER_ROW_BG);
                     }
 
                     let frame_bg = if is_dragging_this {
@@ -170,7 +216,11 @@ impl<'a> ChannelList<'a> {
                                         } else {
                                             Color32::from_rgba_unmultiplied(90, 90, 110, 70)
                                         };
-                                        ui.painter().circle_filled(dot_rect.center(), dot_r, dot_col);
+                                        ui.painter().circle_filled(
+                                            dot_rect.center(),
+                                            dot_r,
+                                            dot_col,
+                                        );
                                     }
                                 }
 
@@ -182,11 +232,22 @@ impl<'a> ChannelList<'a> {
                                             .strong()
                                             .color(Color32::from_rgb(83, 252, 24)),
                                     );
+                                } else if ch.is_irc() {
+                                    ui.label(
+                                        RichText::new("IRC")
+                                            .font(t::small())
+                                            .strong()
+                                            .color(t::TEXT_MUTED),
+                                    );
                                 }
 
                                 // Channel name label
                                 let display = ch.display_name();
-                                let prefix = if ch.is_kick() { "" } else { "# " };
+                                let prefix = if ch.is_kick() || ch.is_irc_server_tab() {
+                                    ""
+                                } else {
+                                    "# "
+                                };
                                 let name_text = if unread_mentions > 0 {
                                     RichText::new(format!("{prefix}{display}"))
                                         .font(t::body())
@@ -275,10 +336,8 @@ impl<'a> ChannelList<'a> {
                     if ds.insert_before >= n {
                         let y = ui.cursor().min.y - t::CHANNEL_ROW_GAP * 0.5;
                         let x_range = ui.max_rect().x_range();
-                        ui.painter().hline(
-                            x_range, y,
-                            egui::Stroke::new(2.0, t::ACCENT),
-                        );
+                        ui.painter()
+                            .hline(x_range, y, egui::Stroke::new(2.0, t::ACCENT));
                     }
                 }
             });

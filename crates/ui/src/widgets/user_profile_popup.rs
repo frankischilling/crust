@@ -12,9 +12,24 @@ use crate::theme as t;
 /// Action emitted by the popup when a moderation button is pressed.
 #[derive(Debug, Clone)]
 pub enum PopupAction {
-    Timeout { channel: ChannelId, login: String, user_id: String, seconds: u32, reason: Option<String> },
-    Ban     { channel: ChannelId, login: String, user_id: String, reason: Option<String> },
-    Unban   { channel: ChannelId, login: String, user_id: String },
+    Timeout {
+        channel: ChannelId,
+        login: String,
+        user_id: String,
+        seconds: u32,
+        reason: Option<String>,
+    },
+    Ban {
+        channel: ChannelId,
+        login: String,
+        user_id: String,
+        reason: Option<String>,
+    },
+    Unban {
+        channel: ChannelId,
+        login: String,
+        user_id: String,
+    },
 }
 
 // ─── Tab state ────────────────────────────────────────────────────────────────
@@ -173,10 +188,8 @@ impl UserProfilePopup {
                     ui.spacing_mut().item_spacing.x = 12.0;
 
                     const AV: f32 = 76.0;
-                    let (av_rect, _) = ui.allocate_exact_size(
-                        Vec2::splat(AV),
-                        egui::Sense::hover(),
-                    );
+                    let (av_rect, _) =
+                        ui.allocate_exact_size(Vec2::splat(AV), egui::Sense::hover());
 
                     // Avatar: real image if loaded, else initial-letter fallback.
                     if let Some((_, _, ref raw)) = profile
@@ -186,15 +199,13 @@ impl UserProfilePopup {
                     {
                         let logo = profile.avatar_url.as_deref().unwrap();
                         let uri = format!("bytes://{logo}");
-                        ui.painter().circle_filled(av_rect.center(), AV / 2.0, t::BG_RAISED);
+                        ui.painter()
+                            .circle_filled(av_rect.center(), AV / 2.0, t::BG_RAISED);
                         ui.put(
                             av_rect,
-                            egui::Image::from_bytes(
-                                uri,
-                                egui::load::Bytes::Shared(raw.clone()),
-                            )
-                            .fit_to_exact_size(Vec2::splat(AV))
-                            .corner_radius(CornerRadius::same(AV as u8 / 2)),
+                            egui::Image::from_bytes(uri, egui::load::Bytes::Shared(raw.clone()))
+                                .fit_to_exact_size(Vec2::splat(AV))
+                                .corner_radius(CornerRadius::same(AV as u8 / 2)),
                         );
                     } else {
                         let initial = profile
@@ -205,7 +216,11 @@ impl UserProfilePopup {
                             .unwrap_or('?');
                         let p = ui.painter();
                         p.circle_filled(av_rect.center(), AV / 2.0, t::ACCENT_DIM);
-                        p.circle_stroke(av_rect.center(), AV / 2.0, egui::Stroke::new(2.0, t::ACCENT));
+                        p.circle_stroke(
+                            av_rect.center(),
+                            AV / 2.0,
+                            egui::Stroke::new(2.0, t::ACCENT),
+                        );
                         p.text(
                             av_rect.center(),
                             egui::Align2::CENTER_CENTER,
@@ -241,7 +256,10 @@ impl UserProfilePopup {
                                     .inner_margin(egui::Margin::symmetric(5, 2))
                                     .show(ui, |ui| {
                                         ui.add(egui::Label::new(
-                                            RichText::new("● LIVE").color(Color32::WHITE).size(10.0).strong(),
+                                            RichText::new("● LIVE")
+                                                .color(Color32::WHITE)
+                                                .size(10.0)
+                                                .strong(),
                                         ));
                                     });
                             }
@@ -252,7 +270,10 @@ impl UserProfilePopup {
                                     .inner_margin(egui::Margin::symmetric(5, 2))
                                     .show(ui, |ui| {
                                         ui.add(egui::Label::new(
-                                            RichText::new("BANNED").color(Color32::WHITE).size(10.0).strong(),
+                                            RichText::new("BANNED")
+                                                .color(Color32::WHITE)
+                                                .size(10.0)
+                                                .strong(),
                                         ));
                                     });
                             }
@@ -279,7 +300,12 @@ impl UserProfilePopup {
                             if let Some(ref hex) = profile.chat_color {
                                 if let Some(c) = parse_hex_color(hex) {
                                     egui::Frame::new()
-                                        .fill(Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 35))
+                                        .fill(Color32::from_rgba_unmultiplied(
+                                            c.r(),
+                                            c.g(),
+                                            c.b(),
+                                            35,
+                                        ))
                                         .corner_radius(t::RADIUS_SM)
                                         .inner_margin(egui::Margin::symmetric(5, 2))
                                         .stroke(egui::Stroke::new(1.0, c))
@@ -298,13 +324,17 @@ impl UserProfilePopup {
                             ui.horizontal_wrapped(|ui| {
                                 ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
                                 for badge in &self.badges {
-                                    let badge_name = badge_display_name(&badge.name, &badge.version);
+                                    let badge_name =
+                                        badge_display_name(&badge.name, &badge.version);
                                     if let Some(url) = &badge.url {
                                         let uri = format!("bytes://{url}");
-                                        if let Some((_, _, ref raw)) = emote_bytes.get(url.as_str()) {
+                                        if let Some((_, _, ref raw)) = emote_bytes.get(url.as_str())
+                                        {
                                             const BS: f32 = 18.0;
-                                            let (brect, _) = ui
-                                                .allocate_exact_size(Vec2::splat(BS), egui::Sense::hover());
+                                            let (brect, _) = ui.allocate_exact_size(
+                                                Vec2::splat(BS),
+                                                egui::Sense::hover(),
+                                            );
                                             ui.put(
                                                 brect,
                                                 egui::Image::from_bytes(
@@ -315,8 +345,10 @@ impl UserProfilePopup {
                                             );
                                             if ui.rect_contains_pointer(brect) {
                                                 egui::show_tooltip_text(
-                                                    ui.ctx(), ui.layer_id(),
-                                                    egui::Id::new(url.as_str()), &badge_name,
+                                                    ui.ctx(),
+                                                    ui.layer_id(),
+                                                    egui::Id::new(url.as_str()),
+                                                    &badge_name,
                                                 );
                                             }
                                             continue;
@@ -336,26 +368,36 @@ impl UserProfilePopup {
                         .fill(Color32::from_rgba_unmultiplied(200, 40, 40, 18))
                         .corner_radius(t::RADIUS)
                         .stroke(egui::Stroke::new(
-                            1.0, Color32::from_rgba_unmultiplied(200, 60, 60, 80),
+                            1.0,
+                            Color32::from_rgba_unmultiplied(200, 60, 60, 80),
                         ))
                         .inner_margin(egui::Margin::symmetric(8, 6))
                         .show(ui, |ui| {
                             if let Some(ref title) = profile.stream_title {
-                                ui.add(egui::Label::new(
-                                    RichText::new(title).color(t::TEXT_PRIMARY).small().strong(),
-                                ).wrap());
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(title)
+                                            .color(t::TEXT_PRIMARY)
+                                            .small()
+                                            .strong(),
+                                    )
+                                    .wrap(),
+                                );
                             }
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 8.0;
                                 if let Some(ref game) = profile.stream_game {
                                     ui.add(egui::Label::new(
-                                        RichText::new(format!("🎮 {game}")).color(t::ACCENT).small(),
+                                        RichText::new(format!("🎮 {game}"))
+                                            .color(t::ACCENT)
+                                            .small(),
                                     ));
                                 }
                                 if let Some(v) = profile.stream_viewers {
                                     ui.add(egui::Label::new(
                                         RichText::new(format!("👁 {}", fmt_count(v)))
-                                            .color(t::TEXT_SECONDARY).small(),
+                                            .color(t::TEXT_SECONDARY)
+                                            .small(),
                                     ));
                                 }
                                 if let Some(ref started) = profile.last_broadcast_at {
@@ -363,7 +405,8 @@ impl UserProfilePopup {
                                     if !uptime.is_empty() {
                                         ui.add(egui::Label::new(
                                             RichText::new(format!("⏱ {uptime}"))
-                                                .color(t::TEXT_SECONDARY).small(),
+                                                .color(t::TEXT_SECONDARY)
+                                                .small(),
                                         ));
                                     }
                                 }
@@ -380,12 +423,16 @@ impl UserProfilePopup {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
                         for (tab_label, tab_val) in [
-                            ("Profile",    ProfileTab::Profile),
+                            ("Profile", ProfileTab::Profile),
                             ("Moderation", ProfileTab::Moderation),
-                            ("Logs",       ProfileTab::Logs),
+                            ("Logs", ProfileTab::Logs),
                         ] {
                             let active = self.active_tab == tab_val;
-                            let fg = if active { t::TEXT_PRIMARY } else { t::TEXT_SECONDARY };
+                            let fg = if active {
+                                t::TEXT_PRIMARY
+                            } else {
+                                t::TEXT_SECONDARY
+                            };
                             let bg = if active {
                                 Color32::from_rgba_unmultiplied(145, 95, 255, 35)
                             } else {
@@ -419,14 +466,14 @@ impl UserProfilePopup {
                         .inner_margin(egui::Margin::symmetric(6, 4))
                         .show(ui, |ui| {
                             ui.label(
-                                RichText::new(
-                                    if log_count == 0 {
-                                        "No messages from this user in the current session.".to_owned()
-                                    } else {
-                                        format!("{log_count} message{} (current session, newest first)",
-                                            if log_count == 1 { "" } else { "s" })
-                                    }
-                                )
+                                RichText::new(if log_count == 0 {
+                                    "No messages from this user in the current session.".to_owned()
+                                } else {
+                                    format!(
+                                        "{log_count} message{} (current session, newest first)",
+                                        if log_count == 1 { "" } else { "s" }
+                                    )
+                                })
                                 .color(t::TEXT_MUTED)
                                 .small(),
                             );
@@ -442,18 +489,30 @@ impl UserProfilePopup {
                             if self.logs.is_empty() {
                                 ui.add_space(8.0);
                                 ui.centered_and_justified(|ui| {
-                                    ui.label(RichText::new("No recent messages.").color(t::TEXT_MUTED).small());
+                                    ui.label(
+                                        RichText::new("No recent messages.")
+                                            .color(t::TEXT_MUTED)
+                                            .small(),
+                                    );
                                 });
                             }
                             for msg in &self.logs {
                                 let time_str = msg.timestamp.format("%H:%M:%S").to_string();
                                 let text = if msg.raw_text.is_empty() {
                                     // Fallback: reconstruct from spans
-                                    msg.spans.iter().filter_map(|s| match s {
-                                        crust_core::model::Span::Text { text, .. } => Some(text.as_str()),
-                                        crust_core::model::Span::Mention { login } => Some(login.as_str()),
-                                        _ => None,
-                                    }).collect::<Vec<_>>().join(" ")
+                                    msg.spans
+                                        .iter()
+                                        .filter_map(|s| match s {
+                                            crust_core::model::Span::Text { text, .. } => {
+                                                Some(text.as_str())
+                                            }
+                                            crust_core::model::Span::Mention { login } => {
+                                                Some(login.as_str())
+                                            }
+                                            _ => None,
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(" ")
                                 } else {
                                     msg.raw_text.clone()
                                 };
@@ -484,17 +543,14 @@ impl UserProfilePopup {
                                             } else {
                                                 t::TEXT_PRIMARY
                                             };
-                                            let rich = RichText::new(&text)
-                                                .color(msg_color)
-                                                .small();
+                                            let rich =
+                                                RichText::new(&text).color(msg_color).small();
                                             let rich = if is_action || is_deleted {
                                                 rich.italics()
                                             } else {
                                                 rich
                                             };
-                                            ui.add(
-                                                egui::Label::new(rich).wrap(),
-                                            );
+                                            ui.add(egui::Label::new(rich).wrap());
                                         });
                                     });
                                 ui.add_space(1.0);
@@ -509,12 +565,20 @@ impl UserProfilePopup {
                         .spacing([12.0, 4.0])
                         .show(ui, |ui| {
                             if let Some(f) = profile.followers {
-                                ui.label(RichText::new("Followers").color(t::TEXT_SECONDARY).small());
-                                ui.label(RichText::new(fmt_count(f)).strong().color(t::TEXT_PRIMARY));
+                                ui.label(
+                                    RichText::new("Followers").color(t::TEXT_SECONDARY).small(),
+                                );
+                                ui.label(
+                                    RichText::new(fmt_count(f)).strong().color(t::TEXT_PRIMARY),
+                                );
                                 ui.end_row();
                             }
                             if let Some(ref ts) = profile.created_at {
-                                ui.label(RichText::new("Account age").color(t::TEXT_SECONDARY).small());
+                                ui.label(
+                                    RichText::new("Account age")
+                                        .color(t::TEXT_SECONDARY)
+                                        .small(),
+                                );
                                 ui.label(RichText::new(fmt_account_age(ts)).color(t::TEXT_PRIMARY));
                                 ui.end_row();
                                 ui.label(RichText::new("Joined").color(t::TEXT_SECONDARY).small());
@@ -523,8 +587,12 @@ impl UserProfilePopup {
                             }
                             if !profile.is_live {
                                 if let Some(ref ts) = profile.last_broadcast_at {
-                                    ui.label(RichText::new("Last live").color(t::TEXT_SECONDARY).small());
-                                    ui.label(RichText::new(fmt_join_date(ts)).color(t::TEXT_SECONDARY));
+                                    ui.label(
+                                        RichText::new("Last live").color(t::TEXT_SECONDARY).small(),
+                                    );
+                                    ui.label(
+                                        RichText::new(fmt_join_date(ts)).color(t::TEXT_SECONDARY),
+                                    );
                                     ui.end_row();
                                 }
                             }
@@ -536,7 +604,9 @@ impl UserProfilePopup {
                         ui.add_space(3.0);
                         ui.add(
                             egui::Label::new(
-                                RichText::new(&profile.description).color(t::TEXT_SECONDARY).small(),
+                                RichText::new(&profile.description)
+                                    .color(t::TEXT_SECONDARY)
+                                    .small(),
                             )
                             .wrap(),
                         );
@@ -549,11 +619,18 @@ impl UserProfilePopup {
                             .corner_radius(t::RADIUS_SM)
                             .inner_margin(egui::Margin::symmetric(8, 5))
                             .show(ui, |ui| {
-                                let reason = profile.ban_reason.as_deref().unwrap_or("No reason provided");
-                                ui.add(egui::Label::new(
-                                    RichText::new(format!("⚠ Suspended: {reason}"))
-                                        .color(t::RED).small(),
-                                ).wrap());
+                                let reason = profile
+                                    .ban_reason
+                                    .as_deref()
+                                    .unwrap_or("No reason provided");
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(format!("⚠ Suspended: {reason}"))
+                                            .color(t::RED)
+                                            .small(),
+                                    )
+                                    .wrap(),
+                                );
                             });
                     }
                 }
@@ -561,11 +638,15 @@ impl UserProfilePopup {
                 // ── Moderation tab ───────────────────────────────────────
                 if self.is_mod && self.active_tab == ProfileTab::Moderation {
                     if let Some(ref channel) = self.channel.clone() {
-                        let login   = profile.login.clone();
+                        let login = profile.login.clone();
                         let user_id = profile.id.clone();
 
                         // ── Reason field ──────────────────────────────────
-                        ui.label(RichText::new("Reason (optional)").color(t::TEXT_SECONDARY).small());
+                        ui.label(
+                            RichText::new("Reason (optional)")
+                                .color(t::TEXT_SECONDARY)
+                                .small(),
+                        );
                         ui.add_space(2.0);
                         ui.add_sized(
                             [ui.available_width(), 22.0],
@@ -584,8 +665,12 @@ impl UserProfilePopup {
                             .spacing([4.0, 4.0])
                             .show(ui, |ui| {
                                 const ROW1: &[(&str, u32)] = &[
-                                    ("1s",  1), ("30s", 30), ("1m", 60),
-                                    ("5m",  300), ("10m", 600), ("30m", 1_800),
+                                    ("1s", 1),
+                                    ("30s", 30),
+                                    ("1m", 60),
+                                    ("5m", 300),
+                                    ("10m", 600),
+                                    ("30m", 1_800),
                                 ];
                                 for &(lbl, secs) in ROW1 {
                                     if timeout_btn(ui, lbl) {
@@ -600,8 +685,11 @@ impl UserProfilePopup {
                                 }
                                 ui.end_row();
                                 const ROW2: &[(&str, u32)] = &[
-                                    ("1h",   3_600), ("8h",  28_800), ("24h", 86_400),
-                                    ("7d", 604_800), ("14d", 1_209_600),
+                                    ("1h", 3_600),
+                                    ("8h", 28_800),
+                                    ("24h", 86_400),
+                                    ("7d", 604_800),
+                                    ("14d", 1_209_600),
                                 ];
                                 for &(lbl, secs) in ROW2 {
                                     if timeout_btn(ui, lbl) {
@@ -625,8 +713,8 @@ impl UserProfilePopup {
                                     .hint_text("custom (s)")
                                     .font(t::small()),
                             );
-                            let pressed = resp.lost_focus()
-                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            let pressed =
+                                resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                             let go_btn = ui.add_sized(
                                 [38.0, 20.0],
                                 egui::Button::new(RichText::new("Go").small()),
@@ -652,13 +740,18 @@ impl UserProfilePopup {
                         // ── Lift restriction ──────────────────────────────
                         section_label(ui, "Lift restriction");
                         ui.add_space(3.0);
-                        if ui.add(
-                            egui::Button::new(
-                                RichText::new("↩ Untimeout / Unban").small().color(Color32::WHITE),
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("↩ Untimeout / Unban")
+                                        .small()
+                                        .color(Color32::WHITE),
+                                )
+                                .fill(Color32::from_rgba_unmultiplied(40, 180, 90, 200))
+                                .min_size(egui::vec2(160.0, 24.0)),
                             )
-                            .fill(Color32::from_rgba_unmultiplied(40, 180, 90, 200))
-                            .min_size(egui::vec2(160.0, 24.0)),
-                        ).clicked() {
+                            .clicked()
+                        {
                             action = Some(PopupAction::Unban {
                                 channel: channel.clone(),
                                 login: login.clone(),
@@ -676,7 +769,9 @@ impl UserProfilePopup {
                                 ui.spacing_mut().item_spacing.x = 6.0;
                                 let confirm = ui.add(
                                     egui::Button::new(
-                                        RichText::new("⚠ Confirm ban").small().color(Color32::WHITE),
+                                        RichText::new("⚠ Confirm ban")
+                                            .small()
+                                            .color(Color32::WHITE),
                                     )
                                     .fill(Color32::from_rgba_unmultiplied(200, 30, 30, 230))
                                     .min_size(egui::vec2(120.0, 24.0)),
@@ -698,13 +793,16 @@ impl UserProfilePopup {
                                     self.ban_confirm = false;
                                 }
                             });
-                        } else if ui.add(
-                            egui::Button::new(
-                                RichText::new("🚫 Ban user").small().color(Color32::WHITE),
+                        } else if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("🚫 Ban user").small().color(Color32::WHITE),
+                                )
+                                .fill(Color32::from_rgba_unmultiplied(180, 40, 40, 180))
+                                .min_size(egui::vec2(100.0, 24.0)),
                             )
-                            .fill(Color32::from_rgba_unmultiplied(180, 40, 40, 180))
-                            .min_size(egui::vec2(100.0, 24.0)),
-                        ).clicked() {
+                            .clicked()
+                        {
                             self.ban_confirm = true;
                         }
                     }
@@ -717,22 +815,18 @@ impl UserProfilePopup {
                 // ── Footer ───────────────────────────────────────────────
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 14.0;
-                    let (primary_label, primary_url) = if self
-                        .channel
-                        .as_ref()
-                        .map(|c| c.is_kick())
-                        .unwrap_or(false)
-                    {
-                        (
-                            "View on Kick ↗".to_owned(),
-                            format!("https://kick.com/{}", profile.login),
-                        )
-                    } else {
-                        (
-                            "View on Twitch ↗".to_owned(),
-                            format!("https://twitch.tv/{}", profile.login),
-                        )
-                    };
+                    let (primary_label, primary_url) =
+                        if self.channel.as_ref().map(|c| c.is_kick()).unwrap_or(false) {
+                            (
+                                "View on Kick ↗".to_owned(),
+                                format!("https://kick.com/{}", profile.login),
+                            )
+                        } else {
+                            (
+                                "View on Twitch ↗".to_owned(),
+                                format!("https://twitch.tv/{}", profile.login),
+                            )
+                        };
                     ui.hyperlink_to(
                         RichText::new(primary_label).small().color(t::ACCENT),
                         primary_url,
@@ -743,7 +837,9 @@ impl UserProfilePopup {
                         profile.login,
                     );
                     ui.hyperlink_to(
-                        RichText::new("Lookup logs ↗").small().color(t::TEXT_SECONDARY),
+                        RichText::new("Lookup logs ↗")
+                            .small()
+                            .color(t::TEXT_SECONDARY),
                         logs_url,
                     );
                 });
@@ -764,7 +860,12 @@ impl UserProfilePopup {
 /// Render a small inline role pill using egui Frame.
 fn role_pill(ui: &mut egui::Ui, text: &str, color: Color32) {
     egui::Frame::new()
-        .fill(Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 40))
+        .fill(Color32::from_rgba_unmultiplied(
+            color.r(),
+            color.g(),
+            color.b(),
+            40,
+        ))
         .corner_radius(t::RADIUS_SM)
         .inner_margin(egui::Margin::symmetric(5, 2))
         .show(ui, |ui| {
@@ -782,7 +883,9 @@ fn badge_text_pill(ui: &mut egui::Ui, name: &str) {
         .inner_margin(egui::Margin::symmetric(4, 1))
         .show(ui, |ui| {
             ui.add(egui::Label::new(
-                RichText::new(name).color(Color32::from_rgb(210, 210, 220)).size(10.0),
+                RichText::new(name)
+                    .color(Color32::from_rgb(210, 210, 220))
+                    .size(10.0),
             ));
         });
 }
@@ -790,7 +893,10 @@ fn badge_text_pill(ui: &mut egui::Ui, name: &str) {
 /// Section heading inside the mod panel.
 fn section_label(ui: &mut egui::Ui, text: &str) {
     ui.add(egui::Label::new(
-        RichText::new(text).small().strong().color(t::TEXT_SECONDARY),
+        RichText::new(text)
+            .small()
+            .strong()
+            .color(t::TEXT_SECONDARY),
     ));
 }
 
@@ -807,13 +913,19 @@ fn timeout_btn(ui: &mut egui::Ui, label: &str) -> bool {
 /// Convert the reason buffer to `Option<String>` (None if empty).
 fn reason_opt(buf: &str) -> Option<String> {
     let s = buf.trim();
-    if s.is_empty() { None } else { Some(s.to_owned()) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_owned())
+    }
 }
 
 /// Parse a CSS hex color string (`#RRGGBB`) into an egui Color32.
 fn parse_hex_color(hex: &str) -> Option<Color32> {
     let h = hex.trim_start_matches('#');
-    if h.len() != 6 { return None; }
+    if h.len() != 6 {
+        return None;
+    }
     let r = u8::from_str_radix(&h[0..2], 16).ok()?;
     let g = u8::from_str_radix(&h[2..4], 16).ok()?;
     let b = u8::from_str_radix(&h[4..6], 16).ok()?;
@@ -823,26 +935,30 @@ fn parse_hex_color(hex: &str) -> Option<Color32> {
 /// Convert a badge name + version to a human-readable label.
 fn badge_display_name(name: &str, version: &str) -> String {
     match name {
-        "subscriber"  => match version.parse::<u32>().unwrap_or(0) {
+        "subscriber" => match version.parse::<u32>().unwrap_or(0) {
             0 => "Subscriber".to_owned(),
             m => format!("{m}-month Sub"),
         },
-        "moderator"   => "Moderator".to_owned(),
+        "moderator" => "Moderator".to_owned(),
         "broadcaster" => "Broadcaster".to_owned(),
-        "vip"         => "VIP".to_owned(),
-        "staff"       => "Staff".to_owned(),
-        "admin"       => "Admin".to_owned(),
-        "global_mod"  => "Global Mod".to_owned(),
-        "partner"     => "Partner".to_owned(),
-        "bits"        => {
+        "vip" => "VIP".to_owned(),
+        "staff" => "Staff".to_owned(),
+        "admin" => "Admin".to_owned(),
+        "global_mod" => "Global Mod".to_owned(),
+        "partner" => "Partner".to_owned(),
+        "bits" => {
             let val: u64 = version.parse().unwrap_or(0);
-            if val > 0 { format!("{val} Bits") } else { "Bits".to_owned() }
+            if val > 0 {
+                format!("{val} Bits")
+            } else {
+                "Bits".to_owned()
+            }
         }
         other => {
             let s = other.replace('_', " ");
             let mut c = s.chars();
             match c.next() {
-                None    => String::new(),
+                None => String::new(),
                 Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
             }
         }
@@ -866,13 +982,23 @@ fn fmt_join_date(ts: &str) -> String {
         return dt.format("%b %-d, %Y").to_string();
     }
     let parts: Vec<&str> = ts.splitn(3, '-').collect();
-    if parts.len() < 2 { return ts.to_owned(); }
-    let year  = parts[0];
+    if parts.len() < 2 {
+        return ts.to_owned();
+    }
+    let year = parts[0];
     let month = match parts[1] {
-        "01" => "January",   "02" => "February", "03" => "March",
-        "04" => "April",     "05" => "May",       "06" => "June",
-        "07" => "July",      "08" => "August",    "09" => "September",
-        "10" => "October",   "11" => "November",  "12" => "December",
+        "01" => "January",
+        "02" => "February",
+        "03" => "March",
+        "04" => "April",
+        "05" => "May",
+        "06" => "June",
+        "07" => "July",
+        "08" => "August",
+        "09" => "September",
+        "10" => "October",
+        "11" => "November",
+        "12" => "December",
         m => m,
     };
     format!("{month} {year}")
@@ -880,33 +1006,55 @@ fn fmt_join_date(ts: &str) -> String {
 
 /// Compute account age ("X years, Ymo") from an ISO 8601 timestamp.
 fn fmt_account_age(ts: &str) -> String {
-    let Some(unix) = iso_to_unix_secs(ts) else { return String::new(); };
+    let Some(unix) = iso_to_unix_secs(ts) else {
+        return String::new();
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let secs = now.saturating_sub(unix);
-    let years  = secs / 31_557_600;
+    let years = secs / 31_557_600;
     let months = (secs % 31_557_600) / 2_629_800;
     match years {
         0 => format!("{months} months"),
-        1 => if months == 0 { "1 year".to_owned() } else { format!("1 year, {months}mo") },
-        n => if months == 0 { format!("{n} years") } else { format!("{n} years, {months}mo") },
+        1 => {
+            if months == 0 {
+                "1 year".to_owned()
+            } else {
+                format!("1 year, {months}mo")
+            }
+        }
+        n => {
+            if months == 0 {
+                format!("{n} years")
+            } else {
+                format!("{n} years, {months}mo")
+            }
+        }
     }
 }
 
 /// Format an active stream as a live uptime string ("1h 23m", "45m").
 fn fmt_uptime(ts: &str) -> String {
-    let Some(started) = iso_to_unix_secs(ts) else { return String::new(); };
+    let Some(started) = iso_to_unix_secs(ts) else {
+        return String::new();
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let elapsed = now.saturating_sub(started);
-    if elapsed == 0 { return String::new(); }
+    if elapsed == 0 {
+        return String::new();
+    }
     let h = elapsed / 3600;
     let m = (elapsed % 3600) / 60;
-    if h > 0 { format!("{h}h {m}m") } else { format!("{m}m") }
+    if h > 0 {
+        format!("{h}h {m}m")
+    } else {
+        format!("{m}m")
+    }
 }
 
 /// Parse an ISO 8601 UTC datetime into Unix seconds.
@@ -922,24 +1070,30 @@ fn iso_to_unix_secs(ts: &str) -> Option<u64> {
     let time_part = &ts[t_idx + 1..];
 
     let dp: Vec<&str> = date_part.splitn(4, '-').collect();
-    if dp.len() < 3 { return None; }
-    let year:  i64 = dp[0].parse().ok()?;
+    if dp.len() < 3 {
+        return None;
+    }
+    let year: i64 = dp[0].parse().ok()?;
     let month: i64 = dp[1].parse().ok()?;
-    let day:   i64 = dp[2].parse().ok()?;
+    let day: i64 = dp[2].parse().ok()?;
 
     let time_clean = time_part.splitn(2, '.').next().unwrap_or(time_part);
     let tp: Vec<&str> = time_clean.splitn(4, ':').collect();
-    if tp.len() < 3 { return None; }
+    if tp.len() < 3 {
+        return None;
+    }
     let hour: u64 = tp[0].parse().ok()?;
-    let min:  u64 = tp[1].parse().ok()?;
-    let sec:  u64 = tp[2].parse().ok()?;
+    let min: u64 = tp[1].parse().ok()?;
+    let sec: u64 = tp[2].parse().ok()?;
 
     // Gregorian date → Julian Day Number → Unix days
-    let a   = (14 - month) / 12;
-    let yy  = year + 4800 - a;
-    let mm  = month + 12 * a - 3;
+    let a = (14 - month) / 12;
+    let yy = year + 4800 - a;
+    let mm = month + 12 * a - 3;
     let jdn = day + (153 * mm + 2) / 5 + 365 * yy + yy / 4 - yy / 100 + yy / 400 - 32_045;
     let unix_days = jdn - 2_440_588; // JDN of 1970-01-01
-    if unix_days < 0 { return None; }
+    if unix_days < 0 {
+        return None;
+    }
     Some(unix_days as u64 * 86_400 + hour * 3_600 + min * 60 + sec)
 }

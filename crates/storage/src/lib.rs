@@ -1,8 +1,8 @@
-pub mod settings;
 pub mod logs;
+pub mod settings;
 
-pub use settings::{AccountEntry, AppSettings, SettingsStore};
 pub use logs::LogStore;
+pub use settings::{AccountEntry, AppSettings, SettingsStore};
 
 use thiserror::Error;
 

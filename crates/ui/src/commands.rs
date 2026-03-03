@@ -43,15 +43,123 @@ const BUILTIN_SLASH_COMMANDS: &[SlashCommandInfo] = &[
         aliases: &[],
     },
     SlashCommandInfo {
+        name: "nick",
+        usage: "/nick <name>",
+        summary: "Set your nickname for generic IRC servers.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "join",
+        usage: "/join <#channel> [key]",
+        summary: "Join or create an IRC channel on the current server.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "part",
+        usage: "/part [#channel]",
+        summary: "Leave an IRC channel (current channel by default).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "msg",
+        usage: "/msg <target> <text>",
+        summary: "Send IRC private or channel message.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "notice",
+        usage: "/notice <target> <text>",
+        summary: "Send an IRC NOTICE message.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "topic",
+        usage: "/topic [#channel] [text]",
+        summary: "Get or set channel topic on IRC.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "names",
+        usage: "/names [#channel]",
+        summary: "Request IRC nickname list for a channel.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "list",
+        usage: "/list [mask]",
+        summary: "List IRC channels available to join.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "mode",
+        usage: "/mode <target> [modes]",
+        summary: "Query or set IRC user/channel modes.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "kick",
+        usage: "/kick <#channel> <nick> [reason]",
+        summary: "Kick a user from an IRC channel (op required).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "invite",
+        usage: "/invite <nick> [#channel]",
+        summary: "Invite a user to an IRC channel.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "whois",
+        usage: "/whois <nick>",
+        summary: "Lookup user details via IRC WHOIS.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "who",
+        usage: "/who [mask|#channel]",
+        summary: "Query IRC users with WHO.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "away",
+        usage: "/away [message]",
+        summary: "Set or clear IRC away status.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "quit",
+        usage: "/quit [message]",
+        summary: "Disconnect from the current IRC server.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "pass",
+        usage: "/pass <password>",
+        summary: "Set IRC server password (applies on reconnect).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "server",
+        usage: "/server <host[:port]>",
+        summary: "Connect to an IRC server tab.",
+        aliases: &["connect"],
+    },
+    SlashCommandInfo {
+        name: "raw",
+        usage: "/raw <line>",
+        summary: "Send a raw IRC line directly to the server.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
         name: "popout",
         usage: "/popout [channel]",
-        summary: "Open Twitch popout chat in the browser.",
+        summary: "Open Twitch/Kick popout chat in the browser.",
         aliases: &[],
     },
     SlashCommandInfo {
         name: "user",
         usage: "/user <user>",
-        summary: "Open twitch.tv/<user> in the browser.",
+        summary: "Open a Twitch/Kick user page in the browser.",
         aliases: &[],
     },
     SlashCommandInfo {
@@ -103,8 +211,12 @@ Built-in commands:\n",
         "\nAliases:\n\
   /whisper is the same as /w\n\
 \n\
-All other /commands are forwarded directly to Twitch\n\
-(examples: /ban, /timeout, /unban, /slow, /clear, /mod, /vip, /raid).",
+IRC tip:\n\
+  In IRC tabs, uppercase protocol lines like `PRIVMSG #rust :hello`\n\
+  are sent as raw IRC commands automatically.\n\
+\n\
+All other /commands are forwarded to the active chat backend\n\
+(Twitch/IRC; Kick message sending is currently unavailable).",
     );
 
     out
@@ -114,7 +226,12 @@ All other /commands are forwarded directly to Twitch\n\
 /// the command query (without leading slash). Returns `Some(\"\")` for `/`.
 pub fn extract_slash_query(buf: &str) -> Option<&str> {
     // After a trailing whitespace, user has moved on to arguments.
-    if buf.chars().last().map(|c| c.is_whitespace()).unwrap_or(false) {
+    if buf
+        .chars()
+        .last()
+        .map(|c| c.is_whitespace())
+        .unwrap_or(false)
+    {
         return None;
     }
 
@@ -157,7 +274,10 @@ pub fn slash_command_matches(query: &str, limit: usize) -> Vec<&'static SlashCom
                 true
             } else {
                 cmd.name.to_ascii_lowercase().contains(&q)
-                    || cmd.aliases.iter().any(|a| a.to_ascii_lowercase().contains(&q))
+                    || cmd
+                        .aliases
+                        .iter()
+                        .any(|a| a.to_ascii_lowercase().contains(&q))
             }
         })
         .collect();
@@ -167,9 +287,13 @@ pub fn slash_command_matches(query: &str, limit: usize) -> Vec<&'static SlashCom
             let a_name = a.name.to_ascii_lowercase();
             let b_name = b.name.to_ascii_lowercase();
             let a_prefix = a_name.starts_with(&q)
-                || a.aliases.iter().any(|al| al.to_ascii_lowercase().starts_with(&q));
+                || a.aliases
+                    .iter()
+                    .any(|al| al.to_ascii_lowercase().starts_with(&q));
             let b_prefix = b_name.starts_with(&q)
-                || b.aliases.iter().any(|al| al.to_ascii_lowercase().starts_with(&q));
+                || b.aliases
+                    .iter()
+                    .any(|al| al.to_ascii_lowercase().starts_with(&q));
             b_prefix
                 .cmp(&a_prefix)
                 .then_with(|| a_name.len().cmp(&b_name.len()))

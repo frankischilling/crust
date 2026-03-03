@@ -27,7 +27,9 @@ const BACKOFF_SECS: &[u64] = &[1, 2, 5, 10, 30];
 pub enum TwitchEvent {
     Connected,
     Disconnected,
-    Reconnecting { attempt: u32 },
+    Reconnecting {
+        attempt: u32,
+    },
     ChatMessage(ChatMessage),
     MessageDeleted {
         channel: ChannelId,
@@ -46,11 +48,20 @@ pub enum TwitchEvent {
     SystemNotice(SystemNotice),
     Error(String),
     /// A user was timed out (CLEARCHAT with ban-duration tag).
-    UserTimedOut { channel: ChannelId, login: String, seconds: u32 },
+    UserTimedOut {
+        channel: ChannelId,
+        login: String,
+        seconds: u32,
+    },
     /// A user was permanently banned (CLEARCHAT without ban-duration).
-    UserBanned { channel: ChannelId, login: String },
+    UserBanned {
+        channel: ChannelId,
+        login: String,
+    },
     /// A moderator cleared the entire chat.
-    ChatCleared { channel: ChannelId },
+    ChatCleared {
+        channel: ChannelId,
+    },
     /// USERSTATE received — badges, color and mod status for the logged-in user.
     UserStateUpdated {
         channel: ChannelId,
@@ -72,7 +83,11 @@ pub enum TwitchEvent {
         sub_msg: String,
     },
     /// Incoming raid notification (USERNOTICE msg-id=raid).
-    Raid { channel: ChannelId, display_name: String, viewer_count: u32 },
+    Raid {
+        channel: ChannelId,
+        display_name: String,
+        viewer_count: u32,
+    },
 }
 
 // Commands consumed by the session
@@ -84,7 +99,10 @@ pub enum SessionCommand {
     /// Send a PRIVMSG to a channel (requires auth).
     SendMessage(ChannelId, String, Option<String>), // channel, text, reply_parent_msg_id
     /// Re-connect with authentication credentials.
-    Authenticate { token: String, nick: String },
+    Authenticate {
+        token: String,
+        nick: String,
+    },
     /// Drop auth and reconnect anonymously.
     LogoutAndReconnect,
     Disconnect,
@@ -249,7 +267,10 @@ impl TwitchSession {
     async fn connect_once(&mut self) -> Result<bool, TwitchError> {
         let is_authed = self.auth_token.is_some();
         if is_authed {
-            info!("Connecting as {} to {WS_URL}", self.auth_nick.as_deref().unwrap_or("?"));
+            info!(
+                "Connecting as {} to {WS_URL}",
+                self.auth_nick.as_deref().unwrap_or("?")
+            );
         } else {
             info!("Connecting anonymously to {WS_URL}");
         }
@@ -272,7 +293,10 @@ impl TwitchSession {
             } else {
                 format!("oauth:{token}")
             };
-            let nick = self.auth_nick.clone().unwrap_or_else(|| "crust_user".into());
+            let nick = self
+                .auth_nick
+                .clone()
+                .unwrap_or_else(|| "crust_user".into());
             send_raw!(format!("PASS {pass}"));
             send_raw!(format!("NICK {nick}"));
         } else {
@@ -379,7 +403,11 @@ impl TwitchSession {
                 return Some(format!("PONG :{server}"));
             }
             "001" => {
-                let mode = if self.auth_token.is_some() { "authenticated" } else { "anonymous" };
+                let mode = if self.auth_token.is_some() {
+                    "authenticated"
+                } else {
+                    "anonymous"
+                };
                 info!("Connected ({mode})");
                 self.emit(TwitchEvent::Connected).await;
             }
@@ -387,7 +415,9 @@ impl TwitchSession {
                 // Sent after successful authenticated login.
                 // Extract user-id and display-name from tags.
                 let user_id = msg.tags.get("user-id").unwrap_or("").to_owned();
-                let display_name = msg.tags.get("display-name")
+                let display_name = msg
+                    .tags
+                    .get("display-name")
                     .filter(|s| !s.is_empty())
                     .unwrap_or(self.auth_nick.as_deref().unwrap_or(""))
                     .to_owned();
@@ -397,7 +427,8 @@ impl TwitchSession {
                     self.emit(TwitchEvent::Authenticated {
                         username: display_name,
                         user_id,
-                    }).await;
+                    })
+                    .await;
                 }
             }
             "JOIN" => {
@@ -433,10 +464,9 @@ impl TwitchSession {
                 }
             }
             "CLEARMSG" => {
-                if let (Some(ch_raw), Some(target_id)) = (
-                    msg.params.first(),
-                    msg.tags.get("target-msg-id"),
-                ) {
+                if let (Some(ch_raw), Some(target_id)) =
+                    (msg.params.first(), msg.tags.get("target-msg-id"))
+                {
                     let channel = ChannelId::new(ch_raw.as_str());
                     self.emit(TwitchEvent::MessageDeleted {
                         channel,
@@ -456,12 +486,14 @@ impl TwitchSession {
                                 channel,
                                 login: login.to_owned(),
                                 seconds,
-                            }).await;
+                            })
+                            .await;
                         } else {
                             self.emit(TwitchEvent::UserBanned {
                                 channel,
                                 login: login.to_owned(),
-                            }).await;
+                            })
+                            .await;
                         }
                     } else {
                         // No target: whole chat was wiped
@@ -487,11 +519,9 @@ impl TwitchSession {
                 // Extract mod status, badges, and color.
                 if let Some(ch_raw) = msg.params.first() {
                     let channel = ChannelId::new(ch_raw.as_str());
-                    let is_mod = matches!(
-                        msg.tags.get("mod"),
-                        Some("1")
-                    );
-                    let badges: Vec<Badge> = msg.tags
+                    let is_mod = matches!(msg.tags.get("mod"), Some("1"));
+                    let badges: Vec<Badge> = msg
+                        .tags
                         .get("badges")
                         .unwrap_or("")
                         .split(',')
@@ -505,11 +535,18 @@ impl TwitchSession {
                             })
                         })
                         .collect();
-                    let color = msg.tags
+                    let color = msg
+                        .tags
                         .get("color")
                         .filter(|s| !s.is_empty())
                         .map(str::to_owned);
-                    self.emit(TwitchEvent::UserStateUpdated { channel, is_mod, badges, color }).await;
+                    self.emit(TwitchEvent::UserStateUpdated {
+                        channel,
+                        is_mod,
+                        badges,
+                        color,
+                    })
+                    .await;
                 }
             }
             "NOTICE" | "HOSTTARGET" => {
@@ -537,9 +574,13 @@ impl TwitchSession {
             }
             "USERNOTICE" => {
                 let ch_opt = msg.params.first().map(|s| ChannelId::new(s.as_str()));
-                let Some(channel) = ch_opt else { return None; };
+                let Some(channel) = ch_opt else {
+                    return None;
+                };
                 let msg_id = msg.tags.get("msg-id").unwrap_or("");
-                let display_name = msg.tags.get("display-name")
+                let display_name = msg
+                    .tags
+                    .get("display-name")
                     .filter(|s| !s.is_empty())
                     .or_else(|| msg.nick())
                     .unwrap_or("unknown")
@@ -548,43 +589,68 @@ impl TwitchSession {
 
                 match msg_id {
                     "sub" | "resub" => {
-                        let months = msg.tags.get("msg-param-cumulative-months")
+                        let months = msg
+                            .tags
+                            .get("msg-param-cumulative-months")
                             .or_else(|| msg.tags.get("msg-param-months"))
                             .and_then(|s| s.parse().ok())
                             .unwrap_or(1u32);
-                        let plan = decode_sub_plan(
-                            msg.tags.get("msg-param-sub-plan").unwrap_or("1000")
-                        );
+                        let plan =
+                            decode_sub_plan(msg.tags.get("msg-param-sub-plan").unwrap_or("1000"));
                         self.emit(TwitchEvent::SubAlert {
-                            channel, display_name, months, plan, is_gift: false, sub_msg,
-                        }).await;
+                            channel,
+                            display_name,
+                            months,
+                            plan,
+                            is_gift: false,
+                            sub_msg,
+                        })
+                        .await;
                     }
                     "subgift" | "anonsubgift" => {
-                        let months = msg.tags.get("msg-param-months")
+                        let months = msg
+                            .tags
+                            .get("msg-param-months")
                             .and_then(|s| s.parse().ok())
                             .unwrap_or(1u32);
-                        let plan = decode_sub_plan(
-                            msg.tags.get("msg-param-sub-plan").unwrap_or("1000")
-                        );
+                        let plan =
+                            decode_sub_plan(msg.tags.get("msg-param-sub-plan").unwrap_or("1000"));
                         // For subgift, display-name is the gifter; recipient is msg-param-recipient-display-name
-                        let recipient = msg.tags.get("msg-param-recipient-display-name")
+                        let recipient = msg
+                            .tags
+                            .get("msg-param-recipient-display-name")
                             .filter(|s| !s.is_empty())
                             .unwrap_or(&display_name)
                             .to_owned();
                         self.emit(TwitchEvent::SubAlert {
-                            channel, display_name: recipient, months, plan, is_gift: true, sub_msg,
-                        }).await;
+                            channel,
+                            display_name: recipient,
+                            months,
+                            plan,
+                            is_gift: true,
+                            sub_msg,
+                        })
+                        .await;
                     }
                     "raid" => {
-                        let viewer_count = msg.tags.get("msg-param-viewerCount")
+                        let viewer_count = msg
+                            .tags
+                            .get("msg-param-viewerCount")
                             .and_then(|s| s.parse().ok())
                             .unwrap_or(0u32);
-                        self.emit(TwitchEvent::Raid { channel, display_name, viewer_count }).await;
+                        self.emit(TwitchEvent::Raid {
+                            channel,
+                            display_name,
+                            viewer_count,
+                        })
+                        .await;
                     }
                     _ => {
                         // Other USERNOTICE types (submysterygift, primepaidupgrade, etc.)
                         // Fall back to the decoded system-msg tag.
-                        let text = msg.tags.get("system-msg")
+                        let text = msg
+                            .tags
+                            .get("system-msg")
                             .filter(|s| !s.is_empty())
                             .map(|s| unescape_irc_tag(s))
                             .or_else(|| msg.trailing().map(|s| s.to_owned()))
@@ -594,7 +660,8 @@ impl TwitchSession {
                                 channel: Some(channel),
                                 text,
                                 timestamp: Utc::now(),
-                            })).await;
+                            }))
+                            .await;
                         }
                     }
                 }
@@ -622,8 +689,7 @@ impl TwitchSession {
         let raw_text = msg.trailing()?.to_owned();
 
         // Handle /me ACTION
-        let (text, is_action) = if raw_text.starts_with("\x01ACTION ")
-            && raw_text.ends_with('\x01')
+        let (text, is_action) = if raw_text.starts_with("\x01ACTION ") && raw_text.ends_with('\x01')
         {
             (&raw_text[8..raw_text.len() - 1], true)
         } else {
@@ -656,9 +722,8 @@ impl TwitchSession {
             .collect();
 
         // Parse Twitch emote positions from the emotes tag
-        let twitch_emotes = crust_core::format::parse_twitch_emotes_tag(
-            tags.get("emotes").unwrap_or(""),
-        );
+        let twitch_emotes =
+            crust_core::format::parse_twitch_emotes_tag(tags.get("emotes").unwrap_or(""));
 
         let sender = Sender {
             user_id: UserId(user_id),
@@ -672,19 +737,23 @@ impl TwitchSession {
 
         // Bits detection
         let bits: u32 = tags.get("bits").and_then(|s| s.parse().ok()).unwrap_or(0);
-        let msg_kind = if bits > 0 { MsgKind::Bits { amount: bits } } else { MsgKind::Chat };
+        let msg_kind = if bits > 0 {
+            MsgKind::Bits { amount: bits }
+        } else {
+            MsgKind::Chat
+        };
 
         // Reply metadata
         let reply = if let Some(parent_id) = tags.get("reply-parent-msg-id") {
             if !parent_id.is_empty() {
                 Some(ReplyInfo {
                     parent_msg_id: parent_id.to_owned(),
-                    parent_user_login: tags.get("reply-parent-user-login")
-                        .unwrap_or("").to_owned(),
-                    parent_display_name: tags.get("reply-parent-display-name")
-                        .unwrap_or("").to_owned(),
-                    parent_msg_body: tags.get("reply-parent-msg-body")
-                        .unwrap_or("").to_owned(),
+                    parent_user_login: tags.get("reply-parent-user-login").unwrap_or("").to_owned(),
+                    parent_display_name: tags
+                        .get("reply-parent-display-name")
+                        .unwrap_or("")
+                        .to_owned(),
+                    parent_msg_body: tags.get("reply-parent-msg-body").unwrap_or("").to_owned(),
                 })
             } else {
                 None
@@ -709,7 +778,8 @@ impl TwitchSession {
                 is_first_msg: tags.get("first-msg") == Some("1"),
                 is_self: is_own,
                 is_mention: false, // set by reducer once auth_username is known
-                custom_reward_id: tags.get("custom-reward-id")
+                custom_reward_id: tags
+                    .get("custom-reward-id")
                     .filter(|s| !s.is_empty())
                     .map(str::to_owned),
                 is_history: false,
@@ -735,9 +805,7 @@ pub fn parse_privmsg_irc(
     let raw_text = msg.trailing()?.to_owned();
 
     // Handle /me ACTION
-    let (text, is_action) = if raw_text.starts_with("\x01ACTION ")
-        && raw_text.ends_with('\x01')
-    {
+    let (text, is_action) = if raw_text.starts_with("\x01ACTION ") && raw_text.ends_with('\x01') {
         (&raw_text[8..raw_text.len() - 1], true)
     } else {
         (raw_text.as_str(), false)
@@ -768,9 +836,8 @@ pub fn parse_privmsg_irc(
         })
         .collect();
 
-    let twitch_emotes = crust_core::format::parse_twitch_emotes_tag(
-        tags.get("emotes").unwrap_or(""),
-    );
+    let twitch_emotes =
+        crust_core::format::parse_twitch_emotes_tag(tags.get("emotes").unwrap_or(""));
 
     let sender = Sender {
         user_id: UserId(user_id),
@@ -795,18 +862,12 @@ pub fn parse_privmsg_irc(
         if !parent_id.is_empty() {
             Some(ReplyInfo {
                 parent_msg_id: parent_id.to_owned(),
-                parent_user_login: tags
-                    .get("reply-parent-user-login")
-                    .unwrap_or("")
-                    .to_owned(),
+                parent_user_login: tags.get("reply-parent-user-login").unwrap_or("").to_owned(),
                 parent_display_name: tags
                     .get("reply-parent-display-name")
                     .unwrap_or("")
                     .to_owned(),
-                parent_msg_body: tags
-                    .get("reply-parent-msg-body")
-                    .unwrap_or("")
-                    .to_owned(),
+                parent_msg_body: tags.get("reply-parent-msg-body").unwrap_or("").to_owned(),
             })
         } else {
             None
@@ -846,10 +907,10 @@ pub fn parse_privmsg_irc(
 fn decode_sub_plan(plan: &str) -> String {
     match plan {
         "Prime" => "Prime".to_owned(),
-        "1000"  => "Tier 1".to_owned(),
-        "2000"  => "Tier 2".to_owned(),
-        "3000"  => "Tier 3".to_owned(),
-        other   => other.to_owned(),
+        "1000" => "Tier 1".to_owned(),
+        "2000" => "Tier 2".to_owned(),
+        "3000" => "Tier 3".to_owned(),
+        other => other.to_owned(),
     }
 }
 
@@ -896,13 +957,16 @@ pub fn unescape_irc_tag(s: &str) -> String {
     while let Some(c) = chars.next() {
         if c == '\\' {
             match chars.next() {
-                Some('s')  => out.push(' '),
-                Some(':')  => out.push(';'),
-                Some('r')  => out.push('\r'),
-                Some('n')  => out.push('\n'),
+                Some('s') => out.push(' '),
+                Some(':') => out.push(';'),
+                Some('r') => out.push('\r'),
+                Some('n') => out.push('\n'),
                 Some('\\') => out.push('\\'),
-                Some(o)    => { out.push('\\'); out.push(o); }
-                None       => out.push('\\'),
+                Some(o) => {
+                    out.push('\\');
+                    out.push(o);
+                }
+                None => out.push('\\'),
             }
         } else {
             out.push(c);

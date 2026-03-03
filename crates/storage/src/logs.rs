@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
+use crate::StorageError;
 use chrono::{DateTime, Utc};
 use directories::ProjectDirs;
 use tokio::io::AsyncWriteExt;
-use crate::StorageError;
 
 /// Append-only per-channel log storage.
 /// Format: logs/<channel>/YYYY-MM-DD.log
@@ -39,12 +39,7 @@ impl LogStore {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let line = format!(
-            "[{}] <{}> {}\n",
-            ts.format("%H:%M:%S"),
-            sender,
-            text
-        );
+        let line = format!("[{}] <{}> {}\n", ts.format("%H:%M:%S"), sender, text);
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)

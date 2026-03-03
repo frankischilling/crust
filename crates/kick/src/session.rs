@@ -23,7 +23,9 @@ const BACKOFF_SECS: &[u64] = &[1, 2, 5, 10, 30];
 pub enum KickEvent {
     Connected,
     Disconnected,
-    Reconnecting { attempt: u32 },
+    Reconnecting {
+        attempt: u32,
+    },
     ChatMessage(ChatMessage),
     MessageDeleted {
         channel: ChannelId,
@@ -297,10 +299,8 @@ impl KickSession {
             Ok(info) => {
                 let chatroom_id = info.chatroom_id;
                 info!("Kick channel '{slug}' → chatroom_id={chatroom_id}");
-                self.chatroom_to_channel
-                    .insert(chatroom_id, ch.clone());
-                self.channel_to_chatroom
-                    .insert(ch.clone(), chatroom_id);
+                self.chatroom_to_channel.insert(chatroom_id, ch.clone());
+                self.channel_to_chatroom.insert(ch.clone(), chatroom_id);
                 self.channel_badge_urls
                     .insert(ch.clone(), info.badge_urls.clone());
 
@@ -420,11 +420,7 @@ impl KickSession {
                         .get(&channel)
                         .and_then(|m| resolve_kick_badge_fallback_url(m, &name, &version))
                 });
-                Some(Badge {
-                    name,
-                    version,
-                    url,
-                })
+                Some(Badge { name, version, url })
             })
             .collect();
 
@@ -435,10 +431,7 @@ impl KickSession {
 
         let display_name = sender_data.username.unwrap_or_else(|| login.clone());
 
-        let user_id_str = sender_data
-            .id
-            .map(|id| id.to_string())
-            .unwrap_or_default();
+        let user_id_str = sender_data.id.map(|id| id.to_string()).unwrap_or_default();
 
         let server_id = payload.id.clone();
         let content = payload.content.unwrap_or_default();
@@ -603,9 +596,7 @@ fn resolve_kick_badge_fallback_url(
             for (k, v) in badge_map {
                 if let Some(months_str) = k.strip_prefix("subscriber:") {
                     if let Ok(months) = months_str.parse::<u32>() {
-                        if months <= target
-                            && best.map(|(m, _)| months > m).unwrap_or(true)
-                        {
+                        if months <= target && best.map(|(m, _)| months > m).unwrap_or(true) {
                             best = Some((months, v));
                         }
                     }

@@ -45,7 +45,9 @@ pub struct BttvProvider {
 
 impl BttvProvider {
     pub fn new() -> Self {
-        Self { client: reqwest::Client::new() }
+        Self {
+            client: reqwest::Client::new(),
+        }
     }
 }
 
@@ -77,7 +79,9 @@ impl BttvEmote {
 
 #[async_trait::async_trait]
 impl EmoteProvider for BttvProvider {
-    fn name(&self) -> &'static str { "bttv" }
+    fn name(&self) -> &'static str {
+        "bttv"
+    }
 
     async fn load_global(&self) -> Vec<EmoteInfo> {
         let url = "https://api.betterttv.net/3/cached/emotes/global";
@@ -97,9 +101,7 @@ impl EmoteProvider for BttvProvider {
     }
 
     async fn load_channel(&self, channel_id: &str) -> Vec<EmoteInfo> {
-        let url = format!(
-            "https://api.betterttv.net/3/cached/users/twitch/{channel_id}"
-        );
+        let url = format!("https://api.betterttv.net/3/cached/users/twitch/{channel_id}");
         #[derive(Deserialize)]
         struct BttvChannel {
             #[serde(rename = "channelEmotes")]
@@ -109,7 +111,10 @@ impl EmoteProvider for BttvProvider {
         }
         match self.client.get(&url).send().await {
             Ok(resp) if !resp.status().is_success() => {
-                tracing::debug!("BTTV channel returned HTTP {} for {channel_id}", resp.status());
+                tracing::debug!(
+                    "BTTV channel returned HTTP {} for {channel_id}",
+                    resp.status()
+                );
                 vec![]
             }
             Ok(resp) => match resp.json::<BttvChannel>().await {
@@ -140,13 +145,17 @@ pub struct FfzProvider {
 
 impl FfzProvider {
     pub fn new() -> Self {
-        Self { client: reqwest::Client::new() }
+        Self {
+            client: reqwest::Client::new(),
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl EmoteProvider for FfzProvider {
-    fn name(&self) -> &'static str { "ffz" }
+    fn name(&self) -> &'static str {
+        "ffz"
+    }
 
     async fn load_global(&self) -> Vec<EmoteInfo> {
         // FFZ global sets: https://api.frankerfacez.com/v1/set/global
@@ -213,7 +222,10 @@ impl EmoteProvider for FfzProvider {
         let url = format!("https://api.frankerfacez.com/v1/room/id/{channel_id}");
         match self.client.get(&url).send().await {
             Ok(resp) if !resp.status().is_success() => {
-                tracing::debug!("FFZ channel returned HTTP {} for {channel_id}", resp.status());
+                tracing::debug!(
+                    "FFZ channel returned HTTP {} for {channel_id}",
+                    resp.status()
+                );
                 vec![]
             }
             Ok(resp) => match resp.json::<FfzRoom>().await {
@@ -251,13 +263,17 @@ pub struct SevenTvProvider {
 
 impl SevenTvProvider {
     pub fn new() -> Self {
-        Self { client: reqwest::Client::new() }
+        Self {
+            client: reqwest::Client::new(),
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl EmoteProvider for SevenTvProvider {
-    fn name(&self) -> &'static str { "7tv" }
+    fn name(&self) -> &'static str {
+        "7tv"
+    }
 
     async fn load_global(&self) -> Vec<EmoteInfo> {
         let url = "https://7tv.io/v3/emote-sets/global";
@@ -277,13 +293,17 @@ pub struct KickProvider {
 
 impl KickProvider {
     pub fn new() -> Self {
-        Self { client: reqwest::Client::new() }
+        Self {
+            client: reqwest::Client::new(),
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl EmoteProvider for KickProvider {
-    fn name(&self) -> &'static str { "kick" }
+    fn name(&self) -> &'static str {
+        "kick"
+    }
 
     async fn load_global(&self) -> Vec<EmoteInfo> {
         // Kick global emotes are not loaded yet.
@@ -292,7 +312,8 @@ impl EmoteProvider for KickProvider {
 
     async fn load_channel(&self, channel_id: &str) -> Vec<EmoteInfo> {
         let url = format!("https://kick.com/emotes/{channel_id}");
-        match self.client
+        match self
+            .client
             .get(&url)
             .header(reqwest::header::USER_AGENT, "CrustChat/0.1")
             .header(reqwest::header::ACCEPT, "application/json")
@@ -300,7 +321,10 @@ impl EmoteProvider for KickProvider {
             .await
         {
             Ok(resp) if !resp.status().is_success() => {
-                tracing::debug!("Kick channel emotes returned HTTP {} for {channel_id}", resp.status());
+                tracing::debug!(
+                    "Kick channel emotes returned HTTP {} for {channel_id}",
+                    resp.status()
+                );
                 vec![]
             }
             Ok(resp) => match resp.json::<serde_json::Value>().await {
@@ -405,7 +429,11 @@ impl SevenTvProvider {
             .filter_map(|e| {
                 let data = e.data?;
                 let base = format!("https:{}", data.host.url);
-                let file_1x = data.host.files.first().map(|f| format!("{base}/{}", f.name));
+                let file_1x = data
+                    .host
+                    .files
+                    .first()
+                    .map(|f| format!("{base}/{}", f.name));
                 let file_2x = data.host.files.get(1).map(|f| format!("{base}/{}", f.name));
                 let file_4x = data.host.files.get(2).map(|f| format!("{base}/{}", f.name));
                 Some(EmoteInfo {
@@ -422,7 +450,10 @@ impl SevenTvProvider {
 }
 
 fn parse_kick_emotes(v: serde_json::Value) -> Vec<EmoteInfo> {
-    let items_opt = v.get("emotes").and_then(|e| e.as_array()).or_else(|| v.as_array());
+    let items_opt = v
+        .get("emotes")
+        .and_then(|e| e.as_array())
+        .or_else(|| v.as_array());
     let Some(items) = items_opt else {
         return Vec::new();
     };
@@ -453,11 +484,15 @@ fn parse_kick_emote_item(item: &serde_json::Value) -> Option<EmoteInfo> {
     })
 }
 
-fn extract_kick_emote_urls(item: &serde_json::Value) -> (Option<String>, Option<String>, Option<String>) {
+fn extract_kick_emote_urls(
+    item: &serde_json::Value,
+) -> (Option<String>, Option<String>, Option<String>) {
     if let Some(urls_obj) = item.get("urls").and_then(|u| u.as_object()) {
-        let u1 = first_obj_str(urls_obj, &["1x", "1", "small", "url"]).map(|u| normalize_kick_url(&u));
+        let u1 =
+            first_obj_str(urls_obj, &["1x", "1", "small", "url"]).map(|u| normalize_kick_url(&u));
         let u2 = first_obj_str(urls_obj, &["2x", "2", "medium"]).map(|u| normalize_kick_url(&u));
-        let u4 = first_obj_str(urls_obj, &["4x", "3x", "3", "large"]).map(|u| normalize_kick_url(&u));
+        let u4 =
+            first_obj_str(urls_obj, &["4x", "3x", "3", "large"]).map(|u| normalize_kick_url(&u));
         if u1.is_some() {
             return (u1, u2, u4);
         }
@@ -465,7 +500,8 @@ fn extract_kick_emote_urls(item: &serde_json::Value) -> (Option<String>, Option<
 
     for key in ["image", "emote"] {
         if let Some(obj) = item.get(key).and_then(|v| v.as_object()) {
-            let u1 = first_obj_str(obj, &["url", "src", "1x", "small"]).map(|u| normalize_kick_url(&u));
+            let u1 =
+                first_obj_str(obj, &["url", "src", "1x", "small"]).map(|u| normalize_kick_url(&u));
             let u2 = first_obj_str(obj, &["2x", "medium"]).map(|u| normalize_kick_url(&u));
             let u4 = first_obj_str(obj, &["4x", "3x", "large"]).map(|u| normalize_kick_url(&u));
             if u1.is_some() {
@@ -492,7 +528,10 @@ fn first_str(item: &serde_json::Value, keys: &[&str]) -> Option<String> {
     None
 }
 
-fn first_obj_str(obj: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<String> {
+fn first_obj_str(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<String> {
     for key in keys {
         if let Some(s) = obj.get(*key).and_then(|v| v.as_str()) {
             if !s.is_empty() {

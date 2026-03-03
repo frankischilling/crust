@@ -804,6 +804,7 @@ dependencies = [
  "chrono",
  "crust-core",
  "crust-emotes",
+ "crust-kick",
  "crust-storage",
  "crust-twitch",
  "crust-ui",
@@ -852,6 +853,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "crust-kick"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "crust-core",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+]
+
+[[package]]
 name = "crust-storage"
 version = "0.1.0"
 dependencies = [
@@ -875,11 +893,13 @@ dependencies = [
  "chrono",
  "crust-core",
  "futures-util",
+ "native-tls",
  "serde",
  "serde_json",
  "smallvec",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-native-tls",
  "tokio-tungstenite",
  "tracing",
 ]

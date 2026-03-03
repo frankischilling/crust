@@ -20,7 +20,7 @@ pub struct PerfOverlay {
 
     // Frame timing
     last_frame: Instant,
-    frame_ms: VecDeque<f32>,    // rolling frame durations (ms)
+    frame_ms: VecDeque<f32>, // rolling frame durations (ms)
 
     // Event throughput
     events_per_frame: VecDeque<u32>,
@@ -32,7 +32,7 @@ pub struct PerfOverlay {
 
     // Snapshot state updated each frame
     pub emote_count: usize,
-    pub emote_ram_kb: usize,  // rough estimate
+    pub emote_ram_kb: usize, // rough estimate
 }
 
 impl Default for PerfOverlay {
@@ -78,8 +78,8 @@ impl PerfOverlay {
 
         let avg_ms = avg_f32(&self.frame_ms);
         let worst_ms = self.frame_ms.iter().cloned().fold(0.0_f32, f32::max);
-        let best_ms  = self.frame_ms.iter().cloned().fold(f32::MAX, f32::min);
-        let fps      = if avg_ms > 0.0 { 1000.0 / avg_ms } else { 0.0 };
+        let best_ms = self.frame_ms.iter().cloned().fold(f32::MAX, f32::min);
+        let fps = if avg_ms > 0.0 { 1000.0 / avg_ms } else { 0.0 };
 
         let avg_events = avg_u32(&self.events_per_frame);
         let repaint_pct = if self.total_frames > 0 {
@@ -112,10 +112,13 @@ impl PerfOverlay {
                         ui.end_row();
 
                         ui.label(RichText::new("Frame (worst)").color(Color32::GRAY));
-                        ui.label(
-                            RichText::new(format!("{worst_ms:.2} ms"))
-                                .color(if worst_ms > 33.0 { Color32::YELLOW } else { Color32::WHITE }),
-                        );
+                        ui.label(RichText::new(format!("{worst_ms:.2} ms")).color(
+                            if worst_ms > 33.0 {
+                                Color32::YELLOW
+                            } else {
+                                Color32::WHITE
+                            },
+                        ));
                         ui.end_row();
 
                         ui.label(RichText::new("Frame (best)").color(Color32::GRAY));
@@ -142,12 +145,13 @@ impl PerfOverlay {
                         // Repaint efficiency
                         ui.label(RichText::new("Repaint efficiency").color(Color32::GRAY));
                         ui.label(
-                            RichText::new(format!("{repaint_pct:.1}% event-driven"))
-                                .color(if repaint_pct < 5.0 {
-                                    Color32::GREEN   // mostly idle - good
+                            RichText::new(format!("{repaint_pct:.1}% event-driven")).color(
+                                if repaint_pct < 5.0 {
+                                    Color32::GREEN // mostly idle - good
                                 } else {
                                     Color32::WHITE
-                                }),
+                                },
+                            ),
                         );
                         ui.end_row();
 
@@ -179,24 +183,37 @@ fn push_ring<T>(buf: &mut VecDeque<T>, val: T, cap: usize) {
 }
 
 fn avg_f32(buf: &VecDeque<f32>) -> f32 {
-    if buf.is_empty() { return 0.0; }
+    if buf.is_empty() {
+        return 0.0;
+    }
     buf.iter().sum::<f32>() / buf.len() as f32
 }
 
 fn avg_u32(buf: &VecDeque<u32>) -> f32 {
-    if buf.is_empty() { return 0.0; }
+    if buf.is_empty() {
+        return 0.0;
+    }
     buf.iter().map(|&x| x as f32).sum::<f32>() / buf.len() as f32
 }
 
 fn fps_color(fps: f32) -> Color32 {
-    if fps >= 55.0 { Color32::GREEN }
-    else if fps >= 30.0 { Color32::YELLOW }
-    else { Color32::RED }
+    if fps >= 55.0 {
+        Color32::GREEN
+    } else if fps >= 30.0 {
+        Color32::YELLOW
+    } else {
+        Color32::RED
+    }
 }
 
 fn human_bytes(bytes: usize) -> (f32, &'static str) {
-    if bytes >= 1_073_741_824 { (bytes as f32 / 1_073_741_824.0, "GB") }
-    else if bytes >= 1_048_576 { (bytes as f32 / 1_048_576.0, "MB") }
-    else if bytes >= 1_024 { (bytes as f32 / 1_024.0, "KB") }
-    else { (bytes as f32, "B") }
+    if bytes >= 1_073_741_824 {
+        (bytes as f32 / 1_073_741_824.0, "GB")
+    } else if bytes >= 1_048_576 {
+        (bytes as f32 / 1_048_576.0, "MB")
+    } else if bytes >= 1_024 {
+        (bytes as f32 / 1_024.0, "KB")
+    } else {
+        (bytes as f32, "B")
+    }
 }

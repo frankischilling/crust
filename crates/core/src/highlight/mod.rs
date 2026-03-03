@@ -17,8 +17,7 @@ impl HighlightRule {
         if self.case_sensitive {
             text.contains(&self.pattern)
         } else {
-            text.to_lowercase()
-                .contains(&self.pattern.to_lowercase())
+            text.to_lowercase().contains(&self.pattern.to_lowercase())
         }
     }
 }

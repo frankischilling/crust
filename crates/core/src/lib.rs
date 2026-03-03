@@ -1,8 +1,8 @@
-pub mod model;
-pub mod format;
-pub mod highlight;
 pub mod emoji;
 pub mod events;
+pub mod format;
+pub mod highlight;
+pub mod model;
 pub mod state;
 
 pub use events::{AppCommand, AppEvent};

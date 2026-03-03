@@ -1,9 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use egui::{
-    Color32, Id, Label, LayerId, Order, RichText, ScrollArea, Ui, Vec2,
-};
+use egui::{Color32, Id, Label, LayerId, Order, RichText, ScrollArea, Ui, Vec2};
 use tokio::sync::mpsc;
 
 use crust_core::{
@@ -51,7 +49,13 @@ impl<'a> MessageList<'a> {
         channel: &'a ChannelId,
         link_previews: &'a HashMap<String, LinkPreview>,
     ) -> Self {
-        Self { messages, emote_bytes, cmd_tx, channel, link_previews }
+        Self {
+            messages,
+            emote_bytes,
+            cmd_tx,
+            channel,
+            link_previews,
+        }
     }
 
     /// Render the message list with auto-scroll behaviour.
@@ -121,7 +125,8 @@ impl<'a> MessageList<'a> {
         // a fresh scroll-offset reset.
         if n == 0 {
             height_cache.clear();
-            ui.ctx().data_mut(|d| d.insert_temp::<bool>(init_key, false));
+            ui.ctx()
+                .data_mut(|d| d.insert_temp::<bool>(init_key, false));
         }
 
         // Scroll-to-reply target
@@ -129,20 +134,25 @@ impl<'a> MessageList<'a> {
         // it only fires once.
         let scroll_to_key = egui::Id::new("ml_scroll_to").with(self.channel.as_str());
         let forced_offset: Option<f32> = {
-            let target: Option<String> =
-                ui.ctx().data_mut(|d| {
-                    let v: Option<String> = d.get_temp(scroll_to_key);
-                    if v.is_some() {
-                        d.remove::<String>(scroll_to_key);
-                    }
-                    v
-                });
+            let target: Option<String> = ui.ctx().data_mut(|d| {
+                let v: Option<String> = d.get_temp(scroll_to_key);
+                if v.is_some() {
+                    d.remove::<String>(scroll_to_key);
+                }
+                v
+            });
             target.and_then(|tgt_id| {
-                let idx = self.messages.iter().position(|m| {
-                    m.server_id.as_deref() == Some(tgt_id.as_str())
-                })?;
+                let idx = self
+                    .messages
+                    .iter()
+                    .position(|m| m.server_id.as_deref() == Some(tgt_id.as_str()))?;
                 let offset: f32 = (0..idx)
-                    .map(|i| height_cache.get(&self.messages[i].id.0).copied().unwrap_or(EST_H))
+                    .map(|i| {
+                        height_cache
+                            .get(&self.messages[i].id.0)
+                            .copied()
+                            .unwrap_or(EST_H)
+                    })
                     .sum();
                 Some(offset)
             })
@@ -153,8 +163,9 @@ impl<'a> MessageList<'a> {
             // We also measure row heights here so the cache is pre-populated
             // when the channel crosses VIRTUAL_THRESHOLD.
             let paused_key = egui::Id::new("scroll_paused").with(self.channel.as_str());
-            let scroll_paused: bool =
-                ui.ctx().data_mut(|d| d.get_temp(paused_key).unwrap_or(false));
+            let scroll_paused: bool = ui
+                .ctx()
+                .data_mut(|d| d.get_temp(paused_key).unwrap_or(false));
             let mut sa = ScrollArea::vertical()
                 .id_salt(scroll_id)
                 .auto_shrink([false; 2])
@@ -165,17 +176,17 @@ impl<'a> MessageList<'a> {
                 sa = sa.vertical_scroll_offset(0.0);
             }
             let output = sa.show(ui, |ui| {
-                    let full_width = ui.available_width();
-                    ui.set_min_width(full_width);
-                    for msg in self.messages.iter() {
-                        let top_y = ui.next_widget_position().y;
-                        self.render_message(ui, msg);
-                        let measured = ui.next_widget_position().y - top_y;
-                        if measured > 0.0 {
-                            height_cache.insert(msg.id.0, measured);
-                        }
+                let full_width = ui.available_width();
+                ui.set_min_width(full_width);
+                for msg in self.messages.iter() {
+                    let top_y = ui.next_widget_position().y;
+                    self.render_message(ui, msg);
+                    let measured = ui.next_widget_position().y - top_y;
+                    if measured > 0.0 {
+                        height_cache.insert(msg.id.0, measured);
                     }
-                });
+                }
+            });
 
             // Persist height cache for seamless transition to virtual scrolling.
             ui.ctx().data_mut(|d| d.insert_temp(hc_id, height_cache));
@@ -201,8 +212,9 @@ impl<'a> MessageList<'a> {
         // coordinates.  We allocate dead space for off-screen rows and only
         // call render_message for rows whose y-range overlaps the viewport.
         let paused_key = egui::Id::new("scroll_paused").with(self.channel.as_str());
-        let scroll_paused: bool =
-            ui.ctx().data_mut(|d| d.get_temp(paused_key).unwrap_or(false));
+        let scroll_paused: bool = ui
+            .ctx()
+            .data_mut(|d| d.get_temp(paused_key).unwrap_or(false));
         let mut sa = ScrollArea::vertical()
             .id_salt(scroll_id)
             .auto_shrink([false; 2])
@@ -213,70 +225,67 @@ impl<'a> MessageList<'a> {
             sa = sa.vertical_scroll_offset(0.0);
         }
         let output = sa.show_viewport(ui, |ui, viewport| {
-                let full_width = ui.available_width();
-                ui.set_min_width(full_width);
+            let full_width = ui.available_width();
+            ui.set_min_width(full_width);
 
-                let vis_min = viewport.min.y;
-                let vis_max = viewport.max.y;
+            let vis_min = viewport.min.y;
+            let vis_max = viewport.max.y;
 
-                // Overscan and minimum-window safeguards prevent first-frame
-                // under-rendering when viewport reports a tiny height.
-                const OVERSCAN_PX: f32 = 260.0;
-                const MIN_RENDER_ROWS: usize = 24;
-                let scan_min = (vis_min - OVERSCAN_PX).max(0.0);
-                let scan_max = vis_max + OVERSCAN_PX;
+            // Overscan and minimum-window safeguards prevent first-frame
+            // under-rendering when viewport reports a tiny height.
+            const OVERSCAN_PX: f32 = 260.0;
+            const MIN_RENDER_ROWS: usize = 24;
+            let scan_min = (vis_min - OVERSCAN_PX).max(0.0);
+            let scan_max = vis_max + OVERSCAN_PX;
 
-                // First row whose bottom edge is visible (top < vis_max).
-                let mut first = if n == 0 {
-                    0
+            // First row whose bottom edge is visible (top < vis_max).
+            let mut first = if n == 0 {
+                0
+            } else {
+                prefix.partition_point(|&p| p < scan_min).saturating_sub(1)
+            };
+            // One past the last visible row (top <= vis_max).
+            let mut last = prefix.partition_point(|&p| p <= scan_max).min(n);
+            let min_last = (first + MIN_RENDER_ROWS).min(n);
+            if last < min_last {
+                last = min_last;
+            }
+            let min_rows = MIN_RENDER_ROWS.min(n);
+            if last.saturating_sub(first) < min_rows {
+                if last == n {
+                    first = n.saturating_sub(min_rows);
                 } else {
-                    prefix.partition_point(|&p| p < scan_min).saturating_sub(1)
-                };
-                // One past the last visible row (top <= vis_max).
-                let mut last = prefix.partition_point(|&p| p <= scan_max).min(n);
-                let min_last = (first + MIN_RENDER_ROWS).min(n);
-                if last < min_last {
-                    last = min_last;
+                    last = (first + min_rows).min(n);
                 }
-                let min_rows = MIN_RENDER_ROWS.min(n);
-                if last.saturating_sub(first) < min_rows {
-                    if last == n {
-                        first = n.saturating_sub(min_rows);
-                    } else {
-                        last = (first + min_rows).min(n);
-                    }
+            }
+
+            // Dead space above the visible window.
+            if first > 0 && prefix[first] > 0.0 {
+                ui.allocate_exact_size(
+                    egui::Vec2::new(full_width, prefix[first]),
+                    egui::Sense::hover(),
+                );
+            }
+
+            // Render only visible rows; measure heights for future frames.
+            for i in first..last {
+                let msg = &self.messages[i];
+                let top_y = ui.next_widget_position().y;
+
+                self.render_message(ui, msg);
+
+                let measured = ui.next_widget_position().y - top_y;
+                if measured > 0.0 {
+                    height_cache.insert(msg.id.0, measured);
                 }
+            }
 
-                // Dead space above the visible window.
-                if first > 0 && prefix[first] > 0.0 {
-                    ui.allocate_exact_size(
-                        egui::Vec2::new(full_width, prefix[first]),
-                        egui::Sense::hover(),
-                    );
-                }
-
-                // Render only visible rows; measure heights for future frames.
-                for i in first..last {
-                    let msg = &self.messages[i];
-                    let top_y = ui.next_widget_position().y;
-
-                    self.render_message(ui, msg);
-
-                    let measured = ui.next_widget_position().y - top_y;
-                    if measured > 0.0 {
-                        height_cache.insert(msg.id.0, measured);
-                    }
-                }
-
-                // Dead space below the visible window.
-                let tail = total_h - prefix[last];
-                if tail > 0.0 {
-                    ui.allocate_exact_size(
-                        egui::Vec2::new(full_width, tail),
-                        egui::Sense::hover(),
-                    );
-                }
-            });
+            // Dead space below the visible window.
+            let tail = total_h - prefix[last];
+            if tail > 0.0 {
+                ui.allocate_exact_size(egui::Vec2::new(full_width, tail), egui::Sense::hover());
+            }
+        });
 
         // Persist height cache for next frame.
         ui.ctx().data_mut(|d| d.insert_temp(hc_id, height_cache));
@@ -293,7 +302,9 @@ impl<'a> MessageList<'a> {
     fn take_reply(&self, ui: &Ui, key: Id) -> Option<ReplyInfo> {
         ui.ctx().data_mut(|d| {
             let v: Option<ReplyInfo> = d.get_temp(key);
-            if v.is_some() { d.remove::<ReplyInfo>(key); }
+            if v.is_some() {
+                d.remove::<ReplyInfo>(key);
+            }
             v
         })
     }
@@ -303,7 +314,9 @@ impl<'a> MessageList<'a> {
         let key = Id::new("ml_profile_req").with(self.channel.as_str());
         ui.ctx().data_mut(|d| {
             let v: Option<(String, Vec<Badge>)> = d.get_temp(key);
-            if v.is_some() { d.remove::<(String, Vec<Badge>)>(key); }
+            if v.is_some() {
+                d.remove::<(String, Vec<Badge>)>(key);
+            }
             v
         })
     }
@@ -313,7 +326,9 @@ impl<'a> MessageList<'a> {
     fn apply_snap(&self, ui: &mut Ui, output: &egui::scroll_area::ScrollAreaOutput<()>) {
         let snap_key = Id::new("snap_to_bottom").with(self.channel.as_str());
         let snapping: bool = ui.ctx().data_mut(|d| d.get_temp(snap_key).unwrap_or(false));
-        if !snapping { return; }
+        if !snapping {
+            return;
+        }
 
         let viewport_h = output.inner_rect.height();
         let max_scroll = (output.content_size.y - viewport_h).max(0.0);
@@ -350,10 +365,7 @@ impl<'a> MessageList<'a> {
         if !at_bottom {
             // Paint a floating button on a foreground layer (no Area/Window needed)
             let btn_size = egui::vec2(170.0, 28.0);
-            let btn_center = egui::pos2(
-                panel_rect.center().x,
-                panel_rect.bottom() - 36.0,
-            );
+            let btn_center = egui::pos2(panel_rect.center().x, panel_rect.bottom() - 36.0);
             let btn_rect = egui::Rect::from_center_size(btn_center, btn_size);
 
             let fg_layer = LayerId::new(Order::Foreground, Id::new("resume_scroll_layer"));
@@ -371,7 +383,8 @@ impl<'a> MessageList<'a> {
             );
 
             // Detect click on the painted rect
-            let btn_response = ui.interact(btn_rect, Id::new("resume_scroll_btn"), egui::Sense::click());
+            let btn_response =
+                ui.interact(btn_rect, Id::new("resume_scroll_btn"), egui::Sense::click());
             if btn_response.clicked() {
                 // Clear paused so stick_to_bottom re-engages next frame.
                 ui.ctx().data_mut(|d| d.insert_temp(paused_key, false));
@@ -393,7 +406,10 @@ impl<'a> MessageList<'a> {
         // Dispatch non-chat (and non-bits) events to the compact system-event renderer.
         match &msg.msg_kind {
             MsgKind::Chat | MsgKind::Bits { .. } => {}
-            _ => { self.render_system_event(ui, msg); return; }
+            _ => {
+                self.render_system_event(ui, msg);
+                return;
+            }
         }
 
         let reply_key = Id::new("ml_reply_req").with(self.channel.as_str());
@@ -407,8 +423,10 @@ impl<'a> MessageList<'a> {
         } else if msg.flags.is_mention {
             Color32::from_rgba_unmultiplied(210, 140, 40, 22)
         } else if msg.flags.is_deleted {
-            Color32::from_rgba_unmultiplied(180, 30, 30, 12)        } else if matches!(msg.msg_kind, MsgKind::Bits { .. }) {
-            Color32::from_rgba_unmultiplied(255, 175, 30, 14)        } else if msg.flags.custom_reward_id.is_some() {
+            Color32::from_rgba_unmultiplied(180, 30, 30, 12)
+        } else if matches!(msg.msg_kind, MsgKind::Bits { .. }) {
+            Color32::from_rgba_unmultiplied(255, 175, 30, 14)
+        } else if msg.flags.custom_reward_id.is_some() {
             Color32::from_rgba_unmultiplied(100, 65, 165, 16)
         } else {
             Color32::TRANSPARENT
@@ -456,14 +474,14 @@ impl<'a> MessageList<'a> {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
                         // Accent left stripe
-                        let (stripe, _) = ui.allocate_exact_size(
-                            egui::vec2(2.0, 12.0),
-                            egui::Sense::hover(),
-                        );
-                        ui.painter().rect_filled(stripe, 0.0, Color32::from_rgb(100, 65, 190));
+                        let (stripe, _) =
+                            ui.allocate_exact_size(egui::vec2(2.0, 12.0), egui::Sense::hover());
+                        ui.painter()
+                            .rect_filled(stripe, 0.0, Color32::from_rgb(100, 65, 190));
                         let body = if rep.parent_msg_body.chars().count() > 80 {
                             // Find the byte offset of the 80th char boundary.
-                            let cut = rep.parent_msg_body
+                            let cut = rep
+                                .parent_msg_body
                                 .char_indices()
                                 .nth(80)
                                 .map(|(i, _)| i)
@@ -474,13 +492,10 @@ impl<'a> MessageList<'a> {
                         };
                         let h = ui.add(
                             Label::new(
-                                RichText::new(format!(
-                                    "↩ @{}: {}",
-                                    rep.parent_display_name, body
-                                ))
-                                .font(t::small())
-                                .color(Color32::from_rgb(130, 130, 155))
-                                .italics(),
+                                RichText::new(format!("↩ @{}: {}", rep.parent_display_name, body))
+                                    .font(t::small())
+                                    .color(Color32::from_rgb(130, 130, 155))
+                                    .italics(),
                             )
                             .sense(egui::Sense::click())
                             .truncate(),
@@ -501,15 +516,11 @@ impl<'a> MessageList<'a> {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         // Colored left stripe
-                        let (rect, _) = ui.allocate_exact_size(
-                            egui::vec2(3.0, 14.0),
-                            egui::Sense::hover(),
-                        );
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(3.0, 14.0), egui::Sense::hover());
                         ui.painter().rect_filled(rect, 1.0, stripe_color);
                         ui.add(Label::new(
-                            RichText::new(label)
-                                .font(t::small())
-                                .color(stripe_color),
+                            RichText::new(label).font(t::small()).color(stripe_color),
                         ));
                     });
                 }
@@ -527,8 +538,12 @@ impl<'a> MessageList<'a> {
                     |ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(3.0, 1.0);
 
-                    // Timestamp
-                        let ts = msg.timestamp.with_timezone(&chrono::Local).format("%H:%M").to_string();
+                        // Timestamp
+                        let ts = msg
+                            .timestamp
+                            .with_timezone(&chrono::Local)
+                            .format("%H:%M")
+                            .to_string();
                         ui.add(Label::new(
                             RichText::new(ts)
                                 .color(Color32::from_rgb(90, 90, 90))
@@ -544,7 +559,7 @@ impl<'a> MessageList<'a> {
 
                         // Badges: image if loaded, else text fallback
                         for badge in &msg.sender.badges {
-                        let tooltip_label = pretty_badge_name(&badge.name, &badge.version);
+                            let tooltip_label = pretty_badge_name(&badge.name, &badge.version);
                             if let Some(url) = &badge.url {
                                 if let Some(&(w, h, ref raw)) = self.emote_bytes.get(url.as_str()) {
                                     let size = fit_size(w, h, BADGE_SIZE);
@@ -553,18 +568,20 @@ impl<'a> MessageList<'a> {
                                     // Closures capture by reference - clones
                                     // only happen when the tooltip is actually
                                     // shown (on hover), not every frame.
-                                    self.show_image(ui, &url_key, raw, size)
-                                        .on_hover_ui(|ui| {
-                                            ui.set_max_width(200.0);
-                                            ui.vertical_centered(|ui| {
-                                                ui.add(
-                                                    egui::Image::from_bytes(url_key.clone(), egui::load::Bytes::Shared(raw.clone()))
-                                                        .fit_to_exact_size(tooltip_size),
-                                                );
-                                                ui.add_space(4.0);
-                                                ui.label(RichText::new(&tooltip_label).strong());
-                                            });
+                                    self.show_image(ui, &url_key, raw, size).on_hover_ui(|ui| {
+                                        ui.set_max_width(200.0);
+                                        ui.vertical_centered(|ui| {
+                                            ui.add(
+                                                egui::Image::from_bytes(
+                                                    url_key.clone(),
+                                                    egui::load::Bytes::Shared(raw.clone()),
+                                                )
+                                                .fit_to_exact_size(tooltip_size),
+                                            );
+                                            ui.add_space(4.0);
+                                            ui.label(RichText::new(&tooltip_label).strong());
                                         });
+                                    });
                                     continue;
                                 }
                             }
@@ -580,28 +597,26 @@ impl<'a> MessageList<'a> {
                         };
                         let name_resp = ui
                             .add(
-                                Label::new(
-                                    RichText::new(name).color(name_color).strong(),
-                                )
-                                .sense(egui::Sense::click()),
+                                Label::new(RichText::new(name).color(name_color).strong())
+                                    .sense(egui::Sense::click()),
                             )
                             .on_hover_text(format!("@{}", msg.sender.login));
                         if name_resp.clicked() {
                             // Clone only when clicked - not every frame.
-                            let _ = self.cmd_tx.try_send(
-                                AppCommand::ShowUserCard {
-                                    login: msg.sender.login.clone(),
-                                    channel: self.channel.clone(),
-                                },
-                            );
+                            let _ = self.cmd_tx.try_send(AppCommand::ShowUserCard {
+                                login: msg.sender.login.clone(),
+                                channel: self.channel.clone(),
+                            });
                             let key = Id::new("ml_profile_req").with(self.channel.as_str());
                             ui.ctx().data_mut(|d| {
-                                d.insert_temp(key, (msg.sender.login.clone(), msg.sender.badges.clone()));
+                                d.insert_temp(
+                                    key,
+                                    (msg.sender.login.clone(), msg.sender.badges.clone()),
+                                );
                             });
                         }
                         if name_resp.hovered() {
-                            ui.ctx()
-                                .set_cursor_icon(egui::CursorIcon::PointingHand);
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                         }
 
                         // Colon separator after name (not shown for /me actions)
@@ -637,7 +652,11 @@ impl<'a> MessageList<'a> {
         // the left edge of the row so the eye finds them instantly in fast chat.
         if msg.flags.is_mention || msg.flags.is_highlighted {
             let r = msg_frame.response.rect;
-            let bar_col = if msg.flags.is_mention { t::ACCENT } else { Color32::from_rgb(255, 210, 30) };
+            let bar_col = if msg.flags.is_mention {
+                t::ACCENT
+            } else {
+                Color32::from_rgb(255, 210, 30)
+            };
             let strip = egui::Rect::from_min_size(r.left_top(), egui::vec2(3.0, r.height()));
             ui.painter().rect_filled(strip, 0.0, bar_col);
         }
@@ -648,7 +667,13 @@ impl<'a> MessageList<'a> {
     /// similar to Chatterino's system-message style.
     fn render_system_event(&self, ui: &mut Ui, msg: &ChatMessage) {
         let (accent, label_override): (Color32, Option<String>) = match &msg.msg_kind {
-            MsgKind::Sub { display_name, months, plan, is_gift, .. } => {
+            MsgKind::Sub {
+                display_name,
+                months,
+                plan,
+                is_gift,
+                ..
+            } => {
                 let text = if *is_gift {
                     format!("🎁  {display_name} received a gifted {plan} sub! ({months} months)")
                 } else if *months <= 1 {
@@ -658,9 +683,14 @@ impl<'a> MessageList<'a> {
                 };
                 (Color32::from_rgb(255, 215, 0), Some(text))
             }
-            MsgKind::Raid { display_name, viewer_count } => (
+            MsgKind::Raid {
+                display_name,
+                viewer_count,
+            } => (
                 Color32::from_rgb(100, 200, 255),
-                Some(format!("🎉  {display_name} is raiding with {viewer_count} viewers!")),
+                Some(format!(
+                    "🎉  {display_name} is raiding with {viewer_count} viewers!"
+                )),
             ),
             MsgKind::Timeout { login, seconds } => {
                 let dur = if *seconds < 60 {
@@ -675,50 +705,60 @@ impl<'a> MessageList<'a> {
                     Some(format!("⏱  {login} was timed out for {dur}.")),
                 )
             }
-            MsgKind::Ban { login } => (
-                t::RED,
-                Some(format!("🚫  {login} was permanently banned.")),
-            ),
+            MsgKind::Ban { login } => {
+                (t::RED, Some(format!("🚫  {login} was permanently banned.")))
+            }
             MsgKind::ChatCleared => (
                 Color32::from_rgb(130, 120, 150),
                 Some("🗑  Chat was cleared by a moderator.".to_owned()),
             ),
-            _ => (
-                Color32::from_rgb(100, 100, 120),
-                Some(msg.raw_text.clone()),
-            ),
+            MsgKind::SystemInfo => {
+                let (color, text) = style_system_info_text(&msg.raw_text);
+                (color, Some(text))
+            }
+            _ => (Color32::from_rgb(100, 100, 120), Some(msg.raw_text.clone())),
         };
 
         let text = label_override.unwrap_or_else(|| msg.raw_text.clone());
         let opacity = if msg.flags.is_history { 0.55 } else { 1.0 };
 
         egui::Frame::new()
-            .fill(Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 10))
-            .inner_margin(egui::Margin::symmetric(ROW_PAD_X as i8, ROW_PAD_Y as i8 + 1))
+            .fill(Color32::from_rgba_unmultiplied(
+                accent.r(),
+                accent.g(),
+                accent.b(),
+                10,
+            ))
+            .inner_margin(egui::Margin::symmetric(
+                ROW_PAD_X as i8,
+                ROW_PAD_Y as i8 + 1,
+            ))
             .show(ui, |ui| {
-                if msg.flags.is_history { ui.set_opacity(opacity); }
+                if msg.flags.is_history {
+                    ui.set_opacity(opacity);
+                }
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     // Coloured left stripe
-                    let (rect, _) = ui.allocate_exact_size(
-                        egui::vec2(3.0, 14.0),
-                        egui::Sense::hover(),
-                    );
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(3.0, 14.0), egui::Sense::hover());
                     ui.painter().rect_filled(rect, 1.0, accent);
 
                     // Timestamp
                     let ts = msg.timestamp.format("%H:%M").to_string();
                     ui.add(Label::new(
-                        RichText::new(ts).color(Color32::from_rgb(90, 90, 90)).font(t::small()),
+                        RichText::new(ts)
+                            .color(Color32::from_rgb(90, 90, 90))
+                            .font(t::small()),
                     ));
 
                     // Message text
-                    ui.add(Label::new(
-                        RichText::new(text)
-                            .italics()
-                            .color(accent)
-                            .font(t::small()),
-                    ).wrap());
+                    let rich = if is_irc_motd_line(&text) {
+                        RichText::new(text).color(accent).font(t::small())
+                    } else {
+                        RichText::new(text).italics().color(accent).font(t::small())
+                    };
+                    ui.add(Label::new(rich).wrap());
                 });
             });
     }
@@ -734,55 +774,61 @@ impl<'a> MessageList<'a> {
                 };
                 ui.add(Label::new(rt).wrap());
             }
-            Span::Emote { url, url_hd, code, provider, .. } => {
+            Span::Emote {
+                url,
+                url_hd,
+                code,
+                provider,
+                ..
+            } => {
                 if let Some(&(w, h, ref raw)) = self.emote_bytes.get(url.as_str()) {
                     let size = fit_size(w, h, EMOTE_SIZE);
                     let url_key = format!("bytes://{url}");
 
                     // Capture shared references - string/Arc clones only
                     // happen when the tooltip is actually shown (on hover).
-                    let emote_bytes = self.emote_bytes;  // &HashMap - Copy
-                    let cmd_tx      = self.cmd_tx;       // &Sender  - Copy
+                    let emote_bytes = self.emote_bytes; // &HashMap - Copy
+                    let cmd_tx = self.cmd_tx; // &Sender  - Copy
 
-                    self.show_image(ui, &url_key, raw, size)
-                        .on_hover_ui(|ui| {
-                            // Check HD availability at hover time, not every frame.
-                            let hd_entry = url_hd.as_deref()
-                                .and_then(|u| emote_bytes.get(u));
+                    self.show_image(ui, &url_key, raw, size).on_hover_ui(|ui| {
+                        // Check HD availability at hover time, not every frame.
+                        let hd_entry = url_hd.as_deref().and_then(|u| emote_bytes.get(u));
 
-                            // Fire HD fetch once on first hover if not yet loaded.
-                            if hd_entry.is_none() {
-                                if let Some(hd_url) = url_hd.as_deref() {
-                                    let _ = cmd_tx.try_send(
-                                        AppCommand::FetchImage { url: hd_url.to_owned() }
-                                    );
-                                }
+                        // Fire HD fetch once on first hover if not yet loaded.
+                        if hd_entry.is_none() {
+                            if let Some(hd_url) = url_hd.as_deref() {
+                                let _ = cmd_tx.try_send(AppCommand::FetchImage {
+                                    url: hd_url.to_owned(),
+                                });
                             }
+                        }
 
-                            let (tt_key, tt_raw, tt_w, tt_h) = match hd_entry {
-                                Some(&(hw, hh, ref href)) => (
-                                    format!("bytes://{}", url_hd.as_deref().unwrap()),
-                                    href.clone(), hw, hh,
-                                ),
-                                None => (url_key.clone(), raw.clone(), w, h),
-                            };
-                            let tt_size = fit_size(tt_w, tt_h, TOOLTIP_EMOTE_SIZE);
+                        let (tt_key, tt_raw, tt_w, tt_h) = match hd_entry {
+                            Some(&(hw, hh, ref href)) => (
+                                format!("bytes://{}", url_hd.as_deref().unwrap()),
+                                href.clone(),
+                                hw,
+                                hh,
+                            ),
+                            None => (url_key.clone(), raw.clone(), w, h),
+                        };
+                        let tt_size = fit_size(tt_w, tt_h, TOOLTIP_EMOTE_SIZE);
 
-                            ui.set_max_width(280.0);
-                            ui.vertical_centered(|ui| {
-                                ui.add(
-                    egui::Image::from_bytes(tt_key, egui::load::Bytes::Shared(tt_raw))
-                                        .fit_to_exact_size(tt_size),
-                                );
-                                ui.add_space(4.0);
-                                ui.label(RichText::new(code.as_str()).strong());
-                                ui.label(
-                                    RichText::new(provider_label(provider))
-                                        .small()
-                                        .color(Color32::GRAY),
-                                );
-                            });
+                        ui.set_max_width(280.0);
+                        ui.vertical_centered(|ui| {
+                            ui.add(
+                                egui::Image::from_bytes(tt_key, egui::load::Bytes::Shared(tt_raw))
+                                    .fit_to_exact_size(tt_size),
+                            );
+                            ui.add_space(4.0);
+                            ui.label(RichText::new(code.as_str()).strong());
+                            ui.label(
+                                RichText::new(provider_label(provider))
+                                    .small()
+                                    .color(Color32::GRAY),
+                            );
                         });
+                    });
                 } else {
                     // Image not yet loaded - show text code as placeholder
                     ui.add(Label::new(
@@ -798,23 +844,25 @@ impl<'a> MessageList<'a> {
                     let size = fit_size(w, h, EMOTE_SIZE);
                     let tooltip_size = fit_size(w, h, TOOLTIP_EMOTE_SIZE);
                     let url_key = format!("bytes://{url}");
-                    self.show_image(ui, &url_key, raw, size)
-                        .on_hover_ui(|ui| {
-                            ui.set_max_width(200.0);
-                            ui.vertical_centered(|ui| {
-                                ui.add(
-                                    egui::Image::from_bytes(url_key.clone(), egui::load::Bytes::Shared(raw.clone()))
-                                        .fit_to_exact_size(tooltip_size),
-                                );
-                                ui.add_space(4.0);
-                                ui.label(RichText::new(text.as_str()).strong());
-                                ui.label(
-                                    RichText::new("Twemoji")
-                                        .small()
-                                        .color(Color32::from_rgb(100, 100, 100)),
-                                );
-                            });
+                    self.show_image(ui, &url_key, raw, size).on_hover_ui(|ui| {
+                        ui.set_max_width(200.0);
+                        ui.vertical_centered(|ui| {
+                            ui.add(
+                                egui::Image::from_bytes(
+                                    url_key.clone(),
+                                    egui::load::Bytes::Shared(raw.clone()),
+                                )
+                                .fit_to_exact_size(tooltip_size),
+                            );
+                            ui.add_space(4.0);
+                            ui.label(RichText::new(text.as_str()).strong());
+                            ui.label(
+                                RichText::new("Twemoji")
+                                    .small()
+                                    .color(Color32::from_rgb(100, 100, 100)),
+                            );
                         });
+                    });
                 } else {
                     ui.add(Label::new(RichText::new(text)));
                 }
@@ -827,9 +875,9 @@ impl<'a> MessageList<'a> {
                 ));
             }
             Span::Url { text, url } => {
-                let cmd_tx      = self.cmd_tx;
+                let cmd_tx = self.cmd_tx;
                 let link_previews = self.link_previews;
-                let emote_bytes  = self.emote_bytes;
+                let emote_bytes = self.emote_bytes;
 
                 // Render as a clickable hyperlink-style label.
                 let resp = ui.add(
@@ -847,9 +895,7 @@ impl<'a> MessageList<'a> {
                     // Fire preview fetch on first hover (idempotent in reducer).
                     let preview = link_previews.get(url.as_str());
                     if preview.map(|p| p.fetched).unwrap_or(false) == false {
-                        let _ = cmd_tx.try_send(
-                            AppCommand::FetchLinkPreview { url: url.clone() }
-                        );
+                        let _ = cmd_tx.try_send(AppCommand::FetchLinkPreview { url: url.clone() });
                     }
 
                     ui.set_max_width(300.0);
@@ -873,13 +919,10 @@ impl<'a> MessageList<'a> {
                             Some(p) => {
                                 // Thumbnail
                                 if let Some(ref thumb) = p.thumbnail_url {
-                                    if let Some(&(w, h, ref raw)) = emote_bytes.get(thumb.as_str()) {
-                                        let scale = (150.0_f32 / h as f32)
-                                            .min(280.0 / w as f32);
-                                        let size = Vec2::new(
-                                            w as f32 * scale,
-                                            h as f32 * scale,
-                                        );
+                                    if let Some(&(w, h, ref raw)) = emote_bytes.get(thumb.as_str())
+                                    {
+                                        let scale = (150.0_f32 / h as f32).min(280.0 / w as f32);
+                                        let size = Vec2::new(w as f32 * scale, h as f32 * scale);
                                         let key = format!("bytes://{thumb}");
                                         ui.add(
                                             egui::Image::from_bytes(
@@ -902,11 +945,12 @@ impl<'a> MessageList<'a> {
                                     } else {
                                         d.clone()
                                     };
-                                    ui.add(
-                                        Label::new(RichText::new(snippet).small()).wrap()
-                                    );
+                                    ui.add(Label::new(RichText::new(snippet).small()).wrap());
                                 }
-                                if p.title.is_none() && p.description.is_none() && p.thumbnail_url.is_none() {
+                                if p.title.is_none()
+                                    && p.description.is_none()
+                                    && p.thumbnail_url.is_none()
+                                {
                                     ui.label(
                                         RichText::new("No preview available")
                                             .small()
@@ -1027,10 +1071,7 @@ fn render_badge_fallback(ui: &mut Ui, name: &str, version: &str, tooltip: &str) 
         .inner_margin(egui::Margin::symmetric(4, 1))
         .show(ui, |ui| {
             ui.add(Label::new(
-                RichText::new(chip_text)
-                    .font(t::small())
-                    .color(fg)
-                    .strong(),
+                RichText::new(chip_text).font(t::small()).color(fg).strong(),
             ));
         })
         .response;
@@ -1066,16 +1107,88 @@ fn badge_chip_text(name: &str, version: &str) -> String {
 
 fn badge_chip_colors(name: &str) -> (Color32, Color32) {
     match name {
-        "subscriber" => (Color32::from_rgb(52, 86, 58), Color32::from_rgb(210, 246, 218)),
-        "sub_gifter" => (Color32::from_rgb(84, 67, 34), Color32::from_rgb(252, 222, 154)),
-        "founder" => (Color32::from_rgb(60, 62, 95), Color32::from_rgb(200, 206, 255)),
-        "moderator" => (Color32::from_rgb(43, 89, 59), Color32::from_rgb(196, 244, 217)),
-        "broadcaster" => (Color32::from_rgb(102, 45, 45), Color32::from_rgb(255, 206, 206)),
-        "vip" => (Color32::from_rgb(112, 57, 98), Color32::from_rgb(255, 206, 242)),
-        "verified" => (Color32::from_rgb(46, 68, 107), Color32::from_rgb(191, 223, 255)),
-        "staff" => (Color32::from_rgb(76, 84, 92), Color32::from_rgb(220, 226, 233)),
-        _ => (Color32::from_rgb(70, 70, 74), Color32::from_rgb(210, 210, 215)),
+        "subscriber" => (
+            Color32::from_rgb(52, 86, 58),
+            Color32::from_rgb(210, 246, 218),
+        ),
+        "sub_gifter" => (
+            Color32::from_rgb(84, 67, 34),
+            Color32::from_rgb(252, 222, 154),
+        ),
+        "founder" => (
+            Color32::from_rgb(60, 62, 95),
+            Color32::from_rgb(200, 206, 255),
+        ),
+        "moderator" => (
+            Color32::from_rgb(43, 89, 59),
+            Color32::from_rgb(196, 244, 217),
+        ),
+        "broadcaster" => (
+            Color32::from_rgb(102, 45, 45),
+            Color32::from_rgb(255, 206, 206),
+        ),
+        "vip" => (
+            Color32::from_rgb(112, 57, 98),
+            Color32::from_rgb(255, 206, 242),
+        ),
+        "verified" => (
+            Color32::from_rgb(46, 68, 107),
+            Color32::from_rgb(191, 223, 255),
+        ),
+        "staff" => (
+            Color32::from_rgb(76, 84, 92),
+            Color32::from_rgb(220, 226, 233),
+        ),
+        _ => (
+            Color32::from_rgb(70, 70, 74),
+            Color32::from_rgb(210, 210, 215),
+        ),
     }
+}
+
+fn style_system_info_text(raw: &str) -> (Color32, String) {
+    let s = raw.trim();
+    let Some((code, payload)) = parse_bracket_numeric_prefix(s) else {
+        return (Color32::from_rgb(120, 125, 145), s.to_owned());
+    };
+
+    match code {
+        "375" => (
+            Color32::from_rgb(130, 165, 220),
+            format!("IRC MOTD: {}", payload.trim()),
+        ),
+        "372" => (
+            Color32::from_rgb(145, 150, 170),
+            format!("  {}", payload.trim()),
+        ),
+        "376" => (
+            Color32::from_rgb(120, 175, 135),
+            "IRC MOTD complete".to_owned(),
+        ),
+        "001" => (Color32::from_rgb(120, 195, 145), payload.trim().to_owned()),
+        "002" | "003" | "004" | "005" => {
+            (Color32::from_rgb(125, 165, 210), payload.trim().to_owned())
+        }
+        "251" | "252" | "253" | "254" | "255" | "265" | "266" | "250" => {
+            (Color32::from_rgb(140, 155, 175), payload.trim().to_owned())
+        }
+        _ => (Color32::from_rgb(120, 125, 145), s.to_owned()),
+    }
+}
+
+fn parse_bracket_numeric_prefix(s: &str) -> Option<(&str, &str)> {
+    let rest = s.strip_prefix('[')?;
+    let end = rest.find(']')?;
+    let code = &rest[..end];
+    if code.len() != 3 || !code.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let payload = rest[end + 1..].trim_start();
+    Some((code, payload))
+}
+
+fn is_irc_motd_line(text: &str) -> bool {
+    text.starts_with("IRC MOTD:") || text.starts_with("  ")
 }
 
 /// Map short provider codes to human-readable labels.
@@ -1092,8 +1205,9 @@ fn provider_label(provider: &str) -> &'static str {
 
 /// Extract just the hostname from a URL for display (e.g. `"youtube.com"`).
 fn url_hostname(url: &str) -> String {
-    let s = url.trim_start_matches("https://")
-               .trim_start_matches("http://");
+    let s = url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
     let host = s.split('/').next().unwrap_or(s);
     // Strip www. prefix for cleanliness
     host.trim_start_matches("www.").to_owned()

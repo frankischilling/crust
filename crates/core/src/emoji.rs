@@ -107,9 +107,7 @@ pub fn twemoji_url(codepoints: &[u32]) -> String {
         .map(|cp| format!("{cp:x}"))
         .collect();
     let slug = hex.join("-");
-    format!(
-        "https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/72x72/{slug}.png"
-    )
+    format!("https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/72x72/{slug}.png")
 }
 
 #[cfg(test)]

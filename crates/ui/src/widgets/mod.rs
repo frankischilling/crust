@@ -1,9 +1,10 @@
 pub mod analytics;
 pub mod channel_list;
-pub mod loading_screen;
 pub mod chat_input;
 pub mod emote_picker;
+pub mod irc_status;
 pub mod join_dialog;
+pub mod loading_screen;
 pub mod login_dialog;
 pub mod message_list;
 pub mod user_profile_popup;

@@ -16,11 +16,7 @@ const ROW_H: f32 = CELL_SIZE + 4.0;
 const FETCH_BATCH: usize = 12;
 
 /// Provider tabs.
-const TABS: &[(&str, &str)] = &[
-    ("7tv", "7TV"),
-    ("bttv", "BTTV"),
-    ("ffz", "FFZ"),
-];
+const TABS: &[(&str, &str)] = &[("7tv", "7TV"), ("bttv", "BTTV"), ("ffz", "FFZ")];
 
 /// Cached per-tab data.
 struct CachedTab {
@@ -160,10 +156,7 @@ impl EmotePicker {
                         let is_active = self.active_tab == Some(ti);
                         let text = format!("{label} ({count})");
 
-                        let resp = ui.selectable_label(
-                            is_active,
-                            RichText::new(text).small(),
-                        );
+                        let resp = ui.selectable_label(is_active, RichText::new(text).small());
                         if resp.clicked() {
                             self.active_tab = if is_active { None } else { Some(ti) };
                         }
@@ -226,8 +219,8 @@ impl EmotePicker {
                         let vis_bottom = clip.bottom() - base_y;
 
                         let first_row = (vis_top / ROW_H).floor().max(0.0) as usize;
-                        let last_row = ((vis_bottom / ROW_H).ceil().max(0.0) as usize)
-                            .min(num_rows);
+                        let last_row =
+                            ((vis_bottom / ROW_H).ceil().max(0.0) as usize).min(num_rows);
 
                         let mut hovered_entry: Option<(usize, egui::Rect)> = None;
 
@@ -240,8 +233,7 @@ impl EmotePicker {
                                 let entry = &catalog[cat_idx];
                                 let col = slot - start;
 
-                                let cell_x =
-                                    grid_rect.left() + col as f32 * CELL_SIZE;
+                                let cell_x = grid_rect.left() + col as f32 * CELL_SIZE;
                                 let cell_y = base_y + row as f32 * ROW_H;
                                 let cell_rect = egui::Rect::from_min_size(
                                     egui::pos2(cell_x, cell_y),
@@ -250,8 +242,7 @@ impl EmotePicker {
 
                                 // Fallback lazy fetch (most images should already
                                 // be prefetched, but just in case)
-                                let has_bytes =
-                                    emote_bytes.contains_key(entry.url.as_str());
+                                let has_bytes = emote_bytes.contains_key(entry.url.as_str());
                                 if !has_bytes
                                     && fetches_this_frame < FETCH_BATCH
                                     && !self.requested.contains(&entry.url)
@@ -308,10 +299,8 @@ impl EmotePicker {
                                         }
                                     } else {
                                         let size = fit_size(w, h, EMOTE_SIZE);
-                                        let image_rect = egui::Rect::from_center_size(
-                                            cell_rect.center(),
-                                            size,
-                                        );
+                                        let image_rect =
+                                            egui::Rect::from_center_size(cell_rect.center(), size);
                                         let url_key = format!("bytes://{}", entry.url);
                                         ui.put(
                                             image_rect,
@@ -340,26 +329,19 @@ impl EmotePicker {
                         // Single hovered cell - click + tooltip
                         if let Some((cat_idx, rect)) = hovered_entry {
                             let entry = &catalog[cat_idx];
-                            let click_resp = ui.interact(
-                                rect,
-                                egui::Id::new("ep_hover"),
-                                egui::Sense::click(),
-                            );
+                            let click_resp =
+                                ui.interact(rect, egui::Id::new("ep_hover"), egui::Sense::click());
                             if click_resp.clicked() {
                                 picked = Some(entry.code.clone());
                             }
                             ui.painter().rect_stroke(
                                 rect.expand(2.0),
                                 4.0,
-                                egui::Stroke::new(
-                                    1.5,
-                                    Color32::from_rgb(140, 120, 220),
-                                ),
+                                egui::Stroke::new(1.5, Color32::from_rgb(140, 120, 220)),
                                 egui::epaint::StrokeKind::Outside,
                             );
                             click_resp.on_hover_ui(|ui| {
-                                if let Some(&(w, h, ref raw)) =
-                                    emote_bytes.get(entry.url.as_str())
+                                if let Some(&(w, h, ref raw)) = emote_bytes.get(entry.url.as_str())
                                 {
                                     let size = fit_size(w, h, 48.0);
                                     ui.add(

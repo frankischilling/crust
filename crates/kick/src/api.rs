@@ -75,7 +75,10 @@ pub async fn fetch_channel_info(slug: &str) -> Result<KickChannelInfo, KickError
         .and_then(|c| c.id)
         .ok_or_else(|| KickError::ChannelNotFound(slug.to_owned()))?;
 
-    let user = data.user.unwrap_or(V2User { id: None, username: None });
+    let user = data.user.unwrap_or(V2User {
+        id: None,
+        username: None,
+    });
     let livestream = data.livestream;
 
     Ok(KickChannelInfo {
@@ -83,10 +86,7 @@ pub async fn fetch_channel_info(slug: &str) -> Result<KickChannelInfo, KickError
         slug: data.slug.unwrap_or_else(|| slug.to_owned()),
         user_id: user.id.unwrap_or(0),
         username: user.username.unwrap_or_else(|| slug.to_owned()),
-        is_live: livestream
-            .as_ref()
-            .and_then(|l| l.is_live)
-            .unwrap_or(false),
+        is_live: livestream.as_ref().and_then(|l| l.is_live).unwrap_or(false),
         stream_title: livestream.and_then(|l| l.session_title),
         badge_urls,
     })
@@ -119,9 +119,7 @@ pub async fn send_chat_message(
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         warn!("Kick send_chat_message failed ({status}): {text}");
-        return Err(KickError::ChannelNotFound(format!(
-            "send failed: {status}"
-        )));
+        return Err(KickError::ChannelNotFound(format!("send failed: {status}")));
     }
 
     Ok(())

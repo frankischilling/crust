@@ -48,7 +48,8 @@ impl Default for AppState {
 impl AppState {
     pub fn join_channel(&mut self, id: ChannelId) {
         if !self.channels.contains_key(&id) {
-            self.channels.insert(id.clone(), ChannelState::new(id.clone()));
+            self.channels
+                .insert(id.clone(), ChannelState::new(id.clone()));
             self.channel_order.push(id.clone());
         }
         if self.active_channel.is_none() {
@@ -65,7 +66,9 @@ impl AppState {
     }
 
     pub fn active_state(&self) -> Option<&ChannelState> {
-        self.active_channel.as_ref().and_then(|id| self.channels.get(id))
+        self.active_channel
+            .as_ref()
+            .and_then(|id| self.channels.get(id))
     }
 
     pub fn active_state_mut(&mut self) -> Option<&mut ChannelState> {
