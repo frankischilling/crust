@@ -20,9 +20,9 @@ Active early-stage project. The app builds and runs, and core chat workflows are
 
 ## Features
 
-- Twitch IRC over WebSocket — anonymous and authenticated modes
-- Multi-channel tabs — join, leave, reorder channels
-- Multi-account support — add, switch, remove, and set a default account
+- Twitch IRC over WebSocket - anonymous and authenticated modes
+- Multi-channel tabs - join, leave, reorder channels
+- Multi-account support - add, switch, remove, and set a default account
 - Message rendering:
   - Twitch native emotes
   - Third-party emotes: BTTV, FFZ, 7TV (global + channel + personal sets)
@@ -43,12 +43,12 @@ Active early-stage project. The app builds and runs, and core chat workflows are
 
 ## Workspace layout
 
-- `crates/app` — binary entrypoint, runtime wiring, reducer/event loop
-- `crates/ui` — `egui` application and widgets
-- `crates/core` — shared domain models, events, tokenizer/highlight/state
-- `crates/twitch` — IRC parser + Twitch session client/reconnect/rate limiting
-- `crates/emotes` — provider loaders and image cache (memory + disk)
-- `crates/storage` — settings/token + log storage
+- `crates/app` - binary entrypoint, runtime wiring, reducer/event loop
+- `crates/ui` - `egui` application and widgets
+- `crates/core` - shared domain models, events, tokenizer/highlight/state
+- `crates/twitch` - IRC parser + Twitch session client/reconnect/rate limiting
+- `crates/emotes` - provider loaders and image cache (memory + disk)
+- `crates/storage` - settings/token + log storage
 
 ## Requirements
 
@@ -76,7 +76,7 @@ cargo run -p crust --release
 Requires VcXsrv launched with the `-wgl` flag (or "Native opengl" checked in XLaunch) to expose GLX framebuffer configs. Mesa version overrides are needed to negotiate a valid OpenGL context:
 
 ```bash
-export DISPLAY=172.17.128.1:0.0  # replace with your host IP — check /etc/resolv.conf nameserver
+export DISPLAY=172.17.128.1:0.0  # replace with your host IP - check /etc/resolv.conf nameserver
 export MESA_GL_VERSION_OVERRIDE=3.3
 export MESA_GLSL_VERSION_OVERRIDE=330
 export WINIT_UNIX_BACKEND=x11
@@ -84,7 +84,7 @@ unset WAYLAND_DISPLAY
 cargo run -p crust --release
 ```
 
-**WSLg (Windows 11)** — works out of the box with Wayland, no X server or overrides needed:
+**WSLg (Windows 11)** - works out of the box with Wayland, no X server or overrides needed:
 
 ```bash
 cargo run -p crust --release
@@ -94,7 +94,7 @@ cargo run -p crust --release
 
 - Anonymous mode works for read-only chat.
 - To send messages, log in with a Twitch OAuth token in-app.
-- Multiple accounts are supported — switch accounts without restarting.
+- Multiple accounts are supported - switch accounts without restarting.
 - Token storage uses the OS keyring when available, with a settings-file fallback.
 
 ## Data paths
