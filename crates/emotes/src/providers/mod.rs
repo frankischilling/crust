@@ -266,30 +266,52 @@ impl EmoteProvider for SevenTvProvider {
 
     async fn load_channel(&self, channel_id: &str) -> Vec<EmoteInfo> {
         let url = format!("https://7tv.io/v3/users/twitch/{channel_id}");
-        #[derive(Deserialize)]
-        struct UserResp {
-            emote_set: Option<EmoteSetResp>,
-        }
-        match self.client.get(&url).send().await {
-            Ok(r) if !r.status().is_success() => {
-                tracing::debug!("7TV channel returned HTTP {} for {channel_id}", r.status());
+        self.fetch_user_emote_set(&url, "7tv channel").await
+    }
+}
+
+/// Kick native emote provider.
+pub struct KickProvider {
+    client: reqwest::Client,
+}
+
+impl KickProvider {
+    pub fn new() -> Self {
+        Self { client: reqwest::Client::new() }
+    }
+}
+
+#[async_trait::async_trait]
+impl EmoteProvider for KickProvider {
+    fn name(&self) -> &'static str { "kick" }
+
+    async fn load_global(&self) -> Vec<EmoteInfo> {
+        // Kick global emotes are not loaded yet.
+        vec![]
+    }
+
+    async fn load_channel(&self, channel_id: &str) -> Vec<EmoteInfo> {
+        let url = format!("https://kick.com/emotes/{channel_id}");
+        match self.client
+            .get(&url)
+            .header(reqwest::header::USER_AGENT, "CrustChat/0.1")
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .await
+        {
+            Ok(resp) if !resp.status().is_success() => {
+                tracing::debug!("Kick channel emotes returned HTTP {} for {channel_id}", resp.status());
                 vec![]
             }
-            Ok(r) => match r.json::<UserResp>().await {
-                Ok(u) => {
-                    if let Some(set) = u.emote_set {
-                        Self::parse_emote_set(set)
-                    } else {
-                        vec![]
-                    }
-                }
+            Ok(resp) => match resp.json::<serde_json::Value>().await {
+                Ok(v) => parse_kick_emotes(v),
                 Err(e) => {
-                    tracing::warn!("7tv channel parse failed: {e}");
+                    tracing::warn!("Kick channel emotes parse failed: {e}");
                     vec![]
                 }
             },
             Err(e) => {
-                tracing::warn!("7tv channel fetch failed: {e}");
+                tracing::warn!("Kick channel emotes fetch failed: {e}");
                 vec![]
             }
         }
@@ -325,6 +347,36 @@ struct EmoteFile {
 }
 
 impl SevenTvProvider {
+    async fn fetch_user_emote_set(&self, url: &str, label: &str) -> Vec<EmoteInfo> {
+        #[derive(Deserialize)]
+        struct UserResp {
+            emote_set: Option<EmoteSetResp>,
+        }
+        match self.client.get(url).send().await {
+            Ok(r) if !r.status().is_success() => {
+                tracing::debug!("{label} returned HTTP {}", r.status());
+                vec![]
+            }
+            Ok(r) => match r.json::<UserResp>().await {
+                Ok(u) => {
+                    if let Some(set) = u.emote_set {
+                        Self::parse_emote_set(set)
+                    } else {
+                        vec![]
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("{label} parse failed: {e}");
+                    vec![]
+                }
+            },
+            Err(e) => {
+                tracing::warn!("{label} fetch failed: {e}");
+                vec![]
+            }
+        }
+    }
+
     async fn fetch_emote_set(&self, url: &str) -> Vec<EmoteInfo> {
         match self.client.get(url).send().await {
             Ok(r) => match r.json::<EmoteSetResp>().await {
@@ -339,6 +391,12 @@ impl SevenTvProvider {
                 vec![]
             }
         }
+    }
+
+    /// Load 7TV emotes for a Kick user-id.
+    pub async fn load_kick_channel(&self, kick_user_id: &str) -> Vec<EmoteInfo> {
+        let url = format!("https://7tv.io/v3/users/kick/{kick_user_id}");
+        self.fetch_user_emote_set(&url, "7tv kick channel").await
     }
 
     fn parse_emote_set(set: EmoteSetResp) -> Vec<EmoteInfo> {
@@ -360,5 +418,97 @@ impl SevenTvProvider {
                 })
             })
             .collect()
+    }
+}
+
+fn parse_kick_emotes(v: serde_json::Value) -> Vec<EmoteInfo> {
+    let items_opt = v.get("emotes").and_then(|e| e.as_array()).or_else(|| v.as_array());
+    let Some(items) = items_opt else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<EmoteInfo> = Vec::new();
+    for item in items {
+        if let Some(e) = parse_kick_emote_item(item) {
+            out.push(e);
+        }
+    }
+    out
+}
+
+fn parse_kick_emote_item(item: &serde_json::Value) -> Option<EmoteInfo> {
+    let code = first_str(item, &["name", "code", "slug", "keyword"])?;
+    let id = first_str(item, &["id", "emote_id", "uuid"]).unwrap_or(code.clone());
+
+    let urls = extract_kick_emote_urls(item);
+    let url_1x = urls.0?;
+
+    Some(EmoteInfo {
+        id,
+        code,
+        url_1x,
+        url_2x: urls.1,
+        url_4x: urls.2,
+        provider: "kick".to_owned(),
+    })
+}
+
+fn extract_kick_emote_urls(item: &serde_json::Value) -> (Option<String>, Option<String>, Option<String>) {
+    if let Some(urls_obj) = item.get("urls").and_then(|u| u.as_object()) {
+        let u1 = first_obj_str(urls_obj, &["1x", "1", "small", "url"]).map(|u| normalize_kick_url(&u));
+        let u2 = first_obj_str(urls_obj, &["2x", "2", "medium"]).map(|u| normalize_kick_url(&u));
+        let u4 = first_obj_str(urls_obj, &["4x", "3x", "3", "large"]).map(|u| normalize_kick_url(&u));
+        if u1.is_some() {
+            return (u1, u2, u4);
+        }
+    }
+
+    for key in ["image", "emote"] {
+        if let Some(obj) = item.get(key).and_then(|v| v.as_object()) {
+            let u1 = first_obj_str(obj, &["url", "src", "1x", "small"]).map(|u| normalize_kick_url(&u));
+            let u2 = first_obj_str(obj, &["2x", "medium"]).map(|u| normalize_kick_url(&u));
+            let u4 = first_obj_str(obj, &["4x", "3x", "large"]).map(|u| normalize_kick_url(&u));
+            if u1.is_some() {
+                return (u1, u2, u4);
+            }
+        }
+    }
+
+    let u1 = first_str(item, &["url", "src", "image_url"]).map(|u| normalize_kick_url(&u));
+    (u1, None, None)
+}
+
+fn first_str(item: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(s) = item.get(*key).and_then(|v| v.as_str()) {
+            if !s.is_empty() {
+                return Some(s.to_owned());
+            }
+        }
+        if let Some(n) = item.get(*key).and_then(|v| v.as_u64()) {
+            return Some(n.to_string());
+        }
+    }
+    None
+}
+
+fn first_obj_str(obj: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(s) = obj.get(*key).and_then(|v| v.as_str()) {
+            if !s.is_empty() {
+                return Some(s.to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn normalize_kick_url(url: &str) -> String {
+    if url.starts_with("//") {
+        format!("https:{url}")
+    } else if url.starts_with('/') {
+        format!("https://kick.com{url}")
+    } else {
+        url.to_owned()
     }
 }

@@ -7,10 +7,17 @@ use egui::{
 use image::DynamicImage;
 
 use crust_core::model::{ChannelId, EmoteCatalogEntry, ReplyInfo};
+use crate::commands::{
+    extract_slash_query,
+    replace_slash_token,
+    slash_command_matches,
+    SlashCommandInfo,
+};
 use crate::theme as t;
 
 const AUTOCOMPLETE_MAX: usize = 10;
 const AUTOCOMPLETE_EMOTE_SIZE: f32 = 20.0;
+const SLASH_AUTOCOMPLETE_MAX: usize = 10;
 /// Maximum number of Tab-completion matches to cycle through.
 const TAB_COMPLETE_MAX: usize = 50;
 
@@ -148,9 +155,11 @@ impl<'a> ChatInput<'a> {
                         );
                     }
 
-                    // Pre-check colon-autocomplete
-                    let pre_matches = find_autocomplete_matches(buf, self.emote_catalog);
-                    let colon_ac_active = !pre_matches.is_empty();
+                    // Pre-check autocompletes before TextEdit consumes keys.
+                    let pre_emote_matches = find_autocomplete_matches(buf, self.emote_catalog);
+                    let pre_slash_matches = find_slash_matches(buf);
+                    let autocomplete_active =
+                        !pre_emote_matches.is_empty() || !pre_slash_matches.is_empty();
 
                     // Always consume Tab / Up / Down before TextEdit so they
                     // don't cause focus changes or unwanted behaviour.
@@ -164,7 +173,7 @@ impl<'a> ChatInput<'a> {
                         consumed_tab = i.consume_key(egui::Modifiers::NONE, Key::Tab);
                         consumed_up = i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
                         consumed_down = i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
-                        if colon_ac_active {
+                        if autocomplete_active {
                             consumed_enter = i.consume_key(egui::Modifiers::NONE, Key::Enter);
                         }
                     });
@@ -189,10 +198,17 @@ impl<'a> ChatInput<'a> {
                     let mut ac_sel: i32 =
                         ui.ctx().data_mut(|d| d.get_temp(ac_id).unwrap_or(0i32));
 
-                    // Recompute matches after TextEdit may have changed buf
+                    // Recompute matches after TextEdit may have changed buf.
+                    // Emote autocomplete takes priority over slash autocomplete.
                     let matches = find_autocomplete_matches(buf, self.emote_catalog);
+                    let slash_matches = if matches.is_empty() {
+                        find_slash_matches(buf)
+                    } else {
+                        Vec::new()
+                    };
 
                     let mut accepted_emote: Option<String> = None;
+                    let mut accepted_slash_cmd: Option<String> = None;
 
                     if !matches.is_empty() {
                         // ── Colon-autocomplete active ──
@@ -209,6 +225,24 @@ impl<'a> ChatInput<'a> {
                             accepted_emote = Some(matches[ac_sel as usize].code.clone());
                         }
                         // Keep focus on the text field while cycling through the AC list.
+                        if consumed_tab || consumed_up || consumed_down {
+                            ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
+                        }
+                    } else if !slash_matches.is_empty() {
+                        // ── Slash-command autocomplete active ──
+                        let n = slash_matches.len() as i32;
+                        ac_sel = ac_sel.clamp(0, n - 1);
+
+                        if consumed_up {
+                            ac_sel = (ac_sel - 1).rem_euclid(n);
+                        }
+                        if consumed_down {
+                            ac_sel = (ac_sel + 1).rem_euclid(n);
+                        }
+                        if consumed_tab || consumed_enter {
+                            accepted_slash_cmd =
+                                Some(slash_matches[ac_sel as usize].name.to_owned());
+                        }
                         if consumed_tab || consumed_up || consumed_down {
                             ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                         }
@@ -322,6 +356,13 @@ impl<'a> ChatInput<'a> {
                             .memory_mut(|m| m.request_focus(text_edit_id));
                         ac_sel = 0;
                     }
+                    if let Some(ref command) = accepted_slash_cmd {
+                        replace_slash_token(buf, command);
+                        move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
+                        ui.ctx()
+                            .memory_mut(|m| m.request_focus(text_edit_id));
+                        ac_sel = 0;
+                    }
 
                     ui.ctx().data_mut(|d| d.insert_temp(ac_id, ac_sel));
 
@@ -368,13 +409,22 @@ impl<'a> ChatInput<'a> {
                     }
 
                     // ── Draw autocomplete popup above input ──────────
-                    let show_popup = !matches.is_empty()
-                        && (resp.has_focus() || accepted_emote.is_some());
+                    let show_popup = (!matches.is_empty() || !slash_matches.is_empty())
+                        && (resp.has_focus() || accepted_emote.is_some() || accepted_slash_cmd.is_some());
                     if show_popup {
-                        if let Some(clicked) = self.show_autocomplete_popup(
-                            ui, &resp, &matches, ac_sel,
+                        if !matches.is_empty() {
+                            if let Some(clicked) = self.show_autocomplete_popup(
+                                ui, &resp, &matches, ac_sel,
+                            ) {
+                                replace_autocomplete_token(buf, &clicked);
+                                move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
+                                ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
+                                ui.ctx().data_mut(|d| d.insert_temp(ac_id, 0i32));
+                            }
+                        } else if let Some(clicked) = self.show_slash_autocomplete_popup(
+                            ui, &resp, &slash_matches, ac_sel,
                         ) {
-                            replace_autocomplete_token(buf, &clicked);
+                            replace_slash_token(buf, &clicked);
                             move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
                             ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                             ui.ctx().data_mut(|d| d.insert_temp(ac_id, 0i32));
@@ -588,6 +638,99 @@ impl<'a> ChatInput<'a> {
 
         clicked_emote
     }
+
+    fn show_slash_autocomplete_popup(
+        &self,
+        ui: &mut Ui,
+        text_resp: &egui::Response,
+        matches: &[&SlashCommandInfo],
+        selected: i32,
+    ) -> Option<String> {
+        let input_rect = text_resp.rect;
+        let popup_width = input_rect.width().min(460.0);
+        let row_h = 24.0;
+        let popup_h =
+            (matches.len() as f32 * row_h).min(SLASH_AUTOCOMPLETE_MAX as f32 * row_h) + 8.0;
+        let popup_rect = egui::Rect::from_min_size(
+            egui::pos2(input_rect.left(), input_rect.top() - popup_h - 4.0),
+            egui::vec2(popup_width, popup_h),
+        );
+
+        let layer_id =
+            LayerId::new(Order::Foreground, Id::new("slash_autocomplete_popup"));
+        let painter = ui.ctx().layer_painter(layer_id);
+        painter.rect_filled(popup_rect, 6.0, t::BG_RAISED);
+        painter.rect_stroke(
+            popup_rect,
+            6.0,
+            egui::Stroke::new(1.0, t::BORDER_SUBTLE),
+            egui::epaint::StrokeKind::Outside,
+        );
+
+        let mut popup_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .layer_id(layer_id)
+                .max_rect(popup_rect.shrink(4.0))
+                .layout(egui::Layout::top_down(egui::Align::LEFT)),
+        );
+        popup_ui.set_clip_rect(popup_rect);
+
+        let mut clicked_cmd: Option<String> = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false; 2])
+            .show(&mut popup_ui, |ui| {
+                for (i, entry) in matches.iter().enumerate() {
+                    let is_selected = i as i32 == selected;
+                    let row_id = Id::new("slash_ac_row").with(i);
+                    let row_bg = if is_selected {
+                        t::ACTIVE_CHANNEL_BG
+                    } else {
+                        Color32::TRANSPARENT
+                    };
+
+                    let frame_resp = egui::Frame::new()
+                        .fill(row_bg)
+                        .corner_radius(3.0)
+                        .inner_margin(egui::Margin::symmetric(6, 3))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let cmd_col = if is_selected {
+                                    t::TEXT_PRIMARY
+                                } else {
+                                    t::ACCENT
+                                };
+                                ui.label(
+                                    RichText::new(entry.usage)
+                                        .font(t::small())
+                                        .color(cmd_col)
+                                        .strong(),
+                                );
+                                let rem = ui.available_width();
+                                if rem > 80.0 {
+                                    ui.add_sized(
+                                        [rem, 14.0],
+                                        egui::Label::new(
+                                            RichText::new(entry.summary)
+                                                .font(t::small())
+                                                .color(t::TEXT_MUTED),
+                                        )
+                                        .truncate(),
+                                    );
+                                }
+                            });
+                        });
+
+                    let row_rect = frame_resp.response.rect;
+                    let click_resp =
+                        ui.interact(row_rect, row_id, egui::Sense::click());
+                    if click_resp.clicked() {
+                        clicked_cmd = Some(entry.name.to_owned());
+                    }
+                }
+            });
+
+        clicked_cmd
+    }
 }
 
 /// Find emotes matching a `:partial` token at the end of the input buffer.
@@ -618,6 +761,14 @@ fn find_autocomplete_matches<'a>(
 
     matches.truncate(AUTOCOMPLETE_MAX);
     matches
+}
+
+/// Find slash commands matching an in-progress `/command` token.
+fn find_slash_matches(buf: &str) -> Vec<&'static SlashCommandInfo> {
+    let Some(query) = extract_slash_query(buf) else {
+        return Vec::new();
+    };
+    slash_command_matches(query, SLASH_AUTOCOMPLETE_MAX)
 }
 
 /// Extract the partial query after the last `:` in the buffer.
@@ -670,6 +821,7 @@ fn provider_label(provider: &str) -> &'static str {
         "ffz" => "FFZ",
         "7tv" => "7TV",
         "twitch" => "Twitch",
+        "kick" => "Kick",
         _ => "Emote",
     }
 }

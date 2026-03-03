@@ -51,6 +51,8 @@ pub struct LoadingScreen {
     started_at:             Instant,
     phase:                  Phase,
     ready_at:               Option<Instant>,
+    /// True when startup proceeds in anonymous mode (no GLOBALUSERSTATE).
+    auth_optional:          bool,
 
     // Progress counters
     authenticated_user:     Option<String>,
@@ -78,6 +80,7 @@ impl Default for LoadingScreen {
             started_at:            Instant::now(),
             phase:                 Phase::Connecting,
             ready_at:              None,
+            auth_optional:         false,
             authenticated_user:    None,
             channels_joined:       Vec::new(),
             channels_with_history: HashSet::new(),
@@ -95,6 +98,12 @@ impl Default for LoadingScreen {
 impl LoadingScreen {
     /// Feed an event; returns whether the loading screen is still active.
     pub fn on_event(&mut self, evt: LoadEvent) {
+        // Startup-only overlay: once we've reached ready/done, ignore any
+        // subsequent connection/auth events (e.g. logout reconnect).
+        if matches!(self.phase, Phase::Ready | Phase::Done) {
+            return;
+        }
+
         match evt {
             LoadEvent::Connecting => {
                 self.phase = Phase::Connecting;
@@ -107,21 +116,25 @@ impl LoadingScreen {
             LoadEvent::Authenticated { username } => {
                 self.push_log(format!("Authenticated as {username}"), t::GREEN);
                 self.authenticated_user = Some(username);
+                self.auth_optional = false;
                 self.phase = Phase::Loading;
             }
             LoadEvent::ChannelJoined { channel } => {
+                self.maybe_enter_anonymous_loading();
                 self.push_log(format!("Joined #{channel}"), t::TEXT_PRIMARY);
                 if !self.channels_joined.contains(&channel) {
                     self.channels_joined.push(channel);
                 }
             }
             LoadEvent::CatalogLoaded { count } => {
+                self.maybe_enter_anonymous_loading();
                 self.push_log(format!("Global emotes ready — {count} emotes"), t::ACCENT);
                 self.catalog_count = count;
                 self.catalog_loaded = true;
                 self.check_done();
             }
             LoadEvent::HistoryLoaded { channel, count } => {
+                self.maybe_enter_anonymous_loading();
                 self.push_log(
                     format!("#{channel}: {count} history messages"),
                     t::TEXT_SECONDARY,
@@ -130,15 +143,18 @@ impl LoadingScreen {
                 self.check_done();
             }
             LoadEvent::EmoteImageReady => {
+                self.maybe_enter_anonymous_loading();
                 self.images_loaded += 1;
                 // Re-check done on every image arrival.
                 self.check_done();
             }
             LoadEvent::ImagePrefetchQueued { count } => {
+                self.maybe_enter_anonymous_loading();
                 self.images_expected += count;
                 // Don't log — too noisy.
             }
             LoadEvent::ChannelEmotesLoaded { channel, count } => {
+                self.maybe_enter_anonymous_loading();
                 if count > 0 {
                     self.push_log(
                         format!("#{channel}: {count} channel emotes"),
@@ -159,7 +175,7 @@ impl LoadingScreen {
 
     /// Call every frame; advances the timeout-based done detection.
     pub fn tick(&mut self) {
-        if self.phase == Phase::Loading
+        if matches!(self.phase, Phase::Authenticating | Phase::Loading)
             && self.started_at.elapsed() >= DONE_TIMEOUT
         {
             self.mark_ready();
@@ -386,6 +402,14 @@ impl LoadingScreen {
 
     // private 
 
+    fn maybe_enter_anonymous_loading(&mut self) {
+        if self.phase == Phase::Authenticating && self.authenticated_user.is_none() {
+            self.auth_optional = true;
+            self.phase = Phase::Loading;
+            self.push_log("Connected anonymously", t::TEXT_MUTED);
+        }
+    }
+
     fn push_log(&mut self, text: impl Into<String>, color: Color32) {
         self.log.push_back(LogLine { text: text.into(), color });
         while self.log.len() > 40 {
@@ -395,14 +419,22 @@ impl LoadingScreen {
 
     fn check_done(&mut self) {
         if self.phase != Phase::Loading { return; }
-        let auth_ok    = self.authenticated_user.is_some();
+        let auth_ok    = self.authenticated_user.is_some() || self.auth_optional;
         let catalog_ok = self.catalog_loaded;
-        let history_ok = !self.channels_joined.is_empty()
-            && self.channels_joined.iter()
-               .all(|ch| self.channels_with_history.contains(ch));
-        let emotes_ok  = !self.channels_joined.is_empty()
-            && self.channels_joined.iter()
-               .all(|ch| self.channels_with_emotes.contains(ch));
+        // Kick channels currently don't emit HistoryLoaded, and their emote
+        // metadata can be unavailable for some rooms. Don't block startup on
+        // those platform-specific side paths.
+        let startup_channels: Vec<&String> = self
+            .channels_joined
+            .iter()
+            .filter(|ch| !ch.starts_with("kick:"))
+            .collect();
+        let history_ok = startup_channels
+            .iter()
+            .all(|ch| self.channels_with_history.contains(*ch));
+        let emotes_ok  = startup_channels
+            .iter()
+            .all(|ch| self.channels_with_emotes.contains(*ch));
         // Wait for the bulk of prefetched images to arrive so the first paint
         // after the loading screen shows real emotes/badges, not blank boxes.
         let images_ok  = self.images_expected == 0

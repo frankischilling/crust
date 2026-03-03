@@ -14,16 +14,18 @@ use crust_core::model::{
 };
 use crust_emotes::{
     cache::EmoteCache,
-    providers::{BttvProvider, EmoteInfo, FfzProvider, SevenTvProvider},
+    providers::{BttvProvider, EmoteInfo, FfzProvider, KickProvider, SevenTvProvider},
     EmoteProvider,
 };
 use crust_storage::{AppSettings, SettingsStore};
 use crust_twitch::{parse_line, parse_privmsg_irc, session::client::{SessionCommand, TwitchEvent, TwitchSession}};
+use crust_kick::session::{KickEvent, KickSession, KickSessionCommand};
 use crust_ui::CrustApp;
 
 const CMD_CHANNEL_SIZE: usize = 128;
 const EVT_CHANNEL_SIZE: usize = 4096;
 const TWITCH_EVT_SIZE: usize = 4096;
+const KICK_EVT_SIZE: usize = 4096;
 
 /// Counter for assigning unique IDs to history messages loaded from external APIs.
 /// Starts at u64::MAX/2 so it never clashes with live session IDs (which count up from 0).
@@ -93,6 +95,10 @@ fn main() -> Result<()> {
     let (tw_evt_tx, tw_evt_rx) = mpsc::channel::<TwitchEvent>(TWITCH_EVT_SIZE);
     let (sess_cmd_tx, sess_cmd_rx) = mpsc::channel::<SessionCommand>(64);
 
+    // Kick session channels
+    let (kick_evt_tx, kick_evt_rx) = mpsc::channel::<KickEvent>(KICK_EVT_SIZE);
+    let (kick_cmd_tx, kick_cmd_rx) = mpsc::channel::<KickSessionCommand>(64);
+
     // Emote index shared between loaders and reducer
     let emote_index: EmoteIndex = Arc::new(RwLock::new(std::collections::HashMap::new()));
 
@@ -137,6 +143,12 @@ fn main() -> Result<()> {
         session.run()
     });
 
+    // Spawn Kick Pusher session
+    rt.spawn({
+        let session = KickSession::new(kick_evt_tx, kick_cmd_rx);
+        session.run()
+    });
+
     // Load global emotes in background
     rt.spawn({
         let idx = emote_index.clone();
@@ -158,19 +170,23 @@ fn main() -> Result<()> {
         }
     });
 
-    // Spawn the reducer (bridges twitch events → tokenized AppEvents for UI)
+    // Spawn the reducer (bridges twitch/kick events → tokenized AppEvents for UI)
     rt.spawn({
         let idx = emote_index.clone();
         let cache = emote_cache.clone();
         let bm = badge_map.clone();
         let gc = global_emote_codes.clone();
-        reducer_loop(cmd_rx, tw_evt_rx, evt_tx, sess_cmd_tx, idx, cache, bm, gc, settings_store, saved_token)
+        reducer_loop(
+            cmd_rx, tw_evt_rx, kick_evt_rx, evt_tx,
+            sess_cmd_tx, kick_cmd_tx,
+            idx, cache, bm, gc, settings_store, saved_token,
+        )
     });
 
     // eframe / egui: UI framework initialization
     let native_opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Crust – Twitch Chat")
+            .with_title("Crust – Twitch & Kick Chat")
             .with_inner_size([1100.0, 700.0])
             .with_min_inner_size([600.0, 400.0])
             .with_app_id("crust"),
@@ -205,13 +221,15 @@ fn main() -> Result<()> {
 
 // Reducer: application state reducer
 
-/// Central reducer: receives raw Twitch events + UI commands, tokenizes
+/// Central reducer: receives raw Twitch/Kick events + UI commands, tokenizes
 /// messages using the emote index, and forwards AppEvents to the UI.
 async fn reducer_loop(
     mut cmd_rx: mpsc::Receiver<AppCommand>,
     mut tw_rx: mpsc::Receiver<TwitchEvent>,
+    mut kick_rx: mpsc::Receiver<KickEvent>,
     evt_tx: mpsc::Sender<AppEvent>,
     sess_tx: mpsc::Sender<SessionCommand>,
+    kick_tx: mpsc::Sender<KickSessionCommand>,
     emote_index: EmoteIndex,
     emote_cache: Option<EmoteCache>,
     badge_map: BadgeMap,
@@ -243,7 +261,48 @@ async fn reducer_loop(
     let mut settings: AppSettings = settings_store.as_ref()
         .map(|s| s.load())
         .unwrap_or_default();
-    let mut joined_channels: HashSet<String> = settings.auto_join.iter().cloned().collect();
+    fn parse_saved_channel(raw: &str) -> Option<ChannelId> {
+        let entry = raw.trim();
+        if entry.is_empty() {
+            return None;
+        }
+        let id = if let Some((prefix, rest)) = entry.split_once(':') {
+            if prefix.eq_ignore_ascii_case("kick") {
+                ChannelId::kick(rest.trim().trim_start_matches('#'))
+            } else if prefix.eq_ignore_ascii_case("twitch") {
+                ChannelId::new(rest.trim())
+            } else {
+                ChannelId::new(entry)
+            }
+        } else {
+            ChannelId::new(entry)
+        };
+        if id.display_name().is_empty() {
+            None
+        } else {
+            Some(id)
+        }
+    }
+
+    fn parsed_auto_join_channels(settings: &AppSettings) -> Vec<ChannelId> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut out = Vec::new();
+        for raw in &settings.auto_join {
+            if let Some(id) = parse_saved_channel(raw) {
+                if seen.insert(id.0.clone()) {
+                    out.push(id);
+                }
+            } else {
+                warn!("Ignoring invalid auto_join entry: {:?}", raw);
+            }
+        }
+        out
+    }
+
+    let mut joined_channels: HashSet<String> = parsed_auto_join_channels(&settings)
+        .into_iter()
+        .map(|id| id.0)
+        .collect();
 
     // Set to `true` whenever we explicitly send `SessionCommand::Authenticate`.
     // While this flag is set, `TwitchEvent::Connected` will skip re-joining
@@ -348,8 +407,14 @@ async fn reducer_loop(
                         // would be premature and creates a double-join (the real
                         // rejoin happens from TwitchEvent::Authenticated below).
                         if !auth_in_progress {
-                            for ch in &settings.auto_join {
-                                let id = ChannelId(ch.clone());
+                            let twitch_restore: Vec<ChannelId> = parsed_auto_join_channels(&settings)
+                                .into_iter()
+                                .filter(|id| id.is_twitch())
+                                .collect();
+                            if !twitch_restore.is_empty() {
+                                info!("Restoring {} Twitch channels from auto-join", twitch_restore.len());
+                            }
+                            for id in twitch_restore {
                                 let _ = evt_tx.send(AppEvent::ChannelJoined { channel: id.clone() }).await;
                                 let _ = sess_tx.send(SessionCommand::JoinChannel(id)).await;
                             }
@@ -431,8 +496,14 @@ async fn reducer_loop(
                         }).await;
 
                         if join_now {
-                            for ch in &settings.auto_join {
-                                let id = ChannelId(ch.clone());
+                            let twitch_restore: Vec<ChannelId> = parsed_auto_join_channels(&settings)
+                                .into_iter()
+                                .filter(|id| id.is_twitch())
+                                .collect();
+                            if !twitch_restore.is_empty() {
+                                info!("Restoring {} Twitch channels after authentication", twitch_restore.len());
+                            }
+                            for id in twitch_restore {
                                 let _ = evt_tx.send(AppEvent::ChannelJoined { channel: id.clone() }).await;
                                 let _ = sess_tx.send(SessionCommand::JoinChannel(id)).await;
                             }
@@ -659,21 +730,215 @@ async fn reducer_loop(
                 }
             }
 
+            // Kick Pusher event
+            Some(kick_evt) = kick_rx.recv() => {
+                match kick_evt {
+                    KickEvent::Connected => {
+                        info!("Kick session connected");
+                        let kick_restore: Vec<ChannelId> = parsed_auto_join_channels(&settings)
+                            .into_iter()
+                            .filter(|id| id.is_kick())
+                            .collect();
+                        if !kick_restore.is_empty() {
+                            info!("Restoring {} Kick channels from auto-join", kick_restore.len());
+                        }
+                        for id in kick_restore {
+                            let _ = evt_tx.send(AppEvent::ChannelJoined { channel: id.clone() }).await;
+                            let _ = kick_tx.send(KickSessionCommand::JoinChannel(id)).await;
+                        }
+                    }
+                    KickEvent::Disconnected => {
+                        info!("Kick session disconnected");
+                    }
+                    KickEvent::Reconnecting { attempt } => {
+                        info!("Kick reconnecting (attempt {attempt})");
+                    }
+                    KickEvent::Error(e) => {
+                        warn!("Kick error: {e}");
+                        let _ = evt_tx.send(AppEvent::Error {
+                            context: "Kick".into(),
+                            message: e,
+                        }).await;
+                    }
+                    KickEvent::ChannelInfoResolved { channel, chatroom_id, user_id } => {
+                        info!("Kick channel {} resolved: chatroom={chatroom_id}, user={user_id}", channel.display_name());
+                        // Load Kick-native + 7TV(Kick) emotes once channel info is resolved.
+                        let idx = emote_index.clone();
+                        let cache_clone = emote_cache.clone();
+                        let etx = evt_tx.clone();
+                        let gc = global_emote_codes.clone();
+                        let ch = channel.clone();
+                        tokio::spawn(async move {
+                            load_kick_channel_emotes(&ch, user_id, &idx, &cache_clone, &etx, &gc).await;
+                        });
+                    }
+                    KickEvent::ChatMessage(mut msg) => {
+                        let (normalized_text, inline_emotes) =
+                            normalize_kick_inline_emotes(&msg.raw_text);
+                        if !inline_emotes.is_empty() {
+                            msg.raw_text = normalized_text;
+                            let mut inserted = 0usize;
+                            {
+                                let mut idx = emote_index.write().unwrap();
+                                for (id, code) in inline_emotes {
+                                    let info = EmoteInfo {
+                                        id: id.clone(),
+                                        code: code.clone(),
+                                        url_1x: kick_inline_emote_url(&id),
+                                        url_2x: None,
+                                        url_4x: None,
+                                        provider: "kick".to_owned(),
+                                    };
+                                    let replace = idx
+                                        .get(&code)
+                                        .map(|e| e.provider != "kick" || e.id != id)
+                                        .unwrap_or(true);
+                                    if replace {
+                                        idx.insert(code, info);
+                                        inserted += 1;
+                                    }
+                                }
+                            }
+                            if inserted > 0 {
+                                if let Some(cache) = emote_cache.as_ref() {
+                                    let idx = emote_index.read().unwrap();
+                                    let emotes: Vec<EmoteInfo> = idx.values().cloned().collect();
+                                    drop(idx);
+                                    cache.register(emotes);
+                                }
+                            }
+                        }
+
+                        // Tokenize for emotes/emoji/URLs
+                        let snapshot: std::collections::HashMap<String, EmoteInfo> = {
+                            let guard = emote_index.read().unwrap();
+                            guard.clone()
+                        };
+
+                        msg.spans = crust_core::format::tokenize(
+                            &msg.raw_text,
+                            msg.flags.is_action,
+                            &msg.twitch_emotes,
+                            &|code| {
+                                snapshot.get(code).map(|info| {
+                                    (
+                                        info.id.clone(),
+                                        info.code.clone(),
+                                        info.url_1x.clone(),
+                                        info.provider.clone(),
+                                        info.url_4x.clone().or_else(|| info.url_2x.clone()),
+                                    )
+                                })
+                            },
+                        );
+
+                        // Queue image fetches for emotes/emoji
+                        for span in &msg.spans {
+                            let url = match span {
+                                crust_core::Span::Emote { url, .. } => Some(url.clone()),
+                                crust_core::Span::Emoji { url, .. } => Some(url.clone()),
+                                _ => None,
+                            };
+                            if let Some(url) = url {
+                                if !pending_images.contains(&url) {
+                                    pending_images.insert(url.clone());
+                                    let evt_tx = evt_tx.clone();
+                                    let cache = emote_cache.clone();
+                                    tokio::spawn(async move {
+                                        fetch_emote_image(&url, &cache, &evt_tx).await;
+                                    });
+                                }
+                            }
+                        }
+                        // Queue badge image fetches
+                        for badge in &msg.sender.badges {
+                            if let Some(url) = &badge.url {
+                                if !pending_images.contains(url) {
+                                    pending_images.insert(url.clone());
+                                    let url = url.clone();
+                                    let evt_tx = evt_tx.clone();
+                                    let cache = emote_cache.clone();
+                                    tokio::spawn(async move {
+                                        fetch_emote_image(&url, &cache, &evt_tx).await;
+                                    });
+                                }
+                            }
+                        }
+
+                        let channel = msg.channel.clone();
+                        let _ = evt_tx.send(AppEvent::MessageReceived {
+                            channel,
+                            message: msg,
+                        }).await;
+                    }
+                    KickEvent::MessageDeleted { channel, server_id } => {
+                        let _ = evt_tx.send(AppEvent::MessageDeleted { channel, server_id }).await;
+                    }
+                    KickEvent::UserBanned { channel, login } => {
+                        let _ = evt_tx.send(AppEvent::UserMessagesCleared {
+                            channel: channel.clone(),
+                            login: login.clone(),
+                        }).await;
+                        let text = format!("{login} was permanently banned.");
+                        let msg = make_system_message(
+                            local_msg_id, channel.clone(), text, Utc::now(),
+                            MsgKind::Ban { login: login.clone() },
+                        );
+                        local_msg_id += 1;
+                        let _ = evt_tx.send(AppEvent::MessageReceived {
+                            channel,
+                            message: msg,
+                        }).await;
+                    }
+                    KickEvent::ChatCleared { channel } => {
+                        let msg = make_system_message(
+                            local_msg_id, channel.clone(),
+                            "Chat was cleared by a moderator.".to_owned(),
+                            Utc::now(), MsgKind::ChatCleared,
+                        );
+                        local_msg_id += 1;
+                        let _ = evt_tx.send(AppEvent::MessageReceived {
+                            channel,
+                            message: msg,
+                        }).await;
+                    }
+                    KickEvent::SystemNotice(notice) => {
+                        if let Some(ch) = notice.channel.clone() {
+                            let msg = make_system_message(
+                                local_msg_id, ch, notice.text.clone(), notice.timestamp,
+                                MsgKind::SystemInfo,
+                            );
+                            local_msg_id += 1;
+                            let _ = evt_tx.send(AppEvent::MessageReceived {
+                                channel: msg.channel.clone(),
+                                message: msg,
+                            }).await;
+                        }
+                    }
+                }
+            }
+
             // UI command
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
                     AppCommand::JoinChannel { channel } => {
-                        info!("Joining #{channel}");
-                        let _ = sess_tx.send(SessionCommand::JoinChannel(channel.clone())).await;
+                        if channel.is_kick() {
+                            info!("Joining Kick channel {}", channel.display_name());
+                            let _ = kick_tx.send(KickSessionCommand::JoinChannel(channel.clone())).await;
+                        } else {
+                            info!("Joining #{channel}");
+                            let _ = sess_tx.send(SessionCommand::JoinChannel(channel.clone())).await;
+                        }
                         // Emit ChannelJoined immediately for UI responsiveness.
                         let _ = evt_tx.send(AppEvent::ChannelJoined {
                             channel: channel.clone(),
                         }).await;
                         // Inject a single join confirmation into the feed.
+                        let platform_label = if channel.is_kick() { "Kick" } else { "Twitch" };
                         let join_msg = make_system_message(
                             local_msg_id,
                             channel.clone(),
-                            format!("Joined #{}", channel.as_str()),
+                            format!("Joined {} channel: {}", platform_label, channel.display_name()),
                             chrono::Utc::now(),
                             MsgKind::SystemInfo,
                         );
@@ -687,8 +952,13 @@ async fn reducer_loop(
                         save_channels(&settings_store, &mut settings, &joined_channels);
                     }
                     AppCommand::LeaveChannel { channel } => {
-                        info!("Leaving #{channel}");
-                        let _ = sess_tx.send(SessionCommand::LeaveChannel(channel.clone())).await;
+                        if channel.is_kick() {
+                            info!("Leaving Kick channel {}", channel.display_name());
+                            let _ = kick_tx.send(KickSessionCommand::LeaveChannel(channel.clone())).await;
+                        } else {
+                            info!("Leaving #{channel}");
+                            let _ = sess_tx.send(SessionCommand::LeaveChannel(channel.clone())).await;
+                        }
                         let _ = evt_tx.send(AppEvent::ChannelParted { channel: channel.clone() }).await;
                         // Persist to settings
                         joined_channels.remove(&channel.0.to_lowercase());
@@ -986,10 +1256,19 @@ async fn reducer_loop(
                     }
                     AppCommand::SendMessage { channel, text, reply_to_msg_id } => {
                         debug!("Sending message to #{channel}: {text}");
-                        let _ = sess_tx.send(SessionCommand::SendMessage(channel.clone(), text.clone(), reply_to_msg_id)).await;
+                        if channel.is_kick() {
+                            // Kick message sending is not yet supported (requires OAuth)
+                            let _ = evt_tx.send(AppEvent::Error {
+                                context: "Kick".into(),
+                                message: "Sending messages to Kick channels is not yet supported.".into(),
+                            }).await;
+                        } else {
+                            let _ = sess_tx.send(SessionCommand::SendMessage(channel.clone(), text.clone(), reply_to_msg_id)).await;
+                        }
 
-                        // Local echo: show the sent message immediately
+                        // Local echo: show the sent message immediately (Twitch only for now)
                         if let (Some(uname), Some(uid)) = (&auth_username, &auth_user_id) {
+                        if !channel.is_kick() {
                             local_msg_id += 1;
                             let mut echo = ChatMessage {
                                 id: MessageId(local_msg_id),
@@ -1066,10 +1345,11 @@ async fn reducer_loop(
                                 message: echo,
                             }).await;
                         }
+                        }
                     }
                     AppCommand::FetchUserProfile { login } => {
                         let etx = evt_tx.clone();
-                        tokio::spawn(async move { fetch_user_profile(&login, etx).await; });
+                        tokio::spawn(async move { fetch_twitch_user_profile(&login, etx).await; });
                     }
                     AppCommand::TimeoutUser { channel, login, user_id, seconds, reason } => {
                         let broadcaster_id = channel_room_ids.get(&channel).cloned();
@@ -1138,11 +1418,11 @@ async fn reducer_loop(
                             message: msg,
                         }).await;
                     }
-                    AppCommand::ShowUserCard { login, .. } => {
-                        // Piggyback on existing FetchUserProfile; the UI
-                        // side already handles set_loading via ShowUserCard.
+                    AppCommand::ShowUserCard { login, channel } => {
                         let etx = evt_tx.clone();
-                        tokio::spawn(async move { fetch_user_profile(&login, etx).await; });
+                        tokio::spawn(async move {
+                            fetch_user_profile_for_channel(&login, &channel, etx).await;
+                        });
                     }
                 }
             }
@@ -1152,6 +1432,81 @@ async fn reducer_loop(
     }
 
     info!("Reducer loop exiting");
+}
+
+/// Parse Kick inline emote tags like `[emote:<id>:<code>]` and return:
+/// - normalized message text with tags replaced by plain emote codes
+/// - discovered `(id, code)` pairs for runtime emote registration
+fn normalize_kick_inline_emotes(raw: &str) -> (String, Vec<(String, String)>) {
+    if raw.is_empty() || !raw.contains("[emote:") {
+        return (raw.to_owned(), Vec::new());
+    }
+
+    let mut out = String::with_capacity(raw.len());
+    let mut found: Vec<(String, String)> = Vec::new();
+    let mut i = 0usize;
+
+    while i < raw.len() {
+        let rest = &raw[i..];
+
+        if let Some(tag_rest) = rest.strip_prefix("[emote:") {
+            if let Some(id_sep_rel) = tag_rest.find(':') {
+                let id_start_rel = "[emote:".len();
+                let id = tag_rest[..id_sep_rel].trim();
+                let code_start_rel = id_start_rel + id_sep_rel + 1;
+                if code_start_rel <= rest.len() {
+                    let code_and_tail = &rest[code_start_rel..];
+                    if let Some(code_end_rel) = code_and_tail.find(']') {
+                        let code = code_and_tail[..code_end_rel].trim();
+                        if !id.is_empty() && !code.is_empty() {
+                            let prev_is_ws = out
+                                .chars()
+                                .last()
+                                .map(|c| c.is_whitespace())
+                                .unwrap_or(true);
+                            if !prev_is_ws {
+                                out.push(' ');
+                            }
+                            out.push_str(code);
+                            found.push((id.to_owned(), code.to_owned()));
+
+                            i += code_start_rel + code_end_rel + 1; // include trailing ']'
+
+                            if i < raw.len() {
+                                let next = raw[i..].chars().next();
+                                let next_needs_space = next
+                                    .map(|c| {
+                                        !c.is_whitespace()
+                                            && !matches!(
+                                                c,
+                                                '.' | ',' | '!' | '?' | ':' | ';' | ')' | ']' | '}'
+                                            )
+                                    })
+                                    .unwrap_or(false);
+                                if next_needs_space {
+                                    out.push(' ');
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(ch) = rest.chars().next() {
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    (out, found)
+}
+
+fn kick_inline_emote_url(id: &str) -> String {
+    format!("https://files.kick.com/emotes/{id}/fullsize")
 }
 
 // Emote loading
@@ -1321,6 +1676,81 @@ async fn load_channel_emotes(
     }).await;
 
     // Eagerly prefetch only the newly-loaded channel emote images
+    prefetch_emote_images(new_urls, cache, evt_tx);
+}
+
+/// Load Kick channel emotes from Kick-native and 7TV(Kick) providers.
+async fn load_kick_channel_emotes(
+    channel: &ChannelId,
+    kick_user_id: u64,
+    index: &EmoteIndex,
+    cache: &Option<EmoteCache>,
+    evt_tx: &mpsc::Sender<AppEvent>,
+    global_codes: &GlobalCodes,
+) {
+    let slug = channel.display_name().to_owned();
+    info!("Loading Kick emotes for {} (kick user-id {kick_user_id})", channel.display_name());
+
+    let kick = KickProvider::new();
+    let stv = SevenTvProvider::new();
+
+    let (kick_emotes, stv_emotes) = tokio::join!(
+        kick.load_channel(&slug),
+        async {
+            if kick_user_id > 0 {
+                stv.load_kick_channel(&kick_user_id.to_string()).await
+            } else {
+                vec![]
+            }
+        },
+    );
+
+    let total = kick_emotes.len() + stv_emotes.len();
+    if total == 0 {
+        warn!("No Kick emotes found for {}", channel.display_name());
+        let _ = evt_tx.send(AppEvent::ChannelEmotesLoaded {
+            channel: channel.clone(),
+            count: 0,
+        }).await;
+        return;
+    }
+
+    info!(
+        "Loaded {total} Kick channel emotes for {} (Kick={}, 7TV={})",
+        channel.display_name(),
+        kick_emotes.len(),
+        stv_emotes.len(),
+    );
+
+    let new_urls: Vec<String> = kick_emotes.iter()
+        .chain(stv_emotes.iter())
+        .map(|e| e.url_1x.clone())
+        .collect();
+
+    {
+        let mut idx = index.write().unwrap();
+        for e in kick_emotes {
+            idx.insert(e.code.clone(), e);
+        }
+        for e in stv_emotes {
+            idx.insert(e.code.clone(), e);
+        }
+    }
+
+    if let Some(cache) = cache {
+        let idx = index.read().unwrap();
+        let emotes: Vec<EmoteInfo> = idx.values().cloned().collect();
+        drop(idx);
+        cache.register(emotes);
+    }
+
+    send_emote_catalog(index, evt_tx, global_codes).await;
+
+    let _ = evt_tx.send(AppEvent::ChannelEmotesLoaded {
+        channel: channel.clone(),
+        count: total,
+    }).await;
+
     prefetch_emote_images(new_urls, cache, evt_tx);
 }
 
@@ -1956,10 +2386,23 @@ async fn validate_token(token: &str) -> Result<ValidateInfo, ValidateError> {
 
 // User profile
 
+/// Fetch a user profile appropriate for the channel platform.
+async fn fetch_user_profile_for_channel(
+    login: &str,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    if channel.is_kick() {
+        fetch_kick_user_profile(login, evt_tx).await;
+    } else {
+        fetch_twitch_user_profile(login, evt_tx).await;
+    }
+}
+
 /// Fetch a Twitch user profile from the IVR API (no auth required) and send
-/// `AppEvent::UserProfileLoaded`.  Also pre-fetches avatar bytes so the popup
+/// `AppEvent::UserProfileLoaded`. Also pre-fetches avatar bytes so the popup
 /// can show the real avatar immediately.
-async fn fetch_user_profile(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
+async fn fetch_twitch_user_profile(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
     #[derive(serde::Deserialize)]
     struct IvrRoles {
         #[serde(rename = "isPartner", default)]
@@ -2034,17 +2477,38 @@ async fn fetch_user_profile(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
     let client = reqwest::Client::new();
     let resp = match client.get(&url).send().await {
         Ok(r) if r.status().is_success() => r,
-        Ok(r) => { warn!("IVR user fetch returned HTTP {} for {login}", r.status()); return; }
-        Err(e) => { warn!("IVR user fetch failed for {login}: {e}"); return; }
+        Ok(r) => {
+            warn!("IVR user fetch returned HTTP {} for {login}", r.status());
+            let _ = evt_tx.send(AppEvent::UserProfileUnavailable {
+                login: login.to_owned(),
+            }).await;
+            return;
+        }
+        Err(e) => {
+            warn!("IVR user fetch failed for {login}: {e}");
+            let _ = evt_tx.send(AppEvent::UserProfileUnavailable {
+                login: login.to_owned(),
+            }).await;
+            return;
+        }
     };
 
     let users: Vec<IvrUser> = match resp.json().await {
         Ok(u) => u,
-        Err(e) => { warn!("IVR user response parse failed for {login}: {e}"); return; }
+        Err(e) => {
+            warn!("IVR user response parse failed for {login}: {e}");
+            let _ = evt_tx.send(AppEvent::UserProfileUnavailable {
+                login: login.to_owned(),
+            }).await;
+            return;
+        }
     };
 
     let Some(user) = users.into_iter().next() else {
         warn!("IVR returned no user for {login}");
+        let _ = evt_tx.send(AppEvent::UserProfileUnavailable {
+            login: login.to_owned(),
+        }).await;
         return;
     };
 
@@ -2085,6 +2549,236 @@ async fn fetch_user_profile(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
     };
 
     // Pre-fetch avatar bytes so egui can display them right away.
+    if let Some(ref logo) = avatar_url {
+        if let Ok((w, h, raw)) = fetch_and_decode_raw(logo).await {
+            let _ = evt_tx.send(AppEvent::EmoteImageReady {
+                uri: logo.clone(),
+                width: w,
+                height: h,
+                raw_bytes: raw,
+            }).await;
+        }
+    }
+
+    let _ = evt_tx.send(AppEvent::UserProfileLoaded { profile }).await;
+}
+
+/// Fetch a Kick user profile via Kick's public channel API.
+async fn fetch_kick_user_profile(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
+    #[derive(serde::Deserialize)]
+    struct KickCategory {
+        #[serde(default, alias = "display_name", alias = "displayName", alias = "slug", alias = "name")]
+        name: Option<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct KickLivestream {
+        #[serde(default, alias = "title", alias = "sessionTitle")]
+        session_title: Option<String>,
+        #[serde(default, alias = "isLive")]
+        is_live: Option<bool>,
+        #[serde(default, alias = "viewer_count", alias = "viewersCount")]
+        viewers_count: Option<u64>,
+        #[serde(default, alias = "startedAt")]
+        started_at: Option<String>,
+        #[serde(default)]
+        category: Option<KickCategory>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct KickUser {
+        #[serde(default)]
+        id: Option<u64>,
+        #[serde(default)]
+        username: Option<String>,
+        #[serde(default)]
+        slug: Option<String>,
+        #[serde(default, alias = "bio", alias = "description")]
+        description: Option<String>,
+        #[serde(
+            default,
+            alias = "profilePicture",
+            alias = "profile_pic",
+            alias = "profilePic",
+            alias = "avatar",
+            alias = "avatar_url"
+        )]
+        avatar_url: Option<String>,
+        #[serde(default, alias = "createdAt")]
+        created_at: Option<String>,
+        #[serde(default, alias = "followersCount", alias = "follower_count", alias = "followers_count")]
+        followers_count: Option<u64>,
+        #[serde(default, alias = "isVerified", alias = "verified")]
+        is_verified: Option<bool>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct KickChannel {
+        #[serde(default)]
+        id: Option<u64>,
+        #[serde(default)]
+        slug: Option<String>,
+        #[serde(default)]
+        user: Option<KickUser>,
+        #[serde(default)]
+        livestream: Option<KickLivestream>,
+        #[serde(default, alias = "description", alias = "bio")]
+        description: Option<String>,
+        #[serde(default, alias = "followersCount", alias = "follower_count", alias = "followers_count")]
+        followers_count: Option<u64>,
+    }
+
+    fn minimal_kick_profile(login: &str) -> UserProfile {
+        UserProfile {
+            id: String::new(),
+            login: login.to_owned(),
+            display_name: login.to_owned(),
+            description: String::new(),
+            created_at: None,
+            avatar_url: None,
+            followers: None,
+            is_partner: false,
+            is_affiliate: false,
+            chat_color: None,
+            is_live: false,
+            stream_title: None,
+            stream_game: None,
+            stream_viewers: None,
+            last_broadcast_at: None,
+            is_banned: false,
+            ban_reason: None,
+        }
+    }
+
+    fn normalize_kick_url(url: &str) -> String {
+        if url.starts_with("//") {
+            format!("https:{url}")
+        } else if url.starts_with('/') {
+            format!("https://kick.com{url}")
+        } else {
+            url.to_owned()
+        }
+    }
+
+    let slug = login
+        .trim()
+        .trim_start_matches('#')
+        .trim_start_matches("kick:")
+        .to_lowercase();
+    let url = format!("https://kick.com/api/v2/channels/{slug}");
+    let client = reqwest::Client::new();
+    let resp = match client
+        .get(&url)
+        .header(
+            reqwest::header::USER_AGENT,
+            "Mozilla/5.0 (X11; Linux x86_64) CrustChat/0.1",
+        )
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            warn!("Kick user fetch returned HTTP {} for {slug}", r.status());
+            let profile = minimal_kick_profile(&slug);
+            let _ = evt_tx.send(AppEvent::UserProfileLoaded { profile }).await;
+            return;
+        }
+        Err(e) => {
+            warn!("Kick user fetch failed for {slug}: {e}");
+            let profile = minimal_kick_profile(&slug);
+            let _ = evt_tx.send(AppEvent::UserProfileLoaded { profile }).await;
+            return;
+        }
+    };
+
+    let channel: KickChannel = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("Kick user response parse failed for {slug}: {e}");
+            let profile = minimal_kick_profile(&slug);
+            let _ = evt_tx.send(AppEvent::UserProfileLoaded { profile }).await;
+            return;
+        }
+    };
+
+    let user = channel.user;
+    let resolved_login = user
+        .as_ref()
+        .and_then(|u| u.slug.clone().or_else(|| u.username.clone()))
+        .or_else(|| channel.slug.clone())
+        .unwrap_or_else(|| slug.clone());
+    let display_name = user
+        .as_ref()
+        .and_then(|u| u.username.clone())
+        .unwrap_or_else(|| resolved_login.clone());
+    let avatar_url = user
+        .as_ref()
+        .and_then(|u| u.avatar_url.as_deref())
+        .map(normalize_kick_url);
+    let followers = user
+        .as_ref()
+        .and_then(|u| u.followers_count)
+        .or(channel.followers_count);
+    let description = user
+        .as_ref()
+        .and_then(|u| u.description.clone())
+        .or(channel.description)
+        .unwrap_or_default();
+    let created_at = user
+        .as_ref()
+        .and_then(|u| u.created_at.clone());
+
+    let is_live = channel
+        .livestream
+        .as_ref()
+        .map(|s| s.is_live.unwrap_or(true))
+        .unwrap_or(false);
+    let stream_title = channel
+        .livestream
+        .as_ref()
+        .and_then(|s| s.session_title.clone())
+        .filter(|s| !s.is_empty());
+    let stream_game = channel
+        .livestream
+        .as_ref()
+        .and_then(|s| s.category.as_ref())
+        .and_then(|c| c.name.clone())
+        .filter(|s| !s.is_empty());
+    let stream_viewers = channel
+        .livestream
+        .as_ref()
+        .and_then(|s| s.viewers_count);
+    let last_broadcast_at = channel
+        .livestream
+        .as_ref()
+        .and_then(|s| s.started_at.clone());
+
+    let profile = UserProfile {
+        id: user
+            .as_ref()
+            .and_then(|u| u.id)
+            .or(channel.id)
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        login: resolved_login,
+        display_name,
+        description,
+        created_at,
+        avatar_url: avatar_url.clone(),
+        followers,
+        is_partner: user.as_ref().and_then(|u| u.is_verified).unwrap_or(false),
+        is_affiliate: false,
+        chat_color: None,
+        is_live,
+        stream_title,
+        stream_game,
+        stream_viewers,
+        last_broadcast_at,
+        is_banned: false,
+        ban_reason: None,
+    };
+
     if let Some(ref logo) = avatar_url {
         if let Ok((w, h, raw)) = fetch_and_decode_raw(logo).await {
             let _ = evt_tx.send(AppEvent::EmoteImageReady {

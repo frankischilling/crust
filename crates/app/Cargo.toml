@@ -23,6 +23,7 @@ smallvec = { workspace = true }
 crust-core = { path = "../core" }
 crust-ui = { path = "../ui" }
 crust-twitch = { path = "../twitch" }
+crust-kick = { path = "../kick" }
 crust-emotes = { path = "../emotes" }
 crust-storage = { path = "../storage" }
 libc = { workspace = true }

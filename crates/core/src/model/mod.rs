@@ -4,28 +4,81 @@ use smallvec::SmallVec;
 
 // Identifiers: types for channel, user, and message IDs
 
-/// Normalized lowercase Twitch channel name (without the leading '#').
+/// Streaming platform that a channel belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum Platform {
+    #[default]
+    Twitch,
+    Kick,
+}
+
+impl std::fmt::Display for Platform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Platform::Twitch => write!(f, "Twitch"),
+            Platform::Kick => write!(f, "Kick"),
+        }
+    }
+}
+
+/// Channel identifier that encodes both platform and channel name.
+///
+/// Internally Kick channels are stored as `"kick:<slug>"` while Twitch
+/// channels are stored as the bare lowercase login (no `#` prefix).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChannelId(pub String);
 
 impl ChannelId {
+    /// Create a Twitch channel ID (default, backward-compatible).
     pub fn new(s: impl Into<String>) -> Self {
         Self(s.into().to_lowercase().trim_start_matches('#').to_owned())
+    }
+
+    /// Create a Kick channel ID.
+    pub fn kick(slug: impl Into<String>) -> Self {
+        let slug = slug.into().to_lowercase();
+        Self(format!("kick:{slug}"))
+    }
+
+    pub fn platform(&self) -> Platform {
+        if self.0.starts_with("kick:") {
+            Platform::Kick
+        } else {
+            Platform::Twitch
+        }
+    }
+
+    /// Human-readable channel name (strips any platform prefix).
+    pub fn display_name(&self) -> &str {
+        self.0.strip_prefix("kick:").unwrap_or(&self.0)
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
-    /// Returns "#channel" form required by IRC JOIN / PRIVMSG.
+    /// Returns "#channel" form required by Twitch IRC JOIN / PRIVMSG.
     pub fn irc_name(&self) -> String {
-        format!("#{}", self.0)
+        format!("#{}", self.display_name())
+    }
+
+    /// Returns the Kick slug, if this is a Kick channel.
+    pub fn kick_slug(&self) -> Option<&str> {
+        self.0.strip_prefix("kick:")
+    }
+
+    pub fn is_kick(&self) -> bool {
+        self.platform() == Platform::Kick
+    }
+
+    pub fn is_twitch(&self) -> bool {
+        self.platform() == Platform::Twitch
     }
 }
 
 impl std::fmt::Display for ChannelId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "{}", self.display_name())
     }
 }
 

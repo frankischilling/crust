@@ -116,6 +116,8 @@ pub enum AppEvent {
     },
     /// Twitch user profile loaded from the IVR API.
     UserProfileLoaded { profile: UserProfile },
+    /// A user profile lookup finished without data (network/API/user not found).
+    UserProfileUnavailable { login: String },
     /// Mark all visible messages from a user as deleted (timeout / ban).
     UserMessagesCleared { channel: ChannelId, login: String },
     /// USERSTATE received - badges, color and mod status for the logged-in user.

@@ -93,6 +93,28 @@ impl UserProfilePopup {
         self.profile = Some(profile);
     }
 
+    /// Called when a profile request completes without data.
+    pub fn set_unavailable(&mut self, login: &str) {
+        self.loading = false;
+        self.open = true;
+        self.loading_login = login.to_owned();
+        self.profile = None;
+    }
+
+    /// Returns true when this popup is currently expecting a profile for
+    /// `login` (either while loading or while refreshing an already-open card).
+    pub fn accepts_profile(&self, login: &str) -> bool {
+        if self.loading {
+            return self.loading_login.eq_ignore_ascii_case(login);
+        }
+        self.open
+            && self
+                .profile
+                .as_ref()
+                .map(|p| p.login.eq_ignore_ascii_case(login))
+                .unwrap_or(false)
+    }
+
     /// Render the popup, returning any moderation action the user triggered.
     pub fn show(
         &mut self,
@@ -695,9 +717,25 @@ impl UserProfilePopup {
                 // ── Footer ───────────────────────────────────────────────
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 14.0;
+                    let (primary_label, primary_url) = if self
+                        .channel
+                        .as_ref()
+                        .map(|c| c.is_kick())
+                        .unwrap_or(false)
+                    {
+                        (
+                            "View on Kick ↗".to_owned(),
+                            format!("https://kick.com/{}", profile.login),
+                        )
+                    } else {
+                        (
+                            "View on Twitch ↗".to_owned(),
+                            format!("https://twitch.tv/{}", profile.login),
+                        )
+                    };
                     ui.hyperlink_to(
-                        RichText::new("View on Twitch ↗").small().color(t::ACCENT),
-                        format!("https://twitch.tv/{}", profile.login),
+                        RichText::new(primary_label).small().color(t::ACCENT),
+                        primary_url,
                     );
                     let logs_url = format!(
                         "https://logs.ivr.fi/?channel={}&username={}",
@@ -824,6 +862,9 @@ fn fmt_count(n: u64) -> String {
 
 /// Format an ISO 8601 timestamp as "Month YYYY".
 fn fmt_join_date(ts: &str) -> String {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+        return dt.format("%b %-d, %Y").to_string();
+    }
     let parts: Vec<&str> = ts.splitn(3, '-').collect();
     if parts.len() < 2 { return ts.to_owned(); }
     let year  = parts[0];
@@ -895,7 +936,7 @@ fn iso_to_unix_secs(ts: &str) -> Option<u64> {
 
     // Gregorian date → Julian Day Number → Unix days
     let a   = (14 - month) / 12;
-    let yy  = year - a;
+    let yy  = year + 4800 - a;
     let mm  = month + 12 * a - 3;
     let jdn = day + (153 * mm + 2) / 5 + 365 * yy + yy / 4 - yy / 100 + yy / 400 - 32_045;
     let unix_days = jdn - 2_440_588; // JDN of 1970-01-01

@@ -155,7 +155,7 @@ impl<'a> ChannelList<'a> {
 
                                 // Live-status indicator dot (animated pulse when live)
                                 if let Some(live_map) = self.live_channels {
-                                    let login = ch.as_str().to_lowercase();
+                                    let login = ch.display_name().to_lowercase();
                                     if let Some(&is_live) = live_map.get(&login) {
                                         let dot_r = 3.5_f32;
                                         let (dot_rect, _) = ui.allocate_exact_size(
@@ -174,24 +174,36 @@ impl<'a> ChannelList<'a> {
                                     }
                                 }
 
+                                // Platform badge for non-Twitch channels
+                                if ch.is_kick() {
+                                    ui.label(
+                                        RichText::new("K")
+                                            .font(t::small())
+                                            .strong()
+                                            .color(Color32::from_rgb(83, 252, 24)),
+                                    );
+                                }
+
                                 // Channel name label
+                                let display = ch.display_name();
+                                let prefix = if ch.is_kick() { "" } else { "# " };
                                 let name_text = if unread_mentions > 0 {
-                                    RichText::new(format!("# {}", ch.as_str()))
+                                    RichText::new(format!("{prefix}{display}"))
                                         .font(t::body())
                                         .color(t::YELLOW)
                                         .strong()
                                 } else if unread_count > 0 {
-                                    RichText::new(format!("# {}", ch.as_str()))
+                                    RichText::new(format!("{prefix}{display}"))
                                         .font(t::body())
                                         .color(t::TEXT_PRIMARY)
                                         .strong()
                                 } else if is_active {
-                                    RichText::new(format!("# {}", ch.as_str()))
+                                    RichText::new(format!("{prefix}{display}"))
                                         .font(t::body())
                                         .color(t::TEXT_PRIMARY)
                                         .strong()
                                 } else {
-                                    RichText::new(format!("# {}", ch.as_str()))
+                                    RichText::new(format!("{prefix}{display}"))
                                         .font(t::body())
                                         .color(t::TEXT_SECONDARY)
                                 };

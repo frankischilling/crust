@@ -568,12 +568,7 @@ impl<'a> MessageList<'a> {
                                     continue;
                                 }
                             }
-                            ui.add(Label::new(
-                                RichText::new(format!("[{}]", badge.name))
-                                    .color(Color32::from_rgb(100, 100, 100))
-                                    .font(t::small()),
-                            ))
-                            .on_hover_text(&tooltip_label);
+                            render_badge_fallback(ui, &badge.name, &badge.version, &tooltip_label);
                         }
 
                         // Sender name - clickable to open user profile card.
@@ -594,8 +589,9 @@ impl<'a> MessageList<'a> {
                         if name_resp.clicked() {
                             // Clone only when clicked - not every frame.
                             let _ = self.cmd_tx.try_send(
-                                AppCommand::FetchUserProfile {
+                                AppCommand::ShowUserCard {
                                     login: msg.sender.login.clone(),
+                                    channel: self.channel.clone(),
                                 },
                             );
                             let key = Id::new("ml_profile_req").with(self.channel.as_str());
@@ -931,11 +927,8 @@ impl<'a> MessageList<'a> {
                 });
             }
             Span::Badge { name, .. } => {
-                ui.add(Label::new(
-                    RichText::new(format!("[{name}]"))
-                        .color(Color32::GRAY)
-                        .font(t::small()),
-                ));
+                let tooltip = pretty_badge_name(name, "1");
+                render_badge_fallback(ui, name, "1", &tooltip);
             }
         }
     }
@@ -1025,6 +1018,66 @@ fn pretty_badge_name(name: &str, version: &str) -> String {
     label
 }
 
+fn render_badge_fallback(ui: &mut Ui, name: &str, version: &str, tooltip: &str) {
+    let (bg, fg) = badge_chip_colors(name);
+    let chip_text = badge_chip_text(name, version);
+    let response = egui::Frame::new()
+        .fill(bg)
+        .corner_radius(egui::CornerRadius::same(4))
+        .inner_margin(egui::Margin::symmetric(4, 1))
+        .show(ui, |ui| {
+            ui.add(Label::new(
+                RichText::new(chip_text)
+                    .font(t::small())
+                    .color(fg)
+                    .strong(),
+            ));
+        })
+        .response;
+    response.on_hover_text(tooltip.to_owned());
+}
+
+fn badge_chip_text(name: &str, version: &str) -> String {
+    match name {
+        "subscriber" => {
+            if let Ok(months) = version.parse::<u32>() {
+                if months > 1 {
+                    return format!("SUB{months}");
+                }
+            }
+            "SUB".to_owned()
+        }
+        "sub_gifter" => "GIFT".to_owned(),
+        "founder" => "FND".to_owned(),
+        "moderator" => "MOD".to_owned(),
+        "broadcaster" => "LIVE".to_owned(),
+        "vip" => "VIP".to_owned(),
+        "verified" => "VER".to_owned(),
+        "staff" => "STAFF".to_owned(),
+        _ => {
+            let first = name
+                .split(|c: char| c == '-' || c == '_')
+                .find(|part| !part.is_empty())
+                .unwrap_or(name);
+            first.chars().take(5).collect::<String>().to_uppercase()
+        }
+    }
+}
+
+fn badge_chip_colors(name: &str) -> (Color32, Color32) {
+    match name {
+        "subscriber" => (Color32::from_rgb(52, 86, 58), Color32::from_rgb(210, 246, 218)),
+        "sub_gifter" => (Color32::from_rgb(84, 67, 34), Color32::from_rgb(252, 222, 154)),
+        "founder" => (Color32::from_rgb(60, 62, 95), Color32::from_rgb(200, 206, 255)),
+        "moderator" => (Color32::from_rgb(43, 89, 59), Color32::from_rgb(196, 244, 217)),
+        "broadcaster" => (Color32::from_rgb(102, 45, 45), Color32::from_rgb(255, 206, 206)),
+        "vip" => (Color32::from_rgb(112, 57, 98), Color32::from_rgb(255, 206, 242)),
+        "verified" => (Color32::from_rgb(46, 68, 107), Color32::from_rgb(191, 223, 255)),
+        "staff" => (Color32::from_rgb(76, 84, 92), Color32::from_rgb(220, 226, 233)),
+        _ => (Color32::from_rgb(70, 70, 74), Color32::from_rgb(210, 210, 215)),
+    }
+}
+
 /// Map short provider codes to human-readable labels.
 fn provider_label(provider: &str) -> &'static str {
     match provider {
@@ -1032,6 +1085,7 @@ fn provider_label(provider: &str) -> &'static str {
         "ffz" => "FrankerFaceZ",
         "7tv" => "7TV",
         "twitch" => "Twitch",
+        "kick" => "Kick",
         _ => "Emote",
     }
 }

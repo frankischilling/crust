@@ -11,6 +11,7 @@ use crust_core::{
     AppState,
 };
 
+use crate::commands::render_help_message;
 use crate::perf::PerfOverlay;
 use crate::theme as t;
 use crate::widgets::{
@@ -234,12 +235,12 @@ impl CrustApp {
             }
             AppEvent::ChannelJoined { channel } => {
                 self.state.join_channel(channel.clone());
-                // Kick off an immediate stream-status fetch for the new channel.
-                // Stamp now so the periodic refresh knows to wait 60 s before
-                // retrying — but if the fetch silently fails the retry still fires.
-                let login = channel.as_str().to_lowercase();
-                self.stream_status_fetched.insert(login.clone(), std::time::Instant::now());
-                self.send_cmd(AppCommand::FetchUserProfile { login });
+                // Kick off an immediate stream-status fetch for the new channel (Twitch only).
+                if channel.is_twitch() {
+                    let login = channel.display_name().to_lowercase();
+                    self.stream_status_fetched.insert(login.clone(), std::time::Instant::now());
+                    self.send_cmd(AppCommand::FetchUserProfile { login });
+                }
             }
             AppEvent::ChannelParted { channel } => {
                 self.state.leave_channel(&channel);
@@ -390,32 +391,41 @@ impl CrustApp {
                     viewers:  profile.stream_viewers,
                 });
                 self.stream_status_fetched.insert(login, std::time::Instant::now());
-                // Collect this user's recent messages from the channel the
-                // popup was opened for (most-recent first, capped at 200).
-                let ch = self.user_profile_popup.channel.clone();
-                let login_lc = profile.login.to_lowercase();
-                let logs: Vec<_> = ch
-                    .as_ref()
-                    .and_then(|c| self.state.channels.get(c))
-                    .map(|s| {
-                        s.messages
-                            .iter()
-                            .rev()
-                            .filter(|m| {
-                                m.sender.login.to_lowercase() == login_lc
-                                    && matches!(
-                                        m.msg_kind,
-                                        crust_core::model::MsgKind::Chat
-                                            | crust_core::model::MsgKind::Bits { .. }
-                                    )
-                            })
-                            .take(200)
-                            .cloned()
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                self.user_profile_popup.set_logs(logs);
-                self.user_profile_popup.set_profile(profile);
+                // This event is also used for channel live-status refresh.
+                // Only drive the popup when it explicitly requested this login.
+                if self.user_profile_popup.accepts_profile(&profile.login) {
+                    // Collect this user's recent messages from the channel the
+                    // popup was opened for (most-recent first, capped at 200).
+                    let ch = self.user_profile_popup.channel.clone();
+                    let login_lc = profile.login.to_lowercase();
+                    let logs: Vec<_> = ch
+                        .as_ref()
+                        .and_then(|c| self.state.channels.get(c))
+                        .map(|s| {
+                            s.messages
+                                .iter()
+                                .rev()
+                                .filter(|m| {
+                                    m.sender.login.to_lowercase() == login_lc
+                                        && matches!(
+                                            m.msg_kind,
+                                            crust_core::model::MsgKind::Chat
+                                                | crust_core::model::MsgKind::Bits { .. }
+                                        )
+                                })
+                                .take(200)
+                                .cloned()
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    self.user_profile_popup.set_logs(logs);
+                    self.user_profile_popup.set_profile(profile);
+                }
+            }
+            AppEvent::UserProfileUnavailable { login } => {
+                if self.user_profile_popup.accepts_profile(&login) {
+                    self.user_profile_popup.set_unavailable(&login);
+                }
             }
             AppEvent::UserMessagesCleared { channel, login } => {
                 if let Some(ch) = self.state.channels.get_mut(&channel) {
@@ -481,7 +491,7 @@ impl eframe::App for CrustApp {
         // Bump to 33 ms (~30 fps) when live-dot animations or toast slide-ins
         // are active so they look smooth.
         let has_live_channel = self.state.active_channel.as_ref()
-            .and_then(|ch| self.stream_statuses.get(&ch.as_str().to_lowercase()))
+            .and_then(|ch| self.stream_statuses.get(&ch.display_name().to_lowercase()))
             .map(|s| s.is_live)
             .unwrap_or(false);
         let has_live_sidebar = self.stream_statuses.values().any(|s| s.is_live);
@@ -514,7 +524,8 @@ impl eframe::App for CrustApp {
         // Periodic stream-status refresh: re-fetch every 60 s per channel.
         const STREAM_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
         let stale_channels: Vec<String> = self.state.channel_order.iter()
-            .map(|ch| ch.as_str().to_lowercase())
+            .filter(|ch| ch.is_twitch())
+            .map(|ch| ch.display_name().to_lowercase())
             .filter(|login| {
                 self.stream_status_fetched
                     .get(login)
@@ -851,135 +862,155 @@ impl eframe::App for CrustApp {
         // Shows live/offline status, viewer count and stream title for the
         // currently active channel. Hidden when no channel is active.
         if let Some(active_ch) = self.state.active_channel.as_ref() {
-            let login = active_ch.as_str().to_lowercase();
+            let login = active_ch.display_name().to_lowercase();
             let status = self.stream_statuses.get(&login).cloned();
             // Subtle red tint on the bar background when the channel is live.
             let bar_is_live = status.as_ref().map(|s| s.is_live).unwrap_or(false);
             let bar_fill = if bar_is_live { Color32::from_rgb(24, 14, 14) } else { t::BG_SURFACE };
             TopBottomPanel::top("stream_info_bar")
-                .exact_height(22.0)
+                .exact_height(24.0)
                 .frame(
                     Frame::new()
                         .fill(bar_fill)
-                        .inner_margin(egui::Margin::symmetric(10, 2))
+                        .inner_margin(egui::Margin::symmetric(8, 3))
                         .stroke(egui::Stroke::new(1.0, t::BORDER_SUBTLE)),
                 )
                 .show(ctx, |ui| {
+                    let bar_w = ui.available_width();
+                    let compact = bar_w < 640.0;
+                    let ultra_compact = bar_w < 460.0;
+                    let show_viewers = bar_w >= 520.0;
+                    let show_game = bar_w >= 840.0;
+                    let show_title = bar_w >= 600.0;
+
                     // Thin accent stripe on the very left edge when live.
                     if bar_is_live {
                         let br = ui.max_rect();
                         let strip = egui::Rect::from_min_size(br.left_top(), egui::vec2(3.0, br.height()));
                         ui.painter().rect_filled(strip, 0.0, t::RED);
                     }
-                    ui.horizontal_centered(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = if ultra_compact { 4.0 } else { 8.0 };
                         match status {
                             None => {
                                 // Not fetched yet – show the channel name only.
+                                let ch_prefix = if active_ch.is_kick() { "" } else { "#" };
                                 ui.label(
-                                    RichText::new(format!("#{}", active_ch.as_str()))
+                                    RichText::new(format!("{ch_prefix}{}", active_ch.display_name()))
+                                        .strong()
                                         .font(t::small())
-                                        .color(t::TEXT_SECONDARY),
+                                        .color(t::TEXT_PRIMARY),
                                 );
+                                if !ultra_compact {
+                                    ui.label(
+                                        RichText::new("Fetching stream status…")
+                                            .font(t::small())
+                                            .color(t::TEXT_MUTED),
+                                    );
+                                }
                             }
                             Some(s) => {
-                                let t_anim = ui.input(|i| i.time) as f32;
                                 let status_text = if s.is_live { "LIVE" } else { "OFFLINE" };
-                                let label_col = if s.is_live { t::RED } else { t::TEXT_MUTED };
-
-                                // Animated dot: outer glow + inner solid circle when live.
-                                if s.is_live {
-                                    let pulse = (t_anim * 2.5).sin() * 0.5 + 0.5;
-                                    let base_r = 3.5_f32;
-                                    let inner_r = base_r - 0.5 + pulse * 0.8;
-                                    let glow_r  = base_r + 1.5 + pulse * 1.5;
-                                    let alloc   = (glow_r + 1.0) * 2.0;
-                                    let (dot_rect, _) = ui.allocate_exact_size(
-                                        egui::vec2(alloc, alloc),
-                                        egui::Sense::hover(),
-                                    );
-                                    let c = dot_rect.center();
-                                    let glow_a = (28.0 + pulse * 55.0) as u8;
-                                    ui.painter().circle_filled(c, glow_r, Color32::from_rgba_unmultiplied(220, 65, 65, glow_a));
-                                    ui.painter().circle_filled(c, inner_r, t::RED);
+                                let status_col = if s.is_live { t::RED } else { t::TEXT_MUTED };
+                                let status_bg = if s.is_live {
+                                    Color32::from_rgba_unmultiplied(200, 45, 45, 30)
                                 } else {
-                                    let dot_r = 3.5_f32;
-                                    let (dot_rect, _) = ui.allocate_exact_size(
-                                        egui::vec2(dot_r * 2.0, dot_r * 2.0),
-                                        egui::Sense::hover(),
-                                    );
-                                    ui.painter().circle_filled(dot_rect.center(), dot_r, t::TEXT_MUTED);
-                                }
+                                    Color32::from_rgba_unmultiplied(120, 120, 120, 20)
+                                };
 
-                                // Status label
+                                egui::Frame::new()
+                                    .fill(status_bg)
+                                    .stroke(egui::Stroke::new(1.0, status_col.gamma_multiply(0.5)))
+                                    .corner_radius(t::RADIUS_SM)
+                                    .inner_margin(egui::Margin::symmetric(6, 1))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 4.0;
+                                            ui.label(
+                                                RichText::new("●")
+                                                    .font(t::small())
+                                                    .color(status_col),
+                                            );
+                                            if !ultra_compact {
+                                                ui.label(
+                                                    RichText::new(status_text)
+                                                        .font(t::small())
+                                                        .color(status_col)
+                                                        .strong(),
+                                                );
+                                            }
+                                        });
+                                    });
+
+                                let ch_prefix2 = if active_ch.is_kick() { "" } else { "#" };
                                 ui.label(
-                                    RichText::new(status_text)
-                                        .font(t::small())
-                                        .color(label_col)
-                                        .strong(),
-                                );
-
-                                ui.separator();
-
-                                // Channel name
-                                ui.label(
-                                    RichText::new(format!("#{}", active_ch.as_str()))
+                                    RichText::new(format!("{ch_prefix2}{}", active_ch.display_name()))
+                                        .strong()
                                         .font(t::small())
                                         .color(t::TEXT_PRIMARY),
                                 );
 
                                 // Viewer count (live only)
                                 if s.is_live {
-                                    if let Some(viewers) = s.viewers {
-                                        ui.separator();
-                                        ui.label(
-                                            RichText::new(format!("👁 {}", fmt_viewers(viewers)))
-                                                .font(t::small())
-                                                .color(t::TEXT_SECONDARY),
-                                        );
-                                    }
-
-                                    // Game
-                                    if let Some(ref game) = s.game {
-                                        if !game.is_empty() {
-                                            ui.separator();
+                                    if show_viewers {
+                                        if let Some(viewers) = s.viewers {
                                             ui.label(
-                                                RichText::new(game.as_str())
+                                                RichText::new(format!("{} viewers", fmt_viewers(viewers)))
                                                     .font(t::small())
                                                     .color(t::TEXT_SECONDARY),
                                             );
                                         }
                                     }
 
-                                    // Stream title – right side, truncated
+                                    // Game
+                                    if show_game {
+                                        if let Some(ref game) = s.game {
+                                            if !game.is_empty() {
+                                                ui.label(
+                                                    RichText::new(game.as_str())
+                                                        .font(t::small())
+                                                        .color(t::TEXT_SECONDARY),
+                                                );
+                                            }
+                                        }
+                                    }
+
+                                    // Stream title uses any remaining horizontal space.
+                                    if show_title {
+                                        if let Some(ref title) = s.title {
+                                            if !title.is_empty() {
+                                                let rem = ui.available_width();
+                                                if rem > if compact { 140.0 } else { 220.0 } {
+                                                    let resp = ui.add_sized(
+                                                        [rem, 16.0],
+                                                        egui::Label::new(
+                                                            RichText::new(title.as_str())
+                                                                .font(t::small())
+                                                                .color(t::TEXT_MUTED),
+                                                        )
+                                                        .truncate(),
+                                                    );
+                                                    resp.on_hover_text(title.as_str());
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else if !compact {
                                     if let Some(ref title) = s.title {
-                                        if !title.is_empty() {
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    let max_w = ui.available_width();
-                                                    let galley = ui.painter().layout(
-                                                        title.clone(),
-                                                        t::small(),
-                                                        t::TEXT_MUTED,
-                                                        max_w,
-                                                    );
-                                                    let size = galley.size();
-                                                    let (r, _) = ui.allocate_exact_size(
-                                                        egui::vec2(max_w.min(size.x), size.y),
-                                                        egui::Sense::hover(),
-                                                    );
-                                                    let clip = egui::Rect::from_min_size(
-                                                        r.min,
-                                                        egui::vec2(max_w, size.y),
-                                                    );
-                                                    ui.painter().with_clip_rect(clip).galley(
-                                                        r.min,
-                                                        galley,
-                                                        t::TEXT_MUTED,
-                                                    );
-                                                },
-                                            );
+                                        if !title.is_empty() && show_title {
+                                            let rem = ui.available_width();
+                                            if rem > 180.0 {
+                                                let resp = ui.add_sized(
+                                                    [rem, 16.0],
+                                                    egui::Label::new(
+                                                        RichText::new(title.as_str())
+                                                            .font(t::small())
+                                                            .color(t::TEXT_MUTED),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                                resp.on_hover_text(title.as_str());
+                                            }
                                         }
                                     }
                                 }
@@ -1025,12 +1056,13 @@ impl eframe::App for CrustApp {
                                             .unwrap_or((0, 0));
 
                                         // Build tab label with optional badge.
+                                        let tab_name = ch.display_name();
                                         let label = if mentions > 0 {
-                                            format!("{} ●{}", ch.as_str(), mentions)
+                                            format!("{tab_name} ●{mentions}")
                                         } else if unread > 0 {
-                                            format!("{} {}", ch.as_str(), unread)
+                                            format!("{tab_name} {unread}")
                                         } else {
-                                            ch.as_str().to_owned()
+                                            tab_name.to_owned()
                                         };
 
                                         let (fg, bg) = if is_active {
@@ -1204,7 +1236,7 @@ impl eframe::App for CrustApp {
                                     .get(&active_ch).map(|c| c.is_mod).unwrap_or(false);
                                 // Broadcaster has full mod powers in their own channel.
                                 let is_broadcaster = self.state.auth.username.as_deref()
-                                    .map(|u| u.eq_ignore_ascii_case(active_ch.as_str()))
+                                    .map(|u| u.eq_ignore_ascii_case(active_ch.display_name()))
                                     .unwrap_or(false);
                                 let can_moderate = is_mod || is_broadcaster;
                                 let chatters_count = self.state.channels
@@ -1250,7 +1282,7 @@ impl eframe::App for CrustApp {
                     // Messages above the input
                     if let Some(state) = self.state.channels.get(&active_ch) {
                         let is_broadcaster = self.state.auth.username.as_deref()
-                            .map(|u| u.eq_ignore_ascii_case(active_ch.as_str()))
+                            .map(|u| u.eq_ignore_ascii_case(active_ch.display_name()))
                             .unwrap_or(false);
                         let is_mod = state.is_mod || is_broadcaster;
                         let ml_result = MessageList::new(
@@ -1453,20 +1485,7 @@ fn parse_slash_command(
     match cmd_lower.as_str() {
         // Purely local commands
         "help" => {
-            let msg = "\
-Crust built-in commands\n\
-  /help               show this message\n\
-  /clearmessages      clear chat view (local only)\n\
-  /chatters           show connected chatter count\n\
-  /fakemsg <text>     inject a local-only message\n\
-  /openurl <url>      open a URL in the system browser\n\
-  /popout [channel]   open Twitch popout chat in browser\n\
-  /user <user>        open twitch.tv/<user> in browser\n\
-  /usercard <user>    open in-app user profile\n\
-  /streamlink [ch]    open stream in streamlink\n\
-  /banid <id>         ban a user by Twitch user ID\n\
-  /w <user> <msg>     send a Twitch whisper\n\
-Any other /command is forwarded directly to Twitch.".to_owned();
+            let msg = render_help_message();
             Some(AppCommand::InjectLocalMessage { channel: channel.clone(), text: msg })
         }
 
@@ -1491,17 +1510,25 @@ Any other /command is forwarded directly to Twitch.".to_owned();
             Some(AppCommand::OpenUrl { url: rest.to_owned() })
         }
 
-        // /popout [channel]  - opens Twitch's popout chat in the browser.
+        // /popout [channel]  - opens popout chat in the browser.
         "popout" => {
-            let target = if rest.is_empty() { channel.as_str() } else { rest };
-            let url = format!("https://www.twitch.tv/popout/{target}/chat?popout=");
+            let target = if rest.is_empty() { channel.display_name() } else { rest };
+            let url = if channel.is_kick() {
+                format!("https://kick.com/{target}/chatroom")
+            } else {
+                format!("https://www.twitch.tv/popout/{target}/chat?popout=")
+            };
             Some(AppCommand::OpenUrl { url })
         }
 
-        // /user <user> [channel]  - open twitch.tv/<user> in browser.
+        // /user <user> [channel]  - open user profile in browser.
         "user" => {
-            let login = rest.split_whitespace().next().unwrap_or(channel.as_str());
-            let url = format!("https://twitch.tv/{login}");
+            let login = rest.split_whitespace().next().unwrap_or(channel.display_name());
+            let url = if channel.is_kick() {
+                format!("https://kick.com/{login}")
+            } else {
+                format!("https://twitch.tv/{login}")
+            };
             Some(AppCommand::OpenUrl { url })
         }
 
