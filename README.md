@@ -80,6 +80,48 @@ Release build:
 cargo run -p crust --release
 ```
 
+### Performance testing
+
+Lightweight performance tests are available as ignored test cases (so they
+don't run in normal `cargo test`):
+
+```bash
+cargo test -p crust-core --release perf_ -- --ignored --nocapture
+cargo test -p crust-twitch --release perf_ -- --ignored --nocapture
+```
+
+These print simple throughput metrics (ops/sec) for tokenization/highlighting
+and Twitch IRC parsing hot paths.
+
+Replay soak test (ignored by default):
+
+```bash
+CRUST_SOAK_RATE=200 CRUST_SOAK_SECS=900 \
+  cargo test -p crust-twitch --release replay_soak_ -- --ignored --nocapture
+```
+
+PowerShell:
+
+```powershell
+$env:CRUST_SOAK_RATE=200
+$env:CRUST_SOAK_SECS=900
+cargo test -p crust-twitch --release replay_soak_ -- --ignored --nocapture
+```
+
+Soak-test performance indicators (printed at the end of the run):
+
+- `ratio` should stay close to `1.000` (consumer keeping up with producer)
+- `parse_errors` should be `0`
+- `final_backlog` should return to `0` (or near-zero)
+- `max_backlog` should stay small and stable (no unbounded growth)
+- `max_frame_work_ms` should remain low; lower values indicate better per-frame headroom
+
+Example healthy output:
+
+```text
+[soak] done: produced=179999, consumed=179999, ratio=1.000, parse_errors=0, max_backlog=9, final_backlog=0, peak_frame_processed=9, max_frame_work_ms=1.529
+```
+
 ### Windows (native)
 
 You can build and run `crust` directly on Windows with Cargo.

@@ -37,6 +37,10 @@ impl IrcTags {
 /// - `\r` → carriage-return
 /// - Any other `\X` → `X` (passthrough)
 fn unescape_tag_value(s: &str) -> String {
+    if !s.as_bytes().contains(&b'\\') {
+        return s.to_owned();
+    }
+
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
