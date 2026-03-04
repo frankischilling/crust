@@ -84,11 +84,18 @@ pub enum AppCommand {
     SetDefaultAccount { username: String },
     /// Set the IRC nickname used for generic IRC servers.
     SetIrcNick { nick: String },
+    /// Set NickServ credentials for automatic IRC identification.
+    SetIrcAuth {
+        nickserv_user: String,
+        nickserv_pass: String,
+    },
     /// Persist beta transport feature toggles.
     SetBetaFeatures {
         kick_enabled: bool,
         irc_enabled: bool,
     },
+    /// Toggle always-on-top window mode.
+    SetAlwaysOnTop { enabled: bool },
 }
 
 // Events (runtime to UI): notifications sent from runtime to UI
@@ -103,6 +110,12 @@ pub enum AppEvent {
     },
     ChannelParted {
         channel: ChannelId,
+    },
+    /// An IRC channel redirect occurred (e.g. #chat → ##chat on Libera).
+    /// The UI should replace the old channel tab with the new one.
+    ChannelRedirected {
+        old_channel: ChannelId,
+        new_channel: ChannelId,
     },
     MessageReceived {
         channel: ChannelId,
@@ -186,6 +199,11 @@ pub enum AppEvent {
         /// Username of the account that auto-logs in on startup, if set.
         default: Option<String>,
     },
+    /// The topic for an IRC channel was set or changed.
+    IrcTopicChanged {
+        channel: ChannelId,
+        topic: String,
+    },
     /// Channel emote catalog loaded (including 0 when none exist).
     ChannelEmotesLoaded {
         channel: ChannelId,
@@ -195,11 +213,26 @@ pub enum AppEvent {
     BetaFeaturesUpdated {
         kick_enabled: bool,
         irc_enabled: bool,
+        /// NickServ username for IRC auto-identification.
+        irc_nickserv_user: String,
+        /// NickServ password for IRC auto-identification.
+        irc_nickserv_pass: String,
+        /// Whether always-on-top is enabled.
+        always_on_top: bool,
     },
     /// A batch of image prefetch tasks has been queued.  The loading screen
     /// uses this to track progress vs `EmoteImageReady` completions.
     ImagePrefetchQueued {
         count: usize,
+    },
+    /// Twitch ROOMSTATE tags updated - room modes for a channel.
+    RoomStateUpdated {
+        channel: ChannelId,
+        emote_only: Option<bool>,
+        followers_only: Option<i32>,
+        slow: Option<u32>,
+        subs_only: Option<bool>,
+        r9k: Option<bool>,
     },
 }
 

@@ -59,6 +59,15 @@ pub struct AppSettings {
     /// Enable generic IRC support (beta).
     #[serde(default)]
     pub enable_irc_beta: bool,
+    /// NickServ username for automatic identification on IRC servers.
+    #[serde(default)]
+    pub irc_nickserv_user: String,
+    /// NickServ password for automatic identification on IRC servers.
+    #[serde(default)]
+    pub irc_nickserv_pass: String,
+    /// Keep the window always on top of other windows.
+    #[serde(default)]
+    pub always_on_top: bool,
 }
 
 fn default_theme() -> String {
@@ -87,6 +96,9 @@ impl Default for AppSettings {
             irc_nick: String::new(),
             enable_kick_beta: false,
             enable_irc_beta: false,
+            irc_nickserv_user: String::new(),
+            irc_nickserv_pass: String::new(),
+            always_on_top: false,
         }
     }
 }

@@ -14,6 +14,8 @@ A native Twitch + Kick + IRC chat client written in Rust.
 
 ![Multi-channel tabs](img/demo5.png)
 
+![Windows built binary](img/demo6.png)
+
 ## Current status
 
 Active early-stage project. The app builds and runs, and core chat workflows are in place. APIs and internals may still change.
@@ -60,7 +62,8 @@ Active early-stage project. The app builds and runs, and core chat workflows are
 
 - Rust stable toolchain (edition 2021)
 - Cargo
-- Linux desktop dependencies for `eframe`/`winit` (X11 or Wayland)
+- Linux desktop dependencies for `eframe`/`winit` (X11 or Wayland), or
+- Windows C++ build tools (MSVC toolchain)
 
 ## Build and run
 
@@ -76,6 +79,32 @@ Release build:
 ```bash
 cargo run -p crust --release
 ```
+
+### Windows (native)
+
+You can build and run `crust` directly on Windows with Cargo.
+
+Install prerequisites with Chocolatey (PowerShell **as Administrator**):
+
+```powershell
+choco install -y rustup.install visualstudio2022buildtools visualstudio2022-workload-vctools git
+rustup default stable-x86_64-pc-windows-msvc
+```
+
+Then build/run from the repo root:
+
+```powershell
+cargo check
+cargo run -p crust
+```
+
+Release:
+
+```powershell
+cargo run -p crust --release
+```
+
+If you hit linker errors like `LNK1318` (PDB/file-system limits), free disk space and retry (or run `cargo clean` first).
 
 ### Running on WSL
 

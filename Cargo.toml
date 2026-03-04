@@ -65,3 +65,10 @@ chrono = { version = "0.4", features = ["serde"] }
 keyring = "3"
 url = "2"
 async-trait = "0.1"
+
+[profile.dev]
+# Keep dev builds lean on low-disk Windows setups:
+# - `debug = 0` avoids large PDB generation (`LNK1318` on full drives)
+# - `incremental = false` avoids sizable incremental cache directories
+debug = 0
+incremental = false

@@ -311,14 +311,17 @@ impl<'a> ChannelList<'a> {
                                             let close = ui.add_visible(
                                                 show_close,
                                                 egui::Label::new(
-                                                    RichText::new("x")
+                                                    RichText::new("✕")
                                                         .font(t::small())
-                                                        .color(t::TEXT_MUTED),
+                                                        .color(if is_hovered { t::TEXT_SECONDARY } else { t::TEXT_MUTED }),
                                                 )
                                                 .sense(egui::Sense::click()),
                                             );
                                             if close.clicked() {
                                                 result.closed = Some(ch.clone());
+                                            }
+                                            if close.hovered() {
+                                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                             }
                                         }
                                     },

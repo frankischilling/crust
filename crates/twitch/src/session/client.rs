@@ -35,10 +35,16 @@ pub enum TwitchEvent {
         channel: ChannelId,
         server_id: String,
     },
-    /// ROOMSTATE received — carries the Twitch numeric user-id for the channel.
+    /// ROOMSTATE received - carries the Twitch numeric user-id for the channel
+    /// plus room mode settings (emote-only, slow, subs-only, etc.).
     RoomState {
         channel: ChannelId,
         room_id: String,
+        emote_only: Option<bool>,
+        followers_only: Option<i32>,
+        slow: Option<u32>,
+        subs_only: Option<bool>,
+        r9k: Option<bool>,
     },
     /// Authenticated: the server confirmed our identity.
     Authenticated {
@@ -62,7 +68,7 @@ pub enum TwitchEvent {
     ChatCleared {
         channel: ChannelId,
     },
-    /// USERSTATE received — badges, color and mod status for the logged-in user.
+    /// USERSTATE received - badges, color and mod status for the logged-in user.
     UserStateUpdated {
         channel: ChannelId,
         is_mod: bool,
@@ -110,7 +116,7 @@ pub enum SessionCommand {
 
 // TwitchSession: manages Twitch IRC session (anonymous and authenticated modes)
 
-/// Twitch IRC session — supports both anonymous (justinfan) and authenticated modes.
+/// Twitch IRC session - supports both anonymous (justinfan) and authenticated modes.
 pub struct TwitchSession {
     channels: HashSet<ChannelId>,
     event_tx: mpsc::Sender<TwitchEvent>,
@@ -177,7 +183,7 @@ impl TwitchSession {
             match self.connect_once().await {
                 Ok(should_reconnect) => {
                     // If Twitch explicitly rejected our credentials via NOTICE,
-                    // stop retrying — the token is definitively invalid.
+                    // stop retrying - the token is definitively invalid.
                     if self.auth_failed {
                         let msg = "Authentication failed: Twitch rejected the token. \
                                    Please re-login with a valid token.";
@@ -200,7 +206,7 @@ impl TwitchSession {
                         self.voluntary_reconnect = false;
                         attempt = 0;
                         quick_fail_streak = 0;
-                        info!("Voluntary reconnect — backoff reset, reconnecting immediately");
+                        info!("Voluntary reconnect - backoff reset, reconnecting immediately");
                         continue;
                     }
                     warn!("Session ended unexpectedly, will reconnect");
@@ -226,7 +232,7 @@ impl TwitchSession {
 
                         if is_transient {
                             // Connection was reset before any data was exchanged (< 3s)
-                            // — could be auth rejection, rate limit, or flaky network.
+                            // - could be auth rejection, rate limit, or flaky network.
                             if elapsed < Duration::from_secs(3) {
                                 quick_fail_streak += 1;
                             } else {
@@ -237,7 +243,7 @@ impl TwitchSession {
                             // so the user knows something persistent is wrong.
                             if quick_fail_streak >= 4 {
                                 let msg = format!(
-                                    "Connection keeps failing — check your token or network. ({})",
+                                    "Connection keeps failing - check your token or network. ({})",
                                     e
                                 );
                                 warn!("{msg}");
@@ -502,13 +508,23 @@ impl TwitchSession {
                 }
             }
             "ROOMSTATE" => {
-                // Extract room-id from tags and emit dedicated event
+                // Extract room-id and room mode tags, then emit dedicated event.
                 if let Some(room_id) = msg.tags.get("room-id") {
                     if let Some(ch_raw) = msg.params.first() {
                         let ch = ChannelId::new(ch_raw.as_str());
+                        let emote_only = msg.tags.get("emote-only").map(|v| v == "1");
+                        let followers_only = msg.tags.get("followers-only").and_then(|v| v.parse::<i32>().ok());
+                        let slow = msg.tags.get("slow").and_then(|v| v.parse::<u32>().ok());
+                        let subs_only = msg.tags.get("subs-only").map(|v| v == "1");
+                        let r9k = msg.tags.get("r9k").map(|v| v == "1");
                         self.emit(TwitchEvent::RoomState {
                             channel: ch,
                             room_id: room_id.to_owned(),
+                            emote_only,
+                            followers_only,
+                            slow,
+                            subs_only,
+                            r9k,
                         })
                         .await;
                     }

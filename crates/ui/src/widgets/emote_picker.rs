@@ -15,19 +15,21 @@ const ROW_H: f32 = CELL_SIZE + 4.0;
 /// Fallback image fetches per frame (safety net if prefetch hasn't finished).
 const FETCH_BATCH: usize = 12;
 
-/// Provider tabs.
-const TABS: &[(&str, &str)] = &[("7tv", "7TV"), ("bttv", "BTTV"), ("ffz", "FFZ")];
+/// Provider tabs - Twitch first since this is a Twitch-first client.
+const TABS: &[(&str, &str)] = &[("twitch", "Twitch"), ("7tv", "7TV"), ("bttv", "BTTV"), ("ffz", "FFZ")];
 
 /// Cached per-tab data.
 struct CachedTab {
     indices: Vec<usize>, // indices into catalog
 }
 
-/// Cached filtered/grouped view.
+    /// Cached filtered/grouped view.
 struct CachedView {
     filter: String,
     catalog_len: usize,
     tabs: Vec<CachedTab>, // one per TABS entry
+    /// Merged indices from all provider tabs (for the "All" meta-tab).
+    all_indices: Vec<usize>,
 }
 
 /// Floating emote picker window with provider tabs.
@@ -104,10 +106,15 @@ impl EmotePicker {
             .map(|indices| CachedTab { indices })
             .collect();
 
+        // Build merged "All" index - union of every tab, sorted by code.
+        let mut all_indices: Vec<usize> = tabs.iter().flat_map(|t| t.indices.iter().copied()).collect();
+        all_indices.sort_by(|&a, &b| catalog[a].code.to_lowercase().cmp(&catalog[b].code.to_lowercase()));
+
         self.cache = Some(CachedView {
             filter: self.filter.clone(),
             catalog_len: catalog.len(),
             tabs,
+            all_indices,
         });
     }
 
@@ -151,6 +158,16 @@ impl EmotePicker {
                 // Tab bar
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
+
+                    // "All" meta-tab - shows every emote regardless of provider.
+                    let total_count: usize = view.tabs.iter().map(|t| t.indices.len()).sum();
+                    let all_active = self.active_tab.is_none();
+                    let all_text = format!("All ({total_count})");
+                    let all_resp = ui.selectable_label(all_active, RichText::new(all_text).small());
+                    if all_resp.clicked() {
+                        self.active_tab = None;
+                    }
+
                     for (ti, &(_, label)) in TABS.iter().enumerate() {
                         let count = view.tabs[ti].indices.len();
                         let is_active = self.active_tab == Some(ti);
@@ -158,29 +175,20 @@ impl EmotePicker {
 
                         let resp = ui.selectable_label(is_active, RichText::new(text).small());
                         if resp.clicked() {
-                            self.active_tab = if is_active { None } else { Some(ti) };
+                            self.active_tab = Some(ti);
                         }
                     }
                 });
                 ui.separator();
 
-                // Content
-                let tab_data = match self.active_tab {
-                    Some(ti) => &view.tabs[ti],
-                    None => {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(40.0);
-                            ui.label(
-                                RichText::new("Select a tab above")
-                                    .color(Color32::from_rgb(120, 120, 130))
-                                    .italics(),
-                            );
-                        });
-                        return;
-                    }
+                // Content - use the merged "All" list when no provider tab is selected.
+                let all_view = self.cache.as_ref().unwrap();
+                let tab_indices: &[usize] = match self.active_tab {
+                    Some(ti) => &all_view.tabs[ti].indices,
+                    None => &all_view.all_indices,
                 };
 
-                if tab_data.indices.is_empty() {
+                if tab_indices.is_empty() {
                     ui.vertical_centered(|ui| {
                         ui.add_space(40.0);
                         ui.label(
@@ -195,7 +203,7 @@ impl EmotePicker {
                 let available_w = ui.available_width();
                 let available_h = ui.available_height();
                 let cols = ((available_w / CELL_SIZE) as usize).max(1);
-                let num_rows = (tab_data.indices.len() + cols - 1) / cols;
+                let num_rows = (tab_indices.len() + cols - 1) / cols;
                 let mut fetches_this_frame = 0usize;
                 let pointer_pos = ui.input(|i| i.pointer.hover_pos());
 
@@ -226,10 +234,10 @@ impl EmotePicker {
 
                         for row in first_row..last_row {
                             let start = row * cols;
-                            let end = (start + cols).min(tab_data.indices.len());
+                            let end = (start + cols).min(tab_indices.len());
 
                             for slot in start..end {
-                                let cat_idx = tab_data.indices[slot];
+                                let cat_idx = tab_indices[slot];
                                 let entry = &catalog[cat_idx];
                                 let col = slot - start;
 

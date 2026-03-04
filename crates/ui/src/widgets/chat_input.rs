@@ -139,7 +139,9 @@ impl<'a> ChatInput<'a> {
 
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing = t::TOOLBAR_SPACING;
-                    // Username label
+                    let input_width = ui.available_width();
+                    // Username label - hide at narrow widths
+                    if input_width > 300.0 {
                     if let Some(name) = self.username {
                         ui.label(
                             RichText::new(format!("{name}:"))
@@ -147,6 +149,7 @@ impl<'a> ChatInput<'a> {
                                 .strong()
                                 .font(t::small()),
                         );
+                    }
                     }
 
                     // Pre-check autocompletes before TextEdit consumes keys.
@@ -175,8 +178,17 @@ impl<'a> ChatInput<'a> {
                         }
                     });
 
-                    // Text input - reserve space for emote button + Send button + 2 gaps
-                    let reserve = t::BAR_H + 58.0 + t::TOOLBAR_SPACING.x * 2.0;
+                    // Text input - reserve space for emote button + Send button + gaps
+                    // At narrow widths, hide Send button and emote picker to maximise input
+                    let show_send_btn = input_width > 250.0;
+                    let show_emote_btn = input_width > 200.0;
+                    let reserve = if show_send_btn && show_emote_btn {
+                        t::BAR_H + 58.0 + t::TOOLBAR_SPACING.x * 2.0
+                    } else if show_emote_btn {
+                        t::BAR_H + t::TOOLBAR_SPACING.x
+                    } else {
+                        0.0
+                    };
                     let text_width = (ui.available_width() - reserve).max(40.0);
                     let resp = ui.add_sized(
                         [text_width, t::BAR_H],
@@ -389,11 +401,21 @@ impl<'a> ChatInput<'a> {
 
                     ui.ctx().data_mut(|d| d.insert_temp(ac_id, ac_sel));
 
+                    const TWITCH_MAX_CHARS: usize = 500;
+                    let is_twitch_channel = !self.channel.is_irc() && !self.channel.is_kick();
+                    let twitch_char_count = if is_twitch_channel {
+                        buf.chars().count()
+                    } else {
+                        0
+                    };
+                    let twitch_over_limit =
+                        is_twitch_channel && twitch_char_count > TWITCH_MAX_CHARS;
+
                     // ── Send on Enter (only fires when we did NOT consume it) ──
                     let enter_pressed =
                         resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
 
-                    if enter_pressed && !buf.trim().is_empty() {
+                    if enter_pressed && !buf.trim().is_empty() && !twitch_over_limit {
                         result.send = Some(buf.trim().to_owned());
                         buf.clear();
                         // Reset history navigation on send
@@ -406,7 +428,8 @@ impl<'a> ChatInput<'a> {
                         resp.request_focus();
                     }
 
-                    // Emote picker button
+                    // Emote picker button - hidden at very narrow widths
+                    if show_emote_btn {
                     if ui
                         .add_sized(
                             [t::BAR_H, t::BAR_H],
@@ -417,18 +440,41 @@ impl<'a> ChatInput<'a> {
                     {
                         result.toggle_emote_picker = true;
                     }
+                    }
 
-                    // Send button
-                    if ui
-                        .add_sized(
-                            [58.0, t::BAR_H],
-                            egui::Button::new(RichText::new("Send").font(t::small())),
-                        )
-                        .clicked()
-                        && !buf.trim().is_empty()
-                    {
+                    // Send button - hidden at very narrow widths
+                    if show_send_btn {
+                    let send_btn = ui.add_enabled(
+                        !twitch_over_limit,
+                        egui::Button::new(RichText::new("Send").font(t::small()))
+                            .min_size(egui::vec2(58.0, t::BAR_H)),
+                    );
+                    let send_btn = if twitch_over_limit && is_twitch_channel {
+                        send_btn.on_hover_text("Twitch messages are limited to 500 characters")
+                    } else {
+                        send_btn
+                    };
+                    if send_btn.clicked() && !buf.trim().is_empty() {
                         result.send = Some(buf.trim().to_owned());
                         buf.clear();
+                    }
+                    }
+
+                    // Character count - Twitch has a 500-char limit.
+                    // Show only for Twitch channels when the user has typed something.
+                    if !buf.is_empty() && is_twitch_channel {
+                        let color = if twitch_char_count > TWITCH_MAX_CHARS {
+                            t::RED
+                        } else if twitch_char_count > 400 {
+                            t::YELLOW
+                        } else {
+                            t::TEXT_MUTED
+                        };
+                        ui.label(
+                            RichText::new(format!("{twitch_char_count}/{TWITCH_MAX_CHARS}"))
+                                .font(t::tiny())
+                                .color(color),
+                        );
                     }
 
                     // ── Draw autocomplete popup above input ──────────

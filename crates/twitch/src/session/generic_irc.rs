@@ -27,7 +27,18 @@ pub enum GenericIrcEvent {
     Reconnecting { server: String, attempt: u32 },
     ChatMessage(ChatMessage),
     SystemNotice(SystemNotice),
+    /// An IRC server redirected us from one channel to another (e.g. 470).
+    ChannelRedirected {
+        server_key: (String, u16, bool),
+        old_channel: String,
+        new_channel: String,
+    },
     Error { server: String, message: String },
+    /// The channel topic was set or changed (TOPIC command or RPL_TOPIC 332).
+    TopicChanged {
+        channel: ChannelId,
+        topic: String,
+    },
 }
 
 #[derive(Debug)]
@@ -39,6 +50,11 @@ pub enum GenericIrcSessionCommand {
     LeaveChannel(ChannelId),
     SendMessage(ChannelId, String),
     SetNick(String),
+    /// Set NickServ credentials for auto-identification after connect.
+    SetNickServAuth {
+        nickserv_user: String,
+        nickserv_pass: String,
+    },
     Disconnect,
 }
 
@@ -100,6 +116,9 @@ pub struct GenericIrcSession {
     event_tx: mpsc::Sender<GenericIrcEvent>,
     cmd_rx: mpsc::Receiver<GenericIrcSessionCommand>,
     preferred_nick: String,
+    /// NickServ credentials for auto-identification after connect.
+    nickserv_user: String,
+    nickserv_pass: String,
 }
 
 impl GenericIrcSession {
@@ -111,6 +130,8 @@ impl GenericIrcSession {
             event_tx,
             cmd_rx,
             preferred_nick: random_guest_nick(),
+            nickserv_user: String::new(),
+            nickserv_pass: String::new(),
         }
     }
 
@@ -173,6 +194,8 @@ impl GenericIrcSession {
                         self.event_tx.clone(),
                         server_cmd_rx,
                         self.preferred_nick.clone(),
+                        self.nickserv_user.clone(),
+                        self.nickserv_pass.clone(),
                     );
                     tokio::spawn(worker.run());
 
@@ -245,6 +268,13 @@ impl GenericIrcSession {
                             .await;
                     }
                 }
+                GenericIrcSessionCommand::SetNickServAuth {
+                    nickserv_user,
+                    nickserv_pass,
+                } => {
+                    self.nickserv_user = nickserv_user;
+                    self.nickserv_pass = nickserv_pass;
+                }
                 GenericIrcSessionCommand::Disconnect => {
                     for (_, handle) in servers.drain() {
                         let _ = handle.cmd_tx.send(ServerCommand::Shutdown).await;
@@ -265,6 +295,10 @@ struct ServerWorker {
     pass: Option<String>,
     user: Option<String>,
     realname: Option<String>,
+    /// NickServ username for auto-identification after 001.
+    nickserv_user: String,
+    /// NickServ password for auto-identification after 001.
+    nickserv_pass: String,
 }
 
 enum WorkerExit {
@@ -279,6 +313,8 @@ impl ServerWorker {
         event_tx: mpsc::Sender<GenericIrcEvent>,
         cmd_rx: mpsc::Receiver<ServerCommand>,
         preferred_nick: String,
+        nickserv_user: String,
+        nickserv_pass: String,
     ) -> Self {
         let nick = normalize_irc_nick(&preferred_nick).unwrap_or_else(random_guest_nick);
         Self {
@@ -290,6 +326,8 @@ impl ServerWorker {
             pass: None,
             user: None,
             realname: None,
+            nickserv_user,
+            nickserv_pass,
         }
     }
 
@@ -462,6 +500,23 @@ impl ServerWorker {
                             self.emit(GenericIrcEvent::Connected {
                                 server: self.key.label(),
                             }).await;
+
+                            // Auto-identify with NickServ if credentials are configured.
+                            if !self.nickserv_user.is_empty() && !self.nickserv_pass.is_empty() {
+                                let identify_cmd = format!(
+                                    "PRIVMSG NickServ :IDENTIFY {} {}",
+                                    self.nickserv_user, self.nickserv_pass
+                                );
+                                let _ = write_irc_line(&mut write_half, &identify_cmd).await;
+                                info!("Sent NickServ IDENTIFY for {}", self.nickserv_user);
+                                // Also change nick to the identified account name.
+                                if let Some(valid) = normalize_irc_nick(&self.nickserv_user) {
+                                    self.nick = valid.clone();
+                                    let _ = write_irc_line(&mut write_half, &format!("NICK {valid}")).await;
+                                    info!("Auto nick-change to {valid} after NickServ IDENTIFY");
+                                }
+                            }
+
                             continue;
                         }
 
@@ -471,11 +526,68 @@ impl ServerWorker {
                             continue;
                         }
 
+                        // IRC 470: channel redirect (e.g. #chat → ##chat on Libera).
+                        // Format: :server 470 nick #oldchan ##newchan :Forwarding to another channel
+                        if msg.command == "470" {
+                            if msg.params.len() >= 3 {
+                                // params[0] = our nick, params[1] = old channel, params[2] = new channel
+                                let old_raw = msg.params[1].trim();
+                                let new_raw = msg.params[2].trim();
+                                if let (Some(old_ch), Some(new_ch)) = (
+                                    normalize_irc_channel_name(old_raw),
+                                    normalize_irc_channel_name(new_raw),
+                                ) {
+                                    info!(
+                                        "IRC channel redirect on {}: #{} → #{}",
+                                        self.key.label(), old_ch, new_ch,
+                                    );
+                                    // Update internal channel map: move the join key from old→new
+                                    let key = self.channels.remove(&old_ch);
+                                    self.channels.insert(new_ch.clone(), key.flatten());
+
+                                    self.emit(GenericIrcEvent::ChannelRedirected {
+                                        server_key: (
+                                            self.key.host.clone(),
+                                            self.key.port,
+                                            self.key.tls,
+                                        ),
+                                        old_channel: old_ch,
+                                        new_channel: new_ch,
+                                    })
+                                    .await;
+                                }
+                            }
+                            // Still let it fall through to parse_irc_system_notice so
+                            // the user sees the notice text in chat.
+                        }
+
                         if msg.command == "PRIVMSG" {
                             if let Some(chat) = parse_irc_privmsg(&msg, &self.key, &self.nick) {
                                 self.emit(GenericIrcEvent::ChatMessage(chat)).await;
                             }
                             continue;
+                        }
+
+                        // Emit a structured TopicChanged for TOPIC and RPL_TOPIC (332).
+                        if msg.command == "TOPIC" {
+                            if let Some(topic) = msg.trailing() {
+                                if let Some(ch) = msg.params.first().and_then(|p| normalize_irc_target_channel(p)) {
+                                    self.emit(GenericIrcEvent::TopicChanged {
+                                        channel: ChannelId::irc(&self.key.host, self.key.port, self.key.tls, ch),
+                                        topic: topic.to_owned(),
+                                    }).await;
+                                }
+                            }
+                        } else if msg.command == "332" {
+                            // RPL_TOPIC: params = [nick, #channel], trailing = topic
+                            if let Some(topic) = msg.trailing() {
+                                if let Some(ch) = msg.params.iter().find_map(|p| normalize_irc_target_channel(p)) {
+                                    self.emit(GenericIrcEvent::TopicChanged {
+                                        channel: ChannelId::irc(&self.key.host, self.key.port, self.key.tls, ch),
+                                        topic: topic.to_owned(),
+                                    }).await;
+                                }
+                            }
                         }
 
                         if let Some(notice) =
@@ -583,7 +695,7 @@ impl ServerWorker {
                     let _ = write_irc_line(writer, rest_raw).await;
                 }
             }
-            "msg" => {
+            "msg" | "privmsg" => {
                 let mut parts = rest_raw.splitn(2, char::is_whitespace);
                 let Some(target) = parts.next().map(str::trim).filter(|s| !s.is_empty()) else {
                     self.emit_command_notice(source_channel, "Usage: /msg <target> <message>")
@@ -601,6 +713,27 @@ impl ServerWorker {
                 };
                 let target = normalize_irc_msg_target(target);
                 let _ = write_irc_line(writer, &format!("PRIVMSG {target} :{body}")).await;
+
+                // When sending IDENTIFY to NickServ with an explicit account
+                // name, automatically attempt to change nick to that account
+                // so the user doesn't have to send a separate /nick command.
+                if target.eq_ignore_ascii_case("nickserv") {
+                    let words: Vec<&str> = body.split_whitespace().collect();
+                    if words
+                        .first()
+                        .map(|s| s.eq_ignore_ascii_case("identify"))
+                        .unwrap_or(false)
+                        && words.len() >= 3
+                    {
+                        // IDENTIFY <account> <password>
+                        if let Some(valid) = normalize_irc_nick(words[1]) {
+                            self.nick = valid.clone();
+                            let _ =
+                                write_irc_line(writer, &format!("NICK {valid}")).await;
+                            info!("Auto nick-change to {valid} after NickServ IDENTIFY");
+                        }
+                    }
+                }
             }
             "notice" => {
                 let mut parts = rest_raw.splitn(2, char::is_whitespace);
@@ -924,7 +1057,7 @@ fn parse_irc_system_notice(
             let joined = msg
                 .params
                 .first()
-                .map(|c| c.trim_start_matches('#'))
+                .map(|c| c.trim().strip_prefix('#').unwrap_or(c.trim()))
                 .unwrap_or(channel_name.as_str());
             format!("{nick} joined #{joined}")
         }
@@ -933,7 +1066,7 @@ fn parse_irc_system_notice(
             let left = msg
                 .params
                 .first()
-                .map(|c| c.trim_start_matches('#'))
+                .map(|c| c.trim().strip_prefix('#').unwrap_or(c.trim()))
                 .unwrap_or(channel_name.as_str());
             if let Some(reason) = msg.trailing().filter(|s| !s.is_empty()) {
                 format!("{nick} left #{left} ({reason})")
@@ -985,7 +1118,7 @@ fn parse_irc_system_notice(
         }
         "KICK" => {
             if msg.params.len() >= 2 {
-                let chan = msg.params[0].trim_start_matches('#');
+                let chan = msg.params[0].trim().strip_prefix('#').unwrap_or(msg.params[0].trim());
                 let target = &msg.params[1];
                 let by = msg.nick().unwrap_or("someone");
                 if let Some(reason) = msg.trailing().filter(|s| !s.is_empty()) {
@@ -1095,7 +1228,7 @@ fn format_numeric_notice_text(msg: &IrcMessage, code: &str) -> Option<String> {
         }
         _ => {
             if !middle.is_empty() && !trailing.is_empty() {
-                Some(format!("[{code}] {middle} — {trailing}"))
+                Some(format!("[{code}] {middle} - {trailing}"))
             } else if !trailing.is_empty() {
                 Some(format!("[{code}] {trailing}"))
             } else if !middle.is_empty() {
@@ -1187,7 +1320,14 @@ fn parse_irc_privmsg(msg: &IrcMessage, key: &ServerKey, my_nick: &str) -> Option
 }
 
 fn normalize_irc_channel_name(raw: &str) -> Option<String> {
-    let name = raw.trim().trim_start_matches('#').to_ascii_lowercase();
+    // Strip exactly one leading '#' - this preserves ##channels (e.g.
+    // ##chat on Libera.Chat is stored internally as #chat and
+    // reconstructed as ##chat when building IRC protocol lines).
+    let trimmed = raw.trim();
+    let name = trimmed
+        .strip_prefix('#')
+        .unwrap_or(trimmed)
+        .to_ascii_lowercase();
     if name.is_empty() {
         return None;
     }

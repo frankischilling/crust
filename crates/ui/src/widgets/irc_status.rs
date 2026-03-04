@@ -1463,7 +1463,7 @@ fn extract_irc_feature_value(body: &str, key: &str) -> Option<String> {
 }
 
 fn split_middle_and_trailing(body: &str) -> (&str, Option<&str>) {
-    if let Some((m, t)) = body.split_once("—") {
+    if let Some((m, t)) = body.split_once("-") {
         return (m.trim(), Some(t.trim()));
     }
     (body.trim(), None)

@@ -101,9 +101,13 @@ impl<'a> MessageList<'a> {
         // Keyed by MessageId (u64). Persisted in egui temp storage so that
         // off-screen rows are not re-measured every frame.  Shared between
         // the simple and virtual paths so the transition is seamless.
+        //
+        // PERF: use remove_temp (ownership via mem::take) instead of get_temp
+        // (which clones the entire HashMap every frame).  The cache is put
+        // back via insert_temp at the end of each path.
         let hc_id = egui::Id::new("msg_row_h").with(self.channel.as_str());
         let mut height_cache: std::collections::HashMap<u64, f32> =
-            ui.ctx().data_mut(|d| d.get_temp(hc_id).unwrap_or_default());
+            ui.ctx().data_mut(|d| d.remove_temp(hc_id).unwrap_or_default());
 
         // Fallback height for rows we have never rendered before.
         const EST_H: f32 = 26.0;
@@ -199,7 +203,13 @@ impl<'a> MessageList<'a> {
         }
 
         // Build prefix-sum array.  prefix[i] = y-offset of the top of message i.
-        let mut prefix = Vec::with_capacity(n + 1);
+        // PERF: reuse the previous Vec allocation via remove_temp (ownership
+        // transfer) so we don't hit the allocator every frame.
+        let ps_id = egui::Id::new("msg_prefix_sum").with(self.channel.as_str());
+        let mut prefix: Vec<f32> =
+            ui.ctx().data_mut(|d| d.remove_temp(ps_id).unwrap_or_default());
+        prefix.clear();
+        prefix.reserve(n + 1);
         prefix.push(0.0f32);
         for msg in self.messages.iter() {
             let h = height_cache.get(&msg.id.0).copied().unwrap_or(EST_H);
@@ -287,8 +297,11 @@ impl<'a> MessageList<'a> {
             }
         });
 
-        // Persist height cache for next frame.
-        ui.ctx().data_mut(|d| d.insert_temp(hc_id, height_cache));
+        // Persist height cache and prefix-sum Vec for next frame.
+        ui.ctx().data_mut(|d| {
+            d.insert_temp(hc_id, height_cache);
+            d.insert_temp(ps_id, prefix);
+        });
 
         self.apply_snap(ui, &output);
         self.show_resume_button(ui, &output, panel_rect);
@@ -372,7 +385,9 @@ impl<'a> MessageList<'a> {
             let painter = ui.ctx().layer_painter(fg_layer);
 
             // Button background
-            painter.rect_filled(btn_rect, 8.0, Color32::from_rgb(88, 55, 175));
+            painter.rect_filled(btn_rect, 8.0, t::ACCENT_DIM);
+            // Subtle border for definition
+            painter.rect_stroke(btn_rect, 8.0, egui::Stroke::new(1.0, t::ACCENT), egui::epaint::StrokeKind::Outside);
             // Button label
             painter.text(
                 btn_rect.center(),
@@ -419,9 +434,9 @@ impl<'a> MessageList<'a> {
 
         // ── Message background ──────────────────────────────────────────
         let bg = if msg.flags.is_highlighted {
-            Color32::from_rgba_unmultiplied(145, 70, 255, 20)
+            Color32::from_rgba_unmultiplied(145, 70, 255, 22)
         } else if msg.flags.is_mention {
-            Color32::from_rgba_unmultiplied(210, 140, 40, 22)
+            Color32::from_rgba_unmultiplied(210, 140, 40, 24)
         } else if msg.flags.is_deleted {
             Color32::from_rgba_unmultiplied(180, 30, 30, 12)
         } else if matches!(msg.msg_kind, MsgKind::Bits { .. }) {
@@ -450,23 +465,31 @@ impl<'a> MessageList<'a> {
                 // when the user actually opens the menu (not every frame).
                 ui.interact(ui.max_rect(), ctx_id, egui::Sense::click())
                     .context_menu(|ui| {
-                        if let Some(ref id) = msg.server_id {
-                            if !msg.flags.is_deleted {
-                                if ui.button("↩  Reply").clicked() {
-                                    let info = ReplyInfo {
-                                        parent_msg_id: id.clone(),
-                                        parent_user_login: msg.sender.login.clone(),
-                                        parent_display_name: msg.sender.display_name.clone(),
-                                        parent_msg_body: msg.raw_text.clone(),
-                                    };
-                                    ui.ctx().data_mut(|d| d.insert_temp(reply_key, info));
-                                    ui.close_menu();
-                                }
-                                ui.separator();
+                        // Reply - works for any non-deleted message (Twitch uses
+                        // server_id, IRC uses a local fallback).
+                        if !msg.flags.is_deleted {
+                            let reply_id = msg
+                                .server_id
+                                .clone()
+                                .unwrap_or_else(|| msg.id.0.to_string());
+                            if ui.button("↩  Reply").clicked() {
+                                let info = ReplyInfo {
+                                    parent_msg_id: reply_id,
+                                    parent_user_login: msg.sender.login.clone(),
+                                    parent_display_name: msg.sender.display_name.clone(),
+                                    parent_msg_body: msg.raw_text.clone(),
+                                };
+                                ui.ctx().data_mut(|d| d.insert_temp(reply_key, info));
+                                ui.close_menu();
                             }
                         }
+                        ui.separator();
                         if ui.button("📋  Copy message").clicked() {
                             ui.ctx().copy_text(msg.raw_text.clone());
+                            ui.close_menu();
+                        }
+                        if ui.button("👤  Copy username").clicked() {
+                            ui.ctx().copy_text(msg.sender.login.clone());
                             ui.close_menu();
                         }
                     });
@@ -546,14 +569,14 @@ impl<'a> MessageList<'a> {
                             .to_string();
                         ui.add(Label::new(
                             RichText::new(ts)
-                                .color(Color32::from_rgb(90, 90, 90))
+                                .color(t::TIMESTAMP)
                                 .font(t::small()),
                         ));
 
                         // Separator dot between timestamp and badges/name
                         ui.add(Label::new(
                             RichText::new("·")
-                                .color(Color32::from_rgb(70, 70, 70))
+                                .color(t::SEPARATOR)
                                 .font(t::small()),
                         ));
 
@@ -600,7 +623,9 @@ impl<'a> MessageList<'a> {
                                 Label::new(RichText::new(name).color(name_color).strong())
                                     .sense(egui::Sense::click()),
                             )
-                            .on_hover_text(format!("@{}", msg.sender.login));
+                            .on_hover_ui(|ui| {
+                                ui.label(format!("@{}", msg.sender.login));
+                            });
                         if name_resp.clicked() {
                             // Clone only when clicked - not every frame.
                             let _ = self.cmd_tx.try_send(AppCommand::ShowUserCard {
@@ -622,7 +647,7 @@ impl<'a> MessageList<'a> {
                         // Colon separator after name (not shown for /me actions)
                         if !msg.flags.is_action {
                             ui.add(Label::new(
-                                RichText::new(":").color(Color32::from_rgb(100, 100, 100)),
+                                RichText::new(":").color(t::SEPARATOR),
                             ));
                         }
 
@@ -635,7 +660,7 @@ impl<'a> MessageList<'a> {
                                     RichText::new(format!("✂ {}", msg.raw_text))
                                         .strikethrough()
                                         .italics()
-                                        .color(Color32::from_rgb(90, 90, 90)),
+                                        .color(t::TEXT_MUTED),
                                 )
                                 .wrap(),
                             );
@@ -648,7 +673,7 @@ impl<'a> MessageList<'a> {
                 );
             });
 
-        // Left accent strip for mentions and highlights — a vivid 3 px bar on
+        // Left accent strip for mentions and highlights - a vivid 3 px bar on
         // the left edge of the row so the eye finds them instantly in fast chat.
         if msg.flags.is_mention || msg.flags.is_highlighted {
             let r = msg_frame.response.rect;
@@ -681,13 +706,13 @@ impl<'a> MessageList<'a> {
                 } else {
                     format!("⭐  {display_name} resubscribed with {plan}! ({months} months)")
                 };
-                (Color32::from_rgb(255, 215, 0), Some(text))
+                (t::GOLD, Some(text))
             }
             MsgKind::Raid {
                 display_name,
                 viewer_count,
             } => (
-                Color32::from_rgb(100, 200, 255),
+                t::RAID_CYAN,
                 Some(format!(
                     "🎉  {display_name} is raiding with {viewer_count} viewers!"
                 )),
@@ -748,7 +773,7 @@ impl<'a> MessageList<'a> {
                     let ts = msg.timestamp.format("%H:%M").to_string();
                     ui.add(Label::new(
                         RichText::new(ts)
-                            .color(Color32::from_rgb(90, 90, 90))
+                            .color(t::TIMESTAMP)
                             .font(t::small()),
                     ));
 
@@ -767,10 +792,14 @@ impl<'a> MessageList<'a> {
         let action_color = Color32::from_rgb(180, 180, 210);
         match span {
             Span::Text { text, .. } => {
+                let cleaned = strip_invisible_chars(text);
+                if cleaned.is_empty() {
+                    return;
+                }
                 let rt = if is_action {
-                    RichText::new(text).italics().color(action_color)
+                    RichText::new(&cleaned).italics().color(action_color)
                 } else {
-                    RichText::new(text)
+                    RichText::new(&cleaned)
                 };
                 ui.add(Label::new(rt).wrap());
             }
@@ -870,7 +899,7 @@ impl<'a> MessageList<'a> {
             Span::Mention { login } => {
                 ui.add(Label::new(
                     RichText::new(format!("@{login}"))
-                        .color(Color32::from_rgb(100, 200, 255))
+                        .color(t::MENTION)
                         .strong(),
                 ));
             }
@@ -883,7 +912,7 @@ impl<'a> MessageList<'a> {
                 let resp = ui.add(
                     Label::new(
                         RichText::new(text)
-                            .color(Color32::from_rgb(100, 180, 255))
+                            .color(t::LINK)
                             .underline(),
                     )
                     .sense(egui::Sense::click()),
@@ -907,7 +936,7 @@ impl<'a> MessageList<'a> {
                                 ui.label(
                                     RichText::new(host)
                                         .small()
-                                        .color(Color32::from_rgb(100, 180, 255)),
+                                        .color(t::LINK),
                                 );
                                 ui.label(
                                     RichText::new("Loading preview…")
@@ -963,7 +992,7 @@ impl<'a> MessageList<'a> {
                                 ui.label(
                                     RichText::new(host)
                                         .small()
-                                        .color(Color32::from_rgb(100, 180, 255)),
+                                        .color(t::LINK),
                                 );
                             }
                         }
@@ -986,6 +1015,94 @@ impl<'a> MessageList<'a> {
     }
 }
 
+/// Strip invisible / zero-width Unicode characters that render as squares.
+/// Preserves normal whitespace (space, newline) but removes combining marks
+/// that appear without a preceding base character, zero-width joiners/non-
+/// joiners, direction overrides, and other control characters that most fonts
+/// cannot render.
+fn strip_invisible_chars(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_is_base = false; // was the previous kept char a base character?
+    for c in s.chars() {
+        // Keep ASCII printable + common whitespace verbatim.
+        if c == ' ' || c == '\n' || c == '\t' {
+            prev_is_base = false;
+            out.push(c);
+            continue;
+        }
+        // Drop C0/C1 control characters (except the whitespace above).
+        if c.is_control() {
+            continue;
+        }
+        let cp = c as u32;
+        // Zero-width and invisible formatting characters - always drop.
+        if matches!(
+            cp,
+            0x00AD             // Soft Hyphen
+            | 0x034F           // Combining Grapheme Joiner
+            | 0x061C           // Arabic Letter Mark
+            | 0x180E           // Mongolian Vowel Separator
+            | 0x200B           // Zero Width Space
+            | 0x200C           // Zero Width Non-Joiner
+            | 0x200D           // Zero Width Joiner (outside emoji context)
+            | 0x200E           // LTR Mark
+            | 0x200F           // RTL Mark
+            | 0x2028           // Line Separator
+            | 0x2029           // Paragraph Separator
+            | 0x202A..=0x202E  // LTR/RTL embedding/override/pop
+            | 0x2060           // Word Joiner
+            | 0x2061..=0x2064  // Invisible operators
+            | 0x2066..=0x2069  // Isolate formatting
+            | 0x206A..=0x206F  // Deprecated formatting
+            | 0x2800           // Braille Pattern Blank
+            | 0x3164           // Hangul Filler
+            | 0xFE00..=0xFE0F  // Variation Selectors
+            | 0xFEFF           // BOM / Zero Width No-Break Space
+            | 0xFFA0           // Halfwidth Hangul Filler
+            | 0xFFF9..=0xFFFB  // Interlinear annotations
+            | 0xE0000..=0xE007F // Tags block
+            | 0xE0100..=0xE01EF // Variation Selectors Supplement
+        ) {
+            continue;
+        }
+        // Combining marks: keep them only when they follow a base character,
+        // otherwise they render as standalone squares / dotted circles.
+        let is_combining = matches!(
+            cp,
+            0x0300..=0x036F    // Combining Diacritical Marks
+            | 0x0483..=0x0489  // Combining Cyrillic
+            | 0x0591..=0x05BD  // Hebrew accents
+            | 0x05BF | 0x05C1..=0x05C2 | 0x05C4..=0x05C5 | 0x05C7
+            | 0x0610..=0x061A  // Arabic combining
+            | 0x064B..=0x065F  // Arabic combining marks
+            | 0x0670           // Arabic superscript alef
+            | 0x06D6..=0x06DC  // Arabic small marks
+            | 0x06DF..=0x06E4
+            | 0x06E7..=0x06E8
+            | 0x06EA..=0x06ED
+            | 0x0730..=0x074A  // Syriac combining
+            | 0x0E31 | 0x0E34..=0x0E3A | 0x0E47..=0x0E4E  // Thai
+            | 0x0EB1 | 0x0EB4..=0x0EBC | 0x0EC8..=0x0ECE  // Lao
+            | 0x1AB0..=0x1AFF  // Combining Diacritical Marks Extended
+            | 0x1DC0..=0x1DFF  // Combining Diacritical Marks Supplement
+            | 0x20D0..=0x20FF  // Combining Marks for Symbols
+            | 0xFE20..=0xFE2F  // Combining Half Marks
+        );
+        if is_combining {
+            if prev_is_base {
+                out.push(c);
+            }
+            // Whether kept or dropped, the next char still has a base before it
+            // (we don't reset prev_is_base so stacked diacritics work).
+            continue;
+        }
+        // Everything else is a visible base character - keep it.
+        prev_is_base = true;
+        out.push(c);
+    }
+    out
+}
+
 /// Scale image dimensions to a target height, preserving aspect ratio.
 fn fit_size(w: u32, h: u32, target_h: f32) -> Vec2 {
     if h == 0 {
@@ -1000,19 +1117,23 @@ fn sender_color(color: &Option<String>) -> Color32 {
         .as_deref()
         .and_then(parse_hex_color)
         .map(|(r, g, b)| {
-            // Brighten dark colors for readability on dark backgrounds
-            let lum = (r as u32 + g as u32 + b as u32) / 3;
-            if lum < 60 {
+            // Ensure readability on dark backgrounds using HSL lightness.
+            // Convert to perceived luminance and boost if too dim.
+            let lum = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+            if lum < 70.0 {
+                // Proportionally brighten to preserve hue rather than washing out.
+                let factor = 70.0 / lum.max(1.0);
+                let factor = factor.min(2.5); // cap to avoid pure-white blow-out
                 Color32::from_rgb(
-                    (r as u16 + 80).min(255) as u8,
-                    (g as u16 + 80).min(255) as u8,
-                    (b as u16 + 80).min(255) as u8,
+                    (r as f32 * factor).min(255.0) as u8,
+                    (g as f32 * factor).min(255.0) as u8,
+                    (b as f32 * factor).min(255.0) as u8,
                 )
             } else {
                 Color32::from_rgb(r, g, b)
             }
         })
-        .unwrap_or(Color32::from_rgb(150, 150, 200))
+        .unwrap_or(t::ACCENT)
 }
 
 fn parse_hex_color(s: &str) -> Option<(u8, u8, u8)> {
@@ -1217,13 +1338,13 @@ fn url_hostname(url: &str) -> String {
 /// Returns `None` for ordinary messages.
 fn notification_label(flags: &MessageFlags, kind: &MsgKind) -> Option<(&'static str, Color32)> {
     if flags.is_highlighted {
-        Some(("Highlighted Message", Color32::from_rgb(145, 70, 255)))
+        Some(("Highlighted Message", t::TWITCH_PURPLE))
     } else if flags.is_mention {
         Some(("Mention", Color32::from_rgb(210, 140, 40)))
     } else if matches!(kind, MsgKind::Bits { .. }) {
-        Some(("Bits Cheer", Color32::from_rgb(255, 175, 30)))
+        Some(("Bits Cheer", t::BITS_ORANGE))
     } else if flags.is_first_msg {
-        Some(("First Message", Color32::from_rgb(60, 160, 100)))
+        Some(("First Message", t::GREEN))
     } else if flags.custom_reward_id.is_some() {
         Some(("Channel Points Reward", Color32::from_rgb(100, 65, 165)))
     } else {

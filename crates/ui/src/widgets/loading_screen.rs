@@ -12,8 +12,15 @@ use crate::theme as t;
 const DONE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Minimum fraction of prefetched images that must arrive before declaring
-/// done (allows for a small number of failed fetches without hanging forever).
+/// done - kept for reference but no longer used to gate the loading screen.
+/// Images now prefetch in the background after the overlay is dismissed.
+#[allow(dead_code)]
 const IMAGES_DONE_PCT: f32 = 0.95;
+
+/// After entering the `Loading` phase, wait at least this long before allowing
+/// `check_done` to succeed.  This gives channel-join events time to arrive so
+/// we don't dismiss the loading screen before any channel data has loaded.
+const MIN_LOADING_GRACE: Duration = Duration::from_secs(2);
 
 /// How long to keep the overlay visible after "ready" before fading out.
 const FADE_DURATION: Duration = Duration::from_millis(700);
@@ -67,6 +74,8 @@ pub struct LoadingScreen {
     started_at: Instant,
     phase: Phase,
     ready_at: Option<Instant>,
+    /// Wall-clock instant when we entered the `Loading` phase (for grace period).
+    loading_entered_at: Option<Instant>,
     /// True when startup proceeds in anonymous mode (no GLOBALUSERSTATE).
     auth_optional: bool,
 
@@ -96,6 +105,7 @@ impl Default for LoadingScreen {
             started_at: Instant::now(),
             phase: Phase::Connecting,
             ready_at: None,
+            loading_entered_at: None,
             auth_optional: false,
             authenticated_user: None,
             channels_joined: Vec::new(),
@@ -122,18 +132,25 @@ impl LoadingScreen {
 
         match evt {
             LoadEvent::Connecting => {
-                self.phase = Phase::Connecting;
+                // Only regress the phase if we haven't advanced past Connecting.
+                if matches!(self.phase, Phase::Connecting) {
+                    self.phase = Phase::Connecting;
+                }
                 self.push_log("Connecting to Twitch…", t::TEXT_SECONDARY);
             }
             LoadEvent::Connected => {
-                self.phase = Phase::Authenticating;
-                self.push_log("Connected — authenticating…", t::GREEN);
+                // Don't regress from Loading if an optimistic Authenticated
+                // event already advanced us.
+                if matches!(self.phase, Phase::Connecting | Phase::Authenticating) {
+                    self.phase = Phase::Authenticating;
+                }
+                self.push_log("Connected - authenticating…", t::GREEN);
             }
             LoadEvent::Authenticated { username } => {
                 self.push_log(format!("Authenticated as {username}"), t::GREEN);
                 self.authenticated_user = Some(username);
                 self.auth_optional = false;
-                self.phase = Phase::Loading;
+                self.enter_loading();
             }
             LoadEvent::ChannelJoined { channel } => {
                 self.maybe_enter_anonymous_loading();
@@ -141,10 +158,11 @@ impl LoadingScreen {
                 if !self.channels_joined.contains(&channel) {
                     self.channels_joined.push(channel);
                 }
+                self.check_done();
             }
             LoadEvent::CatalogLoaded { count } => {
                 self.maybe_enter_anonymous_loading();
-                self.push_log(format!("Global emotes ready — {count} emotes"), t::ACCENT);
+                self.push_log(format!("Global emotes ready - {count} emotes"), t::ACCENT);
                 self.catalog_count = count;
                 self.catalog_loaded = true;
                 self.check_done();
@@ -167,7 +185,7 @@ impl LoadingScreen {
             LoadEvent::ImagePrefetchQueued { count } => {
                 self.maybe_enter_anonymous_loading();
                 self.images_expected += count;
-                // Don't log — too noisy.
+                // Don't log - too noisy.
             }
             LoadEvent::ChannelEmotesLoaded { channel, count } => {
                 self.maybe_enter_anonymous_loading();
@@ -188,11 +206,15 @@ impl LoadingScreen {
 
     /// Call every frame; advances the timeout-based done detection.
     pub fn tick(&mut self) {
-        if matches!(self.phase, Phase::Authenticating | Phase::Loading)
+        if matches!(self.phase, Phase::Connecting | Phase::Authenticating | Phase::Loading)
             && self.started_at.elapsed() >= DONE_TIMEOUT
         {
             self.mark_ready();
         }
+        // Re-run the normal done check every frame so that the grace period
+        // expiry is caught even when no new events arrive (e.g. the user has
+        // no auto-joined channels and CatalogLoaded fired during the grace window).
+        self.check_done();
     }
 
     /// Returns `true` while the overlay should be rendered (including fade-out).
@@ -252,7 +274,7 @@ impl LoadingScreen {
                     ),
                 );
 
-                let card_w = (rect.width() - 36.0).clamp(300.0, 760.0);
+                let card_w = (rect.width() - 36.0).clamp(200.0, 760.0);
                 egui::Area::new(egui::Id::new("loading_center_card"))
                     .order(egui::Order::Foreground)
                     .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
@@ -283,48 +305,51 @@ impl LoadingScreen {
 
                                 ui.add_space(10.0);
 
-                                let (spin_rect, _) = ui.allocate_exact_size(
-                                    Vec2::new(64.0, 64.0),
-                                    egui::Sense::hover(),
-                                );
-                                let center = spin_rect.center();
-                                let spin_painter = ui.painter();
-                                if self.phase != Phase::Ready {
-                                    let t_val = ui.input(|i| i.time) as f32;
-                                    let radius = 20.0_f32;
-                                    let segments = 12usize;
-                                    for i in 0..segments {
-                                        let angle =
-                                            (i as f32 / segments as f32) * std::f32::consts::TAU;
-                                        let spin = (t_val * 1.8).rem_euclid(1.0);
-                                        let dot_age =
-                                            ((i as f32 / segments as f32) - spin).rem_euclid(1.0);
-                                        let dot_alpha = ((1.0 - dot_age) * alpha * 220.0) as u8;
-                                        let p = Pos2::new(
-                                            center.x + radius * angle.cos(),
-                                            center.y + radius * angle.sin(),
-                                        );
-                                        spin_painter.circle_filled(
-                                            p,
-                                            2.7,
-                                            Color32::from_rgba_unmultiplied(
-                                                t::ACCENT.r(),
-                                                t::ACCENT.g(),
-                                                t::ACCENT.b(),
-                                                dot_alpha,
-                                            ),
+                                ui.vertical_centered(|ui| {
+                                    let (spin_rect, _) = ui.allocate_exact_size(
+                                        Vec2::new(64.0, 64.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    let center = spin_rect.center();
+                                    let spin_painter = ui.painter();
+                                    if self.phase != Phase::Ready {
+                                        let t_val = ui.input(|i| i.time) as f32;
+                                        let radius = 20.0_f32;
+                                        let segments = 12usize;
+                                        for i in 0..segments {
+                                            let angle = (i as f32 / segments as f32)
+                                                * std::f32::consts::TAU;
+                                            let spin = (t_val * 1.8).rem_euclid(1.0);
+                                            let dot_age = ((i as f32 / segments as f32) - spin)
+                                                .rem_euclid(1.0);
+                                            let dot_alpha =
+                                                ((1.0 - dot_age) * alpha * 220.0) as u8;
+                                            let p = Pos2::new(
+                                                center.x + radius * angle.cos(),
+                                                center.y + radius * angle.sin(),
+                                            );
+                                            spin_painter.circle_filled(
+                                                p,
+                                                2.7,
+                                                Color32::from_rgba_unmultiplied(
+                                                    t::ACCENT.r(),
+                                                    t::ACCENT.g(),
+                                                    t::ACCENT.b(),
+                                                    dot_alpha,
+                                                ),
+                                            );
+                                        }
+                                        ctx.request_repaint_after(Duration::from_millis(16));
+                                    } else {
+                                        spin_painter.text(
+                                            center,
+                                            Align2::CENTER_CENTER,
+                                            "✓",
+                                            FontId::proportional(28.0),
+                                            a(t::GREEN),
                                         );
                                     }
-                                    ctx.request_repaint_after(Duration::from_millis(16));
-                                } else {
-                                    spin_painter.text(
-                                        center,
-                                        Align2::CENTER_CENTER,
-                                        "✓",
-                                        FontId::proportional(28.0),
-                                        a(t::GREEN),
-                                    );
-                                }
+                                });
 
                                 let stage = match self.phase {
                                     Phase::Connecting => ("Connecting to Twitch…", t::YELLOW),
@@ -342,15 +367,10 @@ impl LoadingScreen {
                                 });
 
                                 ui.add_space(10.0);
-                                let details_w = (card_w - 32.0).clamp(280.0, 560.0);
+                                let details_w = (card_w - 32.0).clamp(160.0, 560.0);
                                 ui.vertical_centered(|ui| {
-                                    ui.allocate_ui_with_layout(
-                                        Vec2::new(details_w, 0.0),
-                                        egui::Layout::top_down(egui::Align::Center),
-                                        |ui| {
-                                            // Keep all lower content locked to a single centered column.
-                                            ui.set_min_width(details_w);
-                                            ui.set_max_width(details_w);
+                                    ui.set_min_width(details_w);
+                                    ui.set_max_width(details_w);
                                             let mut pills: Vec<(String, Color32)> = Vec::new();
                                             let conn_pill = match self.phase {
                                                 Phase::Connecting => {
@@ -416,8 +436,38 @@ impl LoadingScreen {
                                                 ));
                                             }
 
+                                            // Measure total pill width so we can center them.
+                                            let pill_font = FontId::proportional(11.0);
+                                            let pill_h_pad = 16.0_f32; // Margin::symmetric(8,3) → 8+8
+                                            let pill_extra = 6.0_f32;  // frame border overhead
+                                            let pill_spacing = 6.0_f32;
+                                            let mut total_pills_w = 0.0_f32;
+                                            for (text, _) in &pills {
+                                                let tw = ui.fonts(|f| {
+                                                    f.layout_no_wrap(
+                                                        text.clone(),
+                                                        pill_font.clone(),
+                                                        Color32::WHITE,
+                                                    )
+                                                    .rect
+                                                    .width()
+                                                });
+                                                total_pills_w += tw + pill_h_pad + pill_extra;
+                                            }
+                                            if pills.len() > 1 {
+                                                total_pills_w +=
+                                                    (pills.len() - 1) as f32 * pill_spacing;
+                                            }
+                                            let pill_avail = ui.available_width();
+                                            let pill_pad =
+                                                ((pill_avail - total_pills_w) / 2.0).max(0.0);
+
                                             ui.horizontal_wrapped(|ui| {
-                                                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                                                ui.spacing_mut().item_spacing =
+                                                    Vec2::new(pill_spacing, pill_spacing);
+                                                if pill_pad > 1.0 {
+                                                    ui.add_space(pill_pad);
+                                                }
                                                 for (text, color) in pills {
                                                     egui::Frame::new()
                                                         .fill(Color32::from_rgba_unmultiplied(
@@ -429,12 +479,19 @@ impl LoadingScreen {
                                                         .corner_radius(egui::CornerRadius::same(9))
                                                         .inner_margin(egui::Margin::symmetric(8, 3))
                                                         .show(ui, |ui| {
-                                                            ui.label(
-                                                                egui::RichText::new(text)
-                                                                    .font(FontId::proportional(
-                                                                        11.0,
-                                                                    ))
-                                                                    .color(a(color)),
+                                                            ui.add(
+                                                                egui::Label::new(
+                                                                    egui::RichText::new(text)
+                                                                        .font(
+                                                                            FontId::proportional(
+                                                                                11.0,
+                                                                            ),
+                                                                        )
+                                                                        .color(a(color)),
+                                                                )
+                                                                .wrap_mode(
+                                                                    egui::TextWrapMode::Extend,
+                                                                ),
                                                             );
                                                         });
                                                 }
@@ -445,10 +502,11 @@ impl LoadingScreen {
                                                     / self.images_expected as f32)
                                                     .clamp(0.0, 1.0);
                                                 ui.add_space(8.0);
+                                                let bar_w = ui.available_width().min(details_w);
                                                 ui.add(
                                                     egui::widgets::ProgressBar::new(prog)
                                                         .fill(a(t::ACCENT))
-                                                        .desired_width(details_w)
+                                                        .desired_width(bar_w)
                                                         .text(format!(
                                                             "Image prefetch: {} / {}",
                                                             self.images_loaded,
@@ -458,29 +516,28 @@ impl LoadingScreen {
                                             }
 
                                             ui.add_space(10.0);
-                                            ui.horizontal_centered(|ui| {
-                                                ui.allocate_ui(Vec2::new(details_w, 0.0), |ui| {
-                                                    ui.set_min_width(details_w);
-                                                    ui.set_max_width(details_w);
-                                                    egui::Frame::new()
-                                                        .fill(a(t::BG_BASE))
-                                                        .stroke(egui::Stroke::new(
-                                                            1.0,
-                                                            a(t::BORDER_SUBTLE),
-                                                        ))
-                                                        .corner_radius(t::RADIUS_SM)
-                                                        .inner_margin(egui::Margin::symmetric(8, 7))
-                                                        .show(ui, |ui| {
-                                                            let inner_w = (details_w - 18.0).max(0.0);
-                                                            ui.set_min_width(inner_w);
-                                                            ui.set_max_width(inner_w);
-                                                            ui.set_min_height(
-                                                                LOADING_LOG_ROWS as f32
-                                                                    * LOADING_LOG_ROW_HEIGHT,
-                                                            );
+                                            ui.vertical_centered(|ui| {
+                                                ui.set_min_width(details_w);
+                                                ui.set_max_width(details_w);
+                                                egui::Frame::new()
+                                                    .fill(a(t::BG_BASE))
+                                                    .stroke(egui::Stroke::new(
+                                                        1.0,
+                                                        a(t::BORDER_SUBTLE),
+                                                    ))
+                                                    .corner_radius(t::RADIUS_SM)
+                                                    .inner_margin(egui::Margin::symmetric(8, 7))
+                                                    .show(ui, |ui| {
+                                                        let inner_w = (details_w - 18.0).max(0.0);
+                                                        ui.set_min_width(inner_w);
+                                                        ui.set_max_width(inner_w);
+                                                        ui.set_min_height(
+                                                            LOADING_LOG_ROWS as f32
+                                                                * LOADING_LOG_ROW_HEIGHT,
+                                                        );
 
                                                             // Use explicit vertical layout so log lines stack properly
-                                                            // (parent horizontal_centered would otherwise put them on one line)
+                                                            // (parent vertical_centered would otherwise misalign them)
                                                             ui.with_layout(
                                                                 egui::Layout::top_down(
                                                                     egui::Align::Min,
@@ -532,10 +589,7 @@ impl LoadingScreen {
                                                                 },
                                                             );
                                                         });
-                                                });
                                             });
-                                        },
-                                    );
                                 });
                             });
                     });
@@ -544,11 +598,21 @@ impl LoadingScreen {
 
     // private
 
-    fn maybe_enter_anonymous_loading(&mut self) {
-        if self.phase == Phase::Authenticating && self.authenticated_user.is_none() {
-            self.auth_optional = true;
+    /// Transition to the Loading phase, recording when we entered it.
+    fn enter_loading(&mut self) {
+        if matches!(self.phase, Phase::Connecting | Phase::Authenticating) {
             self.phase = Phase::Loading;
+            self.loading_entered_at = Some(Instant::now());
+        }
+    }
+
+    fn maybe_enter_anonymous_loading(&mut self) {
+        if matches!(self.phase, Phase::Connecting | Phase::Authenticating)
+            && self.authenticated_user.is_none()
+        {
+            self.auth_optional = true;
             self.push_log("Connected anonymously", t::TEXT_MUTED);
+            self.enter_loading();
         }
     }
 
@@ -566,6 +630,13 @@ impl LoadingScreen {
         if self.phase != Phase::Loading {
             return;
         }
+        // Don't declare done too quickly - give channel-join events time to
+        // arrive so we don't dismiss before any channel data is loaded.
+        if let Some(entered) = self.loading_entered_at {
+            if entered.elapsed() < MIN_LOADING_GRACE {
+                return;
+            }
+        }
         let auth_ok = self.authenticated_user.is_some() || self.auth_optional;
         let catalog_ok = self.catalog_loaded;
         // Non-Twitch channels don't currently emit full history/emote-load
@@ -581,11 +652,9 @@ impl LoadingScreen {
         let emotes_ok = startup_channels
             .iter()
             .all(|ch| self.channels_with_emotes.contains(*ch));
-        // Wait for the bulk of prefetched images to arrive so the first paint
-        // after the loading screen shows real emotes/badges, not blank boxes.
-        let images_ok = self.images_expected == 0
-            || (self.images_loaded as f32 / self.images_expected as f32) >= IMAGES_DONE_PCT;
-        if auth_ok && catalog_ok && history_ok && emotes_ok && images_ok {
+        // Images are prefetched in the background - don't block the loading
+        // screen on them.  They'll fill in shortly after the overlay fades.
+        if auth_ok && catalog_ok && history_ok && emotes_ok {
             self.push_log(
                 format!(
                     "Ready! ({}/{} images)",

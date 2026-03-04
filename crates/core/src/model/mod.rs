@@ -55,9 +55,14 @@ impl ChannelId {
     }
 
     /// Create an IRC channel target.
+    ///
+    /// The `channel` parameter should be the internal form: wire name with
+    /// the **first** `#` already stripped.  For example `##chat` on the wire
+    /// is stored as `#chat` internally and reconstructed as `##chat` when
+    /// building IRC commands by prefixing `#`.
     pub fn irc(host: impl Into<String>, port: u16, tls: bool, channel: impl Into<String>) -> Self {
         let host = host.into().trim().to_lowercase();
-        let channel = channel.into().trim().trim_start_matches('#').to_lowercase();
+        let channel = channel.into().trim().to_lowercase();
         let tls_flag = if tls { "1" } else { "0" };
         Self(format!("irc:{tls_flag}:{host}:{port}:{channel}"))
     }
@@ -182,7 +187,9 @@ impl ChannelId {
         let (host_port, channel_raw) = without_slashes
             .split_once('/')
             .unwrap_or((without_slashes, ""));
-        let channel = channel_raw.trim().trim_start_matches('#');
+        // Strip exactly ONE leading '#' so ##channels are preserved.
+        let channel_trimmed = channel_raw.trim();
+        let channel = channel_trimmed.strip_prefix('#').unwrap_or(channel_trimmed);
 
         let default_port = if tls { 6697 } else { 6667 };
         let (host_raw, port) = if let Some((h, p)) = host_port.rsplit_once(':') {
@@ -476,6 +483,8 @@ pub struct ChannelState {
     pub unread_mentions: u32,
     /// Whether the logged-in user is a moderator in this channel.
     pub is_mod: bool,
+    /// Channel topic (IRC only).
+    pub topic: Option<String>,
 }
 
 impl ChannelState {
@@ -488,6 +497,7 @@ impl ChannelState {
             unread_count: 0,
             unread_mentions: 0,
             is_mod: false,
+            topic: None,
         }
     }
 
