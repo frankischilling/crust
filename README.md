@@ -22,31 +22,35 @@ Active early-stage project. The app builds and runs, and core chat workflows are
 
 ## Features
 
-- Twitch IRC over WebSocket - anonymous and authenticated modes
-- Kick chat over Pusher WebSocket (read-only)
-- Generic IRC support (plain + TLS) via `irc://host[:port]/channel` and `ircs://host[:port]/channel`
-- Multi-channel tabs - join, leave, reorder channels (Twitch + Kick + IRC)
-- Multi-account support - add, switch, remove, and set a default account
-- Message rendering:
-  - Twitch native emotes
-  - Third-party emotes: BTTV, FFZ, 7TV (global + channel + personal sets)
-  - Kick emotes (Kick-native + inline tag fallback)
-  - Animated emote support (GIF, WebP)
-  - Emoji tokenization via Twemoji URLs
-  - Badge rendering:
-    - Twitch global + channel badges via IVR
-    - Kick badge image rendering with channel-level API fallback
-  - URL and @mention detection
-  - Highlighted and first-message indicators
-- Emote picker and `:` autocomplete with Tab completion
-- Reply flow (threaded replies)
-- Basic moderation: timeout, ban, unban
-- User profile popup with avatar, badges, account metadata, and recent messages (Twitch + Kick)
-- Link preview metadata fetch (Open Graph / Twitter card)
-- Message input history (arrow-key recall)
-- Local settings persistence and optional keyring-backed token storage
-- Per-channel append-only chat logs
-- Chat history on join (via recent-messages.robotty.de / IVR fallback)
+- **Connectivity and session support**
+  - **Twitch IRC (WebSocket):** supports both anonymous read-only sessions and authenticated sessions.
+  - **Kick chat transport:** receives chat over Pusher; current implementation is read-only.
+  - **Generic IRC:** supports plain and TLS server targets via `irc://host[:port]/channel` and `ircs://host[:port]/channel`.
+  - **Multi-channel workflow:** join, leave, reorder, and switch between Twitch, Kick, and IRC tabs.
+  - **Multi-account Twitch auth:** add accounts, switch active account, remove accounts, and set a default auto-login account.
+
+- **Message rendering and media pipeline**
+  - **Native + third-party emotes:** Twitch native emotes plus BTTV/FFZ/7TV global/channel/personal sets.
+  - **Kick emote rendering:** uses Kick-native data with inline tag fallback when needed.
+  - **Animated image support:** GIF and WebP emotes are decoded and rendered in the UI.
+  - **Emoji tokenization:** emoji are normalized through Twemoji URL mapping.
+  - **Badge support:** Twitch global/channel badges (IVR) and Kick badge images (with API fallback path).
+  - **Rich parsing:** URL detection, @mention detection, first-message/highlight indicators.
+  - **Link metadata preview:** Open Graph/Twitter card title/description/thumbnail fetch and display.
+
+- **Input and moderation UX**
+  - **Slash command autocomplete:** type `/` to browse commands; supports keyboard navigation and accept.
+  - **Emote autocomplete:** supports `:`-style completion and Tab cycling.
+  - **Message history recall:** Up/Down navigates previously submitted input.
+  - **Reply flow:** in-input reply banner + message reply metadata forwarding.
+  - **Moderation actions:** timeout, ban, and unban tools in supported contexts.
+  - **User profile popup:** account metadata, avatar, badges, and recent messages (Twitch + Kick).
+  - **Anonymous restrictions:** anonymous users can execute local slash commands, but plain chat messages are not sent.
+
+- **Persistence, storage, and startup behavior**
+  - **Settings + credentials:** app settings persisted locally; token storage uses OS keyring when available, file fallback otherwise.
+  - **Per-channel logs:** append-only channel logs written to local storage.
+  - **Startup preload:** history loading on join (`recent-messages.robotty.de` / IVR fallback), emote catalog hydration, and image prefetch.
 
 ## Workspace layout
 
@@ -180,6 +184,72 @@ cargo run -p crust --release
 - Twitch: `channelname` or `twitch:channelname`
 - Kick: `kick:channelname`
 - IRC: `irc://host[:port]/channel` or `ircs://host[:port]/channel`
+
+## Commands (Detailed Reference)
+
+### Command execution model
+
+- Commands are entered in the chat box as slash commands (for example: `/help`).
+- If a command is handled by crust locally, it executes immediately in the UI.
+- If not handled locally, it may be forwarded to the active backend (Twitch IRC or generic IRC), depending on channel type and auth state.
+
+### Anonymous mode behavior
+
+- Anonymous users can type in the input and run **local** slash commands.
+- Anonymous users cannot send plain chat messages.
+- Slash commands that require backend/server-side execution are blocked in anonymous mode and replaced with a local explanatory notice.
+
+### Local commands (work in anonymous mode)
+
+- `/help` - prints the built-in command guide in chat.
+- `/clearmessages` - clears the current channel view locally (visual clear only).
+- `/chatters` - prints the current tracked chatter count for the active channel.
+- `/fakemsg <text>` - injects a local system message (never sent to Twitch/Kick/IRC).
+- `/openurl <url>` - opens a URL in the system browser.
+- `/popout [channel]` - opens Twitch/Kick popout chat URL in browser (channel-dependent).
+- `/user <user>` - opens Twitch/Kick profile URL in browser (in IRC tabs, `/user` is protocol-level and not local).
+- `/usercard <user>` - opens crust's in-app user profile card popup.
+- `/streamlink [channel]` - opens a `streamlink://` URL for Twitch channels.
+
+### IRC-focused commands
+
+These are intended for IRC tabs. Some are parsed client-side for convenience, while others are forwarded to the IRC server.
+
+- Connection/session helpers:
+  - `/server <host[:port]>` (alias: `/connect`) - open/connect an IRC server tab.
+  - `/join <#channel> [key]` - join/create a channel on the current IRC server.
+  - `/part [#channel]` - leave current/specified IRC channel.
+  - `/nick <name>` - set nickname for generic IRC servers.
+  - `/pass <password>` - set IRC server password (applied on reconnect).
+  - `/quit [message]` - disconnect from current IRC server.
+
+- Typical IRC protocol commands (forwarded to backend/server):
+  - `/msg <target> <text>`
+  - `/notice <target> <text>`
+  - `/topic [#channel] [text]`
+  - `/names [#channel]`
+  - `/list [mask]`
+  - `/mode <target> [modes]`
+  - `/kick <#channel> <nick> [reason]`
+  - `/invite <nick> [#channel]`
+  - `/whois <nick>`
+  - `/who [mask|#channel]`
+  - `/away [message]`
+  - `/raw <line>`
+
+- Raw IRC shortcut:
+  - In IRC tabs, uppercase protocol lines such as `PRIVMSG #rust :hello` are sent as raw IRC lines.
+
+### Twitch-focused commands
+
+- `/w <user> <msg>` and `/whisper <user> <msg>` - send Twitch whispers.
+- `/banid <id>` - convenience shorthand that forwards to `/ban <id>`.
+- Standard Twitch IRC moderation/utility commands (for example `/ban`, `/timeout`, `/slow`, `/clear`) are generally forwarded to Twitch when logged in.
+
+### Kick command notes
+
+- Kick chat is currently read-only in crust.
+- URL/profile helpers (for example `/popout`, `/user`) may still open browser targets for Kick channels.
 
 ## Notes
 

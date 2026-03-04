@@ -211,6 +211,10 @@ Built-in commands:\n",
         "\nAliases:\n\
   /whisper is the same as /w\n\
 \n\
+Anonymous mode:\n\
+    Plain messages and server-side slash commands require login.\n\
+    Anonymous users can run local slash commands only.\n\
+\n\
 IRC tip:\n\
   In IRC tabs, uppercase protocol lines like `PRIVMSG #rust :hello`\n\
   are sent as raw IRC commands automatically.\n\

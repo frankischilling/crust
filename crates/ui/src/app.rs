@@ -7,7 +7,10 @@ use tracing::warn;
 
 use crust_core::{
     events::{AppCommand, AppEvent, ConnectionState, LinkPreview},
-    model::{ChannelId, EmoteCatalogEntry, MsgKind, ReplyInfo, IRC_SERVER_CONTROL_CHANNEL},
+    model::{
+        ChannelId, ChannelState, EmoteCatalogEntry, MsgKind, ReplyInfo,
+        IRC_SERVER_CONTROL_CHANNEL,
+    },
     AppState,
 };
 
@@ -918,18 +921,39 @@ impl eframe::App for CrustApp {
                     .stroke(egui::Stroke::new(1.0, t::BORDER_SUBTLE)),
             )
             .show(ctx, |ui| {
-                ui.set_clip_rect(ui.max_rect());
                 let bar_width = ui.available_width();
-                ui.horizontal_centered(|ui| {
+                const COMPACT_CONTROLS_THRESHOLD: f32 = 700.0;
+                const COMPACT_ACCOUNT_THRESHOLD: f32 = 700.0;
+                const SHOW_LOGO_THRESHOLD: f32 = 250.0;
+                const SHOW_CONN_TEXT_THRESHOLD: f32 = 620.0;
+                const SHOW_JOIN_TEXT_THRESHOLD: f32 = 420.0;
+
+                let compact_controls = bar_width < COMPACT_CONTROLS_THRESHOLD;
+                let compact_account = bar_width < COMPACT_ACCOUNT_THRESHOLD;
+                ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing = t::TOOLBAR_SPACING;
 
                     // App logotype
-                    if bar_width > 200.0 {
-                        ui.label(
-                            RichText::new("crust")
-                                .font(egui::FontId::proportional(15.0))
-                                .strong()
-                                .color(t::ACCENT),
+                    if bar_width > SHOW_LOGO_THRESHOLD {
+                        let logo_font = egui::FontId::proportional(15.0);
+                        let logo_w = ui
+                            .fonts(|f| {
+                                f.layout_no_wrap("crust".to_owned(), logo_font.clone(), t::ACCENT)
+                                    .rect
+                                    .width()
+                            })
+                            + 4.0;
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(logo_w, t::BAR_H),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.label(
+                                    RichText::new("crust")
+                                        .font(logo_font)
+                                        .strong()
+                                        .color(t::ACCENT),
+                                );
+                            },
                         );
                         ui.separator();
                     }
@@ -945,19 +969,45 @@ impl eframe::App for CrustApp {
                     ui.painter()
                         .circle_filled(dot_rect.center(), dot_r, dot_color);
                     // Hide connection label text at narrow widths; dot is sufficient
-                    if bar_width > 500.0 {
-                        ui.label(
-                            RichText::new(conn_label)
-                                .font(t::small())
-                                .color(t::TEXT_SECONDARY),
+                    if bar_width > SHOW_CONN_TEXT_THRESHOLD {
+                        let conn_font = t::small();
+                        let conn_w = ui
+                            .fonts(|f| {
+                                f.layout_no_wrap(
+                                    conn_label.to_owned(),
+                                    conn_font.clone(),
+                                    t::TEXT_SECONDARY,
+                                )
+                                .rect
+                                .width()
+                            })
+                            + 4.0;
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(conn_w, t::BAR_H),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.label(
+                                    RichText::new(conn_label)
+                                        .font(conn_font)
+                                        .color(t::TEXT_SECONDARY),
+                                );
+                            },
                         );
                     }
 
                     ui.separator();
 
                     // Join channel button
-                    let join_label = if bar_width < 300.0 { "+" } else { "+ Join" };
-                    let join_w = if bar_width < 300.0 { 28.0 } else { 72.0 };
+                    let join_label = if bar_width < SHOW_JOIN_TEXT_THRESHOLD {
+                        "+"
+                    } else {
+                        "+ Join"
+                    };
+                    let join_w = if bar_width < SHOW_JOIN_TEXT_THRESHOLD {
+                        28.0
+                    } else {
+                        72.0
+                    };
                     if ui
                         .add_sized(
                             [join_w, t::BAR_H],
@@ -972,7 +1022,8 @@ impl eframe::App for CrustApp {
                     ui.separator();
 
                     // Sidebar / layout toggles - hidden at very narrow widths
-                    if bar_width > 350.0 {
+                    // In compact mode these actions move to the overflow menu.
+                    if !compact_controls && bar_width > 520.0 {
                     // Sidebar visibility toggle
                     let sidebar_open =
                         self.channel_layout == ChannelLayout::Sidebar && self.sidebar_visible;
@@ -1034,24 +1085,124 @@ impl eframe::App for CrustApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing = t::TOOLBAR_SPACING;
 
-                        // Settings button - compact at narrow widths
-                        let settings_label = if bar_width < 300.0 { "⚙" } else { "Settings" };
-                        let settings_w = if bar_width < 300.0 { 28.0 } else { 72.0 };
-                        if ui
-                            .add_sized(
-                                [settings_w, t::BAR_H],
-                                egui::Button::new(RichText::new(settings_label).font(t::small())),
-                            )
-                            .on_hover_text("Open application settings")
-                            .clicked()
-                        {
-                            self.settings_open = true;
+                        if compact_controls {
+                            ui.menu_button(RichText::new("⋯").font(t::small()), |ui| {
+                                if ui
+                                    .button(RichText::new("Settings").font(t::small()))
+                                    .clicked()
+                                {
+                                    self.settings_open = true;
+                                    ui.close_menu();
+                                }
+
+                                ui.separator();
+
+                                let sidebar_open = self.channel_layout == ChannelLayout::Sidebar
+                                    && self.sidebar_visible;
+                                let sidebar_label = if sidebar_open {
+                                    "Hide sidebar"
+                                } else {
+                                    "Show sidebar"
+                                };
+                                if ui
+                                    .button(RichText::new(sidebar_label).font(t::small()))
+                                    .clicked()
+                                {
+                                    match self.channel_layout {
+                                        ChannelLayout::TopTabs => {
+                                            self.channel_layout = ChannelLayout::Sidebar;
+                                            self.sidebar_visible = true;
+                                        }
+                                        ChannelLayout::Sidebar => {
+                                            self.sidebar_visible = !self.sidebar_visible;
+                                        }
+                                    }
+                                    ui.close_menu();
+                                }
+
+                                let mode_label = if self.channel_layout == ChannelLayout::Sidebar {
+                                    "Use top tabs"
+                                } else {
+                                    "Use sidebar"
+                                };
+                                if ui
+                                    .button(RichText::new(mode_label).font(t::small()))
+                                    .clicked()
+                                {
+                                    if self.channel_layout == ChannelLayout::Sidebar {
+                                        self.channel_layout = ChannelLayout::TopTabs;
+                                    } else {
+                                        self.channel_layout = ChannelLayout::Sidebar;
+                                        self.sidebar_visible = true;
+                                    }
+                                    ui.close_menu();
+                                }
+
+                                ui.separator();
+
+                                let perf_label = if self.perf.visible {
+                                    "Perf: on"
+                                } else {
+                                    "Perf: off"
+                                };
+                                if ui
+                                    .button(RichText::new(perf_label).font(t::small()))
+                                    .clicked()
+                                {
+                                    self.perf.visible = !self.perf.visible;
+                                    ui.close_menu();
+                                }
+
+                                let stats_label = if self.analytics_visible {
+                                    "Stats: on"
+                                } else {
+                                    "Stats: off"
+                                };
+                                if ui
+                                    .button(RichText::new(stats_label).font(t::small()))
+                                    .clicked()
+                                {
+                                    self.analytics_visible = !self.analytics_visible;
+                                    ui.close_menu();
+                                }
+
+                                let irc_label = if self.irc_status_visible {
+                                    "IRC: on"
+                                } else {
+                                    "IRC: off"
+                                };
+                                if ui
+                                    .button(RichText::new(irc_label).font(t::small()))
+                                    .clicked()
+                                {
+                                    self.irc_status_visible = !self.irc_status_visible;
+                                    ui.close_menu();
+                                }
+                            });
+                            ui.separator();
                         }
 
-                        ui.separator();
+                        // Settings button stays visible only outside compact mode
+                        // (in compact mode it's available in the overflow menu).
+                        if !compact_controls {
+                            let settings_label = if bar_width < 860.0 { "⚙" } else { "Settings" };
+                            let settings_w = if bar_width < 860.0 { 28.0 } else { 72.0 };
+                            if ui
+                                .add_sized(
+                                    [settings_w, t::BAR_H],
+                                    egui::Button::new(RichText::new(settings_label).font(t::small())),
+                                )
+                                .on_hover_text("Open application settings")
+                                .clicked()
+                            {
+                                self.settings_open = true;
+                            }
+
+                            ui.separator();
+                        }
 
                         // Perf overlay toggle - hide at narrow widths
-                        if bar_width > 650.0 {
+                        if !compact_controls && bar_width > 930.0 {
                             let perf_label = if self.perf.visible {
                                 "Perf: on"
                             } else {
@@ -1091,7 +1242,7 @@ impl eframe::App for CrustApp {
                         }
 
                         // IRC status toggle - hide at narrow widths
-                        if bar_width > 400.0 {
+                        if !compact_controls && bar_width > 760.0 {
                             let irc_status_label = if self.irc_status_visible {
                                 "IRC: on"
                             } else {
@@ -1112,7 +1263,7 @@ impl eframe::App for CrustApp {
                         }
 
                         // Emote count - hide at narrow widths
-                        if bar_width > 550.0 {
+                        if !compact_controls && bar_width > 900.0 {
                             ui.label(
                                 RichText::new(format!("{} emotes", self.emote_bytes.len()))
                                     .font(t::small())
@@ -1133,109 +1284,128 @@ impl eframe::App for CrustApp {
                                 .next()
                                 .unwrap_or('?');
 
-                            let btn_h = t::BAR_H;
-                            let name_galley = ui.painter().layout_no_wrap(
-                                name.to_owned(),
-                                t::small(),
-                                t::TEXT_PRIMARY,
-                            );
-                            let pill_w = btn_h + 6.0 + name_galley.size().x + 10.0;
-                            let (rect, resp) = ui.allocate_exact_size(
-                                egui::vec2(pill_w, btn_h),
-                                egui::Sense::click(),
-                            );
-                            resp.clone().on_hover_text("Account");
-
-                            if ui.is_rect_visible(rect) {
-                                let bg = if resp.hovered() {
-                                    t::BG_RAISED
-                                } else {
-                                    t::BG_SURFACE
-                                };
-                                let border = if resp.hovered() {
-                                    t::BORDER_ACCENT
-                                } else {
-                                    t::BORDER_SUBTLE
-                                };
-                                ui.painter().rect(
-                                    rect,
-                                    t::RADIUS,
-                                    bg,
-                                    egui::Stroke::new(1.0, border),
-                                    egui::StrokeKind::Outside,
+                            if compact_account {
+                                if ui
+                                    .add_sized(
+                                        [t::BAR_H, t::BAR_H],
+                                        egui::Button::new(
+                                            RichText::new(initial.to_string())
+                                                .font(t::small())
+                                                .strong(),
+                                        ),
+                                    )
+                                    .on_hover_text("Account")
+                                    .clicked()
+                                {
+                                    self.login_dialog.toggle();
+                                }
+                            } else {
+                                let btn_h = t::BAR_H;
+                                let name_galley = ui.painter().layout_no_wrap(
+                                    name.to_owned(),
+                                    t::small(),
+                                    t::TEXT_PRIMARY,
                                 );
+                                let pill_w = btn_h + 6.0 + name_galley.size().x + 10.0;
+                                let (rect, resp) = ui.allocate_exact_size(
+                                    egui::vec2(pill_w, btn_h),
+                                    egui::Sense::click(),
+                                );
+                                resp.clone().on_hover_text("Account");
 
-                                // Avatar circle
-                                let avatar_r = btn_h * 0.34;
-                                let avatar_c =
-                                    egui::pos2(rect.left() + btn_h * 0.5, rect.center().y);
-
-                                // Try to render the real avatar image; fall back to initial letter.
-                                let avatar_bytes =
-                                    self.state.auth.avatar_url.as_deref().and_then(|url| {
-                                        self.emote_bytes
-                                            .get(url)
-                                            .map(|(_, _, raw)| (url, raw.clone()))
-                                    });
-
-                                if let Some((logo, raw)) = avatar_bytes {
-                                    let uri = format!("bytes://{logo}");
-                                    let av_size = avatar_r * 2.0;
-                                    let av_rect = egui::Rect::from_center_size(
-                                        avatar_c,
-                                        egui::vec2(av_size, av_size),
+                                if ui.is_rect_visible(rect) {
+                                    let bg = if resp.hovered() {
+                                        t::BG_RAISED
+                                    } else {
+                                        t::BG_SURFACE
+                                    };
+                                    let border = if resp.hovered() {
+                                        t::BORDER_ACCENT
+                                    } else {
+                                        t::BORDER_SUBTLE
+                                    };
+                                    ui.painter().rect(
+                                        rect,
+                                        t::RADIUS,
+                                        bg,
+                                        egui::Stroke::new(1.0, border),
+                                        egui::StrokeKind::Outside,
                                     );
-                                    ui.painter().circle_filled(avatar_c, avatar_r, t::BG_RAISED);
-                                    ui.put(
-                                        av_rect,
-                                        egui::Image::from_bytes(
-                                            uri,
-                                            egui::load::Bytes::Shared(raw),
-                                        )
-                                        .fit_to_exact_size(egui::vec2(av_size, av_size))
-                                        .corner_radius(egui::CornerRadius::same(avatar_r as u8)),
-                                    );
-                                } else {
-                                    ui.painter()
-                                        .circle_filled(avatar_c, avatar_r, t::ACCENT_DIM);
+
+                                    // Avatar circle
+                                    let avatar_r = btn_h * 0.34;
+                                    let avatar_c =
+                                        egui::pos2(rect.left() + btn_h * 0.5, rect.center().y);
+
+                                    // Try to render the real avatar image; fall back to initial letter.
+                                    let avatar_bytes =
+                                        self.state.auth.avatar_url.as_deref().and_then(|url| {
+                                            self.emote_bytes
+                                                .get(url)
+                                                .map(|(_, _, raw)| (url, raw.clone()))
+                                        });
+
+                                    if let Some((logo, raw)) = avatar_bytes {
+                                        let uri = format!("bytes://{logo}");
+                                        let av_size = avatar_r * 2.0;
+                                        let av_rect = egui::Rect::from_center_size(
+                                            avatar_c,
+                                            egui::vec2(av_size, av_size),
+                                        );
+                                        ui.painter().circle_filled(avatar_c, avatar_r, t::BG_RAISED);
+                                        ui.put(
+                                            av_rect,
+                                            egui::Image::from_bytes(
+                                                uri,
+                                                egui::load::Bytes::Shared(raw),
+                                            )
+                                            .fit_to_exact_size(egui::vec2(av_size, av_size))
+                                            .corner_radius(egui::CornerRadius::same(avatar_r as u8)),
+                                        );
+                                    } else {
+                                        ui.painter()
+                                            .circle_filled(avatar_c, avatar_r, t::ACCENT_DIM);
+                                        ui.painter().text(
+                                            avatar_c,
+                                            egui::Align2::CENTER_CENTER,
+                                            initial.to_string(),
+                                            egui::FontId::proportional(avatar_r * 1.15),
+                                            t::TEXT_PRIMARY,
+                                        );
+                                    }
+
+                                    // Username
                                     ui.painter().text(
-                                        avatar_c,
-                                        egui::Align2::CENTER_CENTER,
-                                        initial.to_string(),
-                                        egui::FontId::proportional(avatar_r * 1.15),
+                                        egui::pos2(avatar_c.x + btn_h * 0.5 + 4.0, rect.center().y),
+                                        egui::Align2::LEFT_CENTER,
+                                        name,
+                                        t::small(),
                                         t::TEXT_PRIMARY,
                                     );
                                 }
 
-                                // Username
-                                ui.painter().text(
-                                    egui::pos2(avatar_c.x + btn_h * 0.5 + 4.0, rect.center().y),
-                                    egui::Align2::LEFT_CENTER,
-                                    name,
-                                    t::small(),
-                                    t::TEXT_PRIMARY,
-                                );
+                                if resp.clicked() {
+                                    self.login_dialog.toggle();
+                                }
                             }
-
-                            if resp.clicked() {
+                        } else {
+                            let (login_label, login_w) = if compact_account {
+                                ("👤", t::BAR_H)
+                            } else if self.state.accounts.is_empty() {
+                                ("Log in", 68.0)
+                            } else {
+                                ("Accounts", 68.0)
+                            };
+                            if ui
+                                .add_sized(
+                                    [login_w, t::BAR_H],
+                                    egui::Button::new(RichText::new(login_label).font(t::small())),
+                                )
+                                .on_hover_text("Log in with a Twitch OAuth token")
+                                .clicked()
+                            {
                                 self.login_dialog.toggle();
                             }
-                        } else if ui
-                            .add_sized(
-                                [68.0, t::BAR_H],
-                                egui::Button::new(
-                                    RichText::new(if self.state.accounts.is_empty() {
-                                        "Log in"
-                                    } else {
-                                        "Accounts"
-                                    })
-                                    .font(t::small()),
-                                ),
-                            )
-                            .on_hover_text("Log in with a Twitch OAuth token")
-                            .clicked()
-                        {
-                            self.login_dialog.toggle();
                         }
                     });
                 });
@@ -1247,15 +1417,14 @@ impl eframe::App for CrustApp {
         if let Some(active_ch) = self.state.active_channel.as_ref() {
             if !active_ch.is_twitch() {
                 TopBottomPanel::top("stream_info_bar")
-                    .exact_height(24.0)
+                    .exact_height(28.0)
                     .frame(
                         Frame::new()
                             .fill(t::BG_SURFACE)
-                            .inner_margin(egui::Margin::symmetric(8, 3))
-                            .stroke(egui::Stroke::new(1.0, t::BORDER_SUBTLE)),
+                            .inner_margin(egui::Margin::symmetric(8, 4))
+                            .stroke(egui::Stroke::NONE),
                     )
                     .show(ctx, |ui| {
-                        ui.set_clip_rect(ui.max_rect());
                         let prefix = if active_ch.is_kick() || active_ch.is_irc_server_tab() {
                             ""
                         } else {
@@ -1314,15 +1483,14 @@ impl eframe::App for CrustApp {
                     t::BG_SURFACE
                 };
                 TopBottomPanel::top("stream_info_bar")
-                    .exact_height(24.0)
+                    .exact_height(28.0)
                     .frame(
                         Frame::new()
                             .fill(bar_fill)
-                            .inner_margin(egui::Margin::symmetric(8, 3))
-                            .stroke(egui::Stroke::new(1.0, t::BORDER_SUBTLE)),
+                            .inner_margin(egui::Margin::symmetric(8, 4))
+                            .stroke(egui::Stroke::NONE),
                     )
                     .show(ctx, |ui| {
-                        ui.set_clip_rect(ui.max_rect());
                         let bar_w = ui.available_width();
                         let compact = bar_w < 640.0;
                         let ultra_compact = bar_w < 360.0;
@@ -1515,10 +1683,9 @@ impl eframe::App for CrustApp {
                             Frame::new()
                                 .fill(t::BG_BASE)
                                 .inner_margin(egui::Margin::symmetric(8, 2))
-                                .stroke(egui::Stroke::new(1.0, t::BORDER_SUBTLE)),
+                                .stroke(egui::Stroke::NONE),
                         )
                         .show(ctx, |ui| {
-                            ui.set_clip_rect(ui.max_rect());
                             ui.horizontal_centered(|ui| {
                                 ui.spacing_mut().item_spacing.x = 6.0;
                                 if let Some(rs) = room {
@@ -1770,7 +1937,14 @@ impl eframe::App for CrustApp {
             .show(ctx, |ui| {
                 if let Some(active_ch) = self.state.active_channel.clone() {
                     // Input tray pinned to bottom
+                    let input_panel_h = if self.pending_reply.is_some() {
+                        64.0
+                    } else {
+                        t::BAR_H + (t::INPUT_MARGIN.top + t::INPUT_MARGIN.bottom) as f32
+                    };
                     TopBottomPanel::bottom("chat_input_panel")
+                        .resizable(false)
+                        .exact_height(input_panel_h)
                         .frame(
                             Frame::new()
                                 .fill(t::BG_SURFACE)
@@ -1793,9 +1967,6 @@ impl eframe::App for CrustApp {
                                 self.pending_reply = None;
                             }
                             if let Some(text) = result.send {
-                                if active_ch.is_irc() {
-                                    self.irc_status_panel.note_outgoing(&active_ch, &text);
-                                }
                                 // Push to history (cap at 100)
                                 if self.message_history.last().map(|s| s.as_str()) != Some(&text) {
                                     self.message_history.push(text.clone());
@@ -1825,9 +1996,10 @@ impl eframe::App for CrustApp {
                                     .state
                                     .channels
                                     .get(&active_ch)
-                                    .map(|c| c.chatters.len())
+                                    .map(|c| c.chatters.len().max(estimate_chatter_count(c)))
                                     .unwrap_or(0);
-                                if let Some(cmd) = parse_slash_command(
+
+                                let parsed_cmd = parse_slash_command(
                                     &text,
                                     &active_ch,
                                     reply_to_msg_id.clone(),
@@ -1835,7 +2007,50 @@ impl eframe::App for CrustApp {
                                     chatters_count,
                                     self.kick_beta_enabled,
                                     self.irc_beta_enabled,
-                                ) {
+                                );
+
+                                if !self.state.auth.logged_in {
+                                    match parsed_cmd {
+                                        Some(cmd) if is_anonymous_local_command(&cmd) => {
+                                            // Some slash commands manipulate the popup directly.
+                                            if let AppCommand::ShowUserCard {
+                                                ref login,
+                                                ref channel,
+                                            } = cmd
+                                            {
+                                                self.user_profile_popup.set_loading(
+                                                    login,
+                                                    vec![],
+                                                    Some(channel.clone()),
+                                                    can_moderate,
+                                                );
+                                            }
+                                            self.send_cmd(cmd);
+                                        }
+                                        Some(_) => {
+                                            self.send_cmd(AppCommand::InjectLocalMessage {
+                                                channel: active_ch.clone(),
+                                                text: "Anonymous mode allows local slash commands only. Log in to run server commands or send chat messages. Try /help.".to_owned(),
+                                            });
+                                        }
+                                        None => {
+                                            let text = if text.trim_start().starts_with('/') {
+                                                "That slash command is not available in anonymous mode. Use /help for local commands.".to_owned()
+                                            } else {
+                                                "Anonymous mode cannot send chat messages. Log in to chat, or run local commands like /help.".to_owned()
+                                            };
+                                            self.send_cmd(AppCommand::InjectLocalMessage {
+                                                channel: active_ch.clone(),
+                                                text,
+                                            });
+                                        }
+                                    }
+                                } else if let Some(cmd) = parsed_cmd {
+                                    if let AppCommand::SendMessage { text: ref outgoing_text, .. } = cmd {
+                                        if active_ch.is_irc() {
+                                            self.irc_status_panel.note_outgoing(&active_ch, outgoing_text);
+                                        }
+                                    }
                                     // Some slash commands manipulate the popup directly.
                                     if let AppCommand::ShowUserCard {
                                         ref login,
@@ -1851,6 +2066,9 @@ impl eframe::App for CrustApp {
                                     }
                                     self.send_cmd(cmd);
                                 } else {
+                                    if active_ch.is_irc() {
+                                        self.irc_status_panel.note_outgoing(&active_ch, &text);
+                                    }
                                     self.send_cmd(AppCommand::SendMessage {
                                         channel: active_ch.clone(),
                                         text,
@@ -2385,6 +2603,38 @@ fn parse_slash_command(
         // /r, /w, etc.) are handled server-side.
         _ => None,
     }
+}
+
+fn is_anonymous_local_command(cmd: &AppCommand) -> bool {
+    matches!(
+        cmd,
+        AppCommand::InjectLocalMessage { .. }
+            | AppCommand::ClearLocalMessages { .. }
+            | AppCommand::OpenUrl { .. }
+            | AppCommand::ShowUserCard { .. }
+    )
+}
+
+fn estimate_chatter_count(ch: &ChannelState) -> usize {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for msg in &ch.messages {
+        if msg.flags.is_deleted
+            || matches!(
+                msg.msg_kind,
+                MsgKind::SystemInfo
+                    | MsgKind::ChatCleared
+                    | MsgKind::Timeout { .. }
+                    | MsgKind::Ban { .. }
+            )
+        {
+            continue;
+        }
+        let login = msg.sender.login.trim();
+        if !login.is_empty() {
+            seen.insert(login.to_ascii_lowercase());
+        }
+    }
+    seen.len()
 }
 
 fn parse_irc_channel_arg(current: &ChannelId, raw: &str) -> Option<ChannelId> {

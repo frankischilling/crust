@@ -125,18 +125,6 @@ impl<'a> ChatInput<'a> {
             .fill(t::BG_SURFACE)
             .inner_margin(t::INPUT_MARGIN)
             .show(ui, |ui| {
-                if !self.logged_in {
-                    ui.horizontal_centered(|ui| {
-                        ui.label(
-                            RichText::new("Log in to send messages")
-                                .font(t::body())
-                                .color(t::TEXT_MUTED)
-                                .italics(),
-                        );
-                    });
-                    return;
-                }
-
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing = t::TOOLBAR_SPACING;
                     let input_width = ui.available_width();
@@ -193,7 +181,11 @@ impl<'a> ChatInput<'a> {
                     let resp = ui.add_sized(
                         [text_width, t::BAR_H],
                         egui::TextEdit::singleline(buf)
-                            .hint_text("Send a message...")
+                            .hint_text(if self.logged_in {
+                                "Send a message..."
+                            } else {
+                                "Type a local /command (example: /help)"
+                            })
                             .text_color(t::TEXT_PRIMARY)
                             .margin(egui::Margin::symmetric(6, 6))
                             .frame(true)
@@ -410,12 +402,16 @@ impl<'a> ChatInput<'a> {
                     };
                     let twitch_over_limit =
                         is_twitch_channel && twitch_char_count > TWITCH_MAX_CHARS;
+                    let is_slash_input = buf.trim_start().starts_with('/');
+                    let can_submit = !twitch_over_limit
+                        && !buf.trim().is_empty()
+                        && (self.logged_in || is_slash_input);
 
                     // ── Send on Enter (only fires when we did NOT consume it) ──
                     let enter_pressed =
                         resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
 
-                    if enter_pressed && !buf.trim().is_empty() && !twitch_over_limit {
+                    if enter_pressed && can_submit {
                         result.send = Some(buf.trim().to_owned());
                         buf.clear();
                         // Reset history navigation on send
@@ -445,16 +441,18 @@ impl<'a> ChatInput<'a> {
                     // Send button - hidden at very narrow widths
                     if show_send_btn {
                     let send_btn = ui.add_enabled(
-                        !twitch_over_limit,
+                        can_submit,
                         egui::Button::new(RichText::new("Send").font(t::small()))
                             .min_size(egui::vec2(58.0, t::BAR_H)),
                     );
                     let send_btn = if twitch_over_limit && is_twitch_channel {
                         send_btn.on_hover_text("Twitch messages are limited to 500 characters")
+                    } else if !self.logged_in && !is_slash_input && !buf.trim().is_empty() {
+                        send_btn.on_hover_text("Anonymous mode can run slash commands only")
                     } else {
                         send_btn
                     };
-                    if send_btn.clicked() && !buf.trim().is_empty() {
+                    if send_btn.clicked() && can_submit {
                         result.send = Some(buf.trim().to_owned());
                         buf.clear();
                     }

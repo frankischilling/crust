@@ -26,6 +26,8 @@ const MIN_LOADING_GRACE: Duration = Duration::from_secs(2);
 const FADE_DURATION: Duration = Duration::from_millis(700);
 const LOADING_LOG_ROWS: usize = 10;
 const LOADING_LOG_ROW_HEIGHT: f32 = 16.0;
+const SUPER_NARROW_WIDTH: f32 = 320.0;
+const SUPER_NARROW_LOG_ROWS: usize = 6;
 
 // public event feed
 
@@ -274,6 +276,11 @@ impl LoadingScreen {
                     ),
                 );
 
+                if rect.width() <= SUPER_NARROW_WIDTH {
+                    self.show_super_narrow(ctx, rect, alpha);
+                    return;
+                }
+
                 let card_w = (rect.width() - 36.0).clamp(200.0, 760.0);
                 egui::Area::new(egui::Id::new("loading_center_card"))
                     .order(egui::Order::Foreground)
@@ -351,13 +358,7 @@ impl LoadingScreen {
                                     }
                                 });
 
-                                let stage = match self.phase {
-                                    Phase::Connecting => ("Connecting to Twitch…", t::YELLOW),
-                                    Phase::Authenticating => ("Authenticating…", t::YELLOW),
-                                    Phase::Loading => ("Loading startup data…", t::TEXT_SECONDARY),
-                                    Phase::Ready => ("Ready", t::GREEN),
-                                    Phase::Done => ("Done", t::GREEN),
-                                };
+                                let stage = self.stage_label();
                                 ui.vertical_centered(|ui| {
                                     ui.label(
                                         egui::RichText::new(stage.0)
@@ -372,15 +373,8 @@ impl LoadingScreen {
                                     ui.set_min_width(details_w);
                                     ui.set_max_width(details_w);
                                             let mut pills: Vec<(String, Color32)> = Vec::new();
-                                            let conn_pill = match self.phase {
-                                                Phase::Connecting => {
-                                                    ("● Connecting".to_owned(), t::YELLOW)
-                                                }
-                                                Phase::Authenticating => {
-                                                    ("● Authenticating".to_owned(), t::YELLOW)
-                                                }
-                                                _ => ("● Connected".to_owned(), t::GREEN),
-                                            };
+                                            let conn = self.connection_status();
+                                            let conn_pill = (format!("● {}", conn.0), conn.1);
                                             pills.push(conn_pill);
 
                                             if !self.channels_joined.is_empty() {
@@ -594,6 +588,211 @@ impl LoadingScreen {
                             });
                     });
             });
+    }
+
+    fn show_super_narrow(&mut self, ctx: &Context, rect: egui::Rect, alpha: f32) {
+        let a = |c: Color32| {
+            Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (alpha * 255.0) as u8)
+        };
+
+        let card_w = (rect.width() - 12.0).clamp(120.0, SUPER_NARROW_WIDTH);
+        egui::Area::new(egui::Id::new("loading_narrow_card"))
+            .order(egui::Order::Foreground)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .interactable(false)
+            .show(ctx, |ui| {
+                ui.set_width(card_w);
+                egui::Frame::new()
+                    .fill(a(t::BG_SURFACE))
+                    .stroke(egui::Stroke::new(1.0, a(t::BORDER_SUBTLE)))
+                    .corner_radius(t::RADIUS)
+                    .inner_margin(egui::Margin::symmetric(10, 10))
+                    .show(ui, |ui| {
+                        ui.set_width(card_w - 20.0);
+
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                egui::RichText::new("crust")
+                                    .font(FontId::proportional(30.0))
+                                    .color(a(t::ACCENT)),
+                            );
+                            if card_w > 220.0 {
+                                ui.label(
+                                    egui::RichText::new("Twitch chat client")
+                                        .font(FontId::proportional(11.0))
+                                        .color(a(t::TEXT_MUTED)),
+                                );
+                            }
+                        });
+
+                        ui.add_space(6.0);
+                        ui.vertical_centered(|ui| {
+                            let (spin_rect, _) =
+                                ui.allocate_exact_size(Vec2::new(52.0, 52.0), egui::Sense::hover());
+                            let center = spin_rect.center();
+                            let spin_painter = ui.painter();
+                            if self.phase != Phase::Ready {
+                                let t_val = ui.input(|i| i.time) as f32;
+                                let radius = 16.0_f32;
+                                let segments = 10usize;
+                                for i in 0..segments {
+                                    let angle =
+                                        (i as f32 / segments as f32) * std::f32::consts::TAU;
+                                    let spin = (t_val * 1.8).rem_euclid(1.0);
+                                    let dot_age =
+                                        ((i as f32 / segments as f32) - spin).rem_euclid(1.0);
+                                    let dot_alpha = ((1.0 - dot_age) * alpha * 220.0) as u8;
+                                    let p = Pos2::new(
+                                        center.x + radius * angle.cos(),
+                                        center.y + radius * angle.sin(),
+                                    );
+                                    spin_painter.circle_filled(
+                                        p,
+                                        2.5,
+                                        Color32::from_rgba_unmultiplied(
+                                            t::ACCENT.r(),
+                                            t::ACCENT.g(),
+                                            t::ACCENT.b(),
+                                            dot_alpha,
+                                        ),
+                                    );
+                                }
+                                ctx.request_repaint_after(Duration::from_millis(16));
+                            } else {
+                                spin_painter.text(
+                                    center,
+                                    Align2::CENTER_CENTER,
+                                    "✓",
+                                    FontId::proportional(24.0),
+                                    a(t::GREEN),
+                                );
+                            }
+                        });
+
+                        let stage = self.stage_label();
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                egui::RichText::new(stage.0)
+                                    .font(t::small())
+                                    .color(a(stage.1)),
+                            );
+                        });
+
+                        ui.add_space(8.0);
+                        let conn = self.connection_status();
+                        ui.label(
+                            egui::RichText::new(format!("Connection: {}", conn.0))
+                                .font(t::small())
+                                .color(a(conn.1)),
+                        );
+
+                        if !self.channels_joined.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Channels joined: {}",
+                                    self.channels_joined.len()
+                                ))
+                                .font(t::small())
+                                .color(a(t::TEXT_SECONDARY)),
+                            );
+                        }
+
+                        if self.catalog_loaded {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Global emotes: {}",
+                                    self.catalog_count
+                                ))
+                                .font(t::small())
+                                .color(a(t::ACCENT)),
+                            );
+                        } else if self.phase == Phase::Loading {
+                            ui.label(
+                                egui::RichText::new("Global emotes: loading…")
+                                    .font(t::small())
+                                    .color(a(t::TEXT_MUTED)),
+                            );
+                        }
+
+                        if self.images_expected > 0 {
+                            let prog =
+                                (self.images_loaded as f32 / self.images_expected as f32)
+                                    .clamp(0.0, 1.0);
+                            ui.add_space(6.0);
+                            ui.add(
+                                egui::widgets::ProgressBar::new(prog)
+                                    .fill(a(t::ACCENT))
+                                    .desired_width(ui.available_width())
+                                    .text(format!(
+                                        "Images: {} / {}",
+                                        self.images_loaded, self.images_expected
+                                    )),
+                            );
+                        }
+
+                        ui.add_space(8.0);
+                        egui::Frame::new()
+                            .fill(a(t::BG_BASE))
+                            .stroke(egui::Stroke::new(1.0, a(t::BORDER_SUBTLE)))
+                            .corner_radius(t::RADIUS_SM)
+                            .inner_margin(egui::Margin::symmetric(7, 6))
+                            .show(ui, |ui| {
+                                let inner_w = ui.available_width();
+                                ui.set_min_height(
+                                    SUPER_NARROW_LOG_ROWS as f32 * LOADING_LOG_ROW_HEIGHT,
+                                );
+                                let mut lines: Vec<&LogLine> = self
+                                    .log
+                                    .iter()
+                                    .rev()
+                                    .take(SUPER_NARROW_LOG_ROWS)
+                                    .collect();
+                                lines.reverse();
+
+                                if lines.is_empty() {
+                                    ui.add_sized(
+                                        Vec2::new(inner_w, 0.0),
+                                        egui::Label::new(
+                                            egui::RichText::new("Waiting for startup events…")
+                                                .font(t::small())
+                                                .color(a(t::TEXT_MUTED)),
+                                        )
+                                        .truncate(),
+                                    );
+                                } else {
+                                    for line in lines {
+                                        ui.add_sized(
+                                            Vec2::new(inner_w, 0.0),
+                                            egui::Label::new(
+                                                egui::RichText::new(&line.text)
+                                                    .font(t::small())
+                                                    .color(a(line.color)),
+                                            )
+                                            .truncate(),
+                                        );
+                                    }
+                                }
+                            });
+                    });
+            });
+    }
+
+    fn stage_label(&self) -> (&'static str, Color32) {
+        match self.phase {
+            Phase::Connecting => ("Connecting to Twitch…", t::YELLOW),
+            Phase::Authenticating => ("Authenticating…", t::YELLOW),
+            Phase::Loading => ("Loading startup data…", t::TEXT_SECONDARY),
+            Phase::Ready => ("Ready", t::GREEN),
+            Phase::Done => ("Done", t::GREEN),
+        }
+    }
+
+    fn connection_status(&self) -> (&'static str, Color32) {
+        match self.phase {
+            Phase::Connecting => ("Connecting", t::YELLOW),
+            Phase::Authenticating => ("Authenticating", t::YELLOW),
+            _ => ("Connected", t::GREEN),
+        }
     }
 
     // private
