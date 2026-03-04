@@ -102,8 +102,14 @@ impl<'a> ChatInput<'a> {
                                 .color(t::ACCENT)
                                 .strong(),
                         );
-                        let body = if rep.parent_msg_body.len() > 60 {
-                            format!("\"{}\u{2026}\"", &rep.parent_msg_body[..60])
+                        let body = if rep.parent_msg_body.chars().count() > 60 {
+                            let cut = rep
+                                .parent_msg_body
+                                .char_indices()
+                                .nth(60)
+                                .map(|(i, _)| i)
+                                .unwrap_or(rep.parent_msg_body.len());
+                            format!("\"{}\u{2026}\"", &rep.parent_msg_body[..cut])
                         } else {
                             format!("\"{}\"", rep.parent_msg_body)
                         };

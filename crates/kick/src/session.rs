@@ -453,6 +453,7 @@ impl KickSession {
                 login,
                 display_name,
                 color: identity.color,
+                paint: None,
                 badges,
             },
             raw_text: content.clone(),

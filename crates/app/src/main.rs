@@ -10,7 +10,7 @@ use chrono::Utc;
 use crust_core::events::{AppCommand, AppEvent, ConnectionState};
 use crust_core::model::{
     Badge, ChannelId, ChatMessage, EmoteCatalogEntry, MessageFlags, MessageId, MsgKind, Sender,
-    UserId, UserProfile,
+    SenderPaint, SenderPaintStop, UserId, UserProfile,
 };
 use crust_emotes::{
     cache::EmoteCache,
@@ -34,6 +34,7 @@ const TWITCH_EVT_SIZE: usize = 4096;
 const KICK_EVT_SIZE: usize = 4096;
 const IRC_EVT_SIZE: usize = 4096;
 const TWITCH_MAX_MESSAGE_CHARS: usize = 500;
+const SEVENTV_GQL_URL: &str = "https://api.7tv.app/v3/gql";
 
 /// Counter for assigning unique IDs to history messages loaded from external APIs.
 /// Starts at u64::MAX/2 so it never clashes with live session IDs (which count up from 0).
@@ -67,6 +68,54 @@ fn resolve_emote<'a>(
 
 /// Shared badge map: (set_name, version) → image URL.
 type BadgeMap = Arc<RwLock<std::collections::HashMap<(String, String), String>>>;
+
+#[derive(Debug, Clone, Default)]
+struct SevenTvUserStyleRaw {
+    color: Option<i32>,
+    paint_id: Option<String>,
+    badge_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SevenTvBadgeMeta {
+    tooltip: Option<String>,
+    url: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SevenTvResolvedStyle {
+    color_hex: Option<String>,
+    paint: Option<SenderPaint>,
+    badge: Option<Badge>,
+}
+
+enum SevenTvCosmeticUpdate {
+    Catalog {
+        paints: HashMap<String, SenderPaint>,
+        badges: HashMap<String, SevenTvBadgeMeta>,
+    },
+    UserStyle {
+        twitch_user_id: String,
+        style: Option<SevenTvUserStyleRaw>,
+    },
+    /// Batch of Twitch user-ids discovered in history messages that need
+    /// their 7TV styles resolved.
+    BatchUserLookup {
+        user_ids: Vec<String>,
+    },
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SevenTvGraphQlResponse<T> {
+    data: Option<T>,
+    #[serde(default)]
+    errors: Vec<SevenTvGraphQlError>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SevenTvGraphQlError {
+    message: String,
+}
 
 fn main() -> Result<()> {
     // SIGPIPE: handle broken pipe signals on Wayland
@@ -322,6 +371,34 @@ async fn reducer_loop(
     let mut pending_images: HashSet<String> = HashSet::new();
     // Track URLs we've already kicked off a link-preview fetch for.
     let mut pending_link_previews: HashSet<String> = HashSet::new();
+
+    // 7TV cosmetics cache: global paints/badges + per-user resolved styles.
+    let (stv_update_tx, mut stv_update_rx) = mpsc::channel::<SevenTvCosmeticUpdate>(512);
+    let mut stv_paints: HashMap<String, SenderPaint> = HashMap::new();
+    let mut stv_badges: HashMap<String, SevenTvBadgeMeta> = HashMap::new();
+    let mut stv_user_styles_raw: HashMap<String, SevenTvUserStyleRaw> = HashMap::new();
+    let mut stv_user_styles_resolved: HashMap<String, SevenTvResolvedStyle> = HashMap::new();
+    let mut stv_pending_user_lookups: HashSet<String> = HashSet::new();
+
+    // Shared HTTP client for all 7TV API calls (connection pooling + HTTP/2).
+    let stv_http_client: reqwest::Client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    // Limit concurrent 7TV user-style lookups to avoid overwhelming the API.
+    let stv_lookup_sem = Arc::new(tokio::sync::Semaphore::new(20));
+
+    {
+        let tx = stv_update_tx.clone();
+        let client = stv_http_client.clone();
+        tokio::spawn(async move {
+            if let Some((paints, badges)) = load_7tv_cosmetics_catalog(&client).await {
+                let _ = tx
+                    .send(SevenTvCosmeticUpdate::Catalog { paints, badges })
+                    .await;
+            }
+        });
+    }
 
     // Track authenticated user info for local echo messages
     let mut auth_username: Option<String> = None;
@@ -633,6 +710,7 @@ async fn reducer_loop(
                         let bm_hist = badge_map.clone();
                         let cache_hist = emote_cache.clone();
                         let etx_hist = evt_tx.clone();
+                        let stv_tx_hist = stv_update_tx.clone();
                         tokio::spawn(async move {
                             load_recent_messages(
                                 ch_hist.as_str(),
@@ -641,6 +719,7 @@ async fn reducer_loop(
                                 &bm_hist,
                                 &cache_hist,
                                 &etx_hist,
+                                &stv_tx_hist,
                             ).await;
                         });
                     }
@@ -683,6 +762,25 @@ async fn reducer_loop(
                         tokio::spawn(async move {
                             load_personal_7tv_emotes(&uid, &idx2, &cache2, &etx2, &gc2).await;
                         });
+
+                        // Prime cosmetics cache for the logged-in user.
+                        if !user_id.trim().is_empty()
+                            && stv_pending_user_lookups.insert(user_id.clone())
+                        {
+                            let tx = stv_update_tx.clone();
+                            let client = stv_http_client.clone();
+                            let sem = stv_lookup_sem.clone();
+                            tokio::spawn(async move {
+                                let _permit = sem.acquire().await;
+                                let style = load_7tv_user_style_for_twitch(&client, &user_id).await;
+                                let _ = tx
+                                    .send(SevenTvCosmeticUpdate::UserStyle {
+                                        twitch_user_id: user_id,
+                                        style,
+                                    })
+                                    .await;
+                            });
+                        }
                         // Fetch the user's own avatar for the top-bar profile pill.
                         {
                             let login = auth_username.clone().unwrap_or_default().to_lowercase();
@@ -735,6 +833,34 @@ async fn reducer_loop(
                                 .map(|r| r.parent_user_login.to_lowercase() == uname_lower)
                                 .unwrap_or(false);
                             msg.flags.is_mention = has_mention || is_reply_to_me;
+                        }
+
+                        // Apply cached 7TV cosmetics for Twitch users and
+                        // queue a background style lookup when missing.
+                        if msg.channel.is_twitch() {
+                            let twitch_user_id = msg.sender.user_id.0.trim().to_owned();
+                            if !twitch_user_id.is_empty() {
+                                if let Some(style) = stv_user_styles_resolved.get(&twitch_user_id)
+                                {
+                                    apply_7tv_cosmetics_to_sender(&mut msg.sender, style);
+                                } else if stv_pending_user_lookups.insert(twitch_user_id.clone())
+                                {
+                                    let tx = stv_update_tx.clone();
+                                    let client = stv_http_client.clone();
+                                    let sem = stv_lookup_sem.clone();
+                                    tokio::spawn(async move {
+                                        let _permit = sem.acquire().await;
+                                        let style =
+                                            load_7tv_user_style_for_twitch(&client, &twitch_user_id).await;
+                                        let _ = tx
+                                            .send(SevenTvCosmeticUpdate::UserStyle {
+                                                twitch_user_id,
+                                                style,
+                                            })
+                                            .await;
+                                    });
+                                }
+                            }
                         }
 
                         // Queue image fetches for emotes/emoji/badges
@@ -1293,6 +1419,106 @@ async fn reducer_loop(
                 }
             }
 
+            // Internal 7TV cosmetics updates (catalog + per-user style lookups).
+            Some(stv_update) = stv_update_rx.recv() => {
+                match stv_update {
+                    SevenTvCosmeticUpdate::Catalog { paints, badges } => {
+                        info!("7TV catalog received: {} paints, {} badges", paints.len(), badges.len());
+                        stv_paints = paints;
+                        stv_badges = badges;
+
+                        // Re-resolve any styles we already learned before
+                        // the cosmetics catalog was available.
+                        stv_user_styles_resolved.clear();
+                        let mut updates: Vec<(String, SevenTvResolvedStyle)> = Vec::new();
+                        for (uid, style) in &stv_user_styles_raw {
+                            let resolved = resolve_7tv_user_style(style, &stv_paints, &stv_badges);
+                            updates.push((uid.clone(), resolved.clone()));
+                            stv_user_styles_resolved.insert(uid.clone(), resolved);
+                        }
+
+                        let paint_count = updates.iter().filter(|(_, r)| r.paint.is_some()).count();
+                        if !updates.is_empty() {
+                            info!("7TV re-resolved {} cached user styles ({} with paints)", updates.len(), paint_count);
+                        }
+
+                        for (user_id, resolved) in updates {
+                            if user_id.is_empty() {
+                                continue;
+                            }
+                            let _ = evt_tx
+                                .send(AppEvent::SenderCosmeticsUpdated {
+                                    user_id,
+                                    color: resolved.color_hex,
+                                    paint: resolved.paint,
+                                    badge: resolved.badge,
+                                })
+                                .await;
+                        }
+                    }
+                    SevenTvCosmeticUpdate::UserStyle {
+                        twitch_user_id,
+                        style,
+                    } => {
+                        stv_pending_user_lookups.remove(&twitch_user_id);
+                        if let Some(raw) = style {
+                            let resolved = resolve_7tv_user_style(&raw, &stv_paints, &stv_badges);
+                            let has_paint = resolved.paint.is_some();
+                            stv_user_styles_raw.insert(twitch_user_id.clone(), raw);
+                            stv_user_styles_resolved
+                                .insert(twitch_user_id.clone(), resolved.clone());
+
+                            if has_paint {
+                                info!(
+                                    "7TV paint resolved for user {}: {}",
+                                    twitch_user_id,
+                                    resolved.paint.as_ref().map(|p| p.name.as_str()).unwrap_or("?")
+                                );
+                            }
+
+                            if !twitch_user_id.is_empty() {
+                                let _ = evt_tx
+                                    .send(AppEvent::SenderCosmeticsUpdated {
+                                        user_id: twitch_user_id,
+                                        color: resolved.color_hex,
+                                        paint: resolved.paint,
+                                        badge: resolved.badge,
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                    SevenTvCosmeticUpdate::BatchUserLookup { user_ids } => {
+                        // Triggered by history loading — queue lookups for
+                        // users we haven't seen yet.
+                        let mut queued = 0u32;
+                        for uid in user_ids {
+                            if uid.is_empty() { continue; }
+                            if stv_user_styles_resolved.contains_key(&uid) { continue; }
+                            if !stv_pending_user_lookups.insert(uid.clone()) { continue; }
+                            queued += 1;
+                            let tx = stv_update_tx.clone();
+                            let client = stv_http_client.clone();
+                            let sem = stv_lookup_sem.clone();
+                            tokio::spawn(async move {
+                                let _permit = sem.acquire().await;
+                                let style =
+                                    load_7tv_user_style_for_twitch(&client, &uid).await;
+                                let _ = tx
+                                    .send(SevenTvCosmeticUpdate::UserStyle {
+                                        twitch_user_id: uid,
+                                        style,
+                                    })
+                                    .await;
+                            });
+                        }
+                        if queued > 0 {
+                            info!("7TV: queued {queued} user-style lookups from history");
+                        }
+                    }
+                }
+            }
+
             // UI command
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
@@ -1687,7 +1913,17 @@ async fn reducer_loop(
                             }
                         }
                     }
-                    AppCommand::SendMessage { channel, text, reply_to_msg_id } => {
+                    AppCommand::SendMessage {
+                        channel,
+                        text,
+                        mut reply_to_msg_id,
+                        reply,
+                    } => {
+                        if reply_to_msg_id.is_none() {
+                            reply_to_msg_id =
+                                reply.as_ref().map(|r| r.parent_msg_id.clone());
+                        }
+
                         debug!("Sending message to #{channel}: {text}");
 
                         // Twitch hard-limit: reject overlong messages before
@@ -1781,6 +2017,7 @@ async fn reducer_loop(
                                     login: uname.to_lowercase(),
                                     display_name: uname.clone(),
                                     color: self_color.clone(),
+                                    paint: None,
                                     badges: self_badges.get(&channel).cloned().unwrap_or_default(),
                                 },
                                 raw_text: text.clone(),
@@ -1796,9 +2033,13 @@ async fn reducer_loop(
                                     custom_reward_id: None,
                                     is_history: false,
                                 },
-                                reply: None,
+                                reply: reply.clone(),
                                 msg_kind: MsgKind::Chat,
                             };
+
+                            if let Some(style) = stv_user_styles_resolved.get(uid) {
+                                apply_7tv_cosmetics_to_sender(&mut echo.sender, style);
+                            }
 
                             // Tokenize the echo message
                             {
@@ -1878,6 +2119,7 @@ async fn reducer_loop(
                                         login: display.to_lowercase(),
                                         display_name: display.to_owned(),
                                         color: None,
+                                        paint: None,
                                         badges: Vec::new(),
                                     },
                                     raw_text: echo_text,
@@ -2569,6 +2811,360 @@ fn prefetch_emote_images(
     }
 }
 
+// 7TV cosmetics
+
+fn seven_tv_color_to_rgba(color: i32) -> (u8, u8, u8, u8) {
+    let raw = color as u32;
+    let r = ((raw >> 24) & 0xFF) as u8;
+    let g = ((raw >> 16) & 0xFF) as u8;
+    let b = ((raw >> 8) & 0xFF) as u8;
+    let a = (raw & 0xFF) as u8;
+    (r, g, b, a)
+}
+
+fn seven_tv_color_to_hex(color: i32) -> Option<String> {
+    if color == 0 {
+        return None;
+    }
+    let (r, g, b, a) = seven_tv_color_to_rgba(color);
+    if a == 0 {
+        return None;
+    }
+    Some(format!("#{r:02X}{g:02X}{b:02X}"))
+}
+
+fn seven_tv_badge_url(host_url: &str, file_name: &str) -> String {
+    let base = if host_url.starts_with("//") {
+        format!("https:{host_url}")
+    } else {
+        host_url.to_owned()
+    };
+    format!("{}/{}", base.trim_end_matches('/'), file_name)
+}
+
+fn choose_7tv_badge_file(files: &[SevenTvBadgeFile]) -> Option<&SevenTvBadgeFile> {
+    files
+        .iter()
+        .find(|f| f.name.starts_with("2x."))
+        .or_else(|| files.iter().find(|f| f.name.starts_with("1x.")))
+        .or_else(|| files.first())
+}
+
+fn fallback_hex_from_paint(paint: &SenderPaint) -> Option<String> {
+    paint
+        .stops
+        .first()
+        .and_then(|s| seven_tv_color_to_hex(s.color))
+}
+
+fn resolve_7tv_user_style(
+    style: &SevenTvUserStyleRaw,
+    paints: &HashMap<String, SenderPaint>,
+    badges: &HashMap<String, SevenTvBadgeMeta>,
+) -> SevenTvResolvedStyle {
+    let paint = style
+        .paint_id
+        .as_ref()
+        .and_then(|id| paints.get(id))
+        .cloned();
+
+    let color_hex = style
+        .color
+        .and_then(seven_tv_color_to_hex)
+        .or_else(|| paint.as_ref().and_then(fallback_hex_from_paint));
+
+    let badge = style.badge_id.as_ref().and_then(|id| badges.get(id)).map(|b| {
+        Badge {
+            name: "7tv".to_owned(),
+            version: b.tooltip.clone().unwrap_or_else(|| "1".to_owned()),
+            url: Some(b.url.clone()),
+        }
+    });
+
+    SevenTvResolvedStyle {
+        color_hex,
+        paint,
+        badge,
+    }
+}
+
+fn apply_7tv_cosmetics_to_sender(sender: &mut Sender, style: &SevenTvResolvedStyle) {
+    if let Some(ref color) = style.color_hex {
+        sender.color = Some(color.clone());
+    }
+
+    sender.paint = style.paint.clone();
+
+    if let Some(ref badge) = style.badge {
+        let already_has = sender.badges.iter().any(|b| {
+            b.url.as_deref() == badge.url.as_deref() || b.name.eq_ignore_ascii_case("7tv")
+        });
+        if !already_has {
+            sender.badges.insert(0, badge.clone());
+        }
+    }
+}
+
+async fn load_7tv_cosmetics_catalog(client: &reqwest::Client) -> Option<(HashMap<String, SenderPaint>, HashMap<String, SevenTvBadgeMeta>)> {
+    #[derive(serde::Deserialize)]
+    struct RespData {
+        cosmetics: Cosmetics,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Cosmetics {
+        paints: Vec<PaintNode>,
+        badges: Vec<BadgeNode>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct PaintNode {
+        id: String,
+        name: String,
+        #[serde(rename = "function")]
+        function_name: String,
+        #[serde(default)]
+        angle: f32,
+        #[serde(default)]
+        repeat: bool,
+        #[serde(default)]
+        image_url: String,
+        #[serde(default)]
+        stops: Vec<PaintStopNode>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct PaintStopNode {
+        at: f32,
+        color: i32,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct BadgeNode {
+        id: String,
+        tooltip: Option<String>,
+        host: BadgeHost,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct BadgeHost {
+        url: String,
+        files: Vec<SevenTvBadgeFile>,
+    }
+
+    let query = r#"
+        query {
+            cosmetics {
+                paints {
+                    id
+                    name
+                    function
+                    angle
+                    repeat
+                    image_url
+                    stops {
+                        at
+                        color
+                    }
+                }
+                badges {
+                    id
+                    tooltip
+                    host {
+                        url
+                        files {
+                            name
+                        }
+                    }
+                }
+            }
+        }
+    "#;
+
+    let resp = match client
+        .post(SEVENTV_GQL_URL)
+        .json(&serde_json::json!({ "query": query }))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("7TV cosmetics fetch failed: {e}");
+            return None;
+        }
+    };
+
+    let payload = match resp.json::<SevenTvGraphQlResponse<RespData>>().await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("7TV cosmetics parse failed: {e}");
+            return None;
+        }
+    };
+
+    if !payload.errors.is_empty() {
+        let messages = payload
+            .errors
+            .iter()
+            .map(|e| e.message.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        warn!("7TV cosmetics GraphQL errors: {messages}");
+    }
+
+    let Some(data) = payload.data else {
+        return None;
+    };
+
+    let paints: HashMap<String, SenderPaint> = data
+        .cosmetics
+        .paints
+        .into_iter()
+        .map(|p| {
+            let paint = SenderPaint {
+                id: p.id.clone(),
+                name: p.name,
+                function: p.function_name,
+                angle: p.angle,
+                repeat: p.repeat,
+                image_url: if p.image_url.is_empty() {
+                    None
+                } else {
+                    Some(p.image_url)
+                },
+                stops: p
+                    .stops
+                    .into_iter()
+                    .map(|s| SenderPaintStop {
+                        at: s.at,
+                        color: s.color,
+                    })
+                    .collect(),
+            };
+            (p.id, paint)
+        })
+        .collect();
+
+    let badges: HashMap<String, SevenTvBadgeMeta> = data
+        .cosmetics
+        .badges
+        .into_iter()
+        .filter_map(|b| {
+            let file = choose_7tv_badge_file(&b.host.files)?;
+            Some((
+                b.id,
+                SevenTvBadgeMeta {
+                    tooltip: b.tooltip,
+                    url: seven_tv_badge_url(&b.host.url, &file.name),
+                },
+            ))
+        })
+        .collect();
+
+    info!(
+        "Loaded 7TV cosmetics catalog (paints={}, badges={})",
+        paints.len(),
+        badges.len()
+    );
+
+    Some((paints, badges))
+}
+
+async fn load_7tv_user_style_for_twitch(client: &reqwest::Client, twitch_user_id: &str) -> Option<SevenTvUserStyleRaw> {
+    #[derive(serde::Deserialize)]
+    struct RespData {
+        #[serde(rename = "userByConnection")]
+        user_by_connection: Option<UserNode>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct UserNode {
+        style: StyleNode,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct StyleNode {
+        color: i32,
+        paint_id: Option<String>,
+        badge_id: Option<String>,
+    }
+
+    if twitch_user_id.trim().is_empty() {
+        return None;
+    }
+
+    let query = r#"
+        query($id: String!) {
+            userByConnection(platform: TWITCH, id: $id) {
+                style {
+                    color
+                    paint_id
+                    badge_id
+                }
+            }
+        }
+    "#;
+
+    let resp = match client
+        .post(SEVENTV_GQL_URL)
+        .json(&serde_json::json!({
+            "query": query,
+            "variables": { "id": twitch_user_id }
+        }))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            debug!("7TV user style fetch failed for {twitch_user_id}: {e}");
+            return None;
+        }
+    };
+
+    let payload = match resp.json::<SevenTvGraphQlResponse<RespData>>().await {
+        Ok(p) => p,
+        Err(e) => {
+            debug!("7TV user style parse failed for {twitch_user_id}: {e}");
+            return None;
+        }
+    };
+
+    if !payload.errors.is_empty() {
+        let messages = payload
+            .errors
+            .iter()
+            .map(|e| e.message.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        debug!("7TV user style GraphQL errors for {twitch_user_id}: {messages}");
+    }
+
+    let style = payload
+        .data
+        .and_then(|d| d.user_by_connection)
+        .map(|u| u.style)
+        .unwrap_or(StyleNode {
+            color: 0,
+            paint_id: None,
+            badge_id: None,
+        });
+
+    Some(SevenTvUserStyleRaw {
+        color: if style.color == 0 {
+            None
+        } else {
+            Some(style.color)
+        },
+        paint_id: style.paint_id.filter(|s| !s.is_empty()),
+        badge_id: style.badge_id.filter(|s| !s.is_empty()),
+    })
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SevenTvBadgeFile {
+    name: String,
+}
+
 // Badge loading
 
 /// Resolve a badge image URL from the badge map.
@@ -2788,6 +3384,7 @@ async fn load_recent_messages(
     badge_map: &BadgeMap,
     emote_cache: &Option<EmoteCache>,
     evt_tx: &mpsc::Sender<AppEvent>,
+    stv_update_tx: &mpsc::Sender<SevenTvCosmeticUpdate>,
 ) {
     let ch = channel.trim_start_matches('#');
     let channel_id = crust_core::model::ChannelId::new(ch);
@@ -2987,6 +3584,24 @@ async fn load_recent_messages(
     }
 
     info!("Loaded {} historical messages for #{ch}", messages.len());
+
+    // Collect unique Twitch user-ids from history so 7TV can resolve
+    // their cosmetics (paints/badges) retroactively.
+    {
+        let mut history_user_ids: Vec<String> = messages
+            .iter()
+            .map(|m| m.sender.user_id.0.trim().to_owned())
+            .filter(|id| !id.is_empty())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        history_user_ids.sort();
+        if !history_user_ids.is_empty() {
+            let _ = stv_update_tx
+                .send(SevenTvCosmeticUpdate::BatchUserLookup { user_ids: history_user_ids })
+                .await;
+        }
+    }
 
     // Batch-prefetch all unique image URLs with a semaphore (same path as
     // emote/badge prefetch, which also emits ImagePrefetchQueued for the
@@ -3815,6 +4430,7 @@ fn make_system_message(
             login: String::new(),
             display_name: String::new(),
             color: None,
+            paint: None,
             badges: Vec::new(),
         },
         raw_text: text,

@@ -54,6 +54,12 @@ struct EventToast {
     born: std::time::Instant,
 }
 
+#[derive(Clone)]
+struct PendingReply {
+    channel: ChannelId,
+    info: ReplyInfo,
+}
+
 /// Controls where the channel list is rendered.
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelLayout {
@@ -78,7 +84,7 @@ pub struct CrustApp {
     emote_catalog: Vec<EmoteCatalogEntry>,
     perf: PerfOverlay,
     /// Reply pending for the next send (set by right-click → Reply).
-    pending_reply: Option<ReplyInfo>,
+    pending_reply: Option<PendingReply>,
     /// User profile card (Chatterino-style, shown on username click).
     user_profile_popup: UserProfilePopup,
     /// Cached link previews (Open-Graph metadata) keyed by URL.
@@ -306,12 +312,25 @@ impl CrustApp {
             }
             AppEvent::ChannelParted { channel } => {
                 self.state.leave_channel(&channel);
+                if self
+                    .pending_reply
+                    .as_ref()
+                    .map(|r| r.channel == channel)
+                    .unwrap_or(false)
+                {
+                    self.pending_reply = None;
+                }
             }
             AppEvent::ChannelRedirected {
                 old_channel,
                 new_channel,
             } => {
                 self.state.redirect_channel(&old_channel, &new_channel);
+                if let Some(reply) = self.pending_reply.as_mut() {
+                    if reply.channel == old_channel {
+                        reply.channel = new_channel;
+                    }
+                }
             }
             AppEvent::IrcTopicChanged { channel, topic } => {
                 if let Some(ch) = self.state.channels.get_mut(&channel) {
@@ -635,6 +654,50 @@ impl CrustApp {
                     }
                     if let Some(v) = r9k {
                         ch.room_state.r9k = v;
+                    }
+                }
+            }
+            AppEvent::SenderCosmeticsUpdated {
+                user_id,
+                color,
+                paint,
+                badge,
+            } => {
+                if user_id.is_empty() {
+                    return;
+                }
+
+                let mut updated = 0u32;
+                for ch in self.state.channels.values_mut() {
+                    for msg in &mut ch.messages {
+                        if msg.sender.user_id.0 != user_id {
+                            continue;
+                        }
+
+                        if let Some(ref c) = color {
+                            msg.sender.color = Some(c.clone());
+                        }
+
+                        msg.sender.paint = paint.clone();
+
+                        if let Some(ref b) = badge {
+                            let exists = msg.sender.badges.iter().any(|x| {
+                                x.url.as_deref() == b.url.as_deref()
+                                    || x.name.eq_ignore_ascii_case("7tv")
+                            });
+                            if !exists {
+                                msg.sender.badges.insert(0, b.clone());
+                            }
+                        }
+                        updated += 1;
+                    }
+                }
+                if updated > 0 {
+                    if let Some(ref p) = paint {
+                        tracing::info!(
+                            "7TV: applied paint '{}' to {} msgs for user {}",
+                            p.name, updated, user_id
+                        );
                     }
                 }
             }
@@ -1925,6 +1988,14 @@ impl eframe::App for CrustApp {
             self.state.active_channel = Some(ch);
         }
         if let Some(ch) = ch_closed {
+            if self
+                .pending_reply
+                .as_ref()
+                .map(|r| r.channel == ch)
+                .unwrap_or(false)
+            {
+                self.pending_reply = None;
+            }
             self.send_cmd(AppCommand::LeaveChannel {
                 channel: ch.clone(),
             });
@@ -1966,8 +2037,14 @@ impl eframe::App for CrustApp {
             }))
             .show(ctx, |ui| {
                 if let Some(active_ch) = self.state.active_channel.clone() {
+                    let active_reply = self
+                        .pending_reply
+                        .as_ref()
+                        .filter(|r| r.channel == active_ch)
+                        .map(|r| r.info.clone());
+
                     // Input tray pinned to bottom
-                    let input_panel_h = if self.pending_reply.is_some() {
+                    let input_panel_h = if active_reply.is_some() {
                         64.0
                     } else {
                         t::BAR_H + (t::INPUT_MARGIN.top + t::INPUT_MARGIN.bottom) as f32
@@ -1988,12 +2065,12 @@ impl eframe::App for CrustApp {
                                 username: self.state.auth.username.as_deref(),
                                 emote_catalog: &self.emote_catalog,
                                 emote_bytes: &self.emote_bytes,
-                                pending_reply: self.pending_reply.as_ref(),
+                                pending_reply: active_reply.as_ref(),
                                 message_history: &self.message_history,
                                 known_channels: &self.state.channel_order,
                             };
                             let result = chat.show(ui, &mut self.chat_input_buf);
-                            if result.dismiss_reply {
+                            if result.dismiss_reply && active_reply.is_some() {
                                 self.pending_reply = None;
                             }
                             if let Some(text) = result.send {
@@ -2005,8 +2082,10 @@ impl eframe::App for CrustApp {
                                     }
                                 }
                                 let reply_to_msg_id =
-                                    self.pending_reply.as_ref().map(|r| r.parent_msg_id.clone());
-                                self.pending_reply = None;
+                                    active_reply.as_ref().map(|r| r.parent_msg_id.clone());
+                                if active_reply.is_some() {
+                                    self.pending_reply = None;
+                                }
                                 let is_mod = self
                                     .state
                                     .channels
@@ -2033,6 +2112,7 @@ impl eframe::App for CrustApp {
                                     &text,
                                     &active_ch,
                                     reply_to_msg_id.clone(),
+                                    active_reply.clone(),
                                     can_moderate,
                                     chatters_count,
                                     self.kick_beta_enabled,
@@ -2103,6 +2183,7 @@ impl eframe::App for CrustApp {
                                         channel: active_ch.clone(),
                                         text,
                                         reply_to_msg_id,
+                                        reply: active_reply,
                                     });
                                 }
                             }
@@ -2144,7 +2225,10 @@ impl eframe::App for CrustApp {
                         )
                         .show(ui);
                         if let Some(r) = ml_result.reply {
-                            self.pending_reply = Some(r);
+                            self.pending_reply = Some(PendingReply {
+                                channel: active_ch.clone(),
+                                info: r,
+                            });
                         }
                         if let Some((login, badges)) = ml_result.profile_request {
                             self.user_profile_popup.set_loading(
@@ -2427,6 +2511,7 @@ fn parse_slash_command(
     text: &str,
     channel: &ChannelId,
     reply_to_msg_id: Option<String>,
+    reply: Option<ReplyInfo>,
     _is_mod: bool,
     chatters_count: usize,
     kick_beta_enabled: bool,
@@ -2603,6 +2688,7 @@ fn parse_slash_command(
                     channel: channel.clone(),
                     text: text.to_owned(),
                     reply_to_msg_id,
+                    reply: reply.clone(),
                 });
             }
             let login = rest
@@ -2673,6 +2759,7 @@ fn parse_slash_command(
                 channel: channel.clone(),
                 text: fwd,
                 reply_to_msg_id,
+                reply: reply.clone(),
             })
         }
 
@@ -2681,6 +2768,7 @@ fn parse_slash_command(
             channel: channel.clone(),
             text: text.to_owned(),
             reply_to_msg_id,
+            reply: reply.clone(),
         }),
 
         // Everything else falls through to IRC

@@ -746,6 +746,7 @@ impl TwitchSession {
             login,
             display_name,
             color,
+            paint: None,
             badges,
         };
 
@@ -860,6 +861,7 @@ pub fn parse_privmsg_irc(
         login: login.clone(),
         display_name,
         color,
+        paint: None,
         badges,
     };
 

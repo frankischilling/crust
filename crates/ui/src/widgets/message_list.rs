@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 
 use crust_core::{
     events::{AppCommand, LinkPreview},
-    model::{Badge, ChannelId, ChatMessage, MessageFlags, MsgKind, ReplyInfo, Span},
+    model::{Badge, ChannelId, ChatMessage, MessageFlags, MsgKind, ReplyInfo, SenderPaint, Span},
 };
 
 use crate::theme as t;
@@ -347,6 +347,51 @@ impl<'a> MessageList<'a> {
         })
     }
 
+    fn reply_info_for_message(msg: &ChatMessage) -> Option<ReplyInfo> {
+        if msg.flags.is_deleted || !msg.channel.is_twitch() {
+            return None;
+        }
+        let parent_msg_id = msg.server_id.clone()?.trim().to_owned();
+        if parent_msg_id.is_empty() {
+            return None;
+        }
+        Some(ReplyInfo {
+            parent_msg_id,
+            parent_user_login: msg.sender.login.clone(),
+            parent_display_name: msg.sender.display_name.clone(),
+            parent_msg_body: msg.raw_text.clone(),
+        })
+    }
+
+    fn show_message_context_menu(&self, ui: &mut Ui, msg: &ChatMessage, reply_key: Id) {
+        if let Some(info) = Self::reply_info_for_message(msg) {
+            if ui.button("↩  Reply").clicked() {
+                ui.ctx().data_mut(|d| d.insert_temp(reply_key, info));
+                ui.close_menu();
+            }
+        } else {
+            let hint = if msg.flags.is_deleted {
+                "Cannot reply to deleted messages"
+            } else if !msg.channel.is_twitch() {
+                "Inline replies are currently supported for Twitch messages only"
+            } else {
+                "Cannot reply to this message yet (missing message id)"
+            };
+            ui.add_enabled(false, egui::Button::new("↩  Reply"))
+                .on_hover_text(hint);
+        }
+
+        ui.separator();
+        if ui.button("📋  Copy message").clicked() {
+            ui.ctx().copy_text(msg.raw_text.clone());
+            ui.close_menu();
+        }
+        if ui.button("👤  Copy username").clicked() {
+            ui.ctx().copy_text(msg.sender.login.clone());
+            ui.close_menu();
+        }
+    }
+
     /// If the snap-to-bottom flag is active, force the scroll offset to the
     /// current real maximum every frame until `stick_to_bottom` takes over.
     fn apply_snap(&self, ui: &mut Ui, output: &egui::scroll_area::ScrollAreaOutput<()>) {
@@ -452,8 +497,6 @@ impl<'a> MessageList<'a> {
 
         let reply_key = Id::new("ml_reply_req").with(self.channel.as_str());
         let scroll_to_key = egui::Id::new("ml_scroll_to").with(self.channel.as_str());
-        // Stable ID per message for context menu state tracking.
-        let ctx_id = egui::Id::new("msg_ctx").with(msg.id.0);
 
         // ── Message background ──────────────────────────────────────────
         let bg = if msg.flags.is_highlighted {
@@ -479,43 +522,6 @@ impl<'a> MessageList<'a> {
                 if msg.flags.is_history {
                     ui.set_opacity(0.55);
                 }
-                // ── Context menu - registered FIRST so child widgets (images,
-                // labels) have higher registration order and win egui's hover
-                // hit-test, keeping emote/badge tooltips functional.
-                // `ui.interact` does NOT move the cursor / allocate space.
-                //
-                // We capture `msg` by reference so strings are only cloned
-                // when the user actually opens the menu (not every frame).
-                ui.interact(ui.max_rect(), ctx_id, egui::Sense::click())
-                    .context_menu(|ui| {
-                        // Reply - works for any non-deleted message (Twitch uses
-                        // server_id, IRC uses a local fallback).
-                        if !msg.flags.is_deleted {
-                            let reply_id = msg
-                                .server_id
-                                .clone()
-                                .unwrap_or_else(|| msg.id.0.to_string());
-                            if ui.button("↩  Reply").clicked() {
-                                let info = ReplyInfo {
-                                    parent_msg_id: reply_id,
-                                    parent_user_login: msg.sender.login.clone(),
-                                    parent_display_name: msg.sender.display_name.clone(),
-                                    parent_msg_body: msg.raw_text.clone(),
-                                };
-                                ui.ctx().data_mut(|d| d.insert_temp(reply_key, info));
-                                ui.close_menu();
-                            }
-                        }
-                        ui.separator();
-                        if ui.button("📋  Copy message").clicked() {
-                            ui.ctx().copy_text(msg.raw_text.clone());
-                            ui.close_menu();
-                        }
-                        if ui.button("👤  Copy username").clicked() {
-                            ui.ctx().copy_text(msg.sender.login.clone());
-                            ui.close_menu();
-                        }
-                    });
                 if let Some(ref rep) = msg.reply {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
@@ -546,6 +552,7 @@ impl<'a> MessageList<'a> {
                             .sense(egui::Sense::click())
                             .truncate(),
                         );
+                        h.context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
                         if h.clicked() {
                             let target = rep.parent_msg_id.clone();
                             ui.ctx().data_mut(|d| d.insert_temp(scroll_to_key, target));
@@ -641,14 +648,52 @@ impl<'a> MessageList<'a> {
                         } else {
                             msg.sender.display_name.clone()
                         };
-                        let name_resp = ui
-                            .add(
+                        let name_resp = if let Some(paint) = msg
+                            .sender
+                            .paint
+                            .as_ref()
+                            .filter(|p| !p.stops.is_empty() || p.image_url.is_some())
+                        {
+                            // For URL-based (image) paints, try to sample
+                            // pixel colors from the loaded image data.
+                            let image_data = paint
+                                .image_url
+                                .as_deref()
+                                .and_then(|url| self.emote_bytes.get(url));
+
+                            if paint.image_url.is_some() && image_data.is_none() {
+                                // Image not yet fetched — request it and fall
+                                // back to the user's color for this frame.
+                                if let Some(url) = &paint.image_url {
+                                    let _ = self.cmd_tx.try_send(AppCommand::FetchImage {
+                                        url: url.clone(),
+                                    });
+                                }
+                                ui.add(
+                                    Label::new(
+                                        RichText::new(&name).color(name_color).strong(),
+                                    )
+                                    .sense(egui::Sense::click()),
+                                )
+                            } else {
+                                ui.add(
+                                    Label::new(build_painted_name_layout(
+                                        &name, paint, image_data,
+                                    ))
+                                    .sense(egui::Sense::click()),
+                                )
+                            }
+                        } else {
+                            ui.add(
                                 Label::new(RichText::new(name).color(name_color).strong())
                                     .sense(egui::Sense::click()),
                             )
-                            .on_hover_ui(|ui| {
-                                ui.label(format!("@{}", msg.sender.login));
-                            });
+                        }
+                        .on_hover_ui(|ui| {
+                            ui.label(format!("@{}", msg.sender.login));
+                        });
+                        name_resp
+                            .context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
                         if name_resp.clicked() {
                             // Clone only when clicked - not every frame.
                             let _ = self.cmd_tx.try_send(AppCommand::ShowUserCard {
@@ -702,6 +747,12 @@ impl<'a> MessageList<'a> {
                     },
                 );
             });
+
+        // Attach a context menu to the full rendered row, so right-clicking
+        // the message body (not only clickable children) opens Reply.
+        msg_frame
+            .response
+            .context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
 
         // Left accent strip for mentions and highlights - a vivid 3 px bar on
         // the left edge of the row so the eye finds them instantly in fast chat.
@@ -1147,6 +1198,108 @@ fn fit_size(w: u32, h: u32, target_h: f32) -> Vec2 {
     }
     let scale = target_h / h as f32;
     Vec2::new(w as f32 * scale, target_h)
+}
+
+fn build_painted_name_layout(
+    name: &str,
+    paint: &SenderPaint,
+    image_data: Option<&(u32, u32, Arc<[u8]>)>,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    let chars: Vec<char> = name.chars().collect();
+    let len = chars.len().max(1);
+
+    for (idx, ch) in chars.iter().enumerate() {
+        let t = if len <= 1 {
+            0.0
+        } else {
+            idx as f32 / (len - 1) as f32
+        };
+        let color = if let Some(&(w, h, ref raw)) = image_data {
+            sample_image_color(raw, w, h, t)
+        } else {
+            paint_color_at(paint, t)
+        };
+        job.append(
+            &ch.to_string(),
+            0.0,
+            egui::TextFormat {
+                font_id: t::body(),
+                color,
+                ..Default::default()
+            },
+        );
+    }
+
+    job
+}
+
+/// Sample a pixel color from raw RGBA image bytes at a horizontal position `t`
+/// in [0..1], reading from the vertical center row.
+fn sample_image_color(raw: &[u8], w: u32, h: u32, t: f32) -> Color32 {
+    if w == 0 || h == 0 || raw.len() < (w * h * 4) as usize {
+        return t::ACCENT;
+    }
+    let x = ((t * (w as f32 - 1.0)).round() as u32).min(w - 1);
+    let y = h / 2;
+    let idx = ((y * w + x) * 4) as usize;
+    if idx + 3 < raw.len() {
+        Color32::from_rgba_unmultiplied(raw[idx], raw[idx + 1], raw[idx + 2], raw[idx + 3])
+    } else {
+        t::ACCENT
+    }
+}
+
+fn paint_color_at(paint: &SenderPaint, t: f32) -> Color32 {
+    if paint.stops.is_empty() {
+        return t::ACCENT;
+    }
+
+    if paint.stops.len() == 1 {
+        return seven_tv_color32(paint.stops[0].color);
+    }
+
+    let mut stops: Vec<(f32, Color32)> = paint
+        .stops
+        .iter()
+        .map(|s| (s.at, seven_tv_color32(s.color)))
+        .collect();
+    stops.sort_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let t = t.clamp(0.0, 1.0);
+    let mut prev = stops[0];
+    for next in stops.iter().skip(1) {
+        if t <= next.0 {
+            let span = (next.0 - prev.0).abs().max(0.0001);
+            let x = ((t - prev.0) / span).clamp(0.0, 1.0);
+            return lerp_color(prev.1, next.1, x);
+        }
+        prev = *next;
+    }
+
+    prev.1
+}
+
+fn seven_tv_color32(color: i32) -> Color32 {
+    let raw = color as u32;
+    let r = ((raw >> 24) & 0xFF) as u8;
+    let g = ((raw >> 16) & 0xFF) as u8;
+    let b = ((raw >> 8) & 0xFF) as u8;
+    let a = (raw & 0xFF) as u8;
+    Color32::from_rgba_unmultiplied(r, g, b, a)
+}
+
+fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+        (a as f32 + (b as f32 - a as f32) * t).round().clamp(0.0, 255.0) as u8
+    }
+
+    Color32::from_rgba_unmultiplied(
+        lerp_u8(a.r(), b.r(), t),
+        lerp_u8(a.g(), b.g(), t),
+        lerp_u8(a.b(), b.b(), t),
+        lerp_u8(a.a(), b.a(), t),
+    )
 }
 
 fn sender_color(color: &Option<String>) -> Color32 {

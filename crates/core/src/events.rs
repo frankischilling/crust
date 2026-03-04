@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::model::{ChannelId, ChatMessage, EmoteCatalogEntry, SystemNotice, UserProfile};
+use crate::model::{
+    Badge, ChannelId, ChatMessage, EmoteCatalogEntry, ReplyInfo, SenderPaint, SystemNotice,
+    UserProfile,
+};
 // LinkPreview: Open Graph / Twitter Card metadata for a URL
 
 /// Open Graph / Twitter Card metadata fetched for a URL.
@@ -40,6 +43,9 @@ pub enum AppCommand {
         text: String,
         /// If set, the message is a reply to this server-assigned message ID.
         reply_to_msg_id: Option<String>,
+        /// Optional reply context used for local-echo rendering.
+        #[serde(default)]
+        reply: Option<ReplyInfo>,
     },
     /// Request a Twitch user profile lookup by login name.
     FetchUserProfile { login: String },
@@ -233,6 +239,15 @@ pub enum AppEvent {
         slow: Option<u32>,
         subs_only: Option<bool>,
         r9k: Option<bool>,
+    },
+    /// 7TV cosmetics resolved for a Twitch user id; UI should update visible
+    /// messages from this sender so paints/badges appear without waiting for
+    /// a new message.
+    SenderCosmeticsUpdated {
+        user_id: String,
+        color: Option<String>,
+        paint: Option<SenderPaint>,
+        badge: Option<Badge>,
     },
 }
 

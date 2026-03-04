@@ -1299,6 +1299,7 @@ fn parse_irc_privmsg(msg: &IrcMessage, key: &ServerKey, my_nick: &str) -> Option
             login: login.clone(),
             display_name,
             color,
+            paint: None,
             badges,
         },
         raw_text: text.to_owned(),

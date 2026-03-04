@@ -772,6 +772,7 @@ mod tests {
                 login: login.to_owned(),
                 display_name: login.to_owned(),
                 color: None,
+                paint: None,
                 badges: vec![],
             },
             raw_text: raw_text.to_owned(),

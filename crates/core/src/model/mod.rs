@@ -286,6 +286,31 @@ pub struct Badge {
     pub url: Option<String>,
 }
 
+/// One gradient stop in a 7TV paint definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SenderPaintStop {
+    /// Relative position in the gradient [0..1].
+    pub at: f32,
+    /// 7TV packed RGBA color as signed i32.
+    pub color: i32,
+}
+
+/// 7TV custom name-paint metadata resolved by the runtime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SenderPaint {
+    pub id: String,
+    pub name: String,
+    /// 7TV paint function (e.g. LINEAR_GRADIENT).
+    pub function: String,
+    pub angle: f32,
+    pub repeat: bool,
+    /// Optional texture URL used by image paints.
+    #[serde(default)]
+    pub image_url: Option<String>,
+    #[serde(default)]
+    pub stops: Vec<SenderPaintStop>,
+}
+
 // Sender: chat message sender metadata
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -297,6 +322,9 @@ pub struct Sender {
     pub display_name: String,
     /// #rrggbb color from IRC tag, or None.
     pub color: Option<String>,
+    /// Optional 7TV paint metadata for custom name rendering.
+    #[serde(default)]
+    pub paint: Option<SenderPaint>,
     pub badges: Vec<Badge>,
 }
 
@@ -538,8 +566,19 @@ impl ChannelState {
             // metadata we now know (badges, colour, timestamp, …).
             existing.server_id = Some(echo_id.clone());
             existing.timestamp = msg.timestamp;
-            existing.sender.color = msg.sender.color.clone();
-            existing.sender.badges = msg.sender.badges.clone();
+            existing.sender = msg.sender.clone();
+            existing.twitch_emotes = msg.twitch_emotes.clone();
+            existing.spans = msg.spans.clone();
+            existing.reply = msg.reply.clone();
+            existing.msg_kind = msg.msg_kind.clone();
+
+            // Preserve local echo invariants while importing server metadata.
+            existing.flags.is_self = true;
+            existing.flags.is_history = false;
+            existing.flags.is_action = msg.flags.is_action;
+            existing.flags.is_highlighted = msg.flags.is_highlighted;
+            existing.flags.is_mention = msg.flags.is_mention;
+            existing.flags.custom_reward_id = msg.flags.custom_reward_id.clone();
             return true;
         }
         false
