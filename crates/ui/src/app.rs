@@ -1692,6 +1692,7 @@ impl eframe::App for CrustApp {
                     .channels
                     .get(active_ch)
                     .map(|ch| &ch.room_state);
+                let live_viewers = status.and_then(|s| if s.is_live { s.viewers } else { None });
                 let has_active_modes = room
                     .map(|rs| {
                         rs.emote_only
@@ -1700,7 +1701,8 @@ impl eframe::App for CrustApp {
                             || rs.followers_only.map(|v| v >= 0).unwrap_or(false)
                             || rs.slow_mode.map(|v| v > 0).unwrap_or(false)
                     })
-                    .unwrap_or(false);
+                    .unwrap_or(false)
+                    || live_viewers.is_some();
                 if has_active_modes {
                     TopBottomPanel::top("room_state_bar")
                         .exact_height(20.0)
@@ -1734,6 +1736,13 @@ impl eframe::App for CrustApp {
                                     if rs.r9k {
                                         room_state_pill(ui, "R9K", t::TEXT_MUTED);
                                     }
+                                }
+                                if let Some(viewers) = live_viewers {
+                                    room_state_pill(
+                                        ui,
+                                        &format!("Viewers {}", fmt_viewers(viewers)),
+                                        t::RAID_CYAN,
+                                    );
                                 }
                             });
                         });

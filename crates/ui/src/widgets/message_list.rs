@@ -76,6 +76,21 @@ impl<'a> MessageList<'a> {
         let n = self.messages.len();
         // Use a per-channel scroll area ID so offset doesn't leak
         let scroll_id = egui::Id::new("message_list").with(self.channel.as_str());
+        let paused_key = egui::Id::new("scroll_paused").with(self.channel.as_str());
+
+        // If the user scrolls over the message panel, immediately pause
+        // stick-to-bottom so upward wheel input can take effect this frame.
+        let wheel_over_panel = ui.ctx().input(|i| {
+            let over_panel = i
+                .pointer
+                .hover_pos()
+                .map(|p| panel_rect.contains(p))
+                .unwrap_or(false);
+            over_panel && i.raw_scroll_delta.y.abs() > 0.0
+        });
+        if wheel_over_panel {
+            ui.ctx().data_mut(|d| d.insert_temp(paused_key, true));
+        }
 
         // Reset stale scroll state on first render of a channel
         // egui persists scroll offsets across sessions.  When we
@@ -166,7 +181,6 @@ impl<'a> MessageList<'a> {
             // ── Simple path: render every message, let egui handle layout ─
             // We also measure row heights here so the cache is pre-populated
             // when the channel crosses VIRTUAL_THRESHOLD.
-            let paused_key = egui::Id::new("scroll_paused").with(self.channel.as_str());
             let scroll_paused: bool = ui
                 .ctx()
                 .data_mut(|d| d.get_temp(paused_key).unwrap_or(false));
@@ -221,7 +235,6 @@ impl<'a> MessageList<'a> {
         // show_viewport gives us the currently-visible rect in content-local
         // coordinates.  We allocate dead space for off-screen rows and only
         // call render_message for rows whose y-range overlaps the viewport.
-        let paused_key = egui::Id::new("scroll_paused").with(self.channel.as_str());
         let scroll_paused: bool = ui
             .ctx()
             .data_mut(|d| d.get_temp(paused_key).unwrap_or(false));
@@ -661,24 +674,31 @@ impl<'a> MessageList<'a> {
                             ));
                         }
 
-                        // Message spans - for deleted messages show the
-                        // original content with strikethrough so moderator
-                        // actions are visible without being prominent.
-                        if msg.flags.is_deleted {
-                            ui.add(
-                                Label::new(
-                                    RichText::new(format!("✂ {}", msg.raw_text))
-                                        .strikethrough()
-                                        .italics()
-                                        .color(t::TEXT_MUTED),
-                                )
-                                .wrap(),
-                            );
-                        } else {
-                            for span in &msg.spans {
-                                self.render_span(ui, span, msg.flags.is_action);
+                        // Message spans carry their own whitespace from the
+                        // tokenizer, so keep inter-widget spacing at zero to
+                        // avoid rendering words with visually doubled spaces.
+                        ui.scope(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+
+                            // For deleted messages show the original content
+                            // with strikethrough so moderator actions are
+                            // visible without being prominent.
+                            if msg.flags.is_deleted {
+                                ui.add(
+                                    Label::new(
+                                        RichText::new(format!("✂ {}", msg.raw_text))
+                                            .strikethrough()
+                                            .italics()
+                                            .color(t::TEXT_MUTED),
+                                    )
+                                    .wrap(),
+                                );
+                            } else {
+                                for span in &msg.spans {
+                                    self.render_span(ui, span, msg.flags.is_action);
+                                }
                             }
-                        }
+                        });
                     },
                 );
             });
