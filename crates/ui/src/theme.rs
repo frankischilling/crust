@@ -64,7 +64,7 @@ pub const RADIUS_SM: CornerRadius = CornerRadius::same(3);
 /// Standard toolbar row height.
 pub const BAR_H: f32 = 28.0;
 /// Minimum sidebar width.
-pub const SIDEBAR_MIN_W: f32 = 110.0;
+pub const SIDEBAR_MIN_W: f32 = 80.0;
 /// Maximum sidebar width.
 pub const SIDEBAR_MAX_W: f32 = 300.0;
 /// Default sidebar width.

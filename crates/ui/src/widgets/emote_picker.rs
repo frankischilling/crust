@@ -23,7 +23,7 @@ struct CachedTab {
     indices: Vec<usize>, // indices into catalog
 }
 
-/// Cached filtered/grouped view.
+    /// Cached filtered/grouped view.
 struct CachedView {
     filter: String,
     catalog_len: usize,

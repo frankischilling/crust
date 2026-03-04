@@ -65,6 +65,23 @@ impl AppState {
         }
     }
 
+    /// Redirect a channel (e.g. IRC 470 forward).
+    /// Moves the existing channel state to the new id, preserving messages
+    /// and tab position.
+    pub fn redirect_channel(&mut self, old: &ChannelId, new: &ChannelId) {
+        if let Some(mut ch_state) = self.channels.remove(old) {
+            ch_state.id = new.clone();
+            self.channels.insert(new.clone(), ch_state);
+        }
+        // Update channel order in-place to preserve tab position.
+        if let Some(pos) = self.channel_order.iter().position(|c| c == old) {
+            self.channel_order[pos] = new.clone();
+        }
+        if self.active_channel.as_ref() == Some(old) {
+            self.active_channel = Some(new.clone());
+        }
+    }
+
     pub fn active_state(&self) -> Option<&ChannelState> {
         self.active_channel
             .as_ref()

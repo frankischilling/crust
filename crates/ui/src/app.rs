@@ -101,6 +101,9 @@ pub struct CrustApp {
     stream_statuses: HashMap<String, StreamStatusInfo>,
     /// When each channel's stream status was last fetched.
     stream_status_fetched: HashMap<String, std::time::Instant>,
+    /// Cached live-status map derived from `stream_statuses`; rebuilt only on
+    /// change rather than every frame.
+    live_map_cache: HashMap<String, bool>,
     /// Short-lived pop-in banners for Sub / Raid / Bits events (cap 5).
     event_toasts: Vec<EventToast>,
     /// Settings dialog visibility.
@@ -109,6 +112,12 @@ pub struct CrustApp {
     kick_beta_enabled: bool,
     /// Persisted IRC compatibility (beta) toggle.
     irc_beta_enabled: bool,
+    /// NickServ username for IRC auto-identification.
+    irc_nickserv_user: String,
+    /// NickServ password for IRC auto-identification.
+    irc_nickserv_pass: String,
+    /// Window always-on-top mode.
+    always_on_top: bool,
 }
 
 impl CrustApp {
@@ -193,18 +202,29 @@ impl CrustApp {
             loading_screen: LoadingScreen::default(),
             stream_statuses: HashMap::new(),
             stream_status_fetched: HashMap::new(),
+            live_map_cache: HashMap::new(),
             event_toasts: Vec::new(),
             settings_open: false,
             kick_beta_enabled: false,
             irc_beta_enabled: false,
+            irc_nickserv_user: String::new(),
+            irc_nickserv_pass: String::new(),
+            always_on_top: false,
         }
     }
 
     fn drain_events(&mut self, ctx: &Context) -> u32 {
+        const MAX_EVENTS_PER_FRAME: u32 = 200;
         let mut count = 0u32;
         while let Ok(evt) = self.event_rx.try_recv() {
             self.apply_event(evt, ctx);
             count += 1;
+            if count >= MAX_EVENTS_PER_FRAME {
+                // More events remain — schedule another repaint so we
+                // drain them across multiple frames instead of stalling.
+                ctx.request_repaint();
+                break;
+            }
         }
         count
     }
@@ -281,6 +301,17 @@ impl CrustApp {
             }
             AppEvent::ChannelParted { channel } => {
                 self.state.leave_channel(&channel);
+            }
+            AppEvent::ChannelRedirected {
+                old_channel,
+                new_channel,
+            } => {
+                self.state.redirect_channel(&old_channel, &new_channel);
+            }
+            AppEvent::IrcTopicChanged { channel, topic } => {
+                if let Some(ch) = self.state.channels.get_mut(&channel) {
+                    ch.topic = Some(topic);
+                }
             }
             AppEvent::MessageReceived { channel, message } => {
                 if channel.is_irc() && !self.state.channels.contains_key(&channel) {
@@ -460,6 +491,8 @@ impl CrustApp {
                         viewers: profile.stream_viewers,
                     },
                 );
+                // Keep the cheap live-map cache in sync.
+                self.live_map_cache.insert(login.clone(), profile.is_live);
                 self.stream_status_fetched
                     .insert(login, std::time::Instant::now());
                 // This event is also used for channel live-status refresh.
@@ -545,9 +578,22 @@ impl CrustApp {
             AppEvent::BetaFeaturesUpdated {
                 kick_enabled,
                 irc_enabled,
+                irc_nickserv_user,
+                irc_nickserv_pass,
+                always_on_top,
             } => {
                 self.kick_beta_enabled = kick_enabled;
                 self.irc_beta_enabled = irc_enabled;
+                self.irc_nickserv_user = irc_nickserv_user;
+                self.irc_nickserv_pass = irc_nickserv_pass;
+                self.always_on_top = always_on_top;
+                // Apply the persisted always-on-top preference.
+                let level = if always_on_top {
+                    egui::viewport::WindowLevel::AlwaysOnTop
+                } else {
+                    egui::viewport::WindowLevel::Normal
+                };
+                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
             }
             AppEvent::ChannelEmotesLoaded { .. } => {
                 // Handled in the loading-screen pre-pass above; nothing else to do.
@@ -582,15 +628,10 @@ impl eframe::App for CrustApp {
         }
         // Bump to 33 ms (~30 fps) when live-dot animations or toast slide-ins
         // are active so they look smooth.
-        let has_live_channel = self
-            .state
-            .active_channel
-            .as_ref()
-            .and_then(|ch| self.stream_statuses.get(&ch.display_name().to_lowercase()))
-            .map(|s| s.is_live)
-            .unwrap_or(false);
+        // PERF: avoid per-frame to_lowercase() allocation — check live status
+        // directly against stream_statuses values.
         let has_live_sidebar = self.stream_statuses.values().any(|s| s.is_live);
-        let repaint_ms = if has_live_channel || has_live_sidebar || !self.event_toasts.is_empty() {
+        let repaint_ms = if has_live_sidebar || !self.event_toasts.is_empty() {
             33
         } else {
             100
@@ -610,32 +651,40 @@ impl eframe::App for CrustApp {
 
         // Keep analytics cache warm even when the panel is hidden, so data
         // is ready the moment the user opens it.
-        if let Some(ref ch) = self.state.active_channel.clone() {
+        if let Some(ref ch) = self.state.active_channel {
             if let Some(ch_state) = self.state.channels.get(ch) {
                 self.analytics_panel.tick(ch_state);
             }
         }
 
         // Periodic stream-status refresh: re-fetch every 60 s per channel.
+        // PERF: iterate without collecting into a Vec; avoid per-channel
+        // to_lowercase() allocations when all timestamps are fresh.
         const STREAM_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
-        let stale_channels: Vec<String> = self
-            .state
-            .channel_order
-            .iter()
-            .filter(|ch| ch.is_twitch())
-            .map(|ch| ch.display_name().to_lowercase())
-            .filter(|login| is_valid_twitch_login(login))
-            .filter(|login| {
-                self.stream_status_fetched
-                    .get(login)
+        {
+            let mut stale: Vec<String> = Vec::new();
+            for ch in &self.state.channel_order {
+                if !ch.is_twitch() {
+                    continue;
+                }
+                let login = ch.display_name().to_lowercase();
+                if !is_valid_twitch_login(&login) {
+                    continue;
+                }
+                let is_stale = self
+                    .stream_status_fetched
+                    .get(&login)
                     .map(|t| t.elapsed() >= STREAM_REFRESH)
-                    .unwrap_or(true) // no entry at all → fetch immediately
-            })
-            .collect();
-        for login in stale_channels {
-            self.stream_status_fetched
-                .insert(login.clone(), std::time::Instant::now());
-            self.send_cmd(AppCommand::FetchUserProfile { login });
+                    .unwrap_or(true);
+                if is_stale {
+                    stale.push(login);
+                }
+            }
+            for login in stale {
+                self.stream_status_fetched
+                    .insert(login.clone(), std::time::Instant::now());
+                self.send_cmd(AppCommand::FetchUserProfile { login });
+            }
         }
 
         // Render profile popup and dispatch any moderation action.
@@ -716,6 +765,9 @@ impl eframe::App for CrustApp {
             let mut settings_open = self.settings_open;
             let mut kick = self.kick_beta_enabled;
             let mut irc = self.irc_beta_enabled;
+            let mut ns_user = self.irc_nickserv_user.clone();
+            let mut ns_pass = self.irc_nickserv_pass.clone();
+            let mut on_top = self.always_on_top;
 
             egui::Window::new("Settings")
                 .open(&mut settings_open)
@@ -723,7 +775,22 @@ impl eframe::App for CrustApp {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    ui.set_min_width(360.0);
+                    let settings_w = (ctx.screen_rect().width() - 24.0).clamp(200.0, 400.0);
+                    ui.set_min_width(settings_w);
+                    ui.set_max_width(settings_w);
+
+                    ui.label(
+                        RichText::new("Window")
+                            .font(t::body())
+                            .strong()
+                            .color(t::TEXT_PRIMARY),
+                    );
+                    ui.add_space(4.0);
+                    ui.checkbox(&mut on_top, "Always on top");
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+
                     ui.label(
                         RichText::new("Experimental Transport Compatibility")
                             .font(t::body())
@@ -734,6 +801,36 @@ impl eframe::App for CrustApp {
 
                     ui.checkbox(&mut kick, "Kick compatibility (beta)");
                     ui.checkbox(&mut irc, "IRC chat compatibility (beta)");
+
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+
+                    ui.label(
+                        RichText::new("IRC NickServ Auto-Identify")
+                            .font(t::body())
+                            .strong()
+                            .color(t::TEXT_PRIMARY),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(
+                            "Automatically identify with NickServ when connecting to IRC servers.",
+                        )
+                        .font(t::small())
+                        .color(t::TEXT_MUTED),
+                    );
+                    ui.add_space(6.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label("Username:");
+                        ui.text_edit_singleline(&mut ns_user);
+                    });
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Password:");
+                        ui.add(egui::TextEdit::singleline(&mut ns_pass).password(true));
+                    });
 
                     ui.add_space(8.0);
                     ui.label(
@@ -746,6 +843,16 @@ impl eframe::App for CrustApp {
                 });
 
             self.settings_open = settings_open;
+            if on_top != self.always_on_top {
+                self.always_on_top = on_top;
+                let level = if on_top {
+                    egui::viewport::WindowLevel::AlwaysOnTop
+                } else {
+                    egui::viewport::WindowLevel::Normal
+                };
+                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+                self.send_cmd(AppCommand::SetAlwaysOnTop { enabled: on_top });
+            }
             if kick != self.kick_beta_enabled || irc != self.irc_beta_enabled {
                 self.kick_beta_enabled = kick;
                 self.irc_beta_enabled = irc;
@@ -754,11 +861,30 @@ impl eframe::App for CrustApp {
                     irc_enabled: irc,
                 });
             }
+            if ns_user != self.irc_nickserv_user || ns_pass != self.irc_nickserv_pass {
+                self.irc_nickserv_user = ns_user.clone();
+                self.irc_nickserv_pass = ns_pass.clone();
+                self.send_cmd(AppCommand::SetIrcAuth {
+                    nickserv_user: ns_user,
+                    nickserv_pass: ns_pass,
+                });
+            }
         }
 
         // -- Top bar -----------------------------------------------------------
+        // Auto-collapse sidebar into top tabs when window is very narrow so
+        // the chat area always has usable space for a super-thin layout.
+        let window_width = ctx.screen_rect().width();
+        const NARROW_THRESHOLD: f32 = 400.0;
+        const VERY_NARROW_THRESHOLD: f32 = 260.0;
+        if window_width < NARROW_THRESHOLD {
+            if self.channel_layout == ChannelLayout::Sidebar && self.sidebar_visible {
+                self.channel_layout = ChannelLayout::TopTabs;
+            }
+        }
+
         TopBottomPanel::top("status_bar")
-            .exact_height(36.0)
+            .exact_height(if window_width < VERY_NARROW_THRESHOLD { 28.0 } else { 36.0 })
             .frame(
                 Frame::new()
                     .fill(t::BG_SURFACE)
@@ -766,19 +892,21 @@ impl eframe::App for CrustApp {
                     .stroke(egui::Stroke::new(1.0, t::BORDER_SUBTLE)),
             )
             .show(ctx, |ui| {
+                ui.set_clip_rect(ui.max_rect());
                 let bar_width = ui.available_width();
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing = t::TOOLBAR_SPACING;
 
                     // App logotype
-                    ui.label(
-                        RichText::new("crust")
-                            .font(egui::FontId::proportional(15.0))
-                            .strong()
-                            .color(t::ACCENT),
-                    );
-
-                    ui.separator();
+                    if bar_width > 200.0 {
+                        ui.label(
+                            RichText::new("crust")
+                                .font(egui::FontId::proportional(15.0))
+                                .strong()
+                                .color(t::ACCENT),
+                        );
+                        ui.separator();
+                    }
 
                     // Connection indicator
                     let dot_r = 4.5_f32;
@@ -802,10 +930,12 @@ impl eframe::App for CrustApp {
                     ui.separator();
 
                     // Join channel button
+                    let join_label = if bar_width < 300.0 { "+" } else { "+ Join" };
+                    let join_w = if bar_width < 300.0 { 28.0 } else { 72.0 };
                     if ui
                         .add_sized(
-                            [72.0, t::BAR_H],
-                            egui::Button::new(RichText::new("+ Join").font(t::small())),
+                            [join_w, t::BAR_H],
+                            egui::Button::new(RichText::new(join_label).font(t::small())),
                         )
                         .on_hover_text("Join a Twitch channel")
                         .clicked()
@@ -815,6 +945,8 @@ impl eframe::App for CrustApp {
 
                     ui.separator();
 
+                    // Sidebar / layout toggles — hidden at very narrow widths
+                    if bar_width > 350.0 {
                     // Sidebar visibility toggle
                     let sidebar_open =
                         self.channel_layout == ChannelLayout::Sidebar && self.sidebar_visible;
@@ -870,15 +1002,19 @@ impl eframe::App for CrustApp {
                             self.sidebar_visible = true;
                         }
                     }
+                    } // end bar_width > 350 guard
 
                     // Right-side items
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing = t::TOOLBAR_SPACING;
 
+                        // Settings button — compact at narrow widths
+                        let settings_label = if bar_width < 300.0 { "⚙" } else { "Settings" };
+                        let settings_w = if bar_width < 300.0 { 28.0 } else { 72.0 };
                         if ui
                             .add_sized(
-                                [72.0, t::BAR_H],
-                                egui::Button::new(RichText::new("Settings").font(t::small())),
+                                [settings_w, t::BAR_H],
+                                egui::Button::new(RichText::new(settings_label).font(t::small())),
                             )
                             .on_hover_text("Open application settings")
                             .clicked()
@@ -928,23 +1064,26 @@ impl eframe::App for CrustApp {
                             ui.separator();
                         }
 
-                        let irc_status_label = if self.irc_status_visible {
-                            "IRC: on"
-                        } else {
-                            "IRC: off"
-                        };
-                        if ui
-                            .add_sized(
-                                [62.0, t::BAR_H],
-                                egui::Button::new(RichText::new(irc_status_label).font(t::small())),
-                            )
-                            .on_hover_text("Toggle IRC status window")
-                            .clicked()
-                        {
-                            self.irc_status_visible = !self.irc_status_visible;
-                        }
+                        // IRC status toggle - hide at narrow widths
+                        if bar_width > 400.0 {
+                            let irc_status_label = if self.irc_status_visible {
+                                "IRC: on"
+                            } else {
+                                "IRC: off"
+                            };
+                            if ui
+                                .add_sized(
+                                    [62.0, t::BAR_H],
+                                    egui::Button::new(RichText::new(irc_status_label).font(t::small())),
+                                )
+                                .on_hover_text("Toggle IRC status window")
+                                .clicked()
+                            {
+                                self.irc_status_visible = !self.irc_status_visible;
+                            }
 
-                        ui.separator();
+                            ui.separator();
+                        }
 
                         // Emote count - hide at narrow widths
                         if bar_width > 550.0 {
@@ -1090,31 +1229,59 @@ impl eframe::App for CrustApp {
                             .stroke(egui::Stroke::new(1.0, t::BORDER_SUBTLE)),
                     )
                     .show(ctx, |ui| {
+                        ui.set_clip_rect(ui.max_rect());
                         let prefix = if active_ch.is_kick() || active_ch.is_irc_server_tab() {
                             ""
                         } else {
                             "#"
                         };
                         let platform = if active_ch.is_kick() { "Kick" } else { "IRC" };
+                        let topic = self
+                            .state
+                            .channels
+                            .get(active_ch)
+                            .and_then(|ch| ch.topic.as_deref())
+                            .unwrap_or("");
+                        let bar_w = ui.available_width();
                         ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(format!("{prefix}{}", active_ch.display_name()))
-                                    .strong()
-                                    .font(t::small())
-                                    .color(t::TEXT_PRIMARY),
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!("{prefix}{}", active_ch.display_name()))
+                                        .strong()
+                                        .font(t::small())
+                                        .color(t::TEXT_PRIMARY),
+                                )
+                                .truncate(),
                             );
-                            ui.label(
-                                RichText::new(platform)
-                                    .font(t::small())
-                                    .color(t::TEXT_MUTED),
-                            );
+                            if bar_w > 120.0 {
+                                ui.label(
+                                    RichText::new(platform)
+                                        .font(t::small())
+                                        .color(t::TEXT_MUTED),
+                                );
+                            }
+                            if !topic.is_empty() && bar_w > 200.0 {
+                                ui.label(
+                                    RichText::new("—")
+                                        .font(t::small())
+                                        .color(t::TEXT_MUTED),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(topic)
+                                            .font(t::small())
+                                            .color(t::TEXT_SECONDARY),
+                                    )
+                                    .truncate(),
+                                );
+                            }
                         });
                     });
             } else {
                 let login = active_ch.display_name().to_lowercase();
-                let status = self.stream_statuses.get(&login).cloned();
+                let status = self.stream_statuses.get(&login);
                 // Subtle red tint on the bar background when the channel is live.
-                let bar_is_live = status.as_ref().map(|s| s.is_live).unwrap_or(false);
+                let bar_is_live = status.map(|s| s.is_live).unwrap_or(false);
                 let bar_fill = if bar_is_live {
                     Color32::from_rgb(24, 14, 14)
                 } else {
@@ -1129,12 +1296,13 @@ impl eframe::App for CrustApp {
                             .stroke(egui::Stroke::new(1.0, t::BORDER_SUBTLE)),
                     )
                     .show(ctx, |ui| {
+                        ui.set_clip_rect(ui.max_rect());
                         let bar_w = ui.available_width();
                         let compact = bar_w < 640.0;
-                        let ultra_compact = bar_w < 460.0;
-                        let show_viewers = bar_w >= 520.0;
-                        let show_game = bar_w >= 840.0;
-                        let show_title = bar_w >= 600.0;
+                        let ultra_compact = bar_w < 360.0;
+                        let show_viewers = bar_w >= 420.0;
+                        let show_game = bar_w >= 700.0;
+                        let show_title = bar_w >= 500.0;
 
                         // Thin accent stripe on the very left edge when live.
                         if bar_is_live {
@@ -1258,7 +1426,7 @@ impl eframe::App for CrustApp {
                                             if let Some(ref title) = s.title {
                                                 if !title.is_empty() {
                                                     let rem = ui.available_width();
-                                                    if rem > if compact { 140.0 } else { 220.0 } {
+                                                    if rem > if compact { 80.0 } else { 180.0 } {
                                                         let resp = ui.add_sized(
                                                             [rem, 16.0],
                                                             egui::Label::new(
@@ -1277,7 +1445,7 @@ impl eframe::App for CrustApp {
                                         if let Some(ref title) = s.title {
                                             if !title.is_empty() && show_title {
                                                 let rem = ui.available_width();
-                                                if rem > 180.0 {
+                                                if rem > 80.0 {
                                                     let resp = ui.add_sized(
                                                         [rem, 16.0],
                                                         egui::Label::new(
@@ -1423,9 +1591,10 @@ impl eframe::App for CrustApp {
             // ── Left sidebar (default) ────────────────────────────────────────
             ChannelLayout::Sidebar if self.sidebar_visible => {
                 // Dynamically cap sidebar width so the central panel always gets
-                // at least 350 px - prevents chat from being hidden on narrow windows.
+                // at least some usable space — allows super-narrow layouts.
+                let min_central = if window_width < NARROW_THRESHOLD { 140.0 } else { 250.0 };
                 let sidebar_max =
-                    (ctx.screen_rect().width() - 350.0).clamp(t::SIDEBAR_MIN_W, t::SIDEBAR_MAX_W);
+                    (ctx.screen_rect().width() - min_central).clamp(t::SIDEBAR_MIN_W, t::SIDEBAR_MAX_W);
 
                 SidePanel::left("channel_list")
                     .resizable(true)
@@ -1448,16 +1617,11 @@ impl eframe::App for CrustApp {
                         ui.add_space(4.0);
                         ui.add(egui::Separator::default().spacing(6.0));
 
-                        let live_map: HashMap<String, bool> = self
-                            .stream_statuses
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.is_live))
-                            .collect();
                         let mut list = ChannelList {
                             channels: &self.state.channel_order,
                             active: self.state.active_channel.as_ref(),
                             channel_states: &self.state.channels,
-                            live_channels: Some(&live_map),
+                            live_channels: Some(&self.live_map_cache),
                         };
                         let res = list.show(ui);
                         ch_selected = res.selected;
@@ -2129,7 +2293,9 @@ fn parse_irc_channel_arg(current: &ChannelId, raw: &str) -> Option<ChannelId> {
         return ChannelId::parse_user_input(arg);
     }
     let t = current.irc_target()?;
-    Some(ChannelId::irc(t.host, t.port, t.tls, arg))
+    // Strip exactly one leading '#' for internal storage.
+    let ch = arg.strip_prefix('#').unwrap_or(arg);
+    Some(ChannelId::irc(t.host, t.port, t.tls, ch))
 }
 
 fn parse_irc_join_args(current: &ChannelId, raw: &str) -> Option<(ChannelId, Option<String>)> {
@@ -2147,7 +2313,9 @@ fn parse_irc_join_args(current: &ChannelId, raw: &str) -> Option<(ChannelId, Opt
         ChannelId::parse_user_input(channel_arg)?
     } else {
         let t = current.irc_target()?;
-        ChannelId::irc(t.host, t.port, t.tls, channel_arg)
+        // Strip exactly one leading '#' for internal storage.
+        let ch = channel_arg.strip_prefix('#').unwrap_or(channel_arg);
+        ChannelId::irc(t.host, t.port, t.tls, ch)
     };
     Some((target, key))
 }

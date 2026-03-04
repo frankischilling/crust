@@ -39,8 +39,30 @@ const IRC_EVT_SIZE: usize = 4096;
 static HISTORY_MSG_ID: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(u64::MAX / 2);
 
-/// Shared emote index: code → EmoteInfo.
+/// Shared emote index: "provider:code" → EmoteInfo.
+/// Keyed by compound key so that emotes with the same code from different
+/// providers are all preserved (important for the emote picker catalog).
 type EmoteIndex = Arc<RwLock<std::collections::HashMap<String, EmoteInfo>>>;
+
+/// Build the compound key used in [`EmoteIndex`].
+#[inline]
+fn emote_key(provider: &str, code: &str) -> String {
+    format!("{provider}:{code}")
+}
+
+/// Resolve an emote by code across all providers.
+/// Priority: 7TV > BTTV > FFZ > Kick (matches visual override order).
+fn resolve_emote<'a>(
+    idx: &'a std::collections::HashMap<String, EmoteInfo>,
+    code: &str,
+) -> Option<&'a EmoteInfo> {
+    for provider in &["7tv", "bttv", "ffz", "kick"] {
+        if let Some(info) = idx.get(&emote_key(provider, code)) {
+            return Some(info);
+        }
+    }
+    None
+}
 
 /// Shared badge map: (set_name, version) → image URL.
 type BadgeMap = Arc<RwLock<std::collections::HashMap<(String, String), String>>>;
@@ -226,7 +248,7 @@ fn main() -> Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Crust – Twitch, Kick & IRC Chat")
             .with_inner_size([1100.0, 700.0])
-            .with_min_inner_size([600.0, 400.0])
+            .with_min_inner_size([300.0, 200.0])
             .with_app_id("crust"),
         ..Default::default()
     };
@@ -258,6 +280,22 @@ fn main() -> Result<()> {
 }
 
 // Reducer: application state reducer
+
+/// Result of a background token validation, sent back to the reducer loop.
+enum TokenValidationResult {
+    Startup {
+        token: String,
+        result: Result<ValidateInfo, ValidateError>,
+    },
+    Login {
+        token: String,
+        result: Result<ValidateInfo, ValidateError>,
+    },
+    AddAccount {
+        token: String,
+        result: Result<ValidateInfo, ValidateError>,
+    },
+}
 
 /// Central reducer: receives raw Twitch/Kick events + UI commands, tokenizes
 /// messages using the emote index, and forwards AppEvents to the UI.
@@ -367,6 +405,10 @@ async fn reducer_loop(
     // as before.
     let mut auth_in_progress = false;
 
+    // Internal channel for background token validation results so
+    // validate_token() never blocks the reducer loop.
+    let (token_val_tx, mut token_val_rx) = mpsc::channel::<TokenValidationResult>(8);
+
     /// Persist the current `joined_channels` set back to disk.
     fn save_channels(
         store: &Option<SettingsStore>,
@@ -401,44 +443,18 @@ async fn reducer_loop(
         }
     }
 
-    // If we have a saved token, validate and auto-login
+    // If we have a saved token, validate in the background and auto-login
+    // via the token_val_rx channel.  Set auth_in_progress *now* so that
+    // Connected events arriving before validation completes don't trigger
+    // premature channel rejoins.
     if let Some(token) = saved_token {
-        info!("Found saved token, attempting auto-login…");
-        match validate_token(&token).await {
-            Ok(info) => {
-                let login = info.login;
-                info!("Saved token valid for user: {login}");
-                if !info.client_id.is_empty() {
-                    helix_client_id = Some(info.client_id);
-                }
-                // Update saved username in case it changed.
-                if settings.username != login {
-                    settings.username = login.clone();
-                    if let Some(store) = &settings_store {
-                        let _ = store.save(&settings);
-                    }
-                }
-                auth_in_progress = true;
-                let _ = sess_tx
-                    .send(SessionCommand::Authenticate { token, nick: login })
-                    .await;
-            }
-            Err(ValidateError::Unauthorized) => {
-                // Token explicitly rejected by Twitch - safe to delete.
-                warn!("Saved token rejected by Twitch, clearing and starting anonymous");
-                if let Some(store) = &settings_store {
-                    let _ = store.delete_token();
-                }
-                // Undo the optimistic login we sent earlier.
-                let _ = evt_tx.send(AppEvent::LoggedOut).await;
-            }
-            Err(ValidateError::Transient(e)) => {
-                // Network error, server hiccup, etc. - keep the token so
-                // the next launch can try again.  Just start anonymous.
-                warn!("Token validation failed ({e}), keeping token and starting anonymous");
-                let _ = evt_tx.send(AppEvent::LoggedOut).await;
-            }
-        }
+        info!("Found saved token, spawning background validation…");
+        auth_in_progress = true;
+        let tx = token_val_tx.clone();
+        tokio::spawn(async move {
+            let result = validate_token(&token).await;
+            let _ = tx.send(TokenValidationResult::Startup { token, result }).await;
+        });
     }
 
     // Broadcast the initial account list so the UI knows about all saved
@@ -472,6 +488,9 @@ async fn reducer_loop(
         .send(AppEvent::BetaFeaturesUpdated {
             kick_enabled: kick_beta_enabled,
             irc_enabled: irc_beta_enabled,
+            irc_nickserv_user: settings.irc_nickserv_user.clone(),
+            irc_nickserv_pass: settings.irc_nickserv_pass.clone(),
+            always_on_top: settings.always_on_top,
         })
         .await;
 
@@ -481,6 +500,20 @@ async fn reducer_loop(
             .send(GenericIrcSessionCommand::SetNick(
                 settings.irc_nick.trim().to_owned(),
             ))
+            .await;
+    }
+
+    // Configure NickServ auto-identify credentials (if set).
+    if irc_runtime_enabled
+        && irc_beta_enabled
+        && !settings.irc_nickserv_user.trim().is_empty()
+        && !settings.irc_nickserv_pass.trim().is_empty()
+    {
+        let _ = irc_tx
+            .send(GenericIrcSessionCommand::SetNickServAuth {
+                nickserv_user: settings.irc_nickserv_user.trim().to_owned(),
+                nickserv_pass: settings.irc_nickserv_pass.trim().to_owned(),
+            })
             .await;
     }
 
@@ -648,29 +681,27 @@ async fn reducer_loop(
                         }
                     }
                     TwitchEvent::ChatMessage(mut msg) => {
-                        // Snapshot the emote index
-                        let snapshot: std::collections::HashMap<String, EmoteInfo> = {
-                            let guard = emote_index.read().unwrap();
-                            guard.clone()
-                        };
-
-                        msg.spans = crust_core::format::tokenize(
-                            &msg.raw_text,
-                            msg.flags.is_action,
-                            &msg.twitch_emotes,
-                            &|code| {
-                                snapshot.get(code).map(|info| {
-                                    (
-                                        info.id.clone(),
-                                        info.code.clone(),
-                                        info.url_1x.clone(),
-                                        info.provider.clone(),
-                                        // Prefer 4x, fall back to 2x, for HD tooltip preview
-                                        info.url_4x.clone().or_else(|| info.url_2x.clone()),
-                                    )
-                                })
-                            },
-                        );
+                        // Hold read lock only during tokenization (no clone needed)
+                        {
+                            let emote_guard = emote_index.read().unwrap();
+                            msg.spans = crust_core::format::tokenize(
+                                &msg.raw_text,
+                                msg.flags.is_action,
+                                &msg.twitch_emotes,
+                                &|code| {
+                                    resolve_emote(&emote_guard, code).map(|info| {
+                                        (
+                                            info.id.clone(),
+                                            info.code.clone(),
+                                            info.url_1x.clone(),
+                                            info.provider.clone(),
+                                            // Prefer 4x, fall back to 2x, for HD tooltip preview
+                                            info.url_4x.clone().or_else(|| info.url_2x.clone()),
+                                        )
+                                    })
+                                },
+                            );
+                        }
 
                         // Resolve badge image URLs
                         {
@@ -912,12 +943,13 @@ async fn reducer_loop(
                                         url_4x: None,
                                         provider: "kick".to_owned(),
                                     };
+                                    let key = emote_key("kick", &code);
                                     let replace = idx
-                                        .get(&code)
+                                        .get(&key)
                                         .map(|e| e.provider != "kick" || e.id != id)
                                         .unwrap_or(true);
                                     if replace {
-                                        idx.insert(code, info);
+                                        idx.insert(key, info);
                                         inserted += 1;
                                     }
                                 }
@@ -933,27 +965,25 @@ async fn reducer_loop(
                         }
 
                         // Tokenize for emotes/emoji/URLs
-                        let snapshot: std::collections::HashMap<String, EmoteInfo> = {
-                            let guard = emote_index.read().unwrap();
-                            guard.clone()
-                        };
-
-                        msg.spans = crust_core::format::tokenize(
-                            &msg.raw_text,
-                            msg.flags.is_action,
-                            &msg.twitch_emotes,
-                            &|code| {
-                                snapshot.get(code).map(|info| {
-                                    (
-                                        info.id.clone(),
-                                        info.code.clone(),
-                                        info.url_1x.clone(),
-                                        info.provider.clone(),
-                                        info.url_4x.clone().or_else(|| info.url_2x.clone()),
-                                    )
-                                })
-                            },
-                        );
+                        {
+                            let emote_guard = emote_index.read().unwrap();
+                            msg.spans = crust_core::format::tokenize(
+                                &msg.raw_text,
+                                msg.flags.is_action,
+                                &msg.twitch_emotes,
+                                &|code| {
+                                    resolve_emote(&emote_guard, code).map(|info| {
+                                        (
+                                            info.id.clone(),
+                                            info.code.clone(),
+                                            info.url_1x.clone(),
+                                            info.provider.clone(),
+                                            info.url_4x.clone().or_else(|| info.url_2x.clone()),
+                                        )
+                                    })
+                                },
+                            );
+                        }
 
                         // Queue image fetches for emotes/emoji
                         for span in &msg.spans {
@@ -1111,6 +1141,48 @@ async fn reducer_loop(
                             message,
                         }).await;
                     }
+                    GenericIrcEvent::ChannelRedirected {
+                        server_key: (host, port, tls),
+                        old_channel,
+                        new_channel,
+                    } => {
+                        info!(
+                            "IRC channel redirect: #{old_channel} → #{new_channel} on {host}:{port}"
+                        );
+                        let old_id = ChannelId::irc(&host, port, tls, &old_channel);
+                        let new_id = ChannelId::irc(&host, port, tls, &new_channel);
+
+                        // Update persisted channel set
+                        joined_channels.remove(&old_id.as_str().to_lowercase());
+                        joined_channels.insert(new_id.as_str().to_lowercase());
+                        save_channels(&settings_store, &mut settings, &joined_channels);
+
+                        // Tell UI to seamlessly replace old tab with new one
+                        let _ = evt_tx
+                            .send(AppEvent::ChannelRedirected {
+                                old_channel: old_id.clone(),
+                                new_channel: new_id.clone(),
+                            })
+                            .await;
+
+                        // System notice in the new channel
+                        let redirect_msg = make_system_message(
+                            local_msg_id,
+                            new_id.clone(),
+                            format!(
+                                "Redirected from #{old_channel} to #{new_channel}"
+                            ),
+                            Utc::now(),
+                            MsgKind::SystemInfo,
+                        );
+                        local_msg_id += 1;
+                        let _ = evt_tx
+                            .send(AppEvent::MessageReceived {
+                                channel: new_id,
+                                message: redirect_msg,
+                            })
+                            .await;
+                    }
                     GenericIrcEvent::SystemNotice(notice) => {
                         if let Some(ch) = notice.channel.clone() {
                             let msg = make_system_message(
@@ -1124,38 +1196,54 @@ async fn reducer_loop(
                             }).await;
                         }
                     }
+                    GenericIrcEvent::TopicChanged { channel, topic } => {
+                        let _ = evt_tx.send(AppEvent::IrcTopicChanged {
+                            channel,
+                            topic,
+                        }).await;
+                    }
                     GenericIrcEvent::ChatMessage(mut msg) => {
                         // Tokenize for emotes/emoji/URLs
-                        let snapshot: std::collections::HashMap<String, EmoteInfo> = {
-                            let guard = emote_index.read().unwrap();
-                            guard.clone()
-                        };
-
-                        msg.spans = crust_core::format::tokenize(
-                            &msg.raw_text,
-                            msg.flags.is_action,
-                            &msg.twitch_emotes,
-                            &|code| {
-                                snapshot.get(code).map(|info| {
-                                    (
-                                        info.id.clone(),
-                                        info.code.clone(),
-                                        info.url_1x.clone(),
-                                        info.provider.clone(),
-                                        info.url_4x.clone().or_else(|| info.url_2x.clone()),
-                                    )
-                                })
-                            },
-                        );
+                        {
+                            let emote_guard = emote_index.read().unwrap();
+                            msg.spans = crust_core::format::tokenize(
+                                &msg.raw_text,
+                                msg.flags.is_action,
+                                &msg.twitch_emotes,
+                                &|code| {
+                                    resolve_emote(&emote_guard, code).map(|info| {
+                                        (
+                                            info.id.clone(),
+                                            info.code.clone(),
+                                            info.url_1x.clone(),
+                                            info.provider.clone(),
+                                            info.url_4x.clone().or_else(|| info.url_2x.clone()),
+                                        )
+                                    })
+                                },
+                            );
+                        }
 
                         // Mention detection
+                        let mut has_mention = false;
                         if let Some(ref uname) = auth_username {
                             let uname_lower = uname.to_lowercase();
-                            let has_mention = msg.raw_text
+                            has_mention = msg.raw_text
                                 .to_lowercase()
                                 .contains(&format!("@{uname_lower}"));
-                            msg.flags.is_mention = has_mention;
                         }
+                        // Also match the configured IRC nick as a whole word.
+                        if !has_mention {
+                            let irc_nick = settings.irc_nick.trim();
+                            if !irc_nick.is_empty() {
+                                let nick_lower = irc_nick.to_lowercase();
+                                let text_lower = msg.raw_text.to_lowercase();
+                                has_mention = text_lower
+                                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                                    .any(|w| w == nick_lower);
+                            }
+                        }
+                        msg.flags.is_mention = has_mention;
 
                         for span in &msg.spans {
                             let url = match span {
@@ -1355,73 +1443,12 @@ async fn reducer_loop(
                         }
                     }
                     AppCommand::Login { token } => {
-                        info!("Login requested, validating token…");
-                        let sess_tx = sess_tx.clone();
-                        let evt_tx = evt_tx.clone();
-                        let token_clone = token.clone();
-                        // Validate the token via Twitch API, then authenticate
-                        match validate_token(&token).await {
-                            Ok(info) => {
-                                let login = info.login;
-                                info!("Token valid for user: {login}");
-                                if !info.client_id.is_empty() {
-                                    helix_client_id = Some(info.client_id);
-                                }
-                                // Set both username and token on the in-memory settings
-                                // struct, then do ONE save so neither field overwrites
-                                // the other.
-                                settings.username = login.clone();
-                                settings.oauth_token = token_clone.clone();
-                                // Also add / update the account entry in the accounts list.
-                                if let Some(acc) = settings.accounts.iter_mut().find(|a| a.username == login) {
-                                    acc.oauth_token = token_clone.clone();
-                                } else {
-                                    settings.accounts.push(crust_storage::AccountEntry {
-                                        username: login.clone(),
-                                        oauth_token: token_clone.clone(),
-                                    });
-                                }
-                                if let Some(store) = &settings_store {
-                                    // ONE consolidated save - accounts list AND oauth_token
-                                    // are both in `settings` already.  A separate
-                                    // save_account_token() call would do a redundant
-                                    // load→modify→save cycle that can race with other saves.
-                                    if let Err(e) = store.save(&settings) {
-                                        warn!("Failed to save settings: {e}");
-                                    }
-                                    // Best-effort: also cache in the per-account keyring slot
-                                    // for fast/offline lookup (no disk read/write involved).
-                                    store.try_save_account_keyring(&login, &token_clone);
-                                }
-                                // If we're replacing an active session, flush the old
-                                // auth state so the UI clears the previous avatar.
-                                if auth_username.is_some() {
-                                    auth_username = None;
-                                    auth_user_id = None;
-                                    let _ = evt_tx.send(AppEvent::LoggedOut).await;
-                                }
-                                auth_in_progress = true;
-                                let _ = sess_tx.send(SessionCommand::Authenticate {
-                                    token: token_clone,
-                                    nick: login.clone(),
-                                }).await;
-                                // Broadcast updated account list.
-                                let account_names: Vec<String> = settings.accounts.iter().map(|a| a.username.clone()).collect();
-                                let default = if settings.default_account.is_empty() { None } else { Some(settings.default_account.clone()) };
-                                let _ = evt_tx.send(AppEvent::AccountListUpdated {
-                                    accounts: account_names,
-                                    active: Some(login),
-                                    default,
-                                }).await;
-                            }
-                            Err(e) => {
-                                warn!("Token validation failed: {e}");
-                                let _ = evt_tx.send(AppEvent::Error {
-                                    context: "Login".into(),
-                                    message: format!("Invalid token: {e}"),
-                                }).await;
-                            }
-                        }
+                        info!("Login requested, spawning background validation…");
+                        let tx = token_val_tx.clone();
+                        tokio::spawn(async move {
+                            let result = validate_token(&token).await;
+                            let _ = tx.send(TokenValidationResult::Login { token, result }).await;
+                        });
                     }
                     AppCommand::Logout => {
                         info!("Logout requested");
@@ -1448,60 +1475,12 @@ async fn reducer_loop(
                         }).await;
                     }
                     AppCommand::AddAccount { token } => {
-                        info!("AddAccount requested, validating token…");
-                        match validate_token(&token).await {
-                            Ok(info) => {
-                                let login = info.login;
-                                info!("AddAccount: token valid for {login}");
-                                if !info.client_id.is_empty() {
-                                    helix_client_id = Some(info.client_id);
-                                }
-                                // Update in-memory settings FIRST so that the single
-                                // store.save() call below captures everything atomically.
-                                if let Some(acc) = settings.accounts.iter_mut().find(|a| a.username == login) {
-                                    acc.oauth_token = token.clone();
-                                } else {
-                                    settings.accounts.push(crust_storage::AccountEntry {
-                                        username: login.clone(),
-                                        oauth_token: token.clone(),
-                                    });
-                                }
-                                // Switch to this new account.
-                                settings.username = login.clone();
-                                settings.oauth_token = token.clone(); // keep legacy field in sync
-                                if let Some(store) = &settings_store {
-                                    if let Err(e) = store.save(&settings) {
-                                        warn!("Failed to save settings for AddAccount {login}: {e}");
-                                    }
-                                    store.try_save_account_keyring(&login, &token);
-                                }
-                                // Flush old auth state so the UI transitions cleanly.
-                                if auth_username.is_some() {
-                                    auth_username = None;
-                                    auth_user_id = None;
-                                    let _ = evt_tx.send(AppEvent::LoggedOut).await;
-                                }
-                                auth_in_progress = true;
-                                let _ = sess_tx.send(SessionCommand::Authenticate {
-                                    token,
-                                    nick: login.clone(),
-                                }).await;
-                                let account_names: Vec<String> = settings.accounts.iter().map(|a| a.username.clone()).collect();
-                                let default = if settings.default_account.is_empty() { None } else { Some(settings.default_account.clone()) };
-                                let _ = evt_tx.send(AppEvent::AccountListUpdated {
-                                    accounts: account_names,
-                                    active: Some(login),
-                                    default,
-                                }).await;
-                            }
-                            Err(e) => {
-                                warn!("AddAccount token validation failed: {e}");
-                                let _ = evt_tx.send(AppEvent::Error {
-                                    context: "AddAccount".into(),
-                                    message: format!("Invalid token: {e}"),
-                                }).await;
-                            }
-                        }
+                        info!("AddAccount requested, spawning background validation…");
+                        let tx = token_val_tx.clone();
+                        tokio::spawn(async move {
+                            let result = validate_token(&token).await;
+                            let _ = tx.send(TokenValidationResult::AddAccount { token, result }).await;
+                        });
                     }
                     AppCommand::SwitchAccount { username } => {
                         info!("SwitchAccount to {username}");
@@ -1627,6 +1606,26 @@ async fn reducer_loop(
                                 .await;
                         }
                     }
+                    AppCommand::SetIrcAuth {
+                        nickserv_user,
+                        nickserv_pass,
+                    } => {
+                        settings.irc_nickserv_user = nickserv_user.clone();
+                        settings.irc_nickserv_pass = nickserv_pass.clone();
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save IRC NickServ credentials: {e}");
+                            }
+                        }
+                        if irc_beta_enabled && irc_runtime_enabled {
+                            let _ = irc_tx
+                                .send(GenericIrcSessionCommand::SetNickServAuth {
+                                    nickserv_user,
+                                    nickserv_pass,
+                                })
+                                .await;
+                        }
+                    }
                     AppCommand::SetBetaFeatures {
                         kick_enabled,
                         irc_enabled,
@@ -1644,6 +1643,9 @@ async fn reducer_loop(
                             .send(AppEvent::BetaFeaturesUpdated {
                                 kick_enabled,
                                 irc_enabled,
+                                irc_nickserv_user: settings.irc_nickserv_user.clone(),
+                                irc_nickserv_pass: settings.irc_nickserv_pass.clone(),
+                                always_on_top: settings.always_on_top,
                             })
                             .await;
 
@@ -1654,6 +1656,14 @@ async fn reducer_loop(
                                 context: "Settings".into(),
                                 message: "Restart Crust to apply newly enabled beta transports.".into(),
                             }).await;
+                        }
+                    }
+                    AppCommand::SetAlwaysOnTop { enabled } => {
+                        settings.always_on_top = enabled;
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save always-on-top setting: {e}");
+                            }
                         }
                     }
                     AppCommand::SendMessage { channel, text, reply_to_msg_id } => {
@@ -1752,26 +1762,25 @@ async fn reducer_loop(
                             };
 
                             // Tokenize the echo message
-                            let snapshot: std::collections::HashMap<String, EmoteInfo> = {
-                                let guard = emote_index.read().unwrap();
-                                guard.clone()
-                            };
-                            echo.spans = crust_core::format::tokenize(
-                                &echo.raw_text,
-                                false,
-                                &echo.twitch_emotes,
-                                &|code| {
-                                    snapshot.get(code).map(|info| {
-                                        (
-                                            info.id.clone(),
-                                            info.code.clone(),
-                                            info.url_1x.clone(),
-                                            info.provider.clone(),
-                                            info.url_4x.clone().or_else(|| info.url_2x.clone()),
-                                        )
-                                    })
-                                },
-                            );
+                            {
+                                let emote_guard = emote_index.read().unwrap();
+                                echo.spans = crust_core::format::tokenize(
+                                    &echo.raw_text,
+                                    false,
+                                    &echo.twitch_emotes,
+                                    &|code| {
+                                        resolve_emote(&emote_guard, code).map(|info| {
+                                            (
+                                                info.id.clone(),
+                                                info.code.clone(),
+                                                info.url_1x.clone(),
+                                                info.provider.clone(),
+                                                info.url_4x.clone().or_else(|| info.url_2x.clone()),
+                                            )
+                                        })
+                                    },
+                                );
+                            }
 
                             // Queue image fetches for emotes in the echo
                             for span in &echo.spans {
@@ -1800,88 +1809,100 @@ async fn reducer_loop(
                         }
 
                         // Local echo for generic IRC channels (servers may not echo PRIVMSG).
-                        if channel.is_irc()
-                            && !channel.is_irc_server_tab()
-                            && !text.trim_start().starts_with('/')
-                            && !is_raw_irc_protocol_line(&text)
-                        {
-                            local_msg_id += 1;
-                            let irc_nick = settings.irc_nick.trim();
-                            let display = if irc_nick.is_empty() { "you" } else { irc_nick };
-                            let mut echo = ChatMessage {
-                                id: MessageId(local_msg_id),
-                                server_id: None,
-                                timestamp: Utc::now(),
-                                channel: channel.clone(),
-                                sender: Sender {
-                                    user_id: UserId(display.to_owned()),
-                                    login: display.to_lowercase(),
-                                    display_name: display.to_owned(),
-                                    color: None,
-                                    badges: Vec::new(),
-                                },
-                                raw_text: text.clone(),
-                                spans: smallvec::SmallVec::new(),
-                                twitch_emotes: Vec::new(),
-                                flags: MessageFlags {
-                                    is_action: false,
-                                    is_highlighted: false,
-                                    is_deleted: false,
-                                    is_first_msg: false,
-                                    is_self: true,
-                                    is_mention: false,
-                                    custom_reward_id: None,
-                                    is_history: false,
-                                },
-                                reply: None,
-                                msg_kind: MsgKind::Chat,
+                        // Handles plain text → echo to current channel, and
+                        // /msg or /privmsg #chan text → echo body to target channel.
+                        // Also works from the server tab for /msg and /privmsg.
+                        if channel.is_irc() {
+                            let irc_echo = if channel.is_irc_server_tab() {
+                                // From the server tab, only echo /msg or /privmsg targeting a channel.
+                                extract_irc_msg_echo(&text, &channel)
+                            } else if !text.trim_start().starts_with('/')
+                                && !is_raw_irc_protocol_line(&text)
+                            {
+                                // Plain text: echo to current channel.
+                                Some((channel.clone(), text.clone()))
+                            } else {
+                                // Check for /msg or /privmsg targeting a channel.
+                                extract_irc_msg_echo(&text, &channel)
                             };
-
-                            let snapshot: std::collections::HashMap<String, EmoteInfo> = {
-                                let guard = emote_index.read().unwrap();
-                                guard.clone()
-                            };
-                            echo.spans = crust_core::format::tokenize(
-                                &echo.raw_text,
-                                false,
-                                &echo.twitch_emotes,
-                                &|code| {
-                                    snapshot.get(code).map(|info| {
-                                        (
-                                            info.id.clone(),
-                                            info.code.clone(),
-                                            info.url_1x.clone(),
-                                            info.provider.clone(),
-                                            info.url_4x.clone().or_else(|| info.url_2x.clone()),
-                                        )
-                                    })
-                                },
-                            );
-
-                            for span in &echo.spans {
-                                let url = match span {
-                                    crust_core::Span::Emote { url, .. } => Some(url.clone()),
-                                    crust_core::Span::Emoji { url, .. } => Some(url.clone()),
-                                    _ => None,
+                            if let Some((echo_channel, echo_text)) = irc_echo {
+                                local_msg_id += 1;
+                                let irc_nick = settings.irc_nick.trim();
+                                let display = if irc_nick.is_empty() { "you" } else { irc_nick };
+                                let mut echo = ChatMessage {
+                                    id: MessageId(local_msg_id),
+                                    server_id: None,
+                                    timestamp: Utc::now(),
+                                    channel: echo_channel.clone(),
+                                    sender: Sender {
+                                        user_id: UserId(display.to_owned()),
+                                        login: display.to_lowercase(),
+                                        display_name: display.to_owned(),
+                                        color: None,
+                                        badges: Vec::new(),
+                                    },
+                                    raw_text: echo_text,
+                                    spans: smallvec::SmallVec::new(),
+                                    twitch_emotes: Vec::new(),
+                                    flags: MessageFlags {
+                                        is_action: false,
+                                        is_highlighted: false,
+                                        is_deleted: false,
+                                        is_first_msg: false,
+                                        is_self: true,
+                                        is_mention: false,
+                                        custom_reward_id: None,
+                                        is_history: false,
+                                    },
+                                    reply: None,
+                                    msg_kind: MsgKind::Chat,
                                 };
-                                if let Some(url) = url {
-                                    if !pending_images.contains(&url) {
-                                        pending_images.insert(url.clone());
-                                        let evt_tx = evt_tx.clone();
-                                        let cache = emote_cache.clone();
-                                        tokio::spawn(async move {
-                                            fetch_emote_image(&url, &cache, &evt_tx).await;
-                                        });
+
+                                {
+                                    let emote_guard = emote_index.read().unwrap();
+                                    echo.spans = crust_core::format::tokenize(
+                                        &echo.raw_text,
+                                        false,
+                                        &echo.twitch_emotes,
+                                        &|code| {
+                                            resolve_emote(&emote_guard, code).map(|info| {
+                                                (
+                                                    info.id.clone(),
+                                                    info.code.clone(),
+                                                    info.url_1x.clone(),
+                                                    info.provider.clone(),
+                                                    info.url_4x.clone().or_else(|| info.url_2x.clone()),
+                                                )
+                                            })
+                                        },
+                                    );
+                                }
+
+                                for span in &echo.spans {
+                                    let url = match span {
+                                        crust_core::Span::Emote { url, .. } => Some(url.clone()),
+                                        crust_core::Span::Emoji { url, .. } => Some(url.clone()),
+                                        _ => None,
+                                    };
+                                    if let Some(url) = url {
+                                        if !pending_images.contains(&url) {
+                                            pending_images.insert(url.clone());
+                                            let evt_tx = evt_tx.clone();
+                                            let cache = emote_cache.clone();
+                                            tokio::spawn(async move {
+                                                fetch_emote_image(&url, &cache, &evt_tx).await;
+                                            });
+                                        }
                                     }
                                 }
-                            }
 
-                            let _ = evt_tx
-                                .send(AppEvent::MessageReceived {
-                                    channel: channel.clone(),
-                                    message: echo,
-                                })
-                                .await;
+                                let _ = evt_tx
+                                    .send(AppEvent::MessageReceived {
+                                        channel: echo_channel,
+                                        message: echo,
+                                    })
+                                    .await;
+                            }
                         }
                     }
                     AppCommand::FetchUserProfile { login } => {
@@ -1960,6 +1981,148 @@ async fn reducer_loop(
                         tokio::spawn(async move {
                             fetch_user_profile_for_channel(&login, &channel, etx).await;
                         });
+                    }
+                }
+            }
+
+            // Background token validation results
+            Some(val) = token_val_rx.recv() => {
+                match val {
+                    TokenValidationResult::Startup { token, result } => {
+                        match result {
+                            Ok(info) => {
+                                let login = info.login;
+                                info!("Saved token valid for user: {login}");
+                                if !info.client_id.is_empty() {
+                                    helix_client_id = Some(info.client_id);
+                                }
+                                if settings.username != login {
+                                    settings.username = login.clone();
+                                    if let Some(store) = &settings_store {
+                                        let _ = store.save(&settings);
+                                    }
+                                }
+                                // auth_in_progress was already set to true before spawn
+                                let _ = sess_tx
+                                    .send(SessionCommand::Authenticate { token, nick: login })
+                                    .await;
+                            }
+                            Err(ValidateError::Unauthorized) => {
+                                warn!("Saved token rejected by Twitch, clearing and starting anonymous");
+                                auth_in_progress = false;
+                                if let Some(store) = &settings_store {
+                                    let _ = store.delete_token();
+                                }
+                                let _ = evt_tx.send(AppEvent::LoggedOut).await;
+                            }
+                            Err(ValidateError::Transient(e)) => {
+                                warn!("Token validation failed ({e}), keeping token and starting anonymous");
+                                auth_in_progress = false;
+                                let _ = evt_tx.send(AppEvent::LoggedOut).await;
+                            }
+                        }
+                    }
+                    TokenValidationResult::Login { token, result } => {
+                        match result {
+                            Ok(info) => {
+                                let login = info.login;
+                                info!("Token valid for user: {login}");
+                                if !info.client_id.is_empty() {
+                                    helix_client_id = Some(info.client_id);
+                                }
+                                settings.username = login.clone();
+                                settings.oauth_token = token.clone();
+                                if let Some(acc) = settings.accounts.iter_mut().find(|a| a.username == login) {
+                                    acc.oauth_token = token.clone();
+                                } else {
+                                    settings.accounts.push(crust_storage::AccountEntry {
+                                        username: login.clone(),
+                                        oauth_token: token.clone(),
+                                    });
+                                }
+                                if let Some(store) = &settings_store {
+                                    if let Err(e) = store.save(&settings) {
+                                        warn!("Failed to save settings: {e}");
+                                    }
+                                    store.try_save_account_keyring(&login, &token);
+                                }
+                                if auth_username.is_some() {
+                                    auth_username = None;
+                                    auth_user_id = None;
+                                    let _ = evt_tx.send(AppEvent::LoggedOut).await;
+                                }
+                                auth_in_progress = true;
+                                let _ = sess_tx.send(SessionCommand::Authenticate {
+                                    token,
+                                    nick: login.clone(),
+                                }).await;
+                                let account_names: Vec<String> = settings.accounts.iter().map(|a| a.username.clone()).collect();
+                                let default = if settings.default_account.is_empty() { None } else { Some(settings.default_account.clone()) };
+                                let _ = evt_tx.send(AppEvent::AccountListUpdated {
+                                    accounts: account_names,
+                                    active: Some(login),
+                                    default,
+                                }).await;
+                            }
+                            Err(e) => {
+                                warn!("Token validation failed: {e}");
+                                let _ = evt_tx.send(AppEvent::Error {
+                                    context: "Login".into(),
+                                    message: format!("Invalid token: {e}"),
+                                }).await;
+                            }
+                        }
+                    }
+                    TokenValidationResult::AddAccount { token, result } => {
+                        match result {
+                            Ok(info) => {
+                                let login = info.login;
+                                info!("AddAccount: token valid for {login}");
+                                if !info.client_id.is_empty() {
+                                    helix_client_id = Some(info.client_id);
+                                }
+                                if let Some(acc) = settings.accounts.iter_mut().find(|a| a.username == login) {
+                                    acc.oauth_token = token.clone();
+                                } else {
+                                    settings.accounts.push(crust_storage::AccountEntry {
+                                        username: login.clone(),
+                                        oauth_token: token.clone(),
+                                    });
+                                }
+                                settings.username = login.clone();
+                                settings.oauth_token = token.clone();
+                                if let Some(store) = &settings_store {
+                                    if let Err(e) = store.save(&settings) {
+                                        warn!("Failed to save settings for AddAccount {login}: {e}");
+                                    }
+                                    store.try_save_account_keyring(&login, &token);
+                                }
+                                if auth_username.is_some() {
+                                    auth_username = None;
+                                    auth_user_id = None;
+                                    let _ = evt_tx.send(AppEvent::LoggedOut).await;
+                                }
+                                auth_in_progress = true;
+                                let _ = sess_tx.send(SessionCommand::Authenticate {
+                                    token,
+                                    nick: login.clone(),
+                                }).await;
+                                let account_names: Vec<String> = settings.accounts.iter().map(|a| a.username.clone()).collect();
+                                let default = if settings.default_account.is_empty() { None } else { Some(settings.default_account.clone()) };
+                                let _ = evt_tx.send(AppEvent::AccountListUpdated {
+                                    accounts: account_names,
+                                    active: Some(login),
+                                    default,
+                                }).await;
+                            }
+                            Err(e) => {
+                                warn!("AddAccount token validation failed: {e}");
+                                let _ = evt_tx.send(AppEvent::Error {
+                                    context: "AddAccount".into(),
+                                    message: format!("Invalid token: {e}"),
+                                }).await;
+                            }
+                        }
                     }
                 }
             }
@@ -2081,17 +2244,18 @@ async fn load_global_emotes(
         .map(|e| e.url_1x.clone())
         .collect();
 
-    // Insert in priority order: FFZ < BTTV < 7TV (later overwrites earlier)
+    // Insert each provider under its own compound key so duplicates across
+    // providers are preserved in the catalog.
     {
         let mut idx = index.write().unwrap();
         for e in f {
-            idx.insert(e.code.clone(), e);
+            idx.insert(emote_key(&e.provider, &e.code), e);
         }
         for e in b {
-            idx.insert(e.code.clone(), e);
+            idx.insert(emote_key(&e.provider, &e.code), e);
         }
         for e in s {
-            idx.insert(e.code.clone(), e);
+            idx.insert(emote_key(&e.provider, &e.code), e);
         }
     }
 
@@ -2107,8 +2271,8 @@ async fn load_global_emotes(
     {
         let idx = index.read().unwrap();
         let mut gc = global_codes.write().unwrap();
-        for code in idx.keys() {
-            gc.insert(code.clone());
+        for info in idx.values() {
+            gc.insert(info.code.clone());
         }
     }
 
@@ -2143,7 +2307,7 @@ async fn load_personal_7tv_emotes(
     {
         let mut idx = index.write().unwrap();
         for e in emotes {
-            idx.insert(e.code.clone(), e);
+            idx.insert(emote_key(&e.provider, &e.code), e);
         }
     }
     send_emote_catalog(index, evt_tx, global_codes).await;
@@ -2199,13 +2363,13 @@ async fn load_channel_emotes(
     {
         let mut idx = index.write().unwrap();
         for e in f {
-            idx.insert(e.code.clone(), e);
+            idx.insert(emote_key(&e.provider, &e.code), e);
         }
         for e in b {
-            idx.insert(e.code.clone(), e);
+            idx.insert(emote_key(&e.provider, &e.code), e);
         }
         for e in s {
-            idx.insert(e.code.clone(), e);
+            idx.insert(emote_key(&e.provider, &e.code), e);
         }
     }
 
@@ -2284,10 +2448,10 @@ async fn load_kick_channel_emotes(
     {
         let mut idx = index.write().unwrap();
         for e in kick_emotes {
-            idx.insert(e.code.clone(), e);
+            idx.insert(emote_key(&e.provider, &e.code), e);
         }
         for e in stv_emotes {
-            idx.insert(e.code.clone(), e);
+            idx.insert(emote_key(&e.provider, &e.code), e);
         }
     }
 
@@ -3516,6 +3680,47 @@ async fn fetch_self_avatar(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
 }
 
 // System-message helpers
+
+/// Extract echo info from an IRC `/msg` or `/privmsg` command that targets a
+/// channel (e.g. `/msg ##chat hello`).  Returns `(target_channel_id, body_text)`
+/// so the caller can emit a local echo.  Returns `None` for non-channel targets
+/// (e.g. NickServ) and non-msg commands.
+fn extract_irc_msg_echo(text: &str, source_channel: &ChannelId) -> Option<(ChannelId, String)> {
+    let trimmed = text.trim();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+    let cmd_line = trimmed.trim_start_matches('/').trim_start();
+    let (cmd, rest) = cmd_line
+        .split_once(char::is_whitespace)
+        .map(|(c, r)| (c, r.trim_start()))
+        .unwrap_or((cmd_line, ""));
+    if !matches!(cmd.to_ascii_lowercase().as_str(), "msg" | "privmsg") {
+        return None;
+    }
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let target = parts.next()?.trim();
+    let body = parts.next()?.trim_start();
+    // Strip optional leading ':' (IRC protocol format).
+    let body = body.strip_prefix(':').unwrap_or(body);
+    // Only echo for channel targets (starting with #).
+    if !target.starts_with('#') || body.is_empty() {
+        return None;
+    }
+    let irc_target = source_channel.irc_target()?;
+    // No gvbhrmalize: strip first '#' for internal ChannelId form (##chat → #chat).
+    let ch_name = target
+        .strip_prefix('#')
+        .unwrap_or(target)
+        .to_ascii_lowercase();
+    let echo_ch = ChannelId::irc(
+        &irc_target.host,
+        irc_target.port,
+        irc_target.tls,
+        &ch_name,
+    );
+    Some((echo_ch, body.to_owned()))
+}
 
 /// Construct a system (non-chat) ChatMessage for inline display in a channel.
 fn make_system_message(
