@@ -16,6 +16,8 @@ A native Twitch + Kick + IRC chat client written in Rust.
 
 ![Windows built binary](img/demo6.png)
 
+![Thin narrow UI](img/demo7.png)
+
 ## Current status
 
 Active early-stage project. The app builds and runs, and core chat workflows are in place. APIs and internals may still change.

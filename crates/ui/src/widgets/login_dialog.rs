@@ -103,8 +103,12 @@ impl LoginDialog {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                let max_w = ui.ctx().screen_rect().width() - 40.0;
-                ui.set_min_width(max_w.min(380.0));
+                let screen_w = ui.ctx().screen_rect().width();
+                let dialog_w = (screen_w - 64.0)
+                    .clamp(120.0, 380.0)
+                    .min((screen_w - 16.0).max(80.0));
+                ui.set_min_width(dialog_w);
+                ui.set_max_width(dialog_w);
 
                 ui.add_space(4.0);
 
@@ -152,7 +156,7 @@ impl LoginDialog {
                         egui::TextEdit::singleline(&mut self.token_buf)
                             .hint_text("oauth:abc123…")
                             .password(true)
-                            .desired_width(320.0),
+                            .desired_width((ui.available_width() - 8.0).max(96.0)),
                     );
                     if self.token_buf.is_empty() {
                         resp.request_focus();

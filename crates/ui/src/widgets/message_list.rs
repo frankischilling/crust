@@ -194,8 +194,8 @@ impl<'a> MessageList<'a> {
 
             // Persist height cache for seamless transition to virtual scrolling.
             ui.ctx().data_mut(|d| d.insert_temp(hc_id, height_cache));
-            self.apply_snap(ui, &output);
             self.show_resume_button(ui, &output, panel_rect);
+            self.apply_snap(ui, &output);
             return MessageListResult {
                 reply: self.take_reply(ui, reply_key),
                 profile_request: self.take_profile_request(ui),
@@ -303,8 +303,8 @@ impl<'a> MessageList<'a> {
             d.insert_temp(ps_id, prefix);
         });
 
-        self.apply_snap(ui, &output);
         self.show_resume_button(ui, &output, panel_rect);
+        self.apply_snap(ui, &output);
         MessageListResult {
             reply: self.take_reply(ui, reply_key),
             profile_request: self.take_profile_request(ui),
@@ -340,6 +340,16 @@ impl<'a> MessageList<'a> {
         let snap_key = Id::new("snap_to_bottom").with(self.channel.as_str());
         let snapping: bool = ui.ctx().data_mut(|d| d.get_temp(snap_key).unwrap_or(false));
         if !snapping {
+            return;
+        }
+
+        // If user has scrolled up, never keep forcing snap-to-bottom.
+        let paused_key = egui::Id::new("scroll_paused").with(self.channel.as_str());
+        let scroll_paused: bool = ui
+            .ctx()
+            .data_mut(|d| d.get_temp(paused_key).unwrap_or(false));
+        if scroll_paused {
+            ui.ctx().data_mut(|d| d.insert_temp(snap_key, false));
             return;
         }
 
@@ -677,7 +687,11 @@ impl<'a> MessageList<'a> {
         // the left edge of the row so the eye finds them instantly in fast chat.
         if msg.flags.is_mention || msg.flags.is_highlighted {
             let r = msg_frame.response.rect;
-            let bar_col = if msg.flags.is_mention {
+            let bar_col = if msg.flags.is_mention
+                && matches!(msg.msg_kind, MsgKind::Sub { is_gift: true, .. })
+            {
+                t::RAID_CYAN
+            } else if msg.flags.is_mention {
                 t::ACCENT
             } else {
                 Color32::from_rgb(255, 210, 30)
@@ -699,14 +713,17 @@ impl<'a> MessageList<'a> {
                 is_gift,
                 ..
             } => {
-                let text = if *is_gift {
+                let gifted_to_me = *is_gift && msg.flags.is_mention;
+                let text = if gifted_to_me {
+                    format!("🎉🎊  You received a gifted {plan} sub! ({months} months)")
+                } else if *is_gift {
                     format!("🎁  {display_name} received a gifted {plan} sub! ({months} months)")
                 } else if *months <= 1 {
                     format!("⭐  {display_name} subscribed with {plan}!")
                 } else {
                     format!("⭐  {display_name} resubscribed with {plan}! ({months} months)")
                 };
-                (t::GOLD, Some(text))
+                (if gifted_to_me { t::RAID_CYAN } else { t::GOLD }, Some(text))
             }
             MsgKind::Raid {
                 display_name,

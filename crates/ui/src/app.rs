@@ -48,6 +48,8 @@ struct EventToast {
     text: String,
     /// Accent tint used for the border (Sub = gold, Raid = cyan, Bits = orange).
     hue: Color32,
+    /// Whether to draw celebratory confetti particles around the toast.
+    confetti: bool,
     /// Wall-clock moment the toast was created.
     born: std::time::Instant,
 }
@@ -339,7 +341,10 @@ impl CrustApp {
                                 plan,
                                 ..
                             } => {
-                                let text = if *is_gift {
+                                let gifted_to_me = *is_gift && message.flags.is_mention;
+                                let text = if gifted_to_me {
+                                    format!("🎉🎊  You received a gifted {} sub!", plan)
+                                } else if *is_gift {
                                     format!("🎁  {} received a gifted {} sub!", display_name, plan)
                                 } else if *months <= 1 {
                                     format!("⭐  {} just subscribed with {}!", display_name, plan)
@@ -348,7 +353,8 @@ impl CrustApp {
                                 };
                                 Some(EventToast {
                                     text,
-                                    hue: t::GOLD,
+                                    hue: if gifted_to_me { t::RAID_CYAN } else { t::GOLD },
+                                    confetti: gifted_to_me,
                                     born: std::time::Instant::now(),
                                 })
                             }
@@ -361,6 +367,7 @@ impl CrustApp {
                                     display_name, viewer_count
                                 ),
                                 hue: t::RAID_CYAN,
+                                confetti: false,
                                 born: std::time::Instant::now(),
                             }),
                             MsgKind::Bits { amount } if *amount >= 100 => Some(EventToast {
@@ -369,6 +376,7 @@ impl CrustApp {
                                     message.sender.display_name, amount
                                 ),
                                 hue: t::BITS_ORANGE,
+                                confetti: false,
                                 born: std::time::Instant::now(),
                             }),
                             _ => None,
@@ -804,7 +812,10 @@ impl eframe::App for CrustApp {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    let settings_w = (ctx.screen_rect().width() - 24.0).clamp(200.0, 400.0);
+                    let screen_w = ctx.screen_rect().width();
+                    let settings_w = (screen_w - 64.0)
+                        .clamp(140.0, 400.0)
+                        .min((screen_w - 16.0).max(100.0));
                     ui.set_min_width(settings_w);
                     ui.set_max_width(settings_w);
 
@@ -1496,7 +1507,7 @@ impl eframe::App for CrustApp {
                         let ultra_compact = bar_w < 360.0;
                         let show_viewers = bar_w >= 420.0;
                         let show_game = bar_w >= 700.0;
-                        let show_title = bar_w >= 500.0;
+                        let show_title = bar_w >= 260.0;
 
                         // Thin accent stripe on the very left edge when live.
                         if bar_is_live {
@@ -1620,7 +1631,14 @@ impl eframe::App for CrustApp {
                                             if let Some(ref title) = s.title {
                                                 if !title.is_empty() {
                                                     let rem = ui.available_width();
-                                                    if rem > if compact { 80.0 } else { 180.0 } {
+                                                    let min_title_w = if ultra_compact {
+                                                        24.0
+                                                    } else if compact {
+                                                        56.0
+                                                    } else {
+                                                        140.0
+                                                    };
+                                                    if rem > min_title_w {
                                                         let resp = ui.add_sized(
                                                             [rem, 16.0],
                                                             egui::Label::new(
@@ -1635,11 +1653,18 @@ impl eframe::App for CrustApp {
                                                 }
                                             }
                                         }
-                                    } else if !compact {
+                                    } else {
                                         if let Some(ref title) = s.title {
                                             if !title.is_empty() && show_title {
                                                 let rem = ui.available_width();
-                                                if rem > 80.0 {
+                                                let min_title_w = if ultra_compact {
+                                                    24.0
+                                                } else if compact {
+                                                    56.0
+                                                } else {
+                                                    80.0
+                                                };
+                                                if rem > min_title_w {
                                                     let resp = ui.add_sized(
                                                         [rem, 16.0],
                                                         egui::Label::new(
@@ -1702,11 +1727,7 @@ impl eframe::App for CrustApp {
                                     }
                                     if let Some(fol) = rs.followers_only {
                                         if fol >= 0 {
-                                            let label = if fol == 0 {
-                                                "Followers".to_owned()
-                                            } else {
-                                                format!("Followers {fol}m")
-                                            };
+                                            let label = format_followers_only_label(fol);
                                             room_state_pill(ui, &label, t::TEXT_SECONDARY);
                                         }
                                     }
@@ -2172,7 +2193,7 @@ impl eframe::App for CrustApp {
                     );
                     let fill_col =
                         Color32::from_rgba_unmultiplied(18, 16, 26, (225.0 * opacity) as u8);
-                    egui::Frame::new()
+                    let frame_resp = egui::Frame::new()
                         .fill(fill_col)
                         .stroke(egui::Stroke::new(1.5, border_col))
                         .corner_radius(egui::CornerRadius::same(8))
@@ -2185,6 +2206,36 @@ impl eframe::App for CrustApp {
                                     .color(Color32::WHITE),
                             );
                         });
+
+                    if toast.confetti {
+                        let rect = frame_resp.response.rect.expand(4.0);
+                        let painter = ui.painter();
+                        for n in 0..14 {
+                            let seed = (n as f32) * 17.0 + (i as f32) * 5.0;
+                            let base_x = rect.left() + ((seed * 0.37).fract() * rect.width());
+                            let drop = ((seed * 0.11) + age * 0.85).fract();
+                            let y = rect.top() - 3.0 + drop * (rect.height() + 10.0);
+                            let drift = ((age * 5.2) + seed * 0.23).sin() * 3.2;
+                            let x = (base_x + drift).clamp(rect.left(), rect.right());
+                            let c = match n % 4 {
+                                0 => t::RAID_CYAN,
+                                1 => t::GOLD,
+                                2 => t::ACCENT,
+                                _ => t::BITS_ORANGE,
+                            };
+                            let col = Color32::from_rgba_unmultiplied(
+                                c.r(),
+                                c.g(),
+                                c.b(),
+                                (180.0 * opacity) as u8,
+                            );
+                            painter.circle_filled(
+                                egui::pos2(x, y),
+                                1.6 + (n % 3) as f32 * 0.45,
+                                col,
+                            );
+                        }
+                    }
                 });
         }
         // Keep animating while toasts are live.
@@ -2240,6 +2291,33 @@ fn fmt_viewers(n: u64) -> String {
     } else {
         n.to_string()
     }
+}
+
+fn format_followers_only_label(minutes: i32) -> String {
+    if minutes <= 0 {
+        return "Followers-only".to_owned();
+    }
+
+    let total = minutes as i64;
+    let days = total / 1_440;
+    let hours = (total % 1_440) / 60;
+    let mins = total % 60;
+
+    let mut parts: Vec<String> = Vec::new();
+    if days > 0 {
+        parts.push(format!("{days}d"));
+    }
+    if hours > 0 && parts.len() < 2 {
+        parts.push(format!("{hours}h"));
+    }
+    if mins > 0 && parts.len() < 2 {
+        parts.push(format!("{mins}m"));
+    }
+    if parts.is_empty() {
+        parts.push("0m".to_owned());
+    }
+
+    format!("Followers-only {}", parts.join(" "))
 }
 
 fn is_valid_twitch_login(login: &str) -> bool {

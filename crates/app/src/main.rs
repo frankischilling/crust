@@ -852,11 +852,20 @@ async fn reducer_loop(
                         }).await;
                     }
                     TwitchEvent::SubAlert { channel, display_name, months, plan, is_gift, sub_msg } => {
+                        let gifted_to_me = is_gift
+                            && auth_username
+                                .as_deref()
+                                .map(|u| u.eq_ignore_ascii_case(display_name.as_str()))
+                                .unwrap_or(false);
                         let text = build_sub_text(&display_name, months, &plan, is_gift);
-                        let msg = make_system_message(
+                        let mut msg = make_system_message(
                             local_msg_id, channel.clone(), text, Utc::now(),
                             MsgKind::Sub { display_name, months, plan, is_gift, sub_msg },
                         );
+                        if gifted_to_me {
+                            msg.flags.is_mention = true;
+                            msg.flags.is_highlighted = true;
+                        }
                         local_msg_id += 1;
                         let _ = evt_tx.send(AppEvent::MessageReceived {
                             channel,
