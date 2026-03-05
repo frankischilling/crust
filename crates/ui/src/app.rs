@@ -19,6 +19,7 @@ use crate::perf::PerfOverlay;
 use crate::theme as t;
 use crate::widgets::{
     analytics::AnalyticsPanel,
+    bytes_uri,
     channel_list::ChannelList,
     chat_input::ChatInput,
     emote_picker::EmotePicker,
@@ -54,6 +55,12 @@ struct EventToast {
     born: std::time::Instant,
 }
 
+#[derive(Clone)]
+struct PendingReply {
+    channel: ChannelId,
+    info: ReplyInfo,
+}
+
 /// Controls where the channel list is rendered.
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelLayout {
@@ -78,7 +85,7 @@ pub struct CrustApp {
     emote_catalog: Vec<EmoteCatalogEntry>,
     perf: PerfOverlay,
     /// Reply pending for the next send (set by right-click → Reply).
-    pending_reply: Option<ReplyInfo>,
+    pending_reply: Option<PendingReply>,
     /// User profile card (Chatterino-style, shown on username click).
     user_profile_popup: UserProfilePopup,
     /// Cached link previews (Open-Graph metadata) keyed by URL.
@@ -123,6 +130,63 @@ pub struct CrustApp {
     irc_nickserv_pass: String,
     /// Window always-on-top mode.
     always_on_top: bool,
+    /// 7TV animated avatar URLs keyed by Twitch user ID.
+    stv_avatars: HashMap<String, String>,
+}
+
+/// Apply the Crust colour palette to egui, reading the current dark/light
+/// flag from `theme::is_light()`.  Called once at startup and again whenever
+/// the user toggles the theme.
+fn apply_theme_visuals(ctx: &egui::Context) {
+    let mut vis = if t::is_light() {
+        egui::Visuals::light()
+    } else {
+        egui::Visuals::dark()
+    };
+    vis.override_text_color = Some(t::text_primary());
+    vis.panel_fill = t::bg_base();
+    vis.window_fill = t::bg_dialog();
+    vis.extreme_bg_color = t::bg_raised(); // TextEdit / ComboBox fill
+
+    vis.widgets.inactive.weak_bg_fill = t::bg_surface();
+    vis.widgets.inactive.bg_fill = t::bg_surface();
+    vis.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, t::text_secondary());
+    vis.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, t::border_subtle());
+    vis.widgets.inactive.corner_radius = t::RADIUS;
+
+    vis.widgets.hovered.weak_bg_fill = t::hover_bg();
+    vis.widgets.hovered.bg_fill = t::hover_bg();
+    vis.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, t::text_primary());
+    vis.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, t::border_accent());
+    vis.widgets.hovered.corner_radius = t::RADIUS;
+
+    vis.widgets.active.weak_bg_fill = t::accent_dim();
+    vis.widgets.active.bg_fill = t::accent_dim();
+    vis.widgets.active.fg_stroke = egui::Stroke::new(1.0, Color32::WHITE);
+    vis.widgets.active.bg_stroke = egui::Stroke::new(1.0, t::accent());
+    vis.widgets.active.corner_radius = t::RADIUS;
+
+    vis.widgets.open.weak_bg_fill = t::bg_raised();
+    vis.widgets.open.bg_fill = t::bg_raised();
+
+    vis.selection.bg_fill = t::accent_dim();
+    vis.selection.stroke = egui::Stroke::new(1.0, t::accent());
+
+    vis.window_corner_radius = t::RADIUS;
+    vis.window_stroke = t::stroke_subtle();
+    vis.menu_corner_radius = t::RADIUS;
+    vis.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, t::border_subtle());
+
+    let mut style = egui::Style {
+        visuals: vis,
+        ..(*ctx.style()).clone()
+    };
+    style.spacing.item_spacing = t::ITEM_SPACING;
+    style.spacing.button_padding = egui::vec2(10.0, 5.0);
+    style.spacing.window_margin = Margin::same(10);
+    style.interaction.tooltip_delay = 0.0;
+    style.interaction.tooltip_grace_time = 0.5;
+    ctx.set_style(style);
 }
 
 impl CrustApp {
@@ -134,51 +198,7 @@ impl CrustApp {
         egui_extras::install_image_loaders(&cc.egui_ctx);
 
         // -- Visuals -----------------------------------------------------------
-        let mut vis = egui::Visuals::dark();
-        vis.override_text_color = Some(t::TEXT_PRIMARY);
-        vis.panel_fill = t::BG_BASE;
-        vis.window_fill = t::BG_DIALOG;
-        vis.extreme_bg_color = t::BG_RAISED; // TextEdit / ComboBox fill
-
-        vis.widgets.inactive.weak_bg_fill = t::BG_SURFACE;
-        vis.widgets.inactive.bg_fill = t::BG_SURFACE;
-        vis.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, t::TEXT_SECONDARY);
-        vis.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, t::BORDER_SUBTLE);
-        vis.widgets.inactive.corner_radius = t::RADIUS;
-
-        vis.widgets.hovered.weak_bg_fill = t::HOVER_BG;
-        vis.widgets.hovered.bg_fill = t::HOVER_BG;
-        vis.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, t::TEXT_PRIMARY);
-        vis.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, t::BORDER_ACCENT);
-        vis.widgets.hovered.corner_radius = t::RADIUS;
-
-        vis.widgets.active.weak_bg_fill = t::ACCENT_DIM;
-        vis.widgets.active.bg_fill = t::ACCENT_DIM;
-        vis.widgets.active.fg_stroke = egui::Stroke::new(1.0, Color32::WHITE);
-        vis.widgets.active.bg_stroke = egui::Stroke::new(1.0, t::ACCENT);
-        vis.widgets.active.corner_radius = t::RADIUS;
-
-        vis.widgets.open.weak_bg_fill = t::BG_RAISED;
-        vis.widgets.open.bg_fill = t::BG_RAISED;
-
-        vis.selection.bg_fill = t::ACCENT_DIM;
-        vis.selection.stroke = egui::Stroke::new(1.0, t::ACCENT);
-
-        vis.window_corner_radius = t::RADIUS;
-        vis.window_stroke = t::STROKE_SUBTLE;
-        vis.menu_corner_radius = t::RADIUS;
-        vis.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, t::BORDER_SUBTLE);
-
-        let mut style = egui::Style {
-            visuals: vis,
-            ..(*cc.egui_ctx.style()).clone()
-        };
-        style.spacing.item_spacing = t::ITEM_SPACING;
-        style.spacing.button_padding = egui::vec2(10.0, 5.0);
-        style.spacing.window_margin = Margin::same(10);
-        style.interaction.tooltip_delay = 0.0;
-        style.interaction.tooltip_grace_time = 0.5;
-        cc.egui_ctx.set_style(style);
+        apply_theme_visuals(&cc.egui_ctx);
 
         install_system_fallback_fonts(&cc.egui_ctx);
 
@@ -215,6 +235,7 @@ impl CrustApp {
             irc_nickserv_user: String::new(),
             irc_nickserv_pass: String::new(),
             always_on_top: false,
+            stv_avatars: HashMap::new(),
         }
     }
 
@@ -306,12 +327,25 @@ impl CrustApp {
             }
             AppEvent::ChannelParted { channel } => {
                 self.state.leave_channel(&channel);
+                if self
+                    .pending_reply
+                    .as_ref()
+                    .map(|r| r.channel == channel)
+                    .unwrap_or(false)
+                {
+                    self.pending_reply = None;
+                }
             }
             AppEvent::ChannelRedirected {
                 old_channel,
                 new_channel,
             } => {
                 self.state.redirect_channel(&old_channel, &new_channel);
+                if let Some(reply) = self.pending_reply.as_mut() {
+                    if reply.channel == old_channel {
+                        reply.channel = new_channel;
+                    }
+                }
             }
             AppEvent::IrcTopicChanged { channel, topic } => {
                 if let Some(ch) = self.state.channels.get_mut(&channel) {
@@ -353,7 +387,7 @@ impl CrustApp {
                                 };
                                 Some(EventToast {
                                     text,
-                                    hue: if gifted_to_me { t::RAID_CYAN } else { t::GOLD },
+                                    hue: if gifted_to_me { t::raid_cyan() } else { t::gold() },
                                     confetti: gifted_to_me,
                                     born: std::time::Instant::now(),
                                 })
@@ -366,7 +400,7 @@ impl CrustApp {
                                     "🚀  {} is raiding with {} viewers!",
                                     display_name, viewer_count
                                 ),
-                                hue: t::RAID_CYAN,
+                                hue: t::raid_cyan(),
                                 confetti: false,
                                 born: std::time::Instant::now(),
                             }),
@@ -375,7 +409,7 @@ impl CrustApp {
                                     "💎  {} cheered {} bits!",
                                     message.sender.display_name, amount
                                 ),
-                                hue: t::BITS_ORANGE,
+                                hue: t::bits_orange(),
                                 confetti: false,
                                 born: std::time::Instant::now(),
                             }),
@@ -534,12 +568,31 @@ impl CrustApp {
                         })
                         .unwrap_or_default();
                     self.user_profile_popup.set_logs(logs);
+                    // If we have a 7TV animated avatar for this user, ensure
+                    // its bytes are prefetched so it renders immediately.
+                    if let Some(stv_url) = self.stv_avatars.get(&profile.id) {
+                        if !self.emote_bytes.contains_key(stv_url.as_str()) {
+                            self.send_cmd(AppCommand::FetchImage {
+                                url: stv_url.clone(),
+                            });
+                        }
+                    }
                     self.user_profile_popup.set_profile(profile);
                 }
             }
             AppEvent::UserProfileUnavailable { login } => {
                 if self.user_profile_popup.accepts_profile(&login) {
                     self.user_profile_popup.set_unavailable(&login);
+                }
+            }
+            AppEvent::IvrLogsLoaded { username, messages } => {
+                if self.user_profile_popup.accepts_profile(&username) {
+                    self.user_profile_popup.set_ivr_logs(messages);
+                }
+            }
+            AppEvent::IvrLogsFailed { username, error } => {
+                if self.user_profile_popup.accepts_profile(&username) {
+                    self.user_profile_popup.set_ivr_logs_error(error);
                 }
             }
             AppEvent::UserMessagesCleared { channel, login } => {
@@ -567,6 +620,7 @@ impl CrustApp {
                 title,
                 description,
                 thumbnail_url,
+                site_name,
             } => {
                 self.link_previews.insert(
                     url,
@@ -574,6 +628,7 @@ impl CrustApp {
                         title,
                         description,
                         thumbnail_url,
+                        site_name,
                         fetched: true,
                     },
                 );
@@ -638,6 +693,51 @@ impl CrustApp {
                     }
                 }
             }
+            AppEvent::SenderCosmeticsUpdated {
+                user_id,
+                color,
+                badge,
+                avatar_url,
+            } => {
+                if user_id.is_empty() {
+                    return;
+                }
+
+                // Store 7TV animated avatar URL for this user.
+                if let Some(ref url) = avatar_url {
+                    self.stv_avatars.insert(user_id.clone(), url.clone());
+                    // Prefetch the avatar bytes so they're ready for the popup.
+                    if !self.emote_bytes.contains_key(url.as_str()) {
+                        self.send_cmd(AppCommand::FetchImage {
+                            url: url.clone(),
+                        });
+                    }
+                }
+
+                let mut _updated = 0u32;
+                for ch in self.state.channels.values_mut() {
+                    for msg in &mut ch.messages {
+                        if msg.sender.user_id.0 != user_id {
+                            continue;
+                        }
+
+                        if let Some(ref c) = color {
+                            msg.sender.color = Some(c.clone());
+                        }
+
+                        if let Some(ref b) = badge {
+                            let exists = msg.sender.badges.iter().any(|x| {
+                                x.url.as_deref() == b.url.as_deref()
+                                    || x.name.eq_ignore_ascii_case("7tv")
+                            });
+                            if !exists {
+                                msg.sender.badges.insert(0, b.clone());
+                            }
+                        }
+                        _updated += 1;
+                    }
+                }
+            }
         }
     }
 
@@ -668,7 +768,12 @@ impl eframe::App for CrustApp {
         // PERF: avoid per-frame to_lowercase() allocation - check live status
         // directly against stream_statuses values.
         let has_live_sidebar = self.stream_statuses.values().any(|s| s.is_live);
-        let repaint_ms = if has_live_sidebar || !self.event_toasts.is_empty() {
+        let has_animated_popup = self.user_profile_popup.open
+            && self.user_profile_popup.profile_id()
+                .and_then(|id| self.stv_avatars.get(id))
+                .and_then(|url| self.emote_bytes.get(url.as_str()))
+                .is_some();
+        let repaint_ms = if has_live_sidebar || !self.event_toasts.is_empty() || has_animated_popup {
             33
         } else {
             100
@@ -724,8 +829,8 @@ impl eframe::App for CrustApp {
             }
         }
 
-        // Render profile popup and dispatch any moderation action.
-        if let Some(action) = self.user_profile_popup.show(ctx, &self.emote_bytes) {
+        // Render profile popup and dispatch any actions.
+        for action in self.user_profile_popup.show(ctx, &self.emote_bytes, &self.stv_avatars) {
             match action {
                 PopupAction::Timeout {
                     channel,
@@ -766,6 +871,13 @@ impl eframe::App for CrustApp {
                         user_id,
                     });
                 }
+                PopupAction::FetchIvrLogs { channel, username } => {
+                    self.user_profile_popup.set_ivr_logs_loading();
+                    self.send_cmd(AppCommand::FetchIvrLogs { channel, username });
+                }
+                PopupAction::OpenUrl { url } => {
+                    self.send_cmd(AppCommand::OpenUrl { url });
+                }
             }
         }
 
@@ -776,11 +888,17 @@ impl eframe::App for CrustApp {
         {
             self.send_cmd(AppCommand::JoinChannel { channel: ch });
         }
+        // For the login dialog, prefer 7TV animated avatar if available.
+        let login_avatar_url: Option<&str> = self
+            .state.auth.user_id.as_deref()
+            .and_then(|uid| self.stv_avatars.get(uid))
+            .map(|s| s.as_str())
+            .or(self.state.auth.avatar_url.as_deref());
         if let Some(action) = self.login_dialog.show(
             ctx,
             self.state.auth.logged_in,
             self.state.auth.username.as_deref(),
-            self.state.auth.avatar_url.as_deref(),
+            login_avatar_url,
             &self.emote_bytes,
         ) {
             match action {
@@ -805,6 +923,7 @@ impl eframe::App for CrustApp {
             let mut ns_user = self.irc_nickserv_user.clone();
             let mut ns_pass = self.irc_nickserv_pass.clone();
             let mut on_top = self.always_on_top;
+            let mut light = t::is_light();
 
             egui::Window::new("Settings")
                 .open(&mut settings_open)
@@ -820,10 +939,26 @@ impl eframe::App for CrustApp {
                     ui.set_max_width(settings_w);
 
                     ui.label(
+                        RichText::new("Appearance")
+                            .font(t::body())
+                            .strong()
+                            .color(t::text_primary()),
+                    );
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Theme:");
+                        ui.selectable_value(&mut light, false, "Dark");
+                        ui.selectable_value(&mut light, true, "Light");
+                    });
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+
+                    ui.label(
                         RichText::new("Window")
                             .font(t::body())
                             .strong()
-                            .color(t::TEXT_PRIMARY),
+                            .color(t::text_primary()),
                     );
                     ui.add_space(4.0);
                     ui.checkbox(&mut on_top, "Always on top");
@@ -835,7 +970,7 @@ impl eframe::App for CrustApp {
                         RichText::new("Experimental Transport Compatibility")
                             .font(t::body())
                             .strong()
-                            .color(t::TEXT_PRIMARY),
+                            .color(t::text_primary()),
                     );
                     ui.add_space(6.0);
 
@@ -850,7 +985,7 @@ impl eframe::App for CrustApp {
                         RichText::new("IRC NickServ Auto-Identify")
                             .font(t::body())
                             .strong()
-                            .color(t::TEXT_PRIMARY),
+                            .color(t::text_primary()),
                     );
                     ui.add_space(4.0);
                     ui.label(
@@ -858,7 +993,7 @@ impl eframe::App for CrustApp {
                             "Automatically identify with NickServ when connecting to IRC servers.",
                         )
                         .font(t::small())
-                        .color(t::TEXT_MUTED),
+                        .color(t::text_muted()),
                     );
                     ui.add_space(6.0);
 
@@ -878,11 +1013,17 @@ impl eframe::App for CrustApp {
                             "Changes are saved immediately. Enabling beta transports may require restarting Crust.",
                         )
                         .font(t::small())
-                        .color(t::TEXT_MUTED),
+                        .color(t::text_muted()),
                     );
                 });
 
             self.settings_open = settings_open;
+            if light != t::is_light() {
+                if light { t::set_light(); } else { t::set_dark(); }
+                apply_theme_visuals(ctx);
+                let theme = if light { "light" } else { "dark" };
+                self.send_cmd(AppCommand::SetTheme { theme: theme.to_owned() });
+            }
             if on_top != self.always_on_top {
                 self.always_on_top = on_top;
                 let level = if on_top {
@@ -927,9 +1068,9 @@ impl eframe::App for CrustApp {
             .exact_height(if window_width < VERY_NARROW_THRESHOLD { 28.0 } else { 36.0 })
             .frame(
                 Frame::new()
-                    .fill(t::BG_SURFACE)
+                    .fill(t::bg_surface())
                     .inner_margin(t::BAR_MARGIN)
-                    .stroke(egui::Stroke::new(1.0, t::BORDER_SUBTLE)),
+                    .stroke(egui::Stroke::new(1.0, t::border_subtle())),
             )
             .show(ctx, |ui| {
                 let bar_width = ui.available_width();
@@ -949,7 +1090,7 @@ impl eframe::App for CrustApp {
                         let logo_font = egui::FontId::proportional(15.0);
                         let logo_w = ui
                             .fonts(|f| {
-                                f.layout_no_wrap("crust".to_owned(), logo_font.clone(), t::ACCENT)
+                                f.layout_no_wrap("crust".to_owned(), logo_font.clone(), t::accent())
                                     .rect
                                     .width()
                             })
@@ -962,7 +1103,7 @@ impl eframe::App for CrustApp {
                                     RichText::new("crust")
                                         .font(logo_font)
                                         .strong()
-                                        .color(t::ACCENT),
+                                        .color(t::accent()),
                                 );
                             },
                         );
@@ -987,7 +1128,7 @@ impl eframe::App for CrustApp {
                                 f.layout_no_wrap(
                                     conn_label.to_owned(),
                                     conn_font.clone(),
-                                    t::TEXT_SECONDARY,
+                                    t::text_secondary(),
                                 )
                                 .rect
                                 .width()
@@ -1000,7 +1141,7 @@ impl eframe::App for CrustApp {
                                 ui.label(
                                     RichText::new(conn_label)
                                         .font(conn_font)
-                                        .color(t::TEXT_SECONDARY),
+                                        .color(t::text_secondary()),
                                 );
                             },
                         );
@@ -1278,7 +1419,7 @@ impl eframe::App for CrustApp {
                             ui.label(
                                 RichText::new(format!("{} emotes", self.emote_bytes.len()))
                                     .font(t::small())
-                                    .color(t::TEXT_MUTED),
+                                    .color(t::text_muted()),
                             );
 
                             ui.separator();
@@ -1315,7 +1456,7 @@ impl eframe::App for CrustApp {
                                 let name_galley = ui.painter().layout_no_wrap(
                                     name.to_owned(),
                                     t::small(),
-                                    t::TEXT_PRIMARY,
+                                    t::text_primary(),
                                 );
                                 let pill_w = btn_h + 6.0 + name_galley.size().x + 10.0;
                                 let (rect, resp) = ui.allocate_exact_size(
@@ -1326,14 +1467,14 @@ impl eframe::App for CrustApp {
 
                                 if ui.is_rect_visible(rect) {
                                     let bg = if resp.hovered() {
-                                        t::BG_RAISED
+                                        t::bg_raised()
                                     } else {
-                                        t::BG_SURFACE
+                                        t::bg_surface()
                                     };
                                     let border = if resp.hovered() {
-                                        t::BORDER_ACCENT
+                                        t::border_accent()
                                     } else {
-                                        t::BORDER_SUBTLE
+                                        t::border_subtle()
                                     };
                                     ui.painter().rect(
                                         rect,
@@ -1349,21 +1490,31 @@ impl eframe::App for CrustApp {
                                         egui::pos2(rect.left() + btn_h * 0.5, rect.center().y);
 
                                     // Try to render the real avatar image; fall back to initial letter.
-                                    let avatar_bytes =
-                                        self.state.auth.avatar_url.as_deref().and_then(|url| {
+                                    // Prefer 7TV animated avatar if available.
+                                    let avatar_bytes = self
+                                        .state.auth.user_id.as_deref()
+                                        .and_then(|uid| self.stv_avatars.get(uid))
+                                        .and_then(|url| {
                                             self.emote_bytes
-                                                .get(url)
-                                                .map(|(_, _, raw)| (url, raw.clone()))
+                                                .get(url.as_str())
+                                                .map(|(_, _, raw)| (url.as_str(), raw.clone()))
+                                        })
+                                        .or_else(|| {
+                                            self.state.auth.avatar_url.as_deref().and_then(|url| {
+                                                self.emote_bytes
+                                                    .get(url)
+                                                    .map(|(_, _, raw)| (url, raw.clone()))
+                                            })
                                         });
 
                                     if let Some((logo, raw)) = avatar_bytes {
-                                        let uri = format!("bytes://{logo}");
+                                        let uri = bytes_uri(logo, raw.as_ref());
                                         let av_size = avatar_r * 2.0;
                                         let av_rect = egui::Rect::from_center_size(
                                             avatar_c,
                                             egui::vec2(av_size, av_size),
                                         );
-                                        ui.painter().circle_filled(avatar_c, avatar_r, t::BG_RAISED);
+                                        ui.painter().circle_filled(avatar_c, avatar_r, t::bg_raised());
                                         ui.put(
                                             av_rect,
                                             egui::Image::from_bytes(
@@ -1375,13 +1526,13 @@ impl eframe::App for CrustApp {
                                         );
                                     } else {
                                         ui.painter()
-                                            .circle_filled(avatar_c, avatar_r, t::ACCENT_DIM);
+                                            .circle_filled(avatar_c, avatar_r, t::accent_dim());
                                         ui.painter().text(
                                             avatar_c,
                                             egui::Align2::CENTER_CENTER,
                                             initial.to_string(),
                                             egui::FontId::proportional(avatar_r * 1.15),
-                                            t::TEXT_PRIMARY,
+                                            t::text_primary(),
                                         );
                                     }
 
@@ -1391,7 +1542,7 @@ impl eframe::App for CrustApp {
                                         egui::Align2::LEFT_CENTER,
                                         name,
                                         t::small(),
-                                        t::TEXT_PRIMARY,
+                                        t::text_primary(),
                                     );
                                 }
 
@@ -1431,7 +1582,7 @@ impl eframe::App for CrustApp {
                     .exact_height(28.0)
                     .frame(
                         Frame::new()
-                            .fill(t::BG_SURFACE)
+                            .fill(t::bg_surface())
                             .inner_margin(egui::Margin::symmetric(8, 4))
                             .stroke(egui::Stroke::NONE),
                     )
@@ -1455,7 +1606,7 @@ impl eframe::App for CrustApp {
                                     RichText::new(format!("{prefix}{}", active_ch.display_name()))
                                         .strong()
                                         .font(t::small())
-                                        .color(t::TEXT_PRIMARY),
+                                        .color(t::text_primary()),
                                 )
                                 .truncate(),
                             );
@@ -1463,20 +1614,20 @@ impl eframe::App for CrustApp {
                                 ui.label(
                                     RichText::new(platform)
                                         .font(t::small())
-                                        .color(t::TEXT_MUTED),
+                                        .color(t::text_muted()),
                                 );
                             }
                             if !topic.is_empty() && bar_w > 200.0 {
                                 ui.label(
                                     RichText::new("-")
                                         .font(t::small())
-                                        .color(t::TEXT_MUTED),
+                                        .color(t::text_muted()),
                                 );
                                 ui.add(
                                     egui::Label::new(
                                         RichText::new(topic)
                                             .font(t::small())
-                                            .color(t::TEXT_SECONDARY),
+                                            .color(t::text_secondary()),
                                     )
                                     .truncate(),
                                 );
@@ -1489,9 +1640,9 @@ impl eframe::App for CrustApp {
                 // Subtle red tint on the bar background when the channel is live.
                 let bar_is_live = status.map(|s| s.is_live).unwrap_or(false);
                 let bar_fill = if bar_is_live {
-                    Color32::from_rgb(24, 14, 14)
+                    t::live_tint_bg()
                 } else {
-                    t::BG_SURFACE
+                    t::bg_surface()
                 };
                 TopBottomPanel::top("stream_info_bar")
                     .exact_height(28.0)
@@ -1516,7 +1667,7 @@ impl eframe::App for CrustApp {
                                 br.left_top(),
                                 egui::vec2(3.0, br.height()),
                             );
-                            ui.painter().rect_filled(strip, 0.0, t::RED);
+                            ui.painter().rect_filled(strip, 0.0, t::red());
                         }
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = if ultra_compact { 4.0 } else { 8.0 };
@@ -1536,19 +1687,19 @@ impl eframe::App for CrustApp {
                                         ))
                                         .strong()
                                         .font(t::small())
-                                        .color(t::TEXT_PRIMARY),
+                                        .color(t::text_primary()),
                                     );
                                     if !ultra_compact {
                                         ui.label(
                                             RichText::new("Fetching stream status…")
                                                 .font(t::small())
-                                                .color(t::TEXT_MUTED),
+                                                .color(t::text_muted()),
                                         );
                                     }
                                 }
                                 Some(s) => {
                                     let status_text = if s.is_live { "LIVE" } else { "OFFLINE" };
-                                    let status_col = if s.is_live { t::RED } else { t::TEXT_MUTED };
+                                    let status_col = if s.is_live { t::red() } else { t::text_muted() };
                                     let status_bg = if s.is_live {
                                         Color32::from_rgba_unmultiplied(200, 45, 45, 30)
                                     } else {
@@ -1595,7 +1746,7 @@ impl eframe::App for CrustApp {
                                         ))
                                         .strong()
                                         .font(t::small())
-                                        .color(t::TEXT_PRIMARY),
+                                        .color(t::text_primary()),
                                     );
 
                                     // Viewer count (live only)
@@ -1608,7 +1759,7 @@ impl eframe::App for CrustApp {
                                                         fmt_viewers(viewers)
                                                     ))
                                                     .font(t::small())
-                                                    .color(t::TEXT_SECONDARY),
+                                                    .color(t::text_secondary()),
                                                 );
                                             }
                                         }
@@ -1620,7 +1771,7 @@ impl eframe::App for CrustApp {
                                                     ui.label(
                                                         RichText::new(game.as_str())
                                                             .font(t::small())
-                                                            .color(t::TEXT_SECONDARY),
+                                                            .color(t::text_secondary()),
                                                     );
                                                 }
                                             }
@@ -1644,7 +1795,7 @@ impl eframe::App for CrustApp {
                                                             egui::Label::new(
                                                                 RichText::new(title.as_str())
                                                                     .font(t::small())
-                                                                    .color(t::TEXT_MUTED),
+                                                                    .color(t::text_muted()),
                                                             )
                                                             .truncate(),
                                                         );
@@ -1670,7 +1821,7 @@ impl eframe::App for CrustApp {
                                                         egui::Label::new(
                                                             RichText::new(title.as_str())
                                                                 .font(t::small())
-                                                                .color(t::TEXT_MUTED),
+                                                                .color(t::text_muted()),
                                                         )
                                                         .truncate(),
                                                     );
@@ -1708,7 +1859,7 @@ impl eframe::App for CrustApp {
                         .exact_height(20.0)
                         .frame(
                             Frame::new()
-                                .fill(t::BG_BASE)
+                                .fill(t::bg_base())
                                 .inner_margin(egui::Margin::symmetric(8, 2))
                                 .stroke(egui::Stroke::NONE),
                         )
@@ -1717,31 +1868,31 @@ impl eframe::App for CrustApp {
                                 ui.spacing_mut().item_spacing.x = 6.0;
                                 if let Some(rs) = room {
                                     if rs.emote_only {
-                                        room_state_pill(ui, "Emote Only", t::ACCENT);
+                                        room_state_pill(ui, "Emote Only", t::accent());
                                     }
                                     if rs.subscribers_only {
-                                        room_state_pill(ui, "Sub Only", t::GOLD);
+                                        room_state_pill(ui, "Sub Only", t::gold());
                                     }
                                     if let Some(slow) = rs.slow_mode {
                                         if slow > 0 {
-                                            room_state_pill(ui, &format!("Slow {slow}s"), t::YELLOW);
+                                            room_state_pill(ui, &format!("Slow {slow}s"), t::yellow());
                                         }
                                     }
                                     if let Some(fol) = rs.followers_only {
                                         if fol >= 0 {
                                             let label = format_followers_only_label(fol);
-                                            room_state_pill(ui, &label, t::TEXT_SECONDARY);
+                                            room_state_pill(ui, &label, t::text_secondary());
                                         }
                                     }
                                     if rs.r9k {
-                                        room_state_pill(ui, "R9K", t::TEXT_MUTED);
+                                        room_state_pill(ui, "R9K", t::text_muted());
                                     }
                                 }
                                 if let Some(viewers) = live_viewers {
                                     room_state_pill(
                                         ui,
                                         &format!("Viewers {}", fmt_viewers(viewers)),
-                                        t::RAID_CYAN,
+                                        t::raid_cyan(),
                                     );
                                 }
                             });
@@ -1764,9 +1915,9 @@ impl eframe::App for CrustApp {
                     .exact_height(32.0)
                     .frame(
                         Frame::new()
-                            .fill(t::BG_SURFACE)
+                            .fill(t::bg_surface())
                             .inner_margin(egui::Margin::symmetric(6, 0))
-                            .stroke(egui::Stroke::new(1.0, t::BORDER_SUBTLE)),
+                            .stroke(egui::Stroke::new(1.0, t::border_subtle())),
                     )
                     .show(ctx, |ui| {
                         egui::ScrollArea::horizontal()
@@ -1796,13 +1947,13 @@ impl eframe::App for CrustApp {
                                         };
 
                                         let (fg, bg) = if is_active {
-                                            (t::TEXT_PRIMARY, t::ACCENT_DIM)
+                                            (t::text_primary(), t::accent_dim())
                                         } else if mentions > 0 {
-                                            (t::ACCENT, t::BG_SURFACE)
+                                            (t::accent(), t::bg_surface())
                                         } else if unread > 0 {
-                                            (t::TEXT_PRIMARY, t::BG_SURFACE)
+                                            (t::text_primary(), t::bg_surface())
                                         } else {
-                                            (t::TEXT_SECONDARY, t::BG_SURFACE)
+                                            (t::text_secondary(), t::bg_surface())
                                         };
 
                                         let resp = ui.add(
@@ -1886,16 +2037,16 @@ impl eframe::App for CrustApp {
                     .max_width(sidebar_max)
                     .frame(
                         Frame::new()
-                            .fill(t::BG_SURFACE)
+                            .fill(t::bg_surface())
                             .inner_margin(t::SIDEBAR_MARGIN)
-                            .stroke(egui::Stroke::new(1.0, t::BORDER_SUBTLE)),
+                            .stroke(egui::Stroke::new(1.0, t::border_subtle())),
                     )
                     .show(ctx, |ui| {
                         ui.label(
                             RichText::new("CHANNELS")
                                 .font(t::heading())
                                 .strong()
-                                .color(t::TEXT_MUTED),
+                                .color(t::text_muted()),
                         );
                         ui.add_space(4.0);
                         ui.add(egui::Separator::default().spacing(6.0));
@@ -1925,6 +2076,14 @@ impl eframe::App for CrustApp {
             self.state.active_channel = Some(ch);
         }
         if let Some(ch) = ch_closed {
+            if self
+                .pending_reply
+                .as_ref()
+                .map(|r| r.channel == ch)
+                .unwrap_or(false)
+            {
+                self.pending_reply = None;
+            }
             self.send_cmd(AppCommand::LeaveChannel {
                 channel: ch.clone(),
             });
@@ -1945,9 +2104,9 @@ impl eframe::App for CrustApp {
                         .max_width(340.0)
                         .frame(
                             Frame::new()
-                                .fill(t::BG_SURFACE)
+                                .fill(t::bg_surface())
                                 .inner_margin(t::SIDEBAR_MARGIN)
-                                .stroke(egui::Stroke::new(1.0, t::BORDER_SUBTLE)),
+                                .stroke(egui::Stroke::new(1.0, t::border_subtle())),
                         )
                         .show(ctx, |ui| {
                             self.analytics_panel.show(ui, ch_state);
@@ -1958,7 +2117,7 @@ impl eframe::App for CrustApp {
 
         // -- Central area: messages + input ------------------------------------
         CentralPanel::default()
-            .frame(Frame::new().fill(t::BG_BASE).inner_margin(Margin {
+            .frame(Frame::new().fill(t::bg_base()).inner_margin(Margin {
                 left: 6,
                 right: 0,
                 top: 0,
@@ -1966,8 +2125,14 @@ impl eframe::App for CrustApp {
             }))
             .show(ctx, |ui| {
                 if let Some(active_ch) = self.state.active_channel.clone() {
+                    let active_reply = self
+                        .pending_reply
+                        .as_ref()
+                        .filter(|r| r.channel == active_ch)
+                        .map(|r| r.info.clone());
+
                     // Input tray pinned to bottom
-                    let input_panel_h = if self.pending_reply.is_some() {
+                    let input_panel_h = if active_reply.is_some() {
                         64.0
                     } else {
                         t::BAR_H + (t::INPUT_MARGIN.top + t::INPUT_MARGIN.bottom) as f32
@@ -1977,9 +2142,9 @@ impl eframe::App for CrustApp {
                         .exact_height(input_panel_h)
                         .frame(
                             Frame::new()
-                                .fill(t::BG_SURFACE)
+                                .fill(t::bg_surface())
                                 .inner_margin(Margin::ZERO)
-                                .stroke(egui::Stroke::new(1.0, t::BORDER_SUBTLE)),
+                                .stroke(egui::Stroke::new(1.0, t::border_subtle())),
                         )
                         .show_inside(ui, |ui| {
                             let chat = ChatInput {
@@ -1988,12 +2153,12 @@ impl eframe::App for CrustApp {
                                 username: self.state.auth.username.as_deref(),
                                 emote_catalog: &self.emote_catalog,
                                 emote_bytes: &self.emote_bytes,
-                                pending_reply: self.pending_reply.as_ref(),
+                                pending_reply: active_reply.as_ref(),
                                 message_history: &self.message_history,
                                 known_channels: &self.state.channel_order,
                             };
                             let result = chat.show(ui, &mut self.chat_input_buf);
-                            if result.dismiss_reply {
+                            if result.dismiss_reply && active_reply.is_some() {
                                 self.pending_reply = None;
                             }
                             if let Some(text) = result.send {
@@ -2005,8 +2170,10 @@ impl eframe::App for CrustApp {
                                     }
                                 }
                                 let reply_to_msg_id =
-                                    self.pending_reply.as_ref().map(|r| r.parent_msg_id.clone());
-                                self.pending_reply = None;
+                                    active_reply.as_ref().map(|r| r.parent_msg_id.clone());
+                                if active_reply.is_some() {
+                                    self.pending_reply = None;
+                                }
                                 let is_mod = self
                                     .state
                                     .channels
@@ -2033,6 +2200,7 @@ impl eframe::App for CrustApp {
                                     &text,
                                     &active_ch,
                                     reply_to_msg_id.clone(),
+                                    active_reply.clone(),
                                     can_moderate,
                                     chatters_count,
                                     self.kick_beta_enabled,
@@ -2103,6 +2271,7 @@ impl eframe::App for CrustApp {
                                         channel: active_ch.clone(),
                                         text,
                                         reply_to_msg_id,
+                                        reply: active_reply,
                                     });
                                 }
                             }
@@ -2144,7 +2313,10 @@ impl eframe::App for CrustApp {
                         )
                         .show(ui);
                         if let Some(r) = ml_result.reply {
-                            self.pending_reply = Some(r);
+                            self.pending_reply = Some(PendingReply {
+                                channel: active_ch.clone(),
+                                info: r,
+                            });
                         }
                         if let Some((login, badges)) = ml_result.profile_request {
                             self.user_profile_popup.set_loading(
@@ -2159,7 +2331,7 @@ impl eframe::App for CrustApp {
                     ui.centered_and_justified(|ui| {
                         ui.label(
                             RichText::new("Click \"+ Join\" to open a Twitch channel.")
-                                .color(t::TEXT_MUTED)
+                                .color(t::text_muted())
                                 .font(t::body()),
                         );
                     });
@@ -2200,8 +2372,10 @@ impl eframe::App for CrustApp {
                         toast.hue.b(),
                         (160.0 * opacity) as u8,
                     );
-                    let fill_col =
-                        Color32::from_rgba_unmultiplied(18, 16, 26, (225.0 * opacity) as u8);
+                    let fill_col = {
+                        let o = t::overlay_fill();
+                        Color32::from_rgba_unmultiplied(o.r(), o.g(), o.b(), (225.0 * opacity) as u8)
+                    };
                     let frame_resp = egui::Frame::new()
                         .fill(fill_col)
                         .stroke(egui::Stroke::new(1.5, border_col))
@@ -2227,10 +2401,10 @@ impl eframe::App for CrustApp {
                             let drift = ((age * 5.2) + seed * 0.23).sin() * 3.2;
                             let x = (base_x + drift).clamp(rect.left(), rect.right());
                             let c = match n % 4 {
-                                0 => t::RAID_CYAN,
-                                1 => t::GOLD,
-                                2 => t::ACCENT,
-                                _ => t::BITS_ORANGE,
+                                0 => t::raid_cyan(),
+                                1 => t::gold(),
+                                2 => t::accent(),
+                                _ => t::bits_orange(),
                             };
                             let col = Color32::from_rgba_unmultiplied(
                                 c.r(),
@@ -2283,12 +2457,12 @@ fn room_state_pill(ui: &mut egui::Ui, text: &str, color: Color32) {
 
 fn connection_indicator(state: &ConnectionState, logged_in: bool) -> (Color32, &'static str) {
     match state {
-        ConnectionState::Connected if logged_in => (t::GREEN, "Connected"),
-        ConnectionState::Connected => (t::GREEN, "Connected (anon)"),
-        ConnectionState::Connecting => (t::YELLOW, "Connecting..."),
-        ConnectionState::Reconnecting { .. } => (t::YELLOW, "Reconnecting..."),
-        ConnectionState::Disconnected => (t::RED, "Disconnected"),
-        ConnectionState::Error(_) => (t::RED, "Error"),
+        ConnectionState::Connected if logged_in => (t::green(), "Connected"),
+        ConnectionState::Connected => (t::green(), "Connected (anon)"),
+        ConnectionState::Connecting => (t::yellow(), "Connecting..."),
+        ConnectionState::Reconnecting { .. } => (t::yellow(), "Reconnecting..."),
+        ConnectionState::Disconnected => (t::red(), "Disconnected"),
+        ConnectionState::Error(_) => (t::red(), "Error"),
     }
 }
 
@@ -2346,14 +2520,18 @@ fn install_system_fallback_fonts(ctx: &Context) {
         // DejaVu - good Latin/Greek/Cyrillic/symbols coverage
         ("dejavu", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
         ("dejavu", "/usr/share/fonts/TTF/DejaVuSans.ttf"),
-        // Noto Sans - broad multilingual coverage
+        // Noto Sans - broad multilingual coverage (Latin/Greek/Cyrillic/etc.)
         (
             "noto",
             "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
         ),
         ("noto", "/usr/share/fonts/noto/NotoSans-Regular.ttf"),
-        ("noto", "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc"),
-        ("noto", "/usr/share/fonts/noto/NotoSansCJK-Regular.ttc"),
+        // Noto CJK - Japanese / Chinese / Korean (separate name so it loads
+        // even when plain NotoSans was already found above)
+        ("noto_cjk", "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc"),
+        ("noto_cjk", "/usr/share/fonts/noto/NotoSansCJK-Regular.ttc"),
+        ("noto_cjk", "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+        ("noto_cjk", "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc"),
         // Noto Emoji - colour emoji fallback
         (
             "noto_emoji",
@@ -2372,9 +2550,29 @@ fn install_system_fallback_fonts(ctx: &Context) {
             "arial_unicode",
             "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
         ),
-        // Windows
+        // macOS CJK
+        ("mac_cjk", "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc"),
+        ("mac_cjk", "/System/Library/Fonts/Hiragino Sans GB.ttc"),
+        ("mac_cjk", "/Library/Fonts/Arial Unicode.ttf"),
+        // Windows - Latin / symbols
         ("seguisym", "C:\\Windows\\Fonts\\seguisym.ttf"),
         ("arial", "C:\\Windows\\Fonts\\arial.ttf"),
+        // Windows - Japanese  (Yu Gothic is the modern default JP font)
+        ("win_jp", "C:\\Windows\\Fonts\\YuGothR.ttc"),
+        ("win_jp", "C:\\Windows\\Fonts\\YuGothM.ttc"),
+        ("win_jp", "C:\\Windows\\Fonts\\msgothic.ttc"),
+        ("win_jp", "C:\\Windows\\Fonts\\meiryo.ttc"),
+        // Windows - Chinese Simplified
+        ("win_sc", "C:\\Windows\\Fonts\\msyh.ttc"),
+        ("win_sc", "C:\\Windows\\Fonts\\simsun.ttc"),
+        // Windows - Chinese Traditional
+        ("win_tc", "C:\\Windows\\Fonts\\msjh.ttc"),
+        ("win_tc", "C:\\Windows\\Fonts\\mingliu.ttc"),
+        // Windows - Korean
+        ("win_kr", "C:\\Windows\\Fonts\\malgun.ttf"),
+        ("win_kr", "C:\\Windows\\Fonts\\gulim.ttc"),
+        // Windows - Thai / Arabic / Hebrew / Devanagari
+        ("win_tahoma", "C:\\Windows\\Fonts\\tahoma.ttf"),
     ];
 
     // Start from egui defaults so built-in Ubuntu font is preserved.
@@ -2427,6 +2625,7 @@ fn parse_slash_command(
     text: &str,
     channel: &ChannelId,
     reply_to_msg_id: Option<String>,
+    reply: Option<ReplyInfo>,
     _is_mod: bool,
     chatters_count: usize,
     kick_beta_enabled: bool,
@@ -2603,6 +2802,7 @@ fn parse_slash_command(
                     channel: channel.clone(),
                     text: text.to_owned(),
                     reply_to_msg_id,
+                    reply: reply.clone(),
                 });
             }
             let login = rest
@@ -2673,6 +2873,7 @@ fn parse_slash_command(
                 channel: channel.clone(),
                 text: fwd,
                 reply_to_msg_id,
+                reply: reply.clone(),
             })
         }
 
@@ -2681,6 +2882,7 @@ fn parse_slash_command(
             channel: channel.clone(),
             text: text.to_owned(),
             reply_to_msg_id,
+            reply: reply.clone(),
         }),
 
         // Everything else falls through to IRC

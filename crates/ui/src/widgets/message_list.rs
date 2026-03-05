@@ -88,6 +88,10 @@ impl<'a> MessageList<'a> {
                 .unwrap_or(false);
             over_panel && i.raw_scroll_delta.y.abs() > 0.0
         });
+        // Store whether the wheel was used this frame, so show_resume_button
+        // doesn't immediately clear the paused flag before the delta is applied.
+        let wheel_key = egui::Id::new("scroll_wheel_this_frame").with(self.channel.as_str());
+        ui.ctx().data_mut(|d| d.insert_temp(wheel_key, wheel_over_panel));
         if wheel_over_panel {
             ui.ctx().data_mut(|d| d.insert_temp(paused_key, true));
         }
@@ -347,6 +351,51 @@ impl<'a> MessageList<'a> {
         })
     }
 
+    fn reply_info_for_message(msg: &ChatMessage) -> Option<ReplyInfo> {
+        if msg.flags.is_deleted || !msg.channel.is_twitch() {
+            return None;
+        }
+        let parent_msg_id = msg.server_id.clone()?.trim().to_owned();
+        if parent_msg_id.is_empty() {
+            return None;
+        }
+        Some(ReplyInfo {
+            parent_msg_id,
+            parent_user_login: msg.sender.login.clone(),
+            parent_display_name: msg.sender.display_name.clone(),
+            parent_msg_body: msg.raw_text.clone(),
+        })
+    }
+
+    fn show_message_context_menu(&self, ui: &mut Ui, msg: &ChatMessage, reply_key: Id) {
+        if let Some(info) = Self::reply_info_for_message(msg) {
+            if ui.button("↩  Reply").clicked() {
+                ui.ctx().data_mut(|d| d.insert_temp(reply_key, info));
+                ui.close_menu();
+            }
+        } else {
+            let hint = if msg.flags.is_deleted {
+                "Cannot reply to deleted messages"
+            } else if !msg.channel.is_twitch() {
+                "Inline replies are currently supported for Twitch messages only"
+            } else {
+                "Cannot reply to this message yet (missing message id)"
+            };
+            ui.add_enabled(false, egui::Button::new("↩  Reply"))
+                .on_hover_text(hint);
+        }
+
+        ui.separator();
+        if ui.button("📋  Copy message").clicked() {
+            ui.ctx().copy_text(msg.raw_text.clone());
+            ui.close_menu();
+        }
+        if ui.button("👤  Copy username").clicked() {
+            ui.ctx().copy_text(msg.sender.login.clone());
+            ui.close_menu();
+        }
+    }
+
     /// If the snap-to-bottom flag is active, force the scroll offset to the
     /// current real maximum every frame until `stick_to_bottom` takes over.
     fn apply_snap(&self, ui: &mut Ui, output: &egui::scroll_area::ScrollAreaOutput<()>) {
@@ -391,12 +440,22 @@ impl<'a> MessageList<'a> {
         panel_rect: egui::Rect,
     ) {
         let paused_key = egui::Id::new("scroll_paused").with(self.channel.as_str());
+        let wheel_key = egui::Id::new("scroll_wheel_this_frame").with(self.channel.as_str());
         let viewport_h = output.inner_rect.height();
         let max_scroll = (output.content_size.y - viewport_h).max(0.0);
         let at_bottom = max_scroll < 1.0 || output.state.offset.y >= max_scroll - 20.0;
 
         // Keep the paused flag in sync with where the scroll actually is.
-        ui.ctx().data_mut(|d| d.insert_temp(paused_key, !at_bottom));
+        // When the wheel was used this frame, never clear the flag - the
+        // scroll delta may not have been applied yet, so at_bottom could
+        // still read as true even though the user just scrolled up.
+        let wheel_this_frame: bool = ui
+            .ctx()
+            .data_mut(|d| d.get_temp(wheel_key).unwrap_or(false));
+        if !wheel_this_frame {
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(paused_key, !at_bottom));
+        }
 
         if !at_bottom {
             // Paint a floating button on a foreground layer (no Area/Window needed)
@@ -408,9 +467,9 @@ impl<'a> MessageList<'a> {
             let painter = ui.ctx().layer_painter(fg_layer);
 
             // Button background
-            painter.rect_filled(btn_rect, 8.0, t::ACCENT_DIM);
+            painter.rect_filled(btn_rect, 8.0, t::accent_dim());
             // Subtle border for definition
-            painter.rect_stroke(btn_rect, 8.0, egui::Stroke::new(1.0, t::ACCENT), egui::epaint::StrokeKind::Outside);
+            painter.rect_stroke(btn_rect, 8.0, egui::Stroke::new(1.0, t::accent()), egui::epaint::StrokeKind::Outside);
             // Button label
             painter.text(
                 btn_rect.center(),
@@ -452,8 +511,6 @@ impl<'a> MessageList<'a> {
 
         let reply_key = Id::new("ml_reply_req").with(self.channel.as_str());
         let scroll_to_key = egui::Id::new("ml_scroll_to").with(self.channel.as_str());
-        // Stable ID per message for context menu state tracking.
-        let ctx_id = egui::Id::new("msg_ctx").with(msg.id.0);
 
         // ── Message background ──────────────────────────────────────────
         let bg = if msg.flags.is_highlighted {
@@ -470,151 +527,158 @@ impl<'a> MessageList<'a> {
             Color32::TRANSPARENT
         };
 
-        let msg_frame = egui::Frame::new()
+        // Context-menu approach:
+        //
+        // The Frame is registered FIRST on the layer (before any inner
+        // widgets), so it has the LOWEST hit-test priority.  After
+        // Frame::end(), we augment the frame's response with Sense::click()
+        // via Response::interact().  Egui OR's the Sense and updates the
+        // widget in-place (same index).  Result: inner widgets (username,
+        // URL links) still win primary/secondary clicks in their rects,
+        // but right-clicks on the message body (text, emotes, empty space)
+        // fall through to the frame and open the context menu.
+
+        // Push a stable ID derived from the message's own identifier so that
+        // every inner widget (username label, badge images, emote images, URL
+        // links) keeps the same egui widget-ID across frames.  Without this,
+        // virtual-scrolling shifts the auto-ID counter whenever new messages
+        // arrive and the dead-space allocation above the visible window
+        // changes, causing click-press and click-release to see different IDs
+        // and silently dropping the click event.
+        ui.push_id(msg.id.0, |ui| {
+
+        let mut prepared = egui::Frame::new()
             .fill(bg)
             .inner_margin(egui::Margin::symmetric(ROW_PAD_X as i8, ROW_PAD_Y as i8))
-            .show(ui, |ui| {
-                // History messages are rendered at reduced opacity so they
-                // read as older context while still being fully legible.
-                if msg.flags.is_history {
-                    ui.set_opacity(0.55);
-                }
-                // ── Context menu - registered FIRST so child widgets (images,
-                // labels) have higher registration order and win egui's hover
-                // hit-test, keeping emote/badge tooltips functional.
-                // `ui.interact` does NOT move the cursor / allocate space.
-                //
-                // We capture `msg` by reference so strings are only cloned
-                // when the user actually opens the menu (not every frame).
-                ui.interact(ui.max_rect(), ctx_id, egui::Sense::click())
-                    .context_menu(|ui| {
-                        // Reply - works for any non-deleted message (Twitch uses
-                        // server_id, IRC uses a local fallback).
-                        if !msg.flags.is_deleted {
-                            let reply_id = msg
-                                .server_id
-                                .clone()
-                                .unwrap_or_else(|| msg.id.0.to_string());
-                            if ui.button("↩  Reply").clicked() {
-                                let info = ReplyInfo {
-                                    parent_msg_id: reply_id,
-                                    parent_user_login: msg.sender.login.clone(),
-                                    parent_display_name: msg.sender.display_name.clone(),
-                                    parent_msg_body: msg.raw_text.clone(),
-                                };
-                                ui.ctx().data_mut(|d| d.insert_temp(reply_key, info));
-                                ui.close_menu();
-                            }
-                        }
-                        ui.separator();
-                        if ui.button("📋  Copy message").clicked() {
-                            ui.ctx().copy_text(msg.raw_text.clone());
-                            ui.close_menu();
-                        }
-                        if ui.button("👤  Copy username").clicked() {
-                            ui.ctx().copy_text(msg.sender.login.clone());
-                            ui.close_menu();
-                        }
-                    });
-                if let Some(ref rep) = msg.reply {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        // Accent left stripe
-                        let (stripe, _) =
-                            ui.allocate_exact_size(egui::vec2(2.0, 12.0), egui::Sense::hover());
-                        ui.painter()
-                            .rect_filled(stripe, 0.0, Color32::from_rgb(100, 65, 190));
-                        let body = if rep.parent_msg_body.chars().count() > 80 {
-                            // Find the byte offset of the 80th char boundary.
-                            let cut = rep
-                                .parent_msg_body
-                                .char_indices()
-                                .nth(80)
-                                .map(|(i, _)| i)
-                                .unwrap_or(rep.parent_msg_body.len());
-                            format!("{}…", &rep.parent_msg_body[..cut])
-                        } else {
-                            rep.parent_msg_body.clone()
-                        };
-                        let h = ui.add(
-                            Label::new(
-                                RichText::new(format!("↩ @{}: {}", rep.parent_display_name, body))
-                                    .font(t::small())
-                                    .color(Color32::from_rgb(130, 130, 155))
-                                    .italics(),
-                            )
-                            .sense(egui::Sense::click())
-                            .truncate(),
-                        );
-                        if h.clicked() {
-                            let target = rep.parent_msg_id.clone();
-                            ui.ctx().data_mut(|d| d.insert_temp(scroll_to_key, target));
-                        }
-                        if h.hovered() {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                        }
-                    });
-                }
-                // ── Notification banner (first message / highlighted / channel points) ──
-                // Rendered inside the Frame so the background fill covers
-                // the banner as well, and the interaction rect is contiguous.
-                if let Some((label, stripe_color)) = notification_label(&msg.flags, &msg.msg_kind) {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        // Colored left stripe
-                        let (rect, _) =
-                            ui.allocate_exact_size(egui::vec2(3.0, 14.0), egui::Sense::hover());
-                        ui.painter().rect_filled(rect, 1.0, stripe_color);
-                        ui.add(Label::new(
-                            RichText::new(label).font(t::small()).color(stripe_color),
-                        ));
-                    });
-                }
+            .begin(ui);
+        // The content_ui's widget rect was registered BEFORE any inner widgets
+        // (in Ui::new_child), giving it the lowest hit-test priority in the
+        // layer.  We'll upgrade it to Sense::click() after Frame::end() so
+        // that right-clicks on empty message space open the context menu,
+        // while inner widgets (username, badges, emotes, URLs) still win the
+        // hit test for their own rects.
+        let content_ui_id = prepared.content_ui.unique_id();
+        {
+            let ui = &mut prepared.content_ui;
 
-                // Center-align all items vertically so images don't sit above text baseline.
-                // Use allocate_ui_with_layout with a constrained height hint
-                // (one emote row) instead of with_layout, because Align::Center
-                // in a horizontal layout causes egui to expand frame_size.y to
-                // fill the full available height - which for the first message
-                // in a ScrollArea means the entire viewport, creating huge gaps.
-                let wrap_width = ui.available_width();
-                ui.allocate_ui_with_layout(
-                    egui::vec2(wrap_width, EMOTE_SIZE),
-                    egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
-                    |ui| {
-                        ui.spacing_mut().item_spacing = egui::vec2(3.0, 1.0);
+            // Keep selectable_labels off globally so timestamp / badge
+            // chip / separator labels stay non-interactive.  Text spans
+            // opt-in to selection via `.selectable(true)` and each has
+            // its own `.context_menu()` so right-click → Reply still works
+            // even when the label wins the hit test.
+            ui.style_mut().interaction.selectable_labels = false;
 
-                        // Timestamp
-                        let ts = msg
-                            .timestamp
-                            .with_timezone(&chrono::Local)
-                            .format("%H:%M")
-                            .to_string();
-                        ui.add(Label::new(
-                            RichText::new(ts)
-                                .color(t::TIMESTAMP)
-                                .font(t::small()),
-                        ));
+            // History messages are rendered at reduced opacity so they
+            // read as older context while still being fully legible.
+            if msg.flags.is_history {
+                ui.set_opacity(0.55);
+            }
+            if let Some(ref rep) = msg.reply {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    // Accent left stripe
+                    let (stripe, _) =
+                        ui.allocate_exact_size(egui::vec2(2.0, 12.0), egui::Sense::hover());
+                    ui.painter()
+                        .rect_filled(stripe, 0.0, Color32::from_rgb(100, 65, 190));
+                    let body = if rep.parent_msg_body.chars().count() > 80 {
+                        // Find the byte offset of the 80th char boundary.
+                        let cut = rep
+                            .parent_msg_body
+                            .char_indices()
+                            .nth(80)
+                            .map(|(i, _)| i)
+                            .unwrap_or(rep.parent_msg_body.len());
+                        format!("{}…", &rep.parent_msg_body[..cut])
+                    } else {
+                        rep.parent_msg_body.clone()
+                    };
+                    let reply_color = if t::is_light() {
+                        Color32::from_rgb(90, 90, 115)
+                    } else {
+                        Color32::from_rgb(130, 130, 155)
+                    };
+                    let h = ui.add(
+                        Label::new(
+                            RichText::new(format!("↩ @{}: {}", rep.parent_display_name, body))
+                                .font(t::small())
+                                .color(reply_color)
+                                .italics(),
+                        )
+                        .sense(egui::Sense::click())
+                        .truncate(),
+                    );
+                    h.context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
+                    if h.clicked() {
+                        let target = rep.parent_msg_id.clone();
+                        ui.ctx().data_mut(|d| d.insert_temp(scroll_to_key, target));
+                    }
+                    if h.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                });
+            }
+            // ── Notification banner (first message / highlighted / channel points) ──
+            // Rendered inside the Frame so the background fill covers
+            // the banner as well, and the interaction rect is contiguous.
+            if let Some((label, stripe_color)) = notification_label(&msg.flags, &msg.msg_kind) {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    // Colored left stripe
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(3.0, 14.0), egui::Sense::hover());
+                    ui.painter().rect_filled(rect, 1.0, stripe_color);
+                    ui.add(Label::new(
+                        RichText::new(label).font(t::small()).color(stripe_color),
+                    ));
+                });
+            }
 
-                        // Separator dot between timestamp and badges/name
-                        ui.add(Label::new(
-                            RichText::new("·")
-                                .color(t::SEPARATOR)
-                                .font(t::small()),
-                        ));
+            // Center-align all items vertically so images don't sit above text baseline.
+            // Use allocate_ui_with_layout with a constrained height hint
+            // (one emote row) instead of with_layout, because Align::Center
+            // in a horizontal layout causes egui to expand frame_size.y to
+            // fill the full available height - which for the first message
+            // in a ScrollArea means the entire viewport, creating huge gaps.
+            let wrap_width = ui.available_width();
+            ui.allocate_ui_with_layout(
+                egui::vec2(wrap_width, EMOTE_SIZE),
+                egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
+                |ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(3.0, 1.0);
 
-                        // Badges: image if loaded, else text fallback
-                        for badge in &msg.sender.badges {
-                            let tooltip_label = pretty_badge_name(&badge.name, &badge.version);
-                            if let Some(url) = &badge.url {
-                                if let Some(&(w, h, ref raw)) = self.emote_bytes.get(url.as_str()) {
-                                    let size = fit_size(w, h, BADGE_SIZE);
-                                    let tooltip_size = fit_size(w, h, TOOLTIP_BADGE_SIZE);
-                                    let url_key = format!("bytes://{url}");
-                                    // Closures capture by reference - clones
-                                    // only happen when the tooltip is actually
-                                    // shown (on hover), not every frame.
-                                    self.show_image(ui, &url_key, raw, size).on_hover_ui(|ui| {
+                    // Timestamp
+                    let ts = msg
+                        .timestamp
+                        .with_timezone(&chrono::Local)
+                        .format("%H:%M")
+                        .to_string();
+                    ui.add(Label::new(
+                        RichText::new(ts)
+                            .color(t::timestamp())
+                            .font(t::small()),
+                    ));
+
+                    // Separator dot between timestamp and badges/name
+                    ui.add(Label::new(
+                        RichText::new("·")
+                            .color(t::separator())
+                            .font(t::small()),
+                    ));
+
+                    // Badges: image if loaded, else text fallback
+                    for badge in &msg.sender.badges {
+                        let tooltip_label = pretty_badge_name(&badge.name, &badge.version);
+                        if let Some(url) = &badge.url {
+                            if let Some(&(w, h, ref raw)) = self.emote_bytes.get(url.as_str()) {
+                                let size = fit_size(w, h, BADGE_SIZE);
+                                let tooltip_size = fit_size(w, h, TOOLTIP_BADGE_SIZE);
+                                let url_key = super::bytes_uri(url, raw);
+                                // Closures capture by reference - clones
+                                // only happen when the tooltip is actually
+                                // shown (on hover), not every frame.
+                                self.show_image(ui, &url_key, raw, size)
+                                    .on_hover_ui_at_pointer(|ui| {
                                         ui.set_max_width(200.0);
                                         ui.vertical_centered(|ui| {
                                             ui.add(
@@ -627,98 +691,122 @@ impl<'a> MessageList<'a> {
                                             ui.add_space(4.0);
                                             ui.label(RichText::new(&tooltip_label).strong());
                                         });
+                                    })
+                                    .context_menu(|ui| {
+                                        self.show_message_context_menu(ui, msg, reply_key);
                                     });
-                                    continue;
-                                }
+                                continue;
                             }
-                            render_badge_fallback(ui, &badge.name, &badge.version, &tooltip_label);
                         }
+                        render_badge_fallback(ui, &badge.name, &badge.version, &tooltip_label);
+                    }
 
-                        // Sender name - clickable to open user profile card.
-                        let name_color = sender_color(&msg.sender.color);
-                        let name = if msg.flags.is_action {
-                            format!("* {}", msg.sender.display_name)
-                        } else {
-                            msg.sender.display_name.clone()
-                        };
-                        let name_resp = ui
-                            .add(
-                                Label::new(RichText::new(name).color(name_color).strong())
-                                    .sense(egui::Sense::click()),
-                            )
-                            .on_hover_ui(|ui| {
-                                ui.label(format!("@{}", msg.sender.login));
-                            });
-                        if name_resp.clicked() {
-                            // Clone only when clicked - not every frame.
-                            let _ = self.cmd_tx.try_send(AppCommand::ShowUserCard {
-                                login: msg.sender.login.clone(),
-                                channel: self.channel.clone(),
-                            });
-                            let key = Id::new("ml_profile_req").with(self.channel.as_str());
-                            ui.ctx().data_mut(|d| {
-                                d.insert_temp(
-                                    key,
-                                    (msg.sender.login.clone(), msg.sender.badges.clone()),
-                                );
-                            });
-                        }
-                        if name_resp.hovered() {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                        }
-
-                        // Colon separator after name (not shown for /me actions)
-                        if !msg.flags.is_action {
-                            ui.add(Label::new(
-                                RichText::new(":").color(t::SEPARATOR),
-                            ));
-                        }
-
-                        // Message spans carry their own whitespace from the
-                        // tokenizer, so keep inter-widget spacing at zero to
-                        // avoid rendering words with visually doubled spaces.
-                        ui.scope(|ui| {
-                            ui.spacing_mut().item_spacing.x = 0.0;
-
-                            // For deleted messages show the original content
-                            // with strikethrough so moderator actions are
-                            // visible without being prominent.
-                            if msg.flags.is_deleted {
-                                ui.add(
-                                    Label::new(
-                                        RichText::new(format!("✂ {}", msg.raw_text))
-                                            .strikethrough()
-                                            .italics()
-                                            .color(t::TEXT_MUTED),
-                                    )
-                                    .wrap(),
-                                );
-                            } else {
-                                for span in &msg.spans {
-                                    self.render_span(ui, span, msg.flags.is_action);
-                                }
-                            }
+                    // Sender name - clickable to open user profile card.
+                    let name_color = sender_color(&msg.sender.color);
+                    let name = if msg.flags.is_action {
+                        format!("* {}", msg.sender.display_name)
+                    } else {
+                        msg.sender.display_name.clone()
+                    };
+                    let name_resp = ui
+                        .add(
+                            Label::new(RichText::new(name).color(name_color).strong())
+                                .selectable(false)
+                                .sense(egui::Sense::click()),
+                        )
+                        .on_hover_ui(|ui| {
+                            ui.label(format!("@{}", msg.sender.login));
                         });
-                    },
-                );
-            });
+                    name_resp
+                        .context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
+                    if name_resp.clicked_by(egui::PointerButton::Primary) {
+                        // Clone only when clicked - not every frame.
+                        let _ = self.cmd_tx.try_send(AppCommand::ShowUserCard {
+                            login: msg.sender.login.clone(),
+                            channel: self.channel.clone(),
+                        });
+                        let key = Id::new("ml_profile_req").with(self.channel.as_str());
+                        ui.ctx().data_mut(|d| {
+                            d.insert_temp(
+                                key,
+                                (msg.sender.login.clone(), msg.sender.badges.clone()),
+                            );
+                        });
+                    }
+                    if name_resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+
+                    // Colon separator after name (not shown for /me actions)
+                    if !msg.flags.is_action {
+                        ui.add(Label::new(
+                            RichText::new(":").color(t::separator()),
+                        ));
+                    }
+
+                    // Message spans carry their own whitespace from the
+                    // tokenizer, so keep inter-widget spacing at zero to
+                    // avoid rendering words with visually doubled spaces.
+                    ui.scope(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+
+                        // For deleted messages show the original content
+                        // with strikethrough so moderator actions are
+                        // visible without being prominent.
+                        if msg.flags.is_deleted {
+                            ui.add(
+                                Label::new(
+                                    RichText::new(format!("✂ {}", msg.raw_text))
+                                        .strikethrough()
+                                        .italics()
+                                        .color(t::text_muted()),
+                                )
+                                .wrap(),
+                            );
+                        } else {
+                            for span in &msg.spans {
+                                self.render_span(ui, span, msg.flags.is_action, msg, reply_key);
+                            }
+                        }
+                    });
+                },
+            );
+        }
+        let msg_frame_resp = prepared.end(ui);
+
+        // Attach a click-sensing context menu to the content_ui's background
+        // widget (registered early in the layer → low hit-test priority).
+        // Because its idx_in_layer is lower than every inner widget, the
+        // hit test prefers inner widgets when the pointer is over them.
+        // Only when the pointer is on "empty" message space (plain text,
+        // gaps) does this background widget win the click hit test, and
+        // then secondary_clicked() fires to open the context menu.
+        //
+        // We must NOT use `msg_frame_resp.interact(Sense::click())` here:
+        // Frame::end() allocates the outer rect AFTER inner widgets,
+        // giving it the HIGHEST hit-test priority - it would steal every
+        // click from username labels, badges, and emotes.
+        let bg_click = ui.interact(msg_frame_resp.rect, content_ui_id, egui::Sense::click());
+        bg_click.context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
 
         // Left accent strip for mentions and highlights - a vivid 3 px bar on
         // the left edge of the row so the eye finds them instantly in fast chat.
         if msg.flags.is_mention || msg.flags.is_highlighted {
-            let r = msg_frame.response.rect;
+            let r = msg_frame_resp.rect;
             let bar_col = if msg.flags.is_mention
                 && matches!(msg.msg_kind, MsgKind::Sub { is_gift: true, .. })
             {
-                t::RAID_CYAN
+                t::raid_cyan()
             } else if msg.flags.is_mention {
-                t::ACCENT
+                t::accent()
             } else {
                 Color32::from_rgb(255, 210, 30)
             };
             let strip = egui::Rect::from_min_size(r.left_top(), egui::vec2(3.0, r.height()));
             ui.painter().rect_filled(strip, 0.0, bar_col);
         }
+
+        }); // end push_id
     }
 
     /// Render a compact system-event row (mod action, sub alert, raid, notice).
@@ -743,13 +831,13 @@ impl<'a> MessageList<'a> {
                 } else {
                     format!("⭐  {display_name} resubscribed with {plan}! ({months} months)")
                 };
-                (if gifted_to_me { t::RAID_CYAN } else { t::GOLD }, Some(text))
+                (if gifted_to_me { t::raid_cyan() } else { t::gold() }, Some(text))
             }
             MsgKind::Raid {
                 display_name,
                 viewer_count,
             } => (
-                t::RAID_CYAN,
+                t::raid_cyan(),
                 Some(format!(
                     "🎉  {display_name} is raiding with {viewer_count} viewers!"
                 )),
@@ -768,10 +856,14 @@ impl<'a> MessageList<'a> {
                 )
             }
             MsgKind::Ban { login } => {
-                (t::RED, Some(format!("🚫  {login} was permanently banned.")))
+                (t::red(), Some(format!("🚫  {login} was permanently banned.")))
             }
             MsgKind::ChatCleared => (
-                Color32::from_rgb(130, 120, 150),
+                if t::is_light() {
+                    Color32::from_rgb(100, 90, 120)
+                } else {
+                    Color32::from_rgb(130, 120, 150)
+                },
                 Some("🗑  Chat was cleared by a moderator.".to_owned()),
             ),
             MsgKind::SystemInfo => {
@@ -810,7 +902,7 @@ impl<'a> MessageList<'a> {
                     let ts = msg.timestamp.format("%H:%M").to_string();
                     ui.add(Label::new(
                         RichText::new(ts)
-                            .color(t::TIMESTAMP)
+                            .color(t::timestamp())
                             .font(t::small()),
                     ));
 
@@ -825,8 +917,19 @@ impl<'a> MessageList<'a> {
             });
     }
 
-    fn render_span(&self, ui: &mut Ui, span: &Span, is_action: bool) {
-        let action_color = Color32::from_rgb(180, 180, 210);
+    fn render_span(
+        &self,
+        ui: &mut Ui,
+        span: &Span,
+        is_action: bool,
+        msg: &ChatMessage,
+        reply_key: Id,
+    ) {
+        let action_color = if t::is_light() {
+            Color32::from_rgb(80, 80, 110)
+        } else {
+            Color32::from_rgb(180, 180, 210)
+        };
         match span {
             Span::Text { text, .. } => {
                 let cleaned = strip_invisible_chars(text);
@@ -838,7 +941,8 @@ impl<'a> MessageList<'a> {
                 } else {
                     RichText::new(&cleaned)
                 };
-                ui.add(Label::new(rt).wrap());
+                let resp = ui.add(Label::new(rt).wrap().selectable(true));
+                resp.context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
             }
             Span::Emote {
                 url,
@@ -849,14 +953,15 @@ impl<'a> MessageList<'a> {
             } => {
                 if let Some(&(w, h, ref raw)) = self.emote_bytes.get(url.as_str()) {
                     let size = fit_size(w, h, EMOTE_SIZE);
-                    let url_key = format!("bytes://{url}");
+                    let url_key = super::bytes_uri(url, raw);
 
                     // Capture shared references - string/Arc clones only
                     // happen when the tooltip is actually shown (on hover).
                     let emote_bytes = self.emote_bytes; // &HashMap - Copy
                     let cmd_tx = self.cmd_tx; // &Sender  - Copy
 
-                    self.show_image(ui, &url_key, raw, size).on_hover_ui(|ui| {
+                    self.show_image(ui, &url_key, raw, size)
+                        .on_hover_ui_at_pointer(|ui| {
                         // Check HD availability at hover time, not every frame.
                         let hd_entry = url_hd.as_deref().and_then(|u| emote_bytes.get(u));
 
@@ -871,7 +976,7 @@ impl<'a> MessageList<'a> {
 
                         let (tt_key, tt_raw, tt_w, tt_h) = match hd_entry {
                             Some(&(hw, hh, ref href)) => (
-                                format!("bytes://{}", url_hd.as_deref().unwrap()),
+                                super::bytes_uri(url_hd.as_deref().unwrap(), href),
                                 href.clone(),
                                 hw,
                                 hh,
@@ -894,6 +999,9 @@ impl<'a> MessageList<'a> {
                                     .color(Color32::GRAY),
                             );
                         });
+                    })
+                    .context_menu(|ui| {
+                        self.show_message_context_menu(ui, msg, reply_key);
                     });
                 } else {
                     // Image not yet loaded - show text code as placeholder
@@ -909,36 +1017,41 @@ impl<'a> MessageList<'a> {
                 if let Some(&(w, h, ref raw)) = self.emote_bytes.get(url.as_str()) {
                     let size = fit_size(w, h, EMOTE_SIZE);
                     let tooltip_size = fit_size(w, h, TOOLTIP_EMOTE_SIZE);
-                    let url_key = format!("bytes://{url}");
-                    self.show_image(ui, &url_key, raw, size).on_hover_ui(|ui| {
-                        ui.set_max_width(200.0);
-                        ui.vertical_centered(|ui| {
-                            ui.add(
-                                egui::Image::from_bytes(
-                                    url_key.clone(),
-                                    egui::load::Bytes::Shared(raw.clone()),
-                                )
-                                .fit_to_exact_size(tooltip_size),
-                            );
-                            ui.add_space(4.0);
-                            ui.label(RichText::new(text.as_str()).strong());
-                            ui.label(
-                                RichText::new("Twemoji")
-                                    .small()
-                                    .color(Color32::from_rgb(100, 100, 100)),
-                            );
+                    let url_key = super::bytes_uri(url, raw);
+                    self.show_image(ui, &url_key, raw, size)
+                        .on_hover_ui_at_pointer(|ui| {
+                            ui.set_max_width(200.0);
+                            ui.vertical_centered(|ui| {
+                                ui.add(
+                                    egui::Image::from_bytes(
+                                        url_key.clone(),
+                                        egui::load::Bytes::Shared(raw.clone()),
+                                    )
+                                    .fit_to_exact_size(tooltip_size),
+                                );
+                                ui.add_space(4.0);
+                                ui.label(RichText::new(text.as_str()).strong());
+                                ui.label(
+                                    RichText::new("Twemoji")
+                                        .small()
+                                        .color(Color32::from_rgb(100, 100, 100)),
+                                );
+                            });
+                        })
+                        .context_menu(|ui| {
+                            self.show_message_context_menu(ui, msg, reply_key);
                         });
-                    });
                 } else {
                     ui.add(Label::new(RichText::new(text)));
                 }
             }
             Span::Mention { login } => {
-                ui.add(Label::new(
+                let resp = ui.add(Label::new(
                     RichText::new(format!("@{login}"))
-                        .color(t::MENTION)
+                        .color(t::mention())
                         .strong(),
-                ));
+                ).selectable(true));
+                resp.context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
             }
             Span::Url { text, url } => {
                 let cmd_tx = self.cmd_tx;
@@ -949,14 +1062,16 @@ impl<'a> MessageList<'a> {
                 let resp = ui.add(
                     Label::new(
                         RichText::new(text)
-                            .color(t::LINK)
+                            .color(t::link())
                             .underline(),
                     )
+                    .selectable(false)
                     .sense(egui::Sense::click()),
                 );
                 if resp.clicked() {
                     let _ = cmd_tx.try_send(AppCommand::OpenUrl { url: url.clone() });
                 }
+                resp.context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
                 resp.on_hover_ui(|ui| {
                     // Fire preview fetch on first hover (idempotent in reducer).
                     let preview = link_previews.get(url.as_str());
@@ -964,7 +1079,7 @@ impl<'a> MessageList<'a> {
                         let _ = cmd_tx.try_send(AppCommand::FetchLinkPreview { url: url.clone() });
                     }
 
-                    ui.set_max_width(300.0);
+                    ui.set_max_width(320.0);
                     ui.vertical(|ui| {
                         match preview {
                             None => {
@@ -973,7 +1088,7 @@ impl<'a> MessageList<'a> {
                                 ui.label(
                                     RichText::new(host)
                                         .small()
-                                        .color(t::LINK),
+                                        .color(t::link()),
                                 );
                                 ui.label(
                                     RichText::new("Loading preview…")
@@ -983,35 +1098,62 @@ impl<'a> MessageList<'a> {
                                 );
                             }
                             Some(p) => {
+                                // Site name badge (YouTube, Twitter, etc.)
+                                if let Some(ref sn) = p.site_name {
+                                    let (badge_bg, badge_fg) = site_badge_colors(sn);
+                                    egui::Frame::new()
+                                        .fill(badge_bg)
+                                        .corner_radius(egui::CornerRadius::same(3))
+                                        .inner_margin(egui::Margin::symmetric(5, 1))
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                RichText::new(sn)
+                                                    .small()
+                                                    .strong()
+                                                    .color(badge_fg),
+                                            );
+                                        });
+                                    ui.add_space(3.0);
+                                }
                                 // Thumbnail
                                 if let Some(ref thumb) = p.thumbnail_url {
                                     if let Some(&(w, h, ref raw)) = emote_bytes.get(thumb.as_str())
                                     {
-                                        let scale = (150.0_f32 / h as f32).min(280.0 / w as f32);
+                                        let scale = (170.0_f32 / h as f32).min(300.0 / w as f32);
                                         let size = Vec2::new(w as f32 * scale, h as f32 * scale);
-                                        let key = format!("bytes://{thumb}");
-                                        ui.add(
-                                            egui::Image::from_bytes(
-                                                key,
-                                                egui::load::Bytes::Shared(raw.clone()),
-                                            )
-                                            .fit_to_exact_size(size),
-                                        );
+                                        let key = super::bytes_uri(thumb, raw);
+                                        egui::Frame::new()
+                                            .corner_radius(egui::CornerRadius::same(4))
+                                            .show(ui, |ui| {
+                                                ui.add(
+                                                    egui::Image::from_bytes(
+                                                        key,
+                                                        egui::load::Bytes::Shared(raw.clone()),
+                                                    )
+                                                    .fit_to_exact_size(size),
+                                                );
+                                            });
                                         ui.add_space(4.0);
                                     }
                                 }
                                 // Title
-                                if let Some(ref t) = p.title {
-                                    ui.add(Label::new(RichText::new(t).strong()).wrap());
+                                if let Some(ref title) = p.title {
+                                    ui.add(Label::new(RichText::new(title).strong()).wrap());
                                 }
                                 // Description
                                 if let Some(ref d) = p.description {
-                                    let snippet = if d.len() > 220 {
-                                        format!("{}\u{2026}", &d[..220])
+                                    let snippet = if d.chars().count() > 260 {
+                                        let cut = d.char_indices().nth(260)
+                                            .map(|(i, _)| i).unwrap_or(d.len());
+                                        format!("{}\u{2026}", &d[..cut])
                                     } else {
                                         d.clone()
                                     };
-                                    ui.add(Label::new(RichText::new(snippet).small()).wrap());
+                                    ui.add(Label::new(
+                                        RichText::new(snippet)
+                                            .small()
+                                            .color(t::text_muted()),
+                                    ).wrap());
                                 }
                                 if p.title.is_none()
                                     && p.description.is_none()
@@ -1026,10 +1168,11 @@ impl<'a> MessageList<'a> {
                                 }
                                 // Domain footer
                                 let host = url_hostname(url);
+                                ui.add_space(2.0);
                                 ui.label(
                                     RichText::new(host)
                                         .small()
-                                        .color(t::LINK),
+                                        .color(t::text_muted()),
                                 );
                             }
                         }
@@ -1044,9 +1187,18 @@ impl<'a> MessageList<'a> {
     }
 
     /// Render an image from raw bytes using egui's image loaders (supports GIF animation).
+    ///
+    /// Uses `Sense::click()` (not `Sense::hover()`) because egui 0.31's interaction
+    /// system only adds widgets to the `hovered` IdSet when they are in `hits.click`
+    /// or `hits.drag`.  A `Sense::hover()`-only widget has click=false/drag=false so
+    /// it is never selected by hit-test, `response.hovered()` is always false, and
+    /// `on_hover_ui_at_pointer` never fires.  Using `Sense::click()` ensures the image
+    /// enters the hovered set so tooltips work.  We never actually handle the click
+    /// on images – callers that want right-click menus chain `.context_menu()` themselves.
     fn show_image(&self, ui: &mut Ui, uri: &str, raw: &Arc<[u8]>, size: Vec2) -> egui::Response {
         ui.add(
             egui::Image::from_bytes(uri.to_owned(), egui::load::Bytes::Shared(raw.clone()))
+                .sense(egui::Sense::click())
                 .fit_to_exact_size(size),
         )
     }
@@ -1154,23 +1306,36 @@ fn sender_color(color: &Option<String>) -> Color32 {
         .as_deref()
         .and_then(parse_hex_color)
         .map(|(r, g, b)| {
-            // Ensure readability on dark backgrounds using HSL lightness.
-            // Convert to perceived luminance and boost if too dim.
             let lum = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
-            if lum < 70.0 {
-                // Proportionally brighten to preserve hue rather than washing out.
-                let factor = 70.0 / lum.max(1.0);
-                let factor = factor.min(2.5); // cap to avoid pure-white blow-out
-                Color32::from_rgb(
-                    (r as f32 * factor).min(255.0) as u8,
-                    (g as f32 * factor).min(255.0) as u8,
-                    (b as f32 * factor).min(255.0) as u8,
-                )
+            if t::is_light() {
+                // Darken colours that are too bright for a light background.
+                if lum > 170.0 {
+                    let factor = 170.0 / lum.max(1.0);
+                    let factor = factor.max(0.4);
+                    Color32::from_rgb(
+                        (r as f32 * factor) as u8,
+                        (g as f32 * factor) as u8,
+                        (b as f32 * factor) as u8,
+                    )
+                } else {
+                    Color32::from_rgb(r, g, b)
+                }
             } else {
-                Color32::from_rgb(r, g, b)
+                // Boost dim colours for dark backgrounds.
+                if lum < 70.0 {
+                    let factor = 70.0 / lum.max(1.0);
+                    let factor = factor.min(2.5);
+                    Color32::from_rgb(
+                        (r as f32 * factor).min(255.0) as u8,
+                        (g as f32 * factor).min(255.0) as u8,
+                        (b as f32 * factor).min(255.0) as u8,
+                    )
+                } else {
+                    Color32::from_rgb(r, g, b)
+                }
             }
         })
-        .unwrap_or(t::ACCENT)
+        .unwrap_or(t::accent())
 }
 
 fn parse_hex_color(s: &str) -> Option<(u8, u8, u8)> {
@@ -1229,11 +1394,19 @@ fn render_badge_fallback(ui: &mut Ui, name: &str, version: &str, tooltip: &str) 
         .inner_margin(egui::Margin::symmetric(4, 1))
         .show(ui, |ui| {
             ui.add(Label::new(
-                RichText::new(chip_text).font(t::small()).color(fg).strong(),
+                RichText::new(&chip_text).font(t::small()).color(fg).strong(),
             ));
         })
         .response;
-    response.on_hover_text(tooltip.to_owned());
+    response.on_hover_ui_at_pointer(|ui| {
+        ui.vertical_centered(|ui| {
+            ui.add(Label::new(
+                RichText::new(&chip_text).size(18.0).color(fg).strong(),
+            ));
+            ui.add_space(4.0);
+            ui.label(RichText::new(tooltip).strong());
+        });
+    });
 }
 
 fn badge_chip_text(name: &str, version: &str) -> String {
@@ -1264,43 +1437,53 @@ fn badge_chip_text(name: &str, version: &str) -> String {
 }
 
 fn badge_chip_colors(name: &str) -> (Color32, Color32) {
+    let light = t::is_light();
     match name {
-        "subscriber" => (
-            Color32::from_rgb(52, 86, 58),
-            Color32::from_rgb(210, 246, 218),
-        ),
-        "sub_gifter" => (
-            Color32::from_rgb(84, 67, 34),
-            Color32::from_rgb(252, 222, 154),
-        ),
-        "founder" => (
-            Color32::from_rgb(60, 62, 95),
-            Color32::from_rgb(200, 206, 255),
-        ),
-        "moderator" => (
-            Color32::from_rgb(43, 89, 59),
-            Color32::from_rgb(196, 244, 217),
-        ),
-        "broadcaster" => (
-            Color32::from_rgb(102, 45, 45),
-            Color32::from_rgb(255, 206, 206),
-        ),
-        "vip" => (
-            Color32::from_rgb(112, 57, 98),
-            Color32::from_rgb(255, 206, 242),
-        ),
-        "verified" => (
-            Color32::from_rgb(46, 68, 107),
-            Color32::from_rgb(191, 223, 255),
-        ),
-        "staff" => (
-            Color32::from_rgb(76, 84, 92),
-            Color32::from_rgb(220, 226, 233),
-        ),
-        _ => (
-            Color32::from_rgb(70, 70, 74),
-            Color32::from_rgb(210, 210, 215),
-        ),
+        "subscriber" => if light {
+            (Color32::from_rgb(210, 246, 218), Color32::from_rgb(32, 66, 38))
+        } else {
+            (Color32::from_rgb(52, 86, 58), Color32::from_rgb(210, 246, 218))
+        },
+        "sub_gifter" => if light {
+            (Color32::from_rgb(252, 232, 180), Color32::from_rgb(64, 47, 14))
+        } else {
+            (Color32::from_rgb(84, 67, 34), Color32::from_rgb(252, 222, 154))
+        },
+        "founder" => if light {
+            (Color32::from_rgb(215, 218, 255), Color32::from_rgb(40, 42, 75))
+        } else {
+            (Color32::from_rgb(60, 62, 95), Color32::from_rgb(200, 206, 255))
+        },
+        "moderator" => if light {
+            (Color32::from_rgb(200, 244, 217), Color32::from_rgb(23, 69, 39))
+        } else {
+            (Color32::from_rgb(43, 89, 59), Color32::from_rgb(196, 244, 217))
+        },
+        "broadcaster" => if light {
+            (Color32::from_rgb(255, 220, 220), Color32::from_rgb(82, 25, 25))
+        } else {
+            (Color32::from_rgb(102, 45, 45), Color32::from_rgb(255, 206, 206))
+        },
+        "vip" => if light {
+            (Color32::from_rgb(255, 220, 248), Color32::from_rgb(92, 37, 78))
+        } else {
+            (Color32::from_rgb(112, 57, 98), Color32::from_rgb(255, 206, 242))
+        },
+        "verified" => if light {
+            (Color32::from_rgb(210, 235, 255), Color32::from_rgb(26, 48, 87))
+        } else {
+            (Color32::from_rgb(46, 68, 107), Color32::from_rgb(191, 223, 255))
+        },
+        "staff" => if light {
+            (Color32::from_rgb(228, 234, 240), Color32::from_rgb(56, 64, 72))
+        } else {
+            (Color32::from_rgb(76, 84, 92), Color32::from_rgb(220, 226, 233))
+        },
+        _ => if light {
+            (Color32::from_rgb(220, 220, 228), Color32::from_rgb(50, 50, 54))
+        } else {
+            (Color32::from_rgb(70, 70, 74), Color32::from_rgb(210, 210, 215))
+        },
     }
 }
 
@@ -1371,17 +1554,75 @@ fn url_hostname(url: &str) -> String {
     host.trim_start_matches("www.").to_owned()
 }
 
+/// Badge-style (background, foreground) colours for known site names shown
+/// in the link-preview tooltip.  Roughly matches each site's brand colour.
+fn site_badge_colors(site: &str) -> (Color32, Color32) {
+    let light = t::is_light();
+    match site {
+        "YouTube" => if light {
+            (Color32::from_rgb(255, 220, 220), Color32::from_rgb(180, 18, 18))
+        } else {
+            (Color32::from_rgb(120, 20, 20), Color32::from_rgb(255, 100, 100))
+        },
+        "Twitter" | "X" => if light {
+            (Color32::from_rgb(210, 235, 255), Color32::from_rgb(20, 100, 175))
+        } else {
+            (Color32::from_rgb(20, 55, 90), Color32::from_rgb(100, 180, 255))
+        },
+        "Twitch" | "Twitch Clip" => if light {
+            (Color32::from_rgb(230, 215, 255), Color32::from_rgb(100, 65, 165))
+        } else {
+            (Color32::from_rgb(60, 40, 100), Color32::from_rgb(190, 160, 255))
+        },
+        "Reddit" => if light {
+            (Color32::from_rgb(255, 225, 210), Color32::from_rgb(200, 70, 20))
+        } else {
+            (Color32::from_rgb(100, 35, 10), Color32::from_rgb(255, 135, 80))
+        },
+        "GitHub" => if light {
+            (Color32::from_rgb(225, 225, 235), Color32::from_rgb(40, 40, 50))
+        } else {
+            (Color32::from_rgb(40, 40, 50), Color32::from_rgb(210, 210, 220))
+        },
+        "Instagram" => if light {
+            (Color32::from_rgb(255, 220, 235), Color32::from_rgb(175, 30, 100))
+        } else {
+            (Color32::from_rgb(90, 15, 50), Color32::from_rgb(255, 120, 175))
+        },
+        "TikTok" => if light {
+            (Color32::from_rgb(230, 245, 250), Color32::from_rgb(20, 20, 30))
+        } else {
+            (Color32::from_rgb(20, 20, 30), Color32::from_rgb(230, 245, 250))
+        },
+        "Wikipedia" => if light {
+            (Color32::from_rgb(230, 230, 230), Color32::from_rgb(50, 50, 50))
+        } else {
+            (Color32::from_rgb(50, 50, 55), Color32::from_rgb(220, 220, 225))
+        },
+        "Steam" => if light {
+            (Color32::from_rgb(210, 220, 240), Color32::from_rgb(25, 40, 80))
+        } else {
+            (Color32::from_rgb(25, 35, 65), Color32::from_rgb(150, 180, 230))
+        },
+        _ => if light {
+            (Color32::from_rgb(225, 230, 240), Color32::from_rgb(60, 65, 80))
+        } else {
+            (Color32::from_rgb(50, 55, 65), Color32::from_rgb(180, 185, 200))
+        },
+    }
+}
+
 /// Return `(label_text, stripe_color)` for messages with a chat notification.
 /// Returns `None` for ordinary messages.
 fn notification_label(flags: &MessageFlags, kind: &MsgKind) -> Option<(&'static str, Color32)> {
     if flags.is_highlighted {
-        Some(("Highlighted Message", t::TWITCH_PURPLE))
+        Some(("Highlighted Message", t::twitch_purple()))
     } else if flags.is_mention {
         Some(("Mention", Color32::from_rgb(210, 140, 40)))
     } else if matches!(kind, MsgKind::Bits { .. }) {
-        Some(("Bits Cheer", t::BITS_ORANGE))
+        Some(("Bits Cheer", t::bits_orange()))
     } else if flags.is_first_msg {
-        Some(("First Message", t::GREEN))
+        Some(("First Message", t::green()))
     } else if flags.custom_reward_id.is_some() {
         Some(("Channel Points Reward", Color32::from_rgb(100, 65, 165)))
     } else {

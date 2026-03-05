@@ -4,6 +4,7 @@ use std::sync::Arc;
 use egui::{Color32, CornerRadius, RichText, Vec2};
 
 use crust_core::model::{Badge, ChannelId, ChatMessage, UserProfile};
+use crust_core::events::IvrLogEntry;
 
 use crate::theme as t;
 
@@ -30,6 +31,15 @@ pub enum PopupAction {
         login: String,
         user_id: String,
     },
+    /// Request IVR chat logs for the displayed user.
+    FetchIvrLogs {
+        channel: String,
+        username: String,
+    },
+    /// Open a URL in the system browser.
+    OpenUrl {
+        url: String,
+    },
 }
 
 // ─── Tab state ────────────────────────────────────────────────────────────────
@@ -40,6 +50,7 @@ enum ProfileTab {
     Profile,
     Moderation,
     Logs,
+    IvrLogs,
 }
 
 // ─── Struct ───────────────────────────────────────────────────────────────────
@@ -70,6 +81,14 @@ pub struct UserProfilePopup {
     ban_confirm: bool,
     /// Recent messages from this user in the current channel (most-recent first).
     logs: Vec<ChatMessage>,
+    /// External IVR chat logs fetched from logs.ivr.fi.
+    ivr_logs: Vec<IvrLogEntry>,
+    /// Whether IVR logs are currently being fetched.
+    ivr_logs_loading: bool,
+    /// Error message if IVR log fetch failed.
+    ivr_logs_error: Option<String>,
+    /// Whether IVR logs have been requested for the current popup session.
+    ivr_logs_requested: bool,
 }
 
 impl UserProfilePopup {
@@ -93,12 +112,36 @@ impl UserProfilePopup {
         self.timeout_custom.clear();
         self.ban_confirm = false;
         self.logs.clear();
+        self.ivr_logs.clear();
+        self.ivr_logs_loading = false;
+        self.ivr_logs_error = None;
+        self.ivr_logs_requested = false;
     }
 
     /// Store pre-filtered chat logs for this user (called from `app.rs` when
     /// the profile is loaded).  Expects messages in most-recent-first order.
     pub fn set_logs(&mut self, logs: Vec<ChatMessage>) {
         self.logs = logs;
+    }
+
+    /// Store external IVR chat logs.
+    pub fn set_ivr_logs(&mut self, logs: Vec<IvrLogEntry>) {
+        self.ivr_logs = logs;
+        self.ivr_logs_loading = false;
+        self.ivr_logs_error = None;
+    }
+
+    /// Mark IVR log fetch as failed.
+    pub fn set_ivr_logs_error(&mut self, error: String) {
+        self.ivr_logs_loading = false;
+        self.ivr_logs_error = Some(error);
+    }
+
+    /// Mark IVR logs as currently loading.
+    pub fn set_ivr_logs_loading(&mut self) {
+        self.ivr_logs_loading = true;
+        self.ivr_logs_error = None;
+        self.ivr_logs_requested = true;
     }
 
     /// Called when `AppEvent::UserProfileLoaded` arrives.
@@ -130,14 +173,20 @@ impl UserProfilePopup {
                 .unwrap_or(false)
     }
 
-    /// Render the popup, returning any moderation action the user triggered.
+    /// The Twitch user-id of the currently displayed profile (if loaded).
+    pub fn profile_id(&self) -> Option<&str> {
+        self.profile.as_ref().map(|p| p.id.as_str())
+    }
+
+    /// Render the popup, returning any actions the user triggered.
     pub fn show(
         &mut self,
         ctx: &egui::Context,
         emote_bytes: &HashMap<String, (u32, u32, Arc<[u8]>)>,
-    ) -> Option<PopupAction> {
+        stv_avatars: &HashMap<String, String>,
+    ) -> Vec<PopupAction> {
         if !self.open {
-            return None;
+            return Vec::new();
         }
 
         let title = if self.loading {
@@ -148,7 +197,7 @@ impl UserProfilePopup {
             "User Profile".to_owned()
         };
 
-        let mut action: Option<PopupAction> = None;
+        let mut actions: Vec<PopupAction> = Vec::new();
 
         egui::Window::new(title)
             .collapsible(false)
@@ -166,7 +215,7 @@ impl UserProfilePopup {
                     ui.vertical_centered(|ui| {
                         ui.label(
                             RichText::new("Loading profile…")
-                                .color(t::TEXT_SECONDARY)
+                                .color(t::text_secondary())
                                 .italics(),
                         );
                     });
@@ -176,7 +225,7 @@ impl UserProfilePopup {
 
                 let Some(ref profile) = self.profile else {
                     ui.add_space(8.0);
-                    ui.label(RichText::new("Profile unavailable.").color(t::RED));
+                    ui.label(RichText::new("Profile unavailable.").color(t::red()));
                     ui.add_space(8.0);
                     return;
                 };
@@ -191,16 +240,22 @@ impl UserProfilePopup {
                     let (av_rect, _) =
                         ui.allocate_exact_size(Vec2::splat(AV), egui::Sense::hover());
 
-                    // Avatar: real image if loaded, else initial-letter fallback.
-                    if let Some((_, _, ref raw)) = profile
-                        .avatar_url
-                        .as_deref()
-                        .and_then(|logo| emote_bytes.get(logo))
-                    {
-                        let logo = profile.avatar_url.as_deref().unwrap();
-                        let uri = format!("bytes://{logo}");
+                    // Avatar: prefer 7TV animated avatar, fall back to Twitch,
+                    // then initial-letter circle.
+                    let stv_av = stv_avatars.get(&profile.id);
+                    let avatar_entry = stv_av
+                        .and_then(|url| emote_bytes.get(url.as_str()).map(|e| (url.as_str(), e)))
+                        .or_else(|| {
+                            profile
+                                .avatar_url
+                                .as_deref()
+                                .and_then(|url| emote_bytes.get(url).map(|e| (url, e)))
+                        });
+
+                    if let Some((logo, (_, _, ref raw))) = avatar_entry {
+                        let uri = super::bytes_uri(logo, raw.as_ref());
                         ui.painter()
-                            .circle_filled(av_rect.center(), AV / 2.0, t::BG_RAISED);
+                            .circle_filled(av_rect.center(), AV / 2.0, t::bg_raised());
                         ui.put(
                             av_rect,
                             egui::Image::from_bytes(uri, egui::load::Bytes::Shared(raw.clone()))
@@ -215,26 +270,26 @@ impl UserProfilePopup {
                             .and_then(|c| c.to_uppercase().next())
                             .unwrap_or('?');
                         let p = ui.painter();
-                        p.circle_filled(av_rect.center(), AV / 2.0, t::ACCENT_DIM);
+                        p.circle_filled(av_rect.center(), AV / 2.0, t::accent_dim());
                         p.circle_stroke(
                             av_rect.center(),
                             AV / 2.0,
-                            egui::Stroke::new(2.0, t::ACCENT),
+                            egui::Stroke::new(2.0, t::accent()),
                         );
                         p.text(
                             av_rect.center(),
                             egui::Align2::CENTER_CENTER,
                             initial.to_string(),
                             egui::FontId::proportional(28.0),
-                            t::TEXT_PRIMARY,
+                            t::text_primary(),
                         );
                     }
 
                     // Live pulse dot overlay on avatar bottom-right corner
                     if profile.is_live {
                         let dot_center = egui::pos2(av_rect.max.x - 6.0, av_rect.max.y - 6.0);
-                        ui.painter().circle_filled(dot_center, 7.0, t::BG_BASE);
-                        ui.painter().circle_filled(dot_center, 5.0, t::RED);
+                        ui.painter().circle_filled(dot_center, 7.0, t::bg_base());
+                        ui.painter().circle_filled(dot_center, 5.0, t::red());
                     }
 
                     ui.vertical(|ui| {
@@ -247,7 +302,7 @@ impl UserProfilePopup {
                                 RichText::new(&profile.display_name)
                                     .strong()
                                     .size(16.0)
-                                    .color(t::TEXT_PRIMARY),
+                                    .color(t::text_primary()),
                             ));
                             if profile.is_live {
                                 egui::Frame::new()
@@ -283,7 +338,7 @@ impl UserProfilePopup {
                         if profile.login.to_lowercase() != profile.display_name.to_lowercase() {
                             ui.add(egui::Label::new(
                                 RichText::new(format!("@{}", profile.login))
-                                    .color(t::TEXT_SECONDARY)
+                                    .color(t::text_secondary())
                                     .small(),
                             ));
                         }
@@ -293,7 +348,7 @@ impl UserProfilePopup {
                         ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing = egui::vec2(3.0, 2.0);
                             if profile.is_partner {
-                                role_pill(ui, "✓ Partner", t::ACCENT);
+                                role_pill(ui, "✓ Partner", t::accent());
                             } else if profile.is_affiliate {
                                 role_pill(ui, "Affiliate", Color32::from_rgb(140, 100, 220));
                             }
@@ -327,9 +382,9 @@ impl UserProfilePopup {
                                     let badge_name =
                                         badge_display_name(&badge.name, &badge.version);
                                     if let Some(url) = &badge.url {
-                                        let uri = format!("bytes://{url}");
                                         if let Some((_, _, ref raw)) = emote_bytes.get(url.as_str())
                                         {
+                                            let uri = super::bytes_uri(url, raw.as_ref());
                                             const BS: f32 = 18.0;
                                             let (brect, _) = ui.allocate_exact_size(
                                                 Vec2::splat(BS),
@@ -377,7 +432,7 @@ impl UserProfilePopup {
                                 ui.add(
                                     egui::Label::new(
                                         RichText::new(title)
-                                            .color(t::TEXT_PRIMARY)
+                                            .color(t::text_primary())
                                             .small()
                                             .strong(),
                                     )
@@ -389,14 +444,14 @@ impl UserProfilePopup {
                                 if let Some(ref game) = profile.stream_game {
                                     ui.add(egui::Label::new(
                                         RichText::new(format!("🎮 {game}"))
-                                            .color(t::ACCENT)
+                                            .color(t::accent())
                                             .small(),
                                     ));
                                 }
                                 if let Some(v) = profile.stream_viewers {
                                     ui.add(egui::Label::new(
                                         RichText::new(format!("👁 {}", fmt_count(v)))
-                                            .color(t::TEXT_SECONDARY)
+                                            .color(t::text_secondary())
                                             .small(),
                                     ));
                                 }
@@ -405,7 +460,7 @@ impl UserProfilePopup {
                                     if !uptime.is_empty() {
                                         ui.add(egui::Label::new(
                                             RichText::new(format!("⏱ {uptime}"))
-                                                .color(t::TEXT_SECONDARY)
+                                                .color(t::text_secondary())
                                                 .small(),
                                         ));
                                     }
@@ -418,20 +473,25 @@ impl UserProfilePopup {
                 ui.separator();
                 ui.add_space(2.0);
 
-                // ── Tab bar (only rendered when the user has mod access) ──
-                if self.is_mod {
+                // ── Tab bar ───────────────────────────────────────────
+                {
+                    let mut tabs: Vec<(&str, ProfileTab)> = vec![
+                        ("Profile", ProfileTab::Profile),
+                    ];
+                    if self.is_mod {
+                        tabs.push(("Moderation", ProfileTab::Moderation));
+                        tabs.push(("Logs", ProfileTab::Logs));
+                    }
+                    tabs.push(("IVR Logs", ProfileTab::IvrLogs));
+
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
-                        for (tab_label, tab_val) in [
-                            ("Profile", ProfileTab::Profile),
-                            ("Moderation", ProfileTab::Moderation),
-                            ("Logs", ProfileTab::Logs),
-                        ] {
-                            let active = self.active_tab == tab_val;
+                        for (tab_label, tab_val) in &tabs {
+                            let active = self.active_tab == *tab_val;
                             let fg = if active {
-                                t::TEXT_PRIMARY
+                                t::text_primary()
                             } else {
-                                t::TEXT_SECONDARY
+                                t::text_secondary()
                             };
                             let bg = if active {
                                 Color32::from_rgba_unmultiplied(145, 95, 255, 35)
@@ -444,13 +504,21 @@ impl UserProfilePopup {
                                 .inner_margin(egui::Margin::symmetric(10, 4))
                                 .show(ui, |ui| {
                                     ui.add(egui::Label::new(
-                                        RichText::new(tab_label).color(fg).small().strong(),
+                                        RichText::new(*tab_label).color(fg).small().strong(),
                                     ));
                                 })
                                 .response;
                             if resp.interact(egui::Sense::click()).clicked() {
-                                self.active_tab = tab_val;
+                                self.active_tab = *tab_val;
                                 self.ban_confirm = false;
+                                // Trigger IVR log fetch on first visit
+                                if *tab_val == ProfileTab::IvrLogs && !self.ivr_logs_requested {
+                                    let ch = self.channel.as_ref().map(|c| c.as_str().to_owned()).unwrap_or_default();
+                                    actions.push(PopupAction::FetchIvrLogs {
+                                        channel: ch,
+                                        username: profile.login.clone(),
+                                    });
+                                }
                             }
                         }
                     });
@@ -461,7 +529,11 @@ impl UserProfilePopup {
                 if self.is_mod && self.active_tab == ProfileTab::Logs {
                     let log_count = self.logs.len();
                     egui::Frame::new()
-                        .fill(Color32::from_rgba_unmultiplied(0, 0, 0, 60))
+                        .fill(if t::is_light() {
+                            Color32::from_rgba_unmultiplied(0, 0, 0, 20)
+                        } else {
+                            Color32::from_rgba_unmultiplied(0, 0, 0, 60)
+                        })
                         .corner_radius(t::RADIUS_SM)
                         .inner_margin(egui::Margin::symmetric(6, 4))
                         .show(ui, |ui| {
@@ -474,7 +546,7 @@ impl UserProfilePopup {
                                         if log_count == 1 { "" } else { "s" }
                                     )
                                 })
-                                .color(t::TEXT_MUTED)
+                                .color(t::text_muted())
                                 .small(),
                             );
                         });
@@ -491,7 +563,7 @@ impl UserProfilePopup {
                                 ui.centered_and_justified(|ui| {
                                     ui.label(
                                         RichText::new("No recent messages.")
-                                            .color(t::TEXT_MUTED)
+                                            .color(t::text_muted())
                                             .small(),
                                     );
                                 });
@@ -532,16 +604,16 @@ impl UserProfilePopup {
                                             ui.spacing_mut().item_spacing.x = 4.0;
                                             ui.add(egui::Label::new(
                                                 RichText::new(&time_str)
-                                                    .color(t::TEXT_MUTED)
+                                                    .color(t::text_muted())
                                                     .small()
                                                     .monospace(),
                                             ));
                                             let msg_color = if is_deleted {
-                                                t::TEXT_MUTED
+                                                t::text_muted()
                                             } else if is_action {
                                                 Color32::from_rgba_unmultiplied(200, 200, 255, 230)
                                             } else {
-                                                t::TEXT_PRIMARY
+                                                t::text_primary()
                                             };
                                             let rich =
                                                 RichText::new(&text).color(msg_color).small();
@@ -559,39 +631,39 @@ impl UserProfilePopup {
                 }
 
                 // ── Profile tab ──────────────────────────────────────────
-                if !self.is_mod || self.active_tab == ProfileTab::Profile {
+                if self.active_tab == ProfileTab::Profile {
                     egui::Grid::new("profile_stats")
                         .num_columns(2)
                         .spacing([12.0, 4.0])
                         .show(ui, |ui| {
                             if let Some(f) = profile.followers {
                                 ui.label(
-                                    RichText::new("Followers").color(t::TEXT_SECONDARY).small(),
+                                    RichText::new("Followers").color(t::text_secondary()).small(),
                                 );
                                 ui.label(
-                                    RichText::new(fmt_count(f)).strong().color(t::TEXT_PRIMARY),
+                                    RichText::new(fmt_count(f)).strong().color(t::text_primary()),
                                 );
                                 ui.end_row();
                             }
                             if let Some(ref ts) = profile.created_at {
                                 ui.label(
                                     RichText::new("Account age")
-                                        .color(t::TEXT_SECONDARY)
+                                        .color(t::text_secondary())
                                         .small(),
                                 );
-                                ui.label(RichText::new(fmt_account_age(ts)).color(t::TEXT_PRIMARY));
+                                ui.label(RichText::new(fmt_account_age(ts)).color(t::text_primary()));
                                 ui.end_row();
-                                ui.label(RichText::new("Joined").color(t::TEXT_SECONDARY).small());
-                                ui.label(RichText::new(fmt_join_date(ts)).color(t::TEXT_PRIMARY));
+                                ui.label(RichText::new("Joined").color(t::text_secondary()).small());
+                                ui.label(RichText::new(fmt_join_date(ts)).color(t::text_primary()));
                                 ui.end_row();
                             }
                             if !profile.is_live {
                                 if let Some(ref ts) = profile.last_broadcast_at {
                                     ui.label(
-                                        RichText::new("Last live").color(t::TEXT_SECONDARY).small(),
+                                        RichText::new("Last live").color(t::text_secondary()).small(),
                                     );
                                     ui.label(
-                                        RichText::new(fmt_join_date(ts)).color(t::TEXT_SECONDARY),
+                                        RichText::new(fmt_join_date(ts)).color(t::text_secondary()),
                                     );
                                     ui.end_row();
                                 }
@@ -605,7 +677,7 @@ impl UserProfilePopup {
                         ui.add(
                             egui::Label::new(
                                 RichText::new(&profile.description)
-                                    .color(t::TEXT_SECONDARY)
+                                    .color(t::text_secondary())
                                     .small(),
                             )
                             .wrap(),
@@ -626,7 +698,7 @@ impl UserProfilePopup {
                                 ui.add(
                                     egui::Label::new(
                                         RichText::new(format!("⚠ Suspended: {reason}"))
-                                            .color(t::RED)
+                                            .color(t::red())
                                             .small(),
                                     )
                                     .wrap(),
@@ -644,7 +716,7 @@ impl UserProfilePopup {
                         // ── Reason field ──────────────────────────────────
                         ui.label(
                             RichText::new("Reason (optional)")
-                                .color(t::TEXT_SECONDARY)
+                                .color(t::text_secondary())
                                 .small(),
                         );
                         ui.add_space(2.0);
@@ -674,7 +746,7 @@ impl UserProfilePopup {
                                 ];
                                 for &(lbl, secs) in ROW1 {
                                     if timeout_btn(ui, lbl) {
-                                        action = Some(PopupAction::Timeout {
+                                        actions.push(PopupAction::Timeout {
                                             channel: channel.clone(),
                                             login: login.clone(),
                                             user_id: user_id.clone(),
@@ -693,7 +765,7 @@ impl UserProfilePopup {
                                 ];
                                 for &(lbl, secs) in ROW2 {
                                     if timeout_btn(ui, lbl) {
-                                        action = Some(PopupAction::Timeout {
+                                        actions.push(PopupAction::Timeout {
                                             channel: channel.clone(),
                                             login: login.clone(),
                                             user_id: user_id.clone(),
@@ -722,7 +794,7 @@ impl UserProfilePopup {
                             if pressed || go_btn.clicked() {
                                 if let Ok(secs) = self.timeout_custom.trim().parse::<u32>() {
                                     if secs > 0 {
-                                        action = Some(PopupAction::Timeout {
+                                        actions.push(PopupAction::Timeout {
                                             channel: channel.clone(),
                                             login: login.clone(),
                                             user_id: user_id.clone(),
@@ -752,7 +824,7 @@ impl UserProfilePopup {
                             )
                             .clicked()
                         {
-                            action = Some(PopupAction::Unban {
+                            actions.push(PopupAction::Unban {
                                 channel: channel.clone(),
                                 login: login.clone(),
                                 user_id: user_id.clone(),
@@ -781,7 +853,7 @@ impl UserProfilePopup {
                                         .min_size(egui::vec2(60.0, 24.0)),
                                 );
                                 if confirm.clicked() {
-                                    action = Some(PopupAction::Ban {
+                                    actions.push(PopupAction::Ban {
                                         channel: channel.clone(),
                                         login: login.clone(),
                                         user_id: user_id.clone(),
@@ -808,6 +880,167 @@ impl UserProfilePopup {
                     }
                 }
 
+                // ── IVR Logs tab ─────────────────────────────────────────
+                if self.active_tab == ProfileTab::IvrLogs {
+                    // "Open in Browser" button
+                    let ivr_url = format!(
+                        "https://logs.ivr.fi/?channel={}&username={}",
+                        self.channel.as_ref().map(|c| c.as_str()).unwrap_or(""),
+                        profile.login,
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.add(
+                            egui::Button::new(
+                                RichText::new("Open in Browser ↗")
+                                    .small()
+                                    .color(t::accent()),
+                            )
+                            .fill(Color32::from_rgba_unmultiplied(145, 95, 255, 25))
+                            .min_size(egui::vec2(130.0, 22.0)),
+                        ).clicked() {
+                            actions.push(PopupAction::OpenUrl { url: ivr_url.clone() });
+                        }
+                        // Refresh button
+                        if !self.ivr_logs_loading {
+                            if ui.add(
+                                egui::Button::new(RichText::new("↻ Refresh").small())
+                                    .min_size(egui::vec2(70.0, 22.0)),
+                            ).clicked() {
+                                let ch = self.channel.as_ref().map(|c| c.as_str().to_owned()).unwrap_or_default();
+                                actions.push(PopupAction::FetchIvrLogs {
+                                    channel: ch,
+                                    username: profile.login.clone(),
+                                });
+                            }
+                        }
+                    });
+                    ui.add_space(4.0);
+
+                    if self.ivr_logs_loading {
+                        ui.add_space(8.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                RichText::new("Fetching logs…")
+                                    .color(t::text_secondary())
+                                    .italics(),
+                            );
+                        });
+                        ui.add_space(8.0);
+                    } else if let Some(ref err) = self.ivr_logs_error {
+                        ui.add_space(4.0);
+                        egui::Frame::new()
+                            .fill(Color32::from_rgba_unmultiplied(200, 30, 30, 25))
+                            .corner_radius(t::RADIUS_SM)
+                            .inner_margin(egui::Margin::symmetric(8, 5))
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(format!("⚠ {err}"))
+                                            .color(t::red())
+                                            .small(),
+                                    ).wrap(),
+                                );
+                            });
+                    } else if !self.ivr_logs_requested {
+                        // Not yet fetched - show prompt
+                        ui.add_space(8.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                RichText::new("Click the IVR Logs tab to load external chat history.")
+                                    .color(t::text_muted())
+                                    .small(),
+                            );
+                        });
+                        ui.add_space(8.0);
+                    } else {
+                        // Show log count header
+                        let log_count = self.ivr_logs.len();
+                        egui::Frame::new()
+                            .fill(if t::is_light() {
+                                Color32::from_rgba_unmultiplied(0, 0, 0, 20)
+                            } else {
+                                Color32::from_rgba_unmultiplied(0, 0, 0, 60)
+                            })
+                            .corner_radius(t::RADIUS_SM)
+                            .inner_margin(egui::Margin::symmetric(6, 4))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new(if log_count == 0 {
+                                        "No external logs found for this user.".to_owned()
+                                    } else {
+                                        format!(
+                                            "{log_count} message{} (from logs.ivr.fi, newest first)",
+                                            if log_count == 1 { "" } else { "s" }
+                                        )
+                                    })
+                                    .color(t::text_muted())
+                                    .small(),
+                                );
+                            });
+
+                        ui.add_space(4.0);
+
+                        if self.ivr_logs.is_empty() {
+                            ui.add_space(8.0);
+                            ui.centered_and_justified(|ui| {
+                                ui.label(
+                                    RichText::new("No messages.")
+                                        .color(t::text_muted())
+                                        .small(),
+                                );
+                            });
+                        } else {
+                            // Virtual scrolling: only render the rows visible
+                            // in the viewport.  Each row is ~22 px tall; egui
+                            // uses this estimate to size the scroll bar and
+                            // skip off-screen rows entirely.
+                            const ROW_HEIGHT: f32 = 22.0;
+                            let total_rows = self.ivr_logs.len();
+                            egui::ScrollArea::vertical()
+                                .id_salt("ivr_logs_scroll")
+                                .max_height(320.0)
+                                .auto_shrink([false, true])
+                                .show_rows(ui, ROW_HEIGHT, total_rows, |ui, row_range| {
+                                    for idx in row_range {
+                                        let entry = &self.ivr_logs[idx];
+                                        let time_str = fmt_ivr_timestamp(&entry.timestamp);
+                                        let is_timeout = entry.msg_type == 2;
+
+                                        egui::Frame::new()
+                                            .fill(if is_timeout {
+                                                Color32::from_rgba_unmultiplied(150, 30, 30, 20)
+                                            } else {
+                                                Color32::TRANSPARENT
+                                            })
+                                            .inner_margin(egui::Margin::symmetric(4, 2))
+                                            .show(ui, |ui| {
+                                                ui.horizontal_wrapped(|ui| {
+                                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                                    ui.add(egui::Label::new(
+                                                        RichText::new(&time_str)
+                                                            .color(t::text_muted())
+                                                            .small()
+                                                            .monospace(),
+                                                    ));
+                                                    let msg_color = if is_timeout {
+                                                        t::red()
+                                                    } else {
+                                                        t::text_primary()
+                                                    };
+                                                    let rich = RichText::new(&entry.text)
+                                                        .color(msg_color)
+                                                        .small();
+                                                    let rich = if is_timeout { rich.italics() } else { rich };
+                                                    ui.add(egui::Label::new(rich).wrap());
+                                                });
+                                            });
+                                        ui.add_space(1.0);
+                                    }
+                                });
+                        }
+                    }
+                }
+
                 ui.add_space(8.0);
                 ui.separator();
                 ui.add_space(3.0);
@@ -828,7 +1061,7 @@ impl UserProfilePopup {
                             )
                         };
                     ui.hyperlink_to(
-                        RichText::new(primary_label).small().color(t::ACCENT),
+                        RichText::new(primary_label).small().color(t::accent()),
                         primary_url,
                     );
                     let logs_url = format!(
@@ -839,7 +1072,7 @@ impl UserProfilePopup {
                     ui.hyperlink_to(
                         RichText::new("Lookup logs ↗")
                             .small()
-                            .color(t::TEXT_SECONDARY),
+                            .color(t::text_secondary()),
                         logs_url,
                     );
                 });
@@ -848,14 +1081,32 @@ impl UserProfilePopup {
             });
 
         // Close the popup after a mod action so the user doesn't have to.
-        if action.is_some() {
+        let has_mod_action = actions.iter().any(|a| matches!(a,
+            PopupAction::Timeout { .. } | PopupAction::Ban { .. } | PopupAction::Unban { .. }
+        ));
+        if has_mod_action {
             self.open = false;
         }
-        action
+        actions
     }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Format an IVR timestamp ("2026-03-05T09:35:03.061Z") to "YYYY-MM-DD HH:MM".
+fn fmt_ivr_timestamp(ts: &str) -> String {
+    // Try to extract "YYYY-MM-DD HH:MM" from ISO 8601
+    let ts = ts.trim_end_matches('Z');
+    if let Some(t_idx) = ts.find('T') {
+        let date = &ts[..t_idx];
+        let time = &ts[t_idx + 1..];
+        let time_clean = time.split('.').next().unwrap_or(time);
+        // Show HH:MM:SS only
+        format!("{} {}", date, time_clean)
+    } else {
+        ts.to_owned()
+    }
+}
 
 /// Render a small inline role pill using egui Frame.
 fn role_pill(ui: &mut egui::Ui, text: &str, color: Color32) {
@@ -877,14 +1128,19 @@ fn role_pill(ui: &mut egui::Ui, text: &str, color: Color32) {
 
 /// Render a small text badge pill (fallback when image is unavailable).
 fn badge_text_pill(ui: &mut egui::Ui, name: &str) {
+    let (fill, text_col) = if t::is_light() {
+        (Color32::from_rgba_unmultiplied(80, 80, 100, 50), Color32::from_rgb(50, 50, 65))
+    } else {
+        (Color32::from_rgba_unmultiplied(80, 80, 100, 140), Color32::from_rgb(210, 210, 220))
+    };
     egui::Frame::new()
-        .fill(Color32::from_rgba_unmultiplied(80, 80, 100, 140))
+        .fill(fill)
         .corner_radius(t::RADIUS_SM)
         .inner_margin(egui::Margin::symmetric(4, 1))
         .show(ui, |ui| {
             ui.add(egui::Label::new(
                 RichText::new(name)
-                    .color(Color32::from_rgb(210, 210, 220))
+                    .color(text_col)
                     .size(10.0),
             ));
         });
@@ -896,7 +1152,7 @@ fn section_label(ui: &mut egui::Ui, text: &str) {
         RichText::new(text)
             .small()
             .strong()
-            .color(t::TEXT_SECONDARY),
+            .color(t::text_secondary()),
     ));
 }
 

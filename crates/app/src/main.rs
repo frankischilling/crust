@@ -9,12 +9,15 @@ use tracing_subscriber::EnvFilter;
 use chrono::Utc;
 use crust_core::events::{AppCommand, AppEvent, ConnectionState};
 use crust_core::model::{
-    Badge, ChannelId, ChatMessage, EmoteCatalogEntry, MessageFlags, MessageId, MsgKind, Sender,
-    UserId, UserProfile,
+    Badge, ChannelId, ChatMessage, EmoteCatalogEntry, MessageFlags, MessageId, MsgKind,
+    Sender, UserId, UserProfile,
 };
 use crust_emotes::{
     cache::EmoteCache,
-    providers::{BttvProvider, EmoteInfo, FfzProvider, KickProvider, SevenTvProvider},
+    providers::{
+        BttvProvider, EmoteInfo, FfzProvider, KickProvider, SevenTvProvider,
+        TwitchGlobalProvider,
+    },
     EmoteProvider,
 };
 use crust_kick::session::{KickEvent, KickSession, KickSessionCommand};
@@ -34,6 +37,7 @@ const TWITCH_EVT_SIZE: usize = 4096;
 const KICK_EVT_SIZE: usize = 4096;
 const IRC_EVT_SIZE: usize = 4096;
 const TWITCH_MAX_MESSAGE_CHARS: usize = 500;
+const SEVENTV_GQL_URL: &str = "https://api.7tv.app/v3/gql";
 
 /// Counter for assigning unique IDs to history messages loaded from external APIs.
 /// Starts at u64::MAX/2 so it never clashes with live session IDs (which count up from 0).
@@ -65,8 +69,56 @@ fn resolve_emote<'a>(
     None
 }
 
-/// Shared badge map: (set_name, version) → image URL.
-type BadgeMap = Arc<RwLock<std::collections::HashMap<(String, String), String>>>;
+/// Shared badge map: (scope, set_name, version) → image URL.
+/// `scope` is `""` for global badges, or the channel name for channel-specific badges.
+type BadgeMap = Arc<RwLock<std::collections::HashMap<(String, String, String), String>>>;
+
+#[derive(Debug, Clone, Default)]
+struct SevenTvUserStyleRaw {
+    color: Option<i32>,
+    badge_id: Option<String>,
+    avatar_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SevenTvBadgeMeta {
+    tooltip: Option<String>,
+    url: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SevenTvResolvedStyle {
+    color_hex: Option<String>,
+    badge: Option<Badge>,
+    avatar_url: Option<String>,
+}
+
+enum SevenTvCosmeticUpdate {
+    Catalog {
+        badges: HashMap<String, SevenTvBadgeMeta>,
+    },
+    UserStyle {
+        twitch_user_id: String,
+        style: Option<SevenTvUserStyleRaw>,
+    },
+    /// Batch of Twitch user-ids discovered in history messages that need
+    /// their 7TV styles resolved.
+    BatchUserLookup {
+        user_ids: Vec<String>,
+    },
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SevenTvGraphQlResponse<T> {
+    data: Option<T>,
+    #[serde(default)]
+    errors: Vec<SevenTvGraphQlError>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SevenTvGraphQlError {
+    message: String,
+}
 
 fn main() -> Result<()> {
     // SIGPIPE: handle broken pipe signals on Wayland
@@ -152,6 +204,10 @@ fn main() -> Result<()> {
         .unwrap_or_default();
     let kick_runtime_enabled = initial_settings.enable_kick_beta;
     let irc_runtime_enabled = initial_settings.enable_irc_beta;
+
+    // Apply persisted theme before UI renders.
+    crust_ui::theme::apply_from_str(&initial_settings.theme);
+
     // Determine which account to auto-login as on startup:
     // prefer the explicitly pinned default_account, fall back to the last
     // active username, and finally fall back to the legacy single token.
@@ -322,6 +378,33 @@ async fn reducer_loop(
     let mut pending_images: HashSet<String> = HashSet::new();
     // Track URLs we've already kicked off a link-preview fetch for.
     let mut pending_link_previews: HashSet<String> = HashSet::new();
+
+    // 7TV cosmetics cache: global badges + per-user resolved styles.
+    let (stv_update_tx, mut stv_update_rx) = mpsc::channel::<SevenTvCosmeticUpdate>(512);
+    let mut stv_badges: HashMap<String, SevenTvBadgeMeta> = HashMap::new();
+    let mut stv_user_styles_raw: HashMap<String, SevenTvUserStyleRaw> = HashMap::new();
+    let mut stv_user_styles_resolved: HashMap<String, SevenTvResolvedStyle> = HashMap::new();
+    let mut stv_pending_user_lookups: HashSet<String> = HashSet::new();
+
+    // Shared HTTP client for all 7TV API calls (connection pooling + HTTP/2).
+    let stv_http_client: reqwest::Client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    // Limit concurrent 7TV user-style lookups to avoid overwhelming the API.
+    let stv_lookup_sem = Arc::new(tokio::sync::Semaphore::new(20));
+
+    {
+        let tx = stv_update_tx.clone();
+        let client = stv_http_client.clone();
+        tokio::spawn(async move {
+            if let Some(badges) = load_7tv_cosmetics_catalog(&client).await {
+                let _ = tx
+                    .send(SevenTvCosmeticUpdate::Catalog { badges })
+                    .await;
+            }
+        });
+    }
 
     // Track authenticated user info for local echo messages
     let mut auth_username: Option<String> = None;
@@ -623,8 +706,9 @@ async fn reducer_loop(
                         let bm = badge_map.clone();
                         let etx = evt_tx.clone();
                         let cache_b = emote_cache.clone();
+                        let ch_badge = channel.0.clone();
                         tokio::spawn(async move {
-                            load_channel_badges(&room_id, &bm, &cache_b, &etx).await;
+                            load_channel_badges(&room_id, &ch_badge, &bm, &cache_b, &etx).await;
                         });
                         // Load recent chat history
                         let ch_hist = channel.clone();
@@ -633,6 +717,7 @@ async fn reducer_loop(
                         let bm_hist = badge_map.clone();
                         let cache_hist = emote_cache.clone();
                         let etx_hist = evt_tx.clone();
+                        let stv_tx_hist = stv_update_tx.clone();
                         tokio::spawn(async move {
                             load_recent_messages(
                                 ch_hist.as_str(),
@@ -641,6 +726,7 @@ async fn reducer_loop(
                                 &bm_hist,
                                 &cache_hist,
                                 &etx_hist,
+                                &stv_tx_hist,
                             ).await;
                         });
                     }
@@ -683,6 +769,25 @@ async fn reducer_loop(
                         tokio::spawn(async move {
                             load_personal_7tv_emotes(&uid, &idx2, &cache2, &etx2, &gc2).await;
                         });
+
+                        // Prime cosmetics cache for the logged-in user.
+                        if !user_id.trim().is_empty()
+                            && stv_pending_user_lookups.insert(user_id.clone())
+                        {
+                            let tx = stv_update_tx.clone();
+                            let client = stv_http_client.clone();
+                            let sem = stv_lookup_sem.clone();
+                            tokio::spawn(async move {
+                                let _permit = sem.acquire().await;
+                                let style = load_7tv_user_style_for_twitch(&client, &user_id).await;
+                                let _ = tx
+                                    .send(SevenTvCosmeticUpdate::UserStyle {
+                                        twitch_user_id: user_id,
+                                        style,
+                                    })
+                                    .await;
+                            });
+                        }
                         // Fetch the user's own avatar for the top-bar profile pill.
                         {
                             let login = auth_username.clone().unwrap_or_default().to_lowercase();
@@ -719,22 +824,54 @@ async fn reducer_loop(
                         {
                             let bm = badge_map.read().unwrap();
                             for badge in &mut msg.sender.badges {
-                                badge.url = resolve_badge_url(&bm, &badge.name, &badge.version);
+                                badge.url = resolve_badge_url(&bm, &msg.channel.0, &badge.name, &badge.version);
                             }
                         }
 
                         // Mention / reply-to-me detection
                         if let Some(ref uname) = auth_username {
                             let uname_lower = uname.to_lowercase();
+                            let text_lower = msg.raw_text.to_lowercase();
                             // Direct @mention in message body
-                            let has_mention = msg.raw_text
-                                .to_lowercase()
+                            let has_at_mention = text_lower
                                 .contains(&format!("@{uname_lower}"));
+                            // Bare username as a whole word
+                            let has_bare_mention = text_lower
+                                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                                .any(|w| w == uname_lower);
                             // Reply directed at us
                             let is_reply_to_me = msg.reply.as_ref()
                                 .map(|r| r.parent_user_login.to_lowercase() == uname_lower)
                                 .unwrap_or(false);
-                            msg.flags.is_mention = has_mention || is_reply_to_me;
+                            msg.flags.is_mention = has_at_mention || has_bare_mention || is_reply_to_me;
+                        }
+
+                        // Apply cached 7TV cosmetics for Twitch users and
+                        // queue a background style lookup when missing.
+                        if msg.channel.is_twitch() {
+                            let twitch_user_id = msg.sender.user_id.0.trim().to_owned();
+                            if !twitch_user_id.is_empty() {
+                                if let Some(style) = stv_user_styles_resolved.get(&twitch_user_id)
+                                {
+                                    apply_7tv_cosmetics_to_sender(&mut msg.sender, style);
+                                } else if stv_pending_user_lookups.insert(twitch_user_id.clone())
+                                {
+                                    let tx = stv_update_tx.clone();
+                                    let client = stv_http_client.clone();
+                                    let sem = stv_lookup_sem.clone();
+                                    tokio::spawn(async move {
+                                        let _permit = sem.acquire().await;
+                                        let style =
+                                            load_7tv_user_style_for_twitch(&client, &twitch_user_id).await;
+                                        let _ = tx
+                                            .send(SevenTvCosmeticUpdate::UserStyle {
+                                                twitch_user_id,
+                                                style,
+                                            })
+                                            .await;
+                                    });
+                                }
+                            }
                         }
 
                         // Queue image fetches for emotes/emoji/badges
@@ -889,7 +1026,7 @@ async fn reducer_loop(
                         {
                             let bm = badge_map.read().unwrap();
                             for badge in &mut badges {
-                                badge.url = resolve_badge_url(&bm, &badge.name, &badge.version);
+                                badge.url = resolve_badge_url(&bm, &channel.0, &badge.name, &badge.version);
                             }
                         }
                         // Cache for local echo messages
@@ -1249,9 +1386,13 @@ async fn reducer_loop(
                         let mut has_mention = false;
                         if let Some(ref uname) = auth_username {
                             let uname_lower = uname.to_lowercase();
-                            has_mention = msg.raw_text
-                                .to_lowercase()
-                                .contains(&format!("@{uname_lower}"));
+                            let text_lower = msg.raw_text.to_lowercase();
+                            // @mention or bare username as a whole word
+                            has_mention = text_lower
+                                .contains(&format!("@{uname_lower}"))
+                                || text_lower
+                                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                                    .any(|w| w == uname_lower);
                         }
                         // Also match the configured IRC nick as a whole word.
                         if !has_mention {
@@ -1289,6 +1430,95 @@ async fn reducer_loop(
                             channel,
                             message: msg,
                         }).await;
+                    }
+                }
+            }
+
+            // Internal 7TV cosmetics updates (catalog + per-user style lookups).
+            Some(stv_update) = stv_update_rx.recv() => {
+                match stv_update {
+                    SevenTvCosmeticUpdate::Catalog { badges } => {
+                        info!("7TV catalog received: {} badges", badges.len());
+                        stv_badges = badges;
+
+                        // Re-resolve any styles we already learned before
+                        // the cosmetics catalog was available.
+                        stv_user_styles_resolved.clear();
+                        let mut updates: Vec<(String, SevenTvResolvedStyle)> = Vec::new();
+                        for (uid, style) in &stv_user_styles_raw {
+                            let resolved = resolve_7tv_user_style(style, &stv_badges);
+                            updates.push((uid.clone(), resolved.clone()));
+                            stv_user_styles_resolved.insert(uid.clone(), resolved);
+                        }
+
+                        if !updates.is_empty() {
+                            info!("7TV re-resolved {} cached user styles", updates.len());
+                        }
+
+                        for (user_id, resolved) in updates {
+                            if user_id.is_empty() {
+                                continue;
+                            }
+                            let _ = evt_tx
+                                .send(AppEvent::SenderCosmeticsUpdated {
+                                    user_id,
+                                    color: resolved.color_hex,
+                                    badge: resolved.badge,
+                                    avatar_url: resolved.avatar_url,
+                                })
+                                .await;
+                        }
+                    }
+                    SevenTvCosmeticUpdate::UserStyle {
+                        twitch_user_id,
+                        style,
+                    } => {
+                        stv_pending_user_lookups.remove(&twitch_user_id);
+                        if let Some(raw) = style {
+                            let resolved = resolve_7tv_user_style(&raw, &stv_badges);
+                            stv_user_styles_raw.insert(twitch_user_id.clone(), raw);
+                            stv_user_styles_resolved
+                                .insert(twitch_user_id.clone(), resolved.clone());
+
+                            if !twitch_user_id.is_empty() {
+                                let _ = evt_tx
+                                    .send(AppEvent::SenderCosmeticsUpdated {
+                                        user_id: twitch_user_id,
+                                        color: resolved.color_hex,
+                                        badge: resolved.badge,
+                                        avatar_url: resolved.avatar_url,
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                    SevenTvCosmeticUpdate::BatchUserLookup { user_ids } => {
+                        // Triggered by history loading - queue lookups for
+                        // users we haven't seen yet.
+                        let mut queued = 0u32;
+                        for uid in user_ids {
+                            if uid.is_empty() { continue; }
+                            if stv_user_styles_resolved.contains_key(&uid) { continue; }
+                            if !stv_pending_user_lookups.insert(uid.clone()) { continue; }
+                            queued += 1;
+                            let tx = stv_update_tx.clone();
+                            let client = stv_http_client.clone();
+                            let sem = stv_lookup_sem.clone();
+                            tokio::spawn(async move {
+                                let _permit = sem.acquire().await;
+                                let style =
+                                    load_7tv_user_style_for_twitch(&client, &uid).await;
+                                let _ = tx
+                                    .send(SevenTvCosmeticUpdate::UserStyle {
+                                        twitch_user_id: uid,
+                                        style,
+                                    })
+                                    .await;
+                            });
+                        }
+                        if queued > 0 {
+                            info!("7TV: queued {queued} user-style lookups from history");
+                        }
                     }
                 }
             }
@@ -1687,7 +1917,25 @@ async fn reducer_loop(
                             }
                         }
                     }
-                    AppCommand::SendMessage { channel, text, reply_to_msg_id } => {
+                    AppCommand::SetTheme { theme } => {
+                        settings.theme = theme;
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save theme setting: {e}");
+                            }
+                        }
+                    }
+                    AppCommand::SendMessage {
+                        channel,
+                        text,
+                        mut reply_to_msg_id,
+                        reply,
+                    } => {
+                        if reply_to_msg_id.is_none() {
+                            reply_to_msg_id =
+                                reply.as_ref().map(|r| r.parent_msg_id.clone());
+                        }
+
                         debug!("Sending message to #{channel}: {text}");
 
                         // Twitch hard-limit: reject overlong messages before
@@ -1796,9 +2044,13 @@ async fn reducer_loop(
                                     custom_reward_id: None,
                                     is_history: false,
                                 },
-                                reply: None,
+                                reply: reply.clone(),
                                 msg_kind: MsgKind::Chat,
                             };
+
+                            if let Some(style) = stv_user_styles_resolved.get(uid) {
+                                apply_7tv_cosmetics_to_sender(&mut echo.sender, style);
+                            }
 
                             // Tokenize the echo message
                             {
@@ -2019,6 +2271,12 @@ async fn reducer_loop(
                         let etx = evt_tx.clone();
                         tokio::spawn(async move {
                             fetch_user_profile_for_channel(&login, &channel, etx).await;
+                        });
+                    }
+                    AppCommand::FetchIvrLogs { channel, username } => {
+                        let etx = evt_tx.clone();
+                        tokio::spawn(async move {
+                            fetch_ivr_logs(&channel, &username, etx).await;
                         });
                     }
                 }
@@ -2264,15 +2522,22 @@ async fn load_global_emotes(
     let bttv = BttvProvider::new();
     let ffz = FfzProvider::new();
     let stv = SevenTvProvider::new();
+    let twg = TwitchGlobalProvider::new();
 
-    let (b, f, s) = tokio::join!(bttv.load_global(), ffz.load_global(), stv.load_global());
+    let (b, f, s, t) = tokio::join!(
+        bttv.load_global(),
+        ffz.load_global(),
+        stv.load_global(),
+        twg.load_global(),
+    );
 
-    let total = b.len() + f.len() + s.len();
+    let total = b.len() + f.len() + s.len() + t.len();
     info!(
-        "Loaded {total} global emotes (BTTV={}, FFZ={}, 7TV={})",
+        "Loaded {total} global emotes (BTTV={}, FFZ={}, 7TV={}, Twitch={})",
         b.len(),
         f.len(),
-        s.len()
+        s.len(),
+        t.len(),
     );
 
     // Collect URLs of the newly-loaded emotes for prefetching.
@@ -2280,6 +2545,7 @@ async fn load_global_emotes(
         .iter()
         .chain(b.iter())
         .chain(s.iter())
+        .chain(t.iter())
         .map(|e| e.url_1x.clone())
         .collect();
 
@@ -2294,6 +2560,9 @@ async fn load_global_emotes(
             idx.insert(emote_key(&e.provider, &e.code), e);
         }
         for e in s {
+            idx.insert(emote_key(&e.provider, &e.code), e);
+        }
+        for e in t {
             idx.insert(emote_key(&e.provider, &e.code), e);
         }
     }
@@ -2569,6 +2838,286 @@ fn prefetch_emote_images(
     }
 }
 
+// 7TV cosmetics
+
+fn seven_tv_color_to_rgba(color: i32) -> (u8, u8, u8, u8) {
+    let raw = color as u32;
+    let r = ((raw >> 24) & 0xFF) as u8;
+    let g = ((raw >> 16) & 0xFF) as u8;
+    let b = ((raw >> 8) & 0xFF) as u8;
+    let a = (raw & 0xFF) as u8;
+    // 7TV encodes alpha = 0 to mean "fully opaque" (no alpha override).
+    let a = if a == 0 { 255 } else { a };
+    (r, g, b, a)
+}
+
+fn seven_tv_color_to_hex(color: i32) -> Option<String> {
+    if color == 0 {
+        return None;
+    }
+    let (r, g, b, _a) = seven_tv_color_to_rgba(color);
+    Some(format!("#{r:02X}{g:02X}{b:02X}"))
+}
+
+fn seven_tv_badge_url(host_url: &str, file_name: &str) -> String {
+    let base = if host_url.starts_with("//") {
+        format!("https:{host_url}")
+    } else {
+        host_url.to_owned()
+    };
+    format!("{}/{}", base.trim_end_matches('/'), file_name)
+}
+
+fn choose_7tv_badge_file(files: &[SevenTvBadgeFile]) -> Option<&SevenTvBadgeFile> {
+    files
+        .iter()
+        .find(|f| f.name.starts_with("2x."))
+        .or_else(|| files.iter().find(|f| f.name.starts_with("1x.")))
+        .or_else(|| files.first())
+}
+
+fn resolve_7tv_user_style(
+    style: &SevenTvUserStyleRaw,
+    badges: &HashMap<String, SevenTvBadgeMeta>,
+) -> SevenTvResolvedStyle {
+    let color_hex = style
+        .color
+        .and_then(seven_tv_color_to_hex);
+
+    let badge = style.badge_id.as_ref().and_then(|id| badges.get(id)).map(|b| {
+        Badge {
+            name: "7tv".to_owned(),
+            version: b.tooltip.clone().unwrap_or_else(|| "1".to_owned()),
+            url: Some(b.url.clone()),
+        }
+    });
+
+    SevenTvResolvedStyle {
+        color_hex,
+        badge,
+        avatar_url: style.avatar_url.clone(),
+    }
+}
+
+fn apply_7tv_cosmetics_to_sender(sender: &mut Sender, style: &SevenTvResolvedStyle) {
+    if let Some(ref color) = style.color_hex {
+        sender.color = Some(color.clone());
+    }
+
+    if let Some(ref badge) = style.badge {
+        let already_has = sender.badges.iter().any(|b| {
+            b.url.as_deref() == badge.url.as_deref() || b.name.eq_ignore_ascii_case("7tv")
+        });
+        if !already_has {
+            sender.badges.insert(0, badge.clone());
+        }
+    }
+}
+
+async fn load_7tv_cosmetics_catalog(client: &reqwest::Client) -> Option<HashMap<String, SevenTvBadgeMeta>> {
+    #[derive(serde::Deserialize)]
+    struct RespData {
+        cosmetics: Cosmetics,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Cosmetics {
+        badges: Vec<BadgeNode>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct BadgeNode {
+        id: String,
+        tooltip: Option<String>,
+        host: BadgeHost,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct BadgeHost {
+        url: String,
+        files: Vec<SevenTvBadgeFile>,
+    }
+
+    let query = r#"
+        query {
+            cosmetics {
+                badges {
+                    id
+                    tooltip
+                    host {
+                        url
+                        files {
+                            name
+                        }
+                    }
+                }
+            }
+        }
+    "#;
+
+    let resp = match client
+        .post(SEVENTV_GQL_URL)
+        .json(&serde_json::json!({ "query": query }))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("7TV cosmetics fetch failed: {e}");
+            return None;
+        }
+    };
+
+    let payload = match resp.json::<SevenTvGraphQlResponse<RespData>>().await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("7TV cosmetics parse failed: {e}");
+            return None;
+        }
+    };
+
+    if !payload.errors.is_empty() {
+        let messages = payload
+            .errors
+            .iter()
+            .map(|e| e.message.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        warn!("7TV cosmetics GraphQL errors: {messages}");
+    }
+
+    let Some(data) = payload.data else {
+        return None;
+    };
+
+    let badges: HashMap<String, SevenTvBadgeMeta> = data
+        .cosmetics
+        .badges
+        .into_iter()
+        .filter_map(|b| {
+            let file = choose_7tv_badge_file(&b.host.files)?;
+            Some((
+                b.id,
+                SevenTvBadgeMeta {
+                    tooltip: b.tooltip,
+                    url: seven_tv_badge_url(&b.host.url, &file.name),
+                },
+            ))
+        })
+        .collect();
+
+    info!(
+        "Loaded 7TV cosmetics catalog (badges={})",
+        badges.len()
+    );
+
+    Some(badges)
+}
+
+async fn load_7tv_user_style_for_twitch(client: &reqwest::Client, twitch_user_id: &str) -> Option<SevenTvUserStyleRaw> {
+    #[derive(serde::Deserialize)]
+    struct RespData {
+        #[serde(rename = "userByConnection")]
+        user_by_connection: Option<UserNode>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct UserNode {
+        style: StyleNode,
+        avatar_url: Option<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct StyleNode {
+        color: i32,
+        badge_id: Option<String>,
+    }
+
+    if twitch_user_id.trim().is_empty() {
+        return None;
+    }
+
+    let query = r#"
+        query($id: String!) {
+            userByConnection(platform: TWITCH, id: $id) {
+                avatar_url
+                style {
+                    color
+                    badge_id
+                }
+            }
+        }
+    "#;
+
+    let resp = match client
+        .post(SEVENTV_GQL_URL)
+        .json(&serde_json::json!({
+            "query": query,
+            "variables": { "id": twitch_user_id }
+        }))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            debug!("7TV user style fetch failed for {twitch_user_id}: {e}");
+            return None;
+        }
+    };
+
+    let payload = match resp.json::<SevenTvGraphQlResponse<RespData>>().await {
+        Ok(p) => p,
+        Err(e) => {
+            debug!("7TV user style parse failed for {twitch_user_id}: {e}");
+            return None;
+        }
+    };
+
+    if !payload.errors.is_empty() {
+        let messages = payload
+            .errors
+            .iter()
+            .map(|e| e.message.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        debug!("7TV user style GraphQL errors for {twitch_user_id}: {messages}");
+    }
+
+    let user_node = payload
+        .data
+        .and_then(|d| d.user_by_connection);
+
+    let avatar_url = user_node.as_ref()
+        .and_then(|u| u.avatar_url.clone())
+        .filter(|s| !s.is_empty())
+        .map(|u| {
+            // 7TV sometimes returns protocol-relative URLs (//cdn.7tv.app/...)
+            if u.starts_with("//") { format!("https:{u}") } else { u }
+        });
+
+    let style = user_node
+        .map(|u| u.style)
+        .unwrap_or(StyleNode {
+            color: 0,
+            badge_id: None,
+        });
+
+    Some(SevenTvUserStyleRaw {
+        color: if style.color == 0 {
+            None
+        } else {
+            Some(style.color)
+        },
+        badge_id: style.badge_id.filter(|s| !s.is_empty()),
+        avatar_url,
+    })
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SevenTvBadgeFile {
+    name: String,
+}
+
 // Badge loading
 
 /// Resolve a badge image URL from the badge map.
@@ -2580,33 +3129,43 @@ fn prefetch_emote_images(
 /// available version that is numerically ≤ the requested version, which
 /// selects the correct tier image without requiring a perfect key match.
 fn resolve_badge_url(
-    map: &std::collections::HashMap<(String, String), String>,
+    map: &std::collections::HashMap<(String, String, String), String>,
+    scope: &str,
     name: &str,
     version: &str,
 ) -> Option<String> {
-    // Fast path: exact match.
-    if let Some(url) = map.get(&(name.to_owned(), version.to_owned())) {
-        return Some(url.clone());
-    }
-    // Slow path: numeric fallback - find the highest available version ≤ version.
-    let target: u64 = version.parse().ok()?;
-    let mut best: Option<(u64, &String)> = None;
-    for ((n, v), url) in map {
-        if n == name {
-            if let Ok(candidate) = v.parse::<u64>() {
-                if candidate <= target && best.map_or(true, |(b, _)| candidate > b) {
-                    best = Some((candidate, url));
+    // Try channel-specific scope first, then fall back to global.
+    let scopes: &[&str] = if scope.is_empty() { &[""] } else { &[scope, ""] };
+    for s in scopes {
+        // Fast path: exact match.
+        if let Some(url) = map.get(&(s.to_string(), name.to_owned(), version.to_owned())) {
+            return Some(url.clone());
+        }
+        // Slow path: numeric fallback - find the highest available version ≤ version.
+        if let Ok(target) = version.parse::<u64>() {
+            let mut best: Option<(u64, &String)> = None;
+            for ((sc, n, v), url) in map {
+                if sc.as_str() == *s && n == name {
+                    if let Ok(candidate) = v.parse::<u64>() {
+                        if candidate <= target && best.map_or(true, |(b, _)| candidate > b) {
+                            best = Some((candidate, url));
+                        }
+                    }
                 }
+            }
+            if let Some((_, url)) = best {
+                return Some(url.clone());
             }
         }
     }
-    best.map(|(_, url)| url.clone())
+    None
 }
 
 /// Parse IVR badge response (flat JSON array) and insert into the badge map.
 fn parse_ivr_badge_response(
     body: &str,
-    map: &mut std::collections::HashMap<(String, String), String>,
+    scope: &str,
+    map: &mut std::collections::HashMap<(String, String, String), String>,
 ) {
     #[derive(serde::Deserialize)]
     struct Version {
@@ -2623,7 +3182,7 @@ fn parse_ivr_badge_response(
     if let Ok(sets) = serde_json::from_str::<Vec<BadgeSet>>(body) {
         for set in sets {
             for ver in set.versions {
-                map.insert((set.set_id.clone(), ver.id), ver.image_url_1x);
+                map.insert((scope.to_owned(), set.set_id.clone(), ver.id), ver.image_url_1x);
             }
         }
     }
@@ -2643,7 +3202,7 @@ async fn load_global_badges(
                 let new_urls = {
                     let mut map = badge_map.write().unwrap();
                     let before: std::collections::HashSet<String> = map.values().cloned().collect();
-                    parse_ivr_badge_response(&text, &mut map);
+                    parse_ivr_badge_response(&text, "", &mut map);
                     let after_count = map.len();
                     let new: Vec<String> = map
                         .values()
@@ -2667,6 +3226,7 @@ async fn load_global_badges(
 /// Load channel-specific Twitch badges via IVR API (no auth required).
 async fn load_channel_badges(
     room_id: &str,
+    channel: &str,
     badge_map: &BadgeMap,
     cache: &Option<EmoteCache>,
     evt_tx: &mpsc::Sender<AppEvent>,
@@ -2679,7 +3239,7 @@ async fn load_channel_badges(
                 let new_urls = {
                     let mut map = badge_map.write().unwrap();
                     let before: std::collections::HashSet<String> = map.values().cloned().collect();
-                    parse_ivr_badge_response(&text, &mut map);
+                    parse_ivr_badge_response(&text, channel, &mut map);
                     let new: Vec<String> = map
                         .values()
                         .filter(|u| !before.contains(*u))
@@ -2764,6 +3324,12 @@ async fn fetch_emote_image(url: &str, cache: &Option<EmoteCache>, evt_tx: &mpsc:
 async fn fetch_and_decode_raw(url: &str) -> Result<(u32, u32, Vec<u8>), crust_emotes::EmoteError> {
     let client = reqwest::Client::new();
     let resp = client.get(url).send().await?;
+    if !resp.status().is_success() {
+        return Err(crust_emotes::EmoteError::NotFound(format!(
+            "HTTP {} for {url}",
+            resp.status()
+        )));
+    }
     let raw = resp.bytes().await?;
     let raw_vec = raw.to_vec();
     // Read dimensions from header only - no full RGBA decode needed
@@ -2788,40 +3354,81 @@ async fn load_recent_messages(
     badge_map: &BadgeMap,
     emote_cache: &Option<EmoteCache>,
     evt_tx: &mpsc::Sender<AppEvent>,
+    stv_update_tx: &mpsc::Sender<SevenTvCosmeticUpdate>,
 ) {
     let ch = channel.trim_start_matches('#');
     let channel_id = crust_core::model::ChannelId::new(ch);
+
+    info!("chat-history: fetching recent messages for #{ch}…");
 
     // NOTE: the correct path is /recent-messages/ (hyphen), not /recent_messages/.
     let robotty_url =
         format!("https://recent-messages.robotty.de/api/v2/recent-messages/{ch}?limit=800");
     let ivr_url = format!("https://logs.ivr.fi/channel/{ch}?json=1&reverse=true&limit=800");
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
 
     // Try robotty first; it covers all channels (including small ones).
     // Fall back to IVR if robotty fails or returns nothing.
+    #[allow(unused_assignments)]
+    let mut robotty_err: Option<String> = None;
     let raw_lines: Vec<String> = 'fetch: {
-        if let Ok(resp) = client
+        match client
             .get(&robotty_url)
             .header("Accept", "application/json")
             .send()
             .await
         {
-            if resp.status().is_success() {
-                if let Ok(text) = resp.text().await {
-                    #[derive(serde::Deserialize)]
-                    struct RobottyResponse {
-                        messages: Vec<String>,
-                    }
-                    if let Ok(p) = serde_json::from_str::<RobottyResponse>(&text) {
-                        if !p.messages.is_empty() {
-                            break 'fetch p.messages;
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    match resp.text().await {
+                        Ok(text) => {
+                            #[derive(serde::Deserialize)]
+                            struct RobottyResponse {
+                                messages: Vec<String>,
+                            }
+                            match serde_json::from_str::<RobottyResponse>(&text) {
+                                Ok(p) if !p.messages.is_empty() => {
+                                    info!(
+                                        "chat-history: robotty returned {} raw lines for #{ch}",
+                                        p.messages.len()
+                                    );
+                                    break 'fetch p.messages;
+                                }
+                                Ok(_) => {
+                                    robotty_err =
+                                        Some("robotty returned 0 messages".to_owned());
+                                }
+                                Err(e) => {
+                                    robotty_err = Some(format!(
+                                        "robotty JSON parse failed: {e}"
+                                    ));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            robotty_err =
+                                Some(format!("robotty body read failed: {e}"));
                         }
                     }
+                } else {
+                    robotty_err =
+                        Some(format!("robotty HTTP {status}"));
                 }
             }
+            Err(e) => {
+                robotty_err = Some(format!("robotty request failed: {e}"));
+            }
         }
+
+        if let Some(ref err) = robotty_err {
+            info!("chat-history: {err}, trying IVR fallback for #{ch}");
+        }
+
         // IVR fallback
         match client
             .get(&ivr_url)
@@ -2830,21 +3437,46 @@ async fn load_recent_messages(
             .await
         {
             Ok(resp) if resp.status().is_success() => {
-                if let Ok(text) = resp.text().await {
-                    #[derive(serde::Deserialize)]
-                    struct IvrMsg {
-                        raw: String,
+                match resp.text().await {
+                    Ok(text) => {
+                        #[derive(serde::Deserialize)]
+                        struct IvrMsg {
+                            raw: String,
+                        }
+                        #[derive(serde::Deserialize)]
+                        struct IvrResp {
+                            messages: Vec<IvrMsg>,
+                        }
+                        match serde_json::from_str::<IvrResp>(&text) {
+                            Ok(mut p) if !p.messages.is_empty() => {
+                                p.messages.reverse(); // IVR is newest-first
+                                info!(
+                                    "chat-history: IVR returned {} raw lines for #{ch}",
+                                    p.messages.len()
+                                );
+                                break 'fetch p.messages
+                                    .into_iter()
+                                    .map(|m| m.raw)
+                                    .collect();
+                            }
+                            Ok(_) => {
+                                warn!(
+                                    "chat-history: both sources returned 0 messages for #{ch}"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "chat-history: IVR JSON parse failed for #{ch}: {e}"
+                                );
+                            }
+                        }
+                        Vec::new()
                     }
-                    #[derive(serde::Deserialize)]
-                    struct IvrResp {
-                        messages: Vec<IvrMsg>,
-                    }
-                    if let Ok(mut p) = serde_json::from_str::<IvrResp>(&text) {
-                        p.messages.reverse(); // IVR is newest-first
-                        break 'fetch p.messages.into_iter().map(|m| m.raw).collect();
+                    Err(e) => {
+                        warn!("chat-history: IVR body read failed for #{ch}: {e}");
+                        Vec::new()
                     }
                 }
-                Vec::new()
             }
             Ok(resp) => {
                 warn!(
@@ -2861,7 +3493,7 @@ async fn load_recent_messages(
     };
 
     if raw_lines.is_empty() {
-        info!("Loaded 0 historical messages for #{ch}");
+        info!("chat-history: loaded 0 historical messages for #{ch}");
         let _ = evt_tx
             .send(AppEvent::HistoryLoaded {
                 channel: channel_id,
@@ -2871,6 +3503,8 @@ async fn load_recent_messages(
         return;
     }
 
+    let raw_line_count = raw_lines.len();
+
     // ── Snapshot shared state once before the parse loop ────────────────────
     // Taking these locks inside the loop (800+ times) is expensive; snapshot
     // once and release immediately so other tasks aren't blocked.
@@ -2878,11 +3512,12 @@ async fn load_recent_messages(
         let guard = emote_index.read().unwrap();
         guard.clone()
     };
-    let badge_snapshot: HashMap<(String, String), String> = {
+    let badge_snapshot: HashMap<(String, String, String), String> = {
         let bm = badge_map.read().unwrap();
         bm.clone()
     };
     let local_nick_owned = local_nick.map(str::to_owned);
+    let channel_scope = ch.to_owned();
 
     // ── Move the CPU-bound parse + tokenize loop off the async executor ──────
     // Tokenization and IRC parsing are synchronous CPU work.  Running them
@@ -2915,7 +3550,7 @@ async fn load_recent_messages(
                 msg.flags.is_action,
                 &msg.twitch_emotes,
                 &|code| {
-                    emote_snapshot.get(code).map(|info| {
+                    resolve_emote(&emote_snapshot, code).map(|info| {
                         (
                             info.id.clone(),
                             info.code.clone(),
@@ -2929,16 +3564,19 @@ async fn load_recent_messages(
 
             // Resolve badge URLs from the snapshot (no lock needed)
             for badge in &mut msg.sender.badges {
-                badge.url = resolve_badge_url(&badge_snapshot, &badge.name, &badge.version);
+                badge.url = resolve_badge_url(&badge_snapshot, &channel_scope, &badge.name, &badge.version);
             }
 
             // Mention detection
             if let Some(ref nick) = local_nick_owned {
                 let nick_lower = nick.to_lowercase();
-                let has_mention = msg
-                    .raw_text
-                    .to_lowercase()
-                    .contains(&format!("@{nick_lower}"));
+                let text_lower = msg.raw_text.to_lowercase();
+                // @mention or bare username as a whole word
+                let has_mention = text_lower
+                    .contains(&format!("@{nick_lower}"))
+                    || text_lower
+                        .split(|c: char| !c.is_alphanumeric() && c != '_')
+                        .any(|w| w == nick_lower);
                 let is_reply_to_me = msg
                     .reply
                     .as_ref()
@@ -2976,7 +3614,7 @@ async fn load_recent_messages(
     .unwrap_or_default();
 
     if messages.is_empty() {
-        info!("Loaded 0 historical messages for #{ch}");
+        info!("chat-history: parsed 0 PRIVMSG lines from {raw_line_count} raw lines for #{ch}");
         let _ = evt_tx
             .send(AppEvent::HistoryLoaded {
                 channel: channel_id,
@@ -2986,7 +3624,25 @@ async fn load_recent_messages(
         return;
     }
 
-    info!("Loaded {} historical messages for #{ch}", messages.len());
+    info!("chat-history: loaded {} messages for #{ch}", messages.len());
+
+    // Collect unique Twitch user-ids from history so 7TV can resolve
+    // their cosmetics (paints/badges) retroactively.
+    {
+        let mut history_user_ids: Vec<String> = messages
+            .iter()
+            .map(|m| m.sender.user_id.0.trim().to_owned())
+            .filter(|id| !id.is_empty())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        history_user_ids.sort();
+        if !history_user_ids.is_empty() {
+            let _ = stv_update_tx
+                .send(SevenTvCosmeticUpdate::BatchUserLookup { user_ids: history_user_ids })
+                .await;
+        }
+    }
 
     // Batch-prefetch all unique image URLs with a semaphore (same path as
     // emote/badge prefetch, which also emits ImagePrefetchQueued for the
@@ -3465,6 +4121,118 @@ async fn fetch_twitch_user_profile(login: &str, evt_tx: mpsc::Sender<AppEvent>) 
     let _ = evt_tx.send(AppEvent::UserProfileLoaded { profile }).await;
 }
 
+/// Fetch external chat logs from the IVR logs API (logs.ivr.fi).
+/// Fetches the current month's logs in reverse chronological order.
+async fn fetch_ivr_logs(channel: &str, username: &str, evt_tx: mpsc::Sender<AppEvent>) {
+    use crust_core::events::IvrLogEntry;
+
+    #[derive(serde::Deserialize)]
+    struct IvrLogMessage {
+        #[serde(default)]
+        text: String,
+        #[serde(default)]
+        timestamp: String,
+        #[serde(rename = "displayName", default)]
+        display_name: String,
+        /// 1 = chat message, 2 = timeout/ban
+        #[serde(rename = "type", default)]
+        msg_type: u8,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct IvrLogResponse {
+        #[serde(default)]
+        messages: Vec<IvrLogMessage>,
+    }
+
+    // Fetch current month's logs
+    let now = chrono::Utc::now();
+    let year = now.format("%Y");
+    let month = now.format("%-m");
+
+    let url = format!(
+        "https://logs.ivr.fi/channel/{channel}/user/{username}/{year}/{month}?json=true&reverse=true"
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    let resp = match client
+        .get(&url)
+        .header("User-Agent", "crust-chat/1.0")
+        .header("Accept", "application/json")
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            let status = r.status();
+            let body = r.text().await.unwrap_or_default();
+            let msg = if status.as_u16() == 404 {
+                "No logs found for this user/channel combination.".to_owned()
+            } else {
+                format!("IVR logs returned HTTP {status}: {body}")
+            };
+            warn!("{msg}");
+            let _ = evt_tx.send(AppEvent::IvrLogsFailed {
+                username: username.to_owned(),
+                error: msg,
+            }).await;
+            return;
+        }
+        Err(e) => {
+            warn!("IVR logs fetch failed for {username} in {channel}: {e}");
+            let _ = evt_tx.send(AppEvent::IvrLogsFailed {
+                username: username.to_owned(),
+                error: format!("Network error: {e}"),
+            }).await;
+            return;
+        }
+    };
+
+    // Read the full response as text first, then parse JSON.
+    // This avoids potential hangs from reqwest's streaming JSON parser
+    // and gives us better debug info if something goes wrong.
+    let body = match resp.text().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("IVR logs: failed to read response body for {username}: {e}");
+            let _ = evt_tx.send(AppEvent::IvrLogsFailed {
+                username: username.to_owned(),
+                error: format!("Failed to read response: {e}"),
+            }).await;
+            return;
+        }
+    };
+
+    let parsed: IvrLogResponse = match serde_json::from_str(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("IVR logs parse failed for {username}: {e} (body len={})", body.len());
+            let _ = evt_tx.send(AppEvent::IvrLogsFailed {
+                username: username.to_owned(),
+                error: format!("Failed to parse response: {e}"),
+            }).await;
+            return;
+        }
+    };
+
+    let entries: Vec<IvrLogEntry> = parsed.messages.into_iter().map(|m| IvrLogEntry {
+        text: m.text,
+        timestamp: m.timestamp,
+        display_name: m.display_name,
+        msg_type: m.msg_type,
+    }).collect();
+
+    info!("IVR logs: loaded {} entries for {username} in {channel}", entries.len());
+    let _ = evt_tx.send(AppEvent::IvrLogsLoaded {
+        username: username.to_owned(),
+        messages: entries,
+    }).await;
+}
+
 /// Fetch a Kick user profile via Kick's public channel API.
 async fn fetch_kick_user_profile(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
     #[derive(serde::Deserialize)]
@@ -3589,7 +4357,7 @@ async fn fetch_kick_user_profile(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
         .get(&url)
         .header(
             reqwest::header::USER_AGENT,
-            "Mozilla/5.0 (X11; Linux x86_64) CrustChat/0.1",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         )
         .header(reqwest::header::ACCEPT, "application/json")
         .send()
@@ -3891,11 +4659,18 @@ async fn fetch_link_preview(
         title: None,
         description: None,
         thumbnail_url: None,
+        site_name: None,
     };
 
+    // Use a realistic Chrome User-Agent so sites like Twitter / YouTube
+    // don't serve empty bot pages or block us entirely.
     let client = match reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (compatible; crust-chat/1.0; +https://github.com/crust)")
-        .timeout(std::time::Duration::from_secs(6))
+        .user_agent(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+             AppleWebKit/537.36 (KHTML, like Gecko) \
+             Chrome/131.0.0.0 Safari/537.36",
+        )
+        .timeout(std::time::Duration::from_secs(8))
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()
     {
@@ -3906,7 +4681,24 @@ async fn fetch_link_preview(
         }
     };
 
-    let resp = match client.get(url).send().await {
+    // ── YouTube oEmbed shortcut ─────────────────────────────────────
+    // YouTube serves proper OG tags but the oEmbed JSON API is faster,
+    // more reliable, and doesn't require HTML parsing.
+    if is_youtube_url(url) {
+        if let Some(ev) = fetch_youtube_oembed(url, &client, cache, evt_tx).await {
+            let _ = evt_tx.send(ev).await;
+            return;
+        }
+        // Fall through to generic OG-tag path on failure.
+    }
+
+    // ── Twitter / X.com rewrite ─────────────────────────────────────
+    // twitter.com and x.com serve JavaScript-rendered pages that bots
+    // cannot parse.  fxtwitter.com is a public proxy that serves proper
+    // OG meta tags for tweet URLs.
+    let fetch_url = rewrite_twitter_url(url).unwrap_or_else(|| url.to_owned());
+
+    let resp = match client.get(&fetch_url).send().await {
         Ok(r) if r.status().is_success() => r,
         _ => {
             let _ = evt_tx.send(send_empty(url)).await;
@@ -3942,6 +4734,8 @@ async fn fetch_link_preview(
     let description =
         og_meta(&html, "og:description").or_else(|| og_meta(&html, "twitter:description"));
     let thumbnail_url = og_meta(&html, "og:image").or_else(|| og_meta(&html, "twitter:image"));
+    let site_name = og_meta(&html, "og:site_name")
+        .or_else(|| detect_site_name(url));
 
     // Kick off thumbnail image fetch so bytes land in emote_bytes.
     if let Some(ref img) = thumbnail_url {
@@ -3954,8 +4748,96 @@ async fn fetch_link_preview(
             title,
             description,
             thumbnail_url,
+            site_name,
         })
         .await;
+}
+
+/// Check if a URL is a YouTube / youtu.be link.
+fn is_youtube_url(url: &str) -> bool {
+    let lower = url.to_lowercase();
+    lower.contains("youtube.com/") || lower.contains("youtu.be/")
+}
+
+/// Fetch YouTube video metadata via the public oEmbed JSON endpoint.
+/// Returns `Some(AppEvent)` on success, `None` on failure.
+async fn fetch_youtube_oembed(
+    original_url: &str,
+    client: &reqwest::Client,
+    cache: &Option<EmoteCache>,
+    evt_tx: &mpsc::Sender<AppEvent>,
+) -> Option<AppEvent> {
+    let oembed_url = format!(
+        "https://www.youtube.com/oembed?url={}&format=json",
+        url_percent_encode(original_url)
+    );
+    let resp = client.get(&oembed_url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let json: serde_json::Value = resp.json().await.ok()?;
+    let title = json["title"].as_str().map(|s| s.to_owned());
+    let author = json["author_name"].as_str().map(|s| s.to_owned());
+    let thumbnail_url = json["thumbnail_url"].as_str().map(|s| s.to_owned());
+
+    // Fetch the thumbnail image bytes.
+    if let Some(ref img) = thumbnail_url {
+        fetch_emote_image(img, cache, evt_tx).await;
+    }
+
+    Some(AppEvent::LinkPreviewReady {
+        url: original_url.to_owned(),
+        title,
+        description: author.map(|a| format!("by {a}")),
+        thumbnail_url,
+        site_name: Some("YouTube".to_owned()),
+    })
+}
+
+/// Rewrite twitter.com / x.com URLs to fxtwitter.com so we get proper OG
+/// meta tags instead of a JS-rendered blank page.
+fn rewrite_twitter_url(url: &str) -> Option<String> {
+    let lower = url.to_lowercase();
+    // Match URLs like https://twitter.com/user/status/... or https://x.com/user/status/...
+    if lower.contains("twitter.com/") || lower.contains("x.com/") {
+        // Only rewrite status/tweet URLs, not profile pages.
+        if lower.contains("/status/") {
+            let rewritten = url
+                .replace("twitter.com", "fxtwitter.com")
+                .replace("x.com", "fxtwitter.com");
+            return Some(rewritten);
+        }
+    }
+    None
+}
+
+/// Heuristic site-name detection from the URL hostname when og:site_name
+/// is missing from the HTML.
+fn detect_site_name(url: &str) -> Option<String> {
+    let lower = url.to_lowercase();
+    if lower.contains("youtube.com/") || lower.contains("youtu.be/") {
+        Some("YouTube".to_owned())
+    } else if lower.contains("twitter.com/") || lower.contains("x.com/") || lower.contains("fxtwitter.com/") {
+        Some("Twitter".to_owned())
+    } else if lower.contains("twitch.tv/") {
+        Some("Twitch".to_owned())
+    } else if lower.contains("reddit.com/") {
+        Some("Reddit".to_owned())
+    } else if lower.contains("instagram.com/") {
+        Some("Instagram".to_owned())
+    } else if lower.contains("tiktok.com/") {
+        Some("TikTok".to_owned())
+    } else if lower.contains("github.com/") {
+        Some("GitHub".to_owned())
+    } else if lower.contains("wikipedia.org/") {
+        Some("Wikipedia".to_owned())
+    } else if lower.contains("steamcommunity.com/") || lower.contains("store.steampowered.com/") {
+        Some("Steam".to_owned())
+    } else if lower.contains("clips.twitch.tv/") {
+        Some("Twitch Clip".to_owned())
+    } else {
+        None
+    }
 }
 
 /// Extract the content of a `<meta property="{prop}" ...>` or `<meta name="{prop}" ...>` tag.
@@ -4027,3 +4909,23 @@ fn html_entities(s: &str) -> String {
         .replace("&apos;", "'")
         .replace("&nbsp;", " ")
 }
+
+/// Minimal percent-encoding for query-string values (no external crate needed).
+fn url_percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(char::from(HEX_CHARS[(b >> 4) as usize]));
+                out.push(char::from(HEX_CHARS[(b & 0xf) as usize]));
+            }
+        }
+    }
+    out
+}
+
+const HEX_CHARS: [u8; 16] = *b"0123456789ABCDEF";

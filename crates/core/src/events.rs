@@ -1,6 +1,22 @@
 use serde::{Deserialize, Serialize};
 
-use crate::model::{ChannelId, ChatMessage, EmoteCatalogEntry, SystemNotice, UserProfile};
+use crate::model::{
+    Badge, ChannelId, ChatMessage, EmoteCatalogEntry, ReplyInfo, SystemNotice,
+    UserProfile,
+};
+
+/// A single chat log entry from the IVR logs API.
+#[derive(Debug, Clone)]
+pub struct IvrLogEntry {
+    /// Message text.
+    pub text: String,
+    /// ISO 8601 timestamp, e.g. "2026-03-05T09:35:03.061Z".
+    pub timestamp: String,
+    /// Display name of the sender.
+    pub display_name: String,
+    /// 1 = normal message, 2 = timeout/ban event.
+    pub msg_type: u8,
+}
 // LinkPreview: Open Graph / Twitter Card metadata for a URL
 
 /// Open Graph / Twitter Card metadata fetched for a URL.
@@ -10,6 +26,8 @@ pub struct LinkPreview {
     pub description: Option<String>,
     /// og:image URL (thumbnail). The image is fetched into `emote_bytes`.
     pub thumbnail_url: Option<String>,
+    /// Site name from `og:site_name` (e.g. "YouTube", "Twitter").
+    pub site_name: Option<String>,
     /// True once the fetch attempt has completed (even if it returned nothing).
     pub fetched: bool,
 }
@@ -40,6 +58,9 @@ pub enum AppCommand {
         text: String,
         /// If set, the message is a reply to this server-assigned message ID.
         reply_to_msg_id: Option<String>,
+        /// Optional reply context used for local-echo rendering.
+        #[serde(default)]
+        reply: Option<ReplyInfo>,
     },
     /// Request a Twitch user profile lookup by login name.
     FetchUserProfile { login: String },
@@ -96,6 +117,10 @@ pub enum AppCommand {
     },
     /// Toggle always-on-top window mode.
     SetAlwaysOnTop { enabled: bool },
+    /// Switch UI theme ("dark" or "light") and persist to settings.
+    SetTheme { theme: String },
+    /// Fetch external chat logs for a user from the IVR logs API.
+    FetchIvrLogs { channel: String, username: String },
 }
 
 // Events (runtime to UI): notifications sent from runtime to UI
@@ -189,6 +214,8 @@ pub enum AppEvent {
         description: Option<String>,
         /// og:image URL; the image bytes land in emote_bytes under this key.
         thumbnail_url: Option<String>,
+        /// Site name from `og:site_name` (e.g. "YouTube", "Twitter").
+        site_name: Option<String>,
     },
     /// The set of saved accounts or the active account changed.
     AccountListUpdated {
@@ -233,6 +260,26 @@ pub enum AppEvent {
         slow: Option<u32>,
         subs_only: Option<bool>,
         r9k: Option<bool>,
+    },
+    /// 7TV cosmetics resolved for a Twitch user id; UI should update visible
+    /// messages from this sender so badges appear without waiting for
+    /// a new message.
+    SenderCosmeticsUpdated {
+        user_id: String,
+        color: Option<String>,
+        badge: Option<Badge>,
+        /// 7TV animated avatar URL (if the user has one set).
+        avatar_url: Option<String>,
+    },
+    /// External IVR chat logs loaded for a user.
+    IvrLogsLoaded {
+        username: String,
+        messages: Vec<IvrLogEntry>,
+    },
+    /// External IVR log fetch failed.
+    IvrLogsFailed {
+        username: String,
+        error: String,
     },
 }
 

@@ -138,7 +138,7 @@ impl LoadingScreen {
                 if matches!(self.phase, Phase::Connecting) {
                     self.phase = Phase::Connecting;
                 }
-                self.push_log("Connecting to Twitch…", t::TEXT_SECONDARY);
+                self.push_log("Connecting to Twitch…", t::text_secondary());
             }
             LoadEvent::Connected => {
                 // Don't regress from Loading if an optimistic Authenticated
@@ -146,17 +146,17 @@ impl LoadingScreen {
                 if matches!(self.phase, Phase::Connecting | Phase::Authenticating) {
                     self.phase = Phase::Authenticating;
                 }
-                self.push_log("Connected - authenticating…", t::GREEN);
+                self.push_log("Connected - authenticating…", t::green());
             }
             LoadEvent::Authenticated { username } => {
-                self.push_log(format!("Authenticated as {username}"), t::GREEN);
+                self.push_log(format!("Authenticated as {username}"), t::green());
                 self.authenticated_user = Some(username);
                 self.auth_optional = false;
                 self.enter_loading();
             }
             LoadEvent::ChannelJoined { channel } => {
                 self.maybe_enter_anonymous_loading();
-                self.push_log(format!("Joined #{channel}"), t::TEXT_PRIMARY);
+                self.push_log(format!("Joined #{channel}"), t::text_primary());
                 if !self.channels_joined.contains(&channel) {
                     self.channels_joined.push(channel);
                 }
@@ -164,7 +164,7 @@ impl LoadingScreen {
             }
             LoadEvent::CatalogLoaded { count } => {
                 self.maybe_enter_anonymous_loading();
-                self.push_log(format!("Global emotes ready - {count} emotes"), t::ACCENT);
+                self.push_log(format!("Global emotes ready - {count} emotes"), t::accent());
                 self.catalog_count = count;
                 self.catalog_loaded = true;
                 self.check_done();
@@ -173,7 +173,7 @@ impl LoadingScreen {
                 self.maybe_enter_anonymous_loading();
                 self.push_log(
                     format!("#{channel}: {count} history messages"),
-                    t::TEXT_SECONDARY,
+                    t::text_secondary(),
                 );
                 self.channels_with_history.insert(channel);
                 self.check_done();
@@ -194,10 +194,10 @@ impl LoadingScreen {
                 if count > 0 {
                     self.push_log(
                         format!("#{channel}: {count} channel emotes"),
-                        t::TEXT_SECONDARY,
+                        t::text_secondary(),
                     );
                 } else {
-                    self.push_log(format!("#{channel}: no channel emotes"), t::TEXT_MUTED);
+                    self.push_log(format!("#{channel}: no channel emotes"), t::text_muted());
                 }
                 self.channel_emote_totals.insert(channel.clone(), count);
                 self.channels_with_emotes.insert(channel);
@@ -246,7 +246,7 @@ impl LoadingScreen {
         };
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(t::BG_BASE))
+            .frame(egui::Frame::new().fill(t::bg_base()))
             .show(ctx, |ui| {
                 let rect = ui.max_rect();
                 let painter = ui.painter();
@@ -259,9 +259,9 @@ impl LoadingScreen {
                     Pos2::new(rect.left() + 90.0, rect.top() + 70.0),
                     130.0,
                     Color32::from_rgba_unmultiplied(
-                        t::ACCENT.r(),
-                        t::ACCENT.g(),
-                        t::ACCENT.b(),
+                        t::accent().r(),
+                        t::accent().g(),
+                        t::accent().b(),
                         (alpha * 20.0) as u8,
                     ),
                 );
@@ -269,9 +269,9 @@ impl LoadingScreen {
                     Pos2::new(rect.right() - 80.0, rect.bottom() - 60.0),
                     140.0,
                     Color32::from_rgba_unmultiplied(
-                        t::BORDER_ACCENT.r(),
-                        t::BORDER_ACCENT.g(),
-                        t::BORDER_ACCENT.b(),
+                        t::border_accent().r(),
+                        t::border_accent().g(),
+                        t::border_accent().b(),
                         (alpha * 18.0) as u8,
                     ),
                 );
@@ -282,6 +282,15 @@ impl LoadingScreen {
                 }
 
                 let card_w = (rect.width() - 36.0).clamp(200.0, 760.0);
+                let is_compact = card_w < 400.0;
+                let spinner_box = if is_compact { 48.0 } else { 64.0 };
+                let spinner_r = if is_compact { 15.0_f32 } else { 20.0_f32 };
+                let spinner_dot = if is_compact { 2.3_f32 } else { 2.7_f32 };
+                // Approximate fixed overhead (title, spinner, pills, margins,
+                // spacing) so we can give remaining height to the log.
+                let overhead = if is_compact { 290.0 } else { 330.0 };
+                let log_rows = ((rect.height() - overhead) / LOADING_LOG_ROW_HEIGHT)
+                    .clamp(3.0, LOADING_LOG_ROWS as f32) as usize;
                 egui::Area::new(egui::Id::new("loading_center_card"))
                     .order(egui::Order::Foreground)
                     .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
@@ -289,8 +298,8 @@ impl LoadingScreen {
                     .show(ctx, |ui| {
                         ui.set_width(card_w);
                         egui::Frame::new()
-                            .fill(a(t::BG_SURFACE))
-                            .stroke(egui::Stroke::new(1.0, a(t::BORDER_SUBTLE)))
+                            .fill(a(t::bg_surface()))
+                            .stroke(egui::Stroke::new(1.0, a(t::border_subtle())))
                             .corner_radius(t::RADIUS)
                             .inner_margin(egui::Margin::symmetric(16, 14))
                             .show(ui, |ui| {
@@ -298,31 +307,33 @@ impl LoadingScreen {
                                 ui.vertical_centered(|ui| {
                                     ui.label(
                                         egui::RichText::new("crust")
-                                            .font(FontId::proportional(40.0))
-                                            .color(a(t::ACCENT)),
+                                            .font(FontId::proportional(if is_compact { 30.0 } else { 40.0 }))
+                                            .color(a(t::accent())),
                                     );
-                                    ui.label(
-                                        egui::RichText::new(
-                                            "Twitch chat client (Kick/IRC optional beta)",
-                                        )
-                                        .font(FontId::proportional(12.0))
-                                        .color(a(t::TEXT_MUTED)),
-                                    );
+                                    if !is_compact {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Twitch chat client (Kick/IRC optional beta)",
+                                            )
+                                            .font(FontId::proportional(12.0))
+                                            .color(a(t::text_muted())),
+                                        );
+                                    }
                                 });
 
-                                ui.add_space(10.0);
+                                ui.add_space(if is_compact { 6.0 } else { 10.0 });
 
                                 ui.vertical_centered(|ui| {
                                     let (spin_rect, _) = ui.allocate_exact_size(
-                                        Vec2::new(64.0, 64.0),
+                                        Vec2::new(spinner_box, spinner_box),
                                         egui::Sense::hover(),
                                     );
                                     let center = spin_rect.center();
                                     let spin_painter = ui.painter();
                                     if self.phase != Phase::Ready {
                                         let t_val = ui.input(|i| i.time) as f32;
-                                        let radius = 20.0_f32;
-                                        let segments = 12usize;
+                                        let radius = spinner_r;
+                                        let segments = if is_compact { 10usize } else { 12usize };
                                         for i in 0..segments {
                                             let angle = (i as f32 / segments as f32)
                                                 * std::f32::consts::TAU;
@@ -337,11 +348,11 @@ impl LoadingScreen {
                                             );
                                             spin_painter.circle_filled(
                                                 p,
-                                                2.7,
+                                                spinner_dot,
                                                 Color32::from_rgba_unmultiplied(
-                                                    t::ACCENT.r(),
-                                                    t::ACCENT.g(),
-                                                    t::ACCENT.b(),
+                                                    t::accent().r(),
+                                                    t::accent().g(),
+                                                    t::accent().b(),
                                                     dot_alpha,
                                                 ),
                                             );
@@ -353,7 +364,7 @@ impl LoadingScreen {
                                             Align2::CENTER_CENTER,
                                             "✓",
                                             FontId::proportional(28.0),
-                                            a(t::GREEN),
+                                            a(t::green()),
                                         );
                                     }
                                 });
@@ -367,223 +378,182 @@ impl LoadingScreen {
                                     );
                                 });
 
-                                ui.add_space(10.0);
+                                ui.add_space(if is_compact { 6.0 } else { 10.0 });
                                 let details_w = (card_w - 32.0).clamp(160.0, 560.0);
                                 ui.vertical_centered(|ui| {
                                     ui.set_min_width(details_w);
                                     ui.set_max_width(details_w);
-                                            let mut pills: Vec<(String, Color32)> = Vec::new();
-                                            let conn = self.connection_status();
-                                            let conn_pill = (format!("● {}", conn.0), conn.1);
-                                            pills.push(conn_pill);
+                                    let mut pills: Vec<(String, Color32)> = Vec::new();
+                                    let conn = self.connection_status();
+                                    pills.push((format!("● {}", conn.0), conn.1));
 
-                                            if !self.channels_joined.is_empty() {
-                                                let text = if self.channels_joined.len() <= 4 {
-                                                    self.channels_joined
-                                                        .iter()
-                                                        .map(|c| format!("#{c}"))
-                                                        .collect::<Vec<_>>()
-                                                        .join("  ")
-                                                } else {
-                                                    format!(
-                                                        "{} channels joined",
-                                                        self.channels_joined.len()
-                                                    )
-                                                };
-                                                pills.push((text, t::TEXT_SECONDARY));
-                                            }
+                                    if !self.channels_joined.is_empty() {
+                                        let text = if self.channels_joined.len() <= 4 {
+                                            self.channels_joined
+                                                .iter()
+                                                .map(|c| format!("#{c}"))
+                                                .collect::<Vec<_>>()
+                                                .join("  ")
+                                        } else {
+                                            format!(
+                                                "{} channels joined",
+                                                self.channels_joined.len()
+                                            )
+                                        };
+                                        pills.push((text, t::text_secondary()));
+                                    }
 
-                                            if self.catalog_loaded {
-                                                pills.push((
-                                                    format!("{} global emotes", self.catalog_count),
-                                                    t::ACCENT,
-                                                ));
-                                            } else if self.phase == Phase::Loading {
-                                                pills.push((
-                                                    "Loading global emotes…".to_owned(),
-                                                    t::TEXT_MUTED,
-                                                ));
-                                            }
+                                    if self.catalog_loaded {
+                                        pills.push((
+                                            format!("{} global emotes", self.catalog_count),
+                                            t::accent(),
+                                        ));
+                                    } else if self.phase == Phase::Loading {
+                                        pills.push((
+                                            "Loading global emotes…".to_owned(),
+                                            t::text_muted(),
+                                        ));
+                                    }
 
-                                            if self.images_expected > 0 {
-                                                let pct = ((self.images_loaded as f32
-                                                    / self.images_expected as f32)
-                                                    * 100.0)
-                                                    .min(100.0)
-                                                    as usize;
-                                                let c = if pct >= 95 {
-                                                    t::GREEN
-                                                } else {
-                                                    t::TEXT_SECONDARY
-                                                };
-                                                pills.push((
-                                                    format!(
-                                                        "{} / {} images ({pct}%)",
-                                                        self.images_loaded, self.images_expected
-                                                    ),
-                                                    c,
-                                                ));
-                                            } else if self.images_loaded > 0 {
-                                                pills.push((
-                                                    format!("{} images", self.images_loaded),
-                                                    t::TEXT_SECONDARY,
-                                                ));
-                                            }
+                                    if self.images_expected > 0 {
+                                        let pct = ((self.images_loaded as f32
+                                            / self.images_expected as f32)
+                                            * 100.0)
+                                            .min(100.0)
+                                            as usize;
+                                        let c = if pct >= 95 {
+                                            t::green()
+                                        } else {
+                                            t::text_secondary()
+                                        };
+                                        pills.push((
+                                            format!(
+                                                "{} / {} images ({pct}%)",
+                                                self.images_loaded, self.images_expected
+                                            ),
+                                            c,
+                                        ));
+                                    } else if self.images_loaded > 0 {
+                                        pills.push((
+                                            format!("{} images", self.images_loaded),
+                                            t::text_secondary(),
+                                        ));
+                                    }
 
-                                            // Measure total pill width so we can center them.
-                                            let pill_font = FontId::proportional(11.0);
-                                            let pill_h_pad = 16.0_f32; // Margin::symmetric(8,3) → 8+8
-                                            let pill_extra = 6.0_f32;  // frame border overhead
-                                            let pill_spacing = 6.0_f32;
-                                            let mut total_pills_w = 0.0_f32;
-                                            for (text, _) in &pills {
-                                                let tw = ui.fonts(|f| {
-                                                    f.layout_no_wrap(
-                                                        text.clone(),
-                                                        pill_font.clone(),
-                                                        Color32::WHITE,
-                                                    )
-                                                    .rect
-                                                    .width()
-                                                });
-                                                total_pills_w += tw + pill_h_pad + pill_extra;
-                                            }
-                                            if pills.len() > 1 {
-                                                total_pills_w +=
-                                                    (pills.len() - 1) as f32 * pill_spacing;
-                                            }
-                                            let pill_avail = ui.available_width();
-                                            let pill_pad =
-                                                ((pill_avail - total_pills_w) / 2.0).max(0.0);
-
-                                            ui.horizontal_wrapped(|ui| {
-                                                ui.spacing_mut().item_spacing =
-                                                    Vec2::new(pill_spacing, pill_spacing);
-                                                if pill_pad > 1.0 {
-                                                    ui.add_space(pill_pad);
-                                                }
-                                                for (text, color) in pills {
-                                                    egui::Frame::new()
-                                                        .fill(Color32::from_rgba_unmultiplied(
-                                                            t::BG_RAISED.r(),
-                                                            t::BG_RAISED.g(),
-                                                            t::BG_RAISED.b(),
-                                                            (alpha * 185.0) as u8,
-                                                        ))
-                                                        .corner_radius(egui::CornerRadius::same(9))
-                                                        .inner_margin(egui::Margin::symmetric(8, 3))
-                                                        .show(ui, |ui| {
-                                                            ui.add(
-                                                                egui::Label::new(
-                                                                    egui::RichText::new(text)
-                                                                        .font(
-                                                                            FontId::proportional(
-                                                                                11.0,
-                                                                            ),
-                                                                        )
-                                                                        .color(a(color)),
+                                    let pill_spacing = 6.0_f32;
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.spacing_mut().item_spacing =
+                                            Vec2::new(pill_spacing, pill_spacing);
+                                        for (text, color) in pills {
+                                            egui::Frame::new()
+                                                .fill(Color32::from_rgba_unmultiplied(
+                                                    t::bg_raised().r(),
+                                                    t::bg_raised().g(),
+                                                    t::bg_raised().b(),
+                                                    (alpha * 185.0) as u8,
+                                                ))
+                                                .corner_radius(egui::CornerRadius::same(9))
+                                                .inner_margin(egui::Margin::symmetric(8, 3))
+                                                .show(ui, |ui| {
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            egui::RichText::new(text)
+                                                                .font(
+                                                                    FontId::proportional(11.0),
                                                                 )
-                                                                .wrap_mode(
-                                                                    egui::TextWrapMode::Extend,
-                                                                ),
-                                                            );
-                                                        });
-                                                }
-                                            });
+                                                                .color(a(color)),
+                                                        )
+                                                        .wrap_mode(
+                                                            egui::TextWrapMode::Truncate,
+                                                        ),
+                                                    );
+                                                });
+                                        }
+                                    });
 
-                                            if self.images_expected > 0 {
-                                                let prog = (self.images_loaded as f32
-                                                    / self.images_expected as f32)
-                                                    .clamp(0.0, 1.0);
-                                                ui.add_space(8.0);
-                                                let bar_w = ui.available_width().min(details_w);
-                                                ui.add(
-                                                    egui::widgets::ProgressBar::new(prog)
-                                                        .fill(a(t::ACCENT))
-                                                        .desired_width(bar_w)
-                                                        .text(format!(
-                                                            "Image prefetch: {} / {}",
-                                                            self.images_loaded,
-                                                            self.images_expected
-                                                        )),
+                                    if self.images_expected > 0 {
+                                        let prog = (self.images_loaded as f32
+                                            / self.images_expected as f32)
+                                            .clamp(0.0, 1.0);
+                                        ui.add_space(8.0);
+                                        let bar_w = ui.available_width().min(details_w);
+                                        ui.add(
+                                            egui::widgets::ProgressBar::new(prog)
+                                                .fill(a(t::accent()))
+                                                .desired_width(bar_w)
+                                                .text(format!(
+                                                    "Image prefetch: {} / {}",
+                                                    self.images_loaded,
+                                                    self.images_expected
+                                                )),
+                                        );
+                                    }
+
+                                    ui.add_space(10.0);
+                                    ui.vertical_centered(|ui| {
+                                        ui.set_min_width(details_w);
+                                        ui.set_max_width(details_w);
+                                        egui::Frame::new()
+                                            .fill(a(t::bg_base()))
+                                            .stroke(egui::Stroke::new(
+                                                1.0,
+                                                a(t::border_subtle()),
+                                            ))
+                                            .corner_radius(t::RADIUS_SM)
+                                            .inner_margin(egui::Margin::symmetric(8, 7))
+                                            .show(ui, |ui| {
+                                                let inner_w = (details_w - 18.0).max(0.0);
+                                                ui.set_min_width(inner_w);
+                                                ui.set_max_width(inner_w);
+                                                ui.set_min_height(
+                                                    log_rows as f32
+                                                        * LOADING_LOG_ROW_HEIGHT,
                                                 );
-                                            }
 
-                                            ui.add_space(10.0);
-                                            ui.vertical_centered(|ui| {
-                                                ui.set_min_width(details_w);
-                                                ui.set_max_width(details_w);
-                                                egui::Frame::new()
-                                                    .fill(a(t::BG_BASE))
-                                                    .stroke(egui::Stroke::new(
-                                                        1.0,
-                                                        a(t::BORDER_SUBTLE),
-                                                    ))
-                                                    .corner_radius(t::RADIUS_SM)
-                                                    .inner_margin(egui::Margin::symmetric(8, 7))
-                                                    .show(ui, |ui| {
-                                                        let inner_w = (details_w - 18.0).max(0.0);
-                                                        ui.set_min_width(inner_w);
-                                                        ui.set_max_width(inner_w);
-                                                        ui.set_min_height(
-                                                            LOADING_LOG_ROWS as f32
-                                                                * LOADING_LOG_ROW_HEIGHT,
-                                                        );
-
-                                                            // Use explicit vertical layout so log lines stack properly
-                                                            // (parent vertical_centered would otherwise misalign them)
-                                                            ui.with_layout(
-                                                                egui::Layout::top_down(
-                                                                    egui::Align::Min,
-                                                                ),
-                                                                |ui| {
-                                                                    let mut lines: Vec<&LogLine> =
-                                                                        self
-                                                                            .log
-                                                                            .iter()
-                                                                            .rev()
-                                                                            .take(
-                                                                                LOADING_LOG_ROWS,
-                                                                            )
-                                                                            .collect();
-                                                                    lines.reverse();
-                                                                    if lines.is_empty() {
-                                                                        ui.add_sized(
-                                                                            Vec2::new(inner_w, 0.0),
-                                                                            egui::Label::new(
-                                                                                egui::RichText::new(
-                                                                                    "Waiting for startup events…",
-                                                                                )
-                                                                                .font(t::small())
-                                                                                .color(a(
-                                                                                    t::TEXT_MUTED,
-                                                                                )),
-                                                                            )
-                                                                            .truncate(),
-                                                                        );
-                                                                    } else {
-                                                                        for line in lines {
-                                                                            ui.add_sized(
-                                                                                Vec2::new(
-                                                                                    inner_w, 0.0,
-                                                                                ),
-                                                                                egui::Label::new(
-                                                                                    egui::RichText::new(
-                                                                                        &line.text,
-                                                                                    )
-                                                                                    .font(t::small())
-                                                                                    .color(a(
-                                                                                        line.color,
-                                                                                    )),
-                                                                                )
-                                                                                .truncate(),
-                                                                            );
-                                                                        }
-                                                                    }
-                                                                },
+                                                // Use explicit vertical layout so log lines stack
+                                                // properly (parent vertical_centered would
+                                                // otherwise misalign them).
+                                                ui.with_layout(
+                                                    egui::Layout::top_down(egui::Align::Min),
+                                                    |ui| {
+                                                        let mut lines: Vec<&LogLine> = self
+                                                            .log
+                                                            .iter()
+                                                            .rev()
+                                                            .take(log_rows)
+                                                            .collect();
+                                                        lines.reverse();
+                                                        if lines.is_empty() {
+                                                            ui.add_sized(
+                                                                Vec2::new(inner_w, 0.0),
+                                                                egui::Label::new(
+                                                                    egui::RichText::new(
+                                                                        "Waiting for startup events…",
+                                                                    )
+                                                                    .font(t::small())
+                                                                    .color(a(t::text_muted())),
+                                                                )
+                                                                .truncate(),
                                                             );
-                                                        });
+                                                        } else {
+                                                            for line in lines {
+                                                                ui.add_sized(
+                                                                    Vec2::new(inner_w, 0.0),
+                                                                    egui::Label::new(
+                                                                        egui::RichText::new(
+                                                                            &line.text,
+                                                                        )
+                                                                        .font(t::small())
+                                                                        .color(a(line.color)),
+                                                                    )
+                                                                    .truncate(),
+                                                                );
+                                                            }
+                                                        }
+                                                    },
+                                                );
                                             });
+                                    });
                                 });
                             });
                     });
@@ -603,8 +573,8 @@ impl LoadingScreen {
             .show(ctx, |ui| {
                 ui.set_width(card_w);
                 egui::Frame::new()
-                    .fill(a(t::BG_SURFACE))
-                    .stroke(egui::Stroke::new(1.0, a(t::BORDER_SUBTLE)))
+                    .fill(a(t::bg_surface()))
+                    .stroke(egui::Stroke::new(1.0, a(t::border_subtle())))
                     .corner_radius(t::RADIUS)
                     .inner_margin(egui::Margin::symmetric(10, 10))
                     .show(ui, |ui| {
@@ -614,13 +584,13 @@ impl LoadingScreen {
                             ui.label(
                                 egui::RichText::new("crust")
                                     .font(FontId::proportional(30.0))
-                                    .color(a(t::ACCENT)),
+                                    .color(a(t::accent())),
                             );
                             if card_w > 220.0 {
                                 ui.label(
                                     egui::RichText::new("Twitch chat client")
                                         .font(FontId::proportional(11.0))
-                                        .color(a(t::TEXT_MUTED)),
+                                        .color(a(t::text_muted())),
                                 );
                             }
                         });
@@ -650,9 +620,9 @@ impl LoadingScreen {
                                         p,
                                         2.5,
                                         Color32::from_rgba_unmultiplied(
-                                            t::ACCENT.r(),
-                                            t::ACCENT.g(),
-                                            t::ACCENT.b(),
+                                            t::accent().r(),
+                                            t::accent().g(),
+                                            t::accent().b(),
                                             dot_alpha,
                                         ),
                                     );
@@ -664,7 +634,7 @@ impl LoadingScreen {
                                     Align2::CENTER_CENTER,
                                     "✓",
                                     FontId::proportional(24.0),
-                                    a(t::GREEN),
+                                    a(t::green()),
                                 );
                             }
                         });
@@ -693,7 +663,7 @@ impl LoadingScreen {
                                     self.channels_joined.len()
                                 ))
                                 .font(t::small())
-                                .color(a(t::TEXT_SECONDARY)),
+                                .color(a(t::text_secondary())),
                             );
                         }
 
@@ -704,13 +674,13 @@ impl LoadingScreen {
                                     self.catalog_count
                                 ))
                                 .font(t::small())
-                                .color(a(t::ACCENT)),
+                                .color(a(t::accent())),
                             );
                         } else if self.phase == Phase::Loading {
                             ui.label(
                                 egui::RichText::new("Global emotes: loading…")
                                     .font(t::small())
-                                    .color(a(t::TEXT_MUTED)),
+                                    .color(a(t::text_muted())),
                             );
                         }
 
@@ -721,7 +691,7 @@ impl LoadingScreen {
                             ui.add_space(6.0);
                             ui.add(
                                 egui::widgets::ProgressBar::new(prog)
-                                    .fill(a(t::ACCENT))
+                                    .fill(a(t::accent()))
                                     .desired_width(ui.available_width())
                                     .text(format!(
                                         "Images: {} / {}",
@@ -731,21 +701,23 @@ impl LoadingScreen {
                         }
 
                         ui.add_space(8.0);
+                        let narrow_log_rows = ((rect.height() - 280.0) / LOADING_LOG_ROW_HEIGHT)
+                            .clamp(2.0, SUPER_NARROW_LOG_ROWS as f32) as usize;
                         egui::Frame::new()
-                            .fill(a(t::BG_BASE))
-                            .stroke(egui::Stroke::new(1.0, a(t::BORDER_SUBTLE)))
+                            .fill(a(t::bg_base()))
+                            .stroke(egui::Stroke::new(1.0, a(t::border_subtle())))
                             .corner_radius(t::RADIUS_SM)
                             .inner_margin(egui::Margin::symmetric(7, 6))
                             .show(ui, |ui| {
                                 let inner_w = ui.available_width();
                                 ui.set_min_height(
-                                    SUPER_NARROW_LOG_ROWS as f32 * LOADING_LOG_ROW_HEIGHT,
+                                    narrow_log_rows as f32 * LOADING_LOG_ROW_HEIGHT,
                                 );
                                 let mut lines: Vec<&LogLine> = self
                                     .log
                                     .iter()
                                     .rev()
-                                    .take(SUPER_NARROW_LOG_ROWS)
+                                    .take(narrow_log_rows)
                                     .collect();
                                 lines.reverse();
 
@@ -755,7 +727,7 @@ impl LoadingScreen {
                                         egui::Label::new(
                                             egui::RichText::new("Waiting for startup events…")
                                                 .font(t::small())
-                                                .color(a(t::TEXT_MUTED)),
+                                                .color(a(t::text_muted())),
                                         )
                                         .truncate(),
                                     );
@@ -779,19 +751,19 @@ impl LoadingScreen {
 
     fn stage_label(&self) -> (&'static str, Color32) {
         match self.phase {
-            Phase::Connecting => ("Connecting to Twitch…", t::YELLOW),
-            Phase::Authenticating => ("Authenticating…", t::YELLOW),
-            Phase::Loading => ("Loading startup data…", t::TEXT_SECONDARY),
-            Phase::Ready => ("Ready", t::GREEN),
-            Phase::Done => ("Done", t::GREEN),
+            Phase::Connecting => ("Connecting to Twitch…", t::yellow()),
+            Phase::Authenticating => ("Authenticating…", t::yellow()),
+            Phase::Loading => ("Loading startup data…", t::text_secondary()),
+            Phase::Ready => ("Ready", t::green()),
+            Phase::Done => ("Done", t::green()),
         }
     }
 
     fn connection_status(&self) -> (&'static str, Color32) {
         match self.phase {
-            Phase::Connecting => ("Connecting", t::YELLOW),
-            Phase::Authenticating => ("Authenticating", t::YELLOW),
-            _ => ("Connected", t::GREEN),
+            Phase::Connecting => ("Connecting", t::yellow()),
+            Phase::Authenticating => ("Authenticating", t::yellow()),
+            _ => ("Connected", t::green()),
         }
     }
 
@@ -810,7 +782,7 @@ impl LoadingScreen {
             && self.authenticated_user.is_none()
         {
             self.auth_optional = true;
-            self.push_log("Connected anonymously", t::TEXT_MUTED);
+            self.push_log("Connected anonymously", t::text_muted());
             self.enter_loading();
         }
     }
@@ -859,7 +831,7 @@ impl LoadingScreen {
                     "Ready! ({}/{} images)",
                     self.images_loaded, self.images_expected
                 ),
-                t::GREEN,
+                t::green(),
             );
             self.mark_ready();
         }

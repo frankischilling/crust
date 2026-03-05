@@ -329,7 +329,7 @@ impl AnalyticsPanel {
             ui.label(
                 RichText::new("Analytics")
                     .font(t::body())
-                    .color(t::TEXT_PRIMARY)
+                    .color(t::text_primary())
                     .strong(),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -337,8 +337,8 @@ impl AnalyticsPanel {
                 let save_btn = ui
                     .add(
                         egui::Button::new(RichText::new("💾").font(t::small()))
-                            .fill(t::BG_RAISED)
-                            .stroke(egui::Stroke::new(1.0, t::BORDER_SUBTLE)),
+                            .fill(t::bg_raised())
+                            .stroke(egui::Stroke::new(1.0, t::border_subtle())),
                     )
                     .on_hover_text("Save snapshot to file");
                 if save_btn.clicked() {
@@ -348,8 +348,8 @@ impl AnalyticsPanel {
                 let wipe_btn = ui
                     .add(
                         egui::Button::new(RichText::new("🗑").font(t::small()))
-                            .fill(t::BG_RAISED)
-                            .stroke(egui::Stroke::new(1.0, t::BORDER_SUBTLE)),
+                            .fill(t::bg_raised())
+                            .stroke(egui::Stroke::new(1.0, t::border_subtle())),
                     )
                     .on_hover_text("Reset stats from now");
                 if wipe_btn.clicked() {
@@ -367,9 +367,9 @@ impl AnalyticsPanel {
             if age < 3.0 {
                 let alpha = ((3.0 - age) / 1.0).min(1.0);
                 let col = egui::Color32::from_rgba_unmultiplied(
-                    t::GREEN.r(),
-                    t::GREEN.g(),
-                    t::GREEN.b(),
+                    t::green().r(),
+                    t::green().g(),
+                    t::green().b(),
                     (alpha * 220.0) as u8,
                 );
                 ui.label(RichText::new(msg.as_str()).font(t::small()).color(col));
@@ -393,16 +393,16 @@ impl AnalyticsPanel {
                 let selected = self.time_window == w;
                 let btn = egui::Button::new(RichText::new(w.label()).font(t::small()))
                     .fill(if selected {
-                        t::ACCENT_DIM
+                        t::accent_dim()
                     } else {
-                        t::BG_RAISED
+                        t::bg_raised()
                     })
                     .stroke(egui::Stroke::new(
                         1.0,
                         if selected {
-                            t::ACCENT
+                            t::accent()
                         } else {
-                            t::BORDER_SUBTLE
+                            t::border_subtle()
                         },
                     ));
                 if ui.add(btn).clicked() {
@@ -416,7 +416,7 @@ impl AnalyticsPanel {
             ui.label(
                 RichText::new(format!("Since {}", local.format("%H:%M:%S")))
                     .font(t::small())
-                    .color(t::TEXT_MUTED),
+                    .color(t::text_muted()),
             );
         }
 
@@ -429,16 +429,16 @@ impl AnalyticsPanel {
                 let selected = self.active_tab == tab;
                 let btn = egui::Button::new(RichText::new(tab.label()).font(t::small()))
                     .fill(if selected {
-                        t::BG_RAISED
+                        t::bg_raised()
                     } else {
                         egui::Color32::TRANSPARENT
                     })
                     .stroke(egui::Stroke::new(
                         1.0,
                         if selected {
-                            t::BORDER_ACCENT
+                            t::border_accent()
                         } else {
-                            t::BORDER_SUBTLE
+                            t::border_subtle()
                         },
                     ));
                 if ui.add(btn).clicked() {
@@ -487,7 +487,7 @@ impl AnalyticsPanel {
 
 fn show_overview(ui: &mut Ui, stats: &ChannelStats) {
     let card = Frame::new()
-        .fill(t::BG_RAISED)
+        .fill(t::bg_raised())
         .corner_radius(t::RADIUS_SM)
         .inner_margin(egui::Margin::symmetric(8, 6));
     card.show(ui, |ui| {
@@ -551,7 +551,7 @@ fn show_chatters(ui: &mut Ui, stats: &ChannelStats) {
         ui.label(
             RichText::new("No chat data yet")
                 .font(t::small())
-                .color(t::TEXT_MUTED),
+                .color(t::text_muted()),
         );
         return;
     }
@@ -561,7 +561,7 @@ fn show_chatters(ui: &mut Ui, stats: &ChannelStats) {
         .auto_shrink([false; 2])
         .show(ui, |ui| {
             for (login, count) in &stats.top_chatters {
-                bar_row_u32(ui, login, *count, max, t::ACCENT);
+                bar_row_u32(ui, login, *count, max, t::accent());
             }
             if !stats.top_bit_donors.is_empty() {
                 ui.add_space(8.0);
@@ -569,7 +569,7 @@ fn show_chatters(ui: &mut Ui, stats: &ChannelStats) {
                 ui.add_space(3.0);
                 let bmax = stats.top_bit_donors[0].1.max(1);
                 for (login, bits) in &stats.top_bit_donors {
-                    bar_row_u64(ui, login, *bits, bmax, t::YELLOW);
+                    bar_row_u64(ui, login, *bits, bmax, t::yellow());
                 }
             }
         });
@@ -580,7 +580,7 @@ fn show_emotes(ui: &mut Ui, stats: &ChannelStats) {
         ui.label(
             RichText::new("No emote data yet")
                 .font(t::small())
-                .color(t::TEXT_MUTED),
+                .color(t::text_muted()),
         );
         return;
     }
@@ -590,7 +590,7 @@ fn show_emotes(ui: &mut Ui, stats: &ChannelStats) {
         .auto_shrink([false; 2])
         .show(ui, |ui| {
             for (code, count) in &stats.top_emotes {
-                bar_row_u32(ui, code, *count, max, t::GREEN);
+                bar_row_u32(ui, code, *count, max, t::green());
             }
         });
 }
@@ -600,7 +600,7 @@ fn show_activity(ui: &mut Ui, stats: &ChannelStats) {
         ui.label(
             RichText::new("No activity in this window")
                 .font(t::small())
-                .color(t::TEXT_MUTED),
+                .color(t::text_muted()),
         );
         return;
     }
@@ -623,9 +623,9 @@ fn show_activity(ui: &mut Ui, stats: &ChannelStats) {
             egui::Rect::from_min_size(egui::pos2(x, baseline - bar_h), egui::vec2(bar_w, bar_h)),
             egui::CornerRadius::same(1),
             egui::Color32::from_rgba_unmultiplied(
-                t::ACCENT.r(),
-                t::ACCENT.g(),
-                t::ACCENT.b(),
+                t::accent().r(),
+                t::accent().g(),
+                t::accent().b(),
                 alpha,
             ),
         );
@@ -635,18 +635,18 @@ fn show_activity(ui: &mut Ui, stats: &ChannelStats) {
         egui::Align2::LEFT_TOP,
         "older",
         t::small(),
-        t::TEXT_MUTED,
+        t::text_muted(),
     );
     painter.text(
         egui::pos2(rect.right(), baseline + 2.0),
         egui::Align2::RIGHT_TOP,
         "now",
         t::small(),
-        t::TEXT_MUTED,
+        t::text_muted(),
     );
     ui.add_space(4.0);
     Frame::new()
-        .fill(t::BG_RAISED)
+        .fill(t::bg_raised())
         .corner_radius(t::RADIUS_SM)
         .inner_margin(egui::Margin::symmetric(8, 6))
         .show(ui, |ui| {
@@ -666,7 +666,7 @@ fn section_header(ui: &mut Ui, label: &str) {
         ui.label(
             RichText::new(label)
                 .font(t::heading())
-                .color(t::TEXT_MUTED)
+                .color(t::text_muted())
                 .strong(),
         );
         ui.add(egui::Separator::default().horizontal().spacing(4.0));
@@ -678,10 +678,10 @@ fn stat_row(ui: &mut Ui, label: &str, value: &str) {
         ui.label(
             RichText::new(label)
                 .font(t::small())
-                .color(t::TEXT_SECONDARY),
+                .color(t::text_secondary()),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(RichText::new(value).font(t::small()).color(t::TEXT_PRIMARY));
+            ui.label(RichText::new(value).font(t::small()).color(t::text_primary()));
         });
     });
 }
@@ -703,11 +703,11 @@ fn draw_bar_row(ui: &mut Ui, label: &str, count_str: &str, frac: f32, bar_color:
     );
     let cg = ui
         .painter()
-        .layout_no_wrap(count_str.to_owned(), t::small(), t::TEXT_SECONDARY);
+        .layout_no_wrap(count_str.to_owned(), t::small(), t::text_secondary());
     let cw = cg.size().x;
     let lg = ui
         .painter()
-        .layout_no_wrap(label.to_owned(), t::small(), t::TEXT_PRIMARY);
+        .layout_no_wrap(label.to_owned(), t::small(), t::text_primary());
     let clip = egui::Rect::from_min_max(
         egui::pos2(rect.left(), rect.top()),
         egui::pos2(rect.right() - cw - 12.0, rect.bottom()),
@@ -717,12 +717,12 @@ fn draw_bar_row(ui: &mut Ui, label: &str, count_str: &str, frac: f32, bar_color:
     ui.painter().with_clip_rect(clip).galley(
         egui::pos2(rect.left() + 6.0, rect.top() + ty),
         lg,
-        t::TEXT_PRIMARY,
+        t::text_primary(),
     );
     ui.painter().galley(
         egui::pos2(rect.right() - cw - 4.0, rect.top() + cy),
         cg,
-        t::TEXT_SECONDARY,
+        t::text_secondary(),
     );
 }
 

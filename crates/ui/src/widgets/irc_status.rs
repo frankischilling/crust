@@ -309,13 +309,13 @@ impl IrcStatusPanel {
                         RichText::new(
                             "No IRC servers tracked yet. Join an IRC server/channel first.",
                         )
-                        .color(t::TEXT_MUTED),
+                        .color(t::text_muted()),
                     );
                     return;
                 }
 
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Server").color(t::TEXT_SECONDARY));
+                    ui.label(RichText::new("Server").color(t::text_secondary()));
                     ComboBox::from_id_salt("irc_status_server_select")
                         .selected_text(
                             self.selected_server
@@ -350,17 +350,17 @@ impl IrcStatusPanel {
                         } else {
                             "Disconnected"
                         },
-                        if server.connected { t::GREEN } else { t::RED },
+                        if server.connected { t::green() } else { t::red() },
                     );
                     status_chip(
                         ui,
                         &format!("TLS: {}", yes_no(server.tls_enabled)),
-                        t::TEXT_SECONDARY,
+                        t::text_secondary(),
                     );
                     status_chip(
                         ui,
                         &format!("Nick: {}", opt_text(server.current_nick.clone())),
-                        t::TEXT_SECONDARY,
+                        t::text_secondary(),
                     );
                     status_chip(
                         ui,
@@ -372,12 +372,12 @@ impl IrcStatusPanel {
                                 .filter(|c| c.as_str() != IRC_SERVER_CONTROL_CHANNEL)
                                 .count()
                         ),
-                        t::TEXT_SECONDARY,
+                        t::text_secondary(),
                     );
                     status_chip(
                         ui,
                         &format!("WHOIS cache: {}", server.whois.len()),
-                        t::TEXT_SECONDARY,
+                        t::text_secondary(),
                     );
                 });
                 ui.add_space(6.0);
@@ -442,8 +442,8 @@ impl IrcStatusPanel {
 
     fn section_frame(ui: &mut Ui, title: &str, subtitle: &str, add_contents: impl FnOnce(&mut Ui)) {
         egui::Frame::new()
-            .fill(t::BG_SURFACE)
-            .stroke(egui::Stroke::new(1.0, t::BORDER_SUBTLE))
+            .fill(t::bg_surface())
+            .stroke(egui::Stroke::new(1.0, t::border_subtle()))
             .corner_radius(t::RADIUS)
             .inner_margin(egui::Margin::symmetric(10, 8))
             .show(ui, |ui| {
@@ -451,12 +451,12 @@ impl IrcStatusPanel {
                     RichText::new(title)
                         .font(t::body())
                         .strong()
-                        .color(t::TEXT_PRIMARY),
+                        .color(t::text_primary()),
                 );
                 ui.label(
                     RichText::new(subtitle)
                         .font(t::small())
-                        .color(t::TEXT_MUTED),
+                        .color(t::text_muted()),
                 );
                 ui.add_space(6.0);
                 add_contents(ui);
@@ -1109,19 +1109,19 @@ impl IrcStatusPanel {
         let channel_name = preferred.or_else(|| names.first().map(|s| (*s).clone()));
         let Some(channel_name) = channel_name else {
             ui.label(
-                RichText::new("No IRC channel selected on this server yet.").color(t::TEXT_MUTED),
+                RichText::new("No IRC channel selected on this server yet.").color(t::text_muted()),
             );
             return;
         };
         let Some(ch) = server.channels.get(&channel_name) else {
-            ui.label(RichText::new("No channel status available yet.").color(t::TEXT_MUTED));
+            ui.label(RichText::new("No channel status available yet.").color(t::text_muted()));
             return;
         };
 
         ui.label(
             RichText::new(format!("Inspecting #{}", channel_name))
                 .font(t::small())
-                .color(t::ACCENT),
+                .color(t::accent()),
         );
         ui.add_space(4.0);
 
@@ -1301,7 +1301,7 @@ impl IrcStatusPanel {
 
     fn show_event_log(ui: &mut Ui, server: &IrcServerStatus, key: &IrcServerKey) {
         if server.event_log.is_empty() {
-            ui.label(RichText::new("No IRC lifecycle/protocol events yet.").color(t::TEXT_MUTED));
+            ui.label(RichText::new("No IRC lifecycle/protocol events yet.").color(t::text_muted()));
             return;
         }
         let id = egui::Id::new("irc_status_event_log").with(key.label());
@@ -1313,11 +1313,11 @@ impl IrcStatusPanel {
                     let color = if line.contains("[error]") {
                         Color32::from_rgb(240, 130, 130)
                     } else if line.contains("[conn]") {
-                        t::ACCENT
+                        t::accent()
                     } else if line.contains("[auth]") {
                         Color32::from_rgb(215, 190, 120)
                     } else {
-                        t::TEXT_SECONDARY
+                        t::text_secondary()
                     };
                     ui.label(RichText::new(line).font(t::small()).color(color));
                 }
@@ -1328,7 +1328,7 @@ impl IrcStatusPanel {
         if server.whois.is_empty() {
             ui.label(
                 RichText::new("No WHOIS cache yet. Run `/whois <nick>` on this server.")
-                    .color(t::TEXT_MUTED),
+                    .color(t::text_muted()),
             );
             return;
         }
@@ -1340,7 +1340,7 @@ impl IrcStatusPanel {
         }
 
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Nick").color(t::TEXT_SECONDARY));
+            ui.label(RichText::new("Nick").color(t::text_secondary()));
             ComboBox::from_id_salt(egui::Id::new("irc_status_whois_select").with(key.label()))
                 .selected_text(
                     server
@@ -1547,15 +1547,15 @@ fn is_ctcp_body(raw: &str) -> bool {
 }
 
 fn status_row(ui: &mut Ui, key: &str, value: impl Into<String>) {
-    ui.label(RichText::new(key).color(t::TEXT_MUTED));
-    ui.label(RichText::new(value.into()).color(t::TEXT_PRIMARY));
+    ui.label(RichText::new(key).color(t::text_muted()));
+    ui.label(RichText::new(value.into()).color(t::text_primary()));
     ui.end_row();
 }
 
 fn status_chip(ui: &mut Ui, text: &str, fg: Color32) {
     egui::Frame::new()
-        .fill(t::BG_RAISED)
-        .stroke(egui::Stroke::new(1.0, t::BORDER_SUBTLE))
+        .fill(t::bg_raised())
+        .stroke(egui::Stroke::new(1.0, t::border_subtle()))
         .corner_radius(t::RADIUS_SM)
         .inner_margin(egui::Margin::symmetric(8, 4))
         .show(ui, |ui| {

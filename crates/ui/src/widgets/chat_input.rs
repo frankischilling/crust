@@ -87,7 +87,7 @@ impl<'a> ChatInput<'a> {
         // Reply banner
         if let Some(rep) = self.pending_reply {
             egui::Frame::new()
-                .fill(t::BG_RAISED)
+                .fill(t::bg_raised())
                 .inner_margin(egui::Margin::symmetric(12, 4))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -95,19 +95,25 @@ impl<'a> ChatInput<'a> {
                         // Left accent stripe
                         let (rect, _) =
                             ui.allocate_exact_size(egui::vec2(2.0, 14.0), egui::Sense::hover());
-                        ui.painter().rect_filled(rect, 0.0, t::ACCENT);
+                        ui.painter().rect_filled(rect, 0.0, t::accent());
                         ui.label(
                             RichText::new(format!("↩  Replying to @{}", rep.parent_display_name))
                                 .font(t::small())
-                                .color(t::ACCENT)
+                                .color(t::accent())
                                 .strong(),
                         );
-                        let body = if rep.parent_msg_body.len() > 60 {
-                            format!("\"{}\u{2026}\"", &rep.parent_msg_body[..60])
+                        let body = if rep.parent_msg_body.chars().count() > 60 {
+                            let cut = rep
+                                .parent_msg_body
+                                .char_indices()
+                                .nth(60)
+                                .map(|(i, _)| i)
+                                .unwrap_or(rep.parent_msg_body.len());
+                            format!("\"{}\u{2026}\"", &rep.parent_msg_body[..cut])
                         } else {
                             format!("\"{}\"", rep.parent_msg_body)
                         };
-                        ui.label(RichText::new(body).font(t::small()).color(t::TEXT_MUTED));
+                        ui.label(RichText::new(body).font(t::small()).color(t::text_muted()));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
                                 .small_button("✕")
@@ -122,7 +128,7 @@ impl<'a> ChatInput<'a> {
         }
 
         egui::Frame::new()
-            .fill(t::BG_SURFACE)
+            .fill(t::bg_surface())
             .inner_margin(t::INPUT_MARGIN)
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
@@ -133,7 +139,7 @@ impl<'a> ChatInput<'a> {
                     if let Some(name) = self.username {
                         ui.label(
                             RichText::new(format!("{name}:"))
-                                .color(t::ACCENT)
+                                .color(t::accent())
                                 .strong()
                                 .font(t::small()),
                         );
@@ -186,7 +192,7 @@ impl<'a> ChatInput<'a> {
                             } else {
                                 "Type a local /command (example: /help)"
                             })
-                            .text_color(t::TEXT_PRIMARY)
+                            .text_color(t::text_primary())
                             .margin(egui::Margin::symmetric(6, 6))
                             .frame(true)
                             // Prevent egui from cycling keyboard focus away on Tab;
@@ -462,11 +468,11 @@ impl<'a> ChatInput<'a> {
                     // Show only for Twitch channels when the user has typed something.
                     if !buf.is_empty() && is_twitch_channel {
                         let color = if twitch_char_count > TWITCH_MAX_CHARS {
-                            t::RED
+                            t::red()
                         } else if twitch_char_count > 400 {
-                            t::YELLOW
+                            t::yellow()
                         } else {
-                            t::TEXT_MUTED
+                            t::text_muted()
                         };
                         ui.label(
                             RichText::new(format!("{twitch_char_count}/{TWITCH_MAX_CHARS}"))
@@ -535,11 +541,11 @@ impl<'a> ChatInput<'a> {
         let painter = ui.ctx().layer_painter(layer_id);
 
         // Background + border
-        painter.rect_filled(popup_rect, 6.0, t::BG_RAISED);
+        painter.rect_filled(popup_rect, 6.0, t::bg_raised());
         painter.rect_stroke(
             popup_rect,
             6.0,
-            egui::Stroke::new(1.0, t::BORDER_SUBTLE),
+            egui::Stroke::new(1.0, t::border_subtle()),
             egui::epaint::StrokeKind::Outside,
         );
 
@@ -567,7 +573,7 @@ impl<'a> ChatInput<'a> {
                     let row_id = Id::new("ac_row").with(i);
 
                     let row_bg = if is_selected {
-                        t::ACTIVE_CHANNEL_BG
+                        t::active_channel_bg()
                     } else {
                         Color32::TRANSPARENT
                     };
@@ -626,7 +632,7 @@ impl<'a> ChatInput<'a> {
                                         let size = fit_size(w, h, AUTOCOMPLETE_EMOTE_SIZE);
                                         let image_rect =
                                             egui::Rect::from_center_size(slot_rect.center(), size);
-                                        let url_key = format!("bytes://{}", entry.url);
+                                        let url_key = super::bytes_uri(&entry.url, raw.as_ref());
                                         ui.put(
                                             image_rect,
                                             egui::Image::from_bytes(
@@ -647,9 +653,9 @@ impl<'a> ChatInput<'a> {
                                 }
 
                                 let code_color = if is_selected {
-                                    t::TEXT_PRIMARY
+                                    t::text_primary()
                                 } else {
-                                    t::TEXT_SECONDARY
+                                    t::text_secondary()
                                 };
                                 ui.label(
                                     RichText::new(&entry.code)
@@ -664,7 +670,7 @@ impl<'a> ChatInput<'a> {
                                         ui.label(
                                             RichText::new(provider_label(&entry.provider))
                                                 .font(t::small())
-                                                .color(t::TEXT_MUTED),
+                                                .color(t::text_muted()),
                                         );
                                     },
                                 );
@@ -689,7 +695,7 @@ impl<'a> ChatInput<'a> {
                                 ui.put(
                                     image_rect,
                                     egui::Image::from_bytes(
-                                        format!("bytes://{}", entry.url),
+                                        super::bytes_uri(&entry.url, raw.as_ref()),
                                         egui::load::Bytes::Shared(raw.clone()),
                                     )
                                     .fit_to_exact_size(size),
@@ -729,11 +735,11 @@ impl<'a> ChatInput<'a> {
 
         let layer_id = LayerId::new(Order::Foreground, Id::new("slash_autocomplete_popup"));
         let painter = ui.ctx().layer_painter(layer_id);
-        painter.rect_filled(popup_rect, 6.0, t::BG_RAISED);
+        painter.rect_filled(popup_rect, 6.0, t::bg_raised());
         painter.rect_stroke(
             popup_rect,
             6.0,
-            egui::Stroke::new(1.0, t::BORDER_SUBTLE),
+            egui::Stroke::new(1.0, t::border_subtle()),
             egui::epaint::StrokeKind::Outside,
         );
 
@@ -754,7 +760,7 @@ impl<'a> ChatInput<'a> {
                     let is_selected = i as i32 == selected;
                     let row_id = Id::new("slash_ac_row").with(i);
                     let row_bg = if is_selected {
-                        t::ACTIVE_CHANNEL_BG
+                        t::active_channel_bg()
                     } else {
                         Color32::TRANSPARENT
                     };
@@ -766,9 +772,9 @@ impl<'a> ChatInput<'a> {
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 let cmd_col = if is_selected {
-                                    t::TEXT_PRIMARY
+                                    t::text_primary()
                                 } else {
-                                    t::ACCENT
+                                    t::accent()
                                 };
                                 ui.label(
                                     RichText::new(entry.usage)
@@ -783,7 +789,7 @@ impl<'a> ChatInput<'a> {
                                         egui::Label::new(
                                             RichText::new(entry.summary)
                                                 .font(t::small())
-                                                .color(t::TEXT_MUTED),
+                                                .color(t::text_muted()),
                                         )
                                         .truncate(),
                                     );
@@ -821,11 +827,11 @@ impl<'a> ChatInput<'a> {
 
         let layer_id = LayerId::new(Order::Foreground, Id::new("join_autocomplete_popup"));
         let painter = ui.ctx().layer_painter(layer_id);
-        painter.rect_filled(popup_rect, 6.0, t::BG_RAISED);
+        painter.rect_filled(popup_rect, 6.0, t::bg_raised());
         painter.rect_stroke(
             popup_rect,
             6.0,
-            egui::Stroke::new(1.0, t::BORDER_SUBTLE),
+            egui::Stroke::new(1.0, t::border_subtle()),
             egui::epaint::StrokeKind::Outside,
         );
 
@@ -846,7 +852,7 @@ impl<'a> ChatInput<'a> {
                     let is_selected = i as i32 == selected;
                     let row_id = Id::new("join_ac_row").with(i);
                     let row_bg = if is_selected {
-                        t::ACTIVE_CHANNEL_BG
+                        t::active_channel_bg()
                     } else {
                         Color32::TRANSPARENT
                     };
@@ -857,9 +863,9 @@ impl<'a> ChatInput<'a> {
                         .inner_margin(egui::Margin::symmetric(6, 2))
                         .show(ui, |ui| {
                             let col = if is_selected {
-                                t::TEXT_PRIMARY
+                                t::text_primary()
                             } else {
-                                t::ACCENT
+                                t::accent()
                             };
                             ui.horizontal(|ui| {
                                 ui.label(
@@ -868,7 +874,7 @@ impl<'a> ChatInput<'a> {
                                 ui.label(
                                     RichText::new("Known IRC channel on this server")
                                         .font(t::small())
-                                        .color(t::TEXT_MUTED),
+                                        .color(t::text_muted()),
                                 );
                             });
                         });
@@ -1019,13 +1025,18 @@ fn extract_join_query(buf: &str) -> Option<&str> {
 
 /// Extract the partial query after the last `:` in the buffer.
 fn extract_colon_query(buf: &str) -> Option<&str> {
-    let trimmed = buf.trim_end();
-    let bytes = trimmed.as_bytes();
+    // If the buffer ends with whitespace the user has moved past the
+    // colon-token - dismiss autocomplete immediately.
+    if buf.is_empty() || buf.as_bytes()[buf.len() - 1].is_ascii_whitespace() {
+        return None;
+    }
+
+    let bytes = buf.as_bytes();
 
     for i in (0..bytes.len()).rev() {
         if bytes[i] == b':' {
             if i == 0 || bytes[i - 1] == b' ' {
-                let after = &trimmed[i + 1..];
+                let after = &buf[i + 1..];
                 if !after.contains(' ') && !after.is_empty() {
                     return Some(after);
                 }

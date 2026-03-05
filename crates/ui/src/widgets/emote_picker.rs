@@ -9,6 +9,9 @@ use tracing::info;
 use crust_core::events::AppCommand;
 use crust_core::model::EmoteCatalogEntry;
 
+use super::emoji_list::emoji_catalog_entries;
+use crate::theme as t;
+
 const EMOTE_SIZE: f32 = 28.0;
 const CELL_SIZE: f32 = EMOTE_SIZE + 8.0;
 const ROW_H: f32 = CELL_SIZE + 4.0;
@@ -16,7 +19,13 @@ const ROW_H: f32 = CELL_SIZE + 4.0;
 const FETCH_BATCH: usize = 12;
 
 /// Provider tabs - Twitch first since this is a Twitch-first client.
-const TABS: &[(&str, &str)] = &[("twitch", "Twitch"), ("7tv", "7TV"), ("bttv", "BTTV"), ("ffz", "FFZ")];
+const TABS: &[(&str, &str)] = &[
+    ("twitch", "Twitch"),
+    ("7tv", "7TV"),
+    ("bttv", "BTTV"),
+    ("ffz", "FFZ"),
+    ("emoji", "Emoji"),
+];
 
 /// Cached per-tab data.
 struct CachedTab {
@@ -30,6 +39,9 @@ struct CachedView {
     tabs: Vec<CachedTab>, // one per TABS entry
     /// Merged indices from all provider tabs (for the "All" meta-tab).
     all_indices: Vec<usize>,
+    /// The combined catalog (external emote catalog + emoji entries).
+    /// Indices in `tabs` and `all_indices` point into this vec.
+    combined: Vec<EmoteCatalogEntry>,
 }
 
 /// Floating emote picker window with provider tabs.
@@ -46,6 +58,8 @@ pub struct EmotePicker {
     last_logged_size: Option<Vec2>,
     /// Cached static textures for animated emotes (first frame).
     static_frames: HashMap<String, egui::TextureHandle>,
+    /// Pre-generated emoji catalog entries (created once).
+    emoji_entries: Vec<EmoteCatalogEntry>,
 }
 
 impl Default for EmotePicker {
@@ -58,6 +72,7 @@ impl Default for EmotePicker {
             cache: None,
             last_logged_size: None,
             static_frames: HashMap::new(),
+            emoji_entries: emoji_catalog_entries(),
         }
     }
 }
@@ -83,16 +98,38 @@ impl EmotePicker {
             return;
         }
 
+        // Build the combined catalog: external emotes + emoji entries.
+        let mut combined: Vec<EmoteCatalogEntry> = catalog.to_vec();
+        let emoji_offset = combined.len();
+        combined.extend(self.emoji_entries.iter().cloned());
+
         let filter_lower = self.filter.to_lowercase();
         let has_filter = !filter_lower.is_empty();
 
         // Bucket by provider in one pass
         let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); TABS.len()];
 
-        for (i, entry) in catalog.iter().enumerate() {
-            if has_filter && !entry.code.to_lowercase().contains(&filter_lower) {
+        for (i, entry) in combined.iter().enumerate() {
+            // For emoji, also search by descriptive name (stored in emoji_list).
+            let matches_filter = if !has_filter {
+                true
+            } else if entry.provider == "emoji" {
+                // Search emoji by character or by descriptive name from the
+                // source table.
+                let emoji_local_idx = i.checked_sub(emoji_offset).unwrap_or(usize::MAX);
+                let name_match = super::emoji_list::EMOJI_LIST
+                    .get(emoji_local_idx)
+                    .map(|&(_, name)| name.to_lowercase().contains(&filter_lower))
+                    .unwrap_or(false);
+                entry.code.to_lowercase().contains(&filter_lower) || name_match
+            } else {
+                entry.code.to_lowercase().contains(&filter_lower)
+            };
+
+            if !matches_filter {
                 continue;
             }
+
             for (ti, &(provider_key, _)) in TABS.iter().enumerate() {
                 if entry.provider == provider_key {
                     buckets[ti].push(i);
@@ -108,13 +145,14 @@ impl EmotePicker {
 
         // Build merged "All" index - union of every tab, sorted by code.
         let mut all_indices: Vec<usize> = tabs.iter().flat_map(|t| t.indices.iter().copied()).collect();
-        all_indices.sort_by(|&a, &b| catalog[a].code.to_lowercase().cmp(&catalog[b].code.to_lowercase()));
+        all_indices.sort_by(|&a, &b| combined[a].code.to_lowercase().cmp(&combined[b].code.to_lowercase()));
 
         self.cache = Some(CachedView {
             filter: self.filter.clone(),
             catalog_len: catalog.len(),
             tabs,
             all_indices,
+            combined,
         });
     }
 
@@ -183,6 +221,7 @@ impl EmotePicker {
 
                 // Content - use the merged "All" list when no provider tab is selected.
                 let all_view = self.cache.as_ref().unwrap();
+                let combined = &all_view.combined;
                 let tab_indices: &[usize] = match self.active_tab {
                     Some(ti) => &all_view.tabs[ti].indices,
                     None => &all_view.all_indices,
@@ -193,7 +232,7 @@ impl EmotePicker {
                         ui.add_space(40.0);
                         ui.label(
                             RichText::new("No emotes")
-                                .color(Color32::from_rgb(120, 120, 130))
+                                .color(t::placeholder_text())
                                 .italics(),
                         );
                     });
@@ -238,7 +277,7 @@ impl EmotePicker {
 
                             for slot in start..end {
                                 let cat_idx = tab_indices[slot];
-                                let entry = &catalog[cat_idx];
+                                let entry = &combined[cat_idx];
                                 let col = slot - start;
 
                                 let cell_x = grid_rect.left() + col as f32 * CELL_SIZE;
@@ -302,14 +341,14 @@ impl EmotePicker {
                                             ui.painter().rect_filled(
                                                 cell_rect,
                                                 3.0,
-                                                Color32::from_rgb(40, 40, 48),
+                                                t::tooltip_bg(),
                                             );
                                         }
                                     } else {
                                         let size = fit_size(w, h, EMOTE_SIZE);
                                         let image_rect =
                                             egui::Rect::from_center_size(cell_rect.center(), size);
-                                        let url_key = format!("bytes://{}", entry.url);
+                                        let url_key = super::bytes_uri(&entry.url, raw);
                                         ui.put(
                                             image_rect,
                                             egui::Image::from_bytes(
@@ -323,7 +362,7 @@ impl EmotePicker {
                                     ui.painter().rect_filled(
                                         cell_rect,
                                         3.0,
-                                        Color32::from_rgb(45, 45, 55),
+                                        t::section_header_bg(),
                                     );
                                 }
 
@@ -336,7 +375,7 @@ impl EmotePicker {
 
                         // Single hovered cell - click + tooltip
                         if let Some((cat_idx, rect)) = hovered_entry {
-                            let entry = &catalog[cat_idx];
+                            let entry = &combined[cat_idx];
                             let click_resp =
                                 ui.interact(rect, egui::Id::new("ep_hover"), egui::Sense::click());
                             if click_resp.clicked() {
@@ -345,7 +384,7 @@ impl EmotePicker {
                             ui.painter().rect_stroke(
                                 rect.expand(2.0),
                                 4.0,
-                                egui::Stroke::new(1.5, Color32::from_rgb(140, 120, 220)),
+                                egui::Stroke::new(1.5, t::accent()),
                                 egui::epaint::StrokeKind::Outside,
                             );
                             click_resp.on_hover_ui(|ui| {
@@ -354,7 +393,7 @@ impl EmotePicker {
                                     let size = fit_size(w, h, 48.0);
                                     ui.add(
                                         egui::Image::from_bytes(
-                                            format!("bytes://{}", entry.url),
+                                            super::bytes_uri(&entry.url, raw),
                                             egui::load::Bytes::Shared(raw.clone()),
                                         )
                                         .fit_to_exact_size(size),

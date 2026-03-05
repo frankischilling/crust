@@ -6,6 +6,7 @@ use tracing::{debug, warn};
 use crate::KickError;
 
 const KICK_API_V2: &str = "https://kick.com/api/v2/channels";
+const KICK_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 #[derive(Debug, Clone)]
 pub struct KickChannelInfo {
@@ -56,7 +57,7 @@ pub async fn fetch_channel_info(slug: &str) -> Result<KickChannelInfo, KickError
     let client = reqwest::Client::new();
     let resp = client
         .get(&url)
-        .header(USER_AGENT, "Mozilla/5.0 (X11; Linux x86_64) CrustChat/0.1")
+        .header(USER_AGENT, KICK_UA)
         .header(ACCEPT, "application/json")
         .send()
         .await?;
@@ -108,7 +109,7 @@ pub async fn send_chat_message(
 
     let resp = client
         .post("https://api.kick.com/public/v1/chat")
-        .header(USER_AGENT, "CrustChat/0.1")
+        .header(USER_AGENT, KICK_UA)
         .header(ACCEPT, "application/json")
         .header("Authorization", format!("Bearer {access_token}"))
         .json(&body)

@@ -538,8 +538,19 @@ impl ChannelState {
             // metadata we now know (badges, colour, timestamp, …).
             existing.server_id = Some(echo_id.clone());
             existing.timestamp = msg.timestamp;
-            existing.sender.color = msg.sender.color.clone();
-            existing.sender.badges = msg.sender.badges.clone();
+            existing.sender = msg.sender.clone();
+            existing.twitch_emotes = msg.twitch_emotes.clone();
+            existing.spans = msg.spans.clone();
+            existing.reply = msg.reply.clone();
+            existing.msg_kind = msg.msg_kind.clone();
+
+            // Preserve local echo invariants while importing server metadata.
+            existing.flags.is_self = true;
+            existing.flags.is_history = false;
+            existing.flags.is_action = msg.flags.is_action;
+            existing.flags.is_highlighted = msg.flags.is_highlighted;
+            existing.flags.is_mention = msg.flags.is_mention;
+            existing.flags.custom_reward_id = msg.flags.custom_reward_id.clone();
             return true;
         }
         false

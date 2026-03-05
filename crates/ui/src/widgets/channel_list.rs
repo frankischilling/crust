@@ -71,7 +71,7 @@ impl<'a> ChannelList<'a> {
                             let y = ui.cursor().min.y - t::CHANNEL_ROW_GAP * 0.5;
                             let x_range = ui.max_rect().x_range();
                             ui.painter()
-                                .hline(x_range, y, egui::Stroke::new(2.0, t::ACCENT));
+                                .hline(x_range, y, egui::Stroke::new(2.0, t::accent()));
                         }
                     }
 
@@ -180,13 +180,13 @@ impl<'a> ChannelList<'a> {
 
                     if is_hovered && !is_active {
                         ui.painter()
-                            .rect_filled(row_rect, t::RADIUS_SM, t::HOVER_ROW_BG);
+                            .rect_filled(row_rect, t::RADIUS_SM, t::hover_row_bg());
                     }
 
                     let frame_bg = if is_dragging_this {
                         Color32::from_rgba_unmultiplied(100, 70, 180, 50)
                     } else if is_active {
-                        t::ACTIVE_CHANNEL_BG
+                        t::active_channel_bg()
                     } else {
                         Color32::TRANSPARENT
                     };
@@ -237,7 +237,7 @@ impl<'a> ChannelList<'a> {
                                         RichText::new("IRC")
                                             .font(t::small())
                                             .strong()
-                                            .color(t::TEXT_MUTED),
+                                            .color(t::text_muted()),
                                     );
                                 }
 
@@ -251,22 +251,22 @@ impl<'a> ChannelList<'a> {
                                 let name_text = if unread_mentions > 0 {
                                     RichText::new(format!("{prefix}{display}"))
                                         .font(t::body())
-                                        .color(t::YELLOW)
+                                        .color(t::yellow())
                                         .strong()
                                 } else if unread_count > 0 {
                                     RichText::new(format!("{prefix}{display}"))
                                         .font(t::body())
-                                        .color(t::TEXT_PRIMARY)
+                                        .color(t::text_primary())
                                         .strong()
                                 } else if is_active {
                                     RichText::new(format!("{prefix}{display}"))
                                         .font(t::body())
-                                        .color(t::TEXT_PRIMARY)
+                                        .color(t::text_primary())
                                         .strong()
                                 } else {
                                     RichText::new(format!("{prefix}{display}"))
                                         .font(t::body())
-                                        .color(t::TEXT_SECONDARY)
+                                        .color(t::text_secondary())
                                 };
 
                                 let label_resp = ui.add(
@@ -292,7 +292,7 @@ impl<'a> ChannelList<'a> {
                                                 RichText::new(label)
                                                     .font(t::small())
                                                     .strong()
-                                                    .color(t::YELLOW),
+                                                    .color(t::yellow()),
                                             );
                                         } else if unread_count > 0 {
                                             // Plain unreads badge - muted
@@ -304,7 +304,7 @@ impl<'a> ChannelList<'a> {
                                             ui.label(
                                                 RichText::new(label)
                                                     .font(t::small())
-                                                    .color(t::TEXT_SECONDARY),
+                                                    .color(t::text_secondary()),
                                             );
                                         } else {
                                             let show_close = is_hovered || is_active;
@@ -313,7 +313,7 @@ impl<'a> ChannelList<'a> {
                                                 egui::Label::new(
                                                     RichText::new("✕")
                                                         .font(t::small())
-                                                        .color(if is_hovered { t::TEXT_SECONDARY } else { t::TEXT_MUTED }),
+                                                        .color(if is_hovered { t::text_secondary() } else { t::text_muted() }),
                                                 )
                                                 .sense(egui::Sense::click()),
                                             );
@@ -340,7 +340,7 @@ impl<'a> ChannelList<'a> {
                         let y = ui.cursor().min.y - t::CHANNEL_ROW_GAP * 0.5;
                         let x_range = ui.max_rect().x_range();
                         ui.painter()
-                            .hline(x_range, y, egui::Stroke::new(2.0, t::ACCENT));
+                            .hline(x_range, y, egui::Stroke::new(2.0, t::accent()));
                     }
                 }
             });

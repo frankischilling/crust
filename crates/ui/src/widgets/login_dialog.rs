@@ -118,7 +118,7 @@ impl LoginDialog {
                     ui.vertical_centered(|ui| {
                         ui.label(
                             RichText::new("No accounts added yet.")
-                                .color(t::TEXT_MUTED)
+                                .color(t::text_muted())
                                 .font(t::small()),
                         );
                     });
@@ -148,7 +148,7 @@ impl LoginDialog {
                     ui.label(
                         RichText::new("Paste your Twitch OAuth token:")
                             .font(t::small())
-                            .color(t::TEXT_SECONDARY),
+                            .color(t::text_secondary()),
                     );
                     ui.add_space(4.0);
 
@@ -165,12 +165,12 @@ impl LoginDialog {
                     ui.label(
                         RichText::new("Get a token at twitchtokengenerator.com  (chat:edit + chat:read scopes)")
                             .font(t::small())
-                            .color(t::TEXT_MUTED),
+                            .color(t::text_muted()),
                     );
 
                     if let Some(err) = &self.error_msg {
                         ui.add_space(2.0);
-                        ui.label(RichText::new(err).color(t::RED).font(t::small()));
+                        ui.label(RichText::new(err).color(t::red()).font(t::small()));
                     }
 
                     ui.add_space(6.0);
@@ -278,9 +278,9 @@ fn draw_account_row(
             let avatar_data = avatar_url
                 .and_then(|url| emote_bytes.get(url).map(|(_, _, raw)| (url, raw.clone())));
             if let Some((logo, raw)) = avatar_data {
-                let uri = format!("bytes://{logo}");
+                let uri = super::bytes_uri(logo, raw.as_ref());
                 let av_size = avatar_r * 2.0;
-                ui.painter().circle_filled(center, avatar_r, t::BG_RAISED);
+                ui.painter().circle_filled(center, avatar_r, t::bg_raised());
                 ui.put(
                     av_rect,
                     egui::Image::from_bytes(uri, egui::load::Bytes::Shared(raw))
@@ -288,25 +288,25 @@ fn draw_account_row(
                         .corner_radius(egui::CornerRadius::same(avatar_r as u8)),
                 );
             } else {
-                ui.painter().circle_filled(center, avatar_r, t::ACCENT_DIM);
+                ui.painter().circle_filled(center, avatar_r, t::accent_dim());
                 ui.painter()
-                    .circle_stroke(center, avatar_r, egui::Stroke::new(1.5, t::ACCENT));
+                    .circle_stroke(center, avatar_r, egui::Stroke::new(1.5, t::accent()));
                 ui.painter().text(
                     center,
                     egui::Align2::CENTER_CENTER,
                     initial.to_string(),
                     egui::FontId::proportional(avatar_r * 1.1),
-                    t::TEXT_PRIMARY,
+                    t::text_primary(),
                 );
             }
         } else {
-            ui.painter().circle_filled(center, avatar_r, t::BG_RAISED);
+            ui.painter().circle_filled(center, avatar_r, t::bg_raised());
             ui.painter().text(
                 center,
                 egui::Align2::CENTER_CENTER,
                 initial.to_string(),
                 egui::FontId::proportional(avatar_r * 1.1),
-                t::TEXT_SECONDARY,
+                t::text_secondary(),
             );
         }
 
@@ -317,9 +317,9 @@ fn draw_account_row(
             ui.label(
                 RichText::new(acc_name)
                     .color(if is_active {
-                        t::TEXT_PRIMARY
+                        t::text_primary()
                     } else {
-                        t::TEXT_SECONDARY
+                        t::text_secondary()
                     })
                     .strong(),
             );
@@ -327,7 +327,7 @@ fn draw_account_row(
                 ui.label(
                     RichText::new("● Active")
                         .font(egui::FontId::proportional(10.0))
-                        .color(t::GREEN),
+                        .color(t::green()),
                 );
             }
             if is_default {
@@ -345,9 +345,9 @@ fn draw_account_row(
             if ui
                 .add_sized(
                     [56.0, t::BAR_H],
-                    egui::Button::new(RichText::new("Remove").font(t::small()).color(t::RED))
-                        .fill(t::RED.gamma_multiply(0.08))
-                        .stroke(egui::Stroke::new(1.0, t::RED.gamma_multiply(0.3))),
+                    egui::Button::new(RichText::new("Remove").font(t::small()).color(t::red()))
+                        .fill(t::red().gamma_multiply(0.08))
+                        .stroke(egui::Stroke::new(1.0, t::red().gamma_multiply(0.3))),
                 )
                 .on_hover_text(format!("Remove {acc_name} from saved accounts"))
                 .clicked()
@@ -385,7 +385,7 @@ fn draw_account_row(
             let star_color = if is_default {
                 egui::Color32::from_rgb(220, 180, 50)
             } else {
-                t::TEXT_MUTED
+                t::text_muted()
             };
             let star_tooltip = if is_default {
                 "Auto-login account (click to unset)"

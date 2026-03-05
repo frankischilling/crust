@@ -5,7 +5,7 @@ pub mod highlight;
 pub mod model;
 pub mod state;
 
-pub use events::{AppCommand, AppEvent};
+pub use events::{AppCommand, AppEvent, IvrLogEntry};
 pub use model::{
     Badge, ChannelId, ChannelState, ChatMessage, EmoteCatalogEntry, MessageId, Platform, ReplyInfo,
     Sender, Span, TwitchEmotePos, UserId,
