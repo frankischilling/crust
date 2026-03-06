@@ -1,6 +1,7 @@
 pub mod app;
 pub mod commands;
 pub mod perf;
+pub mod spellcheck;
 pub mod theme;
 pub mod widgets;
 

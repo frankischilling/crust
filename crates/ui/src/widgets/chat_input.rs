@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use egui::{Color32, Id, Key, LayerId, Order, RichText, Ui, Vec2};
+use egui::{Color32, Id, Key, LayerId, Order, Pos2, RichText, Stroke, Ui, Vec2};
 use image::DynamicImage;
 
 use crate::commands::{
@@ -13,10 +13,21 @@ use crust_core::model::{ChannelId, EmoteCatalogEntry, ReplyInfo, IRC_SERVER_CONT
 const AUTOCOMPLETE_MAX: usize = 10;
 const AUTOCOMPLETE_EMOTE_SIZE: f32 = 20.0;
 const SLASH_AUTOCOMPLETE_MAX: usize = 10;
+const USERNAME_AUTOCOMPLETE_MAX: usize = 10;
 /// Maximum number of Tab-completion matches to cycle through.
 const TAB_COMPLETE_MAX: usize = 50;
 
 // Persistent state stored in egui temp data
+
+/// Spell-check context menu state preserved across frames while the menu is
+/// open.
+#[derive(Clone)]
+struct SpellCtx {
+    word: String,
+    start: usize,
+    end: usize,
+    suggestions: Vec<String>,
+}
 
 /// Tab-completion state for bare-word emote completion (no `:` prefix).
 #[derive(Clone, Default)]
@@ -60,6 +71,8 @@ pub struct ChatInput<'a> {
     pub message_history: &'a [String],
     /// All open channel tabs (used for `/join` channel suggestions on IRC).
     pub known_channels: &'a [ChannelId],
+    /// Chatters currently in the channel (sorted, for `@` username autocomplete).
+    pub chatters: &'a [String],
 }
 
 /// Result from showing the chat input.
@@ -96,11 +109,15 @@ impl<'a> ChatInput<'a> {
                         let (rect, _) =
                             ui.allocate_exact_size(egui::vec2(2.0, 14.0), egui::Sense::hover());
                         ui.painter().rect_filled(rect, 0.0, t::accent());
+
                         ui.label(
-                            RichText::new(format!("↩  Replying to @{}", rep.parent_display_name))
-                                .font(t::small())
-                                .color(t::accent())
-                                .strong(),
+                            RichText::new(format!(
+                                "↩  Replying to @{}",
+                                rep.parent_display_name
+                            ))
+                            .font(t::small())
+                            .color(t::accent())
+                            .strong(),
                         );
                         let body = if rep.parent_msg_body.chars().count() > 60 {
                             let cut = rep
@@ -113,16 +130,39 @@ impl<'a> ChatInput<'a> {
                         } else {
                             format!("\"{}\"", rep.parent_msg_body)
                         };
-                        ui.label(RichText::new(body).font(t::small()).color(t::text_muted()));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .small_button("✕")
-                                .on_hover_text("Dismiss reply")
-                                .clicked()
-                            {
-                                result.dismiss_reply = true;
-                            }
-                        });
+
+                        // Reserve 24px for the dismiss button; shrink body
+                        // with truncation at narrow widths.
+                        let btn_reserve = 24.0;
+                        let body_max_w =
+                            (ui.available_width() - btn_reserve).max(0.0);
+                        ui.allocate_ui(
+                            egui::vec2(body_max_w, ui.available_height()),
+                            |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(body)
+                                            .font(t::small())
+                                            .color(t::text_muted()),
+                                    )
+                                    .truncate(),
+                                );
+                            },
+                        );
+
+                        // Dismiss button – right-aligned, always reachable.
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui
+                                    .small_button("✕")
+                                    .on_hover_text("Dismiss reply")
+                                    .clicked()
+                                {
+                                    result.dismiss_reply = true;
+                                }
+                            },
+                        );
                     });
                 });
         }
@@ -148,10 +188,12 @@ impl<'a> ChatInput<'a> {
 
                     // Pre-check autocompletes before TextEdit consumes keys.
                     let pre_emote_matches = find_autocomplete_matches(buf, self.emote_catalog);
+                    let pre_username_matches = find_username_matches(buf, self.chatters);
                     let pre_slash_matches = find_slash_matches(buf);
                     let pre_join_matches =
                         find_join_channel_matches(buf, self.channel, self.known_channels);
                     let autocomplete_active = !pre_emote_matches.is_empty()
+                        || !pre_username_matches.is_empty()
                         || !pre_slash_matches.is_empty()
                         || !pre_join_matches.is_empty();
 
@@ -184,41 +226,87 @@ impl<'a> ChatInput<'a> {
                         0.0
                     };
                     let text_width = (ui.available_width() - reserve).max(40.0);
-                    let resp = ui.add_sized(
-                        [text_width, t::BAR_H],
-                        egui::TextEdit::singleline(buf)
-                            .hint_text(if self.logged_in {
-                                "Send a message..."
-                            } else {
-                                "Type a local /command (example: /help)"
-                            })
-                            .text_color(t::text_primary())
-                            .margin(egui::Margin::symmetric(6, 6))
-                            .frame(true)
-                            // Prevent egui from cycling keyboard focus away on Tab;
-                            // we handle Tab ourselves for autocomplete.
-                            .lock_focus(true),
-                    );
+                    let te_output = ui.allocate_ui(
+                        egui::vec2(text_width, t::BAR_H),
+                        |ui| {
+                            egui::TextEdit::singleline(buf)
+                                .hint_text(if self.logged_in {
+                                    "Send a message..."
+                                } else {
+                                    "Type a local /command (example: /help)"
+                                })
+                                .text_color(t::text_primary())
+                                .margin(egui::Margin::symmetric(6, 6))
+                                .frame(true)
+                                .min_size(egui::vec2(text_width, t::BAR_H))
+                                // Prevent egui from cycling keyboard focus away on Tab;
+                                // we handle Tab ourselves for autocomplete.
+                                .lock_focus(true)
+                                .show(ui)
+                        },
+                    )
+                    .inner;
+                    let resp = te_output.response;
                     let text_edit_id = resp.id;
+
+                    // ── Paint red wavy underlines under misspelled words ──
+                    {
+                        let galley = &te_output.galley;
+                        let galley_pos = te_output.galley_pos;
+                        let clip = te_output.text_clip_rect;
+                        let painter = ui.painter().with_clip_rect(clip);
+
+                        for (word, char_start, _byte_start, char_end) in
+                            iter_words(buf)
+                        {
+                            if crate::spellcheck::is_correct(word) {
+                                continue;
+                            }
+                            // Get screen-space positions of word start and end
+                            let r_start = galley.pos_from_ccursor(
+                                egui::text::CCursor::new(char_start),
+                            );
+                            let r_end = galley.pos_from_ccursor(
+                                egui::text::CCursor::new(char_end),
+                            );
+                            let x0 = galley_pos.x + r_start.min.x;
+                            let x1 = galley_pos.x + r_end.min.x;
+                            let y = galley_pos.y + r_start.max.y + 1.0;
+
+                            paint_wavy_underline(
+                                &painter,
+                                x0,
+                                x1,
+                                y,
+                                t::red(),
+                            );
+                        }
+                    }
 
                     // Read autocomplete selection index
                     let mut ac_sel: i32 = ui.ctx().data_mut(|d| d.get_temp(ac_id).unwrap_or(0i32));
 
                     // Recompute matches after TextEdit may have changed buf.
-                    // Emote autocomplete takes priority over slash autocomplete.
+                    // Emote autocomplete takes priority, then @username, then slash, then /join.
                     let matches = find_autocomplete_matches(buf, self.emote_catalog);
-                    let slash_matches = if matches.is_empty() {
+                    let username_matches = if matches.is_empty() {
+                        find_username_matches(buf, self.chatters)
+                    } else {
+                        Vec::new()
+                    };
+                    let slash_matches = if matches.is_empty() && username_matches.is_empty() {
                         find_slash_matches(buf)
                     } else {
                         Vec::new()
                     };
-                    let join_matches = if matches.is_empty() && slash_matches.is_empty() {
+                    let join_matches = if matches.is_empty() && username_matches.is_empty() && slash_matches.is_empty() {
                         find_join_channel_matches(buf, self.channel, self.known_channels)
                     } else {
                         Vec::new()
                     };
 
                     let mut accepted_emote: Option<String> = None;
+                    let mut accepted_username: Option<String> = None;
                     let mut accepted_slash_cmd: Option<String> = None;
                     let mut accepted_join_channel: Option<String> = None;
 
@@ -237,6 +325,23 @@ impl<'a> ChatInput<'a> {
                             accepted_emote = Some(matches[ac_sel as usize].code.clone());
                         }
                         // Keep focus on the text field while cycling through the AC list.
+                        if consumed_tab || consumed_up || consumed_down {
+                            ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
+                        }
+                    } else if !username_matches.is_empty() {
+                        // ── @username autocomplete active ──
+                        let n = username_matches.len() as i32;
+                        ac_sel = ac_sel.clamp(0, n - 1);
+
+                        if consumed_up {
+                            ac_sel = (ac_sel - 1).rem_euclid(n);
+                        }
+                        if consumed_down {
+                            ac_sel = (ac_sel + 1).rem_euclid(n);
+                        }
+                        if consumed_tab || consumed_enter {
+                            accepted_username = Some(username_matches[ac_sel as usize].clone());
+                        }
                         if consumed_tab || consumed_up || consumed_down {
                             ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                         }
@@ -278,7 +383,7 @@ impl<'a> ChatInput<'a> {
                     } else {
                         ac_sel = 0;
 
-                        // ── Bare-word Tab completion ──
+                        // ── Bare-word Tab completion (emotes + usernames) ──
                         let tab_id = Id::new("tab_complete_state");
                         if consumed_tab {
                             let mut ts: TabState = ui
@@ -294,14 +399,41 @@ impl<'a> ChatInput<'a> {
                                 // Start new tab session
                                 let (pfx, word) = extract_last_word(buf);
                                 if !word.is_empty() {
-                                    let wl = word.to_lowercase();
-                                    let mut m: Vec<String> = self
-                                        .emote_catalog
+                                    // Check if the word starts with @ for mention completion
+                                    let (is_mention, search_word) = if let Some(stripped) = word.strip_prefix('@') {
+                                        (true, stripped)
+                                    } else {
+                                        (false, word)
+                                    };
+                                    let wl = search_word.to_lowercase();
+
+                                    // Collect emote matches (only for non-mention words)
+                                    let mut m: Vec<String> = if !is_mention {
+                                        self.emote_catalog
+                                            .iter()
+                                            .filter(|e| e.code.to_lowercase().starts_with(&wl))
+                                            .map(|e| e.code.clone())
+                                            .collect()
+                                    } else {
+                                        Vec::new()
+                                    };
+
+                                    // Collect username matches
+                                    let user_matches: Vec<String> = self.chatters
                                         .iter()
-                                        .filter(|e| e.code.to_lowercase().starts_with(&wl))
-                                        .map(|e| e.code.clone())
+                                        .filter(|u| u.to_lowercase().starts_with(&wl))
+                                        .map(|u| {
+                                            if is_mention {
+                                                format!("@{u}")
+                                            } else {
+                                                u.clone()
+                                            }
+                                        })
                                         .collect();
+                                    m.extend(user_matches);
+
                                     m.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+                                    m.dedup();
                                     m.truncate(TAB_COMPLETE_MAX);
                                     if !m.is_empty() {
                                         ts = TabState {
@@ -380,6 +512,12 @@ impl<'a> ChatInput<'a> {
                     // Replace the :query token with the accepted emote
                     if let Some(ref code) = accepted_emote {
                         replace_autocomplete_token(buf, code);
+                        move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
+                        ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
+                        ac_sel = 0;
+                    }
+                    if let Some(ref username) = accepted_username {
+                        replace_mention_token(buf, username);
                         move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
                         ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                         ac_sel = 0;
@@ -483,10 +621,12 @@ impl<'a> ChatInput<'a> {
 
                     // ── Draw autocomplete popup above input ──────────
                     let show_popup = (!matches.is_empty()
+                        || !username_matches.is_empty()
                         || !slash_matches.is_empty()
                         || !join_matches.is_empty())
                         && (resp.has_focus()
                             || accepted_emote.is_some()
+                            || accepted_username.is_some()
                             || accepted_slash_cmd.is_some()
                             || accepted_join_channel.is_some());
                     if show_popup {
@@ -495,6 +635,15 @@ impl<'a> ChatInput<'a> {
                                 self.show_autocomplete_popup(ui, &resp, &matches, ac_sel)
                             {
                                 replace_autocomplete_token(buf, &clicked);
+                                move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
+                                ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
+                                ui.ctx().data_mut(|d| d.insert_temp(ac_id, 0i32));
+                            }
+                        } else if !username_matches.is_empty() {
+                            if let Some(clicked) =
+                                self.show_username_autocomplete_popup(ui, &resp, &username_matches, ac_sel)
+                            {
+                                replace_mention_token(buf, &clicked);
                                 move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
                                 ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                                 ui.ctx().data_mut(|d| d.insert_temp(ac_id, 0i32));
@@ -514,6 +663,96 @@ impl<'a> ChatInput<'a> {
                             ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                             ui.ctx().data_mut(|d| d.insert_temp(ac_id, 0i32));
                         }
+                    }
+
+                    // ── Spell-check context menu (right-click) ──────
+                    let sc_id = Id::new("spell_check_ctx");
+
+                    // On right-click, determine the word at the cursor and
+                    // compute suggestions if it is misspelled.
+                    if resp.secondary_clicked() {
+                        let cursor_idx =
+                            egui::TextEdit::load_state(ui.ctx(), text_edit_id)
+                                .and_then(|s| s.ccursor_range())
+                                .map(|r| r.primary.index)
+                                .unwrap_or(buf.len());
+
+                        let (word, byte_start, byte_end) =
+                            crate::spellcheck::word_at_cursor(buf, cursor_idx);
+
+                        if !word.is_empty()
+                            && !crate::spellcheck::is_correct(word)
+                        {
+                            let suggs =
+                                crate::spellcheck::suggestions(word, 5);
+                            ui.ctx().data_mut(|d| {
+                                d.insert_temp(
+                                    sc_id,
+                                    SpellCtx {
+                                        word: word.to_owned(),
+                                        start: byte_start,
+                                        end: byte_end,
+                                        suggestions: suggs,
+                                    },
+                                )
+                            });
+                        } else {
+                            ui.ctx()
+                                .data_mut(|d| d.remove::<SpellCtx>(sc_id));
+                        }
+                    }
+
+                    let mut spell_replace: Option<(usize, usize, String)> =
+                        None;
+                    resp.context_menu(|ui| {
+                        let sc: Option<SpellCtx> =
+                            ui.ctx().data_mut(|d| d.get_temp(sc_id));
+                        if let Some(sc) = sc {
+                            ui.label(
+                                RichText::new(format!(
+                                    "\"{}\" – misspelled",
+                                    sc.word
+                                ))
+                                .color(t::red())
+                                .strong(),
+                            );
+                            ui.separator();
+                            if sc.suggestions.is_empty() {
+                                ui.label(
+                                    RichText::new("No suggestions")
+                                        .weak()
+                                        .italics(),
+                                );
+                            } else {
+                                for sug in &sc.suggestions {
+                                    if ui.button(sug).clicked() {
+                                        spell_replace = Some((
+                                            sc.start,
+                                            sc.end,
+                                            sug.clone(),
+                                        ));
+                                        ui.close_menu();
+                                    }
+                                }
+                            }
+                        } else {
+                            ui.label(
+                                RichText::new("Spelling OK ✓")
+                                    .color(t::green()),
+                            );
+                        }
+                    });
+
+                    if let Some((start, end, replacement)) = spell_replace {
+                        let new_len = start + replacement.len();
+                        buf.replace_range(start..end, &replacement);
+                        move_cursor_to_end(
+                            ui.ctx(),
+                            text_edit_id,
+                            new_len,
+                        );
+                        ui.ctx()
+                            .memory_mut(|m| m.request_focus(text_edit_id));
                     }
                 });
             });
@@ -889,6 +1128,92 @@ impl<'a> ChatInput<'a> {
 
         clicked
     }
+
+    fn show_username_autocomplete_popup(
+        &self,
+        ui: &mut Ui,
+        text_resp: &egui::Response,
+        matches: &[String],
+        selected: i32,
+    ) -> Option<String> {
+        let input_rect = text_resp.rect;
+        let popup_width = input_rect.width().min(350.0);
+        let row_h = 24.0;
+        let popup_h =
+            (matches.len() as f32 * row_h).min(USERNAME_AUTOCOMPLETE_MAX as f32 * row_h) + 8.0;
+        let popup_rect = egui::Rect::from_min_size(
+            egui::pos2(input_rect.left(), input_rect.top() - popup_h - 4.0),
+            egui::vec2(popup_width, popup_h),
+        );
+
+        let layer_id = LayerId::new(Order::Foreground, Id::new("username_autocomplete_popup"));
+        let painter = ui.ctx().layer_painter(layer_id);
+        painter.rect_filled(popup_rect, 6.0, t::bg_raised());
+        painter.rect_stroke(
+            popup_rect,
+            6.0,
+            egui::Stroke::new(1.0, t::border_subtle()),
+            egui::epaint::StrokeKind::Outside,
+        );
+
+        let mut popup_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .layer_id(layer_id)
+                .max_rect(popup_rect.shrink(4.0))
+                .layout(egui::Layout::top_down(egui::Align::LEFT)),
+        );
+        popup_ui.set_clip_rect(popup_rect);
+
+        let mut clicked_username: Option<String> = None;
+        egui::ScrollArea::vertical()
+            .id_salt(text_resp.id.with("username_ac_scroll"))
+            .auto_shrink([false; 2])
+            .show(&mut popup_ui, |ui| {
+                for (i, username) in matches.iter().enumerate() {
+                    let is_selected = i as i32 == selected;
+                    let row_id = Id::new("username_ac_row").with(i);
+                    let row_bg = if is_selected {
+                        t::active_channel_bg()
+                    } else {
+                        Color32::TRANSPARENT
+                    };
+
+                    let frame_resp = egui::Frame::new()
+                        .fill(row_bg)
+                        .corner_radius(3.0)
+                        .inner_margin(egui::Margin::symmetric(6, 3))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                // @ icon
+                                ui.label(
+                                    RichText::new("@")
+                                        .font(t::small())
+                                        .color(t::text_muted()),
+                                );
+                                let col = if is_selected {
+                                    t::text_primary()
+                                } else {
+                                    t::accent()
+                                };
+                                ui.label(
+                                    RichText::new(username)
+                                        .font(t::small())
+                                        .color(col)
+                                        .strong(),
+                                );
+                            });
+                        });
+
+                    let row_rect = frame_resp.response.rect;
+                    let click_resp = ui.interact(row_rect, row_id, egui::Sense::click());
+                    if click_resp.clicked() {
+                        clicked_username = Some(username.clone());
+                    }
+                }
+            });
+
+        clicked_username
+    }
 }
 
 /// Find emotes matching a `:partial` token at the end of the input buffer.
@@ -927,6 +1252,33 @@ fn find_slash_matches(buf: &str) -> Vec<&'static SlashCommandInfo> {
         return Vec::new();
     };
     slash_command_matches(query, SLASH_AUTOCOMPLETE_MAX)
+}
+
+/// Find usernames matching an `@partial` token at the end of the input buffer.
+fn find_username_matches(buf: &str, chatters: &[String]) -> Vec<String> {
+    let query = match extract_mention_query(buf) {
+        Some(q) if !q.is_empty() => q,
+        _ => return Vec::new(),
+    };
+
+    let query_lower = query.to_lowercase();
+    let mut matches: Vec<&String> = chatters
+        .iter()
+        .filter(|u| u.to_lowercase().contains(&query_lower))
+        .collect();
+
+    // Prefix matches first, then shorter names first
+    matches.sort_by(|a, b| {
+        let a_prefix = a.to_lowercase().starts_with(&query_lower);
+        let b_prefix = b.to_lowercase().starts_with(&query_lower);
+        b_prefix
+            .cmp(&a_prefix)
+            .then_with(|| a.len().cmp(&b.len()))
+            .then_with(|| a.cmp(b))
+    });
+
+    matches.truncate(USERNAME_AUTOCOMPLETE_MAX);
+    matches.into_iter().cloned().collect()
 }
 
 /// Find channel suggestions for `/join <channel>` on IRC server tabs.
@@ -1046,6 +1398,28 @@ fn extract_colon_query(buf: &str) -> Option<&str> {
     None
 }
 
+/// Extract the partial query after the last `@` in the buffer.
+fn extract_mention_query(buf: &str) -> Option<&str> {
+    // Dismiss if buffer ends with whitespace.
+    if buf.is_empty() || buf.as_bytes()[buf.len() - 1].is_ascii_whitespace() {
+        return None;
+    }
+
+    let bytes = buf.as_bytes();
+
+    for i in (0..bytes.len()).rev() {
+        if bytes[i] == b'@' {
+            if i == 0 || bytes[i - 1] == b' ' {
+                let after = &buf[i + 1..];
+                if !after.contains(' ') && !after.is_empty() {
+                    return Some(after);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Move the TextEdit cursor to `char_pos` (pass `buf.len()` for end-of-input).
 fn move_cursor_to_end(ctx: &egui::Context, id: egui::Id, char_pos: usize) {
     use egui::text::{CCursor, CCursorRange};
@@ -1065,6 +1439,22 @@ fn replace_autocomplete_token(buf: &mut String, code: &str) {
         if bytes[i] == b':' {
             if i == 0 || bytes[i - 1] == b' ' {
                 buf.replace_range(i..trimmed_len, code);
+                buf.push(' ');
+                return;
+            }
+        }
+    }
+}
+
+/// Replace the `@query` at the end of the buffer with `@username `.
+fn replace_mention_token(buf: &mut String, username: &str) {
+    let trimmed_len = buf.trim_end().len();
+    let bytes = buf.as_bytes();
+
+    for i in (0..trimmed_len).rev() {
+        if bytes[i] == b'@' {
+            if i == 0 || bytes[i - 1] == b' ' {
+                buf.replace_range(i..trimmed_len, &format!("@{username}"));
                 buf.push(' ');
                 return;
             }
@@ -1149,5 +1539,77 @@ fn extract_last_word(buf: &str) -> (&str, &str) {
         (&buf[..pos + 1], &trimmed[pos + 1..])
     } else {
         ("", trimmed)
+    }
+}
+
+/// Iterate over alphabetic words in `buf`.
+/// Yields `(word_slice, char_start, byte_start, char_end)`.
+fn iter_words(buf: &str) -> Vec<(&str, usize, usize, usize)> {
+    let mut result = Vec::new();
+    let chars: Vec<char> = buf.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+    while i < n {
+        // Skip non-alpha
+        if !chars[i].is_ascii_alphabetic() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < n && chars[i].is_ascii_alphabetic() {
+            i += 1;
+        }
+        let char_start = start;
+        let char_end = i;
+        // Convert char indices → byte slice
+        let byte_start: usize = buf
+            .char_indices()
+            .nth(char_start)
+            .map(|(idx, _)| idx)
+            .unwrap_or(buf.len());
+        let byte_end: usize = buf
+            .char_indices()
+            .nth(char_end)
+            .map(|(idx, _)| idx)
+            .unwrap_or(buf.len());
+        result.push((&buf[byte_start..byte_end], char_start, byte_start, char_end));
+    }
+    result
+}
+
+/// Paint a red wavy underline from `x0` to `x1` at screen-space `y`.
+fn paint_wavy_underline(
+    painter: &egui::Painter,
+    x0: f32,
+    x1: f32,
+    y: f32,
+    color: Color32,
+) {
+    const WAVE_H: f32 = 1.5; // half amplitude
+    const WAVE_LEN: f32 = 4.0; // one full wave = 4px
+
+    let stroke = Stroke::new(1.0, color);
+    let mut points: Vec<Pos2> = Vec::new();
+
+    let mut x = x0;
+    while x <= x1 {
+        // Triangle wave: cycles through 0 → +H → 0 → -H → 0 over WAVE_LEN
+        let phase = (x - x0) % WAVE_LEN;
+        let half = WAVE_LEN / 2.0;
+        let dy = if phase < half {
+            WAVE_H * (1.0 - 2.0 * (phase - half / 2.0).abs() / half)
+        } else {
+            -WAVE_H * (1.0 - 2.0 * (phase - half - half / 2.0).abs() / half)
+        };
+        points.push(Pos2::new(x, y + dy));
+        x += 1.0;
+    }
+    // Close to exact x1
+    if points.last().map(|p| p.x) != Some(x1) {
+        points.push(Pos2::new(x1, y));
+    }
+
+    if points.len() >= 2 {
+        painter.add(egui::Shape::line(points, stroke));
     }
 }

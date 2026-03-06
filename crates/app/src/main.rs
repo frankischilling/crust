@@ -61,7 +61,10 @@ fn resolve_emote<'a>(
     idx: &'a std::collections::HashMap<String, EmoteInfo>,
     code: &str,
 ) -> Option<&'a EmoteInfo> {
-    for provider in &["7tv", "bttv", "ffz", "kick"] {
+    // "twitch" is checked last so third-party overrides take precedence,
+    // but it ensures Twitch-native globals (e.g. LUL, Kappa) are still
+    // resolved for local-echo messages that lack IRC emote-position tags.
+    for provider in &["7tv", "bttv", "ffz", "kick", "twitch"] {
         if let Some(info) = idx.get(&emote_key(provider, code)) {
             return Some(info);
         }

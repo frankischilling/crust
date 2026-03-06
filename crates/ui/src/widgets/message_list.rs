@@ -156,6 +156,8 @@ impl<'a> MessageList<'a> {
         // Written by the reply-header click handler; read and cleared here so
         // it only fires once.
         let scroll_to_key = egui::Id::new("ml_scroll_to").with(self.channel.as_str());
+        let highlight_key = egui::Id::new("ml_highlight_msg").with(self.channel.as_str());
+        let highlight_time_key = egui::Id::new("ml_highlight_t").with(self.channel.as_str());
         let forced_offset: Option<f32> = {
             let target: Option<String> = ui.ctx().data_mut(|d| {
                 let v: Option<String> = d.get_temp(scroll_to_key);
@@ -169,6 +171,12 @@ impl<'a> MessageList<'a> {
                     .messages
                     .iter()
                     .position(|m| m.server_id.as_deref() == Some(tgt_id.as_str()))?;
+                // Store the target server_id + time for a brief highlight flash.
+                let now = ui.input(|i| i.time);
+                ui.ctx().data_mut(|d| {
+                    d.insert_temp(highlight_key, tgt_id.clone());
+                    d.insert_temp(highlight_time_key, now);
+                });
                 let offset: f32 = (0..idx)
                     .map(|i| {
                         height_cache
@@ -513,7 +521,39 @@ impl<'a> MessageList<'a> {
         let scroll_to_key = egui::Id::new("ml_scroll_to").with(self.channel.as_str());
 
         // ── Message background ──────────────────────────────────────────
-        let bg = if msg.flags.is_highlighted {
+        // Check if this message is the reply-scroll highlight target.
+        let highlight_key = egui::Id::new("ml_highlight_msg").with(self.channel.as_str());
+        let highlight_time_key = egui::Id::new("ml_highlight_t").with(self.channel.as_str());
+        let highlight_alpha: f32 = {
+            let hl_id: Option<String> = ui.ctx().data_mut(|d| d.get_temp(highlight_key));
+            let hl_time: Option<f64> = ui.ctx().data_mut(|d| d.get_temp(highlight_time_key));
+            match (hl_id, hl_time) {
+                (Some(id), Some(t0))
+                    if msg.server_id.as_deref() == Some(id.as_str()) =>
+                {
+                    let now = ui.input(|i| i.time);
+                    let elapsed = (now - t0) as f32;
+                    const FLASH_SECS: f32 = 1.5;
+                    if elapsed < FLASH_SECS {
+                        // Keep repainting while the flash is visible.
+                        ui.ctx().request_repaint();
+                        1.0 - (elapsed / FLASH_SECS)
+                    } else {
+                        // Flash complete — clean up temp data.
+                        ui.ctx().data_mut(|d| {
+                            d.remove::<String>(highlight_key);
+                            d.remove::<f64>(highlight_time_key);
+                        });
+                        0.0
+                    }
+                }
+                _ => 0.0,
+            }
+        };
+        let bg = if highlight_alpha > 0.0 {
+            let a = (50.0 * highlight_alpha) as u8;
+            Color32::from_rgba_unmultiplied(100, 140, 255, a)
+        } else if msg.flags.is_highlighted {
             Color32::from_rgba_unmultiplied(145, 70, 255, 22)
         } else if msg.flags.is_mention {
             Color32::from_rgba_unmultiplied(210, 140, 40, 24)
@@ -551,15 +591,21 @@ impl<'a> MessageList<'a> {
             .fill(bg)
             .inner_margin(egui::Margin::symmetric(ROW_PAD_X as i8, ROW_PAD_Y as i8))
             .begin(ui);
-        // The content_ui's widget rect was registered BEFORE any inner widgets
-        // (in Ui::new_child), giving it the lowest hit-test priority in the
-        // layer.  We'll upgrade it to Sense::click() after Frame::end() so
-        // that right-clicks on empty message space open the context menu,
-        // while inner widgets (username, badges, emotes, URLs) still win the
-        // hit test for their own rects.
-        let content_ui_id = prepared.content_ui.unique_id();
+        // Register a background click sensor EARLY — before any inner widgets —
+        // so it gets the lowest idx_in_layer and thus the lowest hit-test
+        // priority.  Inner widgets (reply header, username label, emotes, URLs)
+        // are registered afterwards and therefore *win* the hit test when the
+        // pointer is over them.  Only clicks on "empty" message space (padding,
+        // gaps) fall through to this background widget to open the context menu.
+        //
+        // After Frame::end() we re-register with the SAME id and the actual
+        // frame rect; `WidgetRects::insert` updates the rect in-place while
+        // keeping the original (low) idx_in_layer.
+        let bg_click_id = Id::new("msg_bg_click").with(msg.id.0);
         {
             let ui = &mut prepared.content_ui;
+            let placeholder_rect = ui.max_rect();
+            ui.interact(placeholder_rect, bg_click_id, egui::Sense::click());
 
             // Keep selectable_labels off globally so timestamp / badge
             // chip / separator labels stay non-interactive.  Text spans
@@ -774,19 +820,9 @@ impl<'a> MessageList<'a> {
         }
         let msg_frame_resp = prepared.end(ui);
 
-        // Attach a click-sensing context menu to the content_ui's background
-        // widget (registered early in the layer → low hit-test priority).
-        // Because its idx_in_layer is lower than every inner widget, the
-        // hit test prefers inner widgets when the pointer is over them.
-        // Only when the pointer is on "empty" message space (plain text,
-        // gaps) does this background widget win the click hit test, and
-        // then secondary_clicked() fires to open the context menu.
-        //
-        // We must NOT use `msg_frame_resp.interact(Sense::click())` here:
-        // Frame::end() allocates the outer rect AFTER inner widgets,
-        // giving it the HIGHEST hit-test priority - it would steal every
-        // click from username labels, badges, and emotes.
-        let bg_click = ui.interact(msg_frame_resp.rect, content_ui_id, egui::Sense::click());
+        // Re-register the background click widget with the actual frame rect.
+        // Same `bg_click_id` → updates in-place, keeping low hit-test priority.
+        let bg_click = ui.interact(msg_frame_resp.rect, bg_click_id, egui::Sense::click());
         bg_click.context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
 
         // Left accent strip for mentions and highlights - a vivid 3 px bar on

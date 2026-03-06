@@ -61,6 +61,105 @@ struct PendingReply {
     info: ReplyInfo,
 }
 
+// ── Split-pane state ─────────────────────────────────────────────────────
+
+/// One pane in the split view.
+#[derive(Clone)]
+struct Pane {
+    channel: ChannelId,
+    input_buf: String,
+    /// Width fraction (0.0–1.0) of available space; all panes sum to ~1.0.
+    frac: f32,
+}
+
+/// Manages up to 4 side-by-side panes within the central area.
+/// When `panes` is empty the app falls back to the classic single-channel view
+/// driven by `active_channel`.
+#[derive(Default, Clone)]
+struct SplitPanes {
+    /// Active pane slots. 0 = classic single-pane, 1+ = split.
+    panes: Vec<Pane>,
+    /// Index of the focused pane (receives keyboard input, shown in info bar).
+    focused: usize,
+}
+
+impl SplitPanes {
+    fn is_split(&self) -> bool {
+        self.panes.len() > 1
+    }
+
+    /// Ensure `focused` stays within bounds.
+    fn clamp_focus(&mut self) {
+        if !self.panes.is_empty() {
+            self.focused = self.focused.min(self.panes.len() - 1);
+        } else {
+            self.focused = 0;
+        }
+    }
+
+    /// The channel of the focused pane, if any.
+    fn focused_channel(&self) -> Option<&ChannelId> {
+        self.panes.get(self.focused).map(|p| &p.channel)
+    }
+
+    /// Ensure all pane fractions sum to 1.0 and none are too tiny.
+    fn normalize_fractions(&mut self) {
+        let n = self.panes.len();
+        if n == 0 {
+            return;
+        }
+        let min_frac = 0.10_f32;
+        // Clamp minimums.
+        for p in self.panes.iter_mut() {
+            p.frac = p.frac.max(min_frac);
+        }
+        let sum: f32 = self.panes.iter().map(|p| p.frac).sum();
+        if sum > 0.0 {
+            for p in self.panes.iter_mut() {
+                p.frac /= sum;
+            }
+        }
+    }
+
+    /// Add a channel to a new pane (at the given position or end).  Caps at 4.
+    fn add_pane(&mut self, channel: ChannelId, insert_at: Option<usize>) {
+        if self.panes.len() >= 4 {
+            return;
+        }
+        let new_frac = 1.0 / (self.panes.len() as f32 + 1.0);
+        // Shrink existing panes proportionally to make room.
+        let scale = 1.0 - new_frac;
+        for p in self.panes.iter_mut() {
+            p.frac *= scale;
+        }
+        let pane = Pane {
+            channel,
+            input_buf: String::new(),
+            frac: new_frac,
+        };
+        match insert_at {
+            Some(i) if i <= self.panes.len() => self.panes.insert(i, pane),
+            _ => self.panes.push(pane),
+        }
+        self.normalize_fractions();
+        self.clamp_focus();
+    }
+
+    /// Remove a pane by index.
+    fn remove_pane(&mut self, idx: usize) {
+        if idx < self.panes.len() {
+            self.panes.remove(idx);
+            self.normalize_fractions();
+            self.clamp_focus();
+        }
+    }
+
+    /// Returns true if channel already has a pane open.
+    fn contains_channel(&self, ch: &ChannelId) -> bool {
+        self.panes.iter().any(|p| &p.channel == ch)
+    }
+}
+
 /// Controls where the channel list is rendered.
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelLayout {
@@ -132,6 +231,8 @@ pub struct CrustApp {
     always_on_top: bool,
     /// 7TV animated avatar URLs keyed by Twitch user ID.
     stv_avatars: HashMap<String, String>,
+    /// Split-pane state for multi-channel side-by-side view.
+    split_panes: SplitPanes,
 }
 
 /// Apply the Crust colour palette to egui, reading the current dark/light
@@ -202,6 +303,10 @@ impl CrustApp {
 
         install_system_fallback_fonts(&cc.egui_ctx);
 
+        // Eagerly initialise the spell-check dictionary so the first
+        // right-click context menu doesn't stall.
+        crate::spellcheck::init();
+
         Self {
             state: AppState::default(),
             cmd_tx,
@@ -236,6 +341,7 @@ impl CrustApp {
             irc_nickserv_pass: String::new(),
             always_on_top: false,
             stv_avatars: HashMap::new(),
+            split_panes: SplitPanes::default(),
         }
     }
 
@@ -425,6 +531,18 @@ impl CrustApp {
                 }
 
                 if let Some(ch) = self.state.channels.get_mut(&channel) {
+                    // Track the sender for @username autocomplete.
+                    // Only real user messages (Chat, Bits, Sub with text) are
+                    // worth tracking; system notices and mod actions are not.
+                    match message.msg_kind {
+                        MsgKind::Chat | MsgKind::Bits { .. } => {
+                            if !message.sender.display_name.is_empty() {
+                                ch.chatters.insert(message.sender.display_name.clone());
+                            }
+                        }
+                        _ => {}
+                    }
+
                     // If this is Twitch's echo of our own sent message, update
                     // the existing local echo in-place instead of adding a
                     // duplicate entry.  absorb_own_echo returns true when an
@@ -473,6 +591,63 @@ impl CrustApp {
             AppEvent::EmoteCatalogUpdated { mut emotes } => {
                 emotes.sort_by(|a, b| a.code.to_lowercase().cmp(&b.code.to_lowercase()));
                 self.emote_catalog = emotes;
+
+                // Re-tokenize existing messages across ALL channels so that
+                // emotes that loaded after the messages arrived (e.g. global
+                // BTTV/FFZ/7TV emotes like LUL) get resolved.
+                let emote_map = build_emote_lookup(&self.emote_catalog);
+                if !emote_map.is_empty() {
+                    for ch in self.state.channels.values_mut() {
+                        for msg in ch.messages.iter_mut() {
+                            if !matches!(msg.msg_kind, MsgKind::Chat | MsgKind::Bits { .. })
+                            {
+                                continue;
+                            }
+                            let new_spans = crust_core::format::tokenize(
+                                &msg.raw_text,
+                                msg.flags.is_action,
+                                &msg.twitch_emotes,
+                                &|code| {
+                                    emote_map.get(code).map(|e| {
+                                        (
+                                            e.code.clone(),
+                                            e.code.clone(),
+                                            e.url.clone(),
+                                            e.provider.clone(),
+                                            None,
+                                        )
+                                    })
+                                },
+                            );
+
+                            let old_emote_count = msg
+                                .spans
+                                .iter()
+                                .filter(|s| matches!(s, crust_core::Span::Emote { .. }))
+                                .count();
+                            let new_emote_count = new_spans
+                                .iter()
+                                .filter(|s| matches!(s, crust_core::Span::Emote { .. }))
+                                .count();
+
+                            if new_emote_count > old_emote_count {
+                                for span in &new_spans {
+                                    if let crust_core::Span::Emote { url, .. } = span {
+                                        if !self.emote_bytes.contains_key(url.as_str())
+                                        {
+                                            let _ = self.cmd_tx.try_send(
+                                                AppCommand::FetchImage {
+                                                    url: url.clone(),
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                                msg.spans = new_spans;
+                            }
+                        }
+                    }
+                }
             }
             AppEvent::Authenticated { username, user_id } => {
                 // Clear the previous account's avatar so it doesn't flash
@@ -662,7 +837,8 @@ impl CrustApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
             }
             AppEvent::ChannelEmotesLoaded { .. } => {
-                // Handled in the loading-screen pre-pass above; nothing else to do.
+                // Re-tokenization is now handled by EmoteCatalogUpdated which
+                // fires for every emote load (global, channel, personal 7TV).
             }
             AppEvent::ImagePrefetchQueued { .. } => {
                 // Handled in the loading-screen pre-pass above; nothing else to do.
@@ -1907,6 +2083,8 @@ impl eframe::App for CrustApp {
         let mut ch_selected: Option<ChannelId> = None;
         let mut ch_closed: Option<ChannelId> = None;
         let mut ch_reordered: Option<Vec<ChannelId>> = None;
+        let mut ch_drag_split: Option<ChannelId> = None;
+        let mut show_split_drop_zone = false;
 
         match self.channel_layout {
             // ── Top-tab strip ────────────────────────────────────────────────
@@ -1960,11 +2138,69 @@ impl eframe::App for CrustApp {
                                             egui::Button::new(
                                                 RichText::new(&label).font(t::small()).color(fg),
                                             )
-                                            .fill(bg),
+                                            .fill(bg)
+                                            .sense(egui::Sense::click_and_drag()),
                                         );
 
                                         if resp.clicked() {
                                             ch_selected = Some(ch.clone());
+                                        }
+
+                                        // Drag tab downward → split pane
+                                        if resp.dragged() {
+                                            if let Some(pos) = ui.ctx().pointer_latest_pos() {
+                                                let tab_bottom = ui.max_rect().bottom();
+                                                let is_outside = pos.y > tab_bottom + 20.0;
+                                                if is_outside {
+                                                    show_split_drop_zone = true;
+                                                }
+                                                // Floating ghost following cursor
+                                                let layer_id = egui::LayerId::new(
+                                                    egui::Order::Tooltip,
+                                                    egui::Id::new("tab_drag_ghost"),
+                                                );
+                                                let ghost_rect = egui::Rect::from_min_size(
+                                                    egui::pos2(pos.x + 10.0, pos.y + 10.0),
+                                                    egui::vec2(120.0, 26.0),
+                                                );
+                                                let painter = ui.ctx().layer_painter(layer_id);
+                                                let fill = if is_outside {
+                                                    Color32::from_rgba_unmultiplied(60, 140, 90, 210)
+                                                } else {
+                                                    let ac = t::accent();
+                                                    Color32::from_rgba_unmultiplied(ac.r(), ac.g(), ac.b(), 200)
+                                                };
+                                                painter.rect_filled(
+                                                    ghost_rect,
+                                                    egui::CornerRadius::same(5),
+                                                    fill,
+                                                );
+                                                painter.text(
+                                                    ghost_rect.center(),
+                                                    egui::Align2::CENTER_CENTER,
+                                                    ch.display_name(),
+                                                    t::small(),
+                                                    Color32::WHITE,
+                                                );
+                                                if is_outside {
+                                                    painter.text(
+                                                        egui::pos2(ghost_rect.center().x, ghost_rect.bottom() + 2.0),
+                                                        egui::Align2::CENTER_TOP,
+                                                        "Split view",
+                                                        t::small(),
+                                                        Color32::from_rgba_unmultiplied(200, 255, 200, 180),
+                                                    );
+                                                }
+                                            }
+                                            ui.ctx().request_repaint();
+                                        }
+                                        if resp.drag_stopped() {
+                                            if let Some(pos) = ui.ctx().pointer_latest_pos() {
+                                                let tab_bottom = ui.max_rect().bottom();
+                                                if pos.y > tab_bottom + 20.0 {
+                                                    ch_drag_split = Some(ch.clone());
+                                                }
+                                            }
                                         }
 
                                         // Context menu: common channel actions
@@ -2061,6 +2297,8 @@ impl eframe::App for CrustApp {
                         ch_selected = res.selected;
                         ch_closed = res.closed;
                         ch_reordered = res.reordered;
+                        ch_drag_split = res.drag_split;
+                        show_split_drop_zone = res.dragging_outside;
                     });
             }
 
@@ -2073,6 +2311,14 @@ impl eframe::App for CrustApp {
             if let Some(state) = self.state.channels.get_mut(&ch) {
                 state.mark_read();
             }
+            // In split mode, switch the focused pane's channel.
+            if !self.split_panes.panes.is_empty() {
+                let f = self.split_panes.focused;
+                if let Some(pane) = self.split_panes.panes.get_mut(f) {
+                    pane.channel = ch.clone();
+                    pane.input_buf.clear();
+                }
+            }
             self.state.active_channel = Some(ch);
         }
         if let Some(ch) = ch_closed {
@@ -2084,6 +2330,26 @@ impl eframe::App for CrustApp {
             {
                 self.pending_reply = None;
             }
+            // Remove any split pane showing this channel.
+            if let Some(idx) = self
+                .split_panes
+                .panes
+                .iter()
+                .position(|p| p.channel == ch)
+            {
+                self.split_panes.remove_pane(idx);
+                if self.split_panes.panes.len() <= 1 {
+                    if let Some(p) = self.split_panes.panes.first() {
+                        self.state.active_channel = Some(p.channel.clone());
+                        self.chat_input_buf =
+                            std::mem::take(&mut self.split_panes.panes[0].input_buf);
+                    }
+                    self.split_panes.panes.clear();
+                    self.split_panes.focused = 0;
+                } else {
+                    self.split_panes.clamp_focus();
+                }
+            }
             self.send_cmd(AppCommand::LeaveChannel {
                 channel: ch.clone(),
             });
@@ -2091,6 +2357,24 @@ impl eframe::App for CrustApp {
         }
         if let Some(new_order) = ch_reordered {
             self.state.channel_order = new_order;
+        }
+
+        // Drag-to-split: create a new pane for the dragged channel.
+        if let Some(ch) = ch_drag_split {
+            if !self.split_panes.contains_channel(&ch) {
+                // If not yet in split mode, seed pane 0 with the current active channel.
+                if self.split_panes.panes.is_empty() {
+                    if let Some(ref active) = self.state.active_channel {
+                        if active != &ch {
+                            self.split_panes
+                                .add_pane(active.clone(), None);
+                        }
+                    }
+                }
+                self.split_panes.add_pane(ch.clone(), None);
+                self.split_panes.focused = self.split_panes.panes.len().saturating_sub(1);
+                self.state.active_channel = Some(ch);
+            }
         }
 
         // -- Analytics right panel -------------------------------------------
@@ -2117,14 +2401,463 @@ impl eframe::App for CrustApp {
 
         // -- Central area: messages + input ------------------------------------
         CentralPanel::default()
-            .frame(Frame::new().fill(t::bg_base()).inner_margin(Margin {
-                left: 6,
-                right: 0,
-                top: 0,
-                bottom: 0,
-            }))
+            .frame(Frame::new().fill(t::bg_base()).inner_margin(Margin::ZERO))
             .show(ctx, |ui| {
-                if let Some(active_ch) = self.state.active_channel.clone() {
+                // ── Split-pane mode ──────────────────────────────────────
+                if self.split_panes.panes.len() > 1 {
+                    let n = self.split_panes.panes.len();
+                    let total = ui.available_rect_before_wrap();
+                    let sep_w = 1.0_f32; // 1px visible divider line
+                    let drag_w = 8.0_f32; // wider invisible drag hit-zone
+                    let usable_w =
+                        total.width() - sep_w * (n as f32 - 1.0);
+                    let mut close_pane: Option<usize> = None;
+
+                    // ── Draggable separators ─────────────────────
+                    // Compute cumulative x positions first so we can
+                    // place the separator hit-rects.
+                    {
+                        let mut cx = total.left();
+                        for si in 0..(n - 1) {
+                            cx += self.split_panes.panes[si].frac * usable_w + sep_w;
+                            // Centre the wider drag zone on the 1px line.
+                            let drag_rect = egui::Rect::from_min_size(
+                                egui::pos2(cx - sep_w * 0.5 - drag_w * 0.5, total.top()),
+                                egui::vec2(drag_w, total.height()),
+                            );
+                            let sep_resp = ui.interact(
+                                drag_rect,
+                                egui::Id::new("pane_sep").with(si),
+                                egui::Sense::drag(),
+                            );
+                            if sep_resp.hovered() || sep_resp.dragged() {
+                                ui.ctx().set_cursor_icon(
+                                    egui::CursorIcon::ResizeHorizontal,
+                                );
+                                // Highlight a thin strip when hovered or dragged.
+                                let highlight_w = if sep_resp.dragged() { 3.0 } else { 2.0 };
+                                let highlight_alpha = if sep_resp.dragged() { 180_u8 } else { 100 };
+                                let ac = t::accent();
+                                let highlight_rect = egui::Rect::from_min_size(
+                                    egui::pos2(cx - sep_w * 0.5 - highlight_w * 0.5, total.top()),
+                                    egui::vec2(highlight_w, total.height()),
+                                );
+                                ui.painter().rect_filled(
+                                    highlight_rect,
+                                    egui::CornerRadius::ZERO,
+                                    Color32::from_rgba_unmultiplied(ac.r(), ac.g(), ac.b(), highlight_alpha),
+                                );
+                            }
+                            if sep_resp.dragged() {
+                                let dx = sep_resp.drag_delta().x;
+                                if dx.abs() > 0.0 {
+                                    let dfrac = dx / usable_w;
+                                    let a = &mut self.split_panes.panes[si];
+                                    let new_a = (a.frac + dfrac).max(0.10);
+                                    let delta = new_a - a.frac;
+                                    self.split_panes.panes[si].frac = new_a;
+                                    self.split_panes.panes[si + 1].frac =
+                                        (self.split_panes.panes[si + 1].frac - delta)
+                                            .max(0.10);
+                                    self.split_panes.normalize_fractions();
+                                }
+                                ui.ctx().request_repaint();
+                            }
+                        }
+                    }
+
+                    for pi in 0..n {
+                        let ch = self.split_panes.panes[pi].channel.clone();
+                        let is_focused = pi == self.split_panes.focused;
+
+                        // Compute left edge from cumulative fractions so
+                        // panes tile perfectly with no float-rounding gaps.
+                        let pane_left: f32 = total.left()
+                            + (0..pi)
+                                .map(|i| {
+                                    self.split_panes.panes[i].frac * usable_w
+                                        + sep_w
+                                })
+                                .sum::<f32>();
+                        let pane_right: f32 = if pi + 1 < n {
+                            // Right edge = next pane's left minus the separator.
+                            total.left()
+                                + (0..=pi)
+                                    .map(|i| {
+                                        self.split_panes.panes[i].frac
+                                            * usable_w
+                                            + sep_w
+                                    })
+                                    .sum::<f32>()
+                                - sep_w
+                        } else {
+                            // Last pane stretches to the container's right edge.
+                            total.right()
+                        };
+                        let pane_w = pane_right - pane_left;
+                        let pane_rect = egui::Rect::from_min_max(
+                            egui::pos2(pane_left, total.top()),
+                            egui::pos2(pane_right, total.bottom()),
+                        );
+
+                        // Separator line (1px divider)
+                        if pi > 0 {
+                            ui.painter().vline(
+                                pane_left - sep_w * 0.5,
+                                total.y_range(),
+                                egui::Stroke::new(1.0, t::border_subtle()),
+                            );
+                        }
+
+                        // Click-to-focus
+                        let bg_resp = ui.interact(
+                            pane_rect,
+                            egui::Id::new("split_pane_bg").with(pi),
+                            egui::Sense::click(),
+                        );
+                        if bg_resp.clicked() && !is_focused {
+                            self.split_panes.focused = pi;
+                            self.state.active_channel = Some(ch.clone());
+                        }
+
+                        let mut pane_ui = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(pane_rect)
+                                .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                        );
+                        pane_ui.set_clip_rect(pane_rect);
+                        pane_ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+
+                        // ── Pane header (manually painted, edge-to-edge) ─────
+                        {
+                            let hdr_rect = egui::Rect::from_min_size(
+                                pane_rect.min,
+                                egui::vec2(pane_w, 24.0),
+                            );
+                            let hdr_fill = if is_focused {
+                                t::accent_dim()
+                            } else {
+                                t::bg_surface()
+                            };
+                            ui.painter().rect_filled(
+                                hdr_rect,
+                                egui::CornerRadius::ZERO,
+                                hdr_fill,
+                            );
+                            ui.painter().hline(
+                                hdr_rect.x_range(),
+                                hdr_rect.bottom(),
+                                egui::Stroke::new(1.0, t::border_subtle()),
+                            );
+                            let hdr_content = hdr_rect.shrink2(egui::vec2(6.0, 0.0));
+                            let mut hdr_ui = pane_ui.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(hdr_content)
+                                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                            );
+                            hdr_ui.set_clip_rect(hdr_rect);
+                            hdr_ui.label(
+                                RichText::new(format!(
+                                    "# {}",
+                                    ch.display_name()
+                                ))
+                                .font(t::small())
+                                .strong()
+                                .color(if is_focused {
+                                    t::text_primary()
+                                } else {
+                                    t::text_secondary()
+                                }),
+                            );
+                            hdr_ui.with_layout(
+                                egui::Layout::right_to_left(
+                                    egui::Align::Center,
+                                ),
+                                |ui| {
+                                    let cb = ui.add(
+                                        egui::Label::new(
+                                            RichText::new("✕")
+                                                .font(t::small())
+                                                .color(t::text_muted()),
+                                        )
+                                        .sense(egui::Sense::click()),
+                                    );
+                                    if cb.clicked() {
+                                        close_pane = Some(pi);
+                                    }
+                                    if cb.hovered() {
+                                        ui.ctx().set_cursor_icon(
+                                            egui::CursorIcon::PointingHand,
+                                        );
+                                    }
+                                },
+                            );
+                            // Advance pane_ui cursor past the header.
+                            pane_ui.allocate_space(egui::vec2(pane_w, 24.0));
+                        }
+
+                        // ── Pane chat input (bottom) ─────────────
+                        let input_h = t::BAR_H
+                            + (t::INPUT_MARGIN.top + t::INPUT_MARGIN.bottom)
+                                as f32;
+                        let input_rect = egui::Rect::from_min_size(
+                            egui::pos2(
+                                pane_rect.left(),
+                                pane_rect.bottom() - input_h,
+                            ),
+                            egui::vec2(pane_w, input_h),
+                        );
+                        // Paint input background edge-to-edge.
+                        ui.painter().rect_filled(
+                            input_rect,
+                            egui::CornerRadius::ZERO,
+                            t::bg_surface(),
+                        );
+                        ui.painter().hline(
+                            input_rect.x_range(),
+                            input_rect.top(),
+                            egui::Stroke::new(1.0, t::border_subtle()),
+                        );
+                        {
+                        let mut inp_ui = pane_ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(input_rect)
+                                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                        );
+                        inp_ui.set_clip_rect(input_rect);
+                            let chatters_sorted: Vec<String> = self
+                                .state
+                                .channels
+                                .get(&ch)
+                                .map(|c| {
+                                    let mut v: Vec<String> =
+                                        c.chatters.iter().cloned().collect();
+                                    v.sort_unstable_by(|a, b| {
+                                        a.to_lowercase()
+                                            .cmp(&b.to_lowercase())
+                                    });
+                                    v
+                                })
+                                .unwrap_or_default();
+                            let chat = ChatInput {
+                                channel: &ch,
+                                logged_in: self.state.auth.logged_in,
+                                username: self
+                                    .state
+                                    .auth
+                                    .username
+                                    .as_deref(),
+                                emote_catalog: &self.emote_catalog,
+                                emote_bytes: &self.emote_bytes,
+                                pending_reply: None,
+                                message_history: &self.message_history,
+                                known_channels: &self.state.channel_order,
+                                chatters: &chatters_sorted,
+                            };
+                            let inp = chat.show(
+                                &mut inp_ui,
+                                &mut self.split_panes.panes[pi].input_buf,
+                            );
+                            if let Some(text) = inp.send {
+                                if self
+                                    .message_history
+                                    .last()
+                                    .map(|s| s.as_str())
+                                    != Some(&text)
+                                {
+                                    self.message_history
+                                        .push(text.clone());
+                                    if self.message_history.len() > 100 {
+                                        self.message_history.remove(0);
+                                    }
+                                }
+                                let is_mod = self
+                                    .state
+                                    .channels
+                                    .get(&ch)
+                                    .map(|c| c.is_mod)
+                                    .unwrap_or(false);
+                                let is_bc = self
+                                    .state
+                                    .auth
+                                    .username
+                                    .as_deref()
+                                    .map(|u| {
+                                        u.eq_ignore_ascii_case(
+                                            ch.display_name(),
+                                        )
+                                    })
+                                    .unwrap_or(false);
+                                let can_mod = is_mod || is_bc;
+                                let cc = self
+                                    .state
+                                    .channels
+                                    .get(&ch)
+                                    .map(|c| {
+                                        c.chatters.len().max(
+                                            estimate_chatter_count(c),
+                                        )
+                                    })
+                                    .unwrap_or(0);
+                                let pcmd = parse_slash_command(
+                                    &text,
+                                    &ch,
+                                    None,
+                                    None,
+                                    can_mod,
+                                    cc,
+                                    self.kick_beta_enabled,
+                                    self.irc_beta_enabled,
+                                );
+                                if let Some(cmd) = pcmd {
+                                    if let AppCommand::SendMessage {
+                                        text: ref out,
+                                        ..
+                                    } = cmd
+                                    {
+                                        if ch.is_irc() {
+                                            self.irc_status_panel
+                                                .note_outgoing(&ch, out);
+                                        }
+                                    }
+                                    if let AppCommand::ShowUserCard {
+                                        ref login,
+                                        ref channel,
+                                    } = cmd
+                                    {
+                                        self.user_profile_popup
+                                            .set_loading(
+                                                login,
+                                                vec![],
+                                                Some(channel.clone()),
+                                                can_mod,
+                                            );
+                                    }
+                                    let _ = self.cmd_tx.try_send(cmd);
+                                } else {
+                                    if ch.is_irc() {
+                                        self.irc_status_panel
+                                            .note_outgoing(&ch, &text);
+                                    }
+                                    let _ = self.cmd_tx.try_send(
+                                        AppCommand::SendMessage {
+                                            channel: ch.clone(),
+                                            text,
+                                            reply_to_msg_id: None,
+                                            reply: None,
+                                        },
+                                    );
+                                }
+                            }
+                            if inp.toggle_emote_picker {
+                                self.emote_picker.toggle();
+                            }
+                        }
+
+                        // ── Message list (remaining space) ───────
+                        // Region between header bottom and input top.
+                        let msg_rect = egui::Rect::from_min_max(
+                            egui::pos2(pane_rect.left(), pane_rect.top() + 24.0),
+                            egui::pos2(pane_rect.right(), input_rect.top()),
+                        );
+                        if let Some(ch_state) =
+                            self.state.channels.get(&ch)
+                        {
+                            let is_bc = self
+                                .state
+                                .auth
+                                .username
+                                .as_deref()
+                                .map(|u| {
+                                    u.eq_ignore_ascii_case(
+                                        ch.display_name(),
+                                    )
+                                })
+                                .unwrap_or(false);
+                            let _is_mod = ch_state.is_mod || is_bc;
+                            let mut msg_ui = pane_ui.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(msg_rect)
+                                    .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                            );
+                            msg_ui.set_clip_rect(msg_rect);
+                            let ml = MessageList::new(
+                                &ch_state.messages,
+                                &self.emote_bytes,
+                                &self.cmd_tx,
+                                &ch,
+                                &self.link_previews,
+                            )
+                            .show(&mut msg_ui);
+                            if let Some(r) = ml.reply {
+                                self.pending_reply = Some(PendingReply {
+                                    channel: ch.clone(),
+                                    info: r,
+                                });
+                            }
+                            if let Some((login, badges)) =
+                                ml.profile_request
+                            {
+                                self.user_profile_popup.set_loading(
+                                    &login,
+                                    badges,
+                                    Some(ch.clone()),
+                                    ch_state.is_mod || is_bc,
+                                );
+                            }
+                        }
+                    }
+
+                    // Close-pane action
+                    if let Some(idx) = close_pane {
+                        self.split_panes.remove_pane(idx);
+                        if self.split_panes.panes.len() <= 1 {
+                            if let Some(p) =
+                                self.split_panes.panes.first()
+                            {
+                                self.state.active_channel =
+                                    Some(p.channel.clone());
+                                self.chat_input_buf = std::mem::take(
+                                    &mut self.split_panes.panes[0]
+                                        .input_buf,
+                                );
+                            }
+                            self.split_panes.panes.clear();
+                            self.split_panes.focused = 0;
+                        } else {
+                            self.split_panes.clamp_focus();
+                            if let Some(ch) =
+                                self.split_panes.focused_channel()
+                            {
+                                self.state.active_channel =
+                                    Some(ch.clone());
+                            }
+                        }
+                    }
+
+                    // Emote picker → focused pane
+                    if let Some(code) = self.emote_picker.show(
+                        ctx,
+                        &self.emote_catalog,
+                        &self.emote_bytes,
+                        &self.cmd_tx,
+                    ) {
+                        if let Some(pane) = self
+                            .split_panes
+                            .panes
+                            .get_mut(self.split_panes.focused)
+                        {
+                            if !pane.input_buf.is_empty()
+                                && !pane.input_buf.ends_with(' ')
+                            {
+                                pane.input_buf.push(' ');
+                            }
+                            pane.input_buf.push_str(&code);
+                            pane.input_buf.push(' ');
+                        }
+                    }
+                // ── Classic single-channel mode ──────────────────────────
+                } else if let Some(active_ch) = self.state.active_channel.clone() {
                     let active_reply = self
                         .pending_reply
                         .as_ref()
@@ -2147,6 +2880,17 @@ impl eframe::App for CrustApp {
                                 .stroke(egui::Stroke::new(1.0, t::border_subtle())),
                         )
                         .show_inside(ui, |ui| {
+                            // Collect sorted chatters for @username autocomplete
+                            let chatters_sorted: Vec<String> = self
+                                .state
+                                .channels
+                                .get(&active_ch)
+                                .map(|c| {
+                                    let mut v: Vec<String> = c.chatters.iter().cloned().collect();
+                                    v.sort_unstable_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+                                    v
+                                })
+                                .unwrap_or_default();
                             let chat = ChatInput {
                                 channel: &active_ch,
                                 logged_in: self.state.auth.logged_in,
@@ -2156,6 +2900,7 @@ impl eframe::App for CrustApp {
                                 pending_reply: active_reply.as_ref(),
                                 message_history: &self.message_history,
                                 known_channels: &self.state.channel_order,
+                                chatters: &chatters_sorted,
                             };
                             let result = chat.show(ui, &mut self.chat_input_buf);
                             if result.dismiss_reply && active_reply.is_some() {
@@ -2304,6 +3049,19 @@ impl eframe::App for CrustApp {
                             .map(|u| u.eq_ignore_ascii_case(active_ch.display_name()))
                             .unwrap_or(false);
                         let is_mod = state.is_mod || is_broadcaster;
+                        // Small left inset so messages aren't flush against the sidebar.
+                        ui.add_space(0.0); // force cursor
+                        let msg_rect = ui.available_rect_before_wrap();
+                        let inset_rect = egui::Rect::from_min_max(
+                            egui::pos2(msg_rect.left() + 6.0, msg_rect.top()),
+                            msg_rect.max,
+                        );
+                        let mut msg_ui = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(inset_rect)
+                                .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                        );
+                        msg_ui.set_clip_rect(inset_rect);
                         let ml_result = MessageList::new(
                             &state.messages,
                             &self.emote_bytes,
@@ -2311,7 +3069,7 @@ impl eframe::App for CrustApp {
                             &active_ch,
                             &self.link_previews,
                         )
-                        .show(ui);
+                        .show(&mut msg_ui);
                         if let Some(r) = ml_result.reply {
                             self.pending_reply = Some(PendingReply {
                                 channel: active_ch.clone(),
@@ -2337,6 +3095,46 @@ impl eframe::App for CrustApp {
                     });
                 }
             });
+
+        // -- Split drop-zone overlay -----------------------------------------
+        // Pulsing translucent overlay shown over the central area when a
+        // channel is being dragged outside the sidebar / tab strip.
+        if show_split_drop_zone {
+            let time = ctx.input(|i| i.time) as f32;
+            let pulse = (time * 3.0).sin() * 0.5 + 0.5; // 0..1
+            let alpha = (30.0 + pulse * 35.0) as u8;
+            let border_alpha = (80.0 + pulse * 80.0) as u8;
+            let ac = t::accent();
+
+            egui::Area::new(egui::Id::new("split_drop_zone"))
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .order(egui::Order::Foreground)
+                .interactable(false)
+                .show(ctx, |ui| {
+                    let screen = ctx.screen_rect();
+                    // Cover most of the central area.
+                    let zone_rect = screen.shrink(4.0);
+                    ui.painter().rect(
+                        zone_rect,
+                        egui::CornerRadius::same(8),
+                        Color32::from_rgba_unmultiplied(ac.r(), ac.g(), ac.b(), alpha),
+                        egui::Stroke::new(
+                            2.0,
+                            Color32::from_rgba_unmultiplied(ac.r(), ac.g(), ac.b(), border_alpha),
+                        ),
+                        egui::epaint::StrokeKind::Outside,
+                    );
+                    // Center label.
+                    ui.painter().text(
+                        zone_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Drop to split",
+                        t::heading(),
+                        Color32::from_rgba_unmultiplied(255, 255, 255, (120.0 + pulse * 100.0) as u8),
+                    );
+                });
+            ctx.request_repaint();
+        }
 
         // -- Event toast overlay ---------------------------------------------
         // Expire toasts older than 5 s, then render remaining ones as stacked
@@ -2993,4 +3791,26 @@ fn parse_irc_server_arg(raw: &str) -> Option<ChannelId> {
         return None;
     }
     Some(ChannelId::irc(host, port, tls, IRC_SERVER_CONTROL_CHANNEL))
+}
+
+/// Build an emote code → catalog entry lookup with provider priority
+/// 7TV > BTTV > FFZ > Kick (same order as the backend `resolve_emote`).
+fn build_emote_lookup(catalog: &[EmoteCatalogEntry]) -> HashMap<&str, &EmoteCatalogEntry> {
+    fn priority(provider: &str) -> u8 {
+        match provider {
+            "7tv" => 4,
+            "bttv" => 3,
+            "ffz" => 2,
+            "kick" => 1,
+            _ => 0,
+        }
+    }
+    let mut map: HashMap<&str, &EmoteCatalogEntry> = HashMap::with_capacity(catalog.len());
+    // Insert lowest-priority first so higher-priority overwrites.
+    let mut sorted: Vec<&EmoteCatalogEntry> = catalog.iter().collect();
+    sorted.sort_by_key(|e| priority(&e.provider));
+    for e in sorted {
+        map.insert(&e.code, e);
+    }
+    map
 }

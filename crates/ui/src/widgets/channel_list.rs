@@ -20,6 +20,12 @@ pub struct ChannelListResult {
     /// Set when the user dragged a tab to a new position; contains the full
     /// new ordered channel list.
     pub reordered: Option<Vec<ChannelId>>,
+    /// Set when a channel is being dragged outside the sidebar bounds
+    /// (pointer left the sidebar).  The app can use this to initiate a split.
+    pub drag_split: Option<ChannelId>,
+    /// True while a drag is actively in progress (for rendering drop-zone
+    /// overlay in the central panel).
+    pub dragging_outside: bool,
 }
 
 /// Persistent-per-frame drag tracking stored in egui temp storage.
@@ -29,6 +35,8 @@ struct DragState {
     dragging_idx: usize,
     /// Index *before* which the dragged item will be inserted (0 = top).
     insert_before: usize,
+    /// True when the pointer has left the sidebar (split-drop mode).
+    outside_sidebar: bool,
 }
 
 impl<'a> ChannelList<'a> {
@@ -37,6 +45,8 @@ impl<'a> ChannelList<'a> {
             selected: None,
             closed: None,
             reordered: None,
+            drag_split: None,
+            dragging_outside: false,
         };
 
         let drag_id = Id::new("channel_list_drag");
@@ -93,38 +103,57 @@ impl<'a> ChannelList<'a> {
                                 DragState {
                                     dragging_idx: idx,
                                     insert_before: idx,
+                                    outside_sidebar: false,
                                 },
                             )
                         });
                     }
 
-                    // Drag update: recompute insert position
+                    // Drag update: recompute insert position + outside check
                     if row_resp.dragged() {
                         if let Some(pos) = ui.ctx().pointer_latest_pos() {
+                            let sidebar_rect = ui.max_rect();
+                            let is_outside = pos.x > sidebar_rect.right() + 30.0;
                             let rel_y = pos.y - list_top;
                             let new_insert = ((rel_y / STRIDE + 0.5) as usize).min(n);
                             ui.data_mut(|d| {
                                 let mut ds: DragState = d.get_temp(drag_id).unwrap_or(DragState {
                                     dragging_idx: idx,
                                     insert_before: idx,
+                                    outside_sidebar: false,
                                 });
                                 ds.insert_before = new_insert;
+                                ds.outside_sidebar = is_outside;
                                 d.insert_temp(drag_id, ds);
                             });
                         }
                         ui.ctx().request_repaint();
                     }
 
-                    // Drag release: build new order
+                    // Drag release: split or reorder
                     if row_resp.drag_stopped() {
                         if let Some(ds) = ui.data(|d| d.get_temp::<DragState>(drag_id)) {
-                            let raw = ds.insert_before;
-                            let insert = if raw > ds.dragging_idx { raw - 1 } else { raw };
-                            if insert != ds.dragging_idx {
-                                let mut new_order: Vec<ChannelId> = self.channels.to_vec();
-                                let moved = new_order.remove(ds.dragging_idx);
-                                new_order.insert(insert, moved);
-                                result.reordered = Some(new_order);
+                            let sidebar_rect = ui.max_rect();
+                            let outside = ui
+                                .ctx()
+                                .pointer_latest_pos()
+                                .map(|p| p.x > sidebar_rect.right() + 30.0)
+                                .unwrap_or(false);
+                            if outside {
+                                // Pointer released outside sidebar → split pane
+                                result.drag_split =
+                                    Some(self.channels[ds.dragging_idx].clone());
+                            } else {
+                                let raw = ds.insert_before;
+                                let insert =
+                                    if raw > ds.dragging_idx { raw - 1 } else { raw };
+                                if insert != ds.dragging_idx {
+                                    let mut new_order: Vec<ChannelId> =
+                                        self.channels.to_vec();
+                                    let moved = new_order.remove(ds.dragging_idx);
+                                    new_order.insert(insert, moved);
+                                    result.reordered = Some(new_order);
+                                }
                             }
                         }
                         ui.data_mut(|d| d.remove::<DragState>(drag_id));
@@ -177,6 +206,11 @@ impl<'a> ChannelList<'a> {
                         .unwrap_or(false);
                     // Suppress hover style while a drag is in progress.
                     let is_hovered = row_resp.contains_pointer() && drag.is_none();
+
+                    // Ghost the original row when it's being dragged.
+                    if is_dragging_this {
+                        ui.set_opacity(0.35);
+                    }
 
                     if is_hovered && !is_active {
                         ui.painter()
@@ -329,8 +363,69 @@ impl<'a> ChannelList<'a> {
                             });
                         });
 
+                    // Reset opacity after the frame.
+                    if is_dragging_this {
+                        ui.set_opacity(1.0);
+                    }
+
                     if row_resp.clicked() && result.selected.is_none() && result.closed.is_none() {
                         result.selected = Some(ch.clone());
+                    }
+                }
+
+                // ── Floating drag ghost ──────────────────────────
+                // Rendered on a foreground layer, follows the cursor.
+                if let Some(ref ds) = drag {
+                    if let Some(pos) = ui.ctx().pointer_latest_pos() {
+                        let dragged_ch = &self.channels[ds.dragging_idx];
+                        let label_text = format!("# {}", dragged_ch.display_name());
+                        let is_outside = ds.outside_sidebar;
+
+                        let layer_id = egui::LayerId::new(
+                            egui::Order::Tooltip,
+                            Id::new("drag_ghost_layer"),
+                        );
+                        let ghost_rect = egui::Rect::from_min_size(
+                            egui::pos2(pos.x + 12.0, pos.y - 14.0),
+                            egui::vec2(130.0, ROW_H),
+                        );
+                        let painter = ui.ctx().layer_painter(layer_id);
+
+                        // Slight rotation via skewed rounded rect
+                        let fill = if is_outside {
+                            // Green-ish tint for "will split"
+                            Color32::from_rgba_unmultiplied(60, 140, 90, 210)
+                        } else {
+                            let a = t::accent();
+                            Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 210)
+                        };
+                        painter.rect_filled(
+                            ghost_rect,
+                            egui::CornerRadius::same(6),
+                            fill,
+                        );
+                        painter.text(
+                            ghost_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            &label_text,
+                            t::small(),
+                            Color32::WHITE,
+                        );
+
+                        // Sub-label when outside sidebar
+                        if is_outside {
+                            let hint_pos = egui::pos2(
+                                ghost_rect.center().x,
+                                ghost_rect.bottom() + 3.0,
+                            );
+                            painter.text(
+                                hint_pos,
+                                egui::Align2::CENTER_TOP,
+                                "Split view",
+                                t::small(),
+                                Color32::from_rgba_unmultiplied(200, 255, 200, 180),
+                            );
+                        }
                     }
                 }
 
@@ -342,6 +437,8 @@ impl<'a> ChannelList<'a> {
                         ui.painter()
                             .hline(x_range, y, egui::Stroke::new(2.0, t::accent()));
                     }
+                    // Signal to the app that a drop-zone overlay should be shown.
+                    result.dragging_outside = ds.outside_sidebar;
                 }
             });
 

@@ -265,12 +265,15 @@ fn tokenize_with_emoji(word: &str, is_action: bool, out: &mut SmallVec<[Span; 8]
 
 /// Build Twitch-native emote CDN URL (2x).
 pub fn twitch_emote_url(id: &str) -> String {
-    format!("https://static-cdn.jtvnw.net/emoticons/v2/{id}/default/dark/2.0")
+    // Use `static` format to guarantee PNG responses and match the URLs
+    // prefetched by TwitchGlobalProvider (avoids duplicate fetches and
+    // ensures emote_bytes cache hits).
+    format!("https://static-cdn.jtvnw.net/emoticons/v2/{id}/static/dark/1.0")
 }
 
 /// Build Twitch-native emote CDN URL at 4x scale for HD tooltips.
 pub fn twitch_emote_url_hd(id: &str) -> String {
-    format!("https://static-cdn.jtvnw.net/emoticons/v2/{id}/default/dark/4.0")
+    format!("https://static-cdn.jtvnw.net/emoticons/v2/{id}/static/dark/3.0")
 }
 
 /// Parse the raw `emotes` IRC tag value into structured positions.
