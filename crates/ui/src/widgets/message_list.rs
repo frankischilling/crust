@@ -471,7 +471,7 @@ impl<'a> MessageList<'a> {
             let btn_center = egui::pos2(panel_rect.center().x, panel_rect.bottom() - 36.0);
             let btn_rect = egui::Rect::from_center_size(btn_center, btn_size);
 
-            let fg_layer = LayerId::new(Order::Foreground, Id::new("resume_scroll_layer"));
+            let fg_layer = LayerId::new(Order::Foreground, Id::new("resume_scroll_layer").with(self.channel.as_str()));
             let painter = ui.ctx().layer_painter(fg_layer);
 
             // Button background
@@ -489,7 +489,7 @@ impl<'a> MessageList<'a> {
 
             // Detect click on the painted rect
             let btn_response =
-                ui.interact(btn_rect, Id::new("resume_scroll_btn"), egui::Sense::click());
+                ui.interact(btn_rect, Id::new("resume_scroll_btn").with(self.channel.as_str()), egui::Sense::click());
             if btn_response.clicked() {
                 // Clear paused so stick_to_bottom re-engages next frame.
                 ui.ctx().data_mut(|d| d.insert_temp(paused_key, false));
@@ -604,7 +604,15 @@ impl<'a> MessageList<'a> {
         let bg_click_id = Id::new("msg_bg_click").with(msg.id.0);
         {
             let ui = &mut prepared.content_ui;
-            let placeholder_rect = ui.max_rect();
+            // Use a zero-size rect for the early placeholder so that the
+            // second interact() (with the real frame rect) doesn't trigger
+            // egui's ID-clash warning.  The zero rect is fully contained
+            // within the final frame rect, so `check_for_id_clash` treats
+            // them as the same widget.  The key property we care about —
+            // low `idx_in_layer` for hit-test priority — is preserved
+            // because the widget is still registered before inner widgets.
+            let placeholder_rect =
+                egui::Rect::from_min_size(ui.max_rect().left_top(), egui::Vec2::ZERO);
             ui.interact(placeholder_rect, bg_click_id, egui::Sense::click());
 
             // Keep selectable_labels off globally so timestamp / badge
@@ -912,6 +920,13 @@ impl<'a> MessageList<'a> {
         let text = label_override.unwrap_or_else(|| msg.raw_text.clone());
         let opacity = if msg.flags.is_history { 0.55 } else { 1.0 };
 
+        // Push a stable ID derived from the message's own identifier so that
+        // widget IDs inside the system-event row are stable regardless of
+        // where this message falls in the virtual-scroll window.  Without
+        // this, the auto-incremented IDs shift every frame as the visible
+        // range moves, causing egui to report widget ID clashes for every
+        // system event in the loaded history.
+        ui.push_id(msg.id.0, |ui| {
         egui::Frame::new()
             .fill(Color32::from_rgba_unmultiplied(
                 accent.r(),
@@ -951,6 +966,7 @@ impl<'a> MessageList<'a> {
                     ui.add(Label::new(rich).wrap());
                 });
             });
+        }); // end push_id
     }
 
     fn render_span(
