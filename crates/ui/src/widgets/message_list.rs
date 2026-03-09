@@ -10,6 +10,7 @@ use crust_core::{
 };
 
 use crate::theme as t;
+use crate::widgets::message_search::MessageSearchState;
 
 /// Returned from [`MessageList::show`].
 pub struct MessageListResult {
@@ -17,6 +18,58 @@ pub struct MessageListResult {
     pub reply: Option<ReplyInfo>,
     /// Set when a username was clicked: (login, sender_badges).
     pub profile_request: Option<(String, Vec<Badge>)>,
+}
+
+// ── Zero-allocation visible-index abstraction ────────────────────────────
+// When no search filter is active, `VisibleIndices::All(n)` avoids
+// allocating a Vec<usize> with one entry per message every frame.
+
+enum VisibleIndices {
+    /// No filter — visible index `i` maps directly to message index `i`.
+    All(usize),
+    /// Search filter active — sparse set of matching message indices.
+    Filtered(Vec<usize>),
+}
+
+impl VisibleIndices {
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Self::All(n) => *n,
+            Self::Filtered(v) => v.len(),
+        }
+    }
+
+    /// Map a virtual row number to the real message index.
+    #[inline]
+    fn get(&self, i: usize) -> usize {
+        match self {
+            Self::All(_) => i,
+            Self::Filtered(v) => v[i],
+        }
+    }
+
+    /// Find the first virtual row matching a predicate on the real index.
+    fn position<F: Fn(usize) -> bool>(&self, pred: F) -> Option<usize> {
+        match self {
+            Self::All(n) => (0..*n).position(|i| pred(i)),
+            Self::Filtered(v) => v.iter().position(|&idx| pred(idx)),
+        }
+    }
+}
+
+/// Pre-computed per-frame values passed to `render_message` to avoid
+/// redundant `data_mut` lock acquisitions and `Id::new` constructions.
+struct RenderCtx {
+    reply_key: Id,
+    scroll_to_key: Id,
+    /// The server-id of the message currently being flash-highlighted (if any).
+    highlight_server_id: Option<String>,
+    /// Pre-computed base alpha for the highlight flash (0.0 when inactive).
+    highlight_alpha: f32,
+    /// Whether the flash is still animating (need repaint).
+    #[allow(dead_code)]
+    highlight_animating: bool,
 }
 
 const EMOTE_SIZE: f32 = 22.0;
@@ -27,6 +80,8 @@ const TOOLTIP_BADGE_SIZE: f32 = 64.0;
 const ROW_PAD_X: f32 = 6.0;
 /// Row top/bottom padding (px)
 const ROW_PAD_Y: f32 = 2.0;
+/// Fallback height for rows we have never rendered before.
+const EST_H: f32 = 26.0;
 
 /// Scrollable, bottom-anchored list of chat messages with inline emote images.
 pub struct MessageList<'a> {
@@ -39,6 +94,8 @@ pub struct MessageList<'a> {
     channel: &'a ChannelId,
     /// Cached link previews keyed by URL.
     link_previews: &'a HashMap<String, LinkPreview>,
+    /// Optional active search filter for this channel.
+    search: Option<&'a MessageSearchState>,
 }
 
 impl<'a> MessageList<'a> {
@@ -48,6 +105,7 @@ impl<'a> MessageList<'a> {
         cmd_tx: &'a mpsc::Sender<AppCommand>,
         channel: &'a ChannelId,
         link_previews: &'a HashMap<String, LinkPreview>,
+        search: Option<&'a MessageSearchState>,
     ) -> Self {
         Self {
             messages,
@@ -55,6 +113,7 @@ impl<'a> MessageList<'a> {
             cmd_tx,
             channel,
             link_previews,
+            search,
         }
     }
 
@@ -73,10 +132,25 @@ impl<'a> MessageList<'a> {
         let mut clip = ui.clip_rect();
         clip.max.y = clip.max.y.min(panel_rect.max.y - 2.0);
         ui.set_clip_rect(clip);
-        let n = self.messages.len();
+
+        // PERF: use VisibleIndices enum to avoid O(n) Vec allocation when
+        // no search filter is active (the common case).
+        let visible_indices: VisibleIndices = match self.search {
+            Some(search) if search.is_filtering() => VisibleIndices::Filtered(
+                self.messages
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, msg)| search.matches(msg).then_some(idx))
+                    .collect(),
+            ),
+            _ => VisibleIndices::All(self.messages.len()),
+        };
+        let n = visible_indices.len();
         // Use a per-channel scroll area ID so offset doesn't leak
         let scroll_id = egui::Id::new("message_list").with(self.channel.as_str());
         let paused_key = egui::Id::new("scroll_paused").with(self.channel.as_str());
+        let prev_offset_key = egui::Id::new("scroll_prev_offset").with(self.channel.as_str());
+        let paused_ids_key = egui::Id::new("scroll_paused_ids").with(self.channel.as_str());
 
         // If the user scrolls over the message panel, immediately pause
         // stick-to-bottom so upward wheel input can take effect this frame.
@@ -91,10 +165,13 @@ impl<'a> MessageList<'a> {
         // Store whether the wheel was used this frame, so show_resume_button
         // doesn't immediately clear the paused flag before the delta is applied.
         let wheel_key = egui::Id::new("scroll_wheel_this_frame").with(self.channel.as_str());
-        ui.ctx().data_mut(|d| d.insert_temp(wheel_key, wheel_over_panel));
-        if wheel_over_panel {
-            ui.ctx().data_mut(|d| d.insert_temp(paused_key, true));
-        }
+        // Batch two temp writes into one data_mut call.
+        ui.ctx().data_mut(|d| {
+            d.insert_temp(wheel_key, wheel_over_panel);
+            if wheel_over_panel {
+                d.insert_temp(paused_key, true);
+            }
+        });
 
         // Reset stale scroll state on first render of a channel
         // egui persists scroll offsets across sessions.  When we
@@ -128,9 +205,6 @@ impl<'a> MessageList<'a> {
         let mut height_cache: std::collections::HashMap<u64, f32> =
             ui.ctx().data_mut(|d| d.remove_temp(hc_id).unwrap_or_default());
 
-        // Fallback height for rows we have never rendered before.
-        const EST_H: f32 = 26.0;
-
         // Invalidate height cache when available width changes significantly
         // (e.g. window resize or sidebar drag), since messages re-wrap to
         // different heights at different widths.
@@ -146,7 +220,7 @@ impl<'a> MessageList<'a> {
         // (e.g. after leaving and re-joining a channel).
         // Also reset the "first render" flag so re-entering triggers
         // a fresh scroll-offset reset.
-        if n == 0 {
+        if self.messages.is_empty() {
             height_cache.clear();
             ui.ctx()
                 .data_mut(|d| d.insert_temp::<bool>(init_key, false));
@@ -167,10 +241,9 @@ impl<'a> MessageList<'a> {
                 v
             });
             target.and_then(|tgt_id| {
-                let idx = self
-                    .messages
-                    .iter()
-                    .position(|m| m.server_id.as_deref() == Some(tgt_id.as_str()))?;
+                let idx = visible_indices.position(|msg_idx| {
+                    self.messages[msg_idx].server_id.as_deref() == Some(tgt_id.as_str())
+                })?;
                 // Store the target server_id + time for a brief highlight flash.
                 let now = ui.input(|i| i.time);
                 ui.ctx().data_mut(|d| {
@@ -180,7 +253,7 @@ impl<'a> MessageList<'a> {
                 let offset: f32 = (0..idx)
                     .map(|i| {
                         height_cache
-                            .get(&self.messages[i].id.0)
+                            .get(&self.messages[visible_indices.get(i)].id.0)
                             .copied()
                             .unwrap_or(EST_H)
                     })
@@ -188,6 +261,107 @@ impl<'a> MessageList<'a> {
                 Some(offset)
             })
         };
+
+        let paused_before_show: bool = ui
+            .ctx()
+            .data_mut(|d| d.get_temp(paused_key).unwrap_or(false));
+        let prev_offset: f32 = ui
+            .ctx()
+            .data_mut(|d| d.get_temp(prev_offset_key).unwrap_or(0.0));
+        let prev_paused_ids: Vec<u64> = ui
+            .ctx()
+            .data_mut(|d| d.remove_temp(paused_ids_key).unwrap_or_default());
+        let current_visible_ids: Vec<u64> = (0..n)
+            .map(|i| self.messages[visible_indices.get(i)].id.0)
+            .collect();
+        let paused_offset_compensation = if paused_before_show {
+            Self::compensate_paused_offset(
+                &prev_paused_ids,
+                &current_visible_ids,
+                &height_cache,
+                prev_offset,
+            )
+        } else {
+            None
+        };
+
+        // ── Pre-compute highlight state once per frame ───────────────────
+        // Previously this was looked up via 2× data_mut calls inside every
+        // render_message invocation.  Computing it once here avoids dozens
+        // of redundant lock acquisitions per frame.
+        let rctx = {
+            let (hl_id, hl_time): (Option<String>, Option<f64>) = ui.ctx().data_mut(|d| {
+                (d.get_temp(highlight_key), d.get_temp(highlight_time_key))
+            });
+            let now = ui.input(|i| i.time);
+            let (highlight_server_id, highlight_alpha, highlight_animating) =
+                match (hl_id, hl_time) {
+                    (Some(id), Some(t0)) => {
+                        let elapsed = (now - t0) as f32;
+                        const FLASH_SECS: f32 = 1.5;
+                        if elapsed < FLASH_SECS {
+                            (Some(id), 1.0 - (elapsed / FLASH_SECS), true)
+                        } else {
+                            // Flash complete — clean up temp data.
+                            ui.ctx().data_mut(|d| {
+                                d.remove::<String>(highlight_key);
+                                d.remove::<f64>(highlight_time_key);
+                            });
+                            (None, 0.0, false)
+                        }
+                    }
+                    _ => (None, 0.0, false),
+                };
+            if highlight_animating {
+                ui.ctx().request_repaint();
+            }
+            RenderCtx {
+                reply_key,
+                scroll_to_key,
+                highlight_server_id,
+                highlight_alpha,
+                highlight_animating,
+            }
+        };
+
+        if n == 0 {
+            let scroll_paused: bool = ui
+                .ctx()
+                .data_mut(|d| d.get_temp(paused_key).unwrap_or(false));
+            let mut sa = ScrollArea::vertical()
+                .id_salt(scroll_id)
+                .auto_shrink([false; 2])
+                .stick_to_bottom(!scroll_paused && forced_offset.is_none());
+            if let Some(offset) = forced_offset {
+                sa = sa.vertical_scroll_offset(offset);
+            } else if let Some(offset) = paused_offset_compensation {
+                sa = sa.vertical_scroll_offset(offset);
+            } else if first_render {
+                sa = sa.vertical_scroll_offset(0.0);
+            }
+            let output = sa.show(ui, |ui| {
+                let full_width = ui.available_width();
+                ui.set_min_width(full_width);
+                let empty_h = (panel_rect.height() * 0.35).max(24.0);
+                ui.add_space(empty_h);
+                let text = if self.search.map(|s| s.is_filtering()).unwrap_or(false) {
+                    "No messages match the current filters."
+                } else {
+                    "No messages yet."
+                };
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new(text).color(t::text_muted()));
+                });
+            });
+            ui.ctx().data_mut(|d| d.insert_temp(hc_id, height_cache));
+            self.show_resume_button(ui, &output, panel_rect);
+            self.apply_snap(ui, &output);
+            self.persist_paused_anchor(ui, paused_ids_key, &current_visible_ids);
+            return MessageListResult {
+                reply: self.take_reply(ui, rctx.reply_key),
+                profile_request: self.take_profile_request(ui),
+            };
+        }
 
         if n < VIRTUAL_THRESHOLD {
             // ── Simple path: render every message, let egui handle layout ─
@@ -202,15 +376,19 @@ impl<'a> MessageList<'a> {
                 .stick_to_bottom(!scroll_paused && forced_offset.is_none());
             if let Some(offset) = forced_offset {
                 sa = sa.vertical_scroll_offset(offset);
+            } else if let Some(offset) = paused_offset_compensation {
+                sa = sa.vertical_scroll_offset(offset);
             } else if first_render {
                 sa = sa.vertical_scroll_offset(0.0);
             }
             let output = sa.show(ui, |ui| {
                 let full_width = ui.available_width();
                 ui.set_min_width(full_width);
-                for msg in self.messages.iter() {
+                for vi in 0..n {
+                    let msg_idx = visible_indices.get(vi);
+                    let msg = &self.messages[msg_idx];
                     let top_y = ui.next_widget_position().y;
-                    self.render_message(ui, msg);
+                    self.render_message(ui, msg, &rctx);
                     let measured = ui.next_widget_position().y - top_y;
                     if measured > 0.0 {
                         height_cache.insert(msg.id.0, measured);
@@ -222,24 +400,47 @@ impl<'a> MessageList<'a> {
             ui.ctx().data_mut(|d| d.insert_temp(hc_id, height_cache));
             self.show_resume_button(ui, &output, panel_rect);
             self.apply_snap(ui, &output);
+            self.persist_paused_anchor(ui, paused_ids_key, &current_visible_ids);
             return MessageListResult {
-                reply: self.take_reply(ui, reply_key),
+                reply: self.take_reply(ui, rctx.reply_key),
                 profile_request: self.take_profile_request(ui),
             };
         }
 
         // Build prefix-sum array.  prefix[i] = y-offset of the top of message i.
         // PERF: reuse the previous Vec allocation via remove_temp (ownership
-        // transfer) so we don't hit the allocator every frame.
+        // transfer) so we don't hit the allocator every frame.  We also cache
+        // the previous message count so we can skip the rebuild when nothing
+        // changed (the common steady-state case).
         let ps_id = egui::Id::new("msg_prefix_sum").with(self.channel.as_str());
+        let ps_gen_id = egui::Id::new("msg_prefix_gen").with(self.channel.as_str());
         let mut prefix: Vec<f32> =
             ui.ctx().data_mut(|d| d.remove_temp(ps_id).unwrap_or_default());
-        prefix.clear();
-        prefix.reserve(n + 1);
-        prefix.push(0.0f32);
-        for msg in self.messages.iter() {
-            let h = height_cache.get(&msg.id.0).copied().unwrap_or(EST_H);
-            prefix.push(prefix.last().unwrap() + h);
+
+        // Build a lightweight generation key from count + first/last message IDs
+        // so we detect content changes even when the count stays the same
+        // (e.g. ring-buffer eviction: pop_front + push_back at MAX_MESSAGES).
+        let cur_gen: (usize, u64, u64) = if n > 0 {
+            let first_id = self.messages[visible_indices.get(0)].id.0;
+            let last_id = self.messages[visible_indices.get(n - 1)].id.0;
+            (n, first_id, last_id)
+        } else {
+            (0, 0, 0)
+        };
+        let prev_gen: (usize, u64, u64) =
+            ui.ctx().data_mut(|d| d.get_temp(ps_gen_id).unwrap_or((0, 0, 0)));
+        let prefix_stale = prefix.len() != n + 1 || cur_gen != prev_gen;
+        if prefix_stale {
+            prefix.clear();
+            prefix.reserve(n + 1);
+            prefix.push(0.0f32);
+            for vi in 0..n {
+                let msg_idx = visible_indices.get(vi);
+                let msg = &self.messages[msg_idx];
+                let h = height_cache.get(&msg.id.0).copied().unwrap_or(EST_H);
+                prefix.push(prefix.last().unwrap() + h);
+            }
+            ui.ctx().data_mut(|d| d.insert_temp(ps_gen_id, cur_gen));
         }
         let total_h = *prefix.last().unwrap_or(&0.0);
 
@@ -255,6 +456,8 @@ impl<'a> MessageList<'a> {
             .auto_shrink([false; 2])
             .stick_to_bottom(!scroll_paused && forced_offset.is_none());
         if let Some(offset) = forced_offset {
+            sa = sa.vertical_scroll_offset(offset);
+        } else if let Some(offset) = paused_offset_compensation {
             sa = sa.vertical_scroll_offset(offset);
         } else if first_render {
             sa = sa.vertical_scroll_offset(0.0);
@@ -303,16 +506,29 @@ impl<'a> MessageList<'a> {
             }
 
             // Render only visible rows; measure heights for future frames.
+            // Track whether any height changed so we can invalidate the
+            // prefix sum for the next frame.
+            let mut any_height_changed = false;
             for i in first..last {
-                let msg = &self.messages[i];
+                let msg = &self.messages[visible_indices.get(i)];
                 let top_y = ui.next_widget_position().y;
 
-                self.render_message(ui, msg);
+                self.render_message(ui, msg, &rctx);
 
                 let measured = ui.next_widget_position().y - top_y;
                 if measured > 0.0 {
-                    height_cache.insert(msg.id.0, measured);
+                    let prev = height_cache.insert(msg.id.0, measured);
+                    if prev.map(|p| (p - measured).abs() > 0.5).unwrap_or(true) {
+                        any_height_changed = true;
+                    }
                 }
+            }
+
+            // If any visible row's measured height changed, force prefix
+            // rebuild next frame so the scroll bar and dead-space are correct.
+            if any_height_changed {
+                // Invalidate the generation key so the prefix sum is rebuilt next frame.
+                ui.ctx().data_mut(|d| d.insert_temp(ps_gen_id, (0usize, 0u64, 0u64)));
             }
 
             // Dead space below the visible window.
@@ -330,10 +546,50 @@ impl<'a> MessageList<'a> {
 
         self.show_resume_button(ui, &output, panel_rect);
         self.apply_snap(ui, &output);
+        self.persist_paused_anchor(ui, paused_ids_key, &current_visible_ids);
         MessageListResult {
-            reply: self.take_reply(ui, reply_key),
+            reply: self.take_reply(ui, rctx.reply_key),
             profile_request: self.take_profile_request(ui),
         }
+    }
+
+    fn compensate_paused_offset(
+        prev_ids: &[u64],
+        current_ids: &[u64],
+        height_cache: &HashMap<u64, f32>,
+        prev_offset: f32,
+    ) -> Option<f32> {
+        if prev_ids.is_empty() || current_ids.is_empty() || prev_ids[0] == current_ids[0] {
+            return None;
+        }
+
+        let removed_prefix = prev_ids
+            .iter()
+            .position(|&id| id == current_ids[0])
+            .unwrap_or(prev_ids.len());
+        if removed_prefix == 0 {
+            return None;
+        }
+
+        let removed_height: f32 = prev_ids[..removed_prefix]
+            .iter()
+            .map(|id| height_cache.get(id).copied().unwrap_or(EST_H))
+            .sum();
+        Some((prev_offset - removed_height).max(0.0))
+    }
+
+    fn persist_paused_anchor(&self, ui: &Ui, paused_ids_key: Id, current_visible_ids: &[u64]) {
+        let paused_key = egui::Id::new("scroll_paused").with(self.channel.as_str());
+        let scroll_paused: bool = ui
+            .ctx()
+            .data_mut(|d| d.get_temp(paused_key).unwrap_or(false));
+        ui.ctx().data_mut(|d| {
+            if scroll_paused {
+                d.insert_temp(paused_ids_key, current_visible_ids.to_vec());
+            } else {
+                d.remove::<Vec<u64>>(paused_ids_key);
+            }
+        });
     }
 
     /// Read and clear the reply request stored by a context menu during this frame.
@@ -449,9 +705,17 @@ impl<'a> MessageList<'a> {
     ) {
         let paused_key = egui::Id::new("scroll_paused").with(self.channel.as_str());
         let wheel_key = egui::Id::new("scroll_wheel_this_frame").with(self.channel.as_str());
+        let prev_offset_key = egui::Id::new("scroll_prev_offset").with(self.channel.as_str());
         let viewport_h = output.inner_rect.height();
         let max_scroll = (output.content_size.y - viewport_h).max(0.0);
         let at_bottom = max_scroll < 1.0 || output.state.offset.y >= max_scroll - 20.0;
+        let was_paused: bool = ui
+            .ctx()
+            .data_mut(|d| d.get_temp(paused_key).unwrap_or(false));
+        let prev_offset: f32 = ui
+            .ctx()
+            .data_mut(|d| d.get_temp(prev_offset_key).unwrap_or(output.state.offset.y));
+        let moved_up = output.state.offset.y + 2.0 < prev_offset;
 
         // Keep the paused flag in sync with where the scroll actually is.
         // When the wheel was used this frame, never clear the flag - the
@@ -460,10 +724,45 @@ impl<'a> MessageList<'a> {
         let wheel_this_frame: bool = ui
             .ctx()
             .data_mut(|d| d.get_temp(wheel_key).unwrap_or(false));
-        if !wheel_this_frame {
-            ui.ctx()
-                .data_mut(|d| d.insert_temp(paused_key, !at_bottom));
-        }
+        let (drag_scrolling_up, pointer_over_panel_down) = {
+            let over_panel = ui.ctx().input(|i| {
+                i.pointer
+                    .hover_pos()
+                    .map(|p| panel_rect.contains(p))
+                    .unwrap_or(false)
+                    && i.pointer.primary_down()
+            });
+            (over_panel && moved_up, over_panel)
+        };
+        let pause_due_to_user_scroll = wheel_this_frame || drag_scrolling_up;
+
+        // Detect if the user actively scrolled DOWN to the bottom this frame.
+        // We only un-pause when there is positive evidence of user intent
+        // (wheel or drag scroll that lands at the bottom), NOT merely because
+        // `at_bottom` happened to become true due to content changes (e.g.
+        // message eviction from the ring buffer shrinking total_h).
+        let moved_down = output.state.offset.y > prev_offset + 2.0;
+        let user_scrolled_to_bottom =
+            at_bottom && moved_down && (wheel_this_frame || pointer_over_panel_down);
+
+        let scroll_paused = if pause_due_to_user_scroll {
+            true
+        } else if user_scrolled_to_bottom {
+            // User actively scrolled back down to the bottom.
+            false
+        } else if !was_paused {
+            // Was not paused — stay unpaused (stick-to-bottom is active).
+            // Transient !at_bottom from content growth is fine; egui's
+            // stick_to_bottom will catch up next frame.
+            false
+        } else {
+            // was_paused and no explicit un-pause action → stay paused.
+            // This prevents content resizes from silently clearing the pause.
+            true
+        };
+        ui.ctx().data_mut(|d| d.insert_temp(paused_key, scroll_paused));
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(prev_offset_key, output.state.offset.y));
 
         if !at_bottom {
             // Paint a floating button on a foreground layer (no Area/Window needed)
@@ -507,7 +806,7 @@ impl<'a> MessageList<'a> {
         }
     }
 
-    fn render_message(&self, ui: &mut Ui, msg: &ChatMessage) {
+    fn render_message(&self, ui: &mut Ui, msg: &ChatMessage, rctx: &RenderCtx) {
         // Dispatch non-chat (and non-bits) events to the compact system-event renderer.
         match &msg.msg_kind {
             MsgKind::Chat | MsgKind::Bits { .. } => {}
@@ -517,38 +816,15 @@ impl<'a> MessageList<'a> {
             }
         }
 
-        let reply_key = Id::new("ml_reply_req").with(self.channel.as_str());
-        let scroll_to_key = egui::Id::new("ml_scroll_to").with(self.channel.as_str());
+        let reply_key = rctx.reply_key;
+        let scroll_to_key = rctx.scroll_to_key;
 
         // ── Message background ──────────────────────────────────────────
-        // Check if this message is the reply-scroll highlight target.
-        let highlight_key = egui::Id::new("ml_highlight_msg").with(self.channel.as_str());
-        let highlight_time_key = egui::Id::new("ml_highlight_t").with(self.channel.as_str());
-        let highlight_alpha: f32 = {
-            let hl_id: Option<String> = ui.ctx().data_mut(|d| d.get_temp(highlight_key));
-            let hl_time: Option<f64> = ui.ctx().data_mut(|d| d.get_temp(highlight_time_key));
-            match (hl_id, hl_time) {
-                (Some(id), Some(t0))
-                    if msg.server_id.as_deref() == Some(id.as_str()) =>
-                {
-                    let now = ui.input(|i| i.time);
-                    let elapsed = (now - t0) as f32;
-                    const FLASH_SECS: f32 = 1.5;
-                    if elapsed < FLASH_SECS {
-                        // Keep repainting while the flash is visible.
-                        ui.ctx().request_repaint();
-                        1.0 - (elapsed / FLASH_SECS)
-                    } else {
-                        // Flash complete — clean up temp data.
-                        ui.ctx().data_mut(|d| {
-                            d.remove::<String>(highlight_key);
-                            d.remove::<f64>(highlight_time_key);
-                        });
-                        0.0
-                    }
-                }
-                _ => 0.0,
-            }
+        // Use pre-computed highlight state from RenderCtx instead of per-
+        // message data_mut lookups.
+        let highlight_alpha: f32 = match (&rctx.highlight_server_id, msg.server_id.as_deref()) {
+            (Some(hl_id), Some(msg_id)) if hl_id == msg_id => rctx.highlight_alpha,
+            _ => 0.0,
         };
         let bg = if highlight_alpha > 0.0 {
             let a = (50.0 * highlight_alpha) as u8;
@@ -989,9 +1265,9 @@ impl<'a> MessageList<'a> {
                     return;
                 }
                 let rt = if is_action {
-                    RichText::new(&cleaned).italics().color(action_color)
+                    RichText::new(&*cleaned).italics().color(action_color)
                 } else {
-                    RichText::new(&cleaned)
+                    RichText::new(&*cleaned)
                 };
                 let resp = ui.add(Label::new(rt).wrap().selectable(true));
                 resp.context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
@@ -1261,7 +1537,27 @@ impl<'a> MessageList<'a> {
 /// that appear without a preceding base character, zero-width joiners/non-
 /// joiners, direction overrides, and other control characters that most fonts
 /// cannot render.
-fn strip_invisible_chars(s: &str) -> String {
+///
+/// PERF: fast-path scan first — if no bytes need stripping, return a
+/// zero-allocation `Cow::Borrowed` pointing at the original string.
+fn strip_invisible_chars(s: &str) -> std::borrow::Cow<'_, str> {
+    // Fast-path: scan for any character that might need stripping.
+    // Most chat messages are plain ASCII text with no invisible chars,
+    // so this avoids allocating a new String every frame per text span.
+    let needs_work = s.chars().any(|c| {
+        if c == ' ' || c == '\n' || c == '\t' {
+            return false;
+        }
+        if c.is_control() {
+            return true;
+        }
+        let cp = c as u32;
+        is_invisible_codepoint(cp) || is_combining_codepoint(cp)
+    });
+    if !needs_work {
+        return std::borrow::Cow::Borrowed(s);
+    }
+
     let mut out = String::with_capacity(s.len());
     let mut prev_is_base = false; // was the previous kept char a base character?
     for c in s.chars() {
@@ -1277,59 +1573,12 @@ fn strip_invisible_chars(s: &str) -> String {
         }
         let cp = c as u32;
         // Zero-width and invisible formatting characters - always drop.
-        if matches!(
-            cp,
-            0x00AD             // Soft Hyphen
-            | 0x034F           // Combining Grapheme Joiner
-            | 0x061C           // Arabic Letter Mark
-            | 0x180E           // Mongolian Vowel Separator
-            | 0x200B           // Zero Width Space
-            | 0x200C           // Zero Width Non-Joiner
-            | 0x200D           // Zero Width Joiner (outside emoji context)
-            | 0x200E           // LTR Mark
-            | 0x200F           // RTL Mark
-            | 0x2028           // Line Separator
-            | 0x2029           // Paragraph Separator
-            | 0x202A..=0x202E  // LTR/RTL embedding/override/pop
-            | 0x2060           // Word Joiner
-            | 0x2061..=0x2064  // Invisible operators
-            | 0x2066..=0x2069  // Isolate formatting
-            | 0x206A..=0x206F  // Deprecated formatting
-            | 0x2800           // Braille Pattern Blank
-            | 0x3164           // Hangul Filler
-            | 0xFE00..=0xFE0F  // Variation Selectors
-            | 0xFEFF           // BOM / Zero Width No-Break Space
-            | 0xFFA0           // Halfwidth Hangul Filler
-            | 0xFFF9..=0xFFFB  // Interlinear annotations
-            | 0xE0000..=0xE007F // Tags block
-            | 0xE0100..=0xE01EF // Variation Selectors Supplement
-        ) {
+        if is_invisible_codepoint(cp) {
             continue;
         }
         // Combining marks: keep them only when they follow a base character,
         // otherwise they render as standalone squares / dotted circles.
-        let is_combining = matches!(
-            cp,
-            0x0300..=0x036F    // Combining Diacritical Marks
-            | 0x0483..=0x0489  // Combining Cyrillic
-            | 0x0591..=0x05BD  // Hebrew accents
-            | 0x05BF | 0x05C1..=0x05C2 | 0x05C4..=0x05C5 | 0x05C7
-            | 0x0610..=0x061A  // Arabic combining
-            | 0x064B..=0x065F  // Arabic combining marks
-            | 0x0670           // Arabic superscript alef
-            | 0x06D6..=0x06DC  // Arabic small marks
-            | 0x06DF..=0x06E4
-            | 0x06E7..=0x06E8
-            | 0x06EA..=0x06ED
-            | 0x0730..=0x074A  // Syriac combining
-            | 0x0E31 | 0x0E34..=0x0E3A | 0x0E47..=0x0E4E  // Thai
-            | 0x0EB1 | 0x0EB4..=0x0EBC | 0x0EC8..=0x0ECE  // Lao
-            | 0x1AB0..=0x1AFF  // Combining Diacritical Marks Extended
-            | 0x1DC0..=0x1DFF  // Combining Diacritical Marks Supplement
-            | 0x20D0..=0x20FF  // Combining Marks for Symbols
-            | 0xFE20..=0xFE2F  // Combining Half Marks
-        );
-        if is_combining {
+        if is_combining_codepoint(cp) {
             if prev_is_base {
                 out.push(c);
             }
@@ -1341,7 +1590,65 @@ fn strip_invisible_chars(s: &str) -> String {
         prev_is_base = true;
         out.push(c);
     }
-    out
+    std::borrow::Cow::Owned(out)
+}
+
+/// Returns true for zero-width and invisible formatting codepoints.
+#[inline]
+fn is_invisible_codepoint(cp: u32) -> bool {
+    matches!(
+        cp,
+        0x00AD             // Soft Hyphen
+        | 0x034F           // Combining Grapheme Joiner
+        | 0x061C           // Arabic Letter Mark
+        | 0x180E           // Mongolian Vowel Separator
+        | 0x200B           // Zero Width Space
+        | 0x200C           // Zero Width Non-Joiner
+        | 0x200D           // Zero Width Joiner (outside emoji context)
+        | 0x200E           // LTR Mark
+        | 0x200F           // RTL Mark
+        | 0x2028           // Line Separator
+        | 0x2029           // Paragraph Separator
+        | 0x202A..=0x202E  // LTR/RTL embedding/override/pop
+        | 0x2060           // Word Joiner
+        | 0x2061..=0x2064  // Invisible operators
+        | 0x2066..=0x2069  // Isolate formatting
+        | 0x206A..=0x206F  // Deprecated formatting
+        | 0x2800           // Braille Pattern Blank
+        | 0x3164           // Hangul Filler
+        | 0xFE00..=0xFE0F  // Variation Selectors
+        | 0xFEFF           // BOM / Zero Width No-Break Space
+        | 0xFFA0           // Halfwidth Hangul Filler
+        | 0xFFF9..=0xFFFB  // Interlinear annotations
+        | 0xE0000..=0xE007F // Tags block
+        | 0xE0100..=0xE01EF // Variation Selectors Supplement
+    )
+}
+
+/// Returns true for Unicode combining mark codepoints.
+#[inline]
+fn is_combining_codepoint(cp: u32) -> bool {
+    matches!(
+        cp,
+        0x0300..=0x036F    // Combining Diacritical Marks
+        | 0x0483..=0x0489  // Combining Cyrillic
+        | 0x0591..=0x05BD  // Hebrew accents
+        | 0x05BF | 0x05C1..=0x05C2 | 0x05C4..=0x05C5 | 0x05C7
+        | 0x0610..=0x061A  // Arabic combining
+        | 0x064B..=0x065F  // Arabic combining marks
+        | 0x0670           // Arabic superscript alef
+            | 0x06D6..=0x06DC  // Arabic small marks
+            | 0x06DF..=0x06E4
+            | 0x06E7..=0x06E8
+            | 0x06EA..=0x06ED
+            | 0x0730..=0x074A  // Syriac combining
+            | 0x0E31 | 0x0E34..=0x0E3A | 0x0E47..=0x0E4E  // Thai
+            | 0x0EB1 | 0x0EB4..=0x0EBC | 0x0EC8..=0x0ECE  // Lao
+            | 0x1AB0..=0x1AFF  // Combining Diacritical Marks Extended
+            | 0x1DC0..=0x1DFF  // Combining Diacritical Marks Supplement
+            | 0x20D0..=0x20FF  // Combining Marks for Symbols
+            | 0xFE20..=0xFE2F  // Combining Half Marks
+    )
 }
 
 /// Scale image dimensions to a target height, preserving aspect ratio.

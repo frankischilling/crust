@@ -7,6 +7,7 @@ pub mod irc_status;
 pub mod join_dialog;
 pub mod loading_screen;
 pub mod login_dialog;
+pub mod message_search;
 pub mod message_list;
 pub mod user_profile_popup;
 

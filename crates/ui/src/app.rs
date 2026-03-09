@@ -27,6 +27,10 @@ use crate::widgets::{
     join_dialog::JoinDialog,
     loading_screen::{LoadEvent, LoadingScreen},
     login_dialog::{LoginAction, LoginDialog},
+    message_search::{
+        show_message_search_inline, show_message_search_window,
+        should_use_search_window, MessageSearchState,
+    },
     message_list::MessageList,
     user_profile_popup::{PopupAction, UserProfilePopup},
 };
@@ -233,6 +237,8 @@ pub struct CrustApp {
     stv_avatars: HashMap<String, String>,
     /// Split-pane state for multi-channel side-by-side view.
     split_panes: SplitPanes,
+    /// Per-channel message search and filter state.
+    message_search: HashMap<ChannelId, MessageSearchState>,
 }
 
 /// Apply the Crust colour palette to egui, reading the current dark/light
@@ -342,6 +348,7 @@ impl CrustApp {
             always_on_top: false,
             stv_avatars: HashMap::new(),
             split_panes: SplitPanes::default(),
+            message_search: HashMap::new(),
         }
     }
 
@@ -922,12 +929,47 @@ impl CrustApp {
             warn!("Command channel full/closed");
         }
     }
+
+    fn active_search_target(&self) -> Option<ChannelId> {
+        if self.split_panes.panes.len() > 1 {
+            self.split_panes
+                .focused_channel()
+                .cloned()
+                .or_else(|| self.state.active_channel.clone())
+        } else {
+            self.state.active_channel.clone()
+        }
+    }
+
+    fn message_search_mut(&mut self, channel: &ChannelId) -> &mut MessageSearchState {
+        self.message_search.entry(channel.clone()).or_default()
+    }
+
+    fn handle_search_shortcuts(&mut self, ctx: &Context) {
+        let open_search = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::F));
+        let close_search = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        let Some(channel) = self.active_search_target() else {
+            return;
+        };
+
+        if open_search {
+            self.message_search_mut(&channel).request_open();
+        }
+        if close_search {
+            let search = self.message_search_mut(&channel);
+            if search.open {
+                search.close();
+            }
+        }
+    }
 }
 
 // eframe::App implementation
 
 impl eframe::App for CrustApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        self.handle_search_shortcuts(ctx);
+
         let events = self.drain_events(ctx);
         let had_events = events > 0;
 
@@ -2354,6 +2396,7 @@ impl eframe::App for CrustApp {
                 channel: ch.clone(),
             });
             self.state.leave_channel(&ch);
+            self.message_search.remove(&ch);
         }
         if let Some(new_order) = ch_reordered {
             self.state.channel_order = new_order;
@@ -2756,8 +2799,46 @@ impl eframe::App for CrustApp {
 
                         // ── Message list (remaining space) ───────
                         // Region between header bottom and input top.
+                        let mut search_h = 0.0;
+                        if let Some(ch_state) = self.state.channels.get(&ch) {
+                            let search_open = self
+                                .message_search
+                                .get(&ch)
+                                .map(|s| s.open)
+                                .unwrap_or(false);
+                            if search_open {
+                                if let Some(search) = self.message_search.get_mut(&ch) {
+                                    if should_use_search_window(pane_w) {
+                                        show_message_search_window(
+                                            ctx,
+                                            &ch,
+                                            &ch_state.messages,
+                                            search,
+                                            self.always_on_top,
+                                        );
+                                    } else {
+                                        let search_rect = egui::Rect::from_min_max(
+                                            egui::pos2(pane_rect.left() + 6.0, pane_rect.top() + 30.0),
+                                            egui::pos2(pane_rect.right() - 6.0, input_rect.top()),
+                                        );
+                                        let mut search_ui = pane_ui.new_child(
+                                            egui::UiBuilder::new()
+                                                .max_rect(search_rect)
+                                                .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                                        );
+                                        search_ui.set_clip_rect(search_rect);
+                                        search_h = show_message_search_inline(
+                                            &mut search_ui,
+                                            &ch,
+                                            &ch_state.messages,
+                                            search,
+                                        ) + 8.0;
+                                    }
+                                }
+                            }
+                        }
                         let msg_rect = egui::Rect::from_min_max(
-                            egui::pos2(pane_rect.left(), pane_rect.top() + 24.0),
+                            egui::pos2(pane_rect.left(), pane_rect.top() + 24.0 + search_h),
                             egui::pos2(pane_rect.right(), input_rect.top()),
                         );
                         if let Some(ch_state) =
@@ -2787,6 +2868,7 @@ impl eframe::App for CrustApp {
                                 &self.cmd_tx,
                                 &ch,
                                 &self.link_previews,
+                                self.message_search.get(&ch),
                             )
                             .show(&mut msg_ui);
                             if let Some(r) = ml.reply {
@@ -3041,6 +3123,42 @@ impl eframe::App for CrustApp {
 
                     // Messages above the input
                     if let Some(state) = self.state.channels.get(&active_ch) {
+                        if self
+                            .message_search
+                            .get(&active_ch)
+                            .map(|s| s.open)
+                            .unwrap_or(false)
+                        {
+                            if let Some(search) = self.message_search.get_mut(&active_ch) {
+                                if should_use_search_window(ui.available_width()) {
+                                    show_message_search_window(
+                                        ctx,
+                                        &active_ch,
+                                        &state.messages,
+                                        search,
+                                        self.always_on_top,
+                                    );
+                                } else {
+                                    let search_rect = egui::Rect::from_min_max(
+                                        egui::pos2(ui.min_rect().left() + 6.0, ui.min_rect().top() + 6.0),
+                                        egui::pos2(ui.max_rect().right() - 6.0, ui.max_rect().bottom()),
+                                    );
+                                    let mut search_ui = ui.new_child(
+                                        egui::UiBuilder::new()
+                                            .max_rect(search_rect)
+                                            .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                                    );
+                                    search_ui.set_clip_rect(search_rect);
+                                    let search_h = show_message_search_inline(
+                                        &mut search_ui,
+                                        &active_ch,
+                                        &state.messages,
+                                        search,
+                                    ) + 10.0;
+                                    ui.allocate_space(egui::vec2(0.0, search_h));
+                                }
+                            }
+                        }
                         let is_broadcaster = self
                             .state
                             .auth
@@ -3068,6 +3186,7 @@ impl eframe::App for CrustApp {
                             &self.cmd_tx,
                             &active_ch,
                             &self.link_previews,
+                            self.message_search.get(&active_ch),
                         )
                         .show(&mut msg_ui);
                         if let Some(r) = ml_result.reply {
