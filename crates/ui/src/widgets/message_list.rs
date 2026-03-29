@@ -1,12 +1,16 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use egui::{Color32, Id, Label, LayerId, Order, RichText, ScrollArea, Ui, Vec2};
+use image::DynamicImage;
 use tokio::sync::mpsc;
 
 use crust_core::{
     events::{AppCommand, LinkPreview},
-    model::{Badge, ChannelId, ChatMessage, MessageFlags, MsgKind, ReplyInfo, Span},
+    model::{
+        Badge, ChannelId, ChatMessage, MessageFlags, MsgKind, ReplyInfo, SenderNamePaint, Span,
+    },
 };
 
 use crate::theme as t;
@@ -18,6 +22,18 @@ pub struct MessageListResult {
     pub reply: Option<ReplyInfo>,
     /// Set when a username was clicked: (login, sender_badges).
     pub profile_request: Option<(String, Vec<Badge>)>,
+    /// Lightweight per-frame counters for the debug performance overlay.
+    pub perf_stats: MessageListPerfStats,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MessageListPerfStats {
+    pub retained_rows: usize,
+    pub active_rows: usize,
+    pub rendered_rows: usize,
+    pub boundary_hidden_rows: usize,
+    pub prefix_rebuilt: bool,
+    pub height_cache_misses: usize,
 }
 
 // ── Zero-allocation visible-index abstraction ────────────────────────────
@@ -56,6 +72,26 @@ impl VisibleIndices {
             Self::Filtered(v) => v.iter().position(|&idx| pred(idx)),
         }
     }
+
+    fn collect_ids(&self, messages: &VecDeque<ChatMessage>) -> Vec<u64> {
+        (0..self.len())
+            .map(|i| messages[self.get(i)].id.0)
+            .collect()
+    }
+}
+
+/// Extra context to locate a reply parent when direct msg-id lookup fails.
+#[derive(Clone, Default)]
+struct ReplyScrollHint {
+    parent_user_login: String,
+    parent_msg_body: String,
+    child_msg_local_id: u64,
+}
+
+#[derive(Clone)]
+enum StaticFrameCacheEntry {
+    Loaded(egui::TextureHandle),
+    Unavailable,
 }
 
 /// Pre-computed per-frame values passed to `render_message` to avoid
@@ -63,6 +99,7 @@ impl VisibleIndices {
 struct RenderCtx {
     reply_key: Id,
     scroll_to_key: Id,
+    scroll_hint_key: Id,
     /// The server-id of the message currently being flash-highlighted (if any).
     highlight_server_id: Option<String>,
     /// Pre-computed base alpha for the highlight flash (0.0 when inactive).
@@ -74,14 +111,162 @@ struct RenderCtx {
 
 const EMOTE_SIZE: f32 = 22.0;
 const TOOLTIP_EMOTE_SIZE: f32 = 112.0;
-const BADGE_SIZE: f32 = 16.0;
-const TOOLTIP_BADGE_SIZE: f32 = 64.0;
+const BADGE_SIZE: f32 = 18.0;
+const TOOLTIP_BADGE_SIZE: f32 = 72.0;
+const MAX_CACHED_USERNAME_COLORS: usize = 8192;
 /// Row left/right padding (px)
 const ROW_PAD_X: f32 = 6.0;
 /// Row top/bottom padding (px)
 const ROW_PAD_Y: f32 = 2.0;
 /// Fallback height for rows we have never rendered before.
 const EST_H: f32 = 26.0;
+const HOT_WINDOW_TRIGGER: usize = 600;
+const HOT_WINDOW_ROWS: usize = 400;
+const HOT_WINDOW_EXPAND_CHUNK: usize = 200;
+const HOT_WINDOW_EXPAND_THRESHOLD_PX: f32 = 24.0;
+const COMPACT_BOUNDARY_HEIGHT: f32 = 22.0;
+
+// Twitch username fallback palette used when no explicit color is provided.
+const TWITCH_USERNAME_COLORS: [Color32; 15] = [
+    Color32::from_rgb(255, 0, 0),     // Red
+    Color32::from_rgb(0, 0, 255),     // Blue
+    Color32::from_rgb(0, 255, 0),     // Green
+    Color32::from_rgb(178, 34, 34),   // FireBrick
+    Color32::from_rgb(255, 127, 80),  // Coral
+    Color32::from_rgb(154, 205, 50),  // YellowGreen
+    Color32::from_rgb(255, 69, 0),    // OrangeRed
+    Color32::from_rgb(46, 139, 87),   // SeaGreen
+    Color32::from_rgb(218, 165, 32),  // GoldenRod
+    Color32::from_rgb(210, 105, 30),  // Chocolate
+    Color32::from_rgb(95, 158, 160),  // CadetBlue
+    Color32::from_rgb(30, 144, 255),  // DodgerBlue
+    Color32::from_rgb(255, 105, 180), // HotPink
+    Color32::from_rgb(138, 43, 226),  // BlueViolet
+    Color32::from_rgb(0, 255, 127),   // SpringGreen
+];
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HotWindowState {
+    active_rows: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct ScrollAnchor {
+    message_id: u64,
+    /// Distance from the viewport top to the anchor row's top edge.
+    distance_to_viewport_top: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HotWindowPlan {
+    active_start: usize,
+    active_len: usize,
+    hidden_rows: usize,
+}
+
+impl HotWindowPlan {
+    fn full(total_rows: usize) -> Self {
+        Self {
+            active_start: 0,
+            active_len: total_rows,
+            hidden_rows: 0,
+        }
+    }
+
+    fn has_boundary(&self) -> bool {
+        self.hidden_rows > 0
+    }
+
+    fn boundary_height(&self) -> f32 {
+        if self.has_boundary() {
+            COMPACT_BOUNDARY_HEIGHT
+        } else {
+            0.0
+        }
+    }
+}
+
+fn compute_hot_window_plan(
+    total_rows: usize,
+    search_filtering: bool,
+    following_bottom: bool,
+    requested_active_rows: usize,
+) -> HotWindowPlan {
+    if search_filtering || total_rows <= HOT_WINDOW_TRIGGER {
+        return HotWindowPlan::full(total_rows);
+    }
+
+    let active_len = if following_bottom {
+        HOT_WINDOW_ROWS.min(total_rows)
+    } else {
+        requested_active_rows.max(HOT_WINDOW_ROWS).min(total_rows)
+    };
+    let active_start = total_rows.saturating_sub(active_len);
+
+    HotWindowPlan {
+        active_start,
+        active_len,
+        hidden_rows: active_start,
+    }
+}
+
+fn expand_hot_window_rows(current_active_rows: usize, total_rows: usize) -> usize {
+    current_active_rows
+        .saturating_add(HOT_WINDOW_EXPAND_CHUNK)
+        .min(total_rows)
+}
+
+fn should_expand_hot_window(plan: HotWindowPlan, scroll_paused: bool, scroll_offset: f32) -> bool {
+    scroll_paused && plan.has_boundary() && scroll_offset <= HOT_WINDOW_EXPAND_THRESHOLD_PX
+}
+
+fn capture_scroll_anchor(
+    active_ids: &[u64],
+    prefix: &[f32],
+    boundary_height: f32,
+    scroll_offset: f32,
+) -> Option<ScrollAnchor> {
+    if active_ids.is_empty() {
+        return None;
+    }
+
+    let content_offset = (scroll_offset - boundary_height).max(0.0);
+    let idx = prefix
+        .partition_point(|&p| p <= content_offset)
+        .saturating_sub(1)
+        .min(active_ids.len().saturating_sub(1));
+    let anchor_top = boundary_height + prefix.get(idx).copied().unwrap_or(0.0);
+    Some(ScrollAnchor {
+        message_id: active_ids[idx],
+        distance_to_viewport_top: anchor_top - scroll_offset,
+    })
+}
+
+fn compensate_anchor_offset(
+    anchor: &ScrollAnchor,
+    active_ids: &[u64],
+    height_cache: &HashMap<u64, f32>,
+    boundary_height: f32,
+) -> Option<f32> {
+    let anchor_idx = active_ids.iter().position(|&id| id == anchor.message_id)?;
+    let before_anchor: f32 = active_ids[..anchor_idx]
+        .iter()
+        .map(|id| height_cache.get(id).copied().unwrap_or(EST_H))
+        .sum();
+    Some((boundary_height + before_anchor - anchor.distance_to_viewport_top).max(0.0))
+}
+
+fn map_snapshot_ids_to_indices(snapshot_ids: &[u64], live_ids: &[u64]) -> Vec<usize> {
+    let id_to_index: HashMap<u64, usize> = live_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (*id, i))
+        .collect();
+    snapshot_ids
+        .iter()
+        .filter_map(|id| id_to_index.get(id).copied())
+        .collect()
+}
 
 /// Scrollable, bottom-anchored list of chat messages with inline emote images.
 pub struct MessageList<'a> {
@@ -96,6 +281,12 @@ pub struct MessageList<'a> {
     link_previews: &'a HashMap<String, LinkPreview>,
     /// Optional active search filter for this channel.
     search: Option<&'a MessageSearchState>,
+    /// Whether long messages are collapsed with an ellipsis.
+    collapse_long_messages: bool,
+    /// Maximum visible lines before collapse applies.
+    collapse_long_message_lines: usize,
+    /// Whether animated emotes should animate this frame.
+    animate_emotes: bool,
 }
 
 impl<'a> MessageList<'a> {
@@ -106,6 +297,9 @@ impl<'a> MessageList<'a> {
         channel: &'a ChannelId,
         link_previews: &'a HashMap<String, LinkPreview>,
         search: Option<&'a MessageSearchState>,
+        collapse_long_messages: bool,
+        collapse_long_message_lines: usize,
+        animate_emotes: bool,
     ) -> Self {
         Self {
             messages,
@@ -114,6 +308,9 @@ impl<'a> MessageList<'a> {
             channel,
             link_previews,
             search,
+            collapse_long_messages,
+            collapse_long_message_lines: collapse_long_message_lines.max(1),
+            animate_emotes,
         }
     }
 
@@ -125,6 +322,10 @@ impl<'a> MessageList<'a> {
     /// * Returns a [`MessageListResult`] that may contain a reply request.
     pub fn show(&self, ui: &mut Ui) -> MessageListResult {
         let reply_key = Id::new("ml_reply_req").with(self.channel.as_str());
+        let user_color_cache_key = Id::new("ml_user_color_cache").with(self.channel.as_str());
+        let mut user_color_cache: HashMap<String, Color32> = ui
+            .ctx()
+            .data_mut(|d| d.get_temp(user_color_cache_key).unwrap_or_default());
         // We need the available rect before the scroll area consumes it
         let panel_rect = ui.available_rect_before_wrap();
         // Keep a small safety gap at the bottom so message pixels/emotes
@@ -133,9 +334,10 @@ impl<'a> MessageList<'a> {
         clip.max.y = clip.max.y.min(panel_rect.max.y - 2.0);
         ui.set_clip_rect(clip);
 
+        let search_filtering = self.search.map(|s| s.is_filtering()).unwrap_or(false);
         // PERF: use VisibleIndices enum to avoid O(n) Vec allocation when
         // no search filter is active (the common case).
-        let visible_indices: VisibleIndices = match self.search {
+        let live_visible_indices: VisibleIndices = match self.search {
             Some(search) if search.is_filtering() => VisibleIndices::Filtered(
                 self.messages
                     .iter()
@@ -145,12 +347,42 @@ impl<'a> MessageList<'a> {
             ),
             _ => VisibleIndices::All(self.messages.len()),
         };
-        let n = visible_indices.len();
+        let live_visible_count = live_visible_indices.len();
         // Use a per-channel scroll area ID so offset doesn't leak
         let scroll_id = egui::Id::new("message_list").with(self.channel.as_str());
         let paused_key = egui::Id::new("scroll_paused").with(self.channel.as_str());
-        let prev_offset_key = egui::Id::new("scroll_prev_offset").with(self.channel.as_str());
-        let paused_ids_key = egui::Id::new("scroll_paused_ids").with(self.channel.as_str());
+        let paused_snapshot_key = egui::Id::new("paused_snapshot_ids").with(self.channel.as_str());
+        let paused_before_show: bool = ui
+            .ctx()
+            .data_mut(|d| d.get_temp(paused_key).unwrap_or(false));
+
+        // Paused snapshot behavior:
+        // freeze the rendered message-id set while paused so incoming chat does
+        // not keep shifting the lines the user is reading.
+        let visible_indices: VisibleIndices = if paused_before_show && !search_filtering {
+            let mut snapshot_ids: Vec<u64> = ui
+                .ctx()
+                .data_mut(|d| d.get_temp(paused_snapshot_key).unwrap_or_default());
+            if snapshot_ids.is_empty() {
+                snapshot_ids = live_visible_indices.collect_ids(self.messages);
+            }
+            let live_ids: Vec<u64> = self.messages.iter().map(|m| m.id.0).collect();
+            let mapped = map_snapshot_ids_to_indices(&snapshot_ids, &live_ids);
+            let persisted_ids: Vec<u64> = mapped.iter().map(|&idx| live_ids[idx]).collect();
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(paused_snapshot_key, persisted_ids));
+            if mapped.is_empty() {
+                live_visible_indices
+            } else {
+                VisibleIndices::Filtered(mapped)
+            }
+        } else {
+            ui.ctx()
+                .data_mut(|d| d.remove_temp::<Vec<u64>>(paused_snapshot_key));
+            live_visible_indices
+        };
+        let n = visible_indices.len();
+        let paused_snapshot_new_rows = live_visible_count.saturating_sub(n);
 
         // If the user scrolls over the message panel, immediately pause
         // stick-to-bottom so upward wheel input can take effect this frame.
@@ -202,8 +434,13 @@ impl<'a> MessageList<'a> {
         // (which clones the entire HashMap every frame).  The cache is put
         // back via insert_temp at the end of each path.
         let hc_id = egui::Id::new("msg_row_h").with(self.channel.as_str());
-        let mut height_cache: std::collections::HashMap<u64, f32> =
-            ui.ctx().data_mut(|d| d.remove_temp(hc_id).unwrap_or_default());
+        let mut height_cache: std::collections::HashMap<u64, f32> = ui
+            .ctx()
+            .data_mut(|d| d.remove_temp(hc_id).unwrap_or_default());
+        let static_id = egui::Id::new("ml_static_frames").with(self.channel.as_str());
+        let mut static_frames: HashMap<String, StaticFrameCacheEntry> = ui
+            .ctx()
+            .data_mut(|d| d.remove_temp(static_id).unwrap_or_default());
 
         // Invalidate height cache when available width changes significantly
         // (e.g. window resize or sidebar drag), since messages re-wrap to
@@ -230,26 +467,30 @@ impl<'a> MessageList<'a> {
         // Written by the reply-header click handler; read and cleared here so
         // it only fires once.
         let scroll_to_key = egui::Id::new("ml_scroll_to").with(self.channel.as_str());
+        let scroll_hint_key = egui::Id::new("ml_scroll_hint").with(self.channel.as_str());
         let highlight_key = egui::Id::new("ml_highlight_msg").with(self.channel.as_str());
         let highlight_time_key = egui::Id::new("ml_highlight_t").with(self.channel.as_str());
+        let hot_state_key = egui::Id::new("ml_hot_window").with(self.channel.as_str());
+        let anchor_key = egui::Id::new("ml_scroll_anchor").with(self.channel.as_str());
+        let scroll_target_pending = ui.ctx().data_mut(|d| {
+            d.get_temp::<String>(scroll_to_key).is_some()
+                || d.get_temp::<ReplyScrollHint>(scroll_hint_key).is_some()
+        });
         let forced_offset: Option<f32> = {
-            let target: Option<String> = ui.ctx().data_mut(|d| {
-                let v: Option<String> = d.get_temp(scroll_to_key);
-                if v.is_some() {
-                    d.remove::<String>(scroll_to_key);
-                }
-                v
-            });
-            target.and_then(|tgt_id| {
-                let idx = visible_indices.position(|msg_idx| {
-                    self.messages[msg_idx].server_id.as_deref() == Some(tgt_id.as_str())
-                })?;
+            let target: Option<String> = ui.ctx().data_mut(|d| d.remove_temp(scroll_to_key));
+            let hint: Option<ReplyScrollHint> =
+                ui.ctx().data_mut(|d| d.remove_temp(scroll_hint_key));
+            let idx =
+                self.find_reply_target_index(&visible_indices, target.as_deref(), hint.as_ref());
+            idx.map(|idx| {
                 // Store the target server_id + time for a brief highlight flash.
                 let now = ui.input(|i| i.time);
-                ui.ctx().data_mut(|d| {
-                    d.insert_temp(highlight_key, tgt_id.clone());
-                    d.insert_temp(highlight_time_key, now);
-                });
+                if let Some(tgt_id) = target {
+                    ui.ctx().data_mut(|d| {
+                        d.insert_temp(highlight_key, tgt_id);
+                        d.insert_temp(highlight_time_key, now);
+                    });
+                }
                 let offset: f32 = (0..idx)
                     .map(|i| {
                         height_cache
@@ -258,31 +499,50 @@ impl<'a> MessageList<'a> {
                             .unwrap_or(EST_H)
                     })
                     .sum();
-                Some(offset)
+                offset
             })
         };
 
-        let paused_before_show: bool = ui
+        let mut hot_state: HotWindowState = ui
             .ctx()
-            .data_mut(|d| d.get_temp(paused_key).unwrap_or(false));
-        let prev_offset: f32 = ui
-            .ctx()
-            .data_mut(|d| d.get_temp(prev_offset_key).unwrap_or(0.0));
-        let prev_paused_ids: Vec<u64> = ui
-            .ctx()
-            .data_mut(|d| d.remove_temp(paused_ids_key).unwrap_or_default());
-        let current_visible_ids: Vec<u64> = (0..n)
-            .map(|i| self.messages[visible_indices.get(i)].id.0)
+            .data_mut(|d| d.get_temp(hot_state_key).unwrap_or_default());
+        if hot_state.active_rows == 0 {
+            hot_state.active_rows = HOT_WINDOW_ROWS.min(n);
+        }
+        let hot_plan = compute_hot_window_plan(
+            n,
+            search_filtering || scroll_target_pending,
+            !paused_before_show,
+            hot_state.active_rows,
+        );
+        let active_ids: Vec<u64> = (0..hot_plan.active_len)
+            .map(|i| {
+                self.messages[visible_indices.get(hot_plan.active_start + i)]
+                    .id
+                    .0
+            })
             .collect();
         let paused_offset_compensation = if paused_before_show {
-            Self::compensate_paused_offset(
-                &prev_paused_ids,
-                &current_visible_ids,
-                &height_cache,
-                prev_offset,
-            )
+            ui.ctx()
+                .data_mut(|d| d.get_temp::<ScrollAnchor>(anchor_key))
+                .and_then(|anchor| {
+                    compensate_anchor_offset(
+                        &anchor,
+                        &active_ids,
+                        &height_cache,
+                        hot_plan.boundary_height(),
+                    )
+                })
         } else {
             None
+        };
+        let mut perf_stats = MessageListPerfStats {
+            retained_rows: n,
+            active_rows: hot_plan.active_len,
+            rendered_rows: 0,
+            boundary_hidden_rows: hot_plan.hidden_rows,
+            prefix_rebuilt: false,
+            height_cache_misses: 0,
         };
 
         // ── Pre-compute highlight state once per frame ───────────────────
@@ -290,34 +550,35 @@ impl<'a> MessageList<'a> {
         // render_message invocation.  Computing it once here avoids dozens
         // of redundant lock acquisitions per frame.
         let rctx = {
-            let (hl_id, hl_time): (Option<String>, Option<f64>) = ui.ctx().data_mut(|d| {
-                (d.get_temp(highlight_key), d.get_temp(highlight_time_key))
-            });
+            let (hl_id, hl_time): (Option<String>, Option<f64>) = ui
+                .ctx()
+                .data_mut(|d| (d.get_temp(highlight_key), d.get_temp(highlight_time_key)));
             let now = ui.input(|i| i.time);
-            let (highlight_server_id, highlight_alpha, highlight_animating) =
-                match (hl_id, hl_time) {
-                    (Some(id), Some(t0)) => {
-                        let elapsed = (now - t0) as f32;
-                        const FLASH_SECS: f32 = 1.5;
-                        if elapsed < FLASH_SECS {
-                            (Some(id), 1.0 - (elapsed / FLASH_SECS), true)
-                        } else {
-                            // Flash complete — clean up temp data.
-                            ui.ctx().data_mut(|d| {
-                                d.remove::<String>(highlight_key);
-                                d.remove::<f64>(highlight_time_key);
-                            });
-                            (None, 0.0, false)
-                        }
+            let (highlight_server_id, highlight_alpha, highlight_animating) = match (hl_id, hl_time)
+            {
+                (Some(id), Some(t0)) => {
+                    let elapsed = (now - t0) as f32;
+                    const FLASH_SECS: f32 = 1.5;
+                    if elapsed < FLASH_SECS {
+                        (Some(id), 1.0 - (elapsed / FLASH_SECS), true)
+                    } else {
+                        // Flash complete — clean up temp data.
+                        ui.ctx().data_mut(|d| {
+                            d.remove::<String>(highlight_key);
+                            d.remove::<f64>(highlight_time_key);
+                        });
+                        (None, 0.0, false)
                     }
-                    _ => (None, 0.0, false),
-                };
+                }
+                _ => (None, 0.0, false),
+            };
             if highlight_animating {
                 ui.ctx().request_repaint();
             }
             RenderCtx {
                 reply_key,
                 scroll_to_key,
+                scroll_hint_key,
                 highlight_server_id,
                 highlight_alpha,
                 highlight_animating,
@@ -353,13 +614,19 @@ impl<'a> MessageList<'a> {
                     ui.label(RichText::new(text).color(t::text_muted()));
                 });
             });
-            ui.ctx().data_mut(|d| d.insert_temp(hc_id, height_cache));
-            self.show_resume_button(ui, &output, panel_rect);
+            ui.ctx().data_mut(|d| {
+                d.insert_temp(hc_id, height_cache);
+                d.insert_temp(static_id, static_frames);
+                d.insert_temp(hot_state_key, HotWindowState { active_rows: 0 });
+                d.insert_temp(user_color_cache_key, user_color_cache);
+                d.remove_temp::<ScrollAnchor>(anchor_key);
+            });
+            self.show_resume_button(ui, &output, panel_rect, paused_snapshot_new_rows);
             self.apply_snap(ui, &output);
-            self.persist_paused_anchor(ui, paused_ids_key, &current_visible_ids);
             return MessageListResult {
                 reply: self.take_reply(ui, rctx.reply_key),
                 profile_request: self.take_profile_request(ui),
+                perf_stats,
             };
         }
 
@@ -384,11 +651,11 @@ impl<'a> MessageList<'a> {
             let output = sa.show(ui, |ui| {
                 let full_width = ui.available_width();
                 ui.set_min_width(full_width);
-                for vi in 0..n {
+                for vi in hot_plan.active_start..(hot_plan.active_start + hot_plan.active_len) {
                     let msg_idx = visible_indices.get(vi);
                     let msg = &self.messages[msg_idx];
                     let top_y = ui.next_widget_position().y;
-                    self.render_message(ui, msg, &rctx);
+                    self.render_message(ui, msg, &rctx, &mut static_frames, &mut user_color_cache);
                     let measured = ui.next_widget_position().y - top_y;
                     if measured > 0.0 {
                         height_cache.insert(msg.id.0, measured);
@@ -396,14 +663,37 @@ impl<'a> MessageList<'a> {
                 }
             });
 
-            // Persist height cache for seamless transition to virtual scrolling.
-            ui.ctx().data_mut(|d| d.insert_temp(hc_id, height_cache));
-            self.show_resume_button(ui, &output, panel_rect);
+            self.show_resume_button(ui, &output, panel_rect, paused_snapshot_new_rows);
             self.apply_snap(ui, &output);
-            self.persist_paused_anchor(ui, paused_ids_key, &current_visible_ids);
+            let scroll_paused: bool = ui
+                .ctx()
+                .data_mut(|d| d.get_temp(paused_key).unwrap_or(false));
+            let mut anchor_prefix = Vec::with_capacity(active_ids.len() + 1);
+            anchor_prefix.push(0.0);
+            for id in &active_ids {
+                let h = height_cache.get(id).copied().unwrap_or(EST_H);
+                anchor_prefix.push(anchor_prefix.last().copied().unwrap_or(0.0) + h);
+            }
+            self.persist_scroll_anchor(
+                ui,
+                anchor_key,
+                scroll_paused,
+                &active_ids,
+                &anchor_prefix,
+                0.0,
+                output.state.offset.y,
+            );
+            ui.ctx().data_mut(|d| {
+                d.insert_temp(hc_id, height_cache);
+                d.insert_temp(static_id, static_frames);
+                d.insert_temp(hot_state_key, HotWindowState { active_rows: 0 });
+                d.insert_temp(user_color_cache_key, user_color_cache);
+            });
+            perf_stats.rendered_rows = hot_plan.active_len;
             return MessageListResult {
                 reply: self.take_reply(ui, rctx.reply_key),
                 profile_request: self.take_profile_request(ui),
+                perf_stats,
             };
         }
 
@@ -414,35 +704,50 @@ impl<'a> MessageList<'a> {
         // changed (the common steady-state case).
         let ps_id = egui::Id::new("msg_prefix_sum").with(self.channel.as_str());
         let ps_gen_id = egui::Id::new("msg_prefix_gen").with(self.channel.as_str());
-        let mut prefix: Vec<f32> =
-            ui.ctx().data_mut(|d| d.remove_temp(ps_id).unwrap_or_default());
+        let mut prefix: Vec<f32> = ui
+            .ctx()
+            .data_mut(|d| d.remove_temp(ps_id).unwrap_or_default());
 
         // Build a lightweight generation key from count + first/last message IDs
         // so we detect content changes even when the count stays the same
         // (e.g. ring-buffer eviction: pop_front + push_back at MAX_MESSAGES).
-        let cur_gen: (usize, u64, u64) = if n > 0 {
-            let first_id = self.messages[visible_indices.get(0)].id.0;
-            let last_id = self.messages[visible_indices.get(n - 1)].id.0;
-            (n, first_id, last_id)
+        let cur_gen: (usize, u64, u64, usize) = if hot_plan.active_len > 0 {
+            let first_id = self.messages[visible_indices.get(hot_plan.active_start)]
+                .id
+                .0;
+            let last_id = self.messages
+                [visible_indices.get(hot_plan.active_start + hot_plan.active_len - 1)]
+            .id
+            .0;
+            (hot_plan.active_len, first_id, last_id, hot_plan.hidden_rows)
         } else {
-            (0, 0, 0)
+            (0, 0, 0, 0)
         };
-        let prev_gen: (usize, u64, u64) =
-            ui.ctx().data_mut(|d| d.get_temp(ps_gen_id).unwrap_or((0, 0, 0)));
-        let prefix_stale = prefix.len() != n + 1 || cur_gen != prev_gen;
+        let prev_gen: (usize, u64, u64, usize) = ui
+            .ctx()
+            .data_mut(|d| d.get_temp(ps_gen_id).unwrap_or((0, 0, 0, 0)));
+        let prefix_stale = prefix.len() != hot_plan.active_len + 1 || cur_gen != prev_gen;
         if prefix_stale {
             prefix.clear();
-            prefix.reserve(n + 1);
+            prefix.reserve(hot_plan.active_len + 1);
             prefix.push(0.0f32);
-            for vi in 0..n {
+            for vi in hot_plan.active_start..(hot_plan.active_start + hot_plan.active_len) {
                 let msg_idx = visible_indices.get(vi);
                 let msg = &self.messages[msg_idx];
-                let h = height_cache.get(&msg.id.0).copied().unwrap_or(EST_H);
+                let h = match height_cache.get(&msg.id.0).copied() {
+                    Some(h) => h,
+                    None => {
+                        perf_stats.height_cache_misses += 1;
+                        EST_H
+                    }
+                };
                 prefix.push(prefix.last().unwrap() + h);
             }
             ui.ctx().data_mut(|d| d.insert_temp(ps_gen_id, cur_gen));
         }
-        let total_h = *prefix.last().unwrap_or(&0.0);
+        perf_stats.prefix_rebuilt = prefix_stale;
+        let boundary_h = hot_plan.boundary_height();
+        let total_h = boundary_h + *prefix.last().unwrap_or(&0.0);
 
         // ── Virtual-scrolling render pass ────────────────────────────────
         // show_viewport gives us the currently-visible rect in content-local
@@ -476,46 +781,61 @@ impl<'a> MessageList<'a> {
             let scan_min = (vis_min - OVERSCAN_PX).max(0.0);
             let scan_max = vis_max + OVERSCAN_PX;
 
+            let scan_msg_min = (scan_min - boundary_h).max(0.0);
+            let scan_msg_max = (scan_max - boundary_h).max(0.0);
+
             // First row whose bottom edge is visible (top < vis_max).
-            let mut first = if n == 0 {
+            let mut first = if hot_plan.active_len == 0 {
                 0
             } else {
-                prefix.partition_point(|&p| p < scan_min).saturating_sub(1)
+                prefix
+                    .partition_point(|&p| p < scan_msg_min)
+                    .saturating_sub(1)
             };
             // One past the last visible row (top <= vis_max).
-            let mut last = prefix.partition_point(|&p| p <= scan_max).min(n);
-            let min_last = (first + MIN_RENDER_ROWS).min(n);
+            let mut last = prefix
+                .partition_point(|&p| p <= scan_msg_max)
+                .min(hot_plan.active_len);
+            let min_last = (first + MIN_RENDER_ROWS).min(hot_plan.active_len);
             if last < min_last {
                 last = min_last;
             }
-            let min_rows = MIN_RENDER_ROWS.min(n);
+            let min_rows = MIN_RENDER_ROWS.min(hot_plan.active_len);
             if last.saturating_sub(first) < min_rows {
-                if last == n {
-                    first = n.saturating_sub(min_rows);
+                if last == hot_plan.active_len {
+                    first = hot_plan.active_len.saturating_sub(min_rows);
                 } else {
-                    last = (first + min_rows).min(n);
+                    last = (first + min_rows).min(hot_plan.active_len);
                 }
             }
 
             // Dead space above the visible window.
-            if first > 0 && prefix[first] > 0.0 {
+            let render_boundary = hot_plan.has_boundary() && scan_min < boundary_h;
+            let top_dead = if render_boundary { 0.0 } else { boundary_h };
+            let top_space = top_dead + prefix[first];
+            if top_space > 0.0 {
                 ui.allocate_exact_size(
-                    egui::Vec2::new(full_width, prefix[first]),
+                    egui::Vec2::new(full_width, top_space),
                     egui::Sense::hover(),
                 );
+            }
+            if render_boundary {
+                self.render_compact_boundary(ui, hot_plan.hidden_rows);
             }
 
             // Render only visible rows; measure heights for future frames.
             // Track whether any height changed so we can invalidate the
             // prefix sum for the next frame.
             let mut any_height_changed = false;
+            let mut rendered_rows = 0usize;
             for i in first..last {
-                let msg = &self.messages[visible_indices.get(i)];
+                let msg = &self.messages[visible_indices.get(hot_plan.active_start + i)];
                 let top_y = ui.next_widget_position().y;
 
-                self.render_message(ui, msg, &rctx);
+                self.render_message(ui, msg, &rctx, &mut static_frames, &mut user_color_cache);
 
                 let measured = ui.next_widget_position().y - top_y;
+                rendered_rows += 1;
                 if measured > 0.0 {
                     let prev = height_cache.insert(msg.id.0, measured);
                     if prev.map(|p| (p - measured).abs() > 0.5).unwrap_or(true) {
@@ -523,73 +843,190 @@ impl<'a> MessageList<'a> {
                     }
                 }
             }
+            perf_stats.rendered_rows = rendered_rows;
 
             // If any visible row's measured height changed, force prefix
             // rebuild next frame so the scroll bar and dead-space are correct.
             if any_height_changed {
                 // Invalidate the generation key so the prefix sum is rebuilt next frame.
-                ui.ctx().data_mut(|d| d.insert_temp(ps_gen_id, (0usize, 0u64, 0u64)));
+                ui.ctx()
+                    .data_mut(|d| d.insert_temp(ps_gen_id, (0usize, 0u64, 0u64, 0usize)));
             }
 
             // Dead space below the visible window.
-            let tail = total_h - prefix[last];
+            let tail = total_h - (boundary_h + prefix[last]);
             if tail > 0.0 {
                 ui.allocate_exact_size(egui::Vec2::new(full_width, tail), egui::Sense::hover());
             }
         });
 
+        self.show_resume_button(ui, &output, panel_rect, paused_snapshot_new_rows);
+        self.apply_snap(ui, &output);
+        let scroll_paused: bool = ui
+            .ctx()
+            .data_mut(|d| d.get_temp(paused_key).unwrap_or(false));
+        if should_expand_hot_window(hot_plan, scroll_paused, output.state.offset.y) {
+            let expanded_rows = expand_hot_window_rows(hot_plan.active_len, n);
+            if expanded_rows != hot_plan.active_len {
+                if let Some(anchor) = capture_scroll_anchor(
+                    &active_ids,
+                    &prefix,
+                    hot_plan.boundary_height(),
+                    output.state.offset.y,
+                ) {
+                    ui.ctx().data_mut(|d| d.insert_temp(anchor_key, anchor));
+                }
+                hot_state.active_rows = expanded_rows;
+                ui.ctx().request_repaint();
+            }
+        } else if !scroll_paused {
+            hot_state.active_rows = HOT_WINDOW_ROWS.min(n);
+        } else {
+            hot_state.active_rows = hot_plan.active_len;
+        }
+        self.persist_scroll_anchor(
+            ui,
+            anchor_key,
+            scroll_paused,
+            &active_ids,
+            &prefix,
+            hot_plan.boundary_height(),
+            output.state.offset.y,
+        );
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(hot_state_key, hot_state));
         // Persist height cache and prefix-sum Vec for next frame.
         ui.ctx().data_mut(|d| {
             d.insert_temp(hc_id, height_cache);
             d.insert_temp(ps_id, prefix);
+            d.insert_temp(static_id, static_frames);
+            d.insert_temp(user_color_cache_key, user_color_cache);
         });
-
-        self.show_resume_button(ui, &output, panel_rect);
-        self.apply_snap(ui, &output);
-        self.persist_paused_anchor(ui, paused_ids_key, &current_visible_ids);
         MessageListResult {
             reply: self.take_reply(ui, rctx.reply_key),
             profile_request: self.take_profile_request(ui),
+            perf_stats,
         }
     }
 
-    fn compensate_paused_offset(
-        prev_ids: &[u64],
-        current_ids: &[u64],
-        height_cache: &HashMap<u64, f32>,
-        prev_offset: f32,
-    ) -> Option<f32> {
-        if prev_ids.is_empty() || current_ids.is_empty() || prev_ids[0] == current_ids[0] {
+    fn find_reply_target_index(
+        &self,
+        visible_indices: &VisibleIndices,
+        target_id: Option<&str>,
+        hint: Option<&ReplyScrollHint>,
+    ) -> Option<usize> {
+        // Primary path: exact message-id match from reply-parent-msg-id.
+        if let Some(target_id) = target_id.map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(idx) = visible_indices.position(|msg_idx| {
+                self.messages[msg_idx]
+                    .server_id
+                    .as_deref()
+                    .map(str::trim)
+                    .map(|sid| sid == target_id)
+                    .unwrap_or(false)
+            }) {
+                return Some(idx);
+            }
+            // Be tolerant of case mismatches from external history providers.
+            if let Some(idx) = visible_indices.position(|msg_idx| {
+                self.messages[msg_idx]
+                    .server_id
+                    .as_deref()
+                    .map(str::trim)
+                    .map(|sid| sid.eq_ignore_ascii_case(target_id))
+                    .unwrap_or(false)
+            }) {
+                return Some(idx);
+            }
+        }
+
+        // Fallback path: find the nearest older line whose sender/body match
+        // the embedded reply metadata. This handles history rows where msg-id
+        // tags may be missing or inconsistent.
+        let hint = hint?;
+        let login = hint.parent_user_login.trim();
+        let body = hint.parent_msg_body.trim();
+        if login.is_empty() && body.is_empty() {
             return None;
         }
 
-        let removed_prefix = prev_ids
-            .iter()
-            .position(|&id| id == current_ids[0])
-            .unwrap_or(prev_ids.len());
-        if removed_prefix == 0 {
+        let child_vi = visible_indices
+            .position(|msg_idx| self.messages[msg_idx].id.0 == hint.child_msg_local_id)
+            .unwrap_or(visible_indices.len());
+        if child_vi == 0 {
             return None;
         }
 
-        let removed_height: f32 = prev_ids[..removed_prefix]
-            .iter()
-            .map(|id| height_cache.get(id).copied().unwrap_or(EST_H))
-            .sum();
-        Some((prev_offset - removed_height).max(0.0))
+        for vi in (0..child_vi).rev() {
+            let m = &self.messages[visible_indices.get(vi)];
+            if !login.is_empty() && !m.sender.login.eq_ignore_ascii_case(login) {
+                continue;
+            }
+            if body.is_empty() {
+                return Some(vi);
+            }
+            let raw = m.raw_text.trim();
+            if raw == body || raw.starts_with(body) || body.starts_with(raw) {
+                return Some(vi);
+            }
+        }
+
+        None
     }
 
-    fn persist_paused_anchor(&self, ui: &Ui, paused_ids_key: Id, current_visible_ids: &[u64]) {
-        let paused_key = egui::Id::new("scroll_paused").with(self.channel.as_str());
-        let scroll_paused: bool = ui
-            .ctx()
-            .data_mut(|d| d.get_temp(paused_key).unwrap_or(false));
+    fn persist_scroll_anchor(
+        &self,
+        ui: &Ui,
+        anchor_key: Id,
+        scroll_paused: bool,
+        active_ids: &[u64],
+        prefix: &[f32],
+        boundary_height: f32,
+        scroll_offset: f32,
+    ) {
         ui.ctx().data_mut(|d| {
             if scroll_paused {
-                d.insert_temp(paused_ids_key, current_visible_ids.to_vec());
+                if let Some(anchor) =
+                    capture_scroll_anchor(active_ids, prefix, boundary_height, scroll_offset)
+                {
+                    d.insert_temp(anchor_key, anchor);
+                }
             } else {
-                d.remove::<Vec<u64>>(paused_ids_key);
+                d.remove_temp::<ScrollAnchor>(anchor_key);
             }
         });
+    }
+
+    fn render_compact_boundary(&self, ui: &mut Ui, hidden_rows: usize) {
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), COMPACT_BOUNDARY_HEIGHT),
+            egui::Sense::hover(),
+        );
+        let fill = if t::is_light() {
+            Color32::from_rgb(240, 242, 246)
+        } else {
+            Color32::from_rgb(34, 37, 45)
+        };
+        let stroke = if t::is_light() {
+            Color32::from_rgb(195, 201, 212)
+        } else {
+            Color32::from_rgb(76, 84, 99)
+        };
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(6), fill);
+        ui.painter().rect_stroke(
+            rect,
+            egui::CornerRadius::same(6),
+            egui::Stroke::new(1.0, stroke),
+            egui::epaint::StrokeKind::Outside,
+        );
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("{hidden_rows} older messages hidden while following live chat"),
+            t::small(),
+            t::text_muted(),
+        );
     }
 
     /// Read and clear the reply request stored by a context menu during this frame.
@@ -702,6 +1139,7 @@ impl<'a> MessageList<'a> {
         ui: &mut Ui,
         output: &egui::scroll_area::ScrollAreaOutput<()>,
         panel_rect: egui::Rect,
+        paused_new_rows: usize,
     ) {
         let paused_key = egui::Id::new("scroll_paused").with(self.channel.as_str());
         let wheel_key = egui::Id::new("scroll_wheel_this_frame").with(self.channel.as_str());
@@ -760,23 +1198,71 @@ impl<'a> MessageList<'a> {
             // This prevents content resizes from silently clearing the pause.
             true
         };
-        ui.ctx().data_mut(|d| d.insert_temp(paused_key, scroll_paused));
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(paused_key, scroll_paused));
         ui.ctx()
             .data_mut(|d| d.insert_temp(prev_offset_key, output.state.offset.y));
 
-        if !at_bottom {
-            // Paint a floating button on a foreground layer (no Area/Window needed)
+        let show_resume_button = scroll_paused || !at_bottom;
+        let resume_btn_rect = if show_resume_button {
             let btn_size = egui::vec2(170.0, 28.0);
             let btn_center = egui::pos2(panel_rect.center().x, panel_rect.bottom() - 36.0);
-            let btn_rect = egui::Rect::from_center_size(btn_center, btn_size);
+            Some(egui::Rect::from_center_size(btn_center, btn_size))
+        } else {
+            None
+        };
 
-            let fg_layer = LayerId::new(Order::Foreground, Id::new("resume_scroll_layer").with(self.channel.as_str()));
+        if scroll_paused {
+            let badge_size = egui::vec2(190.0, 24.0);
+            let paused_rect = if let Some(btn_rect) = resume_btn_rect {
+                let x = btn_rect.center().x - badge_size.x * 0.5;
+                let y = (btn_rect.min.y - 8.0 - badge_size.y).max(panel_rect.top() + 8.0);
+                egui::Rect::from_min_size(egui::pos2(x, y), badge_size)
+            } else {
+                egui::Rect::from_min_size(panel_rect.left_top() + egui::vec2(8.0, 8.0), badge_size)
+            };
+            let fg_layer = LayerId::new(
+                Order::Middle,
+                Id::new("paused_badge_layer").with(self.channel.as_str()),
+            );
+            let painter = ui.ctx().layer_painter(fg_layer);
+            painter.rect_filled(
+                paused_rect,
+                6.0,
+                Color32::from_rgba_unmultiplied(0, 0, 0, 160),
+            );
+            let text = if paused_new_rows > 0 {
+                format!("Paused · {paused_new_rows} new")
+            } else {
+                "Paused".to_owned()
+            };
+            painter.text(
+                paused_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                text,
+                egui::FontId::proportional(12.0),
+                Color32::from_rgb(220, 220, 220),
+            );
+        }
+
+        if let Some(btn_rect) = resume_btn_rect {
+            // Paint a floating button in the middle UI order so modal
+            // windows (e.g. settings) can still appear above it.
+            let fg_layer = LayerId::new(
+                Order::Middle,
+                Id::new("resume_scroll_layer").with(self.channel.as_str()),
+            );
             let painter = ui.ctx().layer_painter(fg_layer);
 
             // Button background
             painter.rect_filled(btn_rect, 8.0, t::accent_dim());
             // Subtle border for definition
-            painter.rect_stroke(btn_rect, 8.0, egui::Stroke::new(1.0, t::accent()), egui::epaint::StrokeKind::Outside);
+            painter.rect_stroke(
+                btn_rect,
+                8.0,
+                egui::Stroke::new(1.0, t::accent()),
+                egui::epaint::StrokeKind::Outside,
+            );
             // Button label
             painter.text(
                 btn_rect.center(),
@@ -787,8 +1273,11 @@ impl<'a> MessageList<'a> {
             );
 
             // Detect click on the painted rect
-            let btn_response =
-                ui.interact(btn_rect, Id::new("resume_scroll_btn").with(self.channel.as_str()), egui::Sense::click());
+            let btn_response = ui.interact(
+                btn_rect,
+                Id::new("resume_scroll_btn").with(self.channel.as_str()),
+                egui::Sense::click(),
+            );
             if btn_response.clicked() {
                 // Clear paused so stick_to_bottom re-engages next frame.
                 ui.ctx().data_mut(|d| d.insert_temp(paused_key, false));
@@ -806,7 +1295,14 @@ impl<'a> MessageList<'a> {
         }
     }
 
-    fn render_message(&self, ui: &mut Ui, msg: &ChatMessage, rctx: &RenderCtx) {
+    fn render_message(
+        &self,
+        ui: &mut Ui,
+        msg: &ChatMessage,
+        rctx: &RenderCtx,
+        static_frames: &mut HashMap<String, StaticFrameCacheEntry>,
+        user_color_cache: &mut HashMap<String, Color32>,
+    ) {
         // Dispatch non-chat (and non-bits) events to the compact system-event renderer.
         match &msg.msg_kind {
             MsgKind::Chat | MsgKind::Bits { .. } => {}
@@ -826,22 +1322,7 @@ impl<'a> MessageList<'a> {
             (Some(hl_id), Some(msg_id)) if hl_id == msg_id => rctx.highlight_alpha,
             _ => 0.0,
         };
-        let bg = if highlight_alpha > 0.0 {
-            let a = (50.0 * highlight_alpha) as u8;
-            Color32::from_rgba_unmultiplied(100, 140, 255, a)
-        } else if msg.flags.is_highlighted {
-            Color32::from_rgba_unmultiplied(145, 70, 255, 22)
-        } else if msg.flags.is_mention {
-            Color32::from_rgba_unmultiplied(210, 140, 40, 24)
-        } else if msg.flags.is_deleted {
-            Color32::from_rgba_unmultiplied(180, 30, 30, 12)
-        } else if matches!(msg.msg_kind, MsgKind::Bits { .. }) {
-            Color32::from_rgba_unmultiplied(255, 175, 30, 14)
-        } else if msg.flags.custom_reward_id.is_some() {
-            Color32::from_rgba_unmultiplied(100, 65, 165, 16)
-        } else {
-            Color32::TRANSPARENT
-        };
+        let bg = message_row_background(&msg.flags, &msg.msg_kind, highlight_alpha);
 
         // Context-menu approach:
         //
@@ -862,152 +1343,164 @@ impl<'a> MessageList<'a> {
         // changes, causing click-press and click-release to see different IDs
         // and silently dropping the click event.
         ui.push_id(msg.id.0, |ui| {
+            let mut prepared = egui::Frame::new()
+                .fill(bg)
+                .inner_margin(egui::Margin::symmetric(ROW_PAD_X as i8, ROW_PAD_Y as i8))
+                .begin(ui);
+            // Register a background click sensor EARLY — before any inner widgets —
+            // so it gets the lowest idx_in_layer and thus the lowest hit-test
+            // priority.  Inner widgets (reply header, username label, emotes, URLs)
+            // are registered afterwards and therefore *win* the hit test when the
+            // pointer is over them.  Only clicks on "empty" message space (padding,
+            // gaps) fall through to this background widget to open the context menu.
+            //
+            // After Frame::end() we re-register with the SAME id and the actual
+            // frame rect; `WidgetRects::insert` updates the rect in-place while
+            // keeping the original (low) idx_in_layer.
+            let bg_click_id = Id::new("msg_bg_click").with(msg.id.0);
+            {
+                let ui = &mut prepared.content_ui;
+                // Use a zero-size rect for the early placeholder so that the
+                // second interact() (with the real frame rect) doesn't trigger
+                // egui's ID-clash warning.  The zero rect is fully contained
+                // within the final frame rect, so `check_for_id_clash` treats
+                // them as the same widget.  The key property we care about —
+                // low `idx_in_layer` for hit-test priority — is preserved
+                // because the widget is still registered before inner widgets.
+                let placeholder_rect =
+                    egui::Rect::from_min_size(ui.max_rect().left_top(), egui::Vec2::ZERO);
+                ui.interact(placeholder_rect, bg_click_id, egui::Sense::click());
 
-        let mut prepared = egui::Frame::new()
-            .fill(bg)
-            .inner_margin(egui::Margin::symmetric(ROW_PAD_X as i8, ROW_PAD_Y as i8))
-            .begin(ui);
-        // Register a background click sensor EARLY — before any inner widgets —
-        // so it gets the lowest idx_in_layer and thus the lowest hit-test
-        // priority.  Inner widgets (reply header, username label, emotes, URLs)
-        // are registered afterwards and therefore *win* the hit test when the
-        // pointer is over them.  Only clicks on "empty" message space (padding,
-        // gaps) fall through to this background widget to open the context menu.
-        //
-        // After Frame::end() we re-register with the SAME id and the actual
-        // frame rect; `WidgetRects::insert` updates the rect in-place while
-        // keeping the original (low) idx_in_layer.
-        let bg_click_id = Id::new("msg_bg_click").with(msg.id.0);
-        {
-            let ui = &mut prepared.content_ui;
-            // Use a zero-size rect for the early placeholder so that the
-            // second interact() (with the real frame rect) doesn't trigger
-            // egui's ID-clash warning.  The zero rect is fully contained
-            // within the final frame rect, so `check_for_id_clash` treats
-            // them as the same widget.  The key property we care about —
-            // low `idx_in_layer` for hit-test priority — is preserved
-            // because the widget is still registered before inner widgets.
-            let placeholder_rect =
-                egui::Rect::from_min_size(ui.max_rect().left_top(), egui::Vec2::ZERO);
-            ui.interact(placeholder_rect, bg_click_id, egui::Sense::click());
+                // Keep selectable_labels off globally so timestamp / badge
+                // chip / separator labels stay non-interactive.  Text spans
+                // opt-in to selection via `.selectable(true)` and each has
+                // its own `.context_menu()` so right-click → Reply still works
+                // even when the label wins the hit test.
+                ui.style_mut().interaction.selectable_labels = false;
 
-            // Keep selectable_labels off globally so timestamp / badge
-            // chip / separator labels stay non-interactive.  Text spans
-            // opt-in to selection via `.selectable(true)` and each has
-            // its own `.context_menu()` so right-click → Reply still works
-            // even when the label wins the hit test.
-            ui.style_mut().interaction.selectable_labels = false;
+                // History messages are rendered at reduced opacity so they
+                // read as older context while still being fully legible.
+                if msg.flags.is_history {
+                    ui.set_opacity(0.55);
+                }
+                if let Some(ref rep) = msg.reply {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        // Accent left stripe
+                        let (stripe, _) =
+                            ui.allocate_exact_size(egui::vec2(2.0, 12.0), egui::Sense::hover());
+                        ui.painter()
+                            .rect_filled(stripe, 0.0, Color32::from_rgb(100, 65, 190));
+                        let body = if rep.parent_msg_body.chars().count() > 80 {
+                            // Find the byte offset of the 80th char boundary.
+                            let cut = rep
+                                .parent_msg_body
+                                .char_indices()
+                                .nth(80)
+                                .map(|(i, _)| i)
+                                .unwrap_or(rep.parent_msg_body.len());
+                            format!("{}…", &rep.parent_msg_body[..cut])
+                        } else {
+                            rep.parent_msg_body.clone()
+                        };
+                        let reply_color = if t::is_light() {
+                            Color32::from_rgb(90, 90, 115)
+                        } else {
+                            Color32::from_rgb(130, 130, 155)
+                        };
+                        let h = ui.add(
+                            Label::new(
+                                RichText::new(format!("↩ @{}: {}", rep.parent_display_name, body))
+                                    .font(t::small())
+                                    .color(reply_color)
+                                    .italics(),
+                            )
+                            .sense(egui::Sense::click())
+                            .truncate(),
+                        );
+                        h.context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
+                        if h.clicked() {
+                            let target = rep.parent_msg_id.trim().to_owned();
+                            let hint = ReplyScrollHint {
+                                parent_user_login: rep.parent_user_login.clone(),
+                                parent_msg_body: rep.parent_msg_body.clone(),
+                                child_msg_local_id: msg.id.0,
+                            };
+                            ui.ctx().data_mut(|d| {
+                                if !target.is_empty() {
+                                    d.insert_temp(scroll_to_key, target);
+                                }
+                                d.insert_temp(rctx.scroll_hint_key, hint);
+                            });
+                        }
+                        if h.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                    });
+                }
+                // ── Notification banner (pinned / first / highlighted / rewards) ──
+                // Rendered inside the Frame so the background fill covers
+                // the banner as well, and the interaction rect is contiguous.
+                if let Some((label, stripe_color)) = notification_label(&msg.flags, &msg.msg_kind) {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        // Colored left stripe
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(3.0, 14.0), egui::Sense::hover());
+                        ui.painter().rect_filled(rect, 1.0, stripe_color);
+                        ui.add(Label::new(
+                            RichText::new(label).font(t::small()).color(stripe_color),
+                        ));
+                    });
+                }
 
-            // History messages are rendered at reduced opacity so they
-            // read as older context while still being fully legible.
-            if msg.flags.is_history {
-                ui.set_opacity(0.55);
-            }
-            if let Some(ref rep) = msg.reply {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    // Accent left stripe
-                    let (stripe, _) =
-                        ui.allocate_exact_size(egui::vec2(2.0, 12.0), egui::Sense::hover());
-                    ui.painter()
-                        .rect_filled(stripe, 0.0, Color32::from_rgb(100, 65, 190));
-                    let body = if rep.parent_msg_body.chars().count() > 80 {
-                        // Find the byte offset of the 80th char boundary.
-                        let cut = rep
-                            .parent_msg_body
-                            .char_indices()
-                            .nth(80)
-                            .map(|(i, _)| i)
-                            .unwrap_or(rep.parent_msg_body.len());
-                        format!("{}…", &rep.parent_msg_body[..cut])
-                    } else {
-                        rep.parent_msg_body.clone()
-                    };
-                    let reply_color = if t::is_light() {
-                        Color32::from_rgb(90, 90, 115)
-                    } else {
-                        Color32::from_rgb(130, 130, 155)
-                    };
-                    let h = ui.add(
-                        Label::new(
-                            RichText::new(format!("↩ @{}: {}", rep.parent_display_name, body))
-                                .font(t::small())
-                                .color(reply_color)
-                                .italics(),
-                        )
-                        .sense(egui::Sense::click())
-                        .truncate(),
-                    );
-                    h.context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
-                    if h.clicked() {
-                        let target = rep.parent_msg_id.clone();
-                        ui.ctx().data_mut(|d| d.insert_temp(scroll_to_key, target));
-                    }
-                    if h.hovered() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    }
-                });
-            }
-            // ── Notification banner (first message / highlighted / channel points) ──
-            // Rendered inside the Frame so the background fill covers
-            // the banner as well, and the interaction rect is contiguous.
-            if let Some((label, stripe_color)) = notification_label(&msg.flags, &msg.msg_kind) {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    // Colored left stripe
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(3.0, 14.0), egui::Sense::hover());
-                    ui.painter().rect_filled(rect, 1.0, stripe_color);
-                    ui.add(Label::new(
-                        RichText::new(label).font(t::small()).color(stripe_color),
-                    ));
-                });
-            }
+                // Center-align all items vertically so images don't sit above text baseline.
+                // Use allocate_ui_with_layout with a constrained height hint
+                // (one emote row) instead of with_layout, because Align::Center
+                // in a horizontal layout causes egui to expand frame_size.y to
+                // fill the full available height - which for the first message
+                // in a ScrollArea means the entire viewport, creating huge gaps.
+                let wrap_width = ui.available_width();
+                ui.allocate_ui_with_layout(
+                    egui::vec2(wrap_width, EMOTE_SIZE),
+                    egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
+                    |ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(3.0, 1.0);
 
-            // Center-align all items vertically so images don't sit above text baseline.
-            // Use allocate_ui_with_layout with a constrained height hint
-            // (one emote row) instead of with_layout, because Align::Center
-            // in a horizontal layout causes egui to expand frame_size.y to
-            // fill the full available height - which for the first message
-            // in a ScrollArea means the entire viewport, creating huge gaps.
-            let wrap_width = ui.available_width();
-            ui.allocate_ui_with_layout(
-                egui::vec2(wrap_width, EMOTE_SIZE),
-                egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
-                |ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(3.0, 1.0);
+                        // Timestamp
+                        let ts = msg
+                            .timestamp
+                            .with_timezone(&chrono::Local)
+                            .format("%H:%M")
+                            .to_string();
+                        ui.add(Label::new(
+                            RichText::new(ts).color(t::timestamp()).font(t::small()),
+                        ));
 
-                    // Timestamp
-                    let ts = msg
-                        .timestamp
-                        .with_timezone(&chrono::Local)
-                        .format("%H:%M")
-                        .to_string();
-                    ui.add(Label::new(
-                        RichText::new(ts)
-                            .color(t::timestamp())
-                            .font(t::small()),
-                    ));
+                        // Separator dot between timestamp and badges/name
+                        ui.add(Label::new(
+                            RichText::new("·").color(t::separator()).font(t::small()),
+                        ));
 
-                    // Separator dot between timestamp and badges/name
-                    ui.add(Label::new(
-                        RichText::new("·")
-                            .color(t::separator())
-                            .font(t::small()),
-                    ));
-
-                    // Badges: image if loaded, else text fallback
-                    for badge in &msg.sender.badges {
-                        let tooltip_label = pretty_badge_name(&badge.name, &badge.version);
-                        if let Some(url) = &badge.url {
-                            if let Some(&(w, h, ref raw)) = self.emote_bytes.get(url.as_str()) {
-                                let size = fit_size(w, h, BADGE_SIZE);
-                                let tooltip_size = fit_size(w, h, TOOLTIP_BADGE_SIZE);
-                                let url_key = super::bytes_uri(url, raw);
-                                // Closures capture by reference - clones
-                                // only happen when the tooltip is actually
-                                // shown (on hover), not every frame.
-                                self.show_image(ui, &url_key, raw, size)
+                        // Badges: image if loaded, else text fallback
+                        for badge in &msg.sender.badges {
+                            let tooltip_label = pretty_badge_name(&badge.name, &badge.version);
+                            if let Some(url) = &badge.url {
+                                if let Some(&(w, h, ref raw)) = self.emote_bytes.get(url.as_str()) {
+                                    let size = fit_size(w, h, BADGE_SIZE);
+                                    let tooltip_size = fit_size(w, h, TOOLTIP_BADGE_SIZE);
+                                    let url_key = super::bytes_uri(url, raw);
+                                    // Closures capture by reference - clones
+                                    // only happen when the tooltip is actually
+                                    // shown (on hover), not every frame.
+                                    self.show_image(
+                                        ui,
+                                        &url_key,
+                                        raw,
+                                        size,
+                                        Some(url.as_str()),
+                                        static_frames,
+                                    )
                                     .on_hover_ui_at_pointer(|ui| {
                                         ui.set_max_width(200.0);
                                         ui.vertical_centered(|ui| {
@@ -1025,113 +1518,140 @@ impl<'a> MessageList<'a> {
                                     .context_menu(|ui| {
                                         self.show_message_context_menu(ui, msg, reply_key);
                                     });
-                                continue;
+                                    continue;
+                                }
                             }
+                            render_badge_fallback(ui, &badge.name, &badge.version, &tooltip_label);
                         }
-                        render_badge_fallback(ui, &badge.name, &badge.version, &tooltip_label);
-                    }
 
-                    // Sender name - clickable to open user profile card.
-                    let name_color = sender_color(&msg.sender.color);
-                    let name = if msg.flags.is_action {
-                        format!("* {}", msg.sender.display_name)
-                    } else {
-                        msg.sender.display_name.clone()
-                    };
-                    let name_resp = ui
-                        .add(
-                            Label::new(RichText::new(name).color(name_color).strong())
-                                .selectable(false)
-                                .sense(egui::Sense::click()),
+                        // Sender name - clickable to open user profile card.
+                        let name_color = resolve_sender_color(msg, user_color_cache);
+                        let name = if msg.flags.is_action {
+                            format!("* {}", msg.sender.display_name)
+                        } else {
+                            msg.sender.display_name.clone()
+                        };
+                        let name_resp = show_sender_name(
+                            ui,
+                            msg.id.0,
+                            &name,
+                            name_color,
+                            None,
+                            self.emote_bytes,
+                            self.cmd_tx,
                         )
                         .on_hover_ui(|ui| {
                             ui.label(format!("@{}", msg.sender.login));
                         });
-                    name_resp
-                        .context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
-                    if name_resp.clicked_by(egui::PointerButton::Primary) {
-                        // Clone only when clicked - not every frame.
-                        let _ = self.cmd_tx.try_send(AppCommand::ShowUserCard {
-                            login: msg.sender.login.clone(),
-                            channel: self.channel.clone(),
-                        });
-                        let key = Id::new("ml_profile_req").with(self.channel.as_str());
-                        ui.ctx().data_mut(|d| {
-                            d.insert_temp(
-                                key,
-                                (msg.sender.login.clone(), msg.sender.badges.clone()),
-                            );
-                        });
-                    }
-                    if name_resp.hovered() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    }
-
-                    // Colon separator after name (not shown for /me actions)
-                    if !msg.flags.is_action {
-                        ui.add(Label::new(
-                            RichText::new(":").color(t::separator()),
-                        ));
-                    }
-
-                    // Message spans carry their own whitespace from the
-                    // tokenizer, so keep inter-widget spacing at zero to
-                    // avoid rendering words with visually doubled spaces.
-                    ui.scope(|ui| {
-                        ui.spacing_mut().item_spacing.x = 0.0;
-
-                        // For deleted messages show the original content
-                        // with strikethrough so moderator actions are
-                        // visible without being prominent.
-                        if msg.flags.is_deleted {
-                            ui.add(
-                                Label::new(
-                                    RichText::new(format!("✂ {}", msg.raw_text))
-                                        .strikethrough()
-                                        .italics()
-                                        .color(t::text_muted()),
-                                )
-                                .wrap(),
-                            );
-                        } else {
-                            for span in &msg.spans {
-                                self.render_span(ui, span, msg.flags.is_action, msg, reply_key);
-                            }
+                        name_resp
+                            .context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
+                        if name_resp.clicked_by(egui::PointerButton::Primary) {
+                            // Clone only when clicked - not every frame.
+                            let _ = self.cmd_tx.try_send(AppCommand::ShowUserCard {
+                                login: msg.sender.login.clone(),
+                                channel: self.channel.clone(),
+                            });
+                            let key = Id::new("ml_profile_req").with(self.channel.as_str());
+                            ui.ctx().data_mut(|d| {
+                                d.insert_temp(
+                                    key,
+                                    (msg.sender.login.clone(), msg.sender.badges.clone()),
+                                );
+                            });
                         }
-                    });
-                },
-            );
-        }
-        let msg_frame_resp = prepared.end(ui);
+                        if name_resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
 
-        // Re-register the background click widget with the actual frame rect.
-        // Same `bg_click_id` → updates in-place, keeping low hit-test priority.
-        let bg_click = ui.interact(msg_frame_resp.rect, bg_click_id, egui::Sense::click());
-        bg_click.context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
+                        // Colon separator after name (not shown for /me actions)
+                        if !msg.flags.is_action {
+                            ui.add(Label::new(RichText::new(":").color(t::separator())));
+                        }
 
-        // Left accent strip for mentions and highlights - a vivid 3 px bar on
-        // the left edge of the row so the eye finds them instantly in fast chat.
-        if msg.flags.is_mention || msg.flags.is_highlighted {
-            let r = msg_frame_resp.rect;
-            let bar_col = if msg.flags.is_mention
-                && matches!(msg.msg_kind, MsgKind::Sub { is_gift: true, .. })
-            {
-                t::raid_cyan()
-            } else if msg.flags.is_mention {
-                t::accent()
-            } else {
-                Color32::from_rgb(255, 210, 30)
-            };
-            let strip = egui::Rect::from_min_size(r.left_top(), egui::vec2(3.0, r.height()));
-            ui.painter().rect_filled(strip, 0.0, bar_col);
-        }
+                        // Message spans carry their own whitespace from the
+                        // tokenizer, so keep inter-widget spacing at zero to
+                        // avoid rendering words with visually doubled spaces.
+                        ui.scope(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            let collapsed_body = if self.collapse_long_messages {
+                                collapse_message_for_display(
+                                    &msg.raw_text,
+                                    self.collapse_long_message_lines,
+                                )
+                            } else {
+                                None
+                            };
 
+                            // For deleted messages show the original content
+                            // with strikethrough so moderator actions are
+                            // visible without being prominent.
+                            if msg.flags.is_deleted {
+                                let deleted_text =
+                                    collapsed_body.as_deref().unwrap_or(msg.raw_text.as_str());
+                                ui.add(
+                                    Label::new(
+                                        RichText::new(format!("✂ {}", deleted_text))
+                                            .strikethrough()
+                                            .italics()
+                                            .color(t::text_muted()),
+                                    )
+                                    .wrap(),
+                                );
+                            } else if let Some(collapsed_text) = collapsed_body {
+                                // Long-message collapse:
+                                // render a compact text summary instead of
+                                // laying out all original spans/emotes.
+                                let rich = if msg.flags.is_action {
+                                    RichText::new(collapsed_text).italics()
+                                } else {
+                                    RichText::new(collapsed_text)
+                                };
+                                let resp = ui.add(Label::new(rich).wrap().selectable(true));
+                                resp.context_menu(|ui| {
+                                    self.show_message_context_menu(ui, msg, reply_key)
+                                });
+                                resp.on_hover_ui(|ui| {
+                                    ui.label(
+                                        RichText::new("Long message collapsed for performance")
+                                            .font(t::small())
+                                            .color(t::text_muted()),
+                                    );
+                                });
+                            } else {
+                                for span in &msg.spans {
+                                    self.render_span(
+                                        ui,
+                                        span,
+                                        msg.flags.is_action,
+                                        msg,
+                                        reply_key,
+                                        static_frames,
+                                    );
+                                }
+                            }
+                        });
+                    },
+                );
+            }
+            let msg_frame_resp = prepared.end(ui);
+
+            // Re-register the background click widget with the actual frame rect.
+            // Same `bg_click_id` → updates in-place, keeping low hit-test priority.
+            let bg_click = ui.interact(msg_frame_resp.rect, bg_click_id, egui::Sense::click());
+            bg_click.context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
+
+            // Left accent strip for mentions and highlights - a vivid 3 px bar on
+            // the left edge of the row so the eye finds them instantly in fast chat.
+            if let Some(bar_col) = message_left_accent_color(&msg.flags, &msg.msg_kind) {
+                let r = msg_frame_resp.rect;
+                let strip = egui::Rect::from_min_size(r.left_top(), egui::vec2(3.0, r.height()));
+                ui.painter().rect_filled(strip, 0.0, bar_col);
+            }
         }); // end push_id
     }
 
     /// Render a compact system-event row (mod action, sub alert, raid, notice).
-    /// These are centred italic lines with a coloured left stripe and icon,
-    /// similar to Chatterino's system-message style.
+    /// These rows are centered italic lines with a colored left stripe and icon.
     fn render_system_event(&self, ui: &mut Ui, msg: &ChatMessage) {
         let (accent, label_override): (Color32, Option<String>) = match &msg.msg_kind {
             MsgKind::Sub {
@@ -1151,7 +1671,14 @@ impl<'a> MessageList<'a> {
                 } else {
                     format!("⭐  {display_name} resubscribed with {plan}! ({months} months)")
                 };
-                (if gifted_to_me { t::raid_cyan() } else { t::gold() }, Some(text))
+                (
+                    if gifted_to_me {
+                        t::raid_cyan()
+                    } else {
+                        t::gold()
+                    },
+                    Some(text),
+                )
             }
             MsgKind::Raid {
                 display_name,
@@ -1175,9 +1702,10 @@ impl<'a> MessageList<'a> {
                     Some(format!("⏱  {login} was timed out for {dur}.")),
                 )
             }
-            MsgKind::Ban { login } => {
-                (t::red(), Some(format!("🚫  {login} was permanently banned.")))
-            }
+            MsgKind::Ban { login } => (
+                t::red(),
+                Some(format!("🚫  {login} was permanently banned.")),
+            ),
             MsgKind::ChatCleared => (
                 if t::is_light() {
                     Color32::from_rgb(100, 90, 120)
@@ -1203,45 +1731,43 @@ impl<'a> MessageList<'a> {
         // range moves, causing egui to report widget ID clashes for every
         // system event in the loaded history.
         ui.push_id(msg.id.0, |ui| {
-        egui::Frame::new()
-            .fill(Color32::from_rgba_unmultiplied(
-                accent.r(),
-                accent.g(),
-                accent.b(),
-                10,
-            ))
-            .inner_margin(egui::Margin::symmetric(
-                ROW_PAD_X as i8,
-                ROW_PAD_Y as i8 + 1,
-            ))
-            .show(ui, |ui| {
-                if msg.flags.is_history {
-                    ui.set_opacity(opacity);
-                }
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    // Coloured left stripe
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(3.0, 14.0), egui::Sense::hover());
-                    ui.painter().rect_filled(rect, 1.0, accent);
+            egui::Frame::new()
+                .fill(Color32::from_rgba_unmultiplied(
+                    accent.r(),
+                    accent.g(),
+                    accent.b(),
+                    10,
+                ))
+                .inner_margin(egui::Margin::symmetric(
+                    ROW_PAD_X as i8,
+                    ROW_PAD_Y as i8 + 1,
+                ))
+                .show(ui, |ui| {
+                    if msg.flags.is_history {
+                        ui.set_opacity(opacity);
+                    }
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        // Coloured left stripe
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(3.0, 14.0), egui::Sense::hover());
+                        ui.painter().rect_filled(rect, 1.0, accent);
 
-                    // Timestamp
-                    let ts = msg.timestamp.format("%H:%M").to_string();
-                    ui.add(Label::new(
-                        RichText::new(ts)
-                            .color(t::timestamp())
-                            .font(t::small()),
-                    ));
+                        // Timestamp
+                        let ts = msg.timestamp.format("%H:%M").to_string();
+                        ui.add(Label::new(
+                            RichText::new(ts).color(t::timestamp()).font(t::small()),
+                        ));
 
-                    // Message text
-                    let rich = if is_irc_motd_line(&text) {
-                        RichText::new(text).color(accent).font(t::small())
-                    } else {
-                        RichText::new(text).italics().color(accent).font(t::small())
-                    };
-                    ui.add(Label::new(rich).wrap());
+                        // Message text
+                        let rich = if is_irc_motd_line(&text) {
+                            RichText::new(text).color(accent).font(t::small())
+                        } else {
+                            RichText::new(text).italics().color(accent).font(t::small())
+                        };
+                        ui.add(Label::new(rich).wrap());
+                    });
                 });
-            });
         }); // end push_id
     }
 
@@ -1252,6 +1778,7 @@ impl<'a> MessageList<'a> {
         is_action: bool,
         msg: &ChatMessage,
         reply_key: Id,
+        static_frames: &mut HashMap<String, StaticFrameCacheEntry>,
     ) {
         let action_color = if t::is_light() {
             Color32::from_rgb(80, 80, 110)
@@ -1288,49 +1815,52 @@ impl<'a> MessageList<'a> {
                     let emote_bytes = self.emote_bytes; // &HashMap - Copy
                     let cmd_tx = self.cmd_tx; // &Sender  - Copy
 
-                    self.show_image(ui, &url_key, raw, size)
+                    self.show_image(ui, &url_key, raw, size, Some(url.as_str()), static_frames)
                         .on_hover_ui_at_pointer(|ui| {
-                        // Check HD availability at hover time, not every frame.
-                        let hd_entry = url_hd.as_deref().and_then(|u| emote_bytes.get(u));
+                            // Check HD availability at hover time, not every frame.
+                            let hd_entry = url_hd.as_deref().and_then(|u| emote_bytes.get(u));
 
-                        // Fire HD fetch once on first hover if not yet loaded.
-                        if hd_entry.is_none() {
-                            if let Some(hd_url) = url_hd.as_deref() {
-                                let _ = cmd_tx.try_send(AppCommand::FetchImage {
-                                    url: hd_url.to_owned(),
-                                });
+                            // Fire HD fetch once on first hover if not yet loaded.
+                            if hd_entry.is_none() {
+                                if let Some(hd_url) = url_hd.as_deref() {
+                                    let _ = cmd_tx.try_send(AppCommand::FetchImage {
+                                        url: hd_url.to_owned(),
+                                    });
+                                }
                             }
-                        }
 
-                        let (tt_key, tt_raw, tt_w, tt_h) = match hd_entry {
-                            Some(&(hw, hh, ref href)) => (
-                                super::bytes_uri(url_hd.as_deref().unwrap(), href),
-                                href.clone(),
-                                hw,
-                                hh,
-                            ),
-                            None => (url_key.clone(), raw.clone(), w, h),
-                        };
-                        let tt_size = fit_size(tt_w, tt_h, TOOLTIP_EMOTE_SIZE);
+                            let (tt_key, tt_raw, tt_w, tt_h) = match hd_entry {
+                                Some(&(hw, hh, ref href)) => (
+                                    super::bytes_uri(url_hd.as_deref().unwrap(), href),
+                                    href.clone(),
+                                    hw,
+                                    hh,
+                                ),
+                                None => (url_key.clone(), raw.clone(), w, h),
+                            };
+                            let tt_size = fit_size(tt_w, tt_h, TOOLTIP_EMOTE_SIZE);
 
-                        ui.set_max_width(280.0);
-                        ui.vertical_centered(|ui| {
-                            ui.add(
-                                egui::Image::from_bytes(tt_key, egui::load::Bytes::Shared(tt_raw))
+                            ui.set_max_width(280.0);
+                            ui.vertical_centered(|ui| {
+                                ui.add(
+                                    egui::Image::from_bytes(
+                                        tt_key,
+                                        egui::load::Bytes::Shared(tt_raw),
+                                    )
                                     .fit_to_exact_size(tt_size),
-                            );
-                            ui.add_space(4.0);
-                            ui.label(RichText::new(code.as_str()).strong());
-                            ui.label(
-                                RichText::new(provider_label(provider))
-                                    .small()
-                                    .color(Color32::GRAY),
-                            );
+                                );
+                                ui.add_space(4.0);
+                                ui.label(RichText::new(code.as_str()).strong());
+                                ui.label(
+                                    RichText::new(provider_label(provider))
+                                        .small()
+                                        .color(Color32::GRAY),
+                                );
+                            });
+                        })
+                        .context_menu(|ui| {
+                            self.show_message_context_menu(ui, msg, reply_key);
                         });
-                    })
-                    .context_menu(|ui| {
-                        self.show_message_context_menu(ui, msg, reply_key);
-                    });
                 } else {
                     // Image not yet loaded - show text code as placeholder
                     ui.add(Label::new(
@@ -1346,7 +1876,7 @@ impl<'a> MessageList<'a> {
                     let size = fit_size(w, h, EMOTE_SIZE);
                     let tooltip_size = fit_size(w, h, TOOLTIP_EMOTE_SIZE);
                     let url_key = super::bytes_uri(url, raw);
-                    self.show_image(ui, &url_key, raw, size)
+                    self.show_image(ui, &url_key, raw, size, Some(url.as_str()), static_frames)
                         .on_hover_ui_at_pointer(|ui| {
                             ui.set_max_width(200.0);
                             ui.vertical_centered(|ui| {
@@ -1374,11 +1904,14 @@ impl<'a> MessageList<'a> {
                 }
             }
             Span::Mention { login } => {
-                let resp = ui.add(Label::new(
-                    RichText::new(format!("@{login}"))
-                        .color(t::mention())
-                        .strong(),
-                ).selectable(true));
+                let resp = ui.add(
+                    Label::new(
+                        RichText::new(format!("@{login}"))
+                            .color(t::mention())
+                            .strong(),
+                    )
+                    .selectable(true),
+                );
                 resp.context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
             }
             Span::Url { text, url } => {
@@ -1388,13 +1921,9 @@ impl<'a> MessageList<'a> {
 
                 // Render as a clickable hyperlink-style label.
                 let resp = ui.add(
-                    Label::new(
-                        RichText::new(text)
-                            .color(t::link())
-                            .underline(),
-                    )
-                    .selectable(false)
-                    .sense(egui::Sense::click()),
+                    Label::new(RichText::new(text).color(t::link()).underline())
+                        .selectable(false)
+                        .sense(egui::Sense::click()),
                 );
                 if resp.clicked() {
                     let _ = cmd_tx.try_send(AppCommand::OpenUrl { url: url.clone() });
@@ -1413,11 +1942,7 @@ impl<'a> MessageList<'a> {
                             None => {
                                 // Not yet fetched - show hostname + spinner.
                                 let host = url_hostname(url);
-                                ui.label(
-                                    RichText::new(host)
-                                        .small()
-                                        .color(t::link()),
-                                );
+                                ui.label(RichText::new(host).small().color(t::link()));
                                 ui.label(
                                     RichText::new("Loading preview…")
                                         .small()
@@ -1435,10 +1960,7 @@ impl<'a> MessageList<'a> {
                                         .inner_margin(egui::Margin::symmetric(5, 1))
                                         .show(ui, |ui| {
                                             ui.label(
-                                                RichText::new(sn)
-                                                    .small()
-                                                    .strong()
-                                                    .color(badge_fg),
+                                                RichText::new(sn).small().strong().color(badge_fg),
                                             );
                                         });
                                     ui.add_space(3.0);
@@ -1453,12 +1975,13 @@ impl<'a> MessageList<'a> {
                                         egui::Frame::new()
                                             .corner_radius(egui::CornerRadius::same(4))
                                             .show(ui, |ui| {
-                                                ui.add(
-                                                    egui::Image::from_bytes(
-                                                        key,
-                                                        egui::load::Bytes::Shared(raw.clone()),
-                                                    )
-                                                    .fit_to_exact_size(size),
+                                                self.show_image(
+                                                    ui,
+                                                    &key,
+                                                    raw,
+                                                    size,
+                                                    Some(thumb.as_str()),
+                                                    static_frames,
                                                 );
                                             });
                                         ui.add_space(4.0);
@@ -1471,17 +1994,21 @@ impl<'a> MessageList<'a> {
                                 // Description
                                 if let Some(ref d) = p.description {
                                     let snippet = if d.chars().count() > 260 {
-                                        let cut = d.char_indices().nth(260)
-                                            .map(|(i, _)| i).unwrap_or(d.len());
+                                        let cut = d
+                                            .char_indices()
+                                            .nth(260)
+                                            .map(|(i, _)| i)
+                                            .unwrap_or(d.len());
                                         format!("{}\u{2026}", &d[..cut])
                                     } else {
                                         d.clone()
                                     };
-                                    ui.add(Label::new(
-                                        RichText::new(snippet)
-                                            .small()
-                                            .color(t::text_muted()),
-                                    ).wrap());
+                                    ui.add(
+                                        Label::new(
+                                            RichText::new(snippet).small().color(t::text_muted()),
+                                        )
+                                        .wrap(),
+                                    );
                                 }
                                 if p.title.is_none()
                                     && p.description.is_none()
@@ -1497,11 +2024,7 @@ impl<'a> MessageList<'a> {
                                 // Domain footer
                                 let host = url_hostname(url);
                                 ui.add_space(2.0);
-                                ui.label(
-                                    RichText::new(host)
-                                        .small()
-                                        .color(t::text_muted()),
-                                );
+                                ui.label(RichText::new(host).small().color(t::text_muted()));
                             }
                         }
                     });
@@ -1514,7 +2037,7 @@ impl<'a> MessageList<'a> {
         }
     }
 
-    /// Render an image from raw bytes using egui's image loaders (supports GIF animation).
+    /// Render an image from raw bytes, freezing animated sources to a cached static frame.
     ///
     /// Uses `Sense::click()` (not `Sense::hover()`) because egui 0.31's interaction
     /// system only adds widgets to the `hovered` IdSet when they are in `hits.click`
@@ -1523,12 +2046,115 @@ impl<'a> MessageList<'a> {
     /// `on_hover_ui_at_pointer` never fires.  Using `Sense::click()` ensures the image
     /// enters the hovered set so tooltips work.  We never actually handle the click
     /// on images – callers that want right-click menus chain `.context_menu()` themselves.
-    fn show_image(&self, ui: &mut Ui, uri: &str, raw: &Arc<[u8]>, size: Vec2) -> egui::Response {
+    fn show_image(
+        &self,
+        ui: &mut Ui,
+        uri: &str,
+        raw: &Arc<[u8]>,
+        size: Vec2,
+        url_hint: Option<&str>,
+        static_frames: &mut HashMap<String, StaticFrameCacheEntry>,
+    ) -> egui::Response {
+        let cache_key = url_hint.unwrap_or(uri);
+        let is_animated =
+            url_hint.map(is_likely_animated_url).unwrap_or(false) || is_likely_animated_bytes(raw);
+
+        if is_animated && !self.animate_emotes {
+            if !static_frames.contains_key(cache_key) {
+                let entry = if let Some(img) = decode_static_frame(raw) {
+                    let tex = ui.ctx().load_texture(
+                        format!("ml-static://{cache_key}"),
+                        img,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    StaticFrameCacheEntry::Loaded(tex)
+                } else {
+                    StaticFrameCacheEntry::Unavailable
+                };
+                static_frames.insert(cache_key.to_owned(), entry);
+            }
+
+            if let Some(entry) = static_frames.get(cache_key) {
+                if let StaticFrameCacheEntry::Loaded(tex) = entry {
+                    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+                    ui.painter().image(
+                        tex.id(),
+                        rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                    return resp;
+                }
+                return show_image_placeholder(ui, size);
+            }
+        }
+
+        if is_animated && self.animate_emotes {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(33));
+        }
+
         ui.add(
             egui::Image::from_bytes(uri.to_owned(), egui::load::Bytes::Shared(raw.clone()))
                 .sense(egui::Sense::click())
                 .fit_to_exact_size(size),
         )
+    }
+}
+
+/// Collapse a message body after a line budget and append an ellipsis.
+///
+/// This reduces expensive layout work on giant copypastas while staying
+/// lightweight in egui:
+/// - explicit newline budget first
+/// - fallback soft-wrap estimate for long single-line bursts
+fn collapse_message_for_display(text: &str, max_lines: usize) -> Option<String> {
+    if text.is_empty() || max_lines == 0 {
+        return None;
+    }
+
+    if let Some(collapsed) = collapse_by_newline_budget(text, max_lines) {
+        return Some(collapsed);
+    }
+
+    const SOFT_WRAP_CHARS_PER_LINE_ESTIMATE: usize = 110;
+    collapse_by_char_budget(
+        text,
+        max_lines.saturating_mul(SOFT_WRAP_CHARS_PER_LINE_ESTIMATE),
+    )
+}
+
+fn collapse_by_newline_budget(text: &str, max_lines: usize) -> Option<String> {
+    let mut lines_seen = 1usize;
+    for (idx, ch) in text.char_indices() {
+        if ch == '\n' {
+            lines_seen += 1;
+            if lines_seen > max_lines {
+                return Some(with_ellipsis(text, idx));
+            }
+        }
+    }
+    None
+}
+
+fn collapse_by_char_budget(text: &str, char_budget: usize) -> Option<String> {
+    if text.chars().count() <= char_budget {
+        return None;
+    }
+    let cut = text
+        .char_indices()
+        .nth(char_budget)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len());
+    Some(with_ellipsis(text, cut))
+}
+
+fn with_ellipsis(text: &str, cut: usize) -> String {
+    let trimmed = text[..cut].trim_end();
+    if trimmed.is_empty() {
+        "…".to_owned()
+    } else {
+        format!("{trimmed} …")
     }
 }
 
@@ -1660,57 +2286,600 @@ fn fit_size(w: u32, h: u32, target_h: f32) -> Vec2 {
     Vec2::new(w as f32 * scale, target_h)
 }
 
-fn sender_color(color: &Option<String>) -> Color32 {
-    color
-        .as_deref()
-        .and_then(parse_hex_color)
-        .map(|(r, g, b)| {
-            let lum = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
-            if t::is_light() {
-                // Darken colours that are too bright for a light background.
-                if lum > 170.0 {
-                    let factor = 170.0 / lum.max(1.0);
-                    let factor = factor.max(0.4);
-                    Color32::from_rgb(
-                        (r as f32 * factor) as u8,
-                        (g as f32 * factor) as u8,
-                        (b as f32 * factor) as u8,
-                    )
-                } else {
-                    Color32::from_rgb(r, g, b)
-                }
-            } else {
-                // Boost dim colours for dark backgrounds.
-                if lum < 70.0 {
-                    let factor = 70.0 / lum.max(1.0);
-                    let factor = factor.min(2.5);
-                    Color32::from_rgb(
-                        (r as f32 * factor).min(255.0) as u8,
-                        (g as f32 * factor).min(255.0) as u8,
-                        (b as f32 * factor).min(255.0) as u8,
-                    )
-                } else {
-                    Color32::from_rgb(r, g, b)
-                }
-            }
-        })
-        .unwrap_or(t::accent())
+fn is_likely_animated_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.contains(".gif") || lower.contains(".webp")
 }
 
-fn parse_hex_color(s: &str) -> Option<(u8, u8, u8)> {
+fn is_likely_animated_bytes(raw: &[u8]) -> bool {
+    // GIF: more than one image descriptor usually indicates multiple frames.
+    let is_gif = raw.len() >= 6 && (&raw[..6] == b"GIF87a" || &raw[..6] == b"GIF89a");
+    if is_gif {
+        let frame_markers = raw.iter().filter(|&&b| b == 0x2C).take(2).count();
+        if frame_markers >= 2 {
+            return true;
+        }
+    }
+
+    // WEBP animation uses an ANIM chunk in RIFF/WEBP containers.
+    let is_webp = raw.len() >= 12 && &raw[..4] == b"RIFF" && &raw[8..12] == b"WEBP";
+    is_webp && raw.windows(4).any(|w| w == b"ANIM")
+}
+
+fn decode_static_frame(raw: &[u8]) -> Option<egui::ColorImage> {
+    let img = image::load_from_memory(raw).ok()?;
+    dynamic_image_to_color_image(img)
+}
+
+fn dynamic_image_to_color_image(img: DynamicImage) -> Option<egui::ColorImage> {
+    let rgba = img.to_rgba8();
+    let w = usize::try_from(rgba.width()).ok()?;
+    let h = usize::try_from(rgba.height()).ok()?;
+    let pixels = rgba.into_raw();
+    Some(egui::ColorImage::from_rgba_unmultiplied([w, h], &pixels))
+}
+
+fn show_image_placeholder(ui: &mut Ui, size: Vec2) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::same(3), Color32::from_gray(80));
+    resp
+}
+
+fn crust_seeded_username_color(seed: &str) -> Option<Color32> {
+    if seed.is_empty() {
+        return None;
+    }
+
+    let color_seed: i64 = seed.parse::<i64>().unwrap_or_else(|_| {
+        // For non-numeric IDs, derive a stable seed from the string content.
+        seed.chars()
+            .map(|c| c.to_digit(10).map(|d| d as i64).unwrap_or(-1))
+            .sum()
+    });
+
+    let idx = color_seed.rem_euclid(TWITCH_USERNAME_COLORS.len() as i64) as usize;
+    Some(TWITCH_USERNAME_COLORS[idx])
+}
+
+fn resolve_sender_color(
+    msg: &ChatMessage,
+    user_color_cache: &mut HashMap<String, Color32>,
+) -> Color32 {
+    let login_key = msg.sender.login.trim().to_ascii_lowercase();
+
+    if let Some(parsed) = msg
+        .sender
+        .color
+        .as_deref()
+        .and_then(parse_hex_color_opaque_rgb)
+    {
+        if !login_key.is_empty() {
+            if user_color_cache.len() >= MAX_CACHED_USERNAME_COLORS {
+                user_color_cache.clear();
+            }
+            user_color_cache.insert(login_key, parsed);
+        }
+        return parsed;
+    }
+
+    if !login_key.is_empty() {
+        if let Some(cached) = user_color_cache.get(&login_key).copied() {
+            return cached;
+        }
+    }
+
+    let seeded = crust_seeded_username_color(msg.sender.user_id.0.trim())
+        .or_else(|| crust_seeded_username_color(login_key.as_str()));
+    if let Some(color) = seeded {
+        if !login_key.is_empty() {
+            if user_color_cache.len() >= MAX_CACHED_USERNAME_COLORS {
+                user_color_cache.clear();
+            }
+            user_color_cache.entry(login_key).or_insert(color);
+        }
+        return color;
+    }
+
+    t::accent()
+}
+
+fn show_sender_name(
+    ui: &mut Ui,
+    message_id: u64,
+    name: &str,
+    fallback_color: Color32,
+    paint: Option<&SenderNamePaint>,
+    emote_bytes: &HashMap<String, (u32, u32, Arc<[u8]>)>,
+    cmd_tx: &mpsc::Sender<AppCommand>,
+) -> egui::Response {
+    let fallback_color =
+        Color32::from_rgb(fallback_color.r(), fallback_color.g(), fallback_color.b());
+    if let Some(paint) = paint {
+        let label = Label::new(RichText::new(name).strong())
+            .selectable(false)
+            .sense(egui::Sense::click());
+        let (galley_pos, galley, response) = label.layout_in_ui(ui);
+
+        if ui.is_rect_visible(response.rect) {
+            let paint_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, galley.size());
+            let stops = normalized_paint_stops(paint, fallback_color);
+            let url_sampler = url_paint_sampler(ui, paint, emote_bytes, cmd_tx);
+            let font_uv_normalizer = font_uv_normalizer(ui);
+            if stops.is_some() || url_sampler.is_some() {
+                if !paint.shadows.is_empty() {
+                    paint_sender_name_shadows(ui, paint, galley_pos, &galley, font_uv_normalizer);
+                }
+                let mut painted_vertices = 0usize;
+                for row in &galley.rows {
+                    let mut row_painted = false;
+                    let mut mesh = row.visuals.mesh.clone();
+                    normalize_text_mesh_uvs(&mut mesh, font_uv_normalizer);
+                    if !row.visuals.glyph_vertex_range.is_empty() {
+                        for idx in row.visuals.glyph_vertex_range.clone() {
+                            if let Some(v) = mesh.vertices.get_mut(idx) {
+                                if let Some(sampler) = &url_sampler {
+                                    v.color = sample_url_paint_color(
+                                        fallback_color,
+                                        sampler,
+                                        paint_rect,
+                                        v.pos,
+                                    );
+                                } else if let Some(stops) = &stops {
+                                    let t = paint_sample_t(paint, paint_rect, v.pos, stops);
+                                    v.color = gradient_color_at_t(stops, t, paint.repeat);
+                                } else {
+                                    v.color = fallback_color;
+                                }
+                                painted_vertices += 1;
+                                row_painted = true;
+                            }
+                        }
+                    }
+                    if !row_painted {
+                        continue;
+                    }
+                    mesh.translate(galley_pos.to_vec2());
+                    ui.painter().add(egui::Shape::mesh(mesh));
+                }
+                if painted_vertices == 0 {
+                    ui.painter().add(egui::epaint::TextShape::new(
+                        galley_pos,
+                        galley,
+                        fallback_color,
+                    ));
+                }
+            } else {
+                ui.painter().add(egui::epaint::TextShape::new(
+                    galley_pos,
+                    galley,
+                    fallback_color,
+                ));
+            }
+        }
+
+        let id = Id::new("ml_sender_name_paint").with(message_id);
+        return ui.interact(response.rect, id, egui::Sense::click());
+    }
+
+    ui.add(
+        Label::new(RichText::new(name).color(fallback_color).strong())
+            .selectable(false)
+            .sense(egui::Sense::click()),
+    )
+}
+
+#[derive(Clone)]
+struct UrlPaintSampler {
+    width: u32,
+    height: u32,
+    rgba: Arc<[u8]>,
+}
+
+fn url_paint_sampler(
+    ui: &Ui,
+    paint: &SenderNamePaint,
+    emote_bytes: &HashMap<String, (u32, u32, Arc<[u8]>)>,
+    cmd_tx: &mpsc::Sender<AppCommand>,
+) -> Option<UrlPaintSampler> {
+    let function = paint.function.trim();
+    if !function.eq_ignore_ascii_case("url") && !function.eq_ignore_ascii_case("image") {
+        return None;
+    }
+    let raw_url = paint.image_url.as_ref()?;
+    let url = normalize_external_image_url(raw_url)?;
+    if !emote_bytes.contains_key(url.as_str()) {
+        let _ = cmd_tx.try_send(AppCommand::FetchImage { url: url.clone() });
+        return None;
+    }
+
+    let cache_key = Id::new("ml_url_paint_sampler").with(url.as_str());
+    if let Some(cached) = ui
+        .ctx()
+        .data_mut(|d| d.get_temp::<UrlPaintSampler>(cache_key))
+    {
+        return Some(cached);
+    }
+
+    let (_w, _h, raw) = emote_bytes.get(url.as_str())?;
+    let decoded = image::load_from_memory(raw).ok()?.to_rgba8();
+    let (dw, dh) = decoded.dimensions();
+    let rgba: Arc<[u8]> = decoded.into_raw().into();
+    let sampler = UrlPaintSampler {
+        width: dw.max(1),
+        height: dh.max(1),
+        rgba,
+    };
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(cache_key, sampler.clone()));
+    Some(sampler)
+}
+
+fn normalize_external_image_url(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("//") {
+        return Some(format!("https:{trimmed}"));
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return Some(trimmed.to_owned());
+    }
+    None
+}
+
+fn sample_url_paint_color(
+    user_color: Color32,
+    sampler: &UrlPaintSampler,
+    drawing_rect: egui::Rect,
+    sample: egui::Pos2,
+) -> Color32 {
+    let w = drawing_rect.width().max(1.0);
+    let h = drawing_rect.height().max(1.0);
+    let u = ((sample.x - drawing_rect.left()) / w).clamp(0.0, 1.0);
+    let v = ((sample.y - drawing_rect.top()) / h).clamp(0.0, 1.0);
+
+    let sx = u * sampler.width.saturating_sub(1) as f32;
+    let sy = v * sampler.height.saturating_sub(1) as f32;
+    let x0 = sx.floor() as u32;
+    let y0 = sy.floor() as u32;
+    let x1 = (x0 + 1).min(sampler.width.saturating_sub(1));
+    let y1 = (y0 + 1).min(sampler.height.saturating_sub(1));
+    let tx = sx - x0 as f32;
+    let ty = sy - y0 as f32;
+
+    let c00 = sampler_pixel(sampler, x0, y0);
+    let c10 = sampler_pixel(sampler, x1, y0);
+    let c01 = sampler_pixel(sampler, x0, y1);
+    let c11 = sampler_pixel(sampler, x1, y1);
+
+    let lerp = |a: u8, b: u8, t: f32| -> f32 { a as f32 + (b as f32 - a as f32) * t };
+    let top = [
+        lerp(c00[0], c10[0], tx),
+        lerp(c00[1], c10[1], tx),
+        lerp(c00[2], c10[2], tx),
+        lerp(c00[3], c10[3], tx),
+    ];
+    let bot = [
+        lerp(c01[0], c11[0], tx),
+        lerp(c01[1], c11[1], tx),
+        lerp(c01[2], c11[2], tx),
+        lerp(c01[3], c11[3], tx),
+    ];
+    let lerp_f = |a: f32, b: f32, t: f32| -> f32 { a + (b - a) * t };
+    let rgba = [
+        lerp_f(top[0], bot[0], ty).round() as u8,
+        lerp_f(top[1], bot[1], ty).round() as u8,
+        lerp_f(top[2], bot[2], ty).round() as u8,
+        lerp_f(top[3], bot[3], ty).round() as u8,
+    ];
+
+    if rgba[3] == 0 {
+        return user_color;
+    }
+    let fg = Color32::from_rgba_unmultiplied(rgba[0], rgba[1], rgba[2], rgba[3]);
+    overlay_colors(user_color, fg)
+}
+
+fn sampler_pixel(sampler: &UrlPaintSampler, x: u32, y: u32) -> [u8; 4] {
+    let idx = ((y * sampler.width + x) * 4) as usize;
+    if idx + 3 >= sampler.rgba.len() {
+        return [0, 0, 0, 0];
+    }
+    [
+        sampler.rgba[idx],
+        sampler.rgba[idx + 1],
+        sampler.rgba[idx + 2],
+        sampler.rgba[idx + 3],
+    ]
+}
+
+fn paint_sender_name_shadows(
+    ui: &Ui,
+    paint: &SenderNamePaint,
+    galley_pos: egui::Pos2,
+    galley: &Arc<egui::Galley>,
+    uv_normalizer: egui::Vec2,
+) {
+    for shadow in &paint.shadows {
+        if shadow.radius <= 0.0 {
+            continue;
+        }
+        let Some(base_color) = parse_hex_color(&shadow.color) else {
+            continue;
+        };
+        let offsets = shadow_offsets(shadow.x_offset, shadow.y_offset, shadow.radius);
+        if offsets.is_empty() {
+            continue;
+        }
+        for row in &galley.rows {
+            for (dx, dy, alpha_scale) in &offsets {
+                let mut mesh = row.visuals.mesh.clone();
+                normalize_text_mesh_uvs(&mut mesh, uv_normalizer);
+                let c = scale_alpha(base_color, *alpha_scale);
+                for idx in row.visuals.glyph_vertex_range.clone() {
+                    if let Some(v) = mesh.vertices.get_mut(idx) {
+                        v.color = c;
+                    }
+                }
+                mesh.translate(galley_pos.to_vec2() + egui::vec2(*dx, *dy));
+                ui.painter().add(egui::Shape::mesh(mesh));
+            }
+        }
+    }
+}
+
+fn shadow_offsets(x: f32, y: f32, radius: f32) -> Vec<(f32, f32, f32)> {
+    // Match the large-shadow look by scaling the blur radius by 3.
+    let blur_radius = (radius.max(0.0)) * 3.0;
+    if blur_radius <= f32::EPSILON {
+        return Vec::new();
+    }
+
+    // Approximate QPixmapDropShadowFilter with a normalized Gaussian kernel.
+    // Keep tap count bounded for runtime stability in busy chats.
+    let tap_radius = ((blur_radius * 0.75).round() as i32).clamp(1, 6);
+    let step = (blur_radius / tap_radius as f32).max(0.5);
+    let sigma = (blur_radius * 0.5).max(0.5);
+    let two_sigma2 = 2.0 * sigma * sigma;
+
+    let mut taps: Vec<(f32, f32, f32)> = Vec::new();
+    let mut weight_sum = 0.0f32;
+    for gy in -tap_radius..=tap_radius {
+        for gx in -tap_radius..=tap_radius {
+            let ox = gx as f32 * step;
+            let oy = gy as f32 * step;
+            let dist2 = ox * ox + oy * oy;
+            let weight = (-dist2 / two_sigma2).exp();
+            if weight < 0.001 {
+                continue;
+            }
+            taps.push((x + ox, y + oy, weight));
+            weight_sum += weight;
+        }
+    }
+
+    if weight_sum <= f32::EPSILON {
+        return Vec::new();
+    }
+
+    for tap in &mut taps {
+        tap.2 /= weight_sum;
+    }
+    taps
+}
+
+fn scale_alpha(color: Color32, factor: f32) -> Color32 {
+    let a = (color.a() as f32 * factor.clamp(0.0, 1.0)).round() as u8;
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), a)
+}
+
+fn font_uv_normalizer(ui: &Ui) -> egui::Vec2 {
+    ui.fonts(|fonts| {
+        let [w, h] = fonts.font_image_size();
+        egui::vec2(1.0 / (w.max(1) as f32), 1.0 / (h.max(1) as f32))
+    })
+}
+
+fn normalize_text_mesh_uvs(mesh: &mut egui::epaint::Mesh, uv_normalizer: egui::Vec2) {
+    for v in &mut mesh.vertices {
+        v.uv = (v.uv.to_vec2() * uv_normalizer).to_pos2();
+    }
+}
+
+fn normalized_paint_stops(
+    paint: &SenderNamePaint,
+    user_color: Color32,
+) -> Option<Vec<(f32, Color32)>> {
+    let mut stops: Vec<(f32, Color32)> = paint
+        .stops
+        .iter()
+        .filter_map(|s| parse_hex_color(&s.color).map(|c| (s.at, overlay_colors(user_color, c))))
+        .collect();
+    if stops.is_empty() {
+        return None;
+    }
+    stops.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    Some(stops)
+}
+
+fn paint_sample_t(
+    paint: &SenderNamePaint,
+    rect: egui::Rect,
+    sample: egui::Pos2,
+    stops: &[(f32, Color32)],
+) -> f32 {
+    match paint.function.as_str() {
+        "radial-gradient" | "radial_gradient" | "radial" => {
+            radial_gradient_t(rect, sample, paint.repeat, stops)
+        }
+        _ => linear_gradient_t(rect, sample, paint.angle.unwrap_or(0.0)),
+    }
+}
+
+fn linear_gradient_t(rect: egui::Rect, sample: egui::Pos2, angle_deg: f32) -> f32 {
+    let mut start = rect.left_bottom();
+    let mut end = rect.right_top();
+    // Use `int(angle / 90) % 4` with truncation toward zero.
+    let angle_step = ((angle_deg / 90.0).trunc() as i32) % 4;
+    if angle_step == 1 {
+        start = rect.left_top();
+        end = rect.right_bottom();
+    } else if angle_step == 2 {
+        start = rect.right_top();
+        end = rect.left_bottom();
+    } else if angle_step == 3 {
+        start = rect.right_bottom();
+        end = rect.left_top();
+    }
+
+    let center = rect.center();
+    let gradient_angle = 90.0 - angle_deg;
+    let color_axis_angle = -angle_deg;
+
+    let (gradient_origin, gradient_dir) = line_from_angle(center, gradient_angle);
+    let (start_origin, start_dir) = line_from_angle(start, color_axis_angle);
+    let (end_origin, end_dir) = line_from_angle(end, color_axis_angle);
+
+    let gradient_start =
+        line_intersection(gradient_origin, gradient_dir, start_origin, start_dir).unwrap_or(start);
+    let gradient_end =
+        line_intersection(gradient_origin, gradient_dir, end_origin, end_dir).unwrap_or(end);
+
+    let axis = gradient_end - gradient_start;
+    let len2 = axis.length_sq().max(f32::EPSILON);
+    (sample - gradient_start).dot(axis) / len2
+}
+
+fn radial_gradient_t(
+    rect: egui::Rect,
+    sample: egui::Pos2,
+    repeat: bool,
+    stops: &[(f32, Color32)],
+) -> f32 {
+    let mut radius = rect.width().max(rect.height()) * 0.5;
+    if repeat {
+        let tail = stops.last().map(|(at, _)| *at).unwrap_or(1.0);
+        radius *= tail.max(f32::EPSILON);
+    }
+    if radius <= f32::EPSILON {
+        return 0.0;
+    }
+    sample.distance(rect.center()) / radius
+}
+
+fn line_from_angle(origin: egui::Pos2, angle_deg: f32) -> (egui::Pos2, egui::Vec2) {
+    let radians = angle_deg.to_radians();
+    let dir = egui::vec2(radians.cos(), -radians.sin());
+    (origin, dir)
+}
+
+fn line_intersection(
+    p1: egui::Pos2,
+    d1: egui::Vec2,
+    p2: egui::Pos2,
+    d2: egui::Vec2,
+) -> Option<egui::Pos2> {
+    let det = d1.x * d2.y - d1.y * d2.x;
+    if det.abs() <= f32::EPSILON {
+        return None;
+    }
+    let delta = p2 - p1;
+    let t = (delta.x * d2.y - delta.y * d2.x) / det;
+    Some(p1 + d1 * t)
+}
+
+fn gradient_color_at_t(stops: &[(f32, Color32)], t: f32, repeat: bool) -> Color32 {
+    if stops.is_empty() {
+        return Color32::WHITE;
+    }
+
+    if repeat && stops.len() >= 2 {
+        let start = stops[0].0;
+        let end = stops[stops.len() - 1].0;
+        let len = end - start;
+        if len.abs() > f32::EPSILON {
+            let wrapped = ((t - start) / len).rem_euclid(1.0);
+            let normalized: Vec<(f32, Color32)> = stops
+                .iter()
+                .map(|(at, c)| ((at - start) / len, *c))
+                .collect();
+            return gradient_color_at_t(&normalized, wrapped, false);
+        }
+    }
+
+    if t <= stops[0].0 {
+        return stops[0].1;
+    }
+    for window in stops.windows(2) {
+        let (at0, c0) = window[0];
+        let (at1, c1) = window[1];
+        if t <= at1 {
+            let span = (at1 - at0).max(f32::EPSILON);
+            let local_t = ((t - at0) / span).clamp(0.0, 1.0);
+            return Color32::from_rgba_unmultiplied(
+                lerp_u8(c0.r(), c1.r(), local_t),
+                lerp_u8(c0.g(), c1.g(), local_t),
+                lerp_u8(c0.b(), c1.b(), local_t),
+                255,
+            );
+        }
+    }
+    stops.last().map(|(_, c)| *c).unwrap_or(Color32::WHITE)
+}
+
+fn overlay_colors(background: Color32, foreground: Color32) -> Color32 {
+    let alpha = foreground.a() as f32 / 255.0;
+    let r = ((1.0 - alpha) * background.r() as f32) + (alpha * foreground.r() as f32);
+    let g = ((1.0 - alpha) * background.g() as f32) + (alpha * foreground.g() as f32);
+    let b = ((1.0 - alpha) * background.b() as f32) + (alpha * foreground.b() as f32);
+    Color32::from_rgb(r.round() as u8, g.round() as u8, b.round() as u8)
+}
+
+fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+    (a as f32 + (b as f32 - a as f32) * t).round() as u8
+}
+
+fn parse_hex_color(s: &str) -> Option<Color32> {
     let s = s.trim_start_matches('#');
-    if s.len() != 6 {
+    if s.len() != 6 && s.len() != 8 {
         return None;
     }
     let r = u8::from_str_radix(&s[0..2], 16).ok()?;
     let g = u8::from_str_radix(&s[2..4], 16).ok()?;
     let b = u8::from_str_radix(&s[4..6], 16).ok()?;
-    Some((r, g, b))
+    let a = if s.len() == 8 {
+        u8::from_str_radix(&s[6..8], 16).ok()?
+    } else {
+        255
+    };
+    Some(Color32::from_rgba_unmultiplied(r, g, b, a))
+}
+
+fn parse_hex_color_opaque_rgb(s: &str) -> Option<Color32> {
+    let s = s.trim_start_matches('#');
+    if s.len() != 6 && s.len() != 8 {
+        return None;
+    }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some(Color32::from_rgb(r, g, b))
+}
+
+fn normalized_badge_name(name: &str) -> Cow<'_, str> {
+    if name.contains('_') {
+        Cow::Owned(name.replace('_', "-"))
+    } else {
+        Cow::Borrowed(name)
+    }
 }
 
 /// Build a human-readable badge tooltip from the set name and version.
 fn pretty_badge_name(name: &str, version: &str) -> String {
-    let label = name
+    let canonical = normalized_badge_name(name);
+    let label = canonical
         .split(|c: char| c == '-' || c == '_')
         .map(|w| {
             let mut chars = w.chars();
@@ -1727,7 +2896,7 @@ fn pretty_badge_name(name: &str, version: &str) -> String {
         .join(" ");
 
     // For subscriber badges the version usually indicates months
-    if name == "subscriber" {
+    if canonical.as_ref() == "subscriber" {
         if let Ok(months) = version.parse::<u32>() {
             if months == 0 || months == 1 {
                 return format!("{label} (New)");
@@ -1747,13 +2916,19 @@ fn pretty_badge_name(name: &str, version: &str) -> String {
 fn render_badge_fallback(ui: &mut Ui, name: &str, version: &str, tooltip: &str) {
     let (bg, fg) = badge_chip_colors(name);
     let chip_text = badge_chip_text(name, version);
+    let stroke = if t::is_light() {
+        bg.gamma_multiply(0.72)
+    } else {
+        bg.gamma_multiply(1.25)
+    };
     let response = egui::Frame::new()
         .fill(bg)
+        .stroke(egui::Stroke::new(1.0, stroke))
         .corner_radius(egui::CornerRadius::same(4))
-        .inner_margin(egui::Margin::symmetric(4, 1))
+        .inner_margin(egui::Margin::symmetric(3, 1))
         .show(ui, |ui| {
             ui.add(Label::new(
-                RichText::new(&chip_text).font(t::small()).color(fg).strong(),
+                RichText::new(&chip_text).font(t::tiny()).color(fg).strong(),
             ));
         })
         .response;
@@ -1769,7 +2944,7 @@ fn render_badge_fallback(ui: &mut Ui, name: &str, version: &str, tooltip: &str) 
 }
 
 fn badge_chip_text(name: &str, version: &str) -> String {
-    match name {
+    match normalized_badge_name(name).as_ref() {
         "subscriber" => {
             if let Ok(months) = version.parse::<u32>() {
                 if months > 1 {
@@ -1778,71 +2953,146 @@ fn badge_chip_text(name: &str, version: &str) -> String {
             }
             "SUB".to_owned()
         }
-        "sub_gifter" => "GIFT".to_owned(),
+        "sub-gifter" => "GIFT".to_owned(),
         "founder" => "FND".to_owned(),
         "moderator" => "MOD".to_owned(),
-        "broadcaster" => "LIVE".to_owned(),
+        "broadcaster" => "CAST".to_owned(),
         "vip" => "VIP".to_owned(),
         "verified" => "VER".to_owned(),
         "staff" => "STAFF".to_owned(),
+        "global-mod" => "GMOD".to_owned(),
+        "artist-badge" => "ART".to_owned(),
+        "premium" => "PRIME".to_owned(),
         _ => {
             let first = name
                 .split(|c: char| c == '-' || c == '_')
                 .find(|part| !part.is_empty())
                 .unwrap_or(name);
-            first.chars().take(5).collect::<String>().to_uppercase()
+            first.chars().take(4).collect::<String>().to_uppercase()
         }
     }
 }
 
 fn badge_chip_colors(name: &str) -> (Color32, Color32) {
     let light = t::is_light();
-    match name {
-        "subscriber" => if light {
-            (Color32::from_rgb(210, 246, 218), Color32::from_rgb(32, 66, 38))
-        } else {
-            (Color32::from_rgb(52, 86, 58), Color32::from_rgb(210, 246, 218))
-        },
-        "sub_gifter" => if light {
-            (Color32::from_rgb(252, 232, 180), Color32::from_rgb(64, 47, 14))
-        } else {
-            (Color32::from_rgb(84, 67, 34), Color32::from_rgb(252, 222, 154))
-        },
-        "founder" => if light {
-            (Color32::from_rgb(215, 218, 255), Color32::from_rgb(40, 42, 75))
-        } else {
-            (Color32::from_rgb(60, 62, 95), Color32::from_rgb(200, 206, 255))
-        },
-        "moderator" => if light {
-            (Color32::from_rgb(200, 244, 217), Color32::from_rgb(23, 69, 39))
-        } else {
-            (Color32::from_rgb(43, 89, 59), Color32::from_rgb(196, 244, 217))
-        },
-        "broadcaster" => if light {
-            (Color32::from_rgb(255, 220, 220), Color32::from_rgb(82, 25, 25))
-        } else {
-            (Color32::from_rgb(102, 45, 45), Color32::from_rgb(255, 206, 206))
-        },
-        "vip" => if light {
-            (Color32::from_rgb(255, 220, 248), Color32::from_rgb(92, 37, 78))
-        } else {
-            (Color32::from_rgb(112, 57, 98), Color32::from_rgb(255, 206, 242))
-        },
-        "verified" => if light {
-            (Color32::from_rgb(210, 235, 255), Color32::from_rgb(26, 48, 87))
-        } else {
-            (Color32::from_rgb(46, 68, 107), Color32::from_rgb(191, 223, 255))
-        },
-        "staff" => if light {
-            (Color32::from_rgb(228, 234, 240), Color32::from_rgb(56, 64, 72))
-        } else {
-            (Color32::from_rgb(76, 84, 92), Color32::from_rgb(220, 226, 233))
-        },
-        _ => if light {
-            (Color32::from_rgb(220, 220, 228), Color32::from_rgb(50, 50, 54))
-        } else {
-            (Color32::from_rgb(70, 70, 74), Color32::from_rgb(210, 210, 215))
-        },
+    match normalized_badge_name(name).as_ref() {
+        "subscriber" => {
+            if light {
+                (
+                    Color32::from_rgb(210, 246, 218),
+                    Color32::from_rgb(32, 66, 38),
+                )
+            } else {
+                (
+                    Color32::from_rgb(52, 86, 58),
+                    Color32::from_rgb(210, 246, 218),
+                )
+            }
+        }
+        "sub-gifter" => {
+            if light {
+                (
+                    Color32::from_rgb(252, 232, 180),
+                    Color32::from_rgb(64, 47, 14),
+                )
+            } else {
+                (
+                    Color32::from_rgb(84, 67, 34),
+                    Color32::from_rgb(252, 222, 154),
+                )
+            }
+        }
+        "founder" => {
+            if light {
+                (
+                    Color32::from_rgb(215, 218, 255),
+                    Color32::from_rgb(40, 42, 75),
+                )
+            } else {
+                (
+                    Color32::from_rgb(60, 62, 95),
+                    Color32::from_rgb(200, 206, 255),
+                )
+            }
+        }
+        "moderator" => {
+            if light {
+                (
+                    Color32::from_rgb(200, 244, 217),
+                    Color32::from_rgb(23, 69, 39),
+                )
+            } else {
+                (
+                    Color32::from_rgb(43, 89, 59),
+                    Color32::from_rgb(196, 244, 217),
+                )
+            }
+        }
+        "broadcaster" => {
+            if light {
+                (
+                    Color32::from_rgb(255, 220, 220),
+                    Color32::from_rgb(82, 25, 25),
+                )
+            } else {
+                (
+                    Color32::from_rgb(102, 45, 45),
+                    Color32::from_rgb(255, 206, 206),
+                )
+            }
+        }
+        "vip" => {
+            if light {
+                (
+                    Color32::from_rgb(255, 220, 248),
+                    Color32::from_rgb(92, 37, 78),
+                )
+            } else {
+                (
+                    Color32::from_rgb(112, 57, 98),
+                    Color32::from_rgb(255, 206, 242),
+                )
+            }
+        }
+        "verified" => {
+            if light {
+                (
+                    Color32::from_rgb(210, 235, 255),
+                    Color32::from_rgb(26, 48, 87),
+                )
+            } else {
+                (
+                    Color32::from_rgb(46, 68, 107),
+                    Color32::from_rgb(191, 223, 255),
+                )
+            }
+        }
+        "staff" => {
+            if light {
+                (
+                    Color32::from_rgb(228, 234, 240),
+                    Color32::from_rgb(56, 64, 72),
+                )
+            } else {
+                (
+                    Color32::from_rgb(76, 84, 92),
+                    Color32::from_rgb(220, 226, 233),
+                )
+            }
+        }
+        _ => {
+            if light {
+                (
+                    Color32::from_rgb(220, 220, 228),
+                    Color32::from_rgb(50, 50, 54),
+                )
+            } else {
+                (
+                    Color32::from_rgb(70, 70, 74),
+                    Color32::from_rgb(210, 210, 215),
+                )
+            }
+        }
     }
 }
 
@@ -1918,56 +3168,136 @@ fn url_hostname(url: &str) -> String {
 fn site_badge_colors(site: &str) -> (Color32, Color32) {
     let light = t::is_light();
     match site {
-        "YouTube" => if light {
-            (Color32::from_rgb(255, 220, 220), Color32::from_rgb(180, 18, 18))
-        } else {
-            (Color32::from_rgb(120, 20, 20), Color32::from_rgb(255, 100, 100))
-        },
-        "Twitter" | "X" => if light {
-            (Color32::from_rgb(210, 235, 255), Color32::from_rgb(20, 100, 175))
-        } else {
-            (Color32::from_rgb(20, 55, 90), Color32::from_rgb(100, 180, 255))
-        },
-        "Twitch" | "Twitch Clip" => if light {
-            (Color32::from_rgb(230, 215, 255), Color32::from_rgb(100, 65, 165))
-        } else {
-            (Color32::from_rgb(60, 40, 100), Color32::from_rgb(190, 160, 255))
-        },
-        "Reddit" => if light {
-            (Color32::from_rgb(255, 225, 210), Color32::from_rgb(200, 70, 20))
-        } else {
-            (Color32::from_rgb(100, 35, 10), Color32::from_rgb(255, 135, 80))
-        },
-        "GitHub" => if light {
-            (Color32::from_rgb(225, 225, 235), Color32::from_rgb(40, 40, 50))
-        } else {
-            (Color32::from_rgb(40, 40, 50), Color32::from_rgb(210, 210, 220))
-        },
-        "Instagram" => if light {
-            (Color32::from_rgb(255, 220, 235), Color32::from_rgb(175, 30, 100))
-        } else {
-            (Color32::from_rgb(90, 15, 50), Color32::from_rgb(255, 120, 175))
-        },
-        "TikTok" => if light {
-            (Color32::from_rgb(230, 245, 250), Color32::from_rgb(20, 20, 30))
-        } else {
-            (Color32::from_rgb(20, 20, 30), Color32::from_rgb(230, 245, 250))
-        },
-        "Wikipedia" => if light {
-            (Color32::from_rgb(230, 230, 230), Color32::from_rgb(50, 50, 50))
-        } else {
-            (Color32::from_rgb(50, 50, 55), Color32::from_rgb(220, 220, 225))
-        },
-        "Steam" => if light {
-            (Color32::from_rgb(210, 220, 240), Color32::from_rgb(25, 40, 80))
-        } else {
-            (Color32::from_rgb(25, 35, 65), Color32::from_rgb(150, 180, 230))
-        },
-        _ => if light {
-            (Color32::from_rgb(225, 230, 240), Color32::from_rgb(60, 65, 80))
-        } else {
-            (Color32::from_rgb(50, 55, 65), Color32::from_rgb(180, 185, 200))
-        },
+        "YouTube" => {
+            if light {
+                (
+                    Color32::from_rgb(255, 220, 220),
+                    Color32::from_rgb(180, 18, 18),
+                )
+            } else {
+                (
+                    Color32::from_rgb(120, 20, 20),
+                    Color32::from_rgb(255, 100, 100),
+                )
+            }
+        }
+        "Twitter" | "X" => {
+            if light {
+                (
+                    Color32::from_rgb(210, 235, 255),
+                    Color32::from_rgb(20, 100, 175),
+                )
+            } else {
+                (
+                    Color32::from_rgb(20, 55, 90),
+                    Color32::from_rgb(100, 180, 255),
+                )
+            }
+        }
+        "Twitch" | "Twitch Clip" => {
+            if light {
+                (
+                    Color32::from_rgb(230, 215, 255),
+                    Color32::from_rgb(100, 65, 165),
+                )
+            } else {
+                (
+                    Color32::from_rgb(60, 40, 100),
+                    Color32::from_rgb(190, 160, 255),
+                )
+            }
+        }
+        "Reddit" => {
+            if light {
+                (
+                    Color32::from_rgb(255, 225, 210),
+                    Color32::from_rgb(200, 70, 20),
+                )
+            } else {
+                (
+                    Color32::from_rgb(100, 35, 10),
+                    Color32::from_rgb(255, 135, 80),
+                )
+            }
+        }
+        "GitHub" => {
+            if light {
+                (
+                    Color32::from_rgb(225, 225, 235),
+                    Color32::from_rgb(40, 40, 50),
+                )
+            } else {
+                (
+                    Color32::from_rgb(40, 40, 50),
+                    Color32::from_rgb(210, 210, 220),
+                )
+            }
+        }
+        "Instagram" => {
+            if light {
+                (
+                    Color32::from_rgb(255, 220, 235),
+                    Color32::from_rgb(175, 30, 100),
+                )
+            } else {
+                (
+                    Color32::from_rgb(90, 15, 50),
+                    Color32::from_rgb(255, 120, 175),
+                )
+            }
+        }
+        "TikTok" => {
+            if light {
+                (
+                    Color32::from_rgb(230, 245, 250),
+                    Color32::from_rgb(20, 20, 30),
+                )
+            } else {
+                (
+                    Color32::from_rgb(20, 20, 30),
+                    Color32::from_rgb(230, 245, 250),
+                )
+            }
+        }
+        "Wikipedia" => {
+            if light {
+                (
+                    Color32::from_rgb(230, 230, 230),
+                    Color32::from_rgb(50, 50, 50),
+                )
+            } else {
+                (
+                    Color32::from_rgb(50, 50, 55),
+                    Color32::from_rgb(220, 220, 225),
+                )
+            }
+        }
+        "Steam" => {
+            if light {
+                (
+                    Color32::from_rgb(210, 220, 240),
+                    Color32::from_rgb(25, 40, 80),
+                )
+            } else {
+                (
+                    Color32::from_rgb(25, 35, 65),
+                    Color32::from_rgb(150, 180, 230),
+                )
+            }
+        }
+        _ => {
+            if light {
+                (
+                    Color32::from_rgb(225, 230, 240),
+                    Color32::from_rgb(60, 65, 80),
+                )
+            } else {
+                (
+                    Color32::from_rgb(50, 55, 65),
+                    Color32::from_rgb(180, 185, 200),
+                )
+            }
+        }
     }
 }
 
@@ -1978,6 +3308,8 @@ fn notification_label(flags: &MessageFlags, kind: &MsgKind) -> Option<(&'static 
         Some(("Highlighted Message", t::twitch_purple()))
     } else if flags.is_mention {
         Some(("Mention", Color32::from_rgb(210, 140, 40)))
+    } else if flags.is_pinned {
+        Some(("Pinned Message", t::gold()))
     } else if matches!(kind, MsgKind::Bits { .. }) {
         Some(("Bits Cheer", t::bits_orange()))
     } else if flags.is_first_msg {
@@ -1986,5 +3318,308 @@ fn notification_label(flags: &MessageFlags, kind: &MsgKind) -> Option<(&'static 
         Some(("Channel Points Reward", Color32::from_rgb(100, 65, 165)))
     } else {
         None
+    }
+}
+
+fn message_row_background(flags: &MessageFlags, kind: &MsgKind, highlight_alpha: f32) -> Color32 {
+    if highlight_alpha > 0.0 {
+        let a = (50.0 * highlight_alpha) as u8;
+        Color32::from_rgba_unmultiplied(100, 140, 255, a)
+    } else if flags.is_highlighted {
+        Color32::from_rgba_unmultiplied(145, 70, 255, 22)
+    } else if flags.is_mention {
+        Color32::from_rgba_unmultiplied(210, 140, 40, 24)
+    } else if flags.is_pinned {
+        let gold = t::gold();
+        Color32::from_rgba_unmultiplied(gold.r(), gold.g(), gold.b(), 26)
+    } else if flags.is_first_msg {
+        let fg = t::green();
+        Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 22)
+    } else if flags.is_deleted {
+        Color32::from_rgba_unmultiplied(180, 30, 30, 12)
+    } else if matches!(kind, MsgKind::Bits { .. }) {
+        Color32::from_rgba_unmultiplied(255, 175, 30, 14)
+    } else if flags.custom_reward_id.is_some() {
+        Color32::from_rgba_unmultiplied(100, 65, 165, 16)
+    } else {
+        Color32::TRANSPARENT
+    }
+}
+
+fn message_left_accent_color(flags: &MessageFlags, kind: &MsgKind) -> Option<Color32> {
+    if flags.is_mention && matches!(kind, MsgKind::Sub { is_gift: true, .. }) {
+        Some(t::raid_cyan())
+    } else if flags.is_mention {
+        Some(t::accent())
+    } else if flags.is_highlighted {
+        Some(Color32::from_rgb(255, 210, 30))
+    } else if flags.is_pinned {
+        Some(t::gold())
+    } else if flags.is_first_msg {
+        Some(t::green())
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crust_core::model::{ChannelId, MessageId, Sender, UserId};
+
+    fn test_msg(login: &str, user_id: &str, color: Option<&str>) -> ChatMessage {
+        ChatMessage {
+            id: MessageId(1),
+            server_id: None,
+            timestamp: chrono::Utc::now(),
+            channel: ChannelId::new("rustlang"),
+            sender: Sender {
+                user_id: UserId(user_id.to_owned()),
+                login: login.to_owned(),
+                display_name: login.to_owned(),
+                color: color.map(|c| c.to_owned()),
+                name_paint: None,
+                badges: Vec::new(),
+            },
+            raw_text: "hello".to_owned(),
+            spans: Default::default(),
+            twitch_emotes: Vec::new(),
+            flags: MessageFlags::default(),
+            reply: None,
+            msg_kind: MsgKind::Chat,
+        }
+    }
+
+    #[test]
+    fn hot_window_plan_below_trigger_keeps_full_history() {
+        let plan = compute_hot_window_plan(550, false, true, HOT_WINDOW_ROWS);
+
+        assert_eq!(plan.active_start, 0);
+        assert_eq!(plan.active_len, 550);
+        assert_eq!(plan.hidden_rows, 0);
+        assert!(!plan.has_boundary());
+    }
+
+    #[test]
+    fn hot_window_plan_when_following_bottom_compacts_to_recent_rows() {
+        let plan = compute_hot_window_plan(900, false, true, HOT_WINDOW_ROWS);
+
+        assert_eq!(plan.active_start, 500);
+        assert_eq!(plan.active_len, HOT_WINDOW_ROWS);
+        assert_eq!(plan.hidden_rows, 500);
+        assert!(plan.has_boundary());
+    }
+
+    #[test]
+    fn hot_window_plan_disables_compaction_while_search_is_active() {
+        let plan = compute_hot_window_plan(900, true, true, HOT_WINDOW_ROWS);
+
+        assert_eq!(plan.active_start, 0);
+        assert_eq!(plan.active_len, 900);
+        assert_eq!(plan.hidden_rows, 0);
+        assert!(!plan.has_boundary());
+    }
+
+    #[test]
+    fn first_message_rows_get_background_tint() {
+        let flags = MessageFlags {
+            is_first_msg: true,
+            ..MessageFlags::default()
+        };
+        let bg = message_row_background(&flags, &MsgKind::Chat, 0.0);
+        assert_ne!(bg, Color32::TRANSPARENT);
+    }
+
+    #[test]
+    fn first_message_rows_get_left_accent() {
+        let flags = MessageFlags {
+            is_first_msg: true,
+            ..MessageFlags::default()
+        };
+        assert_eq!(
+            message_left_accent_color(&flags, &MsgKind::Chat),
+            Some(t::green())
+        );
+    }
+
+    #[test]
+    fn pinned_message_rows_show_pinned_label() {
+        let flags = MessageFlags {
+            is_pinned: true,
+            ..MessageFlags::default()
+        };
+        assert_eq!(
+            notification_label(&flags, &MsgKind::Chat),
+            Some(("Pinned Message", t::gold()))
+        );
+    }
+
+    #[test]
+    fn hot_window_expands_in_fixed_chunks() {
+        assert_eq!(
+            expand_hot_window_rows(HOT_WINDOW_ROWS, 1_500),
+            HOT_WINDOW_ROWS + HOT_WINDOW_EXPAND_CHUNK
+        );
+        assert_eq!(expand_hot_window_rows(1_450, 1_500), 1_500);
+    }
+
+    #[test]
+    fn anchor_compensation_stays_stable_when_oldest_rows_are_evicted() {
+        let anchor = ScrollAnchor {
+            message_id: 12,
+            distance_to_viewport_top: 10.0,
+        };
+        let active_ids = vec![12, 13, 14];
+        let mut heights = HashMap::new();
+        heights.insert(12, 20.0);
+        heights.insert(13, 20.0);
+        heights.insert(14, 20.0);
+
+        let offset =
+            compensate_anchor_offset(&anchor, &active_ids, &heights, COMPACT_BOUNDARY_HEIGHT);
+
+        assert_eq!(offset, Some(COMPACT_BOUNDARY_HEIGHT - 10.0));
+    }
+
+    #[test]
+    fn snapshot_id_mapping_tracks_shifted_indices_after_eviction() {
+        let snapshot = vec![102, 103, 104];
+        let live = vec![101, 102, 103, 104, 105];
+
+        let mapped = map_snapshot_ids_to_indices(&snapshot, &live);
+
+        assert_eq!(mapped, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn snapshot_id_mapping_drops_missing_messages() {
+        let snapshot = vec![100, 101, 102, 103];
+        let live = vec![102, 103, 104, 105];
+
+        let mapped = map_snapshot_ids_to_indices(&snapshot, &live);
+
+        assert_eq!(mapped, vec![0, 1]);
+    }
+
+    #[test]
+    fn collapse_message_for_display_collapses_after_newline_budget() {
+        let text = "line1\nline2\nline3\nline4";
+        let collapsed = collapse_message_for_display(text, 3);
+        assert_eq!(collapsed, Some("line1\nline2\nline3 …".to_owned()));
+    }
+
+    #[test]
+    fn collapse_message_for_display_uses_soft_wrap_fallback() {
+        let text = "x".repeat(1_000);
+        let collapsed = collapse_message_for_display(&text, 4);
+        assert!(collapsed.is_some());
+        let rendered = collapsed.unwrap_or_default();
+        assert!(rendered.ends_with('…'));
+        assert!(rendered.len() < text.len());
+    }
+
+    #[test]
+    fn collapse_message_for_display_keeps_short_text_unchanged() {
+        let text = "short message";
+        assert_eq!(collapse_message_for_display(text, 4), None);
+    }
+
+    #[test]
+    fn resolve_sender_color_prefers_explicit_tag_color_and_caches_it() {
+        let mut cache = HashMap::new();
+        let msg = test_msg("alice", "12345", Some("#1E90FF"));
+
+        let color = resolve_sender_color(&msg, &mut cache);
+
+        assert_eq!(color, Color32::from_rgb(0x1E, 0x90, 0xFF));
+        assert_eq!(cache.get("alice").copied(), Some(color));
+    }
+
+    #[test]
+    fn resolve_sender_color_uses_cached_channel_color_when_tag_is_missing() {
+        let mut cache = HashMap::new();
+        cache.insert("alice".to_owned(), Color32::from_rgb(10, 20, 30));
+        let msg = test_msg("alice", "12345", None);
+
+        let color = resolve_sender_color(&msg, &mut cache);
+
+        assert_eq!(color, Color32::from_rgb(10, 20, 30));
+    }
+
+    #[test]
+    fn resolve_sender_color_forces_opaque_alpha_for_sender_color_tags() {
+        let mut cache = HashMap::new();
+        let msg = test_msg("alice", "12345", Some("#11223300"));
+
+        let color = resolve_sender_color(&msg, &mut cache);
+
+        assert_eq!(color, Color32::from_rgb(0x11, 0x22, 0x33));
+        assert_eq!(cache.get("alice").copied(), Some(color));
+    }
+
+    #[test]
+    fn resolve_sender_color_falls_back_to_crust_twitch_seed_palette() {
+        let mut cache = HashMap::new();
+        let msg = test_msg("alice", "12345", None);
+
+        let color = resolve_sender_color(&msg, &mut cache);
+
+        // 12345 % 15 = 0 -> first Twitch fallback color (red).
+        assert_eq!(color, Color32::from_rgb(255, 0, 0));
+        assert_eq!(cache.get("alice").copied(), Some(color));
+    }
+
+    #[test]
+    fn sender_name_gradient_maps_first_and_last_stop_to_edges() {
+        let stops = vec![
+            (0.0, Color32::from_rgb(0xFF, 0x00, 0x00)),
+            (1.0, Color32::from_rgb(0x00, 0x00, 0xFF)),
+        ];
+        assert_eq!(
+            gradient_color_at_t(&stops, 0.0, false),
+            Color32::from_rgb(0xFF, 0x00, 0x00)
+        );
+        assert_eq!(
+            gradient_color_at_t(&stops, 1.0, false),
+            Color32::from_rgb(0x00, 0x00, 0xFF)
+        );
+    }
+
+    #[test]
+    fn sender_name_gradient_interpolates_midpoint_color() {
+        let stops = vec![
+            (0.0, Color32::from_rgb(0x00, 0x00, 0x00)),
+            (1.0, Color32::from_rgb(0xFF, 0xFF, 0xFF)),
+        ];
+        assert_eq!(
+            gradient_color_at_t(&stops, 0.5, false),
+            Color32::from_rgb(128, 128, 128)
+        );
+    }
+
+    #[test]
+    fn sender_name_gradient_repeat_wraps_out_of_range_positions() {
+        let stops = vec![
+            (0.0, Color32::from_rgb(255, 0, 0)),
+            (1.0, Color32::from_rgb(0, 0, 255)),
+        ];
+        // 1.25 wraps to 0.25
+        assert_eq!(
+            gradient_color_at_t(&stops, 1.25, true),
+            gradient_color_at_t(&stops, 0.25, false)
+        );
+    }
+
+    #[test]
+    fn normalize_external_image_url_accepts_protocol_relative_urls() {
+        assert_eq!(
+            normalize_external_image_url("//cdn.7tv.app/paint/health/1x.webp"),
+            Some("https://cdn.7tv.app/paint/health/1x.webp".to_owned())
+        );
+        assert_eq!(
+            normalize_external_image_url("https://cdn.7tv.app/paint/health/1x.webp"),
+            Some("https://cdn.7tv.app/paint/health/1x.webp".to_owned())
+        );
+        assert_eq!(normalize_external_image_url(""), None);
     }
 }

@@ -350,7 +350,11 @@ impl IrcStatusPanel {
                         } else {
                             "Disconnected"
                         },
-                        if server.connected { t::green() } else { t::red() },
+                        if server.connected {
+                            t::green()
+                        } else {
+                            t::red()
+                        },
                     );
                     status_chip(
                         ui,

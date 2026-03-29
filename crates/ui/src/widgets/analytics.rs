@@ -681,7 +681,11 @@ fn stat_row(ui: &mut Ui, label: &str, value: &str) {
                 .color(t::text_secondary()),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(RichText::new(value).font(t::small()).color(t::text_primary()));
+            ui.label(
+                RichText::new(value)
+                    .font(t::small())
+                    .color(t::text_primary()),
+            );
         });
     });
 }
@@ -772,6 +776,7 @@ mod tests {
                 login: login.to_owned(),
                 display_name: login.to_owned(),
                 color: None,
+                name_paint: None,
                 badges: vec![],
             },
             raw_text: raw_text.to_owned(),

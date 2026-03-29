@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use anyhow::Result;
+use eframe::egui;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -9,19 +10,18 @@ use tracing_subscriber::EnvFilter;
 use chrono::Utc;
 use crust_core::events::{AppCommand, AppEvent, ConnectionState};
 use crust_core::model::{
-    Badge, ChannelId, ChatMessage, EmoteCatalogEntry, MessageFlags, MessageId, MsgKind,
-    Sender, UserId, UserProfile,
+    Badge, ChannelId, ChatMessage, EmoteCatalogEntry, MessageFlags, MessageId, MsgKind, Sender,
+    UserId, UserProfile,
 };
 use crust_emotes::{
     cache::EmoteCache,
     providers::{
-        BttvProvider, EmoteInfo, FfzProvider, KickProvider, SevenTvProvider,
-        TwitchGlobalProvider,
+        BttvProvider, EmoteInfo, FfzProvider, KickProvider, SevenTvProvider, TwitchGlobalProvider,
     },
     EmoteProvider,
 };
 use crust_kick::session::{KickEvent, KickSession, KickSessionCommand};
-use crust_storage::{AppSettings, SettingsStore};
+use crust_storage::{AppSettings, LogStore, SettingsStore};
 use crust_twitch::session::generic_irc::{
     is_raw_irc_protocol_line, GenericIrcEvent, GenericIrcSession, GenericIrcSessionCommand,
 };
@@ -30,6 +30,13 @@ use crust_twitch::{
     session::client::{SessionCommand, TwitchEvent, TwitchSession},
 };
 use crust_ui::CrustApp;
+use seventv::{
+    apply_7tv_cosmetics_to_sender, load_7tv_cosmetics_catalog, load_7tv_user_style_for_twitch,
+    resolve_7tv_user_style, SevenTvBadgeMeta, SevenTvCosmeticUpdate, SevenTvPaintMeta,
+    SevenTvResolvedStyle, SevenTvUserStyleRaw,
+};
+
+mod seventv;
 
 const CMD_CHANNEL_SIZE: usize = 128;
 const EVT_CHANNEL_SIZE: usize = 4096;
@@ -37,7 +44,17 @@ const TWITCH_EVT_SIZE: usize = 4096;
 const KICK_EVT_SIZE: usize = 4096;
 const IRC_EVT_SIZE: usize = 4096;
 const TWITCH_MAX_MESSAGE_CHARS: usize = 500;
-const SEVENTV_GQL_URL: &str = "https://api.7tv.app/v3/gql";
+const TWITCH_GQL_URL: &str = "https://gql.twitch.tv/gql";
+const TWITCH_WEB_CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
+
+static UI_REPAINT_CTX: OnceLock<egui::Context> = OnceLock::new();
+
+#[inline]
+fn request_ui_repaint() {
+    if let Some(ctx) = UI_REPAINT_CTX.get() {
+        ctx.request_repaint();
+    }
+}
 
 /// Counter for assigning unique IDs to history messages loaded from external APIs.
 /// Starts at u64::MAX/2 so it never clashes with live session IDs (which count up from 0).
@@ -75,53 +92,6 @@ fn resolve_emote<'a>(
 /// Shared badge map: (scope, set_name, version) → image URL.
 /// `scope` is `""` for global badges, or the channel name for channel-specific badges.
 type BadgeMap = Arc<RwLock<std::collections::HashMap<(String, String, String), String>>>;
-
-#[derive(Debug, Clone, Default)]
-struct SevenTvUserStyleRaw {
-    color: Option<i32>,
-    badge_id: Option<String>,
-    avatar_url: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct SevenTvBadgeMeta {
-    tooltip: Option<String>,
-    url: String,
-}
-
-#[derive(Debug, Clone, Default)]
-struct SevenTvResolvedStyle {
-    color_hex: Option<String>,
-    badge: Option<Badge>,
-    avatar_url: Option<String>,
-}
-
-enum SevenTvCosmeticUpdate {
-    Catalog {
-        badges: HashMap<String, SevenTvBadgeMeta>,
-    },
-    UserStyle {
-        twitch_user_id: String,
-        style: Option<SevenTvUserStyleRaw>,
-    },
-    /// Batch of Twitch user-ids discovered in history messages that need
-    /// their 7TV styles resolved.
-    BatchUserLookup {
-        user_ids: Vec<String>,
-    },
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct SevenTvGraphQlResponse<T> {
-    data: Option<T>,
-    #[serde(default)]
-    errors: Vec<SevenTvGraphQlError>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct SevenTvGraphQlError {
-    message: String,
-}
 
 fn main() -> Result<()> {
     // SIGPIPE: handle broken pipe signals on Wayland
@@ -172,7 +142,10 @@ fn main() -> Result<()> {
 
     // Channels: UI ↔ runtime
     let (cmd_tx, cmd_rx) = mpsc::channel::<AppCommand>(CMD_CHANNEL_SIZE);
-    let (evt_tx, evt_rx) = mpsc::channel::<AppEvent>(EVT_CHANNEL_SIZE);
+    let (ui_evt_tx, evt_rx) = mpsc::channel::<AppEvent>(EVT_CHANNEL_SIZE);
+    // Runtime-side event bus. A bridge forwards events to the UI channel and
+    // immediately requests an egui repaint so new events show up without delay.
+    let (evt_tx, mut evt_bridge_rx) = mpsc::channel::<AppEvent>(EVT_CHANNEL_SIZE);
 
     // Twitch session channels
     let (tw_evt_tx, tw_evt_rx) = mpsc::channel::<TwitchEvent>(TWITCH_EVT_SIZE);
@@ -201,6 +174,7 @@ fn main() -> Result<()> {
 
     // Settings / token storage
     let settings_store = SettingsStore::new().ok();
+    let chat_logs = LogStore::new().ok();
     let initial_settings: AppSettings = settings_store
         .as_ref()
         .map(|s| s.load())
@@ -233,6 +207,14 @@ fn main() -> Result<()> {
         .worker_threads(4)
         .enable_all()
         .build()?;
+
+    rt.spawn(async move {
+        while let Some(evt) = evt_bridge_rx.recv().await {
+            if ui_evt_tx.send(evt).await.is_ok() {
+                request_ui_repaint();
+            }
+        }
+    });
 
     // Spawn anonymous Twitch session
     rt.spawn({
@@ -297,6 +279,7 @@ fn main() -> Result<()> {
             bm,
             gc,
             settings_store,
+            chat_logs,
             saved_token,
             kick_runtime_enabled,
             irc_runtime_enabled,
@@ -316,7 +299,10 @@ fn main() -> Result<()> {
     let result = eframe::run_native(
         "crust",
         native_opts,
-        Box::new(move |cc| Ok(Box::new(CrustApp::new(cc, cmd_tx, evt_rx)))),
+        Box::new(move |cc| {
+            let _ = UI_REPAINT_CTX.set(cc.egui_ctx.clone());
+            Ok(Box::new(CrustApp::new(cc, cmd_tx, evt_rx)))
+        }),
     );
 
     // winit on Wayland may exit with code 1 if the sctk-adwaita CSD
@@ -373,6 +359,7 @@ async fn reducer_loop(
     badge_map: BadgeMap,
     global_emote_codes: GlobalCodes,
     settings_store: Option<SettingsStore>,
+    chat_logs: Option<LogStore>,
     saved_token: Option<String>,
     kick_runtime_enabled: bool,
     irc_runtime_enabled: bool,
@@ -382,9 +369,10 @@ async fn reducer_loop(
     // Track URLs we've already kicked off a link-preview fetch for.
     let mut pending_link_previews: HashSet<String> = HashSet::new();
 
-    // 7TV cosmetics cache: global badges + per-user resolved styles.
+    // 7TV cosmetics cache: global badges/paints + per-user resolved styles.
     let (stv_update_tx, mut stv_update_rx) = mpsc::channel::<SevenTvCosmeticUpdate>(512);
     let mut stv_badges: HashMap<String, SevenTvBadgeMeta> = HashMap::new();
+    let mut stv_paints: HashMap<String, SevenTvPaintMeta> = HashMap::new();
     let mut stv_user_styles_raw: HashMap<String, SevenTvUserStyleRaw> = HashMap::new();
     let mut stv_user_styles_resolved: HashMap<String, SevenTvResolvedStyle> = HashMap::new();
     let mut stv_pending_user_lookups: HashSet<String> = HashSet::new();
@@ -401,9 +389,9 @@ async fn reducer_loop(
         let tx = stv_update_tx.clone();
         let client = stv_http_client.clone();
         tokio::spawn(async move {
-            if let Some(badges) = load_7tv_cosmetics_catalog(&client).await {
+            if let Some((badges, paints)) = load_7tv_cosmetics_catalog(&client).await {
                 let _ = tx
-                    .send(SevenTvCosmeticUpdate::Catalog { badges })
+                    .send(SevenTvCosmeticUpdate::Catalog { badges, paints })
                     .await;
             }
         });
@@ -540,7 +528,9 @@ async fn reducer_loop(
         let tx = token_val_tx.clone();
         tokio::spawn(async move {
             let result = validate_token(&token).await;
-            let _ = tx.send(TokenValidationResult::Startup { token, result }).await;
+            let _ = tx
+                .send(TokenValidationResult::Startup { token, result })
+                .await;
         });
     }
 
@@ -578,6 +568,14 @@ async fn reducer_loop(
             irc_nickserv_user: settings.irc_nickserv_user.clone(),
             irc_nickserv_pass: settings.irc_nickserv_pass.clone(),
             always_on_top: settings.always_on_top,
+        })
+        .await;
+    let _ = evt_tx
+        .send(AppEvent::ChatUiBehaviorUpdated {
+            prevent_overlong_twitch_messages: settings.prevent_overlong_twitch_messages,
+            collapse_long_messages: settings.collapse_long_messages,
+            collapse_long_message_lines: settings.collapse_long_message_lines,
+            animations_when_focused: settings.animations_when_focused,
         })
         .await;
 
@@ -713,6 +711,15 @@ async fn reducer_loop(
                         tokio::spawn(async move {
                             load_channel_badges(&room_id, &ch_badge, &bm, &cache_b, &etx).await;
                         });
+                        // Load persisted local chat history first (SQLite),
+                        // then merge remote history on top.
+                        if let Some(store) = chat_logs.clone() {
+                            let ch_local = channel.clone();
+                            let etx_local = evt_tx.clone();
+                            tokio::spawn(async move {
+                                load_local_recent_messages(ch_local, store, etx_local).await;
+                            });
+                        }
                         // Load recent chat history
                         let ch_hist = channel.clone();
                         let uname_hist = auth_username.clone();
@@ -731,6 +738,14 @@ async fn reducer_loop(
                                 &etx_hist,
                                 &stv_tx_hist,
                             ).await;
+                        });
+                        // Fetch the currently pinned message snapshot for this channel.
+                        // Twitch does not always replay moderator-pinned state over IRC
+                        // when joining, so we mirror the web client GraphQL query.
+                        let ch_pin = channel.clone();
+                        let etx_pin = evt_tx.clone();
+                        tokio::spawn(async move {
+                            fetch_current_twitch_pinned_message(ch_pin, etx_pin).await;
                         });
                     }
                     TwitchEvent::Authenticated { username, user_id } => {
@@ -913,6 +928,11 @@ async fn reducer_loop(
                         }
 
                         let channel = msg.channel.clone();
+                        if let Some(store) = chat_logs.as_ref() {
+                            if let Err(e) = store.append_message(&msg) {
+                                warn!("chat-log: failed to persist Twitch message: {e}");
+                            }
+                        }
                         let _ = evt_tx.send(AppEvent::MessageReceived {
                             channel,
                             message: msg,
@@ -933,10 +953,13 @@ async fn reducer_loop(
                         );
                         if !is_join_noise {
                             if let Some(ch) = notice.channel.clone() {
-                                let msg = make_system_message(
+                                let mut msg = make_system_message(
                                     local_msg_id, ch, notice.text.clone(), notice.timestamp,
                                     MsgKind::SystemInfo,
                                 );
+                                if is_twitch_pinned_notice(&notice.text) {
+                                    msg.flags.is_pinned = true;
+                                }
                                 local_msg_id += 1;
                                 let _ = evt_tx.send(AppEvent::MessageReceived {
                                     channel: msg.channel.clone(),
@@ -1180,6 +1203,11 @@ async fn reducer_loop(
                         }
 
                         let channel = msg.channel.clone();
+                        if let Some(store) = chat_logs.as_ref() {
+                            if let Err(e) = store.append_message(&msg) {
+                                warn!("chat-log: failed to persist Kick message: {e}");
+                            }
+                        }
                         let _ = evt_tx.send(AppEvent::MessageReceived {
                             channel,
                             message: msg,
@@ -1429,6 +1457,11 @@ async fn reducer_loop(
                         }
 
                         let channel = msg.channel.clone();
+                        if let Some(store) = chat_logs.as_ref() {
+                            if let Err(e) = store.append_message(&msg) {
+                                warn!("chat-log: failed to persist IRC message: {e}");
+                            }
+                        }
                         let _ = evt_tx.send(AppEvent::MessageReceived {
                             channel,
                             message: msg,
@@ -1440,16 +1473,21 @@ async fn reducer_loop(
             // Internal 7TV cosmetics updates (catalog + per-user style lookups).
             Some(stv_update) = stv_update_rx.recv() => {
                 match stv_update {
-                    SevenTvCosmeticUpdate::Catalog { badges } => {
-                        info!("7TV catalog received: {} badges", badges.len());
+                    SevenTvCosmeticUpdate::Catalog { badges, paints } => {
+                        info!(
+                            "7TV catalog received: {} badges, {} paints",
+                            badges.len(),
+                            paints.len()
+                        );
                         stv_badges = badges;
+                        stv_paints = paints;
 
                         // Re-resolve any styles we already learned before
                         // the cosmetics catalog was available.
                         stv_user_styles_resolved.clear();
                         let mut updates: Vec<(String, SevenTvResolvedStyle)> = Vec::new();
                         for (uid, style) in &stv_user_styles_raw {
-                            let resolved = resolve_7tv_user_style(style, &stv_badges);
+                            let resolved = resolve_7tv_user_style(style, &stv_badges, &stv_paints);
                             updates.push((uid.clone(), resolved.clone()));
                             stv_user_styles_resolved.insert(uid.clone(), resolved);
                         }
@@ -1466,6 +1504,7 @@ async fn reducer_loop(
                                 .send(AppEvent::SenderCosmeticsUpdated {
                                     user_id,
                                     color: resolved.color_hex,
+                                    name_paint: None,
                                     badge: resolved.badge,
                                     avatar_url: resolved.avatar_url,
                                 })
@@ -1478,7 +1517,7 @@ async fn reducer_loop(
                     } => {
                         stv_pending_user_lookups.remove(&twitch_user_id);
                         if let Some(raw) = style {
-                            let resolved = resolve_7tv_user_style(&raw, &stv_badges);
+                            let resolved = resolve_7tv_user_style(&raw, &stv_badges, &stv_paints);
                             stv_user_styles_raw.insert(twitch_user_id.clone(), raw);
                             stv_user_styles_resolved
                                 .insert(twitch_user_id.clone(), resolved.clone());
@@ -1488,6 +1527,7 @@ async fn reducer_loop(
                                     .send(AppEvent::SenderCosmeticsUpdated {
                                         user_id: twitch_user_id,
                                         color: resolved.color_hex,
+                                        name_paint: None,
                                         badge: resolved.badge,
                                         avatar_url: resolved.avatar_url,
                                     })
@@ -1567,6 +1607,15 @@ async fn reducer_loop(
                         let _ = evt_tx.send(AppEvent::ChannelJoined {
                             channel: channel.clone(),
                         }).await;
+                        if !channel.is_twitch() {
+                            if let Some(store) = chat_logs.clone() {
+                                let etx_local = evt_tx.clone();
+                                let ch_local = channel.clone();
+                                tokio::spawn(async move {
+                                    load_local_recent_messages(ch_local, store, etx_local).await;
+                                });
+                            }
+                        }
                         // Inject a single join confirmation into the feed.
                         let platform_label = if channel.is_kick() {
                             "Kick"
@@ -1625,6 +1674,13 @@ async fn reducer_loop(
                                 channel: channel.clone(),
                             })
                             .await;
+                        if let Some(store) = chat_logs.clone() {
+                            let etx_local = evt_tx.clone();
+                            let ch_local = channel.clone();
+                            tokio::spawn(async move {
+                                load_local_recent_messages(ch_local, store, etx_local).await;
+                            });
+                        }
                         let join_msg = make_system_message(
                             local_msg_id,
                             channel.clone(),
@@ -1928,6 +1984,32 @@ async fn reducer_loop(
                             }
                         }
                     }
+                    AppCommand::SetChatUiBehavior {
+                        prevent_overlong_twitch_messages,
+                        collapse_long_messages,
+                        collapse_long_message_lines,
+                        animations_when_focused,
+                    } => {
+                        settings.prevent_overlong_twitch_messages =
+                            prevent_overlong_twitch_messages;
+                        settings.collapse_long_messages = collapse_long_messages;
+                        settings.collapse_long_message_lines = collapse_long_message_lines.max(1);
+                        settings.animations_when_focused = animations_when_focused;
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save chat UI behavior settings: {e}");
+                            }
+                        }
+                        let _ = evt_tx
+                            .send(AppEvent::ChatUiBehaviorUpdated {
+                                prevent_overlong_twitch_messages:
+                                    settings.prevent_overlong_twitch_messages,
+                                collapse_long_messages: settings.collapse_long_messages,
+                                collapse_long_message_lines: settings.collapse_long_message_lines,
+                                animations_when_focused: settings.animations_when_focused,
+                            })
+                            .await;
+                    }
                     AppCommand::SendMessage {
                         channel,
                         text,
@@ -2032,6 +2114,7 @@ async fn reducer_loop(
                                     login: uname.to_lowercase(),
                                     display_name: uname.clone(),
                                     color: self_color.clone(),
+                                    name_paint: None,
                                     badges: self_badges.get(&channel).cloned().unwrap_or_default(),
                                 },
                                 raw_text: text.clone(),
@@ -2042,6 +2125,7 @@ async fn reducer_loop(
                                     is_highlighted: false,
                                     is_deleted: false,
                                     is_first_msg: false,
+                                    is_pinned: false,
                                     is_self: true,
                                     is_mention: false,
                                     custom_reward_id: None,
@@ -2133,6 +2217,7 @@ async fn reducer_loop(
                                         login: display.to_lowercase(),
                                         display_name: display.to_owned(),
                                         color: None,
+                                        name_paint: None,
                                         badges: Vec::new(),
                                     },
                                     raw_text: echo_text,
@@ -2143,6 +2228,7 @@ async fn reducer_loop(
                                         is_highlighted: false,
                                         is_deleted: false,
                                         is_first_msg: false,
+                                        is_pinned: false,
                                         is_self: true,
                                         is_mention: false,
                                         custom_reward_id: None,
@@ -2841,286 +2927,6 @@ fn prefetch_emote_images(
     }
 }
 
-// 7TV cosmetics
-
-fn seven_tv_color_to_rgba(color: i32) -> (u8, u8, u8, u8) {
-    let raw = color as u32;
-    let r = ((raw >> 24) & 0xFF) as u8;
-    let g = ((raw >> 16) & 0xFF) as u8;
-    let b = ((raw >> 8) & 0xFF) as u8;
-    let a = (raw & 0xFF) as u8;
-    // 7TV encodes alpha = 0 to mean "fully opaque" (no alpha override).
-    let a = if a == 0 { 255 } else { a };
-    (r, g, b, a)
-}
-
-fn seven_tv_color_to_hex(color: i32) -> Option<String> {
-    if color == 0 {
-        return None;
-    }
-    let (r, g, b, _a) = seven_tv_color_to_rgba(color);
-    Some(format!("#{r:02X}{g:02X}{b:02X}"))
-}
-
-fn seven_tv_badge_url(host_url: &str, file_name: &str) -> String {
-    let base = if host_url.starts_with("//") {
-        format!("https:{host_url}")
-    } else {
-        host_url.to_owned()
-    };
-    format!("{}/{}", base.trim_end_matches('/'), file_name)
-}
-
-fn choose_7tv_badge_file(files: &[SevenTvBadgeFile]) -> Option<&SevenTvBadgeFile> {
-    files
-        .iter()
-        .find(|f| f.name.starts_with("2x."))
-        .or_else(|| files.iter().find(|f| f.name.starts_with("1x.")))
-        .or_else(|| files.first())
-}
-
-fn resolve_7tv_user_style(
-    style: &SevenTvUserStyleRaw,
-    badges: &HashMap<String, SevenTvBadgeMeta>,
-) -> SevenTvResolvedStyle {
-    let color_hex = style
-        .color
-        .and_then(seven_tv_color_to_hex);
-
-    let badge = style.badge_id.as_ref().and_then(|id| badges.get(id)).map(|b| {
-        Badge {
-            name: "7tv".to_owned(),
-            version: b.tooltip.clone().unwrap_or_else(|| "1".to_owned()),
-            url: Some(b.url.clone()),
-        }
-    });
-
-    SevenTvResolvedStyle {
-        color_hex,
-        badge,
-        avatar_url: style.avatar_url.clone(),
-    }
-}
-
-fn apply_7tv_cosmetics_to_sender(sender: &mut Sender, style: &SevenTvResolvedStyle) {
-    if let Some(ref color) = style.color_hex {
-        sender.color = Some(color.clone());
-    }
-
-    if let Some(ref badge) = style.badge {
-        let already_has = sender.badges.iter().any(|b| {
-            b.url.as_deref() == badge.url.as_deref() || b.name.eq_ignore_ascii_case("7tv")
-        });
-        if !already_has {
-            sender.badges.insert(0, badge.clone());
-        }
-    }
-}
-
-async fn load_7tv_cosmetics_catalog(client: &reqwest::Client) -> Option<HashMap<String, SevenTvBadgeMeta>> {
-    #[derive(serde::Deserialize)]
-    struct RespData {
-        cosmetics: Cosmetics,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct Cosmetics {
-        badges: Vec<BadgeNode>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct BadgeNode {
-        id: String,
-        tooltip: Option<String>,
-        host: BadgeHost,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct BadgeHost {
-        url: String,
-        files: Vec<SevenTvBadgeFile>,
-    }
-
-    let query = r#"
-        query {
-            cosmetics {
-                badges {
-                    id
-                    tooltip
-                    host {
-                        url
-                        files {
-                            name
-                        }
-                    }
-                }
-            }
-        }
-    "#;
-
-    let resp = match client
-        .post(SEVENTV_GQL_URL)
-        .json(&serde_json::json!({ "query": query }))
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("7TV cosmetics fetch failed: {e}");
-            return None;
-        }
-    };
-
-    let payload = match resp.json::<SevenTvGraphQlResponse<RespData>>().await {
-        Ok(p) => p,
-        Err(e) => {
-            warn!("7TV cosmetics parse failed: {e}");
-            return None;
-        }
-    };
-
-    if !payload.errors.is_empty() {
-        let messages = payload
-            .errors
-            .iter()
-            .map(|e| e.message.as_str())
-            .collect::<Vec<_>>()
-            .join(" | ");
-        warn!("7TV cosmetics GraphQL errors: {messages}");
-    }
-
-    let Some(data) = payload.data else {
-        return None;
-    };
-
-    let badges: HashMap<String, SevenTvBadgeMeta> = data
-        .cosmetics
-        .badges
-        .into_iter()
-        .filter_map(|b| {
-            let file = choose_7tv_badge_file(&b.host.files)?;
-            Some((
-                b.id,
-                SevenTvBadgeMeta {
-                    tooltip: b.tooltip,
-                    url: seven_tv_badge_url(&b.host.url, &file.name),
-                },
-            ))
-        })
-        .collect();
-
-    info!(
-        "Loaded 7TV cosmetics catalog (badges={})",
-        badges.len()
-    );
-
-    Some(badges)
-}
-
-async fn load_7tv_user_style_for_twitch(client: &reqwest::Client, twitch_user_id: &str) -> Option<SevenTvUserStyleRaw> {
-    #[derive(serde::Deserialize)]
-    struct RespData {
-        #[serde(rename = "userByConnection")]
-        user_by_connection: Option<UserNode>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct UserNode {
-        style: StyleNode,
-        avatar_url: Option<String>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct StyleNode {
-        color: i32,
-        badge_id: Option<String>,
-    }
-
-    if twitch_user_id.trim().is_empty() {
-        return None;
-    }
-
-    let query = r#"
-        query($id: String!) {
-            userByConnection(platform: TWITCH, id: $id) {
-                avatar_url
-                style {
-                    color
-                    badge_id
-                }
-            }
-        }
-    "#;
-
-    let resp = match client
-        .post(SEVENTV_GQL_URL)
-        .json(&serde_json::json!({
-            "query": query,
-            "variables": { "id": twitch_user_id }
-        }))
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            debug!("7TV user style fetch failed for {twitch_user_id}: {e}");
-            return None;
-        }
-    };
-
-    let payload = match resp.json::<SevenTvGraphQlResponse<RespData>>().await {
-        Ok(p) => p,
-        Err(e) => {
-            debug!("7TV user style parse failed for {twitch_user_id}: {e}");
-            return None;
-        }
-    };
-
-    if !payload.errors.is_empty() {
-        let messages = payload
-            .errors
-            .iter()
-            .map(|e| e.message.as_str())
-            .collect::<Vec<_>>()
-            .join(" | ");
-        debug!("7TV user style GraphQL errors for {twitch_user_id}: {messages}");
-    }
-
-    let user_node = payload
-        .data
-        .and_then(|d| d.user_by_connection);
-
-    let avatar_url = user_node.as_ref()
-        .and_then(|u| u.avatar_url.clone())
-        .filter(|s| !s.is_empty())
-        .map(|u| {
-            // 7TV sometimes returns protocol-relative URLs (//cdn.7tv.app/...)
-            if u.starts_with("//") { format!("https:{u}") } else { u }
-        });
-
-    let style = user_node
-        .map(|u| u.style)
-        .unwrap_or(StyleNode {
-            color: 0,
-            badge_id: None,
-        });
-
-    Some(SevenTvUserStyleRaw {
-        color: if style.color == 0 {
-            None
-        } else {
-            Some(style.color)
-        },
-        badge_id: style.badge_id.filter(|s| !s.is_empty()),
-        avatar_url,
-    })
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct SevenTvBadgeFile {
-    name: String,
-}
-
 // Badge loading
 
 /// Resolve a badge image URL from the badge map.
@@ -3138,7 +2944,11 @@ fn resolve_badge_url(
     version: &str,
 ) -> Option<String> {
     // Try channel-specific scope first, then fall back to global.
-    let scopes: &[&str] = if scope.is_empty() { &[""] } else { &[scope, ""] };
+    let scopes: &[&str] = if scope.is_empty() {
+        &[""]
+    } else {
+        &[scope, ""]
+    };
     for s in scopes {
         // Fast path: exact match.
         if let Some(url) = map.get(&(s.to_string(), name.to_owned(), version.to_owned())) {
@@ -3174,6 +2984,10 @@ fn parse_ivr_badge_response(
     struct Version {
         id: String,
         image_url_1x: String,
+        #[serde(default)]
+        image_url_2x: Option<String>,
+        #[serde(default)]
+        image_url_4x: Option<String>,
     }
     #[derive(serde::Deserialize)]
     struct BadgeSet {
@@ -3181,11 +2995,49 @@ fn parse_ivr_badge_response(
         versions: Vec<Version>,
     }
 
+    fn normalize_badge_url(url: String) -> String {
+        if url.starts_with("//") {
+            format!("https:{url}")
+        } else {
+            url
+        }
+    }
+
+    fn badge_set_aliases(set_id: &str) -> Vec<String> {
+        let mut out = Vec::with_capacity(3);
+        out.push(set_id.to_owned());
+
+        if set_id.contains('-') {
+            let alt = set_id.replace('-', "_");
+            if !out.iter().any(|v| v == &alt) {
+                out.push(alt);
+            }
+        }
+        if set_id.contains('_') {
+            let alt = set_id.replace('_', "-");
+            if !out.iter().any(|v| v == &alt) {
+                out.push(alt);
+            }
+        }
+
+        out
+    }
+
     // IVR returns a flat array: [{set_id, versions: [...]}]
     if let Ok(sets) = serde_json::from_str::<Vec<BadgeSet>>(body) {
+        let scope = scope.to_owned();
         for set in sets {
             for ver in set.versions {
-                map.insert((scope.to_owned(), set.set_id.clone(), ver.id), ver.image_url_1x);
+                let version_id = ver.id;
+                let url = normalize_badge_url(
+                    ver.image_url_4x
+                        .or(ver.image_url_2x)
+                        .unwrap_or(ver.image_url_1x),
+                );
+
+                for set_id in badge_set_aliases(&set.set_id) {
+                    map.insert((scope.clone(), set_id, version_id.clone()), url.clone());
+                }
             }
         }
     }
@@ -3346,6 +3198,57 @@ async fn fetch_and_decode_raw(url: &str) -> Result<(u32, u32, Vec<u8>), crust_em
 
 // Recent message history
 
+/// Load locally persisted chat history from SQLite and replay it as
+/// `AppEvent::HistoryLoaded` for the channel.
+async fn load_local_recent_messages(
+    channel: ChannelId,
+    log_store: LogStore,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let channel_for_query = channel.clone();
+    let loaded = tokio::task::spawn_blocking(move || {
+        log_store.recent_messages(&channel_for_query, LogStore::default_recent_limit())
+    })
+    .await;
+
+    let mut messages = match loaded {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(e)) => {
+            warn!(
+                "chat-history: local SQLite load failed for #{}: {e}",
+                channel.display_name()
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(
+                "chat-history: local SQLite task failed for #{}: {e}",
+                channel.display_name()
+            );
+            return;
+        }
+    };
+
+    if messages.is_empty() {
+        return;
+    }
+
+    for msg in &mut messages {
+        msg.id = MessageId(HISTORY_MSG_ID.fetch_sub(1, std::sync::atomic::Ordering::Relaxed));
+        msg.flags.is_history = true;
+        msg.channel = channel.clone();
+    }
+
+    info!(
+        "chat-history: loaded {} local SQLite messages for #{}",
+        messages.len(),
+        channel.display_name()
+    );
+    let _ = evt_tx
+        .send(AppEvent::HistoryLoaded { channel, messages })
+        .await;
+}
+
 /// Fetch recent messages for a channel and send `AppEvent::HistoryLoaded`.
 /// Primary source: recent-messages.robotty.de (covers all channels, correct
 /// path uses a hyphen: /recent-messages/).  Fallback: logs.ivr.fi (large
@@ -3403,24 +3306,19 @@ async fn load_recent_messages(
                                     break 'fetch p.messages;
                                 }
                                 Ok(_) => {
-                                    robotty_err =
-                                        Some("robotty returned 0 messages".to_owned());
+                                    robotty_err = Some("robotty returned 0 messages".to_owned());
                                 }
                                 Err(e) => {
-                                    robotty_err = Some(format!(
-                                        "robotty JSON parse failed: {e}"
-                                    ));
+                                    robotty_err = Some(format!("robotty JSON parse failed: {e}"));
                                 }
                             }
                         }
                         Err(e) => {
-                            robotty_err =
-                                Some(format!("robotty body read failed: {e}"));
+                            robotty_err = Some(format!("robotty body read failed: {e}"));
                         }
                     }
                 } else {
-                    robotty_err =
-                        Some(format!("robotty HTTP {status}"));
+                    robotty_err = Some(format!("robotty HTTP {status}"));
                 }
             }
             Err(e) => {
@@ -3457,20 +3355,13 @@ async fn load_recent_messages(
                                     "chat-history: IVR returned {} raw lines for #{ch}",
                                     p.messages.len()
                                 );
-                                break 'fetch p.messages
-                                    .into_iter()
-                                    .map(|m| m.raw)
-                                    .collect();
+                                break 'fetch p.messages.into_iter().map(|m| m.raw).collect();
                             }
                             Ok(_) => {
-                                warn!(
-                                    "chat-history: both sources returned 0 messages for #{ch}"
-                                );
+                                warn!("chat-history: both sources returned 0 messages for #{ch}");
                             }
                             Err(e) => {
-                                warn!(
-                                    "chat-history: IVR JSON parse failed for #{ch}: {e}"
-                                );
+                                warn!("chat-history: IVR JSON parse failed for #{ch}: {e}");
                             }
                         }
                         Vec::new()
@@ -3567,7 +3458,8 @@ async fn load_recent_messages(
 
             // Resolve badge URLs from the snapshot (no lock needed)
             for badge in &mut msg.sender.badges {
-                badge.url = resolve_badge_url(&badge_snapshot, &channel_scope, &badge.name, &badge.version);
+                badge.url =
+                    resolve_badge_url(&badge_snapshot, &channel_scope, &badge.name, &badge.version);
             }
 
             // Mention detection
@@ -3575,8 +3467,7 @@ async fn load_recent_messages(
                 let nick_lower = nick.to_lowercase();
                 let text_lower = msg.raw_text.to_lowercase();
                 // @mention or bare username as a whole word
-                let has_mention = text_lower
-                    .contains(&format!("@{nick_lower}"))
+                let has_mention = text_lower.contains(&format!("@{nick_lower}"))
                     || text_lower
                         .split(|c: char| !c.is_alphanumeric() && c != '_')
                         .any(|w| w == nick_lower);
@@ -3642,7 +3533,9 @@ async fn load_recent_messages(
         history_user_ids.sort();
         if !history_user_ids.is_empty() {
             let _ = stv_update_tx
-                .send(SevenTvCosmeticUpdate::BatchUserLookup { user_ids: history_user_ids })
+                .send(SevenTvCosmeticUpdate::BatchUserLookup {
+                    user_ids: history_user_ids,
+                })
                 .await;
         }
     }
@@ -4179,18 +4072,22 @@ async fn fetch_ivr_logs(channel: &str, username: &str, evt_tx: mpsc::Sender<AppE
                 format!("IVR logs returned HTTP {status}: {body}")
             };
             warn!("{msg}");
-            let _ = evt_tx.send(AppEvent::IvrLogsFailed {
-                username: username.to_owned(),
-                error: msg,
-            }).await;
+            let _ = evt_tx
+                .send(AppEvent::IvrLogsFailed {
+                    username: username.to_owned(),
+                    error: msg,
+                })
+                .await;
             return;
         }
         Err(e) => {
             warn!("IVR logs fetch failed for {username} in {channel}: {e}");
-            let _ = evt_tx.send(AppEvent::IvrLogsFailed {
-                username: username.to_owned(),
-                error: format!("Network error: {e}"),
-            }).await;
+            let _ = evt_tx
+                .send(AppEvent::IvrLogsFailed {
+                    username: username.to_owned(),
+                    error: format!("Network error: {e}"),
+                })
+                .await;
             return;
         }
     };
@@ -4202,10 +4099,12 @@ async fn fetch_ivr_logs(channel: &str, username: &str, evt_tx: mpsc::Sender<AppE
         Ok(b) => b,
         Err(e) => {
             warn!("IVR logs: failed to read response body for {username}: {e}");
-            let _ = evt_tx.send(AppEvent::IvrLogsFailed {
-                username: username.to_owned(),
-                error: format!("Failed to read response: {e}"),
-            }).await;
+            let _ = evt_tx
+                .send(AppEvent::IvrLogsFailed {
+                    username: username.to_owned(),
+                    error: format!("Failed to read response: {e}"),
+                })
+                .await;
             return;
         }
     };
@@ -4213,27 +4112,41 @@ async fn fetch_ivr_logs(channel: &str, username: &str, evt_tx: mpsc::Sender<AppE
     let parsed: IvrLogResponse = match serde_json::from_str(&body) {
         Ok(p) => p,
         Err(e) => {
-            warn!("IVR logs parse failed for {username}: {e} (body len={})", body.len());
-            let _ = evt_tx.send(AppEvent::IvrLogsFailed {
-                username: username.to_owned(),
-                error: format!("Failed to parse response: {e}"),
-            }).await;
+            warn!(
+                "IVR logs parse failed for {username}: {e} (body len={})",
+                body.len()
+            );
+            let _ = evt_tx
+                .send(AppEvent::IvrLogsFailed {
+                    username: username.to_owned(),
+                    error: format!("Failed to parse response: {e}"),
+                })
+                .await;
             return;
         }
     };
 
-    let entries: Vec<IvrLogEntry> = parsed.messages.into_iter().map(|m| IvrLogEntry {
-        text: m.text,
-        timestamp: m.timestamp,
-        display_name: m.display_name,
-        msg_type: m.msg_type,
-    }).collect();
+    let entries: Vec<IvrLogEntry> = parsed
+        .messages
+        .into_iter()
+        .map(|m| IvrLogEntry {
+            text: m.text,
+            timestamp: m.timestamp,
+            display_name: m.display_name,
+            msg_type: m.msg_type,
+        })
+        .collect();
 
-    info!("IVR logs: loaded {} entries for {username} in {channel}", entries.len());
-    let _ = evt_tx.send(AppEvent::IvrLogsLoaded {
-        username: username.to_owned(),
-        messages: entries,
-    }).await;
+    info!(
+        "IVR logs: loaded {} entries for {username} in {channel}",
+        entries.len()
+    );
+    let _ = evt_tx
+        .send(AppEvent::IvrLogsLoaded {
+            username: username.to_owned(),
+            messages: entries,
+        })
+        .await;
 }
 
 /// Fetch a Kick user profile via Kick's public channel API.
@@ -4554,12 +4467,7 @@ fn extract_irc_msg_echo(text: &str, source_channel: &ChannelId) -> Option<(Chann
         .strip_prefix('#')
         .unwrap_or(target)
         .to_ascii_lowercase();
-    let echo_ch = ChannelId::irc(
-        &irc_target.host,
-        irc_target.port,
-        irc_target.tls,
-        &ch_name,
-    );
+    let echo_ch = ChannelId::irc(&irc_target.host, irc_target.port, irc_target.tls, &ch_name);
     Some((echo_ch, body.to_owned()))
 }
 
@@ -4586,6 +4494,7 @@ fn make_system_message(
             login: String::new(),
             display_name: String::new(),
             color: None,
+            name_paint: None,
             badges: Vec::new(),
         },
         raw_text: text,
@@ -4596,6 +4505,7 @@ fn make_system_message(
             is_highlighted: false,
             is_deleted: false,
             is_first_msg: false,
+            is_pinned: false,
             is_self: false,
             is_mention: false,
             custom_reward_id: None,
@@ -4604,6 +4514,196 @@ fn make_system_message(
         reply: None,
         msg_kind: kind,
     }
+}
+
+#[derive(Debug, Clone)]
+struct TwitchPinnedSnapshot {
+    pinned_id: String,
+    sender_id: String,
+    sender_login: String,
+    sender_display_name: String,
+    text: String,
+    sent_at: Option<String>,
+    starts_at: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TwitchPinnedQueryResponse {
+    data: Option<TwitchPinnedQueryData>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TwitchPinnedQueryData {
+    user: Option<TwitchPinnedUser>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TwitchPinnedUser {
+    channel: Option<TwitchPinnedChannel>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TwitchPinnedChannel {
+    #[serde(rename = "pinnedChatMessages")]
+    pinned_chat_messages: Option<TwitchPinnedConnection>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TwitchPinnedConnection {
+    edges: Vec<TwitchPinnedEdge>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TwitchPinnedEdge {
+    node: TwitchPinnedNode,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TwitchPinnedNode {
+    id: String,
+    #[serde(rename = "startsAt")]
+    starts_at: Option<String>,
+    #[serde(rename = "pinnedMessage")]
+    pinned_message: TwitchPinnedMessage,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TwitchPinnedMessage {
+    content: TwitchPinnedContent,
+    sender: TwitchPinnedSender,
+    #[serde(rename = "sentAt")]
+    sent_at: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TwitchPinnedContent {
+    text: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TwitchPinnedSender {
+    id: String,
+    login: String,
+    #[serde(rename = "displayName")]
+    display_name: String,
+}
+
+fn parse_twitch_pinned_snapshot_json(body: &str) -> Option<TwitchPinnedSnapshot> {
+    let parsed: TwitchPinnedQueryResponse = serde_json::from_str(body).ok()?;
+    let edge = parsed
+        .data?
+        .user?
+        .channel?
+        .pinned_chat_messages?
+        .edges
+        .into_iter()
+        .next()?;
+    let node = edge.node;
+    let text = node.pinned_message.content.text.trim().to_owned();
+    if text.is_empty() {
+        return None;
+    }
+    Some(TwitchPinnedSnapshot {
+        pinned_id: node.id,
+        sender_id: node.pinned_message.sender.id,
+        sender_login: node.pinned_message.sender.login,
+        sender_display_name: node.pinned_message.sender.display_name,
+        text,
+        sent_at: node.pinned_message.sent_at,
+        starts_at: node.starts_at,
+    })
+}
+
+async fn fetch_current_twitch_pinned_message(channel: ChannelId, evt_tx: mpsc::Sender<AppEvent>) {
+    let channel_login = channel.as_str().trim().to_ascii_lowercase();
+    if channel_login.is_empty() {
+        return;
+    }
+
+    let payload = serde_json::json!({
+        "query": "query($login:String!){user(login:$login){channel{id pinnedChatMessages(first:1){edges{node{id startsAt pinnedMessage{content{text} sender{id displayName login} sentAt}}}}}}}",
+        "variables": { "login": channel_login },
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(6))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    let resp = match client
+        .post(TWITCH_GQL_URL)
+        .header("Client-ID", TWITCH_WEB_CLIENT_ID)
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(
+                "pinned-fetch: request failed for #{}: {}",
+                channel.display_name(),
+                e
+            );
+            return;
+        }
+    };
+
+    let body = match resp.text().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(
+                "pinned-fetch: failed reading response for #{}: {}",
+                channel.display_name(),
+                e
+            );
+            return;
+        }
+    };
+
+    let Some(snapshot) = parse_twitch_pinned_snapshot_json(&body) else {
+        return;
+    };
+
+    let timestamp = snapshot
+        .sent_at
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+        .or_else(|| {
+            snapshot
+                .starts_at
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&Utc))
+        })
+        .unwrap_or_else(Utc::now);
+
+    let mut msg = make_system_message(
+        HISTORY_MSG_ID.fetch_sub(1, std::sync::atomic::Ordering::Relaxed),
+        channel.clone(),
+        snapshot.text,
+        timestamp,
+        MsgKind::SystemInfo,
+    );
+    msg.server_id = Some(format!("twitch:pinned:{}", snapshot.pinned_id));
+    msg.sender = Sender {
+        user_id: UserId(snapshot.sender_id),
+        login: snapshot.sender_login,
+        display_name: snapshot.sender_display_name,
+        color: None,
+        name_paint: None,
+        badges: Vec::new(),
+    };
+    msg.flags.is_pinned = true;
+    // Snapshot fetched on join; treat as historical context, not a fresh live event.
+    msg.flags.is_history = true;
+
+    let _ = evt_tx
+        .send(AppEvent::MessageReceived {
+            channel,
+            message: msg,
+        })
+        .await;
 }
 
 /// Format a timeout notice for display in chat.
@@ -4619,6 +4719,19 @@ fn format_timeout_text(login: &str, seconds: u32) -> String {
             (seconds % 3600) / 60
         )
     }
+}
+
+/// Best-effort detection for Twitch pinned-card notices delivered as system text.
+/// Twitch can surface current pinned cards as notice text instead of PRIVMSG tags.
+fn is_twitch_pinned_notice(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("unpinned") {
+        return false;
+    }
+
+    lower.contains("pinned by ")
+        || lower.contains("pinned a message")
+        || (lower.contains("pinned") && lower.contains(" sent at "))
 }
 
 /// Build a human-readable sub alert text.
@@ -4737,8 +4850,7 @@ async fn fetch_link_preview(
     let description =
         og_meta(&html, "og:description").or_else(|| og_meta(&html, "twitter:description"));
     let thumbnail_url = og_meta(&html, "og:image").or_else(|| og_meta(&html, "twitter:image"));
-    let site_name = og_meta(&html, "og:site_name")
-        .or_else(|| detect_site_name(url));
+    let site_name = og_meta(&html, "og:site_name").or_else(|| detect_site_name(url));
 
     // Kick off thumbnail image fetch so bytes land in emote_bytes.
     if let Some(ref img) = thumbnail_url {
@@ -4820,7 +4932,10 @@ fn detect_site_name(url: &str) -> Option<String> {
     let lower = url.to_lowercase();
     if lower.contains("youtube.com/") || lower.contains("youtu.be/") {
         Some("YouTube".to_owned())
-    } else if lower.contains("twitter.com/") || lower.contains("x.com/") || lower.contains("fxtwitter.com/") {
+    } else if lower.contains("twitter.com/")
+        || lower.contains("x.com/")
+        || lower.contains("fxtwitter.com/")
+    {
         Some("Twitter".to_owned())
     } else if lower.contains("twitch.tv/") {
         Some("Twitch".to_owned())
@@ -4932,3 +5047,81 @@ fn url_percent_encode(s: &str) -> String {
 }
 
 const HEX_CHARS: [u8; 16] = *b"0123456789ABCDEF";
+
+#[cfg(test)]
+mod tests {
+    use super::{is_twitch_pinned_notice, parse_twitch_pinned_snapshot_json};
+
+    #[test]
+    fn twitch_pinned_notice_detects_multi_line_pin_card_text() {
+        let txt = "Pinned by ModeratorFieryVamp\n\nDon't forget to vote for your favorite content to be showcased here https://asmongold247.tv/\n\nModerator6-Month SubscriberDittoFieryVamp sent at 05:28 AM";
+        assert!(is_twitch_pinned_notice(txt));
+    }
+
+    #[test]
+    fn twitch_pinned_notice_ignores_regular_system_messages() {
+        assert!(!is_twitch_pinned_notice("Joined channel"));
+        assert!(!is_twitch_pinned_notice(
+            "You are permanently banned from talking in this channel."
+        ));
+        assert!(!is_twitch_pinned_notice("The pinned message was unpinned."));
+    }
+
+    #[test]
+    fn parse_twitch_pinned_snapshot_extracts_first_edge() {
+        let json = r#"{
+            "data": {
+                "user": {
+                    "channel": {
+                        "pinnedChatMessages": {
+                            "edges": [
+                                {
+                                    "node": {
+                                        "id": "fa15fd37-56df-4349-98eb-412b0544d475",
+                                        "startsAt": "2026-03-28T09:28:42Z",
+                                        "pinnedMessage": {
+                                            "content": {
+                                                "text": "Don't forget to vote for your favorite content to be showcased here https://asmongold247.tv/"
+                                            },
+                                            "sender": {
+                                                "id": "222687958",
+                                                "displayName": "FieryVamp",
+                                                "login": "fieryvamp"
+                                            },
+                                            "sentAt": "2026-03-28T09:28:39.861714831Z"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        }"#;
+
+        let parsed = parse_twitch_pinned_snapshot_json(json).expect("expected pinned snapshot");
+        assert_eq!(parsed.pinned_id, "fa15fd37-56df-4349-98eb-412b0544d475");
+        assert_eq!(parsed.sender_display_name, "FieryVamp");
+        assert_eq!(
+            parsed.text,
+            "Don't forget to vote for your favorite content to be showcased here https://asmongold247.tv/"
+        );
+    }
+
+    #[test]
+    fn parse_twitch_pinned_snapshot_returns_none_when_no_edges() {
+        let json = r#"{
+            "data": {
+                "user": {
+                    "channel": {
+                        "pinnedChatMessages": {
+                            "edges": []
+                        }
+                    }
+                }
+            }
+        }"#;
+
+        assert!(parse_twitch_pinned_snapshot_json(json).is_none());
+    }
+}

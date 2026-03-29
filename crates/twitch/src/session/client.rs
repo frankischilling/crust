@@ -513,7 +513,10 @@ impl TwitchSession {
                     if let Some(ch_raw) = msg.params.first() {
                         let ch = ChannelId::new(ch_raw.as_str());
                         let emote_only = msg.tags.get("emote-only").map(|v| v == "1");
-                        let followers_only = msg.tags.get("followers-only").and_then(|v| v.parse::<i32>().ok());
+                        let followers_only = msg
+                            .tags
+                            .get("followers-only")
+                            .and_then(|v| v.parse::<i32>().ok());
                         let slow = msg.tags.get("slow").and_then(|v| v.parse::<u32>().ok());
                         let subs_only = msg.tags.get("subs-only").map(|v| v == "1");
                         let r9k = msg.tags.get("r9k").map(|v| v == "1");
@@ -746,6 +749,7 @@ impl TwitchSession {
             login,
             display_name,
             color,
+            name_paint: None,
             badges,
         };
 
@@ -789,9 +793,10 @@ impl TwitchSession {
             twitch_emotes,
             flags: MessageFlags {
                 is_action,
-                is_highlighted: tags.get("msg-id") == Some("highlighted-message"),
+                is_highlighted: irc_msg_id_contains(tags, "highlighted-message"),
                 is_deleted: false,
                 is_first_msg: tags.get("first-msg") == Some("1"),
+                is_pinned: is_pinned_chat_message(tags),
                 is_self: is_own,
                 is_mention: false, // set by reducer once auth_username is known
                 custom_reward_id: tags
@@ -860,6 +865,7 @@ pub fn parse_privmsg_irc(
         login: login.clone(),
         display_name,
         color,
+        name_paint: None,
         badges,
     };
 
@@ -903,9 +909,10 @@ pub fn parse_privmsg_irc(
         twitch_emotes,
         flags: MessageFlags {
             is_action,
-            is_highlighted: tags.get("msg-id") == Some("highlighted-message"),
+            is_highlighted: irc_msg_id_contains(tags, "highlighted-message"),
             is_deleted: false,
             is_first_msg: tags.get("first-msg") == Some("1"),
+            is_pinned: is_pinned_chat_message(tags),
             is_self: is_own,
             is_mention: false, // set by caller
             custom_reward_id: tags
@@ -917,6 +924,27 @@ pub fn parse_privmsg_irc(
         reply,
         msg_kind: MsgKind::Chat,
     })
+}
+
+fn irc_msg_id_contains(tags: &crate::irc::types::IrcTags, needle: &str) -> bool {
+    tags.get("msg-id")
+        .map(|v| v.split(';').any(|part| part.eq_ignore_ascii_case(needle)))
+        .unwrap_or(false)
+}
+
+fn is_pinned_chat_message(tags: &crate::irc::types::IrcTags) -> bool {
+    // Twitch Hype Chat/pinned tags can vary between providers/history sources.
+    // Accept any IRC tag in the pinned-chat family plus a msg-id fallback.
+    tags.0
+        .keys()
+        .any(|k| k.to_ascii_lowercase().starts_with("pinned-chat-"))
+        || tags
+            .get("msg-id")
+            .map(|v| {
+                v.split(';')
+                    .any(|part| part.to_ascii_lowercase().contains("pinned-chat"))
+            })
+            .unwrap_or(false)
 }
 
 /// Decode a Twitch sub-plan code to a human-readable tier name.

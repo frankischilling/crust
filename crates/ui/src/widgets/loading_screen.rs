@@ -208,8 +208,10 @@ impl LoadingScreen {
 
     /// Call every frame; advances the timeout-based done detection.
     pub fn tick(&mut self) {
-        if matches!(self.phase, Phase::Connecting | Phase::Authenticating | Phase::Loading)
-            && self.started_at.elapsed() >= DONE_TIMEOUT
+        if matches!(
+            self.phase,
+            Phase::Connecting | Phase::Authenticating | Phase::Loading
+        ) && self.started_at.elapsed() >= DONE_TIMEOUT
         {
             self.mark_ready();
         }
@@ -685,9 +687,8 @@ impl LoadingScreen {
                         }
 
                         if self.images_expected > 0 {
-                            let prog =
-                                (self.images_loaded as f32 / self.images_expected as f32)
-                                    .clamp(0.0, 1.0);
+                            let prog = (self.images_loaded as f32 / self.images_expected as f32)
+                                .clamp(0.0, 1.0);
                             ui.add_space(6.0);
                             ui.add(
                                 egui::widgets::ProgressBar::new(prog)
@@ -702,7 +703,8 @@ impl LoadingScreen {
 
                         ui.add_space(8.0);
                         let narrow_log_rows = ((rect.height() - 280.0) / LOADING_LOG_ROW_HEIGHT)
-                            .clamp(2.0, SUPER_NARROW_LOG_ROWS as f32) as usize;
+                            .clamp(2.0, SUPER_NARROW_LOG_ROWS as f32)
+                            as usize;
                         egui::Frame::new()
                             .fill(a(t::bg_base()))
                             .stroke(egui::Stroke::new(1.0, a(t::border_subtle())))
@@ -710,15 +712,9 @@ impl LoadingScreen {
                             .inner_margin(egui::Margin::symmetric(7, 6))
                             .show(ui, |ui| {
                                 let inner_w = ui.available_width();
-                                ui.set_min_height(
-                                    narrow_log_rows as f32 * LOADING_LOG_ROW_HEIGHT,
-                                );
-                                let mut lines: Vec<&LogLine> = self
-                                    .log
-                                    .iter()
-                                    .rev()
-                                    .take(narrow_log_rows)
-                                    .collect();
+                                ui.set_min_height(narrow_log_rows as f32 * LOADING_LOG_ROW_HEIGHT);
+                                let mut lines: Vec<&LogLine> =
+                                    self.log.iter().rev().take(narrow_log_rows).collect();
                                 lines.reverse();
 
                                 if lines.is_empty() {

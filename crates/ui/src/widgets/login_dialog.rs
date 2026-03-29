@@ -288,7 +288,8 @@ fn draw_account_row(
                         .corner_radius(egui::CornerRadius::same(avatar_r as u8)),
                 );
             } else {
-                ui.painter().circle_filled(center, avatar_r, t::accent_dim());
+                ui.painter()
+                    .circle_filled(center, avatar_r, t::accent_dim());
                 ui.painter()
                     .circle_stroke(center, avatar_r, egui::Stroke::new(1.5, t::accent()));
                 ui.painter().text(

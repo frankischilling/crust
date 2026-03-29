@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use egui::{Color32, CornerRadius, RichText, Vec2};
 
-use crust_core::model::{Badge, ChannelId, ChatMessage, UserProfile};
 use crust_core::events::IvrLogEntry;
+use crust_core::model::{Badge, ChannelId, ChatMessage, UserProfile};
 
 use crate::theme as t;
 
@@ -32,14 +32,9 @@ pub enum PopupAction {
         user_id: String,
     },
     /// Request IVR chat logs for the displayed user.
-    FetchIvrLogs {
-        channel: String,
-        username: String,
-    },
+    FetchIvrLogs { channel: String, username: String },
     /// Open a URL in the system browser.
-    OpenUrl {
-        url: String,
-    },
+    OpenUrl { url: String },
 }
 
 // ─── Tab state ────────────────────────────────────────────────────────────────
@@ -1081,9 +1076,12 @@ impl UserProfilePopup {
             });
 
         // Close the popup after a mod action so the user doesn't have to.
-        let has_mod_action = actions.iter().any(|a| matches!(a,
-            PopupAction::Timeout { .. } | PopupAction::Ban { .. } | PopupAction::Unban { .. }
-        ));
+        let has_mod_action = actions.iter().any(|a| {
+            matches!(
+                a,
+                PopupAction::Timeout { .. } | PopupAction::Ban { .. } | PopupAction::Unban { .. }
+            )
+        });
         if has_mod_action {
             self.open = false;
         }
@@ -1129,9 +1127,15 @@ fn role_pill(ui: &mut egui::Ui, text: &str, color: Color32) {
 /// Render a small text badge pill (fallback when image is unavailable).
 fn badge_text_pill(ui: &mut egui::Ui, name: &str) {
     let (fill, text_col) = if t::is_light() {
-        (Color32::from_rgba_unmultiplied(80, 80, 100, 50), Color32::from_rgb(50, 50, 65))
+        (
+            Color32::from_rgba_unmultiplied(80, 80, 100, 50),
+            Color32::from_rgb(50, 50, 65),
+        )
     } else {
-        (Color32::from_rgba_unmultiplied(80, 80, 100, 140), Color32::from_rgb(210, 210, 220))
+        (
+            Color32::from_rgba_unmultiplied(80, 80, 100, 140),
+            Color32::from_rgb(210, 210, 220),
+        )
     };
     egui::Frame::new()
         .fill(fill)
@@ -1139,9 +1143,7 @@ fn badge_text_pill(ui: &mut egui::Ui, name: &str) {
         .inner_margin(egui::Margin::symmetric(4, 1))
         .show(ui, |ui| {
             ui.add(egui::Label::new(
-                RichText::new(name)
-                    .color(text_col)
-                    .size(10.0),
+                RichText::new(name).color(text_col).size(10.0),
             ));
         });
 }
@@ -1190,7 +1192,8 @@ fn parse_hex_color(hex: &str) -> Option<Color32> {
 
 /// Convert a badge name + version to a human-readable label.
 fn badge_display_name(name: &str, version: &str) -> String {
-    match name {
+    let canonical = name.replace('_', "-");
+    match canonical.as_str() {
         "subscriber" => match version.parse::<u32>().unwrap_or(0) {
             0 => "Subscriber".to_owned(),
             m => format!("{m}-month Sub"),
@@ -1200,8 +1203,10 @@ fn badge_display_name(name: &str, version: &str) -> String {
         "vip" => "VIP".to_owned(),
         "staff" => "Staff".to_owned(),
         "admin" => "Admin".to_owned(),
-        "global_mod" => "Global Mod".to_owned(),
+        "global-mod" => "Global Mod".to_owned(),
         "partner" => "Partner".to_owned(),
+        "sub-gifter" => "Sub Gifter".to_owned(),
+        "artist-badge" => "Artist".to_owned(),
         "bits" => {
             let val: u64 = version.parse().unwrap_or(0);
             if val > 0 {
@@ -1210,8 +1215,8 @@ fn badge_display_name(name: &str, version: &str) -> String {
                 "Bits".to_owned()
             }
         }
-        other => {
-            let s = other.replace('_', " ");
+        _ => {
+            let s = canonical.replace('-', " ");
             let mut c = s.chars();
             match c.next() {
                 None => String::new(),

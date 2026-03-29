@@ -141,15 +141,12 @@ impl<'a> ChannelList<'a> {
                                 .unwrap_or(false);
                             if outside {
                                 // Pointer released outside sidebar → split pane
-                                result.drag_split =
-                                    Some(self.channels[ds.dragging_idx].clone());
+                                result.drag_split = Some(self.channels[ds.dragging_idx].clone());
                             } else {
                                 let raw = ds.insert_before;
-                                let insert =
-                                    if raw > ds.dragging_idx { raw - 1 } else { raw };
+                                let insert = if raw > ds.dragging_idx { raw - 1 } else { raw };
                                 if insert != ds.dragging_idx {
-                                    let mut new_order: Vec<ChannelId> =
-                                        self.channels.to_vec();
+                                    let mut new_order: Vec<ChannelId> = self.channels.to_vec();
                                     let moved = new_order.remove(ds.dragging_idx);
                                     new_order.insert(insert, moved);
                                     result.reordered = Some(new_order);
@@ -233,20 +230,16 @@ impl<'a> ChannelList<'a> {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 4.0;
 
-                                // Live-status indicator dot (animated pulse when live)
+                                // Live-status indicator dot.
                                 if let Some(live_map) = self.live_channels {
-                                    let login = ch.display_name().to_lowercase();
-                                    if let Some(&is_live) = live_map.get(&login) {
+                                    if let Some(&is_live) = live_map.get(ch.display_name()) {
                                         let dot_r = 3.5_f32;
                                         let (dot_rect, _) = ui.allocate_exact_size(
                                             egui::vec2(dot_r * 2.0 + 2.0, dot_r * 2.0),
                                             egui::Sense::hover(),
                                         );
                                         let dot_col = if is_live {
-                                            let t = ui.input(|i| i.time) as f32;
-                                            let p = (t * 2.5_f32).sin() * 0.5 + 0.5;
-                                            let a = (160.0_f32 + p * 95.0) as u8;
-                                            Color32::from_rgba_unmultiplied(220, 65, 65, a)
+                                            Color32::from_rgb(220, 65, 65)
                                         } else {
                                             Color32::from_rgba_unmultiplied(90, 90, 110, 70)
                                         };
@@ -345,9 +338,13 @@ impl<'a> ChannelList<'a> {
                                             let close = ui.add_visible(
                                                 show_close,
                                                 egui::Label::new(
-                                                    RichText::new("✕")
-                                                        .font(t::small())
-                                                        .color(if is_hovered { t::text_secondary() } else { t::text_muted() }),
+                                                    RichText::new("✕").font(t::small()).color(
+                                                        if is_hovered {
+                                                            t::text_secondary()
+                                                        } else {
+                                                            t::text_muted()
+                                                        },
+                                                    ),
                                                 )
                                                 .sense(egui::Sense::click()),
                                             );
@@ -355,7 +352,9 @@ impl<'a> ChannelList<'a> {
                                                 result.closed = Some(ch.clone());
                                             }
                                             if close.hovered() {
-                                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                                ui.ctx().set_cursor_icon(
+                                                    egui::CursorIcon::PointingHand,
+                                                );
                                             }
                                         }
                                     },
@@ -381,10 +380,8 @@ impl<'a> ChannelList<'a> {
                         let label_text = format!("# {}", dragged_ch.display_name());
                         let is_outside = ds.outside_sidebar;
 
-                        let layer_id = egui::LayerId::new(
-                            egui::Order::Tooltip,
-                            Id::new("drag_ghost_layer"),
-                        );
+                        let layer_id =
+                            egui::LayerId::new(egui::Order::Tooltip, Id::new("drag_ghost_layer"));
                         let ghost_rect = egui::Rect::from_min_size(
                             egui::pos2(pos.x + 12.0, pos.y - 14.0),
                             egui::vec2(130.0, ROW_H),
@@ -399,11 +396,7 @@ impl<'a> ChannelList<'a> {
                             let a = t::accent();
                             Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 210)
                         };
-                        painter.rect_filled(
-                            ghost_rect,
-                            egui::CornerRadius::same(6),
-                            fill,
-                        );
+                        painter.rect_filled(ghost_rect, egui::CornerRadius::same(6), fill);
                         painter.text(
                             ghost_rect.center(),
                             egui::Align2::CENTER_CENTER,
@@ -414,10 +407,8 @@ impl<'a> ChannelList<'a> {
 
                         // Sub-label when outside sidebar
                         if is_outside {
-                            let hint_pos = egui::pos2(
-                                ghost_rect.center().x,
-                                ghost_rect.bottom() + 3.0,
-                            );
+                            let hint_pos =
+                                egui::pos2(ghost_rect.center().x, ghost_rect.bottom() + 3.0);
                             painter.text(
                                 hint_pos,
                                 egui::Align2::CENTER_TOP,

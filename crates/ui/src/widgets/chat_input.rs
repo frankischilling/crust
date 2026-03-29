@@ -73,6 +73,11 @@ pub struct ChatInput<'a> {
     pub known_channels: &'a [ChannelId],
     /// Chatters currently in the channel (sorted, for `@` username autocomplete).
     pub chatters: &'a [String],
+    /// Overflow handling mode for Twitch messages:
+    /// `true` = Prevent, `false` = Highlight.
+    pub prevent_overlong_twitch_messages: bool,
+    /// Whether animated emotes should animate this frame.
+    pub animate_emotes: bool,
 }
 
 /// Result from showing the chat input.
@@ -111,13 +116,10 @@ impl<'a> ChatInput<'a> {
                         ui.painter().rect_filled(rect, 0.0, t::accent());
 
                         ui.label(
-                            RichText::new(format!(
-                                "↩  Replying to @{}",
-                                rep.parent_display_name
-                            ))
-                            .font(t::small())
-                            .color(t::accent())
-                            .strong(),
+                            RichText::new(format!("↩  Replying to @{}", rep.parent_display_name))
+                                .font(t::small())
+                                .color(t::accent())
+                                .strong(),
                         );
                         let body = if rep.parent_msg_body.chars().count() > 60 {
                             let cut = rep
@@ -134,35 +136,26 @@ impl<'a> ChatInput<'a> {
                         // Reserve 24px for the dismiss button; shrink body
                         // with truncation at narrow widths.
                         let btn_reserve = 24.0;
-                        let body_max_w =
-                            (ui.available_width() - btn_reserve).max(0.0);
-                        ui.allocate_ui(
-                            egui::vec2(body_max_w, ui.available_height()),
-                            |ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(body)
-                                            .font(t::small())
-                                            .color(t::text_muted()),
-                                    )
-                                    .truncate(),
-                                );
-                            },
-                        );
+                        let body_max_w = (ui.available_width() - btn_reserve).max(0.0);
+                        ui.allocate_ui(egui::vec2(body_max_w, ui.available_height()), |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(body).font(t::small()).color(t::text_muted()),
+                                )
+                                .truncate(),
+                            );
+                        });
 
                         // Dismiss button – right-aligned, always reachable.
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if ui
-                                    .small_button("✕")
-                                    .on_hover_text("Dismiss reply")
-                                    .clicked()
-                                {
-                                    result.dismiss_reply = true;
-                                }
-                            },
-                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .small_button("✕")
+                                .on_hover_text("Dismiss reply")
+                                .clicked()
+                            {
+                                result.dismiss_reply = true;
+                            }
+                        });
                     });
                 });
         }
@@ -176,14 +169,14 @@ impl<'a> ChatInput<'a> {
                     let input_width = ui.available_width();
                     // Username label - hide at narrow widths
                     if input_width > 300.0 {
-                    if let Some(name) = self.username {
-                        ui.label(
-                            RichText::new(format!("{name}:"))
-                                .color(t::accent())
-                                .strong()
-                                .font(t::small()),
-                        );
-                    }
+                        if let Some(name) = self.username {
+                            ui.label(
+                                RichText::new(format!("{name}:"))
+                                    .color(t::accent())
+                                    .strong()
+                                    .font(t::small()),
+                            );
+                        }
                     }
 
                     // Pre-check autocompletes before TextEdit consumes keys.
@@ -226,9 +219,8 @@ impl<'a> ChatInput<'a> {
                         0.0
                     };
                     let text_width = (ui.available_width() - reserve).max(40.0);
-                    let te_output = ui.allocate_ui(
-                        egui::vec2(text_width, t::BAR_H),
-                        |ui| {
+                    let te_output = ui
+                        .allocate_ui(egui::vec2(text_width, t::BAR_H), |ui| {
                             egui::TextEdit::singleline(buf)
                                 .hint_text(if self.logged_in {
                                     "Send a message..."
@@ -243,9 +235,8 @@ impl<'a> ChatInput<'a> {
                                 // we handle Tab ourselves for autocomplete.
                                 .lock_focus(true)
                                 .show(ui)
-                        },
-                    )
-                    .inner;
+                        })
+                        .inner;
                     let resp = te_output.response;
                     let text_edit_id = resp.id;
 
@@ -256,30 +247,19 @@ impl<'a> ChatInput<'a> {
                         let clip = te_output.text_clip_rect;
                         let painter = ui.painter().with_clip_rect(clip);
 
-                        for (word, char_start, _byte_start, char_end) in
-                            iter_words(buf)
-                        {
+                        for (word, char_start, _byte_start, char_end) in iter_words(buf) {
                             if crate::spellcheck::is_correct(word) {
                                 continue;
                             }
                             // Get screen-space positions of word start and end
-                            let r_start = galley.pos_from_ccursor(
-                                egui::text::CCursor::new(char_start),
-                            );
-                            let r_end = galley.pos_from_ccursor(
-                                egui::text::CCursor::new(char_end),
-                            );
+                            let r_start =
+                                galley.pos_from_ccursor(egui::text::CCursor::new(char_start));
+                            let r_end = galley.pos_from_ccursor(egui::text::CCursor::new(char_end));
                             let x0 = galley_pos.x + r_start.min.x;
                             let x1 = galley_pos.x + r_end.min.x;
                             let y = galley_pos.y + r_start.max.y + 1.0;
 
-                            paint_wavy_underline(
-                                &painter,
-                                x0,
-                                x1,
-                                y,
-                                t::red(),
-                            );
+                            paint_wavy_underline(&painter, x0, x1, y, t::red());
                         }
                     }
 
@@ -299,7 +279,10 @@ impl<'a> ChatInput<'a> {
                     } else {
                         Vec::new()
                     };
-                    let join_matches = if matches.is_empty() && username_matches.is_empty() && slash_matches.is_empty() {
+                    let join_matches = if matches.is_empty()
+                        && username_matches.is_empty()
+                        && slash_matches.is_empty()
+                    {
                         find_join_channel_matches(buf, self.channel, self.known_channels)
                     } else {
                         Vec::new()
@@ -400,11 +383,12 @@ impl<'a> ChatInput<'a> {
                                 let (pfx, word) = extract_last_word(buf);
                                 if !word.is_empty() {
                                     // Check if the word starts with @ for mention completion
-                                    let (is_mention, search_word) = if let Some(stripped) = word.strip_prefix('@') {
-                                        (true, stripped)
-                                    } else {
-                                        (false, word)
-                                    };
+                                    let (is_mention, search_word) =
+                                        if let Some(stripped) = word.strip_prefix('@') {
+                                            (true, stripped)
+                                        } else {
+                                            (false, word)
+                                        };
                                     let wl = search_word.to_lowercase();
 
                                     // Collect emote matches (only for non-mention words)
@@ -419,7 +403,8 @@ impl<'a> ChatInput<'a> {
                                     };
 
                                     // Collect username matches
-                                    let user_matches: Vec<String> = self.chatters
+                                    let user_matches: Vec<String> = self
+                                        .chatters
                                         .iter()
                                         .filter(|u| u.to_lowercase().starts_with(&wl))
                                         .map(|u| {
@@ -539,11 +524,21 @@ impl<'a> ChatInput<'a> {
 
                     const TWITCH_MAX_CHARS: usize = 500;
                     let is_twitch_channel = !self.channel.is_irc() && !self.channel.is_kick();
-                    let twitch_char_count = if is_twitch_channel {
+                    let mut twitch_char_count = if is_twitch_channel {
                         buf.chars().count()
                     } else {
                         0
                     };
+                    // Prevent mode: enforce Twitch's hard character cap in the editor.
+                    if is_twitch_channel
+                        && self.prevent_overlong_twitch_messages
+                        && twitch_char_count > TWITCH_MAX_CHARS
+                    {
+                        truncate_to_max_chars(buf, TWITCH_MAX_CHARS);
+                        twitch_char_count = buf.chars().count();
+                        move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
+                        ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
+                    }
                     let twitch_over_limit =
                         is_twitch_channel && twitch_char_count > TWITCH_MAX_CHARS;
                     let is_slash_input = buf.trim_start().starts_with('/');
@@ -570,36 +565,36 @@ impl<'a> ChatInput<'a> {
 
                     // Emote picker button - hidden at very narrow widths
                     if show_emote_btn {
-                    if ui
-                        .add_sized(
-                            [t::BAR_H, t::BAR_H],
-                            egui::Button::new(RichText::new(":)").font(t::small())),
-                        )
-                        .on_hover_text("Emote picker")
-                        .clicked()
-                    {
-                        result.toggle_emote_picker = true;
-                    }
+                        if ui
+                            .add_sized(
+                                [t::BAR_H, t::BAR_H],
+                                egui::Button::new(RichText::new(":)").font(t::small())),
+                            )
+                            .on_hover_text("Emote picker")
+                            .clicked()
+                        {
+                            result.toggle_emote_picker = true;
+                        }
                     }
 
                     // Send button - hidden at very narrow widths
                     if show_send_btn {
-                    let send_btn = ui.add_enabled(
-                        can_submit,
-                        egui::Button::new(RichText::new("Send").font(t::small()))
-                            .min_size(egui::vec2(58.0, t::BAR_H)),
-                    );
-                    let send_btn = if twitch_over_limit && is_twitch_channel {
-                        send_btn.on_hover_text("Twitch messages are limited to 500 characters")
-                    } else if !self.logged_in && !is_slash_input && !buf.trim().is_empty() {
-                        send_btn.on_hover_text("Anonymous mode can run slash commands only")
-                    } else {
-                        send_btn
-                    };
-                    if send_btn.clicked() && can_submit {
-                        result.send = Some(buf.trim().to_owned());
-                        buf.clear();
-                    }
+                        let send_btn = ui.add_enabled(
+                            can_submit,
+                            egui::Button::new(RichText::new("Send").font(t::small()))
+                                .min_size(egui::vec2(58.0, t::BAR_H)),
+                        );
+                        let send_btn = if twitch_over_limit && is_twitch_channel {
+                            send_btn.on_hover_text("Twitch messages are limited to 500 characters")
+                        } else if !self.logged_in && !is_slash_input && !buf.trim().is_empty() {
+                            send_btn.on_hover_text("Anonymous mode can run slash commands only")
+                        } else {
+                            send_btn
+                        };
+                        if send_btn.clicked() && can_submit {
+                            result.send = Some(buf.trim().to_owned());
+                            buf.clear();
+                        }
                     }
 
                     // Character count - Twitch has a 500-char limit.
@@ -616,6 +611,23 @@ impl<'a> ChatInput<'a> {
                             RichText::new(format!("{twitch_char_count}/{TWITCH_MAX_CHARS}"))
                                 .font(t::tiny())
                                 .color(color),
+                        );
+                        if twitch_over_limit && !self.prevent_overlong_twitch_messages {
+                            let over_by = twitch_char_count - TWITCH_MAX_CHARS;
+                            ui.label(
+                                RichText::new(format!("Over by {over_by} chars"))
+                                    .font(t::tiny())
+                                    .color(t::red()),
+                            );
+                        }
+                    }
+
+                    if twitch_over_limit && !self.prevent_overlong_twitch_messages {
+                        ui.painter().rect_stroke(
+                            resp.rect.expand(1.0),
+                            4.0,
+                            Stroke::new(1.0, t::red()),
+                            egui::epaint::StrokeKind::Outside,
                         );
                     }
 
@@ -640,9 +652,12 @@ impl<'a> ChatInput<'a> {
                                 ui.ctx().data_mut(|d| d.insert_temp(ac_id, 0i32));
                             }
                         } else if !username_matches.is_empty() {
-                            if let Some(clicked) =
-                                self.show_username_autocomplete_popup(ui, &resp, &username_matches, ac_sel)
-                            {
+                            if let Some(clicked) = self.show_username_autocomplete_popup(
+                                ui,
+                                &resp,
+                                &username_matches,
+                                ac_sel,
+                            ) {
                                 replace_mention_token(buf, &clicked);
                                 move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
                                 ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
@@ -671,20 +686,16 @@ impl<'a> ChatInput<'a> {
                     // On right-click, determine the word at the cursor and
                     // compute suggestions if it is misspelled.
                     if resp.secondary_clicked() {
-                        let cursor_idx =
-                            egui::TextEdit::load_state(ui.ctx(), text_edit_id)
-                                .and_then(|s| s.ccursor_range())
-                                .map(|r| r.primary.index)
-                                .unwrap_or(buf.len());
+                        let cursor_idx = egui::TextEdit::load_state(ui.ctx(), text_edit_id)
+                            .and_then(|s| s.cursor.char_range())
+                            .map(|r| r.primary.index)
+                            .unwrap_or(buf.len());
 
                         let (word, byte_start, byte_end) =
                             crate::spellcheck::word_at_cursor(buf, cursor_idx);
 
-                        if !word.is_empty()
-                            && !crate::spellcheck::is_correct(word)
-                        {
-                            let suggs =
-                                crate::spellcheck::suggestions(word, 5);
+                        if !word.is_empty() && !crate::spellcheck::is_correct(word) {
+                            let suggs = crate::spellcheck::suggestions(word, 5);
                             ui.ctx().data_mut(|d| {
                                 d.insert_temp(
                                     sc_id,
@@ -697,62 +708,40 @@ impl<'a> ChatInput<'a> {
                                 )
                             });
                         } else {
-                            ui.ctx()
-                                .data_mut(|d| d.remove::<SpellCtx>(sc_id));
+                            ui.ctx().data_mut(|d| d.remove::<SpellCtx>(sc_id));
                         }
                     }
 
-                    let mut spell_replace: Option<(usize, usize, String)> =
-                        None;
+                    let mut spell_replace: Option<(usize, usize, String)> = None;
                     resp.context_menu(|ui| {
-                        let sc: Option<SpellCtx> =
-                            ui.ctx().data_mut(|d| d.get_temp(sc_id));
+                        let sc: Option<SpellCtx> = ui.ctx().data_mut(|d| d.get_temp(sc_id));
                         if let Some(sc) = sc {
                             ui.label(
-                                RichText::new(format!(
-                                    "\"{}\" – misspelled",
-                                    sc.word
-                                ))
-                                .color(t::red())
-                                .strong(),
+                                RichText::new(format!("\"{}\" – misspelled", sc.word))
+                                    .color(t::red())
+                                    .strong(),
                             );
                             ui.separator();
                             if sc.suggestions.is_empty() {
-                                ui.label(
-                                    RichText::new("No suggestions")
-                                        .weak()
-                                        .italics(),
-                                );
+                                ui.label(RichText::new("No suggestions").weak().italics());
                             } else {
                                 for sug in &sc.suggestions {
                                     if ui.button(sug).clicked() {
-                                        spell_replace = Some((
-                                            sc.start,
-                                            sc.end,
-                                            sug.clone(),
-                                        ));
+                                        spell_replace = Some((sc.start, sc.end, sug.clone()));
                                         ui.close_menu();
                                     }
                                 }
                             }
                         } else {
-                            ui.label(
-                                RichText::new("Spelling OK ✓")
-                                    .color(t::green()),
-                            );
+                            ui.label(RichText::new("Spelling OK ✓").color(t::green()));
                         }
                     });
 
                     if let Some((start, end, replacement)) = spell_replace {
                         let new_len = start + replacement.len();
                         buf.replace_range(start..end, &replacement);
-                        move_cursor_to_end(
-                            ui.ctx(),
-                            text_edit_id,
-                            new_len,
-                        );
-                        ui.ctx()
-                            .memory_mut(|m| m.request_focus(text_edit_id));
+                        move_cursor_to_end(ui.ctx(), text_edit_id, new_len);
+                        ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                     }
                 });
             });
@@ -798,6 +787,7 @@ impl<'a> ChatInput<'a> {
         popup_ui.set_clip_rect(popup_rect);
 
         let mut clicked_emote: Option<String> = None;
+        let mut has_animated_preview = false;
         let static_id = Id::new("ac_static_frames");
         let mut static_frames: HashMap<String, egui::TextureHandle> = ui
             .ctx()
@@ -830,7 +820,7 @@ impl<'a> ChatInput<'a> {
                                     self.emote_bytes.get(entry.url.as_str())
                                 {
                                     let animated = is_likely_animated_url(&entry.url);
-                                    let should_animate = is_selected;
+                                    let should_animate = self.animate_emotes && is_selected;
                                     let (slot_rect, _) = ui.allocate_exact_size(
                                         egui::vec2(
                                             AUTOCOMPLETE_EMOTE_SIZE,
@@ -868,6 +858,9 @@ impl<'a> ChatInput<'a> {
                                             );
                                         }
                                     } else {
+                                        if animated && self.animate_emotes {
+                                            has_animated_preview = true;
+                                        }
                                         let size = fit_size(w, h, AUTOCOMPLETE_EMOTE_SIZE);
                                         let image_rect =
                                             egui::Rect::from_center_size(slot_rect.center(), size);
@@ -923,7 +916,8 @@ impl<'a> ChatInput<'a> {
                     // If an animated emote row is hovered, render its animated preview.
                     if click_resp.hovered() {
                         if let Some(&(w, h, ref raw)) = self.emote_bytes.get(entry.url.as_str()) {
-                            if is_likely_animated_url(&entry.url) {
+                            if self.animate_emotes && is_likely_animated_url(&entry.url) {
+                                has_animated_preview = true;
                                 let size = fit_size(w, h, AUTOCOMPLETE_EMOTE_SIZE);
                                 let preview_rect = egui::Rect::from_min_size(
                                     egui::pos2(row_rect.left() + 4.0, row_rect.top() + 2.0),
@@ -951,6 +945,10 @@ impl<'a> ChatInput<'a> {
 
         ui.ctx()
             .data_mut(|d| d.insert_temp(static_id, static_frames));
+        if has_animated_preview {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(33));
+        }
 
         clicked_emote
     }
@@ -1186,9 +1184,7 @@ impl<'a> ChatInput<'a> {
                             ui.horizontal(|ui| {
                                 // @ icon
                                 ui.label(
-                                    RichText::new("@")
-                                        .font(t::small())
-                                        .color(t::text_muted()),
+                                    RichText::new("@").font(t::small()).color(t::text_muted()),
                                 );
                                 let col = if is_selected {
                                     t::text_primary()
@@ -1196,10 +1192,7 @@ impl<'a> ChatInput<'a> {
                                     t::accent()
                                 };
                                 ui.label(
-                                    RichText::new(username)
-                                        .font(t::small())
-                                        .color(col)
-                                        .strong(),
+                                    RichText::new(username).font(t::small()).color(col).strong(),
                                 );
                             });
                         });
@@ -1425,7 +1418,7 @@ fn move_cursor_to_end(ctx: &egui::Context, id: egui::Id, char_pos: usize) {
     use egui::text::{CCursor, CCursorRange};
     if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
         let cursor = CCursor::new(char_pos);
-        state.set_ccursor_range(Some(CCursorRange::one(cursor)));
+        state.cursor.set_char_range(Some(CCursorRange::one(cursor)));
         egui::TextEdit::store_state(ctx, id, state);
     }
 }
@@ -1528,6 +1521,18 @@ fn dynamic_image_to_color_image(img: DynamicImage) -> Option<egui::ColorImage> {
     Some(egui::ColorImage::from_rgba_unmultiplied([w, h], &pixels))
 }
 
+fn truncate_to_max_chars(buf: &mut String, max_chars: usize) {
+    if buf.chars().count() <= max_chars {
+        return;
+    }
+    let cut = buf
+        .char_indices()
+        .nth(max_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(buf.len());
+    buf.truncate(cut);
+}
+
 /// Extract the last whitespace-delimited word from the buffer.
 /// Returns `(prefix_before_word, word)`.
 fn extract_last_word(buf: &str) -> (&str, &str) {
@@ -1578,13 +1583,7 @@ fn iter_words(buf: &str) -> Vec<(&str, usize, usize, usize)> {
 }
 
 /// Paint a red wavy underline from `x0` to `x1` at screen-space `y`.
-fn paint_wavy_underline(
-    painter: &egui::Painter,
-    x0: f32,
-    x1: f32,
-    y: f32,
-    color: Color32,
-) {
+fn paint_wavy_underline(painter: &egui::Painter, x0: f32, x1: f32, y: f32, color: Color32) {
     const WAVE_H: f32 = 1.5; // half amplitude
     const WAVE_LEN: f32 = 4.0; // one full wave = 4px
 
@@ -1611,5 +1610,17 @@ fn paint_wavy_underline(
 
     if points.len() >= 2 {
         painter.add(egui::Shape::line(points, stroke));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_to_max_chars;
+
+    #[test]
+    fn truncate_to_max_chars_is_unicode_safe() {
+        let mut s = "abc🙂def".to_owned();
+        truncate_to_max_chars(&mut s, 4);
+        assert_eq!(s, "abc🙂");
     }
 }

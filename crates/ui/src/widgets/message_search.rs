@@ -1,9 +1,8 @@
 use std::collections::VecDeque;
 
 use egui::{
-    Align, Button, CentralPanel, Color32, Context, Frame, Grid, Id, Key,
-    Layout, RichText, Stroke, Ui, ViewportBuilder, ViewportClass,
-    ViewportCommand, ViewportId,
+    Align, Button, CentralPanel, Color32, Context, Frame, Grid, Id, Key, Layout, RichText, Stroke,
+    Ui, ViewportBuilder, ViewportClass, ViewportCommand, ViewportId,
 };
 use regex::{Regex, RegexBuilder};
 
@@ -269,7 +268,11 @@ fn show_message_search_contents(
     ui.horizontal(|ui| {
         ui.label(RichText::new("⌕").color(t::accent()).size(18.0));
         ui.vertical(|ui| {
-            ui.label(RichText::new("Search chat history").font(t::body()).strong());
+            ui.label(
+                RichText::new("Search chat history")
+                    .font(t::body())
+                    .strong(),
+            );
             ui.label(
                 RichText::new(if detached {
                     "Detached search window for this channel"
@@ -401,9 +404,11 @@ fn show_message_search_contents(
         );
     } else {
         ui.label(
-            RichText::new("All filters are combined. Username and keyword ignore case. Press Esc to close.")
-                .font(t::small())
-                .color(t::text_muted()),
+            RichText::new(
+                "All filters are combined. Username and keyword ignore case. Press Esc to close.",
+            )
+            .font(t::small())
+            .color(t::text_muted()),
         );
     }
 }
@@ -469,7 +474,9 @@ fn search_field_row(
             .font(t::small())
             .color(t::text_secondary()),
     );
-    let id = Id::new("message_search_row").with(channel.as_str()).with(key);
+    let id = Id::new("message_search_row")
+        .with(channel.as_str())
+        .with(key);
     let mut edit = egui::TextEdit::singleline(value)
         .id(id)
         .hint_text(hint)

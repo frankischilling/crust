@@ -68,6 +68,19 @@ pub struct AppSettings {
     /// Keep the window always on top of other windows.
     #[serde(default)]
     pub always_on_top: bool,
+    /// Overflow handling for Twitch chat input.
+    /// `true` = block extra chars, `false` = allow and highlight overflow.
+    #[serde(default = "bool_true")]
+    pub prevent_overlong_twitch_messages: bool,
+    /// Collapse long messages in the chat list with an ellipsis.
+    #[serde(default = "bool_true")]
+    pub collapse_long_messages: bool,
+    /// Maximum visible lines before long-message collapse applies.
+    #[serde(default = "default_collapse_long_message_lines")]
+    pub collapse_long_message_lines: usize,
+    /// If true, animation repainting runs only while the app window is focused.
+    #[serde(default = "bool_true")]
+    pub animations_when_focused: bool,
 }
 
 fn default_theme() -> String {
@@ -78,6 +91,9 @@ fn default_font_size() -> f32 {
 }
 fn bool_true() -> bool {
     true
+}
+fn default_collapse_long_message_lines() -> usize {
+    8
 }
 
 impl Default for AppSettings {
@@ -99,6 +115,10 @@ impl Default for AppSettings {
             irc_nickserv_user: String::new(),
             irc_nickserv_pass: String::new(),
             always_on_top: false,
+            prevent_overlong_twitch_messages: true,
+            collapse_long_messages: true,
+            collapse_long_message_lines: default_collapse_long_message_lines(),
+            animations_when_focused: true,
         }
     }
 }
@@ -142,6 +162,9 @@ impl SettingsStore {
                         username: cfg.username.clone(),
                         oauth_token: cfg.oauth_token.clone(),
                     });
+                }
+                if cfg.collapse_long_message_lines == 0 {
+                    cfg.collapse_long_message_lines = default_collapse_long_message_lines();
                 }
                 cfg
             }

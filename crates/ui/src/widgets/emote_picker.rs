@@ -32,7 +32,7 @@ struct CachedTab {
     indices: Vec<usize>, // indices into catalog
 }
 
-    /// Cached filtered/grouped view.
+/// Cached filtered/grouped view.
 struct CachedView {
     filter: String,
     catalog_len: usize,
@@ -144,8 +144,16 @@ impl EmotePicker {
             .collect();
 
         // Build merged "All" index - union of every tab, sorted by code.
-        let mut all_indices: Vec<usize> = tabs.iter().flat_map(|t| t.indices.iter().copied()).collect();
-        all_indices.sort_by(|&a, &b| combined[a].code.to_lowercase().cmp(&combined[b].code.to_lowercase()));
+        let mut all_indices: Vec<usize> = tabs
+            .iter()
+            .flat_map(|t| t.indices.iter().copied())
+            .collect();
+        all_indices.sort_by(|&a, &b| {
+            combined[a]
+                .code
+                .to_lowercase()
+                .cmp(&combined[b].code.to_lowercase())
+        });
 
         self.cache = Some(CachedView {
             filter: self.filter.clone(),
@@ -163,6 +171,7 @@ impl EmotePicker {
         catalog: &[EmoteCatalogEntry],
         emote_bytes: &HashMap<String, (u32, u32, Arc<[u8]>)>,
         cmd_tx: &mpsc::Sender<AppCommand>,
+        animate_emotes: bool,
     ) -> Option<String> {
         if !self.open {
             return None;
@@ -245,6 +254,7 @@ impl EmotePicker {
                 let num_rows = (tab_indices.len() + cols - 1) / cols;
                 let mut fetches_this_frame = 0usize;
                 let pointer_pos = ui.input(|i| i.pointer.hover_pos());
+                let mut has_animated_visible = false;
 
                 ScrollArea::vertical()
                     .max_height(available_h)
@@ -310,7 +320,7 @@ impl EmotePicker {
                                     let &(w, h, ref raw) =
                                         emote_bytes.get(entry.url.as_str()).unwrap();
                                     let animated = is_likely_animated_url(&entry.url);
-                                    if animated && !is_hovered {
+                                    if animated && !animate_emotes {
                                         if !self.static_frames.contains_key(&entry.url) {
                                             if let Some(img) = decode_static_frame(raw) {
                                                 let tex = ui.ctx().load_texture(
@@ -345,6 +355,9 @@ impl EmotePicker {
                                             );
                                         }
                                     } else {
+                                        if animated && animate_emotes {
+                                            has_animated_visible = true;
+                                        }
                                         let size = fit_size(w, h, EMOTE_SIZE);
                                         let image_rect =
                                             egui::Rect::from_center_size(cell_rect.center(), size);
@@ -403,6 +416,10 @@ impl EmotePicker {
                             });
                         }
                     });
+                if has_animated_visible {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(33));
+                }
             });
 
         if let Some(resp) = &window_resp {

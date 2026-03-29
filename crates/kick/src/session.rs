@@ -117,6 +117,35 @@ struct KickBannedUser {
     slug: Option<String>,
 }
 
+#[derive(Deserialize, Debug)]
+struct KickPinnedBy {
+    id: Option<u64>,
+    username: Option<String>,
+    slug: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct KickPinnedMessageRef {
+    id: Option<String>,
+    text: Option<String>,
+    content: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct KickPinnedCreatedPayload {
+    #[serde(rename = "pinnedBy")]
+    pinned_by: Option<KickPinnedBy>,
+    message: Option<KickPinnedMessageRef>,
+    created_at: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct KickPinnedDeletedPayload {
+    id: Option<String>,
+    message_id: Option<String>,
+    message: Option<KickPinnedMessageRef>,
+}
+
 pub struct KickSession {
     event_tx: mpsc::Sender<KickEvent>,
     cmd_rx: mpsc::Receiver<KickSessionCommand>,
@@ -356,6 +385,12 @@ impl KickSession {
             "App\\Events\\UserBannedEvent" => {
                 self.handle_user_banned(&msg).await;
             }
+            "App\\Events\\PinnedMessageCreatedEvent" | "PinnedMessageCreatedEvent" => {
+                self.handle_pinned_message_created(&msg).await;
+            }
+            "App\\Events\\PinnedMessageDeletedEvent" | "PinnedMessageDeletedEvent" => {
+                self.handle_pinned_message_deleted(&msg).await;
+            }
             "App\\Events\\ChatroomClearEvent" => {
                 self.handle_chat_cleared(&msg).await;
             }
@@ -453,6 +488,7 @@ impl KickSession {
                 login,
                 display_name,
                 color: identity.color,
+                name_paint: None,
                 badges,
             },
             raw_text: content.clone(),
@@ -463,6 +499,7 @@ impl KickSession {
                 is_highlighted: false,
                 is_deleted: false,
                 is_first_msg: false,
+                is_pinned: false,
                 is_self: false,
                 is_mention: false,
                 custom_reward_id: None,
@@ -518,6 +555,113 @@ impl KickSession {
             return;
         };
         self.emit(KickEvent::ChatCleared { channel }).await;
+    }
+
+    async fn handle_pinned_message_created(&mut self, msg: &PusherMessage) {
+        let Some(channel) = self.channel_from_pusher(msg.channel.as_deref()) else {
+            return;
+        };
+
+        let Some(payload) = Self::parse_data::<KickPinnedCreatedPayload>(&msg.data) else {
+            warn!("Failed to parse Kick pinned message payload");
+            return;
+        };
+
+        let creator = payload
+            .pinned_by
+            .as_ref()
+            .and_then(|u| u.username.clone().or_else(|| u.slug.clone()))
+            .unwrap_or_else(|| "Kick".to_owned());
+        let creator_login = creator.to_ascii_lowercase();
+        let creator_user_id = payload
+            .pinned_by
+            .as_ref()
+            .and_then(|u| u.id.map(|id| id.to_string()))
+            .unwrap_or_default();
+
+        let pinned_id = payload
+            .message
+            .as_ref()
+            .and_then(|m| m.id.clone())
+            .filter(|id| !id.trim().is_empty());
+        let pinned_text = payload
+            .message
+            .as_ref()
+            .and_then(|m| m.text.clone().or_else(|| m.content.clone()))
+            .unwrap_or_default();
+
+        let timestamp = payload
+            .created_at
+            .as_deref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(Utc::now);
+
+        let chat_msg = ChatMessage {
+            id: self.alloc_id(),
+            server_id: pinned_id.map(|id| format!("kick:pinned:{id}")),
+            timestamp,
+            channel: channel.clone(),
+            sender: Sender {
+                user_id: UserId(creator_user_id),
+                login: creator_login,
+                display_name: creator,
+                color: None,
+                name_paint: None,
+                badges: Vec::new(),
+            },
+            raw_text: pinned_text,
+            spans: smallvec::SmallVec::new(),
+            twitch_emotes: Vec::new(),
+            flags: MessageFlags {
+                is_action: false,
+                is_highlighted: false,
+                is_deleted: false,
+                is_first_msg: false,
+                is_pinned: true,
+                is_self: false,
+                is_mention: false,
+                custom_reward_id: None,
+                is_history: false,
+            },
+            reply: None,
+            msg_kind: MsgKind::Chat,
+        };
+
+        self.emit(KickEvent::ChatMessage(chat_msg)).await;
+    }
+
+    async fn handle_pinned_message_deleted(&mut self, msg: &PusherMessage) {
+        let Some(channel) = self.channel_from_pusher(msg.channel.as_deref()) else {
+            return;
+        };
+
+        let payload = Self::parse_data::<KickPinnedDeletedPayload>(&msg.data);
+        let pinned_id = payload
+            .as_ref()
+            .and_then(|p| {
+                p.message
+                    .as_ref()
+                    .and_then(|m| m.id.clone())
+                    .or_else(|| p.message_id.clone())
+                    .or_else(|| p.id.clone())
+            })
+            .filter(|id| !id.trim().is_empty());
+
+        if let Some(id) = pinned_id {
+            self.emit(KickEvent::MessageDeleted {
+                channel: channel.clone(),
+                server_id: format!("kick:pinned:{id}"),
+            })
+            .await;
+        }
+
+        self.emit(KickEvent::SystemNotice(SystemNotice {
+            channel: Some(channel),
+            text: "The pinned message was unpinned.".to_owned(),
+            timestamp: Utc::now(),
+        }))
+        .await;
     }
 }
 

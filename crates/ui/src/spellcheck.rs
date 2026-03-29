@@ -177,7 +177,11 @@ pub fn word_at_cursor(buf: &str, char_pos: usize) -> (&str, usize, usize) {
         return ("", char_pos, char_pos);
     }
 
-    let byte_start = buf.char_indices().nth(start).map(|(i, _)| i).unwrap_or(buf.len());
+    let byte_start = buf
+        .char_indices()
+        .nth(start)
+        .map(|(i, _)| i)
+        .unwrap_or(buf.len());
     let byte_end = buf
         .char_indices()
         .nth(end)
@@ -189,13 +193,7 @@ pub fn word_at_cursor(buf: &str, char_pos: usize) -> (&str, usize, usize) {
 // ── Scoring ────────────────────────────────────────────────────────────────
 
 /// Compute a single score for `candidate` (lower = better).
-fn score(
-    query: &str,
-    candidate: &str,
-    edit_dist: u8,
-    query_sx: &[u8; 4],
-    d: &SpellData,
-) -> f64 {
+fn score(query: &str, candidate: &str, edit_dist: u8, query_sx: &[u8; 4], d: &SpellData) -> f64 {
     // Base: edit distance dominates.
     let mut s = edit_dist as f64 * 1000.0;
 

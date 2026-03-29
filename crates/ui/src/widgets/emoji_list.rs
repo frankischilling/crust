@@ -176,7 +176,6 @@ pub const EMOJI_LIST: &[(&str, &str)] = &[
     ("💬", "speech balloon"),
     ("💭", "thought balloon"),
     ("💤", "zzz"),
-
     // ── Gestures & People ────────────────────────────────────────────────
     ("👋", "waving hand"),
     ("🤚", "raised back of hand"),
@@ -226,7 +225,6 @@ pub const EMOJI_LIST: &[(&str, &str)] = &[
     ("👄", "mouth"),
     ("🫦", "biting lip"),
     ("🧠", "brain"),
-
     // ── Animals & Nature ─────────────────────────────────────────────────
     ("🐶", "dog face"),
     ("🐱", "cat face"),
@@ -349,7 +347,6 @@ pub const EMOJI_LIST: &[(&str, &str)] = &[
     ("💐", "bouquet"),
     ("🍄", "mushroom"),
     ("🌰", "chestnut"),
-
     // ── Food & Drink ─────────────────────────────────────────────────────
     ("🍎", "red apple"),
     ("🍏", "green apple"),
@@ -461,7 +458,6 @@ pub const EMOJI_LIST: &[(&str, &str)] = &[
     ("🧃", "beverage box"),
     ("🧉", "mate"),
     ("🧊", "ice"),
-
     // ── Activities & Objects ──────────────────────────────────────────────
     ("⚽", "soccer ball"),
     ("🏀", "basketball"),
@@ -587,7 +583,6 @@ pub const EMOJI_LIST: &[(&str, &str)] = &[
     ("🥇", "1st place medal"),
     ("🥈", "2nd place medal"),
     ("🥉", "3rd place medal"),
-
     // ── Travel & Places ──────────────────────────────────────────────────
     ("🌍", "globe showing Europe-Africa"),
     ("🌎", "globe showing Americas"),
@@ -683,7 +678,6 @@ pub const EMOJI_LIST: &[(&str, &str)] = &[
     ("🛸", "flying saucer"),
     ("🛰️", "satellite"),
     ("🧳", "luggage"),
-
     // ── Weather & Sky ────────────────────────────────────────────────────
     ("🌙", "crescent moon"),
     ("🌛", "first quarter moon face"),
@@ -715,7 +709,6 @@ pub const EMOJI_LIST: &[(&str, &str)] = &[
     ("🔥", "fire"),
     ("💧", "droplet"),
     ("🌊", "water wave"),
-
     // ── Symbols ──────────────────────────────────────────────────────────
     ("❤️", "red heart"),
     ("🩷", "pink heart"),
@@ -837,7 +830,6 @@ pub const EMOJI_LIST: &[(&str, &str)] = &[
     ("🏳️", "white flag"),
     ("🏳️\u{200D}🌈", "rainbow flag"),
     ("🏴\u{200D}☠️", "pirate flag"),
-
     // ── Flags (popular) ─────────────────────────────────────────────────
     ("🇺🇸", "United States"),
     ("🇬🇧", "United Kingdom"),

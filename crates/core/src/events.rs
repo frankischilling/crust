@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    Badge, ChannelId, ChatMessage, EmoteCatalogEntry, ReplyInfo, SystemNotice,
+    Badge, ChannelId, ChatMessage, EmoteCatalogEntry, ReplyInfo, SenderNamePaint, SystemNotice,
     UserProfile,
 };
 
@@ -119,6 +119,18 @@ pub enum AppCommand {
     SetAlwaysOnTop { enabled: bool },
     /// Switch UI theme ("dark" or "light") and persist to settings.
     SetTheme { theme: String },
+    /// Persist chat-input overflow behavior and long-message collapse settings.
+    SetChatUiBehavior {
+        /// `true` = Prevent mode (block typing past Twitch's limit).
+        /// `false` = Highlight mode (allow typing and mark overflow).
+        prevent_overlong_twitch_messages: bool,
+        /// Whether to collapse very long messages in the message list.
+        collapse_long_messages: bool,
+        /// Maximum visible lines before appending an ellipsis.
+        collapse_long_message_lines: usize,
+        /// Only run animation-driven repainting while the window is focused.
+        animations_when_focused: bool,
+    },
     /// Fetch external chat logs for a user from the IVR logs API.
     FetchIvrLogs { channel: String, username: String },
 }
@@ -247,6 +259,18 @@ pub enum AppEvent {
         /// Whether always-on-top is enabled.
         always_on_top: bool,
     },
+    /// Chat UX/perf behavior loaded or updated from settings.
+    ChatUiBehaviorUpdated {
+        /// `true` = Prevent mode (block typing past Twitch's limit).
+        /// `false` = Highlight mode (allow typing and mark overflow).
+        prevent_overlong_twitch_messages: bool,
+        /// Whether to collapse very long messages in the message list.
+        collapse_long_messages: bool,
+        /// Maximum visible lines before appending an ellipsis.
+        collapse_long_message_lines: usize,
+        /// Only run animation-driven repainting while the window is focused.
+        animations_when_focused: bool,
+    },
     /// A batch of image prefetch tasks has been queued.  The loading screen
     /// uses this to track progress vs `EmoteImageReady` completions.
     ImagePrefetchQueued {
@@ -267,6 +291,8 @@ pub enum AppEvent {
     SenderCosmeticsUpdated {
         user_id: String,
         color: Option<String>,
+        /// Optional 7TV name paint metadata.
+        name_paint: Option<SenderNamePaint>,
         badge: Option<Badge>,
         /// 7TV animated avatar URL (if the user has one set).
         avatar_url: Option<String>,

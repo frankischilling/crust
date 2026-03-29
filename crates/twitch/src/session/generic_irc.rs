@@ -22,9 +22,16 @@ static IRC_MSG_ID: AtomicU64 = AtomicU64::new(20_000_000_000);
 
 #[derive(Debug, Clone)]
 pub enum GenericIrcEvent {
-    Connected { server: String },
-    Disconnected { server: String },
-    Reconnecting { server: String, attempt: u32 },
+    Connected {
+        server: String,
+    },
+    Disconnected {
+        server: String,
+    },
+    Reconnecting {
+        server: String,
+        attempt: u32,
+    },
     ChatMessage(ChatMessage),
     SystemNotice(SystemNotice),
     /// An IRC server redirected us from one channel to another (e.g. 470).
@@ -33,7 +40,10 @@ pub enum GenericIrcEvent {
         old_channel: String,
         new_channel: String,
     },
-    Error { server: String, message: String },
+    Error {
+        server: String,
+        message: String,
+    },
     /// The channel topic was set or changed (TOPIC command or RPL_TOPIC 332).
     TopicChanged {
         channel: ChannelId,
@@ -728,8 +738,7 @@ impl ServerWorker {
                         // IDENTIFY <account> <password>
                         if let Some(valid) = normalize_irc_nick(words[1]) {
                             self.nick = valid.clone();
-                            let _ =
-                                write_irc_line(writer, &format!("NICK {valid}")).await;
+                            let _ = write_irc_line(writer, &format!("NICK {valid}")).await;
                             info!("Auto nick-change to {valid} after NickServ IDENTIFY");
                         }
                     }
@@ -1118,7 +1127,10 @@ fn parse_irc_system_notice(
         }
         "KICK" => {
             if msg.params.len() >= 2 {
-                let chan = msg.params[0].trim().strip_prefix('#').unwrap_or(msg.params[0].trim());
+                let chan = msg.params[0]
+                    .trim()
+                    .strip_prefix('#')
+                    .unwrap_or(msg.params[0].trim());
                 let target = &msg.params[1];
                 let by = msg.nick().unwrap_or("someone");
                 if let Some(reason) = msg.trailing().filter(|s| !s.is_empty()) {
@@ -1299,6 +1311,7 @@ fn parse_irc_privmsg(msg: &IrcMessage, key: &ServerKey, my_nick: &str) -> Option
             login: login.clone(),
             display_name,
             color,
+            name_paint: None,
             badges,
         },
         raw_text: text.to_owned(),
@@ -1309,6 +1322,7 @@ fn parse_irc_privmsg(msg: &IrcMessage, key: &ServerKey, my_nick: &str) -> Option
             is_highlighted: false,
             is_deleted: false,
             is_first_msg: false,
+            is_pinned: false,
             is_self: login.eq_ignore_ascii_case(my_nick),
             is_mention: false,
             custom_reward_id: None,

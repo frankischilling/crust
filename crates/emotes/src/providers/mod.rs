@@ -463,7 +463,10 @@ fn twitch_global_emotes() -> Vec<EmoteInfo> {
         tw("62834", "duDudu"),
         tw("35063", "mcaT"),
         // ── emotesv2_* IDs (verified via streamdatabase.com) ────────────
-        tw("emotesv2_ed53f0877c984ddcadfa500347b1fd0c", "AndalusianCrush"),
+        tw(
+            "emotesv2_ed53f0877c984ddcadfa500347b1fd0c",
+            "AndalusianCrush",
+        ),
         tw("emotesv2_50b3304bc0884c6792f13615db072a5c", "CaitThinking"),
         tw("emotesv2_d351c5d5e9084402b30bc39eaa3d92ae", "Cinheimer"),
         tw("emotesv2_dcd06b30a5c24f6eb871e8f5edbd44f7", "DinoDance"),
@@ -576,6 +579,43 @@ struct EmoteHost {
 #[derive(Deserialize)]
 struct EmoteFile {
     name: String,
+    #[serde(default)]
+    width: Option<u32>,
+}
+
+fn seven_tv_file_scale(file_name: &str) -> Option<u8> {
+    let name = file_name
+        .split('.')
+        .next()
+        .unwrap_or(file_name)
+        .to_ascii_lowercase();
+    if !name.ends_with('x') {
+        return None;
+    }
+    let digits = &name[..name.len().saturating_sub(1)];
+    digits.parse::<u8>().ok()
+}
+
+fn choose_7tv_file_by_scale<'a>(
+    files: &'a [EmoteFile],
+    preferences: &[u8],
+) -> Option<&'a EmoteFile> {
+    for preferred in preferences {
+        if let Some(file) = files
+            .iter()
+            .find(|f| seven_tv_file_scale(&f.name) == Some(*preferred))
+        {
+            return Some(file);
+        }
+    }
+    None
+}
+
+fn choose_7tv_smallest_file(files: &[EmoteFile]) -> Option<&EmoteFile> {
+    files
+        .iter()
+        .min_by_key(|f| f.width.unwrap_or(u32::MAX))
+        .or_else(|| files.first())
 }
 
 impl SevenTvProvider {
@@ -636,14 +676,17 @@ impl SevenTvProvider {
             .into_iter()
             .filter_map(|e| {
                 let data = e.data?;
-                let base = format!("https:{}", data.host.url);
-                let file_1x = data
-                    .host
-                    .files
-                    .first()
+                let base = format!("https:{}", data.host.url.trim_end_matches('/'));
+                let files = data.host.files;
+
+                let file_1x = choose_7tv_file_by_scale(&files, &[1])
+                    .or_else(|| choose_7tv_smallest_file(&files))
                     .map(|f| format!("{base}/{}", f.name));
-                let file_2x = data.host.files.get(1).map(|f| format!("{base}/{}", f.name));
-                let file_4x = data.host.files.get(2).map(|f| format!("{base}/{}", f.name));
+                let file_2x = choose_7tv_file_by_scale(&files, &[2, 3, 4])
+                    .map(|f| format!("{base}/{}", f.name));
+                // Prefer true 4x assets for HD previews; fall back to 3x/2x.
+                let file_4x = choose_7tv_file_by_scale(&files, &[4, 3, 2])
+                    .map(|f| format!("{base}/{}", f.name));
                 Some(EmoteInfo {
                     id: e.id,
                     code: e.name,
@@ -757,5 +800,97 @@ fn normalize_kick_url(url: &str) -> String {
         format!("https://kick.com{url}")
     } else {
         url.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_7tv_set(value: serde_json::Value) -> Vec<EmoteInfo> {
+        let set: EmoteSetResp = serde_json::from_value(value).expect("valid emote set json");
+        SevenTvProvider::parse_emote_set(set)
+    }
+
+    #[test]
+    fn seven_tv_prefers_true_4x_file_for_hd_url() {
+        let emotes = parse_7tv_set(serde_json::json!({
+            "emotes": [{
+                "id": "1",
+                "name": "OMEGALUL",
+                "data": {
+                    "host": {
+                        "url": "//cdn.7tv.app/emote/abc",
+                        "files": [
+                            { "name": "1x.webp", "width": 32 },
+                            { "name": "3x.webp", "width": 96 },
+                            { "name": "4x.webp", "width": 128 },
+                            { "name": "2x.webp", "width": 64 }
+                        ]
+                    }
+                }
+            }]
+        }));
+
+        assert_eq!(emotes.len(), 1);
+        let e = &emotes[0];
+        assert_eq!(e.url_1x, "https://cdn.7tv.app/emote/abc/1x.webp");
+        assert_eq!(
+            e.url_2x.as_deref(),
+            Some("https://cdn.7tv.app/emote/abc/2x.webp")
+        );
+        assert_eq!(
+            e.url_4x.as_deref(),
+            Some("https://cdn.7tv.app/emote/abc/4x.webp")
+        );
+    }
+
+    #[test]
+    fn seven_tv_falls_back_to_3x_when_4x_missing() {
+        let emotes = parse_7tv_set(serde_json::json!({
+            "emotes": [{
+                "id": "1",
+                "name": "forsenE",
+                "data": {
+                    "host": {
+                        "url": "//cdn.7tv.app/emote/def",
+                        "files": [
+                            { "name": "1x.webp", "width": 32 },
+                            { "name": "2x.webp", "width": 64 },
+                            { "name": "3x.webp", "width": 96 }
+                        ]
+                    }
+                }
+            }]
+        }));
+
+        assert_eq!(emotes.len(), 1);
+        assert_eq!(
+            emotes[0].url_4x.as_deref(),
+            Some("https://cdn.7tv.app/emote/def/3x.webp")
+        );
+    }
+
+    #[test]
+    fn seven_tv_uses_smallest_width_when_scale_names_are_unavailable() {
+        let emotes = parse_7tv_set(serde_json::json!({
+            "emotes": [{
+                "id": "1",
+                "name": "widepeepoHappy",
+                "data": {
+                    "host": {
+                        "url": "//cdn.7tv.app/emote/ghi",
+                        "files": [
+                            { "name": "a.webp", "width": 128 },
+                            { "name": "b.webp", "width": 48 },
+                            { "name": "c.webp", "width": 64 }
+                        ]
+                    }
+                }
+            }]
+        }));
+
+        assert_eq!(emotes.len(), 1);
+        assert_eq!(emotes[0].url_1x, "https://cdn.7tv.app/emote/ghi/b.webp");
     }
 }
