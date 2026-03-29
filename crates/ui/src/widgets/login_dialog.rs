@@ -5,6 +5,8 @@ use egui::RichText;
 
 use crate::theme as t;
 
+use super::chrome;
+
 /// Action emitted by the account-manager dialog.
 pub enum LoginAction {
     /// Add / log in with a new OAuth token.
@@ -110,7 +112,12 @@ impl LoginDialog {
                 ui.set_min_width(dialog_w);
                 ui.set_max_width(dialog_w);
 
-                ui.add_space(4.0);
+                chrome::dialog_header(
+                    ui,
+                    "Accounts",
+                    Some("Switch, add, and manage saved Twitch logins."),
+                );
+                ui.add_space(6.0);
 
                 // ── Account list ────────────────────────────────────────────
                 if shown_accounts.is_empty() {
@@ -127,16 +134,18 @@ impl LoginDialog {
                     for acc_name in &shown_accounts {
                         let is_active = active.as_deref() == Some(acc_name.as_str());
                         let is_default = self.default_account.as_deref() == Some(acc_name.as_str());
-                        draw_account_row(
-                            ui,
-                            acc_name,
-                            is_active,
-                            is_default,
-                            avatar_url,
-                            emote_bytes,
-                            &mut result,
-                            &mut self.open,
-                        );
+                        chrome::card_frame().show(ui, |ui| {
+                            draw_account_row(
+                                ui,
+                                acc_name,
+                                is_active,
+                                is_default,
+                                avatar_url,
+                                emote_bytes,
+                                &mut result,
+                                &mut self.open,
+                            );
+                        });
                     }
                     ui.add_space(6.0);
                     ui.add(egui::Separator::default().spacing(4.0));

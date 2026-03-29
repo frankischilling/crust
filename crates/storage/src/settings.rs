@@ -81,6 +81,36 @@ pub struct AppSettings {
     /// If true, animation repainting runs only while the app window is focused.
     #[serde(default = "bool_true")]
     pub animations_when_focused: bool,
+    /// Preferred channel chrome layout: `sidebar` or `top_tabs`.
+    #[serde(default = "default_channel_layout")]
+    pub channel_layout: String,
+    /// Whether the sidebar is visible when using sidebar layout.
+    #[serde(default = "bool_true")]
+    pub sidebar_visible: bool,
+    /// Whether the analytics side panel is visible.
+    #[serde(default)]
+    pub analytics_visible: bool,
+    /// Whether the IRC status panel is visible.
+    #[serde(default)]
+    pub irc_status_visible: bool,
+    /// Tab density/style: `compact` or `normal`.
+    #[serde(default = "default_tab_style")]
+    pub tab_style: String,
+    /// Whether tabs show close buttons on hover/selection.
+    #[serde(default = "bool_true")]
+    pub show_tab_close_buttons: bool,
+    /// Whether tabs show live indicators for live Twitch channels.
+    #[serde(default = "bool_true")]
+    pub show_tab_live_indicators: bool,
+    /// Whether split headers show the stream title when available.
+    #[serde(default = "bool_true")]
+    pub split_header_show_title: bool,
+    /// Whether split headers show the current game/category.
+    #[serde(default)]
+    pub split_header_show_game: bool,
+    /// Whether split headers show viewer counts when available.
+    #[serde(default = "bool_true")]
+    pub split_header_show_viewer_count: bool,
 }
 
 fn default_theme() -> String {
@@ -94,6 +124,12 @@ fn bool_true() -> bool {
 }
 fn default_collapse_long_message_lines() -> usize {
     8
+}
+fn default_channel_layout() -> String {
+    "sidebar".to_owned()
+}
+fn default_tab_style() -> String {
+    "compact".to_owned()
 }
 
 impl Default for AppSettings {
@@ -119,6 +155,16 @@ impl Default for AppSettings {
             collapse_long_messages: true,
             collapse_long_message_lines: default_collapse_long_message_lines(),
             animations_when_focused: true,
+            channel_layout: default_channel_layout(),
+            sidebar_visible: true,
+            analytics_visible: false,
+            irc_status_visible: false,
+            tab_style: default_tab_style(),
+            show_tab_close_buttons: true,
+            show_tab_live_indicators: true,
+            split_header_show_title: true,
+            split_header_show_game: false,
+            split_header_show_viewer_count: true,
         }
     }
 }
@@ -165,6 +211,12 @@ impl SettingsStore {
                 }
                 if cfg.collapse_long_message_lines == 0 {
                     cfg.collapse_long_message_lines = default_collapse_long_message_lines();
+                }
+                if !matches!(cfg.channel_layout.as_str(), "sidebar" | "top_tabs") {
+                    cfg.channel_layout = default_channel_layout();
+                }
+                if !matches!(cfg.tab_style.as_str(), "compact" | "normal") {
+                    cfg.tab_style = default_tab_style();
                 }
                 cfg
             }
@@ -315,5 +367,63 @@ impl SettingsStore {
         let mut settings = self.load();
         settings.oauth_token = String::new();
         self.save(&settings)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppSettings;
+
+    #[test]
+    fn legacy_configs_pick_up_new_appearance_defaults() {
+        let cfg: AppSettings = toml::from_str(
+            r#"
+theme = "dark"
+font_size = 13.0
+show_timestamps = true
+"#,
+        )
+        .expect("legacy config should parse");
+
+        assert_eq!(cfg.channel_layout, "sidebar");
+        assert!(cfg.sidebar_visible);
+        assert_eq!(cfg.tab_style, "compact");
+        assert!(cfg.show_tab_close_buttons);
+        assert!(cfg.show_tab_live_indicators);
+        assert!(cfg.split_header_show_title);
+        assert!(cfg.split_header_show_viewer_count);
+        assert!(!cfg.split_header_show_game);
+        assert!(!cfg.analytics_visible);
+        assert!(!cfg.irc_status_visible);
+    }
+
+    #[test]
+    fn explicit_appearance_settings_round_trip_from_toml() {
+        let cfg: AppSettings = toml::from_str(
+            r#"
+channel_layout = "top_tabs"
+sidebar_visible = false
+analytics_visible = true
+irc_status_visible = true
+tab_style = "normal"
+show_tab_close_buttons = false
+show_tab_live_indicators = false
+split_header_show_title = false
+split_header_show_game = true
+split_header_show_viewer_count = false
+"#,
+        )
+        .expect("appearance config should parse");
+
+        assert_eq!(cfg.channel_layout, "top_tabs");
+        assert!(!cfg.sidebar_visible);
+        assert!(cfg.analytics_visible);
+        assert!(cfg.irc_status_visible);
+        assert_eq!(cfg.tab_style, "normal");
+        assert!(!cfg.show_tab_close_buttons);
+        assert!(!cfg.show_tab_live_indicators);
+        assert!(!cfg.split_header_show_title);
+        assert!(cfg.split_header_show_game);
+        assert!(!cfg.split_header_show_viewer_count);
     }
 }

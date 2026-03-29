@@ -12,6 +12,8 @@ use crust_core::model::EmoteCatalogEntry;
 use super::emoji_list::emoji_catalog_entries;
 use crate::theme as t;
 
+use super::chrome;
+
 const EMOTE_SIZE: f32 = 28.0;
 const CELL_SIZE: f32 = EMOTE_SIZE + 8.0;
 const ROW_H: f32 = CELL_SIZE + 4.0;
@@ -188,6 +190,12 @@ impl EmotePicker {
             .collapsible(true)
             .scroll(false)
             .show(ctx, |ui| {
+                chrome::dialog_header(
+                    ui,
+                    "Emotes",
+                    Some("Browse Twitch, 7TV, BTTV, FFZ, and emoji."),
+                );
+                ui.add_space(6.0);
                 // Search bar
                 ui.horizontal(|ui| {
                     ui.label("🔍");

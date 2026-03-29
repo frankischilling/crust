@@ -8,6 +8,8 @@ use crust_core::model::{Badge, ChannelId, ChatMessage, UserProfile};
 
 use crate::theme as t;
 
+use super::chrome;
+
 // ─── Public action returned from show() ──────────────────────────────────────
 
 /// Action emitted by the popup when a moderation button is pressed.
@@ -225,6 +227,12 @@ impl UserProfilePopup {
                     return;
                 };
 
+                let profile_subtitle = format!("@{}", profile.login);
+                chrome::dialog_header(
+                    ui,
+                    profile.display_name.as_str(),
+                    Some(profile_subtitle.as_str()),
+                );
                 ui.add_space(6.0);
 
                 // ── Header: avatar + name + badges ───────────────────────

@@ -12,6 +12,8 @@ pub struct ChannelList<'a> {
     pub channel_states: &'a HashMap<ChannelId, ChannelState>,
     /// Optional map of channel-login → is_live for drawing live status dots.
     pub live_channels: Option<&'a HashMap<String, bool>>,
+    pub show_live_indicator: bool,
+    pub show_close_button: bool,
 }
 
 pub struct ChannelListResult {
@@ -231,7 +233,8 @@ impl<'a> ChannelList<'a> {
                                 ui.spacing_mut().item_spacing.x = 4.0;
 
                                 // Live-status indicator dot.
-                                if let Some(live_map) = self.live_channels {
+                                if self.show_live_indicator {
+                                    if let Some(live_map) = self.live_channels {
                                     if let Some(&is_live) = live_map.get(ch.display_name()) {
                                         let dot_r = 3.5_f32;
                                         let (dot_rect, _) = ui.allocate_exact_size(
@@ -249,6 +252,7 @@ impl<'a> ChannelList<'a> {
                                             dot_col,
                                         );
                                     }
+                                }
                                 }
 
                                 // Platform badge for non-Twitch channels
@@ -334,7 +338,8 @@ impl<'a> ChannelList<'a> {
                                                     .color(t::text_secondary()),
                                             );
                                         } else {
-                                            let show_close = is_hovered || is_active;
+                                            let show_close =
+                                                self.show_close_button && (is_hovered || is_active);
                                             let close = ui.add_visible(
                                                 show_close,
                                                 egui::Label::new(

@@ -1,14 +1,18 @@
 pub mod analytics;
 pub mod channel_list;
 pub mod chat_input;
+pub mod chrome;
 pub mod emoji_list;
 pub mod emote_picker;
+pub mod info_bars;
 pub mod irc_status;
 pub mod join_dialog;
 pub mod loading_screen;
 pub mod login_dialog;
 pub mod message_list;
 pub mod message_search;
+pub mod settings_page;
+pub mod split_header;
 pub mod user_profile_popup;
 
 /// Build a `bytes://` URI for egui image loading.

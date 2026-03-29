@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use egui::{Color32, Id, Label, LayerId, Order, RichText, ScrollArea, Ui, Vec2};
@@ -287,6 +287,12 @@ pub struct MessageList<'a> {
     collapse_long_message_lines: usize,
     /// Whether animated emotes should animate this frame.
     animate_emotes: bool,
+    /// Whether timestamps should be shown for each message.
+    show_timestamps: bool,
+    /// Ignored usernames (lowercase) hidden from the message list.
+    ignored_logins: &'a HashSet<String>,
+    /// Lowercased highlight keywords used for local keyword highlighting.
+    highlight_terms: &'a [String],
 }
 
 impl<'a> MessageList<'a> {
@@ -300,6 +306,9 @@ impl<'a> MessageList<'a> {
         collapse_long_messages: bool,
         collapse_long_message_lines: usize,
         animate_emotes: bool,
+        show_timestamps: bool,
+        ignored_logins: &'a HashSet<String>,
+        highlight_terms: &'a [String],
     ) -> Self {
         Self {
             messages,
@@ -311,6 +320,9 @@ impl<'a> MessageList<'a> {
             collapse_long_messages,
             collapse_long_message_lines: collapse_long_message_lines.max(1),
             animate_emotes,
+            show_timestamps,
+            ignored_logins,
+            highlight_terms,
         }
     }
 
@@ -335,6 +347,14 @@ impl<'a> MessageList<'a> {
         ui.set_clip_rect(clip);
 
         let search_filtering = self.search.map(|s| s.is_filtering()).unwrap_or(false);
+        let is_visible_message = |msg: &ChatMessage| {
+            if self.ignored_logins.is_empty() {
+                return true;
+            }
+            let login = msg.sender.login.as_str();
+            !self.ignored_logins.contains(login)
+                && !self.ignored_logins.contains(&login.to_ascii_lowercase())
+        };
         // PERF: use VisibleIndices enum to avoid O(n) Vec allocation when
         // no search filter is active (the common case).
         let live_visible_indices: VisibleIndices = match self.search {
@@ -342,10 +362,19 @@ impl<'a> MessageList<'a> {
                 self.messages
                     .iter()
                     .enumerate()
-                    .filter_map(|(idx, msg)| search.matches(msg).then_some(idx))
+                    .filter_map(|(idx, msg)| {
+                        (is_visible_message(msg) && search.matches(msg)).then_some(idx)
+                    })
                     .collect(),
             ),
-            _ => VisibleIndices::All(self.messages.len()),
+            _ if self.ignored_logins.is_empty() => VisibleIndices::All(self.messages.len()),
+            _ => VisibleIndices::Filtered(
+                self.messages
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, msg)| is_visible_message(msg).then_some(idx))
+                    .collect(),
+            ),
         };
         let live_visible_count = live_visible_indices.len();
         // Use a per-channel scroll area ID so offset doesn't leak
@@ -1322,7 +1351,13 @@ impl<'a> MessageList<'a> {
             (Some(hl_id), Some(msg_id)) if hl_id == msg_id => rctx.highlight_alpha,
             _ => 0.0,
         };
-        let bg = message_row_background(&msg.flags, &msg.msg_kind, highlight_alpha);
+        let keyword_highlight = self.message_matches_keyword_highlight(msg);
+        let bg = message_row_background(
+            &msg.flags,
+            &msg.msg_kind,
+            highlight_alpha,
+            keyword_highlight,
+        );
 
         // Context-menu approach:
         //
@@ -1441,7 +1476,9 @@ impl<'a> MessageList<'a> {
                 // ── Notification banner (pinned / first / highlighted / rewards) ──
                 // Rendered inside the Frame so the background fill covers
                 // the banner as well, and the interaction rect is contiguous.
-                if let Some((label, stripe_color)) = notification_label(&msg.flags, &msg.msg_kind) {
+                if let Some((label, stripe_color)) =
+                    notification_label(&msg.flags, &msg.msg_kind, keyword_highlight)
+                {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         // Colored left stripe
@@ -1467,20 +1504,22 @@ impl<'a> MessageList<'a> {
                     |ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(3.0, 1.0);
 
-                        // Timestamp
-                        let ts = msg
-                            .timestamp
-                            .with_timezone(&chrono::Local)
-                            .format("%H:%M")
-                            .to_string();
-                        ui.add(Label::new(
-                            RichText::new(ts).color(t::timestamp()).font(t::small()),
-                        ));
+                        if self.show_timestamps {
+                            // Timestamp
+                            let ts = msg
+                                .timestamp
+                                .with_timezone(&chrono::Local)
+                                .format("%H:%M")
+                                .to_string();
+                            ui.add(Label::new(
+                                RichText::new(ts).color(t::timestamp()).font(t::small()),
+                            ));
 
-                        // Separator dot between timestamp and badges/name
-                        ui.add(Label::new(
-                            RichText::new("·").color(t::separator()).font(t::small()),
-                        ));
+                            // Separator dot between timestamp and badges/name
+                            ui.add(Label::new(
+                                RichText::new("·").color(t::separator()).font(t::small()),
+                            ));
+                        }
 
                         // Badges: image if loaded, else text fallback
                         for badge in &msg.sender.badges {
@@ -1642,12 +1681,27 @@ impl<'a> MessageList<'a> {
 
             // Left accent strip for mentions and highlights - a vivid 3 px bar on
             // the left edge of the row so the eye finds them instantly in fast chat.
-            if let Some(bar_col) = message_left_accent_color(&msg.flags, &msg.msg_kind) {
+            if let Some(bar_col) =
+                message_left_accent_color(&msg.flags, &msg.msg_kind, keyword_highlight)
+            {
                 let r = msg_frame_resp.rect;
                 let strip = egui::Rect::from_min_size(r.left_top(), egui::vec2(3.0, r.height()));
                 ui.painter().rect_filled(strip, 0.0, bar_col);
             }
         }); // end push_id
+    }
+
+    fn message_matches_keyword_highlight(&self, msg: &ChatMessage) -> bool {
+        if self.highlight_terms.is_empty() {
+            return false;
+        }
+        if msg.raw_text.is_empty() {
+            return false;
+        }
+        let lowered = msg.raw_text.to_ascii_lowercase();
+        self.highlight_terms
+            .iter()
+            .any(|term| lowered.contains(term))
     }
 
     /// Render a compact system-event row (mod action, sub alert, raid, notice).
@@ -1753,11 +1807,13 @@ impl<'a> MessageList<'a> {
                             ui.allocate_exact_size(egui::vec2(3.0, 14.0), egui::Sense::hover());
                         ui.painter().rect_filled(rect, 1.0, accent);
 
-                        // Timestamp
-                        let ts = msg.timestamp.format("%H:%M").to_string();
-                        ui.add(Label::new(
-                            RichText::new(ts).color(t::timestamp()).font(t::small()),
-                        ));
+                        if self.show_timestamps {
+                            // Timestamp
+                            let ts = msg.timestamp.format("%H:%M").to_string();
+                            ui.add(Label::new(
+                                RichText::new(ts).color(t::timestamp()).font(t::small()),
+                            ));
+                        }
 
                         // Message text
                         let rich = if is_irc_motd_line(&text) {
@@ -3303,9 +3359,15 @@ fn site_badge_colors(site: &str) -> (Color32, Color32) {
 
 /// Return `(label_text, stripe_color)` for messages with a chat notification.
 /// Returns `None` for ordinary messages.
-fn notification_label(flags: &MessageFlags, kind: &MsgKind) -> Option<(&'static str, Color32)> {
+fn notification_label(
+    flags: &MessageFlags,
+    kind: &MsgKind,
+    keyword_highlight: bool,
+) -> Option<(&'static str, Color32)> {
     if flags.is_highlighted {
         Some(("Highlighted Message", t::twitch_purple()))
+    } else if keyword_highlight {
+        Some(("Keyword Highlight", t::twitch_purple()))
     } else if flags.is_mention {
         Some(("Mention", Color32::from_rgb(210, 140, 40)))
     } else if flags.is_pinned {
@@ -3321,12 +3383,19 @@ fn notification_label(flags: &MessageFlags, kind: &MsgKind) -> Option<(&'static 
     }
 }
 
-fn message_row_background(flags: &MessageFlags, kind: &MsgKind, highlight_alpha: f32) -> Color32 {
+fn message_row_background(
+    flags: &MessageFlags,
+    kind: &MsgKind,
+    highlight_alpha: f32,
+    keyword_highlight: bool,
+) -> Color32 {
     if highlight_alpha > 0.0 {
         let a = (50.0 * highlight_alpha) as u8;
         Color32::from_rgba_unmultiplied(100, 140, 255, a)
     } else if flags.is_highlighted {
         Color32::from_rgba_unmultiplied(145, 70, 255, 22)
+    } else if keyword_highlight {
+        Color32::from_rgba_unmultiplied(145, 70, 255, 18)
     } else if flags.is_mention {
         Color32::from_rgba_unmultiplied(210, 140, 40, 24)
     } else if flags.is_pinned {
@@ -3346,13 +3415,19 @@ fn message_row_background(flags: &MessageFlags, kind: &MsgKind, highlight_alpha:
     }
 }
 
-fn message_left_accent_color(flags: &MessageFlags, kind: &MsgKind) -> Option<Color32> {
+fn message_left_accent_color(
+    flags: &MessageFlags,
+    kind: &MsgKind,
+    keyword_highlight: bool,
+) -> Option<Color32> {
     if flags.is_mention && matches!(kind, MsgKind::Sub { is_gift: true, .. }) {
         Some(t::raid_cyan())
     } else if flags.is_mention {
         Some(t::accent())
     } else if flags.is_highlighted {
         Some(Color32::from_rgb(255, 210, 30))
+    } else if keyword_highlight {
+        Some(t::twitch_purple())
     } else if flags.is_pinned {
         Some(t::gold())
     } else if flags.is_first_msg {
@@ -3426,7 +3501,7 @@ mod tests {
             is_first_msg: true,
             ..MessageFlags::default()
         };
-        let bg = message_row_background(&flags, &MsgKind::Chat, 0.0);
+        let bg = message_row_background(&flags, &MsgKind::Chat, 0.0, false);
         assert_ne!(bg, Color32::TRANSPARENT);
     }
 
@@ -3437,7 +3512,7 @@ mod tests {
             ..MessageFlags::default()
         };
         assert_eq!(
-            message_left_accent_color(&flags, &MsgKind::Chat),
+            message_left_accent_color(&flags, &MsgKind::Chat, false),
             Some(t::green())
         );
     }
@@ -3449,7 +3524,7 @@ mod tests {
             ..MessageFlags::default()
         };
         assert_eq!(
-            notification_label(&flags, &MsgKind::Chat),
+            notification_label(&flags, &MsgKind::Chat, false),
             Some(("Pinned Message", t::gold()))
         );
     }

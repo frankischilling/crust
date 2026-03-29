@@ -326,6 +326,86 @@ pub fn overlay_fill() -> Color32 {
     }
 }
 
+/// Header / toolbar group fill.
+#[inline]
+pub fn bg_header() -> Color32 {
+    if is_light() {
+        Color32::from_rgb(228, 228, 236)
+    } else {
+        Color32::from_rgb(24, 24, 34)
+    }
+}
+
+/// Card/dialog section fill.
+#[inline]
+pub fn bg_card() -> Color32 {
+    if is_light() {
+        Color32::from_rgb(240, 240, 247)
+    } else {
+        Color32::from_rgb(26, 26, 36)
+    }
+}
+
+/// Selected tab fill.
+#[inline]
+pub fn tab_selected_bg() -> Color32 {
+    if is_light() {
+        Color32::from_rgba_premultiplied(120, 90, 210, 52)
+    } else {
+        Color32::from_rgba_premultiplied(96, 76, 170, 160)
+    }
+}
+
+/// Tab hover fill.
+#[inline]
+pub fn tab_hover_bg() -> Color32 {
+    if is_light() {
+        Color32::from_rgba_premultiplied(120, 120, 150, 26)
+    } else {
+        Color32::from_rgba_premultiplied(80, 80, 110, 72)
+    }
+}
+
+/// Soft fill for badges and pills.
+#[inline]
+pub fn pill_bg() -> Color32 {
+    if is_light() {
+        Color32::from_rgba_premultiplied(110, 110, 140, 28)
+    } else {
+        Color32::from_rgba_premultiplied(100, 100, 130, 70)
+    }
+}
+
+/// Mention badge fill.
+#[inline]
+pub fn mention_pill_bg() -> Color32 {
+    if is_light() {
+        Color32::from_rgba_premultiplied(215, 175, 40, 44)
+    } else {
+        Color32::from_rgba_premultiplied(220, 175, 45, 84)
+    }
+}
+
+/// Destructive action fill.
+#[inline]
+pub fn danger_bg() -> Color32 {
+    if is_light() {
+        Color32::from_rgba_premultiplied(210, 60, 60, 28)
+    } else {
+        Color32::from_rgba_premultiplied(200, 55, 55, 54)
+    }
+}
+
+/// Soft info stripe fill.
+#[inline]
+pub fn info_bg() -> Color32 {
+    if is_light() {
+        Color32::from_rgba_premultiplied(90, 130, 220, 24)
+    } else {
+        Color32::from_rgba_premultiplied(85, 115, 210, 48)
+    }
+}
+
 // Layout metrics
 
 /// Corner radius shared across most interactive elements.
@@ -335,12 +415,41 @@ pub const RADIUS_SM: CornerRadius = CornerRadius::same(3);
 
 /// Standard toolbar row height.
 pub const BAR_H: f32 = 28.0;
+/// Compact square icon button size.
+pub const ICON_BTN_SM: f32 = 18.0;
+/// Default square icon button size.
+pub const ICON_BTN: f32 = 24.0;
+/// Dialog header padding.
+pub const DIALOG_MARGIN: Margin = Margin {
+    left: 12,
+    right: 12,
+    top: 10,
+    bottom: 10,
+};
+/// Card/section padding for redesigned secondary surfaces.
+pub const CARD_MARGIN: Margin = Margin {
+    left: 10,
+    right: 10,
+    top: 9,
+    bottom: 9,
+};
+/// Inner margin for the top tab strip.
+pub const TAB_STRIP_MARGIN: Margin = Margin {
+    left: 6,
+    right: 6,
+    top: 2,
+    bottom: 2,
+};
 /// Minimum sidebar width.
 pub const SIDEBAR_MIN_W: f32 = 80.0;
+/// Minimum sidebar width once the window enters a narrow layout.
+pub const SIDEBAR_COMPACT_MIN_W: f32 = 64.0;
 /// Maximum sidebar width.
 pub const SIDEBAR_MAX_W: f32 = 300.0;
 /// Default sidebar width.
 pub const SIDEBAR_W: f32 = 160.0;
+/// Default sidebar width in narrow mode.
+pub const SIDEBAR_COMPACT_W: f32 = 124.0;
 
 /// Inner margin for toolbar panels.
 pub const BAR_MARGIN: Margin = Margin {
@@ -370,6 +479,8 @@ pub const TOOLBAR_SPACING: Vec2 = Vec2::new(6.0, 0.0);
 pub const ITEM_SPACING: Vec2 = Vec2::new(4.0, 3.0);
 /// Channel row vertical gap.
 pub const CHANNEL_ROW_GAP: f32 = 2.0;
+/// Default gap between major UI sections.
+pub const SECTION_GAP: f32 = 8.0;
 
 // Typography styles
 

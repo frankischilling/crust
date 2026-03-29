@@ -131,6 +131,40 @@ pub enum AppCommand {
         /// Only run animation-driven repainting while the window is focused.
         animations_when_focused: bool,
     },
+    /// Persist general UI/filter/channel settings managed by the settings page.
+    SetGeneralSettings {
+        /// Show per-message timestamps in chat.
+        show_timestamps: bool,
+        /// Channels to auto-join at startup/reconnect.
+        auto_join: Vec<String>,
+        /// Highlight keywords (free-form, case-insensitive matching ready).
+        highlights: Vec<String>,
+        /// Ignored usernames (lowercase expected).
+        ignores: Vec<String>,
+    },
+    /// Persist appearance and shell layout settings.
+    SetAppearanceSettings {
+        /// Preferred channel list layout (`sidebar` or `top_tabs`).
+        channel_layout: String,
+        /// Whether the sidebar should remain visible in sidebar mode.
+        sidebar_visible: bool,
+        /// Whether the analytics panel is visible.
+        analytics_visible: bool,
+        /// Whether the IRC diagnostics panel is visible.
+        irc_status_visible: bool,
+        /// Tab density/style (`compact` or `normal`).
+        tab_style: String,
+        /// Whether tabs show close affordances on hover/selection.
+        show_tab_close_buttons: bool,
+        /// Whether tabs show live indicators for live Twitch channels.
+        show_tab_live_indicators: bool,
+        /// Whether split headers show stream title metadata.
+        split_header_show_title: bool,
+        /// Whether split headers show game/category metadata.
+        split_header_show_game: bool,
+        /// Whether split headers show viewer counts.
+        split_header_show_viewer_count: bool,
+    },
     /// Fetch external chat logs for a user from the IVR logs API.
     FetchIvrLogs { channel: String, username: String },
 }
@@ -270,6 +304,30 @@ pub enum AppEvent {
         collapse_long_message_lines: usize,
         /// Only run animation-driven repainting while the window is focused.
         animations_when_focused: bool,
+    },
+    /// General settings snapshot loaded/updated from persistent storage.
+    GeneralSettingsUpdated {
+        /// Show per-message timestamps in chat.
+        show_timestamps: bool,
+        /// Channels to auto-join at startup/reconnect.
+        auto_join: Vec<String>,
+        /// Highlight keywords.
+        highlights: Vec<String>,
+        /// Ignored usernames (lowercase).
+        ignores: Vec<String>,
+    },
+    /// Appearance and shell layout settings loaded/updated from storage.
+    AppearanceSettingsUpdated {
+        channel_layout: String,
+        sidebar_visible: bool,
+        analytics_visible: bool,
+        irc_status_visible: bool,
+        tab_style: String,
+        show_tab_close_buttons: bool,
+        show_tab_live_indicators: bool,
+        split_header_show_title: bool,
+        split_header_show_game: bool,
+        split_header_show_viewer_count: bool,
     },
     /// A batch of image prefetch tasks has been queued.  The loading screen
     /// uses this to track progress vs `EmoteImageReady` completions.

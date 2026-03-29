@@ -10,6 +10,8 @@ use crust_core::model::{ChannelId, ChatMessage};
 
 use crate::theme as t;
 
+use super::chrome;
+
 const SEARCH_PANEL_MIN_WIDTH: f32 = 680.0;
 const SEARCH_FIELD_MIN_WIDTH: f32 = 170.0;
 const SEARCH_WINDOW_DEFAULT_WIDTH: f32 = 440.0;
@@ -156,7 +158,7 @@ pub fn show_message_search_inline(
     } else {
         t::stroke_subtle()
     };
-    Frame::new()
+    chrome::card_frame()
         .fill(t::bg_raised())
         .corner_radius(t::RADIUS)
         .inner_margin(egui::Margin::same(10))
@@ -238,7 +240,7 @@ pub fn show_message_search_window(
             _ => {
                 CentralPanel::default()
                     .frame(
-                        Frame::new()
+                        chrome::card_frame()
                             .fill(t::bg_dialog())
                             .stroke(Stroke::new(1.0, t::border_subtle()))
                             .inner_margin(egui::Margin::same(12)),
@@ -266,23 +268,15 @@ fn show_message_search_contents(
     ui.spacing_mut().item_spacing = egui::vec2(10.0, 8.0);
 
     ui.horizontal(|ui| {
-        ui.label(RichText::new("⌕").color(t::accent()).size(18.0));
-        ui.vertical(|ui| {
-            ui.label(
-                RichText::new("Search chat history")
-                    .font(t::body())
-                    .strong(),
-            );
-            ui.label(
-                RichText::new(if detached {
-                    "Detached search window for this channel"
-                } else {
-                    "Filter by username, keyword, or Rust regex"
-                })
-                .font(t::small())
-                .color(t::text_muted()),
-            );
-        });
+        chrome::dialog_header(
+            ui,
+            "Search chat history",
+            Some(if detached {
+                "Detached search window for this channel"
+            } else {
+                "Filter by username, keyword, or Rust regex"
+            }),
+        );
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if !detached {

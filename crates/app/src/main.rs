@@ -11,7 +11,7 @@ use chrono::Utc;
 use crust_core::events::{AppCommand, AppEvent, ConnectionState};
 use crust_core::model::{
     Badge, ChannelId, ChatMessage, EmoteCatalogEntry, MessageFlags, MessageId, MsgKind, Sender,
-    UserId, UserProfile,
+    UserId,
 };
 use crust_emotes::{
     cache::EmoteCache,
@@ -36,6 +36,17 @@ use seventv::{
     SevenTvResolvedStyle, SevenTvUserStyleRaw,
 };
 
+use runtime::assets::fetch_emote_image;
+use runtime::link_preview::fetch_link_preview;
+use runtime::profiles::{
+    fetch_ivr_logs, fetch_self_avatar, fetch_twitch_user_profile, fetch_user_profile_for_channel,
+};
+use runtime::system_messages::{
+    build_sub_text, extract_irc_msg_echo, format_timeout_text, is_twitch_pinned_notice,
+    make_system_message,
+};
+
+mod runtime;
 mod seventv;
 
 const CMD_CHANNEL_SIZE: usize = 128;
@@ -46,6 +57,8 @@ const IRC_EVT_SIZE: usize = 4096;
 const TWITCH_MAX_MESSAGE_CHARS: usize = 500;
 const TWITCH_GQL_URL: &str = "https://gql.twitch.tv/gql";
 const TWITCH_WEB_CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
+const APP_INITIAL_INNER_SIZE: [f32; 2] = [1100.0, 700.0];
+const APP_MIN_INNER_SIZE: [f32; 2] = [220.0, 200.0];
 
 static UI_REPAINT_CTX: OnceLock<egui::Context> = OnceLock::new();
 
@@ -290,8 +303,8 @@ fn main() -> Result<()> {
     let native_opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Crust – Twitch, Kick & IRC Chat")
-            .with_inner_size([1100.0, 700.0])
-            .with_min_inner_size([300.0, 200.0])
+            .with_inner_size(APP_INITIAL_INNER_SIZE)
+            .with_min_inner_size(APP_MIN_INNER_SIZE)
             .with_app_id("crust"),
         ..Default::default()
     };
@@ -576,6 +589,28 @@ async fn reducer_loop(
             collapse_long_messages: settings.collapse_long_messages,
             collapse_long_message_lines: settings.collapse_long_message_lines,
             animations_when_focused: settings.animations_when_focused,
+        })
+        .await;
+    let _ = evt_tx
+        .send(AppEvent::GeneralSettingsUpdated {
+            show_timestamps: settings.show_timestamps,
+            auto_join: settings.auto_join.clone(),
+            highlights: settings.highlights.clone(),
+            ignores: settings.ignores.clone(),
+        })
+        .await;
+    let _ = evt_tx
+        .send(AppEvent::AppearanceSettingsUpdated {
+            channel_layout: settings.channel_layout.clone(),
+            sidebar_visible: settings.sidebar_visible,
+            analytics_visible: settings.analytics_visible,
+            irc_status_visible: settings.irc_status_visible,
+            tab_style: settings.tab_style.clone(),
+            show_tab_close_buttons: settings.show_tab_close_buttons,
+            show_tab_live_indicators: settings.show_tab_live_indicators,
+            split_header_show_title: settings.split_header_show_title,
+            split_header_show_game: settings.split_header_show_game,
+            split_header_show_viewer_count: settings.split_header_show_viewer_count,
         })
         .await;
 
@@ -2010,6 +2045,125 @@ async fn reducer_loop(
                             })
                             .await;
                     }
+                    AppCommand::SetGeneralSettings {
+                        show_timestamps,
+                        auto_join,
+                        highlights,
+                        ignores,
+                    } => {
+                        let mut seen_channels: HashSet<String> = HashSet::new();
+                        let mut sanitized_auto_join: Vec<String> = Vec::new();
+                        for raw in auto_join {
+                            if let Some(id) = parse_saved_channel(&raw) {
+                                if seen_channels.insert(id.0.clone()) {
+                                    sanitized_auto_join.push(id.0);
+                                }
+                            }
+                        }
+                        sanitized_auto_join.sort();
+
+                        let mut seen_highlights: HashSet<String> = HashSet::new();
+                        let mut sanitized_highlights: Vec<String> = Vec::new();
+                        for raw in highlights {
+                            let trimmed = raw.trim();
+                            if trimmed.is_empty() {
+                                continue;
+                            }
+                            let key = trimmed.to_ascii_lowercase();
+                            if seen_highlights.insert(key) {
+                                sanitized_highlights.push(trimmed.to_owned());
+                            }
+                        }
+
+                        let mut seen_ignores: HashSet<String> = HashSet::new();
+                        let mut sanitized_ignores: Vec<String> = Vec::new();
+                        for raw in ignores {
+                            let trimmed = raw.trim().to_ascii_lowercase();
+                            if trimmed.is_empty() {
+                                continue;
+                            }
+                            if seen_ignores.insert(trimmed.clone()) {
+                                sanitized_ignores.push(trimmed);
+                            }
+                        }
+
+                        settings.show_timestamps = show_timestamps;
+                        settings.auto_join = sanitized_auto_join.clone();
+                        settings.highlights = sanitized_highlights.clone();
+                        settings.ignores = sanitized_ignores.clone();
+                        joined_channels = settings.auto_join.iter().cloned().collect();
+
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save general settings: {e}");
+                            }
+                        }
+
+                        let _ = evt_tx
+                            .send(AppEvent::GeneralSettingsUpdated {
+                                show_timestamps: settings.show_timestamps,
+                                auto_join: settings.auto_join.clone(),
+                                highlights: settings.highlights.clone(),
+                                ignores: settings.ignores.clone(),
+                            })
+                            .await;
+                    }
+                    AppCommand::SetAppearanceSettings {
+                        channel_layout,
+                        sidebar_visible,
+                        analytics_visible,
+                        irc_status_visible,
+                        tab_style,
+                        show_tab_close_buttons,
+                        show_tab_live_indicators,
+                        split_header_show_title,
+                        split_header_show_game,
+                        split_header_show_viewer_count,
+                    } => {
+                        settings.channel_layout = if matches!(
+                            channel_layout.as_str(),
+                            "sidebar" | "top_tabs"
+                        ) {
+                            channel_layout
+                        } else {
+                            "sidebar".to_owned()
+                        };
+                        settings.sidebar_visible = sidebar_visible;
+                        settings.analytics_visible = analytics_visible;
+                        settings.irc_status_visible = irc_status_visible;
+                        settings.tab_style = if matches!(tab_style.as_str(), "compact" | "normal")
+                        {
+                            tab_style
+                        } else {
+                            "compact".to_owned()
+                        };
+                        settings.show_tab_close_buttons = show_tab_close_buttons;
+                        settings.show_tab_live_indicators = show_tab_live_indicators;
+                        settings.split_header_show_title = split_header_show_title;
+                        settings.split_header_show_game = split_header_show_game;
+                        settings.split_header_show_viewer_count =
+                            split_header_show_viewer_count;
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save appearance settings: {e}");
+                            }
+                        }
+                        let _ = evt_tx
+                            .send(AppEvent::AppearanceSettingsUpdated {
+                                channel_layout: settings.channel_layout.clone(),
+                                sidebar_visible: settings.sidebar_visible,
+                                analytics_visible: settings.analytics_visible,
+                                irc_status_visible: settings.irc_status_visible,
+                                tab_style: settings.tab_style.clone(),
+                                show_tab_close_buttons: settings.show_tab_close_buttons,
+                                show_tab_live_indicators: settings.show_tab_live_indicators,
+                                split_header_show_title: settings.split_header_show_title,
+                                split_header_show_game: settings.split_header_show_game,
+                                split_header_show_viewer_count:
+                                    settings.split_header_show_viewer_count,
+                            })
+                            .await;
+                    }
                     AppCommand::SendMessage {
                         channel,
                         text,
@@ -3141,61 +3295,6 @@ fn prefetch_badge_images(
     }
 }
 
-/// Fetch a single emote/emoji/badge image and send raw bytes to UI.
-async fn fetch_emote_image(url: &str, cache: &Option<EmoteCache>, evt_tx: &mpsc::Sender<AppEvent>) {
-    let result = if let Some(cache) = cache {
-        cache.fetch_and_decode(url).await
-    } else {
-        fetch_and_decode_raw(url).await
-    };
-
-    match result {
-        Ok((width, height, raw_bytes)) => {
-            let _ = evt_tx
-                .send(AppEvent::EmoteImageReady {
-                    uri: url.to_owned(),
-                    width,
-                    height,
-                    raw_bytes,
-                })
-                .await;
-        }
-        Err(e) => {
-            debug!("Failed to fetch emote image {url}: {e}");
-            // Emit a zero-byte stub so the loading screen can count this
-            // fetch as settled (prevents hanging on failures).
-            let _ = evt_tx
-                .send(AppEvent::EmoteImageReady {
-                    uri: url.to_owned(),
-                    width: 0,
-                    height: 0,
-                    raw_bytes: vec![],
-                })
-                .await;
-        }
-    }
-}
-
-async fn fetch_and_decode_raw(url: &str) -> Result<(u32, u32, Vec<u8>), crust_emotes::EmoteError> {
-    let client = reqwest::Client::new();
-    let resp = client.get(url).send().await?;
-    if !resp.status().is_success() {
-        return Err(crust_emotes::EmoteError::NotFound(format!(
-            "HTTP {} for {url}",
-            resp.status()
-        )));
-    }
-    let raw = resp.bytes().await?;
-    let raw_vec = raw.to_vec();
-    // Read dimensions from header only - no full RGBA decode needed
-    let (w, h) = image::ImageReader::new(std::io::Cursor::new(&raw_vec))
-        .with_guessed_format()
-        .ok()
-        .and_then(|r| r.into_dimensions().ok())
-        .unwrap_or((1, 1));
-    Ok((w, h, raw_vec))
-}
-
 // Recent message history
 
 /// Load locally persisted chat history from SQLite and replay it as
@@ -3817,705 +3916,6 @@ async fn validate_token(token: &str) -> Result<ValidateInfo, ValidateError> {
     })
 }
 
-// User profile
-
-/// Fetch a user profile appropriate for the channel platform.
-async fn fetch_user_profile_for_channel(
-    login: &str,
-    channel: &ChannelId,
-    evt_tx: mpsc::Sender<AppEvent>,
-) {
-    if channel.is_kick() {
-        fetch_kick_user_profile(login, evt_tx).await;
-    } else if channel.is_irc() {
-        let _ = evt_tx
-            .send(AppEvent::UserProfileUnavailable {
-                login: login.to_owned(),
-            })
-            .await;
-    } else {
-        fetch_twitch_user_profile(login, evt_tx).await;
-    }
-}
-
-/// Fetch a Twitch user profile from the IVR API (no auth required) and send
-/// `AppEvent::UserProfileLoaded`. Also pre-fetches avatar bytes so the popup
-/// can show the real avatar immediately.
-async fn fetch_twitch_user_profile(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
-    #[derive(serde::Deserialize)]
-    struct IvrRoles {
-        #[serde(rename = "isPartner", default)]
-        is_partner: bool,
-        #[serde(rename = "isAffiliate", default)]
-        is_affiliate: bool,
-        #[serde(rename = "isBanned", default)]
-        is_banned: bool,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct IvrStreamGame {
-        #[serde(rename = "displayName", default)]
-        display_name: String,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct IvrStream {
-        #[serde(default)]
-        title: String,
-        /// IVR v2 returns game as an object {displayName: "..."}.
-        game: Option<IvrStreamGame>,
-        /// IVR uses "viewersCount" in v2.
-        #[serde(rename = "viewersCount", default)]
-        viewers_count: u64,
-        #[serde(rename = "startedAt")]
-        started_at: Option<String>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct IvrBroadcast {
-        #[serde(rename = "startedAt")]
-        started_at: Option<String>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct IvrBanStatus {
-        reason: Option<String>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct IvrUser {
-        #[serde(default)]
-        id: String,
-        #[serde(default)]
-        login: String,
-        #[serde(rename = "displayName", default)]
-        display_name: String,
-        #[serde(default)]
-        description: String,
-        #[serde(rename = "createdAt")]
-        created_at: Option<String>,
-        logo: Option<String>,
-        #[serde(default)]
-        followers: Option<u64>,
-        #[serde(default)]
-        roles: Option<IvrRoles>,
-        /// User's chosen chat colour, e.g. `"#FF6905"`.
-        #[serde(rename = "chatColor")]
-        chat_color: Option<String>,
-        /// Non-null while the channel is live.
-        stream: Option<IvrStream>,
-        /// Info about the most recent broadcast.
-        #[serde(rename = "lastBroadcast")]
-        last_broadcast: Option<IvrBroadcast>,
-        /// Non-null if the account is banned/suspended.
-        #[serde(rename = "banStatus")]
-        ban_status: Option<IvrBanStatus>,
-    }
-
-    let url = format!("https://api.ivr.fi/v2/twitch/user?login={login}");
-    let client = reqwest::Client::new();
-    let resp = match client.get(&url).send().await {
-        Ok(r) if r.status().is_success() => r,
-        Ok(r) => {
-            warn!("IVR user fetch returned HTTP {} for {login}", r.status());
-            let _ = evt_tx
-                .send(AppEvent::UserProfileUnavailable {
-                    login: login.to_owned(),
-                })
-                .await;
-            return;
-        }
-        Err(e) => {
-            warn!("IVR user fetch failed for {login}: {e}");
-            let _ = evt_tx
-                .send(AppEvent::UserProfileUnavailable {
-                    login: login.to_owned(),
-                })
-                .await;
-            return;
-        }
-    };
-
-    let users: Vec<IvrUser> = match resp.json().await {
-        Ok(u) => u,
-        Err(e) => {
-            warn!("IVR user response parse failed for {login}: {e}");
-            let _ = evt_tx
-                .send(AppEvent::UserProfileUnavailable {
-                    login: login.to_owned(),
-                })
-                .await;
-            return;
-        }
-    };
-
-    let Some(user) = users.into_iter().next() else {
-        warn!("IVR returned no user for {login}");
-        let _ = evt_tx
-            .send(AppEvent::UserProfileUnavailable {
-                login: login.to_owned(),
-            })
-            .await;
-        return;
-    };
-
-    let avatar_url = user.logo.clone();
-
-    let is_live = user.stream.is_some();
-    let stream_title = user
-        .stream
-        .as_ref()
-        .map(|s| s.title.clone())
-        .filter(|s| !s.is_empty());
-    let stream_game = user
-        .stream
-        .as_ref()
-        .and_then(|s| s.game.as_ref())
-        .map(|g| g.display_name.clone())
-        .filter(|s| !s.is_empty());
-    let stream_viewers = user.stream.as_ref().map(|s| s.viewers_count);
-    let stream_started = user.stream.as_ref().and_then(|s| s.started_at.clone());
-    let last_broadcast_at =
-        stream_started.or_else(|| user.last_broadcast.and_then(|b| b.started_at));
-    let is_banned = user.roles.as_ref().map_or(false, |r| r.is_banned) || user.ban_status.is_some();
-    let ban_reason = user.ban_status.and_then(|b| b.reason);
-
-    let profile = UserProfile {
-        id: user.id,
-        login: user.login,
-        display_name: user.display_name,
-        description: user.description,
-        created_at: user.created_at,
-        avatar_url: avatar_url.clone(),
-        followers: user.followers,
-        is_partner: user.roles.as_ref().map_or(false, |r| r.is_partner),
-        is_affiliate: user.roles.as_ref().map_or(false, |r| r.is_affiliate),
-        chat_color: user.chat_color,
-        is_live,
-        stream_title,
-        stream_game,
-        stream_viewers,
-        last_broadcast_at,
-        is_banned,
-        ban_reason,
-    };
-
-    // Pre-fetch avatar bytes so egui can display them right away.
-    if let Some(ref logo) = avatar_url {
-        if let Ok((w, h, raw)) = fetch_and_decode_raw(logo).await {
-            let _ = evt_tx
-                .send(AppEvent::EmoteImageReady {
-                    uri: logo.clone(),
-                    width: w,
-                    height: h,
-                    raw_bytes: raw,
-                })
-                .await;
-        }
-    }
-
-    let _ = evt_tx.send(AppEvent::UserProfileLoaded { profile }).await;
-}
-
-/// Fetch external chat logs from the IVR logs API (logs.ivr.fi).
-/// Fetches the current month's logs in reverse chronological order.
-async fn fetch_ivr_logs(channel: &str, username: &str, evt_tx: mpsc::Sender<AppEvent>) {
-    use crust_core::events::IvrLogEntry;
-
-    #[derive(serde::Deserialize)]
-    struct IvrLogMessage {
-        #[serde(default)]
-        text: String,
-        #[serde(default)]
-        timestamp: String,
-        #[serde(rename = "displayName", default)]
-        display_name: String,
-        /// 1 = chat message, 2 = timeout/ban
-        #[serde(rename = "type", default)]
-        msg_type: u8,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct IvrLogResponse {
-        #[serde(default)]
-        messages: Vec<IvrLogMessage>,
-    }
-
-    // Fetch current month's logs
-    let now = chrono::Utc::now();
-    let year = now.format("%Y");
-    let month = now.format("%-m");
-
-    let url = format!(
-        "https://logs.ivr.fi/channel/{channel}/user/{username}/{year}/{month}?json=true&reverse=true"
-    );
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-
-    let resp = match client
-        .get(&url)
-        .header("User-Agent", "crust-chat/1.0")
-        .header("Accept", "application/json")
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => r,
-        Ok(r) => {
-            let status = r.status();
-            let body = r.text().await.unwrap_or_default();
-            let msg = if status.as_u16() == 404 {
-                "No logs found for this user/channel combination.".to_owned()
-            } else {
-                format!("IVR logs returned HTTP {status}: {body}")
-            };
-            warn!("{msg}");
-            let _ = evt_tx
-                .send(AppEvent::IvrLogsFailed {
-                    username: username.to_owned(),
-                    error: msg,
-                })
-                .await;
-            return;
-        }
-        Err(e) => {
-            warn!("IVR logs fetch failed for {username} in {channel}: {e}");
-            let _ = evt_tx
-                .send(AppEvent::IvrLogsFailed {
-                    username: username.to_owned(),
-                    error: format!("Network error: {e}"),
-                })
-                .await;
-            return;
-        }
-    };
-
-    // Read the full response as text first, then parse JSON.
-    // This avoids potential hangs from reqwest's streaming JSON parser
-    // and gives us better debug info if something goes wrong.
-    let body = match resp.text().await {
-        Ok(b) => b,
-        Err(e) => {
-            warn!("IVR logs: failed to read response body for {username}: {e}");
-            let _ = evt_tx
-                .send(AppEvent::IvrLogsFailed {
-                    username: username.to_owned(),
-                    error: format!("Failed to read response: {e}"),
-                })
-                .await;
-            return;
-        }
-    };
-
-    let parsed: IvrLogResponse = match serde_json::from_str(&body) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(
-                "IVR logs parse failed for {username}: {e} (body len={})",
-                body.len()
-            );
-            let _ = evt_tx
-                .send(AppEvent::IvrLogsFailed {
-                    username: username.to_owned(),
-                    error: format!("Failed to parse response: {e}"),
-                })
-                .await;
-            return;
-        }
-    };
-
-    let entries: Vec<IvrLogEntry> = parsed
-        .messages
-        .into_iter()
-        .map(|m| IvrLogEntry {
-            text: m.text,
-            timestamp: m.timestamp,
-            display_name: m.display_name,
-            msg_type: m.msg_type,
-        })
-        .collect();
-
-    info!(
-        "IVR logs: loaded {} entries for {username} in {channel}",
-        entries.len()
-    );
-    let _ = evt_tx
-        .send(AppEvent::IvrLogsLoaded {
-            username: username.to_owned(),
-            messages: entries,
-        })
-        .await;
-}
-
-/// Fetch a Kick user profile via Kick's public channel API.
-async fn fetch_kick_user_profile(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
-    #[derive(serde::Deserialize)]
-    struct KickCategory {
-        #[serde(
-            default,
-            alias = "display_name",
-            alias = "displayName",
-            alias = "slug",
-            alias = "name"
-        )]
-        name: Option<String>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct KickLivestream {
-        #[serde(default, alias = "title", alias = "sessionTitle")]
-        session_title: Option<String>,
-        #[serde(default, alias = "isLive")]
-        is_live: Option<bool>,
-        #[serde(default, alias = "viewer_count", alias = "viewersCount")]
-        viewers_count: Option<u64>,
-        #[serde(default, alias = "startedAt")]
-        started_at: Option<String>,
-        #[serde(default)]
-        category: Option<KickCategory>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct KickUser {
-        #[serde(default)]
-        id: Option<u64>,
-        #[serde(default)]
-        username: Option<String>,
-        #[serde(default)]
-        slug: Option<String>,
-        #[serde(default, alias = "bio", alias = "description")]
-        description: Option<String>,
-        #[serde(
-            default,
-            alias = "profilePicture",
-            alias = "profile_pic",
-            alias = "profilePic",
-            alias = "avatar",
-            alias = "avatar_url"
-        )]
-        avatar_url: Option<String>,
-        #[serde(default, alias = "createdAt")]
-        created_at: Option<String>,
-        #[serde(
-            default,
-            alias = "followersCount",
-            alias = "follower_count",
-            alias = "followers_count"
-        )]
-        followers_count: Option<u64>,
-        #[serde(default, alias = "isVerified", alias = "verified")]
-        is_verified: Option<bool>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct KickChannel {
-        #[serde(default)]
-        id: Option<u64>,
-        #[serde(default)]
-        slug: Option<String>,
-        #[serde(default)]
-        user: Option<KickUser>,
-        #[serde(default)]
-        livestream: Option<KickLivestream>,
-        #[serde(default, alias = "description", alias = "bio")]
-        description: Option<String>,
-        #[serde(
-            default,
-            alias = "followersCount",
-            alias = "follower_count",
-            alias = "followers_count"
-        )]
-        followers_count: Option<u64>,
-    }
-
-    fn minimal_kick_profile(login: &str) -> UserProfile {
-        UserProfile {
-            id: String::new(),
-            login: login.to_owned(),
-            display_name: login.to_owned(),
-            description: String::new(),
-            created_at: None,
-            avatar_url: None,
-            followers: None,
-            is_partner: false,
-            is_affiliate: false,
-            chat_color: None,
-            is_live: false,
-            stream_title: None,
-            stream_game: None,
-            stream_viewers: None,
-            last_broadcast_at: None,
-            is_banned: false,
-            ban_reason: None,
-        }
-    }
-
-    fn normalize_kick_url(url: &str) -> String {
-        if url.starts_with("//") {
-            format!("https:{url}")
-        } else if url.starts_with('/') {
-            format!("https://kick.com{url}")
-        } else {
-            url.to_owned()
-        }
-    }
-
-    let slug = login
-        .trim()
-        .trim_start_matches('#')
-        .trim_start_matches("kick:")
-        .to_lowercase();
-    let url = format!("https://kick.com/api/v2/channels/{slug}");
-    let client = reqwest::Client::new();
-    let resp = match client
-        .get(&url)
-        .header(
-            reqwest::header::USER_AGENT,
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        )
-        .header(reqwest::header::ACCEPT, "application/json")
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => r,
-        Ok(r) => {
-            warn!("Kick user fetch returned HTTP {} for {slug}", r.status());
-            let profile = minimal_kick_profile(&slug);
-            let _ = evt_tx.send(AppEvent::UserProfileLoaded { profile }).await;
-            return;
-        }
-        Err(e) => {
-            warn!("Kick user fetch failed for {slug}: {e}");
-            let profile = minimal_kick_profile(&slug);
-            let _ = evt_tx.send(AppEvent::UserProfileLoaded { profile }).await;
-            return;
-        }
-    };
-
-    let channel: KickChannel = match resp.json().await {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("Kick user response parse failed for {slug}: {e}");
-            let profile = minimal_kick_profile(&slug);
-            let _ = evt_tx.send(AppEvent::UserProfileLoaded { profile }).await;
-            return;
-        }
-    };
-
-    let user = channel.user;
-    let resolved_login = user
-        .as_ref()
-        .and_then(|u| u.slug.clone().or_else(|| u.username.clone()))
-        .or_else(|| channel.slug.clone())
-        .unwrap_or_else(|| slug.clone());
-    let display_name = user
-        .as_ref()
-        .and_then(|u| u.username.clone())
-        .unwrap_or_else(|| resolved_login.clone());
-    let avatar_url = user
-        .as_ref()
-        .and_then(|u| u.avatar_url.as_deref())
-        .map(normalize_kick_url);
-    let followers = user
-        .as_ref()
-        .and_then(|u| u.followers_count)
-        .or(channel.followers_count);
-    let description = user
-        .as_ref()
-        .and_then(|u| u.description.clone())
-        .or(channel.description)
-        .unwrap_or_default();
-    let created_at = user.as_ref().and_then(|u| u.created_at.clone());
-
-    let is_live = channel
-        .livestream
-        .as_ref()
-        .map(|s| s.is_live.unwrap_or(true))
-        .unwrap_or(false);
-    let stream_title = channel
-        .livestream
-        .as_ref()
-        .and_then(|s| s.session_title.clone())
-        .filter(|s| !s.is_empty());
-    let stream_game = channel
-        .livestream
-        .as_ref()
-        .and_then(|s| s.category.as_ref())
-        .and_then(|c| c.name.clone())
-        .filter(|s| !s.is_empty());
-    let stream_viewers = channel.livestream.as_ref().and_then(|s| s.viewers_count);
-    let last_broadcast_at = channel
-        .livestream
-        .as_ref()
-        .and_then(|s| s.started_at.clone());
-
-    let profile = UserProfile {
-        id: user
-            .as_ref()
-            .and_then(|u| u.id)
-            .or(channel.id)
-            .map(|v| v.to_string())
-            .unwrap_or_default(),
-        login: resolved_login,
-        display_name,
-        description,
-        created_at,
-        avatar_url: avatar_url.clone(),
-        followers,
-        is_partner: user.as_ref().and_then(|u| u.is_verified).unwrap_or(false),
-        is_affiliate: false,
-        chat_color: None,
-        is_live,
-        stream_title,
-        stream_game,
-        stream_viewers,
-        last_broadcast_at,
-        is_banned: false,
-        ban_reason: None,
-    };
-
-    if let Some(ref logo) = avatar_url {
-        if let Ok((w, h, raw)) = fetch_and_decode_raw(logo).await {
-            let _ = evt_tx
-                .send(AppEvent::EmoteImageReady {
-                    uri: logo.clone(),
-                    width: w,
-                    height: h,
-                    raw_bytes: raw,
-                })
-                .await;
-        }
-    }
-
-    let _ = evt_tx.send(AppEvent::UserProfileLoaded { profile }).await;
-}
-
-/// Fetch the logged-in user's avatar URL and image bytes for the top-bar pill.
-async fn fetch_self_avatar(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
-    if login.is_empty() {
-        return;
-    }
-
-    #[derive(serde::Deserialize)]
-    struct IvrUserMin {
-        logo: Option<String>,
-    }
-
-    let url = format!("https://api.ivr.fi/v2/twitch/user?login={login}");
-    let client = reqwest::Client::new();
-    let resp = match client.get(&url).send().await {
-        Ok(r) if r.status().is_success() => r,
-        _ => return,
-    };
-    let users: Vec<IvrUserMin> = match resp.json().await {
-        Ok(u) => u,
-        Err(_) => return,
-    };
-    let Some(user) = users.into_iter().next() else {
-        return;
-    };
-    let Some(avatar_url) = user.logo else { return };
-
-    // Pre-fetch image bytes
-    if let Ok((w, h, raw)) = fetch_and_decode_raw(&avatar_url).await {
-        let _ = evt_tx
-            .send(AppEvent::EmoteImageReady {
-                uri: avatar_url.clone(),
-                width: w,
-                height: h,
-                raw_bytes: raw,
-            })
-            .await;
-    }
-
-    let _ = evt_tx.send(AppEvent::SelfAvatarLoaded { avatar_url }).await;
-}
-
-// System-message helpers
-
-/// Extract echo info from an IRC `/msg` or `/privmsg` command that targets a
-/// channel (e.g. `/msg ##chat hello`).  Returns `(target_channel_id, body_text)`
-/// so the caller can emit a local echo.  Returns `None` for non-channel targets
-/// (e.g. NickServ) and non-msg commands.
-fn extract_irc_msg_echo(text: &str, source_channel: &ChannelId) -> Option<(ChannelId, String)> {
-    let trimmed = text.trim();
-    if !trimmed.starts_with('/') {
-        return None;
-    }
-    let cmd_line = trimmed.trim_start_matches('/').trim_start();
-    let (cmd, rest) = cmd_line
-        .split_once(char::is_whitespace)
-        .map(|(c, r)| (c, r.trim_start()))
-        .unwrap_or((cmd_line, ""));
-    if !matches!(cmd.to_ascii_lowercase().as_str(), "msg" | "privmsg") {
-        return None;
-    }
-    let mut parts = rest.splitn(2, char::is_whitespace);
-    let target = parts.next()?.trim();
-    let body = parts.next()?.trim_start();
-    // Strip optional leading ':' (IRC protocol format).
-    let body = body.strip_prefix(':').unwrap_or(body);
-    // Only echo for channel targets (starting with #).
-    if !target.starts_with('#') || body.is_empty() {
-        return None;
-    }
-    let irc_target = source_channel.irc_target()?;
-    // No gvbhrmalize: strip first '#' for internal ChannelId form (##chat → #chat).
-    let ch_name = target
-        .strip_prefix('#')
-        .unwrap_or(target)
-        .to_ascii_lowercase();
-    let echo_ch = ChannelId::irc(&irc_target.host, irc_target.port, irc_target.tls, &ch_name);
-    Some((echo_ch, body.to_owned()))
-}
-
-/// Construct a system (non-chat) ChatMessage for inline display in a channel.
-fn make_system_message(
-    id: u64,
-    channel: ChannelId,
-    text: String,
-    timestamp: chrono::DateTime<Utc>,
-    kind: MsgKind,
-) -> ChatMessage {
-    use smallvec::smallvec;
-    let spans = smallvec![crust_core::model::Span::Text {
-        text: text.clone(),
-        is_action: false
-    }];
-    ChatMessage {
-        id: MessageId(id),
-        server_id: None,
-        timestamp,
-        channel,
-        sender: Sender {
-            user_id: UserId(String::new()),
-            login: String::new(),
-            display_name: String::new(),
-            color: None,
-            name_paint: None,
-            badges: Vec::new(),
-        },
-        raw_text: text,
-        spans,
-        twitch_emotes: Vec::new(),
-        flags: MessageFlags {
-            is_action: false,
-            is_highlighted: false,
-            is_deleted: false,
-            is_first_msg: false,
-            is_pinned: false,
-            is_self: false,
-            is_mention: false,
-            custom_reward_id: None,
-            is_history: false,
-        },
-        reply: None,
-        msg_kind: kind,
-    }
-}
-
 #[derive(Debug, Clone)]
 struct TwitchPinnedSnapshot {
     pinned_id: String,
@@ -4706,44 +4106,6 @@ async fn fetch_current_twitch_pinned_message(channel: ChannelId, evt_tx: mpsc::S
         .await;
 }
 
-/// Format a timeout notice for display in chat.
-fn format_timeout_text(login: &str, seconds: u32) -> String {
-    if seconds < 60 {
-        format!("{login} was timed out for {seconds}s.")
-    } else if seconds < 3600 {
-        format!("{login} was timed out for {}m.", seconds / 60)
-    } else {
-        format!(
-            "{login} was timed out for {}h {}m.",
-            seconds / 3600,
-            (seconds % 3600) / 60
-        )
-    }
-}
-
-/// Best-effort detection for Twitch pinned-card notices delivered as system text.
-/// Twitch can surface current pinned cards as notice text instead of PRIVMSG tags.
-fn is_twitch_pinned_notice(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    if lower.contains("unpinned") {
-        return false;
-    }
-
-    lower.contains("pinned by ")
-        || lower.contains("pinned a message")
-        || (lower.contains("pinned") && lower.contains(" sent at "))
-}
-
-/// Build a human-readable sub alert text.
-fn build_sub_text(display_name: &str, months: u32, plan: &str, is_gift: bool) -> String {
-    if is_gift {
-        format!("{display_name} received a gifted {plan} subscription! ({months} months total)")
-    } else if months <= 1 {
-        format!("{display_name} subscribed with {plan}!")
-    } else {
-        format!("{display_name} resubscribed with {plan}! ({months} months)")
-    }
-}
 /// Open a URL in the system's default browser.
 /// Uses `xdg-open` on Linux, `open` on macOS, `cmd /c start` on Windows.
 fn open_url_in_browser(url: &str) {
@@ -4763,294 +4125,10 @@ fn open_url_in_browser(url: &str) {
     }
 }
 
-// Link preview fetch
-
-async fn fetch_link_preview(
-    url: &str,
-    cache: &Option<EmoteCache>,
-    evt_tx: &mpsc::Sender<AppEvent>,
-) {
-    let send_empty = |url: &str| AppEvent::LinkPreviewReady {
-        url: url.to_owned(),
-        title: None,
-        description: None,
-        thumbnail_url: None,
-        site_name: None,
-    };
-
-    // Use a realistic Chrome User-Agent so sites like Twitter / YouTube
-    // don't serve empty bot pages or block us entirely.
-    let client = match reqwest::Client::builder()
-        .user_agent(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
-             AppleWebKit/537.36 (KHTML, like Gecko) \
-             Chrome/131.0.0.0 Safari/537.36",
-        )
-        .timeout(std::time::Duration::from_secs(8))
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => {
-            let _ = evt_tx.send(send_empty(url)).await;
-            return;
-        }
-    };
-
-    // ── YouTube oEmbed shortcut ─────────────────────────────────────
-    // YouTube serves proper OG tags but the oEmbed JSON API is faster,
-    // more reliable, and doesn't require HTML parsing.
-    if is_youtube_url(url) {
-        if let Some(ev) = fetch_youtube_oembed(url, &client, cache, evt_tx).await {
-            let _ = evt_tx.send(ev).await;
-            return;
-        }
-        // Fall through to generic OG-tag path on failure.
-    }
-
-    // ── Twitter / X.com rewrite ─────────────────────────────────────
-    // twitter.com and x.com serve JavaScript-rendered pages that bots
-    // cannot parse.  fxtwitter.com is a public proxy that serves proper
-    // OG meta tags for tweet URLs.
-    let fetch_url = rewrite_twitter_url(url).unwrap_or_else(|| url.to_owned());
-
-    let resp = match client.get(&fetch_url).send().await {
-        Ok(r) if r.status().is_success() => r,
-        _ => {
-            let _ = evt_tx.send(send_empty(url)).await;
-            return;
-        }
-    };
-
-    // Only parse HTML
-    let ct = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_lowercase();
-    if !ct.contains("html") {
-        let _ = evt_tx.send(send_empty(url)).await;
-        return;
-    }
-
-    let bytes = match resp.bytes().await {
-        Ok(b) => b,
-        Err(_) => {
-            let _ = evt_tx.send(send_empty(url)).await;
-            return;
-        }
-    };
-    // Only read the first 64 KB to avoid processing megabyte HTML files.
-    let html = String::from_utf8_lossy(&bytes[..bytes.len().min(65_536)]);
-
-    let title = og_meta(&html, "og:title")
-        .or_else(|| og_meta(&html, "twitter:title"))
-        .or_else(|| html_title(&html));
-    let description =
-        og_meta(&html, "og:description").or_else(|| og_meta(&html, "twitter:description"));
-    let thumbnail_url = og_meta(&html, "og:image").or_else(|| og_meta(&html, "twitter:image"));
-    let site_name = og_meta(&html, "og:site_name").or_else(|| detect_site_name(url));
-
-    // Kick off thumbnail image fetch so bytes land in emote_bytes.
-    if let Some(ref img) = thumbnail_url {
-        fetch_emote_image(img, cache, evt_tx).await;
-    }
-
-    let _ = evt_tx
-        .send(AppEvent::LinkPreviewReady {
-            url: url.to_owned(),
-            title,
-            description,
-            thumbnail_url,
-            site_name,
-        })
-        .await;
-}
-
-/// Check if a URL is a YouTube / youtu.be link.
-fn is_youtube_url(url: &str) -> bool {
-    let lower = url.to_lowercase();
-    lower.contains("youtube.com/") || lower.contains("youtu.be/")
-}
-
-/// Fetch YouTube video metadata via the public oEmbed JSON endpoint.
-/// Returns `Some(AppEvent)` on success, `None` on failure.
-async fn fetch_youtube_oembed(
-    original_url: &str,
-    client: &reqwest::Client,
-    cache: &Option<EmoteCache>,
-    evt_tx: &mpsc::Sender<AppEvent>,
-) -> Option<AppEvent> {
-    let oembed_url = format!(
-        "https://www.youtube.com/oembed?url={}&format=json",
-        url_percent_encode(original_url)
-    );
-    let resp = client.get(&oembed_url).send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let json: serde_json::Value = resp.json().await.ok()?;
-    let title = json["title"].as_str().map(|s| s.to_owned());
-    let author = json["author_name"].as_str().map(|s| s.to_owned());
-    let thumbnail_url = json["thumbnail_url"].as_str().map(|s| s.to_owned());
-
-    // Fetch the thumbnail image bytes.
-    if let Some(ref img) = thumbnail_url {
-        fetch_emote_image(img, cache, evt_tx).await;
-    }
-
-    Some(AppEvent::LinkPreviewReady {
-        url: original_url.to_owned(),
-        title,
-        description: author.map(|a| format!("by {a}")),
-        thumbnail_url,
-        site_name: Some("YouTube".to_owned()),
-    })
-}
-
-/// Rewrite twitter.com / x.com URLs to fxtwitter.com so we get proper OG
-/// meta tags instead of a JS-rendered blank page.
-fn rewrite_twitter_url(url: &str) -> Option<String> {
-    let lower = url.to_lowercase();
-    // Match URLs like https://twitter.com/user/status/... or https://x.com/user/status/...
-    if lower.contains("twitter.com/") || lower.contains("x.com/") {
-        // Only rewrite status/tweet URLs, not profile pages.
-        if lower.contains("/status/") {
-            let rewritten = url
-                .replace("twitter.com", "fxtwitter.com")
-                .replace("x.com", "fxtwitter.com");
-            return Some(rewritten);
-        }
-    }
-    None
-}
-
-/// Heuristic site-name detection from the URL hostname when og:site_name
-/// is missing from the HTML.
-fn detect_site_name(url: &str) -> Option<String> {
-    let lower = url.to_lowercase();
-    if lower.contains("youtube.com/") || lower.contains("youtu.be/") {
-        Some("YouTube".to_owned())
-    } else if lower.contains("twitter.com/")
-        || lower.contains("x.com/")
-        || lower.contains("fxtwitter.com/")
-    {
-        Some("Twitter".to_owned())
-    } else if lower.contains("twitch.tv/") {
-        Some("Twitch".to_owned())
-    } else if lower.contains("reddit.com/") {
-        Some("Reddit".to_owned())
-    } else if lower.contains("instagram.com/") {
-        Some("Instagram".to_owned())
-    } else if lower.contains("tiktok.com/") {
-        Some("TikTok".to_owned())
-    } else if lower.contains("github.com/") {
-        Some("GitHub".to_owned())
-    } else if lower.contains("wikipedia.org/") {
-        Some("Wikipedia".to_owned())
-    } else if lower.contains("steamcommunity.com/") || lower.contains("store.steampowered.com/") {
-        Some("Steam".to_owned())
-    } else if lower.contains("clips.twitch.tv/") {
-        Some("Twitch Clip".to_owned())
-    } else {
-        None
-    }
-}
-
-/// Extract the content of a `<meta property="{prop}" ...>` or `<meta name="{prop}" ...>` tag.
-fn og_meta(html: &str, prop: &str) -> Option<String> {
-    let prop_lower = prop.to_lowercase();
-    let mut offset = 0;
-    while let Some(rel) = html[offset..].to_lowercase().find("<meta") {
-        let abs = offset + rel;
-        let rest = &html[abs..];
-        // Find end of this tag
-        let tag_end = rest.find('>').unwrap_or(rest.len()).min(512);
-        let tag = &rest[..tag_end];
-        let tag_lower = tag.to_lowercase();
-
-        let has_prop = tag_lower.contains(&format!("property=\"{prop_lower}\""))
-            || tag_lower.contains(&format!("property='{prop_lower}'"))
-            || tag_lower.contains(&format!("name=\"{prop_lower}\""))
-            || tag_lower.contains(&format!("name='{prop_lower}'"));
-
-        if has_prop {
-            if let Some(val) = html_attr(tag, "content") {
-                return Some(html_entities(val));
-            }
-        }
-        offset = abs + 5;
-    }
-    None
-}
-
-/// Extract an attribute value from an HTML tag snippet.
-fn html_attr<'a>(tag: &'a str, attr: &str) -> Option<&'a str> {
-    let tag_lower = tag.to_lowercase();
-    let needle = format!("{}=", attr.to_lowercase());
-    let pos = tag_lower.find(&needle)?;
-    let after = &tag[pos + needle.len()..];
-    if after.starts_with('"') {
-        let end = after[1..].find('"')?;
-        Some(&after[1..1 + end])
-    } else if after.starts_with('\'') {
-        let end = after[1..].find('\'')?;
-        Some(&after[1..1 + end])
-    } else {
-        None
-    }
-}
-
-/// Extract `<title>` text as a fallback.
-fn html_title(html: &str) -> Option<String> {
-    let lower = html.to_lowercase();
-    let s = lower.find("<title")? + 6;
-    let tag_end = lower[s..].find('>')?;
-    let body_start = s + tag_end + 1;
-    let body_end = lower[body_start..].find("</title>")?;
-    let text = html[body_start..body_start + body_end].trim().to_owned();
-    if text.is_empty() {
-        None
-    } else {
-        Some(html_entities(&text))
-    }
-}
-
-/// Decode common HTML entities.
-fn html_entities(s: &str) -> String {
-    s.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&apos;", "'")
-        .replace("&nbsp;", " ")
-}
-
-/// Minimal percent-encoding for query-string values (no external crate needed).
-fn url_percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 2);
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char);
-            }
-            _ => {
-                out.push('%');
-                out.push(char::from(HEX_CHARS[(b >> 4) as usize]));
-                out.push(char::from(HEX_CHARS[(b & 0xf) as usize]));
-            }
-        }
-    }
-    out
-}
-
-const HEX_CHARS: [u8; 16] = *b"0123456789ABCDEF";
-
 #[cfg(test)]
 mod tests {
-    use super::{is_twitch_pinned_notice, parse_twitch_pinned_snapshot_json};
+    use super::{parse_twitch_pinned_snapshot_json, APP_INITIAL_INNER_SIZE, APP_MIN_INNER_SIZE};
+    use crate::runtime::system_messages::is_twitch_pinned_notice;
 
     #[test]
     fn twitch_pinned_notice_detects_multi_line_pin_card_text() {
@@ -5123,5 +4201,12 @@ mod tests {
         }"#;
 
         assert!(parse_twitch_pinned_snapshot_json(json).is_none());
+    }
+
+    #[test]
+    fn app_min_inner_size_allows_thinner_windows() {
+        assert!(APP_MIN_INNER_SIZE[0] < 300.0);
+        assert_eq!(APP_MIN_INNER_SIZE[1], 200.0);
+        assert!(APP_INITIAL_INNER_SIZE[0] > APP_MIN_INNER_SIZE[0]);
     }
 }

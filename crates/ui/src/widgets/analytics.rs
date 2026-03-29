@@ -9,6 +9,8 @@ use crust_core::model::{ChannelState, MsgKind, Span};
 
 use crate::theme as t;
 
+use super::chrome;
+
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const ACTIVITY_BUCKETS: usize = 30;
 
@@ -326,12 +328,7 @@ impl AnalyticsPanel {
 
         // Header
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("Analytics")
-                    .font(t::body())
-                    .color(t::text_primary())
-                    .strong(),
-            );
+            chrome::dialog_header(ui, "Analytics", Some("Recent message, chatter, and activity stats."));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 let save_btn = ui
