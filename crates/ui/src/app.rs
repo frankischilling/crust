@@ -1327,11 +1327,14 @@ impl CrustApp {
                         msg.sender.name_paint = None;
 
                         if let Some(ref b) = badge {
-                            let exists = msg.sender.badges.iter().any(|x| {
-                                x.url.as_deref() == b.url.as_deref()
-                                    || x.name.eq_ignore_ascii_case("7tv")
-                            });
-                            if !exists {
+                            if let Some(existing) = msg
+                                .sender
+                                .badges
+                                .iter_mut()
+                                .find(|x| x.name.eq_ignore_ascii_case("7tv"))
+                            {
+                                *existing = b.clone();
+                            } else {
                                 msg.sender.badges.insert(0, b.clone());
                             }
                         }

@@ -98,10 +98,13 @@ pub(crate) fn apply_7tv_cosmetics_to_sender(sender: &mut Sender, style: &SevenTv
     sender.name_paint = None;
 
     if let Some(ref badge) = style.badge {
-        let already_has = sender.badges.iter().any(|b| {
-            b.url.as_deref() == badge.url.as_deref() || b.name.eq_ignore_ascii_case("7tv")
-        });
-        if !already_has {
+        if let Some(existing) = sender
+            .badges
+            .iter_mut()
+            .find(|b| b.name.eq_ignore_ascii_case("7tv"))
+        {
+            *existing = badge.clone();
+        } else {
             sender.badges.insert(0, badge.clone());
         }
     }
@@ -340,6 +343,29 @@ pub(crate) async fn load_7tv_user_style_for_twitch(
         badge_id: Option<String>,
     }
 
+    #[derive(serde::Deserialize)]
+    struct StyleNodeV2 {
+        color: i32,
+        badge: Option<BadgeIdNode>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct BadgeIdNode {
+        id: Option<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RespDataV2 {
+        #[serde(rename = "userByConnection")]
+        user_by_connection: Option<UserNodeV2>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct UserNodeV2 {
+        style: Option<StyleNodeV2>,
+        avatar_url: Option<String>,
+    }
+
     if twitch_user_id.trim().is_empty() {
         return None;
     }
@@ -410,7 +436,7 @@ pub(crate) async fn load_7tv_user_style_for_twitch(
         badge_id: None,
     });
 
-    Some(SevenTvUserStyleRaw {
+    let mut out = SevenTvUserStyleRaw {
         color: if style.color == 0 {
             None
         } else {
@@ -418,7 +444,62 @@ pub(crate) async fn load_7tv_user_style_for_twitch(
         },
         badge_id: style.badge_id.filter(|s| !s.is_empty()),
         avatar_url,
-    })
+    };
+
+    // Some 7TV schemas expose badge id under style.badge.id instead of
+    // style.badge_id. When missing, try a compatible fallback query.
+    if out.badge_id.is_none() {
+        let query_v2 = r#"
+            query($id: String!) {
+                userByConnection(platform: TWITCH, id: $id) {
+                    avatar_url
+                    style {
+                        color
+                        badge {
+                            id
+                        }
+                    }
+                }
+            }
+        "#;
+
+        if let Ok(resp2) = client
+            .post(SEVENTV_GQL_URL)
+            .json(&serde_json::json!({
+                "query": query_v2,
+                "variables": { "id": twitch_user_id }
+            }))
+            .send()
+            .await
+        {
+            if let Ok(payload2) = resp2.json::<SevenTvGraphQlResponse<RespDataV2>>().await {
+                if let Some(user2) = payload2.data.and_then(|d| d.user_by_connection) {
+                    if out.avatar_url.is_none() {
+                        out.avatar_url = user2.avatar_url.filter(|s| !s.is_empty()).map(|u| {
+                            if u.starts_with("//") {
+                                format!("https:{u}")
+                            } else {
+                                u
+                            }
+                        });
+                    }
+                    if out.color.is_none() {
+                        out.color = user2
+                            .style
+                            .as_ref()
+                            .and_then(|s| if s.color == 0 { None } else { Some(s.color) });
+                    }
+                    out.badge_id = user2
+                        .style
+                        .and_then(|s| s.badge)
+                        .and_then(|b| b.id)
+                        .filter(|s| !s.is_empty());
+                }
+            }
+        }
+    }
+
+    Some(out)
 }
 
 fn seven_tv_color_to_rgba(color: i32) -> (u8, u8, u8, u8) {
