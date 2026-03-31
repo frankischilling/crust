@@ -85,6 +85,16 @@ pub enum AppCommand {
         login: String,
         user_id: String,
     },
+    /// Update a channel-points redemption status via Twitch Helix.
+    /// `status` should be `FULFILLED` or `CANCELED`.
+    UpdateRewardRedemptionStatus {
+        channel: ChannelId,
+        reward_id: String,
+        redemption_id: String,
+        status: String,
+        user_login: String,
+        reward_title: String,
+    },
     /// Clears all messages in the channel display (visual-only, not sent to Twitch).
     ClearLocalMessages { channel: ChannelId },
     /// Opens a URL in the system default browser.
@@ -167,6 +177,69 @@ pub enum AppCommand {
     },
     /// Fetch external chat logs for a user from the IVR logs API.
     FetchIvrLogs { channel: String, username: String },
+    /// Load older locally persisted chat history (SQLite) before the oldest
+    /// currently loaded message timestamp.
+    LoadOlderLocalHistory {
+        channel: ChannelId,
+        /// Exclusive upper timestamp bound (Unix ms).
+        before_ts_ms: i64,
+        /// Maximum number of rows to load.
+        limit: usize,
+    },
+    /// Create a Twitch poll via Helix (`POST /helix/polls`).
+    CreatePoll {
+        channel: ChannelId,
+        title: String,
+        choices: Vec<String>,
+        duration_secs: u32,
+    },
+    /// End or cancel the active Twitch poll via Helix (`PATCH /helix/polls`).
+    /// `status` should be `ARCHIVED` (normal end) or `TERMINATED` (cancel).
+    EndPoll {
+        channel: ChannelId,
+        status: String,
+    },
+    /// Create a Twitch prediction via Helix (`POST /helix/predictions`).
+    CreatePrediction {
+        channel: ChannelId,
+        title: String,
+        outcomes: Vec<String>,
+        duration_secs: u32,
+    },
+    /// Lock the active Twitch prediction via Helix (`PATCH /helix/predictions`, status=LOCKED).
+    LockPrediction {
+        channel: ChannelId,
+    },
+    /// Resolve the active Twitch prediction with a 1-based outcome index.
+    ResolvePrediction {
+        channel: ChannelId,
+        winning_outcome_index: usize,
+    },
+    /// Cancel the active Twitch prediction via Helix (`PATCH /helix/predictions`, status=CANCELED).
+    CancelPrediction {
+        channel: ChannelId,
+    },
+    /// Start a Twitch commercial via Helix (`POST /helix/channels/commercial`).
+    StartCommercial {
+        channel: ChannelId,
+        length_secs: u32,
+    },
+    /// Create a Twitch stream marker via Helix (`POST /helix/streams/markers`).
+    CreateStreamMarker {
+        channel: ChannelId,
+        description: Option<String>,
+    },
+    /// Send a Twitch channel announcement via Helix (`POST /helix/chat/announcements`).
+    SendAnnouncement {
+        channel: ChannelId,
+        message: String,
+        color: Option<String>,
+    },
+    /// Send a Twitch shoutout via Helix (`POST /helix/chat/shoutouts`).
+    SendShoutout {
+        channel: ChannelId,
+        target_login: String,
+    },
 }
 
 // Events (runtime to UI): notifications sent from runtime to UI

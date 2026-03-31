@@ -72,6 +72,16 @@ pub enum MsgKind {
     ChatCleared,
     /// Generic informational notice (NOTICE, JOIN/PART system message, etc.).
     SystemInfo,
+    /// Channel points redemption notification (EventSub).
+    ChannelPointsReward {
+        user_login: String,
+        reward_title: String,
+        cost: u32,
+        reward_id: Option<String>,
+        redemption_id: Option<String>,
+        user_input: Option<String>,
+        status: Option<String>,
+    },
     /// Message containing a bits cheermote donation.
     Bits { amount: u32 },
 }

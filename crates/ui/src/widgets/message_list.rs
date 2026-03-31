@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use egui::{Color32, Id, Label, LayerId, Order, RichText, ScrollArea, Ui, Vec2};
 use image::DynamicImage;
+use regex::{Regex, RegexBuilder};
 use tokio::sync::mpsc;
 
 use crust_core::{
@@ -268,6 +269,147 @@ fn map_snapshot_ids_to_indices(snapshot_ids: &[u64], live_ids: &[u64]) -> Vec<us
         .collect()
 }
 
+#[derive(Clone)]
+enum HighlightMatcher {
+    Substring(String),
+    Regex(Regex),
+}
+
+#[derive(Clone)]
+pub(crate) struct HighlightRule {
+    channel_scope: Option<String>,
+    sender_scope: Option<String>,
+    mention_only: bool,
+    matcher: HighlightMatcher,
+}
+
+impl HighlightRule {
+    fn matches_scope(&self, msg: &ChatMessage, channel: &ChannelId) -> bool {
+        if let Some(channel_scope) = self.channel_scope.as_deref() {
+            let display = channel.display_name().to_ascii_lowercase();
+            let full = channel.as_str().to_ascii_lowercase();
+            if channel_scope != display.as_str() && channel_scope != full.as_str() {
+                return false;
+            }
+        }
+
+        if let Some(sender_scope) = self.sender_scope.as_deref() {
+            if !msg.sender.login.eq_ignore_ascii_case(sender_scope) {
+                return false;
+            }
+        }
+
+        if self.mention_only && !msg.flags.is_mention {
+            return false;
+        }
+
+        true
+    }
+
+    fn matches_message(&self, lowered_text: &str, raw_text: &str) -> bool {
+        match &self.matcher {
+            HighlightMatcher::Substring(term) => lowered_text.contains(term),
+            HighlightMatcher::Regex(re) => re.is_match(raw_text),
+        }
+    }
+}
+
+pub(crate) fn compile_highlight_rules(lines: &[String]) -> Vec<HighlightRule> {
+    lines
+        .iter()
+        .filter_map(|line| parse_highlight_rule(line))
+        .collect()
+}
+
+fn parse_highlight_rule(line: &str) -> Option<HighlightRule> {
+    let raw = line.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    let mut rest = raw;
+    let mut channel_scope: Option<String> = None;
+    let mut sender_scope: Option<String> = None;
+    let mut mention_only = false;
+
+    loop {
+        if let Some(after) = rest.strip_prefix("channel=") {
+            let (scope, next) = split_first_token(after);
+            if scope.is_empty() {
+                return None;
+            }
+            channel_scope = Some(scope.to_ascii_lowercase());
+            rest = next;
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("from=") {
+            let (scope, next) = split_first_token(after);
+            if scope.is_empty() {
+                return None;
+            }
+            sender_scope = Some(scope.to_ascii_lowercase());
+            rest = next;
+            continue;
+        }
+        if let Some(next) = rest.strip_prefix("mention ") {
+            mention_only = true;
+            rest = next.trim_start();
+            continue;
+        }
+        if rest == "mention" {
+            mention_only = true;
+            rest = "";
+            continue;
+        }
+        if let Some(next) = rest.strip_prefix("mentions ") {
+            mention_only = true;
+            rest = next.trim_start();
+            continue;
+        }
+        if rest == "mentions" {
+            mention_only = true;
+            rest = "";
+            continue;
+        }
+        break;
+    }
+
+    let matcher = if let Some(pattern) = rest.strip_prefix("re:") {
+        let pattern = pattern.trim();
+        if pattern.is_empty() {
+            return None;
+        }
+        let re = RegexBuilder::new(pattern)
+            .case_insensitive(true)
+            .build()
+            .ok()?;
+        HighlightMatcher::Regex(re)
+    } else {
+        let lowered = rest.trim().to_ascii_lowercase();
+        if lowered.is_empty() {
+            return None;
+        }
+        HighlightMatcher::Substring(lowered)
+    };
+
+    Some(HighlightRule {
+        channel_scope,
+        sender_scope,
+        mention_only,
+        matcher,
+    })
+}
+
+fn split_first_token(input: &str) -> (&str, &str) {
+    if let Some(idx) = input.find(char::is_whitespace) {
+        let head = &input[..idx];
+        let tail = input[idx..].trim_start();
+        (head.trim(), tail)
+    } else {
+        (input.trim(), "")
+    }
+}
+
 /// Scrollable, bottom-anchored list of chat messages with inline emote images.
 pub struct MessageList<'a> {
     messages: &'a VecDeque<ChatMessage>,
@@ -289,14 +431,16 @@ pub struct MessageList<'a> {
     animate_emotes: bool,
     /// Whether timestamps should be shown for each message.
     show_timestamps: bool,
+    /// Whether the local user can moderate in this channel.
+    can_moderate: bool,
     /// Ignored usernames (lowercase) hidden from the message list.
     ignored_logins: &'a HashSet<String>,
-    /// Lowercased highlight keywords used for local keyword highlighting.
-    highlight_terms: &'a [String],
+    /// Compiled highlight rules used for local keyword highlighting.
+    highlight_rules: &'a [HighlightRule],
 }
 
 impl<'a> MessageList<'a> {
-    pub fn new(
+    pub(crate) fn new(
         messages: &'a VecDeque<ChatMessage>,
         emote_bytes: &'a HashMap<String, (u32, u32, Arc<[u8]>)>,
         cmd_tx: &'a mpsc::Sender<AppCommand>,
@@ -307,8 +451,9 @@ impl<'a> MessageList<'a> {
         collapse_long_message_lines: usize,
         animate_emotes: bool,
         show_timestamps: bool,
+        can_moderate: bool,
         ignored_logins: &'a HashSet<String>,
-        highlight_terms: &'a [String],
+        highlight_rules: &'a [HighlightRule],
     ) -> Self {
         Self {
             messages,
@@ -321,8 +466,9 @@ impl<'a> MessageList<'a> {
             collapse_long_message_lines: collapse_long_message_lines.max(1),
             animate_emotes,
             show_timestamps,
+            can_moderate,
             ignored_logins,
-            highlight_terms,
+            highlight_rules,
         }
     }
 
@@ -1124,6 +1270,160 @@ impl<'a> MessageList<'a> {
             ui.ctx().copy_text(msg.sender.login.clone());
             ui.close_menu();
         }
+
+        if self.can_moderate && msg.channel.is_twitch() {
+            ui.separator();
+            ui.label(RichText::new("Moderation").small().color(t::text_muted()));
+
+            let target_user_id = msg.sender.user_id.0.trim();
+            let can_user_action = !target_user_id.is_empty() && !msg.sender.login.trim().is_empty();
+
+            if can_user_action {
+                for (label, seconds) in [
+                    ("⏱  Timeout 30s", 30u32),
+                    ("⏱  Timeout 5m", 5 * 60),
+                    ("⏱  Timeout 10m", 10 * 60),
+                    ("⏱  Timeout 1h", 60 * 60),
+                    ("⏱  Timeout 1d", 24 * 60 * 60),
+                ] {
+                    if ui.button(label).clicked() {
+                        let _ = self.cmd_tx.try_send(AppCommand::TimeoutUser {
+                            channel: self.channel.clone(),
+                            login: msg.sender.login.clone(),
+                            user_id: target_user_id.to_owned(),
+                            seconds,
+                            reason: None,
+                        });
+                        ui.close_menu();
+                    }
+                }
+
+                if ui.button("🚫  Ban user").clicked() {
+                    let _ = self.cmd_tx.try_send(AppCommand::BanUser {
+                        channel: self.channel.clone(),
+                        login: msg.sender.login.clone(),
+                        user_id: target_user_id.to_owned(),
+                        reason: None,
+                    });
+                    ui.close_menu();
+                }
+
+                if ui.button("♻  Unban user").clicked() {
+                    let _ = self.cmd_tx.try_send(AppCommand::UnbanUser {
+                        channel: self.channel.clone(),
+                        login: msg.sender.login.clone(),
+                        user_id: target_user_id.to_owned(),
+                    });
+                    ui.close_menu();
+                }
+            } else {
+                ui.add_enabled(false, egui::Button::new("⏱  Timeout presets"));
+                ui.add_enabled(false, egui::Button::new("🚫  Ban user"));
+                ui.add_enabled(false, egui::Button::new("♻  Unban user"));
+            }
+
+            let channel_login = self.channel.display_name().trim().to_ascii_lowercase();
+            if !channel_login.is_empty() {
+                ui.separator();
+                ui.label(RichText::new("Workflows").small().color(t::text_muted()));
+
+                if ui.button("🛡  Open mod view").clicked() {
+                    let _ = self.cmd_tx.try_send(AppCommand::OpenUrl {
+                        url: format!("https://www.twitch.tv/moderator/{channel_login}/chat"),
+                    });
+                    ui.close_menu();
+                }
+                if ui.button("🧰  Open AutoMod queue").clicked() {
+                    let _ = self.cmd_tx.try_send(AppCommand::OpenUrl {
+                        url: format!(
+                            "https://dashboard.twitch.tv/u/{channel_login}/settings/moderation/automod"
+                        ),
+                    });
+                    ui.close_menu();
+                }
+                if ui.button("📨  Open unban requests").clicked() {
+                    let _ = self.cmd_tx.try_send(AppCommand::OpenUrl {
+                        url: format!(
+                            "https://dashboard.twitch.tv/u/{channel_login}/community/unban-requests"
+                        ),
+                    });
+                    ui.close_menu();
+                }
+                if ui.button("🧾  Open user logs (IVR)").clicked() {
+                    let _ = self.cmd_tx.try_send(AppCommand::OpenUrl {
+                        url: format!(
+                            "https://logs.ivr.fi/?channel={channel_login}&username={}",
+                            msg.sender.login
+                        ),
+                    });
+                    ui.close_menu();
+                }
+            }
+
+            if let MsgKind::ChannelPointsReward {
+                reward_id,
+                redemption_id,
+                status,
+                user_login,
+                reward_title,
+                ..
+            } = &msg.msg_kind
+            {
+                ui.separator();
+                ui.label(RichText::new("Redemption").small().color(t::text_muted()));
+
+                let is_terminal = status
+                    .as_deref()
+                    .map(|s| {
+                        s.eq_ignore_ascii_case("fulfilled")
+                            || s.eq_ignore_ascii_case("canceled")
+                            || s.eq_ignore_ascii_case("cancelled")
+                    })
+                    .unwrap_or(false);
+                let can_update = !is_terminal
+                    && reward_id.as_deref().map(str::trim).is_some_and(|s| !s.is_empty())
+                    && redemption_id
+                        .as_deref()
+                        .map(str::trim)
+                        .is_some_and(|s| !s.is_empty());
+
+                if can_update {
+                    if ui.button("✅  Mark fulfilled").clicked() {
+                        let _ = self.cmd_tx.try_send(AppCommand::UpdateRewardRedemptionStatus {
+                            channel: self.channel.clone(),
+                            reward_id: reward_id.clone().unwrap_or_default(),
+                            redemption_id: redemption_id.clone().unwrap_or_default(),
+                            status: "FULFILLED".to_owned(),
+                            user_login: user_login.clone(),
+                            reward_title: reward_title.clone(),
+                        });
+                        ui.close_menu();
+                    }
+
+                    if ui.button("❌  Reject redemption").clicked() {
+                        let _ = self.cmd_tx.try_send(AppCommand::UpdateRewardRedemptionStatus {
+                            channel: self.channel.clone(),
+                            reward_id: reward_id.clone().unwrap_or_default(),
+                            redemption_id: redemption_id.clone().unwrap_or_default(),
+                            status: "CANCELED".to_owned(),
+                            user_login: user_login.clone(),
+                            reward_title: reward_title.clone(),
+                        });
+                        ui.close_menu();
+                    }
+                } else {
+                    let reason = if is_terminal {
+                        "This redemption is already final."
+                    } else {
+                        "Missing reward/redemption id from EventSub payload."
+                    };
+                    ui.add_enabled(false, egui::Button::new("✅  Mark fulfilled"))
+                        .on_hover_text(reason);
+                    ui.add_enabled(false, egui::Button::new("❌  Reject redemption"))
+                        .on_hover_text(reason);
+                }
+            }
+        }
     }
 
     /// If the snap-to-bottom flag is active, force the scroll offset to the
@@ -1692,16 +1992,19 @@ impl<'a> MessageList<'a> {
     }
 
     fn message_matches_keyword_highlight(&self, msg: &ChatMessage) -> bool {
-        if self.highlight_terms.is_empty() {
+        if self.highlight_rules.is_empty() {
             return false;
         }
         if msg.raw_text.is_empty() {
             return false;
         }
         let lowered = msg.raw_text.to_ascii_lowercase();
-        self.highlight_terms
+        self.highlight_rules
             .iter()
-            .any(|term| lowered.contains(term))
+            .any(|rule| {
+                rule.matches_scope(msg, self.channel)
+                    && rule.matches_message(lowered.as_str(), msg.raw_text.as_str())
+            })
     }
 
     /// Render a compact system-event row (mod action, sub alert, raid, notice).
@@ -1771,6 +2074,36 @@ impl<'a> MessageList<'a> {
             MsgKind::SystemInfo => {
                 let (color, text) = style_system_info_text(&msg.raw_text);
                 (color, Some(text))
+            }
+            MsgKind::ChannelPointsReward {
+                user_login,
+                reward_title,
+                cost,
+                reward_id,
+                redemption_id,
+                user_input,
+                status,
+            } => {
+                let mut text = format!("🎟  {user_login} redeemed '{reward_title}' ({cost} points)");
+                if let Some(input) = user_input.as_deref().filter(|s| !s.trim().is_empty()) {
+                    text.push_str(&format!(": {input}"));
+                }
+                if let Some(status) = status.as_deref().filter(|s| !s.trim().is_empty()) {
+                    text.push_str(&format!(" [{status}]"));
+                } else {
+                    text.push_str(" [UNFULFILLED]");
+                }
+                if reward_id.is_none() || redemption_id.is_none() {
+                    text.push_str(" [id-missing]");
+                }
+                let accent = match status.as_deref() {
+                    Some(s) if s.eq_ignore_ascii_case("fulfilled") => t::green(),
+                    Some(s)
+                        if s.eq_ignore_ascii_case("canceled")
+                            || s.eq_ignore_ascii_case("cancelled") => t::red(),
+                    _ => Color32::from_rgb(120, 85, 195),
+                };
+                (accent, Some(text))
             }
             _ => (Color32::from_rgb(100, 100, 120), Some(msg.raw_text.clone())),
         };
@@ -3376,7 +3709,9 @@ fn notification_label(
         Some(("Bits Cheer", t::bits_orange()))
     } else if flags.is_first_msg {
         Some(("First Message", t::green()))
-    } else if flags.custom_reward_id.is_some() {
+    } else if flags.custom_reward_id.is_some()
+        || matches!(kind, MsgKind::ChannelPointsReward { .. })
+    {
         Some(("Channel Points Reward", Color32::from_rgb(100, 65, 165)))
     } else {
         None
@@ -3408,7 +3743,9 @@ fn message_row_background(
         Color32::from_rgba_unmultiplied(180, 30, 30, 12)
     } else if matches!(kind, MsgKind::Bits { .. }) {
         Color32::from_rgba_unmultiplied(255, 175, 30, 14)
-    } else if flags.custom_reward_id.is_some() {
+    } else if flags.custom_reward_id.is_some()
+        || matches!(kind, MsgKind::ChannelPointsReward { .. })
+    {
         Color32::from_rgba_unmultiplied(100, 65, 165, 16)
     } else {
         Color32::TRANSPARENT
@@ -3428,6 +3765,8 @@ fn message_left_accent_color(
         Some(Color32::from_rgb(255, 210, 30))
     } else if keyword_highlight {
         Some(t::twitch_purple())
+    } else if matches!(kind, MsgKind::ChannelPointsReward { .. }) {
+        Some(Color32::from_rgb(120, 85, 195))
     } else if flags.is_pinned {
         Some(t::gold())
     } else if flags.is_first_msg {

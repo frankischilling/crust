@@ -29,7 +29,7 @@ use crate::widgets::{
     join_dialog::JoinDialog,
     loading_screen::{LoadEvent, LoadingScreen},
     login_dialog::{LoginAction, LoginDialog},
-    message_list::MessageList,
+    message_list::{compile_highlight_rules, HighlightRule, MessageList},
     message_search::{
         should_use_search_window, show_message_search_inline, show_message_search_window,
         MessageSearchState,
@@ -46,6 +46,9 @@ use crate::widgets::{
 const REPAINT_ANIM_MS: u64 = 33;
 const REPAINT_HOUSEKEEPING_MS: u64 = 2_000;
 const STREAM_REFRESH_SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+const STREAM_REFRESH_ACTIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+const STREAM_REFRESH_BACKGROUND_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(60);
 const NARROW_WINDOW_THRESHOLD: f32 = 520.0;
 const VERY_NARROW_WINDOW_THRESHOLD: f32 = 320.0;
 const REGULAR_MIN_CENTRAL_WIDTH: f32 = 250.0;
@@ -58,6 +61,7 @@ const ANALYTICS_MAX_W: f32 = 340.0;
 const ANALYTICS_COMPACT_DEFAULT_W: f32 = 176.0;
 const ANALYTICS_COMPACT_MIN_W: f32 = 140.0;
 const ANALYTICS_COMPACT_MAX_W: f32 = 260.0;
+const LOCAL_HISTORY_SEARCH_PAGE: usize = 800;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ResponsiveLayout {
@@ -593,6 +597,8 @@ pub struct CrustApp {
     emote_ram_bytes: usize,
     /// Chat message history for Up/Down arrow recall.
     message_history: Vec<String>,
+    /// Slash command usage frequency for autocomplete ranking.
+    slash_usage_counts: HashMap<String, u32>,
     /// Controls whether the left channel sidebar is visible (Sidebar mode only).
     sidebar_visible: bool,
     /// Where channel tabs are rendered: left sidebar or top strip.
@@ -617,8 +623,12 @@ pub struct CrustApp {
     stream_statuses: HashMap<String, StreamStatusInfo>,
     /// When each channel's stream status was last fetched.
     stream_status_fetched: HashMap<String, std::time::Instant>,
+    /// Channel logins currently being fetched for stream status.
+    stream_status_fetch_inflight: HashSet<String>,
     /// Last time we scanned channels to schedule stale stream-status refreshes.
     last_stream_refresh_scan: std::time::Instant,
+    /// Last time we forced a refresh for the active Twitch channel.
+    last_active_stream_refresh: std::time::Instant,
     /// Cached live-status map derived from `stream_statuses`; rebuilt only on
     /// change rather than every frame.
     live_map_cache: HashMap<String, bool>,
@@ -657,8 +667,8 @@ pub struct CrustApp {
     split_header_show_viewer_count: bool,
     /// Highlight keyword list from settings.
     highlights: Vec<String>,
-    /// Lowercased highlight keywords used by message rendering.
-    highlights_lower: Vec<String>,
+    /// Compiled highlight rules (substring / regex / scope) used by message rendering.
+    highlight_rules: Vec<HighlightRule>,
     /// Ignored usernames from settings.
     ignores: Vec<String>,
     /// Fast lookup set for ignored usernames.
@@ -771,6 +781,7 @@ impl CrustApp {
             link_previews: HashMap::new(),
             emote_ram_bytes: 0,
             message_history: Vec::new(),
+            slash_usage_counts: HashMap::new(),
             sidebar_visible: true,
             channel_layout: ChannelLayout::default(),
             tab_style: TabVisualStyle::default(),
@@ -783,7 +794,9 @@ impl CrustApp {
             loading_screen: LoadingScreen::default(),
             stream_statuses: HashMap::new(),
             stream_status_fetched: HashMap::new(),
+            stream_status_fetch_inflight: HashSet::new(),
             last_stream_refresh_scan: std::time::Instant::now(),
+            last_active_stream_refresh: std::time::Instant::now(),
             live_map_cache: HashMap::new(),
             event_toasts: Vec::new(),
             settings_open: false,
@@ -802,7 +815,7 @@ impl CrustApp {
             split_header_show_game: false,
             split_header_show_viewer_count: true,
             highlights: Vec::new(),
-            highlights_lower: Vec::new(),
+            highlight_rules: Vec::new(),
             ignores: Vec::new(),
             ignores_set: HashSet::new(),
             auto_join_channels: Vec::new(),
@@ -845,6 +858,19 @@ impl CrustApp {
             split_header_show_game: self.split_header_show_game,
             split_header_show_viewer_count: self.split_header_show_viewer_count,
         });
+    }
+
+    fn request_stream_status_refresh(&mut self, login: &str) {
+        let login = login.trim().to_ascii_lowercase();
+        if !is_valid_twitch_login(&login) {
+            return;
+        }
+        if self.stream_status_fetch_inflight.contains(&login) {
+            return;
+        }
+
+        self.stream_status_fetch_inflight.insert(login.clone());
+        self.send_cmd(AppCommand::FetchUserProfile { login });
     }
 
     fn drain_events(&mut self, ctx: &Context) -> u32 {
@@ -927,16 +953,19 @@ impl CrustApp {
                 // Kick off an immediate stream-status fetch for the new channel (Twitch only).
                 if channel.is_twitch() {
                     let login = channel.display_name().to_ascii_lowercase();
-                    if is_valid_twitch_login(&login) {
-                        self.stream_status_fetched
-                            .insert(login.clone(), std::time::Instant::now());
-                        self.send_cmd(AppCommand::FetchUserProfile { login });
-                    }
+                    self.request_stream_status_refresh(&login);
                 }
             }
             AppEvent::ChannelParted { channel } => {
                 self.state.leave_channel(&channel);
                 self.sorted_chatters.remove(&channel);
+                if channel.is_twitch() {
+                    let login = channel.display_name().to_ascii_lowercase();
+                    self.stream_statuses.remove(&login);
+                    self.live_map_cache.remove(&login);
+                    self.stream_status_fetched.remove(&login);
+                    self.stream_status_fetch_inflight.remove(&login);
+                }
                 if self
                     .pending_reply
                     .as_ref()
@@ -1247,6 +1276,7 @@ impl CrustApp {
             AppEvent::UserProfileLoaded { profile } => {
                 // Cache stream status.
                 let login = profile.login.to_lowercase();
+                let previous = self.stream_statuses.get(&login).cloned();
                 self.stream_statuses.insert(
                     login.clone(),
                     StreamStatusInfo {
@@ -1258,8 +1288,33 @@ impl CrustApp {
                 );
                 // Keep the cheap live-map cache in sync.
                 self.live_map_cache.insert(login.clone(), profile.is_live);
+                self.stream_status_fetch_inflight.remove(&login);
                 self.stream_status_fetched
-                    .insert(login, std::time::Instant::now());
+                    .insert(login.clone(), std::time::Instant::now());
+
+                if let Some(prev) = previous {
+                    if prev.is_live != profile.is_live {
+                        let display = if profile.display_name.is_empty() {
+                            profile.login.as_str()
+                        } else {
+                            profile.display_name.as_str()
+                        };
+                        let text = if profile.is_live {
+                            if let Some(title) = profile.stream_title.as_ref().filter(|s| !s.is_empty()) {
+                                format!("{display} just went live: {title}")
+                            } else {
+                                format!("{display} just went live.")
+                            }
+                        } else {
+                            format!("{display} went offline.")
+                        };
+
+                        self.send_cmd(AppCommand::InjectLocalMessage {
+                            channel: ChannelId::new(login),
+                            text,
+                        });
+                    }
+                }
                 // This event is also used for channel live-status refresh.
                 // Only drive the popup when it explicitly requested this login.
                 if self.user_profile_popup.accepts_profile(&profile.login) {
@@ -1301,6 +1356,10 @@ impl CrustApp {
                 }
             }
             AppEvent::UserProfileUnavailable { login } => {
+                let login_lc = login.to_ascii_lowercase();
+                self.stream_status_fetch_inflight.remove(&login_lc);
+                self.stream_status_fetched
+                    .insert(login_lc.clone(), std::time::Instant::now());
                 if self.user_profile_popup.accepts_profile(&login) {
                     self.user_profile_popup.set_unavailable(&login);
                 }
@@ -1401,12 +1460,7 @@ impl CrustApp {
                 self.show_timestamps = show_timestamps;
                 self.auto_join_channels = auto_join;
                 self.highlights = highlights;
-                self.highlights_lower = self
-                    .highlights
-                    .iter()
-                    .map(|s| s.to_ascii_lowercase())
-                    .filter(|s| !s.is_empty())
-                    .collect();
+                self.highlight_rules = compile_highlight_rules(&self.highlights);
                 self.ignores = ignores;
                 self.ignores_set = self
                     .ignores
@@ -1558,6 +1612,14 @@ impl CrustApp {
 
     fn message_search_mut(&mut self, channel: &ChannelId) -> &mut MessageSearchState {
         self.message_search.entry(channel.clone()).or_default()
+    }
+
+    fn request_older_local_history(&self, channel: &ChannelId, oldest_loaded_ts_ms: i64) {
+        self.send_cmd(AppCommand::LoadOlderLocalHistory {
+            channel: channel.clone(),
+            before_ts_ms: oldest_loaded_ts_ms,
+            limit: LOCAL_HISTORY_SEARCH_PAGE,
+        });
     }
 
     fn static_avatar_texture_for(
@@ -1775,12 +1837,149 @@ impl CrustApp {
             }
         }
     }
+
+    fn record_slash_usage_from_text(&mut self, text: &str) {
+        let trimmed = text.trim_start();
+        if !trimmed.starts_with('/') {
+            return;
+        }
+        let without_slash = &trimmed[1..];
+        let Some(token) = without_slash.split_whitespace().next() else {
+            return;
+        };
+        let cmd = token.trim().to_ascii_lowercase();
+        if cmd.is_empty() {
+            return;
+        }
+        let entry = self.slash_usage_counts.entry(cmd).or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+
+    fn activate_channel(&mut self, channel: ChannelId) {
+        if let Some(state) = self.state.channels.get_mut(&channel) {
+            state.mark_read();
+        }
+        if !self.split_panes.panes.is_empty() {
+            let focused = self.split_panes.focused;
+            if let Some(pane) = self.split_panes.panes.get_mut(focused) {
+                pane.channel = channel.clone();
+                pane.input_buf.clear();
+            }
+        }
+        self.state.active_channel = Some(channel);
+    }
+
+    fn next_channel_target(&self, reverse: bool) -> Option<ChannelId> {
+        let len = self.state.channel_order.len();
+        if len == 0 {
+            return None;
+        }
+
+        let current_idx = self
+            .state
+            .active_channel
+            .as_ref()
+            .and_then(|active| self.state.channel_order.iter().position(|ch| ch == active))
+            .unwrap_or(0);
+
+        let find_by = |predicate: &dyn Fn(&ChannelId) -> bool| -> Option<ChannelId> {
+            for step in 1..=len {
+                let idx = if reverse {
+                    (current_idx + len - (step % len)) % len
+                } else {
+                    (current_idx + step) % len
+                };
+                let ch = &self.state.channel_order[idx];
+                if predicate(ch) {
+                    return Some(ch.clone());
+                }
+            }
+            None
+        };
+
+        find_by(&|ch| {
+            self.state
+                .channels
+                .get(ch)
+                .map(|s| s.unread_mentions > 0)
+                .unwrap_or(false)
+        })
+        .or_else(|| {
+            find_by(&|ch| {
+                self.state
+                    .channels
+                    .get(ch)
+                    .map(|s| s.unread_count > 0)
+                    .unwrap_or(false)
+            })
+        })
+        .or_else(|| {
+            let idx = if reverse {
+                (current_idx + len - 1) % len
+            } else {
+                (current_idx + 1) % len
+            };
+            self.state.channel_order.get(idx).cloned()
+        })
+    }
+
+    fn handle_channel_shortcuts(&mut self, ctx: &Context) {
+        let (next, prev, direct_idx) = ctx.input_mut(|i| {
+            let ctrl_shift = egui::Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            };
+            let next = i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab)
+                || i.consume_key(egui::Modifiers::CTRL, egui::Key::PageDown);
+            let prev = i.consume_key(ctrl_shift, egui::Key::Tab)
+                || i.consume_key(egui::Modifiers::CTRL, egui::Key::PageUp);
+            let direct_idx = [
+                egui::Key::Num1,
+                egui::Key::Num2,
+                egui::Key::Num3,
+                egui::Key::Num4,
+                egui::Key::Num5,
+                egui::Key::Num6,
+                egui::Key::Num7,
+                egui::Key::Num8,
+                egui::Key::Num9,
+            ]
+            .iter()
+            .position(|key| i.consume_key(egui::Modifiers::CTRL, *key));
+            (next, prev, direct_idx)
+        });
+
+        if let Some(idx) = direct_idx {
+            if let Some(target) = self.state.channel_order.get(idx).cloned() {
+                self.activate_channel(target);
+            }
+            return;
+        }
+
+        let reverse = if next {
+            Some(false)
+        } else if prev {
+            Some(true)
+        } else {
+            None
+        };
+
+        let Some(reverse) = reverse else {
+            return;
+        };
+
+        if let Some(target) = self.next_channel_target(reverse) {
+            self.activate_channel(target);
+        }
+    }
 }
 
 // eframe::App implementation
 
 impl eframe::App for CrustApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        self.handle_channel_shortcuts(ctx);
         self.handle_search_shortcuts(ctx);
 
         let events = self.drain_events(ctx);
@@ -1834,9 +2033,29 @@ impl eframe::App for CrustApp {
             }
         }
 
-        // Periodic stream-status refresh: re-fetch every 60 s per channel.
+        // Periodic stream-status refresh: re-fetch the active Twitch channel
+        // at a higher cadence and all joined channels on a slower interval.
         // Throttle the stale-scan itself to avoid per-frame channel iteration.
-        const STREAM_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
+        if self.last_active_stream_refresh.elapsed() >= STREAM_REFRESH_ACTIVE_INTERVAL {
+            self.last_active_stream_refresh = std::time::Instant::now();
+            let active_login = self
+                .state
+                .active_channel
+                .as_ref()
+                .filter(|ch| ch.is_twitch())
+                .map(|ch| ch.display_name().to_ascii_lowercase());
+            if let Some(login) = active_login {
+                let is_stale = self
+                    .stream_status_fetched
+                    .get(&login)
+                    .map(|t| t.elapsed() >= STREAM_REFRESH_ACTIVE_INTERVAL)
+                    .unwrap_or(true);
+                if is_stale {
+                    self.request_stream_status_refresh(&login);
+                }
+            }
+        }
+
         if self.last_stream_refresh_scan.elapsed() >= STREAM_REFRESH_SCAN_INTERVAL {
             self.last_stream_refresh_scan = std::time::Instant::now();
             let mut stale: Vec<String> = Vec::new();
@@ -1851,16 +2070,14 @@ impl eframe::App for CrustApp {
                 let is_stale = self
                     .stream_status_fetched
                     .get(&login)
-                    .map(|t| t.elapsed() >= STREAM_REFRESH)
+                    .map(|t| t.elapsed() >= STREAM_REFRESH_BACKGROUND_INTERVAL)
                     .unwrap_or(true);
                 if is_stale {
                     stale.push(login);
                 }
             }
             for login in stale {
-                self.stream_status_fetched
-                    .insert(login.clone(), std::time::Instant::now());
-                self.send_cmd(AppCommand::FetchUserProfile { login });
+                self.request_stream_status_refresh(&login);
             }
         }
 
@@ -2095,11 +2312,7 @@ impl eframe::App for CrustApp {
 
                 self.show_timestamps = state.show_timestamps;
                 self.highlights = highlights.clone();
-                self.highlights_lower = highlights
-                    .iter()
-                    .map(|s| s.to_ascii_lowercase())
-                    .filter(|s| !s.is_empty())
-                    .collect();
+                self.highlight_rules = compile_highlight_rules(&highlights);
                 self.ignores = ignores.clone();
                 self.ignores_set = ignores.iter().cloned().collect();
                 self.auto_join_channels = auto_join.clone();
@@ -2806,18 +3019,7 @@ impl eframe::App for CrustApp {
 
         // Apply channel-list actions gathered above.
         if let Some(ch) = ch_selected {
-            if let Some(state) = self.state.channels.get_mut(&ch) {
-                state.mark_read();
-            }
-            // In split mode, switch the focused pane's channel.
-            if !self.split_panes.panes.is_empty() {
-                let f = self.split_panes.focused;
-                if let Some(pane) = self.split_panes.panes.get_mut(f) {
-                    pane.channel = ch.clone();
-                    pane.input_buf.clear();
-                }
-            }
-            self.state.active_channel = Some(ch);
+            self.activate_channel(ch);
         }
         if let Some(ch) = ch_closed {
             if self
@@ -3125,6 +3327,7 @@ impl eframe::App for CrustApp {
                                 emote_bytes: &self.emote_bytes,
                                 pending_reply: None,
                                 message_history: &self.message_history,
+                                slash_usage_counts: &self.slash_usage_counts,
                                 known_channels: &self.state.channel_order,
                                 chatters: chatters_sorted,
                                 prevent_overlong_twitch_messages: self
@@ -3148,6 +3351,7 @@ impl eframe::App for CrustApp {
                                         self.message_history.remove(0);
                                     }
                                 }
+                                self.record_slash_usage_from_text(&text);
                                 let is_mod = self
                                     .state
                                     .channels
@@ -3270,6 +3474,14 @@ impl eframe::App for CrustApp {
                                             search,
                                         ) + pane_inner_pad;
                                     }
+                                    if search.take_load_more_local_request() {
+                                        let oldest_ts = ch_state
+                                            .messages
+                                            .front()
+                                            .map(|m| m.timestamp.timestamp_millis())
+                                            .unwrap_or(i64::MAX);
+                                        self.request_older_local_history(&ch, oldest_ts);
+                                    }
                                 }
                             }
                         }
@@ -3290,7 +3502,7 @@ impl eframe::App for CrustApp {
                                     )
                                 })
                                 .unwrap_or(false);
-                            let _is_mod = ch_state.is_mod || is_bc;
+                            let is_mod = ch_state.is_mod || is_bc;
                             let mut msg_ui = pane_ui.new_child(
                                 egui::UiBuilder::new()
                                     .max_rect(msg_rect)
@@ -3308,8 +3520,9 @@ impl eframe::App for CrustApp {
                                 self.collapse_long_message_lines,
                                 animations_allowed,
                                 self.show_timestamps,
+                                is_mod,
                                 &self.ignores_set,
-                                &self.highlights_lower,
+                                &self.highlight_rules,
                             )
                             .show(&mut msg_ui);
                             frame_chat_stats.accumulate(&ml.perf_stats);
@@ -3429,6 +3642,7 @@ impl eframe::App for CrustApp {
                                 emote_bytes: &self.emote_bytes,
                                 pending_reply: active_reply.as_ref(),
                                 message_history: &self.message_history,
+                                slash_usage_counts: &self.slash_usage_counts,
                                 known_channels: &self.state.channel_order,
                                 chatters: chatters_sorted,
                                 prevent_overlong_twitch_messages: self
@@ -3447,6 +3661,7 @@ impl eframe::App for CrustApp {
                                         self.message_history.remove(0);
                                     }
                                 }
+                                self.record_slash_usage_from_text(&text);
                                 let reply_to_msg_id =
                                     active_reply.as_ref().map(|r| r.parent_msg_id.clone());
                                 if active_reply.is_some() {
@@ -3609,6 +3824,14 @@ impl eframe::App for CrustApp {
                                     ) + 10.0;
                                     ui.allocate_space(egui::vec2(0.0, search_h));
                                 }
+                                if search.take_load_more_local_request() {
+                                    let oldest_ts = state
+                                        .messages
+                                        .front()
+                                        .map(|m| m.timestamp.timestamp_millis())
+                                        .unwrap_or(i64::MAX);
+                                    self.request_older_local_history(&active_ch, oldest_ts);
+                                }
                             }
                         }
                         let is_broadcaster = self
@@ -3643,8 +3866,9 @@ impl eframe::App for CrustApp {
                             self.collapse_long_message_lines,
                             animations_allowed,
                             self.show_timestamps,
+                            is_mod,
                             &self.ignores_set,
-                            &self.highlights_lower,
+                            &self.highlight_rules,
                         )
                         .show(&mut msg_ui);
                         frame_chat_stats.accumulate(&ml_result.perf_stats);
@@ -4089,7 +4313,7 @@ fn parse_slash_command(
     channel: &ChannelId,
     reply_to_msg_id: Option<String>,
     reply: Option<ReplyInfo>,
-    _is_mod: bool,
+    is_mod: bool,
     chatters_count: usize,
     kick_beta_enabled: bool,
     irc_beta_enabled: bool,
@@ -4125,6 +4349,374 @@ fn parse_slash_command(
             Some(AppCommand::InjectLocalMessage {
                 channel: channel.clone(),
                 text: msg,
+            })
+        }
+
+        // Twitch Helix poll management.
+        "poll" => {
+            if !channel.is_twitch() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Poll commands are only supported for Twitch channels.".to_owned(),
+                });
+            }
+            if !is_mod {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Poll commands require moderator or broadcaster permissions."
+                        .to_owned(),
+                });
+            }
+
+            let usage =
+                "Usage: /poll <title> | <choice 1> | <choice 2> [| ...] [--duration <15..1800>]";
+            if rest.is_empty() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: usage.to_owned(),
+                });
+            }
+
+            let (spec, duration_opt) = extract_duration_flag(rest);
+            let duration_secs = duration_opt.unwrap_or(60).clamp(15, 1800);
+            let parts = parse_pipe_args(&spec);
+            if parts.len() < 3 {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: usage.to_owned(),
+                });
+            }
+            let title = parts[0].clone();
+            let choices = parts[1..].to_vec();
+            if choices.len() > 5 {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Twitch polls support 2 to 5 choices.".to_owned(),
+                });
+            }
+
+            Some(AppCommand::CreatePoll {
+                channel: channel.clone(),
+                title,
+                choices,
+                duration_secs,
+            })
+        }
+
+        "endpoll" => {
+            if !channel.is_twitch() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Poll commands are only supported for Twitch channels.".to_owned(),
+                });
+            }
+            if !is_mod {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Poll commands require moderator or broadcaster permissions."
+                        .to_owned(),
+                });
+            }
+            Some(AppCommand::EndPoll {
+                channel: channel.clone(),
+                status: "ARCHIVED".to_owned(),
+            })
+        }
+
+        "cancelpoll" => {
+            if !channel.is_twitch() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Poll commands are only supported for Twitch channels.".to_owned(),
+                });
+            }
+            if !is_mod {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Poll commands require moderator or broadcaster permissions."
+                        .to_owned(),
+                });
+            }
+            Some(AppCommand::EndPoll {
+                channel: channel.clone(),
+                status: "TERMINATED".to_owned(),
+            })
+        }
+
+        // Twitch Helix prediction management.
+        "prediction" => {
+            if !channel.is_twitch() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Prediction commands are only supported for Twitch channels.".to_owned(),
+                });
+            }
+            if !is_mod {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Prediction commands require moderator or broadcaster permissions."
+                        .to_owned(),
+                });
+            }
+
+            let usage = "Usage: /prediction <title> | <outcome 1> | <outcome 2> [| ...] [--duration <30..1800>]";
+            if rest.is_empty() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: usage.to_owned(),
+                });
+            }
+
+            let (spec, duration_opt) = extract_duration_flag(rest);
+            let duration_secs = duration_opt.unwrap_or(120).clamp(30, 1800);
+            let parts = parse_pipe_args(&spec);
+            if parts.len() < 3 {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: usage.to_owned(),
+                });
+            }
+            let title = parts[0].clone();
+            let outcomes = parts[1..].to_vec();
+            if outcomes.len() > 10 {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Twitch predictions support 2 to 10 outcomes.".to_owned(),
+                });
+            }
+
+            Some(AppCommand::CreatePrediction {
+                channel: channel.clone(),
+                title,
+                outcomes,
+                duration_secs,
+            })
+        }
+
+        "lockprediction" => {
+            if !channel.is_twitch() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Prediction commands are only supported for Twitch channels.".to_owned(),
+                });
+            }
+            if !is_mod {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Prediction commands require moderator or broadcaster permissions."
+                        .to_owned(),
+                });
+            }
+            Some(AppCommand::LockPrediction {
+                channel: channel.clone(),
+            })
+        }
+
+        "endprediction" => {
+            if !channel.is_twitch() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Prediction commands are only supported for Twitch channels.".to_owned(),
+                });
+            }
+            if !is_mod {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Prediction commands require moderator or broadcaster permissions."
+                        .to_owned(),
+                });
+            }
+            let idx: usize = match rest.trim().parse() {
+                Ok(v) if v >= 1 => v,
+                _ => {
+                    return Some(AppCommand::InjectLocalMessage {
+                        channel: channel.clone(),
+                        text: "Usage: /endprediction <winning outcome index starting at 1>"
+                            .to_owned(),
+                    });
+                }
+            };
+            Some(AppCommand::ResolvePrediction {
+                channel: channel.clone(),
+                winning_outcome_index: idx,
+            })
+        }
+
+        "cancelprediction" => {
+            if !channel.is_twitch() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Prediction commands are only supported for Twitch channels.".to_owned(),
+                });
+            }
+            if !is_mod {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Prediction commands require moderator or broadcaster permissions."
+                        .to_owned(),
+                });
+            }
+            Some(AppCommand::CancelPrediction {
+                channel: channel.clone(),
+            })
+        }
+
+        "commercial" => {
+            if !channel.is_twitch() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Commercial commands are only supported for Twitch channels.".to_owned(),
+                });
+            }
+            if !is_mod {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Commercial commands require moderator or broadcaster permissions."
+                        .to_owned(),
+                });
+            }
+
+            let usage = "Usage: /commercial [30|60|90|120|150|180]";
+            let length_secs = if rest.is_empty() {
+                30
+            } else {
+                match rest.trim().parse::<u32>() {
+                    Ok(v) if matches!(v, 30 | 60 | 90 | 120 | 150 | 180) => v,
+                    _ => {
+                        return Some(AppCommand::InjectLocalMessage {
+                            channel: channel.clone(),
+                            text: usage.to_owned(),
+                        });
+                    }
+                }
+            };
+
+            Some(AppCommand::StartCommercial {
+                channel: channel.clone(),
+                length_secs,
+            })
+        }
+
+        "marker" => {
+            if !channel.is_twitch() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Marker commands are only supported for Twitch channels.".to_owned(),
+                });
+            }
+            if !is_mod {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Marker commands require moderator or broadcaster permissions."
+                        .to_owned(),
+                });
+            }
+
+            let description = if rest.is_empty() {
+                None
+            } else {
+                let desc = rest.trim();
+                if desc.chars().count() > 140 {
+                    return Some(AppCommand::InjectLocalMessage {
+                        channel: channel.clone(),
+                        text: "Usage: /marker [description up to 140 characters]".to_owned(),
+                    });
+                }
+                Some(desc.to_owned())
+            };
+
+            Some(AppCommand::CreateStreamMarker {
+                channel: channel.clone(),
+                description,
+            })
+        }
+
+        "announce" => {
+            if !channel.is_twitch() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Announcement commands are only supported for Twitch channels."
+                        .to_owned(),
+                });
+            }
+            if !is_mod {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Announcement commands require moderator or broadcaster permissions."
+                        .to_owned(),
+                });
+            }
+
+            let usage =
+                "Usage: /announce <message> [--color primary|blue|green|orange|purple]";
+            let (message, color) = extract_color_flag(rest);
+            let message = message.trim();
+            if message.is_empty() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: usage.to_owned(),
+                });
+            }
+            if message.chars().count() > 500 {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Announcement message must be 500 characters or fewer.".to_owned(),
+                });
+            }
+
+            Some(AppCommand::SendAnnouncement {
+                channel: channel.clone(),
+                message: message.to_owned(),
+                color,
+            })
+        }
+
+        "shoutout" => {
+            if !channel.is_twitch() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Shoutout commands are only supported for Twitch channels.".to_owned(),
+                });
+            }
+            if !is_mod {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Shoutout commands require moderator or broadcaster permissions."
+                        .to_owned(),
+                });
+            }
+
+            let usage = "Usage: /shoutout <channel>";
+            let target = rest
+                .split_whitespace()
+                .next()
+                .map(|raw| raw.trim_start_matches('@').trim_start_matches('#'))
+                .unwrap_or("")
+                .trim();
+            if target.is_empty() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: usage.to_owned(),
+                });
+            }
+            let target_login = target.to_ascii_lowercase();
+            let is_valid_login = {
+                let len = target_login.len();
+                (3..=25).contains(&len)
+                    && target_login
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            };
+            if !is_valid_login {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: usage.to_owned(),
+                });
+            }
+
+            Some(AppCommand::SendShoutout {
+                channel: channel.clone(),
+                target_login,
             })
         }
 
@@ -4351,7 +4943,7 @@ fn parse_slash_command(
         // Everything else falls through to IRC
         // Standard Twitch chat commands (/ban, /timeout, /unban, /slow,
         // /subscribers, /emoteonly, /clear, /mod, /vip, /color, /delete,
-        // /raid, /host, /commercial, /uniquechat, /marker, /block, /unblock,
+        // /raid, /host, /uniquechat, /block, /unblock,
         // /r, /w, etc.) are handled server-side.
         _ => None,
     }
@@ -4408,6 +5000,61 @@ fn parse_irc_channel_arg(current: &ChannelId, raw: &str) -> Option<ChannelId> {
     // Strip exactly one leading '#' for internal storage.
     let ch = arg.strip_prefix('#').unwrap_or(arg);
     Some(ChannelId::irc(t.host, t.port, t.tls, ch))
+}
+
+fn parse_pipe_args(spec: &str) -> Vec<String> {
+    spec.split('|')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn extract_duration_flag(input: &str) -> (String, Option<u32>) {
+    let mut cleaned_tokens: Vec<&str> = Vec::new();
+    let mut duration: Option<u32> = None;
+
+    let tokens: Vec<&str> = input.split_whitespace().collect();
+    let mut i = 0usize;
+    while i < tokens.len() {
+        if tokens[i] == "--duration" {
+            if let Some(next) = tokens.get(i + 1) {
+                if let Ok(v) = next.parse::<u32>() {
+                    duration = Some(v);
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        cleaned_tokens.push(tokens[i]);
+        i += 1;
+    }
+
+    (cleaned_tokens.join(" "), duration)
+}
+
+fn extract_color_flag(input: &str) -> (String, Option<String>) {
+    let mut cleaned_tokens: Vec<&str> = Vec::new();
+    let mut color: Option<String> = None;
+
+    let tokens: Vec<&str> = input.split_whitespace().collect();
+    let mut i = 0usize;
+    while i < tokens.len() {
+        if tokens[i] == "--color" {
+            if let Some(next) = tokens.get(i + 1) {
+                let candidate = next.trim().to_ascii_lowercase();
+                if matches!(candidate.as_str(), "primary" | "blue" | "green" | "orange" | "purple") {
+                    color = Some(candidate);
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        cleaned_tokens.push(tokens[i]);
+        i += 1;
+    }
+
+    (cleaned_tokens.join(" "), color)
 }
 
 fn parse_irc_join_args(current: &ChannelId, raw: &str) -> Option<(ChannelId, Option<String>)> {
@@ -4489,7 +5136,12 @@ fn build_emote_lookup(catalog: &[EmoteCatalogEntry]) -> HashMap<&str, &EmoteCata
 
 #[cfg(test)]
 mod tests {
-    use super::{responsive_layout, top_tab_metrics, toolbar_visibility, TabVisualStyle};
+    use super::{
+        parse_slash_command, responsive_layout, top_tab_metrics, toolbar_visibility,
+        TabVisualStyle,
+    };
+    use crust_core::events::AppCommand;
+    use crust_core::model::ChannelId;
     use crate::theme as t;
 
     #[test]
@@ -4557,5 +5209,85 @@ mod tests {
         assert!(visibility.show_irc_in_overflow);
         assert!(visibility.show_overflow_menu);
         assert!(!visibility.compact_controls);
+    }
+
+    #[test]
+    fn slash_commercial_rejects_invalid_duration_argument() {
+        let channel = ChannelId::new("somechannel");
+        let parsed = parse_slash_command(
+            "/commercial 45",
+            &channel,
+            None,
+            None,
+            true,
+            0,
+            true,
+            true,
+        );
+
+        match parsed {
+            Some(AppCommand::InjectLocalMessage { text, .. }) => {
+                assert_eq!(text, "Usage: /commercial [30|60|90|120|150|180]");
+            }
+            other => panic!("expected usage local message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_commercial_accepts_supported_duration_argument() {
+        let channel = ChannelId::new("somechannel");
+        let parsed = parse_slash_command(
+            "/commercial 90",
+            &channel,
+            None,
+            None,
+            true,
+            0,
+            true,
+            true,
+        );
+
+        match parsed {
+            Some(AppCommand::StartCommercial { length_secs, .. }) => {
+                assert_eq!(length_secs, 90);
+            }
+            other => panic!("expected StartCommercial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_marker_rejects_description_over_140_chars() {
+        let channel = ChannelId::new("somechannel");
+        let long = format!("/marker {}", "x".repeat(141));
+        let parsed = parse_slash_command(&long, &channel, None, None, true, 0, true, true);
+
+        match parsed {
+            Some(AppCommand::InjectLocalMessage { text, .. }) => {
+                assert_eq!(text, "Usage: /marker [description up to 140 characters]");
+            }
+            other => panic!("expected usage local message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_marker_accepts_trimmed_description() {
+        let channel = ChannelId::new("somechannel");
+        let parsed = parse_slash_command(
+            "/marker   clutch moment   ",
+            &channel,
+            None,
+            None,
+            true,
+            0,
+            true,
+            true,
+        );
+
+        match parsed {
+            Some(AppCommand::CreateStreamMarker { description, .. }) => {
+                assert_eq!(description.as_deref(), Some("clutch moment"));
+            }
+            other => panic!("expected CreateStreamMarker, got {other:?}"),
+        }
     }
 }

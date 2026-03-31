@@ -16,6 +16,8 @@ pub struct UserProfile {
     pub followers: Option<u64>,
     pub is_partner: bool,
     pub is_affiliate: bool,
+    /// Optional pronouns label (provider-dependent string), e.g. "he/him".
+    pub pronouns: Option<String>,
 
     // Extended fields (IVR v2)
     /// The user's chosen chat-message colour as a CSS hex string, e.g. `"#FF6905"`.

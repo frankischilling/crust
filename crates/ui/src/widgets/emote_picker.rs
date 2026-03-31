@@ -19,6 +19,8 @@ const CELL_SIZE: f32 = EMOTE_SIZE + 8.0;
 const ROW_H: f32 = CELL_SIZE + 4.0;
 /// Fallback image fetches per frame (safety net if prefetch hasn't finished).
 const FETCH_BATCH: usize = 12;
+/// Max recent emotes kept in memory.
+const RECENT_LIMIT: usize = 80;
 
 /// Provider tabs - Twitch first since this is a Twitch-first client.
 const TABS: &[(&str, &str)] = &[
@@ -29,9 +31,17 @@ const TABS: &[(&str, &str)] = &[
     ("emoji", "Emoji"),
 ];
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PickerView {
+    All,
+    Favorites,
+    Recent,
+    Provider(usize),
+}
+
 /// Cached per-tab data.
 struct CachedTab {
-    indices: Vec<usize>, // indices into catalog
+    indices: Vec<usize>, // indices into combined
 }
 
 /// Cached filtered/grouped view.
@@ -39,10 +49,9 @@ struct CachedView {
     filter: String,
     catalog_len: usize,
     tabs: Vec<CachedTab>, // one per TABS entry
-    /// Merged indices from all provider tabs (for the "All" meta-tab).
+    /// Merged indices from all provider tabs (for the "All" view).
     all_indices: Vec<usize>,
-    /// The combined catalog (external emote catalog + emoji entries).
-    /// Indices in `tabs` and `all_indices` point into this vec.
+    /// Combined catalog (external emotes + emoji entries).
     combined: Vec<EmoteCatalogEntry>,
 }
 
@@ -50,18 +59,25 @@ struct CachedView {
 pub struct EmotePicker {
     pub open: bool,
     filter: String,
-    /// Currently selected tab index into TABS. `None` = no tab selected.
-    active_tab: Option<usize>,
+    active_view: PickerView,
     /// URLs we've already requested fetching for (fallback lazy fetch).
     requested: HashSet<String>,
     /// Cached filtered/grouped view.
     cache: Option<CachedView>,
-    /// Last size we logged to avoid spamming console every frame.
+    /// Last size we logged to avoid spamming every frame.
     last_logged_size: Option<Vec2>,
     /// Cached static textures for animated emotes (first frame).
     static_frames: HashMap<String, egui::TextureHandle>,
     /// Pre-generated emoji catalog entries (created once).
     emoji_entries: Vec<EmoteCatalogEntry>,
+    /// Favorite emotes by unique URL.
+    favorite_urls: HashSet<String>,
+    /// Most recently used emotes by URL (most recent first).
+    recent_urls: Vec<String>,
+    /// Usage counts by URL for usage-based ranking.
+    usage_by_url: HashMap<String, u32>,
+    /// Optional provider boost key, e.g. "7tv".
+    provider_boost: Option<String>,
 }
 
 impl Default for EmotePicker {
@@ -69,12 +85,16 @@ impl Default for EmotePicker {
         Self {
             open: false,
             filter: String::new(),
-            active_tab: None,
+            active_view: PickerView::All,
             requested: HashSet::new(),
             cache: None,
             last_logged_size: None,
             static_frames: HashMap::new(),
             emoji_entries: emoji_catalog_entries(),
+            favorite_urls: HashSet::new(),
+            recent_urls: Vec::new(),
+            usage_by_url: HashMap::new(),
+            provider_boost: None,
         }
     }
 }
@@ -85,8 +105,27 @@ impl EmotePicker {
         if self.open {
             self.filter.clear();
             self.cache = None;
-            self.active_tab = None; // no tab selected by default
+            self.active_view = PickerView::All;
             self.last_logged_size = None;
+        }
+    }
+
+    fn note_pick(&mut self, entry: &EmoteCatalogEntry) {
+        let usage = self.usage_by_url.entry(entry.url.clone()).or_insert(0);
+        *usage = usage.saturating_add(1);
+
+        self.recent_urls.retain(|u| u != &entry.url);
+        self.recent_urls.insert(0, entry.url.clone());
+        if self.recent_urls.len() > RECENT_LIMIT {
+            self.recent_urls.truncate(RECENT_LIMIT);
+        }
+    }
+
+    fn toggle_favorite_url(&mut self, url: &str) {
+        if self.favorite_urls.contains(url) {
+            self.favorite_urls.remove(url);
+        } else {
+            self.favorite_urls.insert(url.to_owned());
         }
     }
 
@@ -108,16 +147,14 @@ impl EmotePicker {
         let filter_lower = self.filter.to_lowercase();
         let has_filter = !filter_lower.is_empty();
 
-        // Bucket by provider in one pass
+        // Bucket by provider in one pass.
         let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); TABS.len()];
 
         for (i, entry) in combined.iter().enumerate() {
-            // For emoji, also search by descriptive name (stored in emoji_list).
+            // For emoji, also search by descriptive name from source table.
             let matches_filter = if !has_filter {
                 true
             } else if entry.provider == "emoji" {
-                // Search emoji by character or by descriptive name from the
-                // source table.
                 let emoji_local_idx = i.checked_sub(emoji_offset).unwrap_or(usize::MAX);
                 let name_match = super::emoji_list::EMOJI_LIST
                     .get(emoji_local_idx)
@@ -145,17 +182,10 @@ impl EmotePicker {
             .map(|indices| CachedTab { indices })
             .collect();
 
-        // Build merged "All" index - union of every tab, sorted by code.
-        let mut all_indices: Vec<usize> = tabs
+        let all_indices: Vec<usize> = tabs
             .iter()
             .flat_map(|t| t.indices.iter().copied())
             .collect();
-        all_indices.sort_by(|&a, &b| {
-            combined[a]
-                .code
-                .to_lowercase()
-                .cmp(&combined[b].code.to_lowercase())
-        });
 
         self.cache = Some(CachedView {
             filter: self.filter.clone(),
@@ -163,6 +193,79 @@ impl EmotePicker {
             tabs,
             all_indices,
             combined,
+        });
+    }
+
+    fn favorite_indices(&self, view: &CachedView) -> Vec<usize> {
+        view.all_indices
+            .iter()
+            .copied()
+            .filter(|&idx| self.favorite_urls.contains(view.combined[idx].url.as_str()))
+            .collect()
+    }
+
+    fn recent_indices(&self, view: &CachedView) -> Vec<usize> {
+        let mut by_url: HashMap<&str, usize> = HashMap::new();
+        for &idx in &view.all_indices {
+            let url = view.combined[idx].url.as_str();
+            by_url.entry(url).or_insert(idx);
+        }
+
+        let mut out = Vec::new();
+        for url in &self.recent_urls {
+            if let Some(&idx) = by_url.get(url.as_str()) {
+                out.push(idx);
+            }
+        }
+        out
+    }
+
+    fn rank_indices(
+        &self,
+        indices: &mut [usize],
+        combined: &[EmoteCatalogEntry],
+        keep_recent_order: bool,
+    ) {
+        if keep_recent_order {
+            return;
+        }
+
+        let query = self.filter.to_ascii_lowercase();
+        let boosted = self.provider_boost.as_deref();
+        let recent_rank: HashMap<&str, usize> = self
+            .recent_urls
+            .iter()
+            .enumerate()
+            .map(|(i, url)| (url.as_str(), i))
+            .collect();
+
+        indices.sort_by(|&a, &b| {
+            let ea = &combined[a];
+            let eb = &combined[b];
+
+            let a_prefix = !query.is_empty() && ea.code.to_ascii_lowercase().starts_with(&query);
+            let b_prefix = !query.is_empty() && eb.code.to_ascii_lowercase().starts_with(&query);
+
+            let a_fav = self.favorite_urls.contains(ea.url.as_str());
+            let b_fav = self.favorite_urls.contains(eb.url.as_str());
+
+            let a_boost = boosted.map(|p| ea.provider == p).unwrap_or(false);
+            let b_boost = boosted.map(|p| eb.provider == p).unwrap_or(false);
+
+            let a_usage = self.usage_by_url.get(ea.url.as_str()).copied().unwrap_or(0);
+            let b_usage = self.usage_by_url.get(eb.url.as_str()).copied().unwrap_or(0);
+
+            let a_recent = recent_rank.get(ea.url.as_str()).copied().unwrap_or(usize::MAX);
+            let b_recent = recent_rank.get(eb.url.as_str()).copied().unwrap_or(usize::MAX);
+
+            b_prefix
+                .cmp(&a_prefix)
+                .then_with(|| b_fav.cmp(&a_fav))
+                .then_with(|| b_boost.cmp(&a_boost))
+                .then_with(|| b_usage.cmp(&a_usage))
+                .then_with(|| a_recent.cmp(&b_recent))
+                .then_with(|| ea.code.len().cmp(&eb.code.len()))
+                .then_with(|| ea.code.to_ascii_lowercase().cmp(&eb.code.to_ascii_lowercase()))
         });
     }
 
@@ -180,7 +283,11 @@ impl EmotePicker {
         }
 
         let mut picked: Option<String> = None;
+        let mut picked_entry: Option<EmoteCatalogEntry> = None;
         let mut still_open = self.open;
+        let mut next_active_view = self.active_view;
+        let mut next_provider_boost = self.provider_boost.clone();
+        let mut pending_favorite_toggle: Option<String> = None;
 
         let window_resp = egui::Window::new("Emotes")
             .open(&mut still_open)
@@ -196,6 +303,7 @@ impl EmotePicker {
                     Some("Browse Twitch, 7TV, BTTV, FFZ, and emoji."),
                 );
                 ui.add_space(6.0);
+
                 // Search bar
                 ui.horizontal(|ui| {
                     ui.label("🔍");
@@ -208,43 +316,95 @@ impl EmotePicker {
                 ui.add_space(2.0);
 
                 self.ensure_cache(catalog);
-                let view = self.cache.as_ref().unwrap();
+                let view = self.cache.as_ref().expect("cache initialized");
 
-                // Tab bar
+                // View tabs
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
 
-                    // "All" meta-tab - shows every emote regardless of provider.
-                    let total_count: usize = view.tabs.iter().map(|t| t.indices.len()).sum();
-                    let all_active = self.active_tab.is_none();
-                    let all_text = format!("All ({total_count})");
-                    let all_resp = ui.selectable_label(all_active, RichText::new(all_text).small());
-                    if all_resp.clicked() {
-                        self.active_tab = None;
+                    let all_count = view.all_indices.len();
+                    if ui
+                        .selectable_label(
+                            next_active_view == PickerView::All,
+                            RichText::new(format!("All ({all_count})")).small(),
+                        )
+                        .clicked()
+                    {
+                        next_active_view = PickerView::All;
+                    }
+
+                    let favorite_count = self.favorite_indices(view).len();
+                    if ui
+                        .selectable_label(
+                            next_active_view == PickerView::Favorites,
+                            RichText::new(format!("Favorites ({favorite_count})")).small(),
+                        )
+                        .clicked()
+                    {
+                        next_active_view = PickerView::Favorites;
+                    }
+
+                    let recent_count = self.recent_indices(view).len();
+                    if ui
+                        .selectable_label(
+                            next_active_view == PickerView::Recent,
+                            RichText::new(format!("Recent ({recent_count})")).small(),
+                        )
+                        .clicked()
+                    {
+                        next_active_view = PickerView::Recent;
                     }
 
                     for (ti, &(_, label)) in TABS.iter().enumerate() {
                         let count = view.tabs[ti].indices.len();
-                        let is_active = self.active_tab == Some(ti);
+                        let is_active = next_active_view == PickerView::Provider(ti);
                         let text = format!("{label} ({count})");
+                        if ui.selectable_label(is_active, RichText::new(text).small()).clicked() {
+                            next_active_view = PickerView::Provider(ti);
+                        }
+                    }
+                });
 
-                        let resp = ui.selectable_label(is_active, RichText::new(text).small());
-                        if resp.clicked() {
-                            self.active_tab = Some(ti);
+                // Provider boost controls for ranking preference.
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Boost").small().color(t::text_muted()));
+                    let none_active = next_provider_boost.is_none();
+                    if ui
+                        .selectable_label(none_active, RichText::new("None").small())
+                        .clicked()
+                    {
+                        next_provider_boost = None;
+                    }
+                    for &(provider_key, label) in TABS {
+                        let selected = next_provider_boost.as_deref() == Some(provider_key);
+                        if ui
+                            .selectable_label(selected, RichText::new(label).small())
+                            .clicked()
+                        {
+                            next_provider_boost = Some(provider_key.to_owned());
                         }
                     }
                 });
                 ui.separator();
 
-                // Content - use the merged "All" list when no provider tab is selected.
-                let all_view = self.cache.as_ref().unwrap();
-                let combined = &all_view.combined;
-                let tab_indices: &[usize] = match self.active_tab {
-                    Some(ti) => &all_view.tabs[ti].indices,
-                    None => &all_view.all_indices,
+                let mut display_indices: Vec<usize> = match next_active_view {
+                    PickerView::All => view.all_indices.clone(),
+                    PickerView::Favorites => self.favorite_indices(view),
+                    PickerView::Recent => self.recent_indices(view),
+                    PickerView::Provider(ti) => view
+                        .tabs
+                        .get(ti)
+                        .map(|t| t.indices.clone())
+                        .unwrap_or_default(),
                 };
 
-                if tab_indices.is_empty() {
+                self.rank_indices(
+                    &mut display_indices,
+                    &view.combined,
+                    next_active_view == PickerView::Recent,
+                );
+
+                if display_indices.is_empty() {
                     ui.vertical_centered(|ui| {
                         ui.add_space(40.0);
                         ui.label(
@@ -259,7 +419,7 @@ impl EmotePicker {
                 let available_w = ui.available_width();
                 let available_h = ui.available_height();
                 let cols = ((available_w / CELL_SIZE) as usize).max(1);
-                let num_rows = (tab_indices.len() + cols - 1) / cols;
+                let num_rows = (display_indices.len() + cols - 1) / cols;
                 let mut fetches_this_frame = 0usize;
                 let pointer_pos = ui.input(|i| i.pointer.hover_pos());
                 let mut has_animated_visible = false;
@@ -268,7 +428,6 @@ impl EmotePicker {
                     .max_height(available_h)
                     .auto_shrink([false; 2])
                     .show(ui, |ui| {
-                        // Lock content width to prevent layout feedback loop
                         ui.set_min_width(available_w);
                         ui.set_max_width(available_w);
 
@@ -284,18 +443,17 @@ impl EmotePicker {
                         let vis_bottom = clip.bottom() - base_y;
 
                         let first_row = (vis_top / ROW_H).floor().max(0.0) as usize;
-                        let last_row =
-                            ((vis_bottom / ROW_H).ceil().max(0.0) as usize).min(num_rows);
+                        let last_row = ((vis_bottom / ROW_H).ceil().max(0.0) as usize).min(num_rows);
 
                         let mut hovered_entry: Option<(usize, egui::Rect)> = None;
 
                         for row in first_row..last_row {
                             let start = row * cols;
-                            let end = (start + cols).min(tab_indices.len());
+                            let end = (start + cols).min(display_indices.len());
 
                             for slot in start..end {
-                                let cat_idx = tab_indices[slot];
-                                let entry = &combined[cat_idx];
+                                let cat_idx = display_indices[slot];
+                                let entry = &view.combined[cat_idx];
                                 let col = slot - start;
 
                                 let cell_x = grid_rect.left() + col as f32 * CELL_SIZE;
@@ -305,8 +463,7 @@ impl EmotePicker {
                                     egui::vec2(EMOTE_SIZE, EMOTE_SIZE),
                                 );
 
-                                // Fallback lazy fetch (most images should already
-                                // be prefetched, but just in case)
+                                // Fallback lazy fetch
                                 let has_bytes = emote_bytes.contains_key(entry.url.as_str());
                                 if !has_bytes
                                     && fetches_this_frame < FETCH_BATCH
@@ -323,10 +480,8 @@ impl EmotePicker {
                                     .map(|pos| cell_rect.contains(pos))
                                     .unwrap_or(false);
 
-                                // Render
                                 if has_bytes {
-                                    let &(w, h, ref raw) =
-                                        emote_bytes.get(entry.url.as_str()).unwrap();
+                                    let &(w, h, ref raw) = emote_bytes.get(entry.url.as_str()).unwrap();
                                     let animated = is_likely_animated_url(&entry.url);
                                     if animated && !animate_emotes {
                                         if !self.static_frames.contains_key(&entry.url) {
@@ -342,10 +497,8 @@ impl EmotePicker {
 
                                         if let Some(tex) = self.static_frames.get(&entry.url) {
                                             let size = fit_size(w, h, EMOTE_SIZE);
-                                            let image_rect = egui::Rect::from_center_size(
-                                                cell_rect.center(),
-                                                size,
-                                            );
+                                            let image_rect =
+                                                egui::Rect::from_center_size(cell_rect.center(), size);
                                             ui.painter().image(
                                                 tex.id(),
                                                 image_rect,
@@ -356,11 +509,7 @@ impl EmotePicker {
                                                 Color32::WHITE,
                                             );
                                         } else {
-                                            ui.painter().rect_filled(
-                                                cell_rect,
-                                                3.0,
-                                                t::tooltip_bg(),
-                                            );
+                                            ui.painter().rect_filled(cell_rect, 3.0, t::tooltip_bg());
                                         }
                                     } else {
                                         if animated && animate_emotes {
@@ -380,37 +529,57 @@ impl EmotePicker {
                                         );
                                     }
                                 } else {
-                                    ui.painter().rect_filled(
-                                        cell_rect,
-                                        3.0,
-                                        t::section_header_bg(),
+                                    ui.painter().rect_filled(cell_rect, 3.0, t::section_header_bg());
+                                }
+
+                                if self.favorite_urls.contains(entry.url.as_str()) {
+                                    ui.painter().text(
+                                        egui::pos2(cell_rect.right() - 2.0, cell_rect.top() + 1.0),
+                                        egui::Align2::RIGHT_TOP,
+                                        "★",
+                                        t::tiny(),
+                                        t::gold(),
                                     );
                                 }
 
-                                // Hover check via pointer position
                                 if is_hovered {
                                     hovered_entry = Some((cat_idx, cell_rect));
                                 }
                             }
                         }
 
-                        // Single hovered cell - click + tooltip
                         if let Some((cat_idx, rect)) = hovered_entry {
-                            let entry = &combined[cat_idx];
+                            let entry = &view.combined[cat_idx];
+                            let entry_url = entry.url.clone();
                             let click_resp =
                                 ui.interact(rect, egui::Id::new("ep_hover"), egui::Sense::click());
                             if click_resp.clicked() {
                                 picked = Some(entry.code.clone());
+                                picked_entry = Some(entry.clone());
                             }
+
+                            click_resp.context_menu(|ui| {
+                                let is_favorite = self.favorite_urls.contains(entry_url.as_str());
+                                let label = if is_favorite {
+                                    "Remove from favorites"
+                                } else {
+                                    "Add to favorites"
+                                };
+                                if ui.button(label).clicked() {
+                                    pending_favorite_toggle = Some(entry_url.clone());
+                                    ui.close_menu();
+                                }
+                            });
+
                             ui.painter().rect_stroke(
                                 rect.expand(2.0),
                                 4.0,
                                 egui::Stroke::new(1.5, t::accent()),
                                 egui::epaint::StrokeKind::Outside,
                             );
+
                             click_resp.on_hover_ui(|ui| {
-                                if let Some(&(w, h, ref raw)) = emote_bytes.get(entry.url.as_str())
-                                {
+                                if let Some(&(w, h, ref raw)) = emote_bytes.get(entry.url.as_str()) {
                                     let size = fit_size(w, h, 48.0);
                                     ui.add(
                                         egui::Image::from_bytes(
@@ -420,15 +589,32 @@ impl EmotePicker {
                                         .fit_to_exact_size(size),
                                     );
                                 }
-                                ui.label(RichText::new(&entry.code).strong());
+                                let fav = if self.favorite_urls.contains(entry.url.as_str()) {
+                                    " ★"
+                                } else {
+                                    ""
+                                };
+                                ui.label(RichText::new(format!("{}{}", entry.code, fav)).strong());
+                                ui.label(RichText::new(format!("{}", entry.provider)).small().color(t::text_muted()));
                             });
                         }
                     });
+
                 if has_animated_visible {
                     ui.ctx()
                         .request_repaint_after(std::time::Duration::from_millis(33));
                 }
             });
+
+        if let Some(entry) = picked_entry.as_ref() {
+            self.note_pick(entry);
+        }
+
+        self.active_view = next_active_view;
+        self.provider_boost = next_provider_boost;
+        if let Some(url) = pending_favorite_toggle {
+            self.toggle_favorite_url(&url);
+        }
 
         if let Some(resp) = &window_resp {
             let size = resp.response.rect.size();
@@ -438,7 +624,6 @@ impl EmotePicker {
                 .unwrap_or(true);
             if changed {
                 info!("Emote window size: {:.1} x {:.1}", size.x, size.y);
-                eprintln!("Emote window size: {:.1} x {:.1}", size.x, size.y);
                 self.last_logged_size = Some(size);
             }
         }

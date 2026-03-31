@@ -560,6 +560,7 @@ pub fn show_settings_page(
         .open(settings_open)
         .collapsible(false)
         .resizable(true)
+        .order(egui::Order::Foreground)
         .default_pos(settings_default_pos)
         .default_size(egui::vec2(760.0, 560.0))
         .show(ctx, |ui| {

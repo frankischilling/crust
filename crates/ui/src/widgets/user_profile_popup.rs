@@ -635,6 +635,9 @@ impl UserProfilePopup {
                 if let Some(f) = profile.followers {
                     add_row("Followers", fmt_count(f));
                 }
+                if let Some(ref pronouns) = profile.pronouns {
+                    add_row("Pronouns", pronouns.clone());
+                }
                 if let Some(ref ts) = profile.created_at {
                     add_row("Account age", fmt_account_age(ts));
                     add_row("Joined", fmt_join_date(ts));
@@ -794,6 +797,34 @@ impl UserProfilePopup {
                 channel: channel.clone(),
                 login: login.clone(),
                 user_id: user_id.clone(),
+            });
+        }
+
+        let channel_login = channel.display_name().to_ascii_lowercase();
+        if !channel_login.is_empty() {
+            ui.add_space(8.0);
+            section_label(ui, "Workflows");
+            ui.add_space(3.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Open mod view").clicked() {
+                    actions.push(PopupAction::OpenUrl {
+                        url: format!("https://www.twitch.tv/moderator/{channel_login}/chat"),
+                    });
+                }
+                if ui.button("Open AutoMod").clicked() {
+                    actions.push(PopupAction::OpenUrl {
+                        url: format!(
+                            "https://dashboard.twitch.tv/u/{channel_login}/settings/moderation/automod"
+                        ),
+                    });
+                }
+                if ui.button("Unban requests").clicked() {
+                    actions.push(PopupAction::OpenUrl {
+                        url: format!(
+                            "https://dashboard.twitch.tv/u/{channel_login}/community/unban-requests"
+                        ),
+                    });
+                }
             });
         }
 

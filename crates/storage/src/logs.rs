@@ -132,6 +132,40 @@ impl LogStore {
         Ok(out)
     }
 
+    /// Load older messages for a channel before `before_ts_ms`, oldest → newest.
+    pub fn older_messages(
+        &self,
+        channel: &ChannelId,
+        before_ts_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<ChatMessage>, StorageError> {
+        let safe_limit = limit.clamp(1, 5_000) as i64;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| StorageError::Io(std::io::Error::other("chat log DB mutex poisoned")))?;
+        let mut stmt = conn.prepare(
+            "SELECT payload_json
+             FROM chat_messages
+             WHERE channel = ?1 AND ts_ms < ?2
+             ORDER BY ts_ms DESC, id DESC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![channel.as_str(), before_ts_ms, safe_limit], |row| {
+            row.get::<_, String>(0)
+        })?;
+
+        let mut out: Vec<ChatMessage> = Vec::new();
+        for row in rows {
+            let payload = row?;
+            if let Ok(msg) = serde_json::from_str::<ChatMessage>(&payload) {
+                out.push(msg);
+            }
+        }
+        out.reverse(); // oldest first for prepend behavior
+        Ok(out)
+    }
+
     /// Compatibility wrapper: append a plain text line as a chat message.
     pub async fn append(
         &self,
@@ -277,6 +311,12 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].raw_text, "two");
         assert_eq!(rows[1].raw_text, "three");
+
+        let older = store
+            .older_messages(&channel, rows[0].timestamp.timestamp_millis(), 8)
+            .expect("load older rows");
+        assert_eq!(older.len(), 1);
+        assert_eq!(older[0].raw_text, "one");
 
         let _ = std::fs::remove_file(path);
     }

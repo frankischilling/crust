@@ -29,6 +29,7 @@ use crust_twitch::session::generic_irc::{
     is_raw_irc_protocol_line, GenericIrcEvent, GenericIrcSession, GenericIrcSessionCommand,
 };
 use crust_twitch::{
+    eventsub::{EventSubCommand, EventSubEvent, EventSubNoticeKind, EventSubSession},
     parse_line, parse_privmsg_irc,
     session::client::{SessionCommand, TwitchEvent, TwitchSession},
 };
@@ -57,6 +58,7 @@ const EVT_CHANNEL_SIZE: usize = 4096;
 const TWITCH_EVT_SIZE: usize = 4096;
 const KICK_EVT_SIZE: usize = 4096;
 const IRC_EVT_SIZE: usize = 4096;
+const EVENTSUB_EVT_SIZE: usize = 1024;
 const TWITCH_MAX_MESSAGE_CHARS: usize = 500;
 const TWITCH_GQL_URL: &str = "https://gql.twitch.tv/gql";
 const TWITCH_WEB_CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
@@ -263,6 +265,10 @@ fn main() -> Result<()> {
     let (irc_evt_tx, irc_evt_rx) = mpsc::channel::<GenericIrcEvent>(IRC_EVT_SIZE);
     let (irc_cmd_tx, irc_cmd_rx) = mpsc::channel::<GenericIrcSessionCommand>(128);
 
+    // Twitch EventSub channels
+    let (eventsub_evt_tx, eventsub_evt_rx) = mpsc::channel::<EventSubEvent>(EVENTSUB_EVT_SIZE);
+    let (eventsub_cmd_tx, eventsub_cmd_rx) = mpsc::channel::<EventSubCommand>(128);
+
     // Emote index shared between loaders and reducer
     let emote_index: EmoteIndex = Arc::new(RwLock::new(std::collections::HashMap::new()));
 
@@ -346,6 +352,12 @@ fn main() -> Result<()> {
         });
     }
 
+    // Spawn Twitch EventSub websocket/session manager.
+    rt.spawn({
+        let session = EventSubSession::new(eventsub_evt_tx, eventsub_cmd_rx);
+        session.run()
+    });
+
     // Load global emotes in background
     rt.spawn({
         let idx = emote_index.clone();
@@ -379,10 +391,12 @@ fn main() -> Result<()> {
             tw_evt_rx,
             kick_evt_rx,
             irc_evt_rx,
+            eventsub_evt_rx,
             evt_tx,
             sess_cmd_tx,
             kick_cmd_tx,
             irc_cmd_tx,
+            eventsub_cmd_tx,
             idx,
             cache,
             bm,
@@ -459,10 +473,12 @@ async fn reducer_loop(
     mut tw_rx: mpsc::Receiver<TwitchEvent>,
     mut kick_rx: mpsc::Receiver<KickEvent>,
     mut irc_rx: mpsc::Receiver<GenericIrcEvent>,
+    mut eventsub_rx: mpsc::Receiver<EventSubEvent>,
     evt_tx: mpsc::Sender<AppEvent>,
     sess_tx: mpsc::Sender<SessionCommand>,
     kick_tx: mpsc::Sender<KickSessionCommand>,
     irc_tx: mpsc::Sender<GenericIrcSessionCommand>,
+    eventsub_tx: mpsc::Sender<EventSubCommand>,
     emote_index: EmoteIndex,
     emote_cache: Option<EmoteCache>,
     badge_map: BadgeMap,
@@ -813,6 +829,11 @@ async fn reducer_loop(
                     TwitchEvent::RoomState { channel, room_id, emote_only, followers_only, slow, subs_only, r9k } => {
                         info!("Got room-id {room_id} for #{channel}");
                         channel_room_ids.insert(channel.clone(), room_id.clone());
+                        let _ = eventsub_tx
+                            .send(EventSubCommand::WatchChannel {
+                                broadcaster_id: room_id.clone(),
+                            })
+                            .await;
 
                         // Forward room-mode updates to the UI.
                         let _ = evt_tx.send(AppEvent::RoomStateUpdated {
@@ -900,6 +921,22 @@ async fn reducer_loop(
 
                         auth_username = Some(username.clone());
                         auth_user_id = Some(user_id.clone());
+                        sync_eventsub_auth(
+                            &eventsub_tx,
+                            &settings,
+                            helix_client_id.as_deref(),
+                            Some(&user_id),
+                        )
+                        .await;
+
+                        for broadcaster_id in channel_room_ids.values() {
+                            let _ = eventsub_tx
+                                .send(EventSubCommand::WatchChannel {
+                                    broadcaster_id: broadcaster_id.clone(),
+                                })
+                                .await;
+                        }
+
                         let _ = evt_tx.send(AppEvent::Authenticated {
                             username,
                             user_id: user_id.clone(),
@@ -1611,6 +1648,72 @@ async fn reducer_loop(
                 }
             }
 
+            // Twitch EventSub notifications and reconnect/backfill signals.
+            Some(eventsub_evt) = eventsub_rx.recv() => {
+                match eventsub_evt {
+                    EventSubEvent::Connected { resumed } => {
+                        info!("EventSub connected (resumed={resumed})");
+                    }
+                    EventSubEvent::Reconnecting { attempt } => {
+                        debug!("EventSub reconnect attempt {attempt}");
+                    }
+                    EventSubEvent::BackfillRequested => {
+                        // Refresh per-channel profile snapshots after reconnect so
+                        // online/offline title/game UI catches up immediately.
+                        let twitch_channels: Vec<String> = channel_room_ids
+                            .keys()
+                            .filter(|ch| ch.is_twitch())
+                            .map(|ch| ch.display_name().to_owned())
+                            .collect();
+                        for login in twitch_channels {
+                            let etx = evt_tx.clone();
+                            tokio::spawn(async move {
+                                fetch_twitch_user_profile(&login, etx).await;
+                            });
+                        }
+                    }
+                    EventSubEvent::Notice(notice) => {
+                        let channel = channel_room_ids
+                            .iter()
+                            .find(|(_, room_id)| *room_id == &notice.broadcaster_id)
+                            .map(|(ch, _)| ch.clone())
+                            .or_else(|| {
+                                notice
+                                    .broadcaster_login
+                                    .as_ref()
+                                    .map(|login| ChannelId::new(login.clone()))
+                            });
+
+                        if let Some(channel) = channel {
+                            let (msg_kind, text) = eventsub_notice_to_message(&notice.kind);
+                            let msg = make_system_message(
+                                local_msg_id,
+                                channel.clone(),
+                                text,
+                                Utc::now(),
+                                msg_kind,
+                            );
+                            local_msg_id += 1;
+                            let _ = evt_tx
+                                .send(AppEvent::MessageReceived {
+                                    channel,
+                                    message: msg,
+                                })
+                                .await;
+                        }
+                    }
+                    EventSubEvent::Error(message) => {
+                        warn!("EventSub error: {message}");
+                        let _ = evt_tx
+                            .send(AppEvent::Error {
+                                context: "EventSub".into(),
+                                message,
+                            })
+                            .await;
+                    }
+                }
+            }
+
             // Internal 7TV cosmetics updates (catalog + per-user style lookups).
             Some(stv_update) = stv_update_rx.recv() => {
                 match stv_update {
@@ -1851,6 +1954,11 @@ async fn reducer_loop(
                             let _ = sess_tx.send(SessionCommand::LeaveChannel(channel.clone())).await;
                         }
                         let _ = evt_tx.send(AppEvent::ChannelParted { channel: channel.clone() }).await;
+                        if let Some(broadcaster_id) = channel_room_ids.remove(&channel) {
+                            let _ = eventsub_tx
+                                .send(EventSubCommand::UnwatchChannel { broadcaster_id })
+                                .await;
+                        }
                         // Persist to settings
                         joined_channels.remove(&channel.0.to_lowercase());
                         save_channels(&settings_store, &mut settings, &joined_channels);
@@ -1914,6 +2022,7 @@ async fn reducer_loop(
                         }
                         auth_username = None;
                         auth_user_id = None;
+                        let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
                         let _ = sess_tx.send(SessionCommand::LogoutAndReconnect).await;
                         let _ = evt_tx.send(AppEvent::LoggedOut).await;
                         // Broadcast updated account list.
@@ -1951,6 +2060,7 @@ async fn reducer_loop(
                             auth_username = None;
                             auth_user_id = None;
                             let _ = evt_tx.send(AppEvent::LoggedOut).await;
+                            let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
                             auth_in_progress = true;
                             let _ = sess_tx.send(SessionCommand::Authenticate {
                                 token,
@@ -1998,6 +2108,7 @@ async fn reducer_loop(
                                     auth_username = None;
                                     auth_user_id = None;
                                     settings.username = String::new();
+                                    let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
                                     let _ = sess_tx.send(SessionCommand::LogoutAndReconnect).await;
                                     let _ = evt_tx.send(AppEvent::LoggedOut).await;
                                 }
@@ -2005,6 +2116,7 @@ async fn reducer_loop(
                                 auth_username = None;
                                 auth_user_id = None;
                                 settings.username = String::new();
+                                let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
                                 let _ = sess_tx.send(SessionCommand::LogoutAndReconnect).await;
                                 let _ = evt_tx.send(AppEvent::LoggedOut).await;
                             }
@@ -2598,6 +2710,238 @@ async fn reducer_loop(
                             ).await;
                         });
                     }
+                    AppCommand::UpdateRewardRedemptionStatus {
+                        channel,
+                        reward_id,
+                        redemption_id,
+                        status,
+                        user_login,
+                        reward_title,
+                    } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        let ch_name = channel.clone();
+                        tokio::spawn(async move {
+                            helix_update_reward_redemption_status(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                &reward_id,
+                                &redemption_id,
+                                &status,
+                                &user_login,
+                                &reward_title,
+                                &ch_name,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::CreatePoll {
+                        channel,
+                        title,
+                        choices,
+                        duration_secs,
+                    } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        tokio::spawn(async move {
+                            helix_create_poll(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                &title,
+                                &choices,
+                                duration_secs,
+                                &channel,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::EndPoll { channel, status } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        tokio::spawn(async move {
+                            helix_end_poll(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                &status,
+                                &channel,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::CreatePrediction {
+                        channel,
+                        title,
+                        outcomes,
+                        duration_secs,
+                    } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        tokio::spawn(async move {
+                            helix_create_prediction(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                &title,
+                                &outcomes,
+                                duration_secs,
+                                &channel,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::LockPrediction { channel } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        tokio::spawn(async move {
+                            helix_lock_prediction(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                &channel,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::ResolvePrediction {
+                        channel,
+                        winning_outcome_index,
+                    } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        tokio::spawn(async move {
+                            helix_resolve_prediction(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                winning_outcome_index,
+                                &channel,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::CancelPrediction { channel } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        tokio::spawn(async move {
+                            helix_cancel_prediction(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                &channel,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::StartCommercial {
+                        channel,
+                        length_secs,
+                    } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        tokio::spawn(async move {
+                            helix_start_commercial(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                length_secs,
+                                &channel,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::CreateStreamMarker {
+                        channel,
+                        description,
+                    } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        tokio::spawn(async move {
+                            helix_create_stream_marker(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                description.as_deref(),
+                                &channel,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::SendAnnouncement {
+                        channel,
+                        message,
+                        color,
+                    } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let moderator_id = auth_user_id.clone();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        tokio::spawn(async move {
+                            helix_send_announcement(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                moderator_id.as_deref(),
+                                &message,
+                                color.as_deref(),
+                                &channel,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::SendShoutout {
+                        channel,
+                        target_login,
+                    } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let moderator_id = auth_user_id.clone();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        tokio::spawn(async move {
+                            helix_send_shoutout(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                moderator_id.as_deref(),
+                                &target_login,
+                                &channel,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
                     AppCommand::ClearLocalMessages { channel } => {
                         let _ = evt_tx.send(AppEvent::ChannelMessagesCleared { channel }).await;
                     }
@@ -2628,6 +2972,26 @@ async fn reducer_loop(
                             fetch_ivr_logs(&channel, &username, etx).await;
                         });
                     }
+                    AppCommand::LoadOlderLocalHistory {
+                        channel,
+                        before_ts_ms,
+                        limit,
+                    } => {
+                        let Some(store) = chat_logs.clone() else {
+                            let _ = evt_tx
+                                .send(AppEvent::Error {
+                                    context: "History".into(),
+                                    message: "Local history is unavailable on this system.".into(),
+                                })
+                                .await;
+                            continue;
+                        };
+                        let etx = evt_tx.clone();
+                        tokio::spawn(async move {
+                            load_local_older_messages(channel, before_ts_ms, limit, store, etx)
+                                .await;
+                        });
+                    }
                 }
             }
 
@@ -2648,6 +3012,13 @@ async fn reducer_loop(
                                         let _ = store.save(&settings);
                                     }
                                 }
+                                sync_eventsub_auth(
+                                    &eventsub_tx,
+                                    &settings,
+                                    helix_client_id.as_deref(),
+                                    auth_user_id.as_deref(),
+                                )
+                                .await;
                                 // auth_in_progress was already set to true before spawn
                                 let _ = sess_tx
                                     .send(SessionCommand::Authenticate { token, nick: login })
@@ -2656,6 +3027,7 @@ async fn reducer_loop(
                             Err(ValidateError::Unauthorized) => {
                                 warn!("Saved token rejected by Twitch, clearing and starting anonymous");
                                 auth_in_progress = false;
+                                let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
                                 if let Some(store) = &settings_store {
                                     let _ = store.delete_token();
                                 }
@@ -2664,6 +3036,7 @@ async fn reducer_loop(
                             Err(ValidateError::Transient(e)) => {
                                 warn!("Token validation failed ({e}), keeping token and starting anonymous");
                                 auth_in_progress = false;
+                                let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
                                 let _ = evt_tx.send(AppEvent::LoggedOut).await;
                             }
                         }
@@ -2697,6 +3070,7 @@ async fn reducer_loop(
                                     auth_user_id = None;
                                     let _ = evt_tx.send(AppEvent::LoggedOut).await;
                                 }
+                                let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
                                 auth_in_progress = true;
                                 let _ = sess_tx.send(SessionCommand::Authenticate {
                                     token,
@@ -2748,6 +3122,7 @@ async fn reducer_loop(
                                     auth_user_id = None;
                                     let _ = evt_tx.send(AppEvent::LoggedOut).await;
                                 }
+                                let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
                                 auth_in_progress = true;
                                 let _ = sess_tx.send(SessionCommand::Authenticate {
                                     token,
@@ -2778,6 +3153,143 @@ async fn reducer_loop(
     }
 
     info!("Reducer loop exiting");
+}
+
+async fn sync_eventsub_auth(
+    eventsub_tx: &mpsc::Sender<EventSubCommand>,
+    settings: &AppSettings,
+    helix_client_id: Option<&str>,
+    auth_user_id: Option<&str>,
+) {
+    let token = settings.oauth_token.trim();
+    let cid = helix_client_id.unwrap_or("").trim();
+    let uid = auth_user_id.unwrap_or("").trim();
+
+    if token.is_empty() || cid.is_empty() || uid.is_empty() {
+        let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
+        return;
+    }
+
+    let _ = eventsub_tx
+        .send(EventSubCommand::SetAuth {
+            token: token.to_owned(),
+            client_id: cid.to_owned(),
+            user_id: uid.to_owned(),
+        })
+        .await;
+}
+
+fn format_eventsub_notice_text(kind: &EventSubNoticeKind) -> String {
+    match kind {
+        EventSubNoticeKind::Follow { user_login } => {
+            format!("{user_login} followed the channel.")
+        }
+        EventSubNoticeKind::Subscribe {
+            user_login,
+            tier,
+            is_gift,
+        } => {
+            if *is_gift {
+                format!("{user_login} subscribed with a gifted {tier} sub.")
+            } else {
+                format!("{user_login} subscribed ({tier}).")
+            }
+        }
+        EventSubNoticeKind::SubscriptionGift {
+            gifter_login,
+            tier,
+            total,
+        } => {
+            let from = gifter_login
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("An anonymous gifter");
+            if let Some(total) = total {
+                format!("{from} gifted {total} {tier} subscriptions.")
+            } else {
+                format!("{from} gifted a {tier} subscription.")
+            }
+        }
+        EventSubNoticeKind::Raid {
+            from_login,
+            viewers,
+        } => {
+            format!("Incoming raid from {from_login} with {viewers} viewers.")
+        }
+        EventSubNoticeKind::ChannelPointsRedemption {
+            user_login,
+            reward_title,
+            cost,
+            user_input,
+            status,
+            ..
+        } => {
+            let mut out = format!(
+                "{user_login} redeemed '{reward_title}' ({} points)",
+                cost
+            );
+            if let Some(input) = user_input.as_deref().filter(|s| !s.trim().is_empty()) {
+                out.push_str(&format!(": {input}"));
+            }
+            if let Some(status) = status.as_deref().filter(|s| !s.trim().is_empty()) {
+                out.push_str(&format!(" [{status}]"));
+            }
+            out
+        }
+        EventSubNoticeKind::PollLifecycle {
+            title,
+            phase,
+            status,
+        } => {
+            if let Some(status) = status.as_deref().filter(|s| !s.is_empty()) {
+                format!("Poll {phase}: {title} ({status})")
+            } else {
+                format!("Poll {phase}: {title}")
+            }
+        }
+        EventSubNoticeKind::PredictionLifecycle {
+            title,
+            phase,
+            status,
+        } => {
+            if let Some(status) = status.as_deref().filter(|s| !s.is_empty()) {
+                format!("Prediction {phase}: {title} ({status})")
+            } else {
+                format!("Prediction {phase}: {title}")
+            }
+        }
+        EventSubNoticeKind::StreamOnline => "Stream is now live.".to_owned(),
+        EventSubNoticeKind::StreamOffline => "Stream is now offline.".to_owned(),
+    }
+}
+
+fn eventsub_notice_to_message(kind: &EventSubNoticeKind) -> (MsgKind, String) {
+    match kind {
+        EventSubNoticeKind::ChannelPointsRedemption {
+            user_login,
+            reward_title,
+            cost,
+            reward_id,
+            redemption_id,
+            user_input,
+            status,
+        } => {
+            let text = format_eventsub_notice_text(kind);
+            (
+                MsgKind::ChannelPointsReward {
+                    user_login: user_login.clone(),
+                    reward_title: reward_title.clone(),
+                    cost: *cost,
+                    reward_id: reward_id.clone(),
+                    redemption_id: redemption_id.clone(),
+                    user_input: user_input.clone(),
+                    status: status.clone(),
+                },
+                text,
+            )
+        }
+        _ => (MsgKind::SystemInfo, format_eventsub_notice_text(kind)),
+    }
 }
 
 /// Parse Kick inline emote tags like `[emote:<id>:<code>]` and return:
@@ -3894,6 +4406,59 @@ async fn load_local_recent_messages(
         .await;
 }
 
+/// Load older locally persisted chat history rows before `before_ts_ms` and
+/// replay them as `AppEvent::HistoryLoaded` for incremental backfill.
+async fn load_local_older_messages(
+    channel: ChannelId,
+    before_ts_ms: i64,
+    limit: usize,
+    log_store: LogStore,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let channel_for_query = channel.clone();
+    let loaded = tokio::task::spawn_blocking(move || {
+        log_store.older_messages(&channel_for_query, before_ts_ms, limit)
+    })
+    .await;
+
+    let mut messages = match loaded {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(e)) => {
+            warn!(
+                "chat-history: local older SQLite load failed for #{}: {e}",
+                channel.display_name()
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(
+                "chat-history: local older SQLite task failed for #{}: {e}",
+                channel.display_name()
+            );
+            return;
+        }
+    };
+
+    if messages.is_empty() {
+        return;
+    }
+
+    for msg in &mut messages {
+        msg.id = MessageId(HISTORY_MSG_ID.fetch_sub(1, std::sync::atomic::Ordering::Relaxed));
+        msg.flags.is_history = true;
+        msg.channel = channel.clone();
+    }
+
+    info!(
+        "chat-history: loaded {} older local SQLite messages for #{}",
+        messages.len(),
+        channel.display_name()
+    );
+    let _ = evt_tx
+        .send(AppEvent::HistoryLoaded { channel, messages })
+        .await;
+}
+
 /// Fetch recent messages for a channel and send `AppEvent::HistoryLoaded`.
 /// Primary source: recent-messages.robotty.de (covers all channels, correct
 /// path uses a hyphen: /recent-messages/).  Fallback: logs.ivr.fi (large
@@ -4299,6 +4864,13 @@ async fn helix_ban_user(
             "permanently banned".into()
         };
         info!("Moderation: {target_login} {verb} in #{channel}");
+        emit_helix_system_info(
+            evt_tx,
+            channel,
+            format!("Moderation: {target_login} {verb}."),
+        )
+        .await;
+        return;
     } else {
         let body_text = resp.text().await.unwrap_or_default();
         warn!("helix_ban_user: HTTP {status} - {body_text}");
@@ -4374,6 +4946,13 @@ async fn helix_unban_user(
     let status = resp.status();
     if status.is_success() || status.as_u16() == 204 {
         info!("Moderation: {target_login} unbanned/untimedout in #{channel}");
+        emit_helix_system_info(
+            evt_tx,
+            channel,
+            format!("Moderation: {target_login} unbanned/untimed out."),
+        )
+        .await;
+        return;
     } else {
         let body_text = resp.text().await.unwrap_or_default();
         warn!("helix_unban_user: HTTP {status} - {body_text}");
@@ -4388,6 +4967,1313 @@ async fn helix_unban_user(
             })
             .await;
     }
+}
+
+/// Update a channel-points redemption status via
+/// `PATCH /helix/channel_points/custom_rewards/redemptions`.
+async fn helix_update_reward_redemption_status(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    reward_id: &str,
+    redemption_id: &str,
+    status: &str,
+    user_login: &str,
+    reward_title: &str,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (Some(cid), Some(bid)) = (client_id, broadcaster_id) else {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Channel Points".into(),
+                message: "Cannot update redemption: missing Twitch credentials.".into(),
+            })
+            .await;
+        return;
+    };
+
+    if reward_id.trim().is_empty() || redemption_id.trim().is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Channel Points".into(),
+                message: "Cannot update redemption: missing reward/redemption identifiers.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let status_norm = status.trim().to_ascii_uppercase();
+    if status_norm != "FULFILLED" && status_norm != "CANCELED" {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Channel Points".into(),
+                message: format!("Unsupported redemption status: {status}"),
+            })
+            .await;
+        return;
+    }
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    let url = format!(
+        "https://api.twitch.tv/helix/channel_points/custom_rewards/redemptions\
+         ?broadcaster_id={bid}&reward_id={reward_id}&id={redemption_id}"
+    );
+
+    #[derive(serde::Serialize)]
+    struct RedemptionStatusBody<'a> {
+        status: &'a str,
+    }
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .patch(&url)
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .json(&RedemptionStatusBody {
+            status: &status_norm,
+        })
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Channel Points".into(),
+                    message: format!("Redemption update request failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let http_status = resp.status();
+    if http_status.is_success() {
+        let action = if status_norm == "FULFILLED" {
+            "approved"
+        } else {
+            "rejected"
+        };
+        emit_helix_system_info(
+            evt_tx,
+            channel,
+            format!("{action} redemption '{reward_title}' from {user_login}."),
+        )
+        .await;
+        return;
+    }
+
+    let body = resp.text().await.unwrap_or_default();
+    let helix_msg = helix_error_message(http_status, &body);
+    let _ = evt_tx
+        .send(AppEvent::Error {
+            context: "Channel Points".into(),
+            message: format!("Could not update redemption: {helix_msg}"),
+        })
+        .await;
+}
+
+async fn emit_helix_system_info(evt_tx: mpsc::Sender<AppEvent>, channel: &ChannelId, text: String) {
+    let msg = make_system_message(
+        HISTORY_MSG_ID.fetch_sub(1, std::sync::atomic::Ordering::Relaxed),
+        channel.clone(),
+        text,
+        Utc::now(),
+        MsgKind::SystemInfo,
+    );
+    let _ = evt_tx
+        .send(AppEvent::MessageReceived {
+            channel: channel.clone(),
+            message: msg,
+        })
+        .await;
+}
+
+fn helix_error_message(status: reqwest::StatusCode, body_text: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body_text)
+        .ok()
+        .and_then(|v| {
+            v.get("message")
+                .and_then(|m| m.as_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| format!("HTTP {status}"))
+}
+
+fn require_helix_context<'a>(
+    client_id: Option<&'a str>,
+    broadcaster_id: Option<&'a str>,
+) -> Result<(&'a str, &'a str), String> {
+    let cid = client_id.ok_or_else(|| "Missing Twitch Client-ID.".to_owned())?;
+    let bid = broadcaster_id.ok_or_else(|| {
+        "Channel metadata not ready yet. Wait a moment, then retry command.".to_owned()
+    })?;
+    Ok((cid, bid))
+}
+
+fn require_helix_moderation_context<'a>(
+    client_id: Option<&'a str>,
+    broadcaster_id: Option<&'a str>,
+    moderator_id: Option<&'a str>,
+) -> Result<(&'a str, &'a str, &'a str), String> {
+    let (cid, bid) = require_helix_context(client_id, broadcaster_id)?;
+    let mid = moderator_id.ok_or_else(|| {
+        "Missing moderator identity. Reconnect and try again once chat auth finishes.".to_owned()
+    })?;
+    Ok((cid, bid, mid))
+}
+
+async fn helix_user_id_by_login(
+    bare_token: &str,
+    client_id: &str,
+    login: &str,
+) -> Result<String, String> {
+    #[derive(serde::Deserialize)]
+    struct UserItem {
+        id: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct UsersResponse {
+        data: Vec<UserItem>,
+    }
+
+    let url = format!("https://api.twitch.tv/helix/users?login={login}");
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(url)
+        .header("Authorization", format!("Bearer {bare_token}"))
+        .header("Client-Id", client_id)
+        .send()
+        .await
+        .map_err(|e| format!("Lookup user '{login}' failed: {e}"))?;
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "Lookup user '{login}' failed: {}",
+            helix_error_message(status, &body)
+        ));
+    }
+
+    let parsed = serde_json::from_str::<UsersResponse>(&body)
+        .map_err(|e| format!("Failed to parse user lookup response: {e}"))?;
+    let user = parsed
+        .data
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("Could not find Twitch channel '{login}'."))?;
+    Ok(user.id)
+}
+
+async fn helix_send_announcement(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    moderator_id: Option<&str>,
+    message: &str,
+    color: Option<&str>,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (cid, bid, mid) =
+        match require_helix_moderation_context(client_id, broadcaster_id, moderator_id) {
+            Ok(v) => v,
+            Err(msg) => {
+                let _ = evt_tx
+                    .send(AppEvent::Error {
+                        context: "Announcement".into(),
+                        message: msg,
+                    })
+                    .await;
+                return;
+            }
+        };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    if bare.trim().is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Announcement".into(),
+                message: "You must be logged in to send announcements.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Announcement".into(),
+                message: "Announcement message cannot be empty.".into(),
+            })
+            .await;
+        return;
+    }
+    if trimmed.chars().count() > 500 {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Announcement".into(),
+                message: "Announcement message must be 500 characters or fewer.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let normalized_color = color
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(str::to_ascii_lowercase)
+        .filter(|c| matches!(c.as_str(), "primary" | "blue" | "green" | "orange" | "purple"));
+
+    #[derive(serde::Serialize)]
+    struct AnnouncementBody<'a> {
+        message: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        color: Option<&'a str>,
+    }
+
+    let url = format!(
+        "https://api.twitch.tv/helix/chat/announcements?broadcaster_id={bid}&moderator_id={mid}"
+    );
+    let req = AnnouncementBody {
+        message: trimmed,
+        color: normalized_color.as_deref(),
+    };
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .post(url)
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .json(&req)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Announcement".into(),
+                    message: format!("Send announcement request failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let status = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        let color_note = normalized_color
+            .as_deref()
+            .map(|c| format!(" ({c})"))
+            .unwrap_or_default();
+        emit_helix_system_info(
+            evt_tx,
+            channel,
+            format!("Sent announcement{color_note}: {trimmed}"),
+        )
+        .await;
+        return;
+    }
+
+    let msg = helix_error_message(status, &body_text);
+    let _ = evt_tx
+        .send(AppEvent::Error {
+            context: "Announcement".into(),
+            message: format!("Could not send announcement: {msg}"),
+        })
+        .await;
+}
+
+async fn helix_send_shoutout(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    moderator_id: Option<&str>,
+    target_login: &str,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (cid, bid, mid) =
+        match require_helix_moderation_context(client_id, broadcaster_id, moderator_id) {
+            Ok(v) => v,
+            Err(msg) => {
+                let _ = evt_tx
+                    .send(AppEvent::Error {
+                        context: "Shoutout".into(),
+                        message: msg,
+                    })
+                    .await;
+                return;
+            }
+        };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    if bare.trim().is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Shoutout".into(),
+                message: "You must be logged in to send shoutouts.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let login = target_login.trim().trim_start_matches('@').to_ascii_lowercase();
+    if login.is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Shoutout".into(),
+                message: "Usage: /shoutout <channel>".into(),
+            })
+            .await;
+        return;
+    }
+    if login.eq_ignore_ascii_case(channel.display_name()) {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Shoutout".into(),
+                message: "You cannot shout out the current channel.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let to_broadcaster_id = match helix_user_id_by_login(bare, cid, &login).await {
+        Ok(id) => id,
+        Err(msg) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Shoutout".into(),
+                    message: msg,
+                })
+                .await;
+            return;
+        }
+    };
+
+    let url = format!(
+        "https://api.twitch.tv/helix/chat/shoutouts?from_broadcaster_id={bid}&to_broadcaster_id={to_broadcaster_id}&moderator_id={mid}"
+    );
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .post(url)
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Shoutout".into(),
+                    message: format!("Send shoutout request failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let status = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        emit_helix_system_info(evt_tx, channel, format!("Sent shoutout to {login}."))
+            .await;
+        return;
+    }
+
+    let msg = helix_error_message(status, &body_text);
+    let _ = evt_tx
+        .send(AppEvent::Error {
+            context: "Shoutout".into(),
+            message: format!("Could not send shoutout: {msg}"),
+        })
+        .await;
+}
+
+async fn helix_start_commercial(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    length_secs: u32,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (cid, bid) = match require_helix_context(client_id, broadcaster_id) {
+        Ok(v) => v,
+        Err(msg) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Commercial".into(),
+                    message: msg,
+                })
+                .await;
+            return;
+        }
+    };
+
+    if !matches!(length_secs, 30 | 60 | 90 | 120 | 150 | 180) {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Commercial".into(),
+                message: "Commercial length must be one of 30, 60, 90, 120, 150, or 180 seconds."
+                    .into(),
+            })
+            .await;
+        return;
+    }
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    if bare.trim().is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Commercial".into(),
+                message: "You must be logged in to start a commercial.".into(),
+            })
+            .await;
+        return;
+    }
+
+    #[derive(serde::Serialize)]
+    struct CommercialBody<'a> {
+        broadcaster_id: &'a str,
+        length: u32,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CommercialData {
+        length: Option<u32>,
+        message: Option<String>,
+        retry_after: Option<u32>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CommercialResponse {
+        data: Vec<CommercialData>,
+    }
+
+    let req = CommercialBody {
+        broadcaster_id: bid,
+        length: length_secs,
+    };
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .post("https://api.twitch.tv/helix/channels/commercial")
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .json(&req)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Commercial".into(),
+                    message: format!("Start commercial request failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let status = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        let info = serde_json::from_str::<CommercialResponse>(&body_text)
+            .ok()
+            .and_then(|payload| payload.data.into_iter().next());
+        let confirmed_len = info
+            .as_ref()
+            .and_then(|d| d.length)
+            .unwrap_or(length_secs);
+        let server_msg = info
+            .as_ref()
+            .and_then(|d| d.message.as_deref())
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or("Commercial started.");
+        let retry_hint = info
+            .as_ref()
+            .and_then(|d| d.retry_after)
+            .map(|retry| format!(" Next one available in {retry}s."))
+            .unwrap_or_default();
+        emit_helix_system_info(
+            evt_tx,
+            channel,
+            format!("Started {confirmed_len}s commercial. {server_msg}{retry_hint}"),
+        )
+        .await;
+        return;
+    }
+
+    let msg = helix_error_message(status, &body_text);
+    let _ = evt_tx
+        .send(AppEvent::Error {
+            context: "Commercial".into(),
+            message: format!("Could not start commercial: {msg}"),
+        })
+        .await;
+}
+
+async fn helix_create_stream_marker(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    description: Option<&str>,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (cid, bid) = match require_helix_context(client_id, broadcaster_id) {
+        Ok(v) => v,
+        Err(msg) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Marker".into(),
+                    message: msg,
+                })
+                .await;
+            return;
+        }
+    };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    if bare.trim().is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Marker".into(),
+                message: "You must be logged in to create a stream marker.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let description = description.map(str::trim).filter(|d| !d.is_empty());
+    if let Some(desc) = description {
+        if desc.chars().count() > 140 {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Marker".into(),
+                    message: "Marker description must be 140 characters or fewer.".into(),
+                })
+                .await;
+            return;
+        }
+    }
+
+    #[derive(serde::Serialize)]
+    struct MarkerBody<'a> {
+        user_id: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<&'a str>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct MarkerData {
+        id: Option<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct MarkerResponse {
+        data: Vec<MarkerData>,
+    }
+
+    let req = MarkerBody {
+        user_id: bid,
+        description,
+    };
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .post("https://api.twitch.tv/helix/streams/markers")
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .json(&req)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Marker".into(),
+                    message: format!("Create marker request failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let status = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        let marker_id = serde_json::from_str::<MarkerResponse>(&body_text)
+            .ok()
+            .and_then(|payload| payload.data.into_iter().next())
+            .and_then(|entry| entry.id);
+        let mut summary = if let Some(desc) = description {
+            format!("Created stream marker: {desc}")
+        } else {
+            "Created stream marker.".to_owned()
+        };
+        if let Some(id) = marker_id {
+            summary.push_str(&format!(" (id: {id})"));
+        }
+        emit_helix_system_info(evt_tx, channel, summary).await;
+        return;
+    }
+
+    let msg = helix_error_message(status, &body_text);
+    let _ = evt_tx
+        .send(AppEvent::Error {
+            context: "Marker".into(),
+            message: format!("Could not create stream marker: {msg}"),
+        })
+        .await;
+}
+
+async fn helix_create_poll(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    title: &str,
+    choices: &[String],
+    duration_secs: u32,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (cid, bid) = match require_helix_context(client_id, broadcaster_id) {
+        Ok(v) => v,
+        Err(msg) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Poll".into(),
+                    message: msg,
+                })
+                .await;
+            return;
+        }
+    };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    if bare.trim().is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Poll".into(),
+                message: "You must be logged in to manage polls.".into(),
+            })
+            .await;
+        return;
+    }
+
+    #[derive(serde::Serialize)]
+    struct PollChoice<'a> {
+        title: &'a str,
+    }
+
+    #[derive(serde::Serialize)]
+    struct PollBody<'a> {
+        broadcaster_id: &'a str,
+        title: &'a str,
+        choices: Vec<PollChoice<'a>>,
+        duration: u32,
+    }
+
+    let req = PollBody {
+        broadcaster_id: bid,
+        title,
+        choices: choices.iter().map(|c| PollChoice { title: c }).collect(),
+        duration: duration_secs,
+    };
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .post("https://api.twitch.tv/helix/polls")
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .json(&req)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Poll".into(),
+                    message: format!("Create poll request failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let status = resp.status();
+    if status.is_success() {
+        emit_helix_system_info(
+            evt_tx,
+            channel,
+            format!(
+                "Started poll: {title} ({} choices, {}s)",
+                choices.len(),
+                duration_secs
+            ),
+        )
+        .await;
+        return;
+    }
+
+    let body_text = resp.text().await.unwrap_or_default();
+    let msg = helix_error_message(status, &body_text);
+    let _ = evt_tx
+        .send(AppEvent::Error {
+            context: "Poll".into(),
+            message: format!("Could not create poll: {msg}"),
+        })
+        .await;
+}
+
+async fn helix_find_active_poll(
+    bare_token: &str,
+    client_id: &str,
+    broadcaster_id: &str,
+) -> Result<(String, String), String> {
+    #[derive(serde::Deserialize)]
+    struct PollItem {
+        id: String,
+        title: String,
+        status: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct PollList {
+        data: Vec<PollItem>,
+    }
+
+    let url = format!(
+        "https://api.twitch.tv/helix/polls?broadcaster_id={broadcaster_id}&first=20"
+    );
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(url)
+        .header("Authorization", format!("Bearer {bare_token}"))
+        .header("Client-Id", client_id)
+        .send()
+        .await
+        .map_err(|e| format!("Fetch active poll failed: {e}"))?;
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "Fetch active poll failed: {}",
+            helix_error_message(status, &body)
+        ));
+    }
+
+    let parsed = serde_json::from_str::<PollList>(&body)
+        .map_err(|e| format!("Failed to parse poll list: {e}"))?;
+    let active = parsed
+        .data
+        .into_iter()
+        .find(|p| p.status.eq_ignore_ascii_case("ACTIVE"))
+        .ok_or_else(|| "No active poll found in this channel.".to_owned())?;
+    Ok((active.id, active.title))
+}
+
+async fn helix_end_poll(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    status: &str,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (cid, bid) = match require_helix_context(client_id, broadcaster_id) {
+        Ok(v) => v,
+        Err(msg) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Poll".into(),
+                    message: msg,
+                })
+                .await;
+            return;
+        }
+    };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    if bare.trim().is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Poll".into(),
+                message: "You must be logged in to manage polls.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let (poll_id, poll_title) = match helix_find_active_poll(bare, cid, bid).await {
+        Ok(v) => v,
+        Err(msg) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Poll".into(),
+                    message: msg,
+                })
+                .await;
+            return;
+        }
+    };
+
+    #[derive(serde::Serialize)]
+    struct EndPollBody<'a> {
+        broadcaster_id: &'a str,
+        id: &'a str,
+        status: &'a str,
+    }
+
+    let req = EndPollBody {
+        broadcaster_id: bid,
+        id: &poll_id,
+        status,
+    };
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .patch("https://api.twitch.tv/helix/polls")
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .json(&req)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Poll".into(),
+                    message: format!("End poll request failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let http_status = resp.status();
+    if http_status.is_success() {
+        let verb = if status.eq_ignore_ascii_case("TERMINATED") {
+            "Canceled"
+        } else {
+            "Ended"
+        };
+        emit_helix_system_info(evt_tx, channel, format!("{verb} poll: {poll_title}"))
+            .await;
+        return;
+    }
+
+    let body_text = resp.text().await.unwrap_or_default();
+    let msg = helix_error_message(http_status, &body_text);
+    let _ = evt_tx
+        .send(AppEvent::Error {
+            context: "Poll".into(),
+            message: format!("Could not update poll: {msg}"),
+        })
+        .await;
+}
+
+#[derive(Debug, Clone)]
+struct HelixPredictionOutcome {
+    id: String,
+    title: String,
+}
+
+#[derive(Debug, Clone)]
+struct HelixPredictionState {
+    id: String,
+    title: String,
+    status: String,
+    outcomes: Vec<HelixPredictionOutcome>,
+}
+
+async fn helix_find_manageable_prediction(
+    bare_token: &str,
+    client_id: &str,
+    broadcaster_id: &str,
+) -> Result<HelixPredictionState, String> {
+    #[derive(serde::Deserialize)]
+    struct OutcomeItem {
+        id: String,
+        title: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct PredictionItem {
+        id: String,
+        title: String,
+        status: String,
+        outcomes: Vec<OutcomeItem>,
+    }
+    #[derive(serde::Deserialize)]
+    struct PredictionList {
+        data: Vec<PredictionItem>,
+    }
+
+    let url = format!(
+        "https://api.twitch.tv/helix/predictions?broadcaster_id={broadcaster_id}&first=20"
+    );
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(url)
+        .header("Authorization", format!("Bearer {bare_token}"))
+        .header("Client-Id", client_id)
+        .send()
+        .await
+        .map_err(|e| format!("Fetch active prediction failed: {e}"))?;
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "Fetch active prediction failed: {}",
+            helix_error_message(status, &body)
+        ));
+    }
+
+    let parsed = serde_json::from_str::<PredictionList>(&body)
+        .map_err(|e| format!("Failed to parse prediction list: {e}"))?;
+    let selected = parsed
+        .data
+        .into_iter()
+        .find(|p| {
+            p.status.eq_ignore_ascii_case("LOCKED") || p.status.eq_ignore_ascii_case("ACTIVE")
+        })
+        .ok_or_else(|| "No active or locked prediction found in this channel.".to_owned())?;
+
+    Ok(HelixPredictionState {
+        id: selected.id,
+        title: selected.title,
+        status: selected.status,
+        outcomes: selected
+            .outcomes
+            .into_iter()
+            .map(|o| HelixPredictionOutcome {
+                id: o.id,
+                title: o.title,
+            })
+            .collect(),
+    })
+}
+
+async fn helix_create_prediction(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    title: &str,
+    outcomes: &[String],
+    duration_secs: u32,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (cid, bid) = match require_helix_context(client_id, broadcaster_id) {
+        Ok(v) => v,
+        Err(msg) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Prediction".into(),
+                    message: msg,
+                })
+                .await;
+            return;
+        }
+    };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    if bare.trim().is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Prediction".into(),
+                message: "You must be logged in to manage predictions.".into(),
+            })
+            .await;
+        return;
+    }
+
+    #[derive(serde::Serialize)]
+    struct PredictionOutcome<'a> {
+        title: &'a str,
+    }
+
+    #[derive(serde::Serialize)]
+    struct PredictionBody<'a> {
+        broadcaster_id: &'a str,
+        title: &'a str,
+        outcomes: Vec<PredictionOutcome<'a>>,
+        prediction_window: u32,
+    }
+
+    let req = PredictionBody {
+        broadcaster_id: bid,
+        title,
+        outcomes: outcomes
+            .iter()
+            .map(|outcome| PredictionOutcome { title: outcome })
+            .collect(),
+        prediction_window: duration_secs,
+    };
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .post("https://api.twitch.tv/helix/predictions")
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .json(&req)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Prediction".into(),
+                    message: format!("Create prediction request failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let status = resp.status();
+    if status.is_success() {
+        emit_helix_system_info(
+            evt_tx,
+            channel,
+            format!(
+                "Started prediction: {title} ({} outcomes, {}s)",
+                outcomes.len(),
+                duration_secs
+            ),
+        )
+        .await;
+        return;
+    }
+
+    let body_text = resp.text().await.unwrap_or_default();
+    let msg = helix_error_message(status, &body_text);
+    let _ = evt_tx
+        .send(AppEvent::Error {
+            context: "Prediction".into(),
+            message: format!("Could not create prediction: {msg}"),
+        })
+        .await;
+}
+
+async fn helix_patch_prediction_status(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+    desired_status: &str,
+    winning_outcome_index: Option<usize>,
+) {
+    let (cid, bid) = match require_helix_context(client_id, broadcaster_id) {
+        Ok(v) => v,
+        Err(msg) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Prediction".into(),
+                    message: msg,
+                })
+                .await;
+            return;
+        }
+    };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    if bare.trim().is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Prediction".into(),
+                message: "You must be logged in to manage predictions.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let prediction = match helix_find_manageable_prediction(bare, cid, bid).await {
+        Ok(v) => v,
+        Err(msg) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Prediction".into(),
+                    message: msg,
+                })
+                .await;
+            return;
+        }
+    };
+
+    if desired_status.eq_ignore_ascii_case("LOCKED")
+        && !prediction.status.eq_ignore_ascii_case("ACTIVE")
+    {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Prediction".into(),
+                message: format!(
+                    "Prediction is {} and cannot be locked.",
+                    prediction.status
+                ),
+            })
+            .await;
+        return;
+    }
+
+    let winning_outcome_id = if let Some(index_1based) = winning_outcome_index {
+        let index = index_1based.saturating_sub(1);
+        let Some(outcome) = prediction.outcomes.get(index) else {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Prediction".into(),
+                    message: format!(
+                        "Outcome index {} is out of range. Available outcomes: {}.",
+                        index_1based,
+                        prediction.outcomes.len()
+                    ),
+                })
+                .await;
+            return;
+        };
+        Some((outcome.id.clone(), outcome.title.clone()))
+    } else {
+        None
+    };
+
+    #[derive(serde::Serialize)]
+    struct PatchPredictionBody<'a> {
+        broadcaster_id: &'a str,
+        id: &'a str,
+        status: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        winning_outcome_id: Option<&'a str>,
+    }
+
+    let req = PatchPredictionBody {
+        broadcaster_id: bid,
+        id: &prediction.id,
+        status: desired_status,
+        winning_outcome_id: winning_outcome_id.as_ref().map(|(id, _)| id.as_str()),
+    };
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .patch("https://api.twitch.tv/helix/predictions")
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .json(&req)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Prediction".into(),
+                    message: format!("Update prediction request failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let http_status = resp.status();
+    if http_status.is_success() {
+        let summary = if desired_status.eq_ignore_ascii_case("LOCKED") {
+            format!("Locked prediction: {}", prediction.title)
+        } else if desired_status.eq_ignore_ascii_case("CANCELED") {
+            format!("Canceled prediction: {}", prediction.title)
+        } else if desired_status.eq_ignore_ascii_case("RESOLVED") {
+            let winner = winning_outcome_id
+                .as_ref()
+                .map(|(_, title)| title.as_str())
+                .unwrap_or("<unknown>");
+            format!("Resolved prediction: {} (winner: {})", prediction.title, winner)
+        } else {
+            format!("Updated prediction: {}", prediction.title)
+        };
+        emit_helix_system_info(evt_tx, channel, summary).await;
+        return;
+    }
+
+    let body_text = resp.text().await.unwrap_or_default();
+    let msg = helix_error_message(http_status, &body_text);
+    let _ = evt_tx
+        .send(AppEvent::Error {
+            context: "Prediction".into(),
+            message: format!("Could not update prediction: {msg}"),
+        })
+        .await;
+}
+
+async fn helix_lock_prediction(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    helix_patch_prediction_status(
+        token,
+        client_id,
+        broadcaster_id,
+        channel,
+        evt_tx,
+        "LOCKED",
+        None,
+    )
+    .await;
+}
+
+async fn helix_resolve_prediction(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    winning_outcome_index: usize,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    helix_patch_prediction_status(
+        token,
+        client_id,
+        broadcaster_id,
+        channel,
+        evt_tx,
+        "RESOLVED",
+        Some(winning_outcome_index),
+    )
+    .await;
+}
+
+async fn helix_cancel_prediction(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    helix_patch_prediction_status(
+        token,
+        client_id,
+        broadcaster_id,
+        channel,
+        evt_tx,
+        "CANCELED",
+        None,
+    )
+    .await;
 }
 
 /// Error returned by [`validate_token`].

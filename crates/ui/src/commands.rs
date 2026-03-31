@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 /// Metadata for one built-in slash command.
 #[derive(Clone, Copy)]
 pub struct SlashCommandInfo {
@@ -28,6 +30,72 @@ const BUILTIN_SLASH_COMMANDS: &[SlashCommandInfo] = &[
         name: "chatters",
         usage: "/chatters",
         summary: "Show the current chatter count in this channel.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "poll",
+        usage: "/poll <title> | <choice1> | <choice2> [--duration <15..1800>]",
+        summary: "Create a Twitch poll (mod/broadcaster only).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "endpoll",
+        usage: "/endpoll",
+        summary: "End the active Twitch poll and archive results.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "cancelpoll",
+        usage: "/cancelpoll",
+        summary: "Cancel the active Twitch poll.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "prediction",
+        usage: "/prediction <title> | <outcome1> | <outcome2> [--duration <30..1800>]",
+        summary: "Create a Twitch prediction (mod/broadcaster only).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "lockprediction",
+        usage: "/lockprediction",
+        summary: "Lock wagering on the active Twitch prediction.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "endprediction",
+        usage: "/endprediction <winning outcome index>",
+        summary: "Resolve the active Twitch prediction.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "cancelprediction",
+        usage: "/cancelprediction",
+        summary: "Cancel the active Twitch prediction.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "commercial",
+        usage: "/commercial [30|60|90|120|150|180]",
+        summary: "Start a Twitch commercial break (mod/broadcaster only).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "marker",
+        usage: "/marker [description]",
+        summary: "Create a Twitch stream marker (mod/broadcaster only).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "announce",
+        usage: "/announce <message> [--color primary|blue|green|orange|purple]",
+        summary: "Send a Twitch announcement banner (mod/broadcaster only).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "shoutout",
+        usage: "/shoutout <channel>",
+        summary: "Send a Twitch shoutout to another channel (mod/broadcaster only).",
         aliases: &[],
     },
     SlashCommandInfo {
@@ -270,6 +338,16 @@ pub fn replace_slash_token(buf: &mut String, command: &str) {
 
 /// Find command suggestions for a slash query.
 pub fn slash_command_matches(query: &str, limit: usize) -> Vec<&'static SlashCommandInfo> {
+    let usage_counts: HashMap<String, u32> = HashMap::new();
+    slash_command_matches_ranked(query, limit, &usage_counts)
+}
+
+/// Find command suggestions for a slash query, weighted by command usage.
+pub fn slash_command_matches_ranked(
+    query: &str,
+    limit: usize,
+    usage_counts: &HashMap<String, u32>,
+) -> Vec<&'static SlashCommandInfo> {
     let q = query.to_ascii_lowercase();
     let mut matches: Vec<&SlashCommandInfo> = built_in_commands()
         .iter()
@@ -277,34 +355,106 @@ pub fn slash_command_matches(query: &str, limit: usize) -> Vec<&'static SlashCom
             if q.is_empty() {
                 true
             } else {
-                cmd.name.to_ascii_lowercase().contains(&q)
+                cmd.name.to_ascii_lowercase().starts_with(&q)
                     || cmd
                         .aliases
                         .iter()
-                        .any(|a| a.to_ascii_lowercase().contains(&q))
+                        .any(|a| a.to_ascii_lowercase().starts_with(&q))
             }
         })
         .collect();
 
-    if !q.is_empty() {
-        matches.sort_by(|a, b| {
-            let a_name = a.name.to_ascii_lowercase();
-            let b_name = b.name.to_ascii_lowercase();
-            let a_prefix = a_name.starts_with(&q)
-                || a.aliases
-                    .iter()
-                    .any(|al| al.to_ascii_lowercase().starts_with(&q));
-            let b_prefix = b_name.starts_with(&q)
-                || b.aliases
-                    .iter()
-                    .any(|al| al.to_ascii_lowercase().starts_with(&q));
-            b_prefix
-                .cmp(&a_prefix)
-                .then_with(|| a_name.len().cmp(&b_name.len()))
-                .then_with(|| a_name.cmp(&b_name))
-        });
-    }
+    matches.sort_by(|a, b| {
+        let a_name = a.name.to_ascii_lowercase();
+        let b_name = b.name.to_ascii_lowercase();
+        let a_exact = a_name == q || a.aliases.iter().any(|al| al.eq_ignore_ascii_case(&q));
+        let b_exact = b_name == q || b.aliases.iter().any(|al| al.eq_ignore_ascii_case(&q));
+        let a_prefix = a_name.starts_with(&q)
+            || a
+                .aliases
+                .iter()
+                .any(|al| al.to_ascii_lowercase().starts_with(&q));
+        let b_prefix = b_name.starts_with(&q)
+            || b
+                .aliases
+                .iter()
+                .any(|al| al.to_ascii_lowercase().starts_with(&q));
+        let a_usage = usage_weight(a, usage_counts);
+        let b_usage = usage_weight(b, usage_counts);
+
+        b_exact
+            .cmp(&a_exact)
+            .then_with(|| b_prefix.cmp(&a_prefix))
+            .then_with(|| b_usage.cmp(&a_usage))
+            .then_with(|| a_name.len().cmp(&b_name.len()))
+            .then_with(|| a_name.cmp(&b_name))
+    });
 
     matches.truncate(limit);
     matches
+}
+
+fn usage_weight(cmd: &SlashCommandInfo, usage_counts: &HashMap<String, u32>) -> u32 {
+    let mut out = usage_counts
+        .get(&cmd.name.to_ascii_lowercase())
+        .copied()
+        .unwrap_or(0);
+    for alias in cmd.aliases {
+        out = out.saturating_add(
+            usage_counts
+                .get(&alias.to_ascii_lowercase())
+                .copied()
+                .unwrap_or(0),
+        );
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::{
+        built_in_commands, extract_slash_query, slash_command_matches, slash_command_matches_ranked,
+    };
+
+    #[test]
+    fn slash_query_detects_root_slash() {
+        assert_eq!(extract_slash_query("/"), Some(""));
+    }
+
+    #[test]
+    fn slash_matches_return_all_for_empty_query() {
+        let all = slash_command_matches("", usize::MAX);
+        assert_eq!(all.len(), built_in_commands().len());
+    }
+
+    #[test]
+    fn slash_matches_include_prediction_commands() {
+        let pred = slash_command_matches("pred", usize::MAX);
+        assert!(pred.iter().any(|c| c.name == "prediction"));
+    }
+
+    #[test]
+    fn slash_matches_include_commercial_command() {
+        let matches = slash_command_matches("comm", usize::MAX);
+        assert!(matches.iter().any(|c| c.name == "commercial"));
+    }
+
+    #[test]
+    fn slash_matches_are_prefix_based_not_substring() {
+        // Should not match "prediction" via middle substring "edict".
+        let noisy = slash_command_matches("edict", usize::MAX);
+        assert!(!noisy.iter().any(|c| c.name == "prediction"));
+    }
+
+    #[test]
+    fn slash_matches_prioritize_recently_used_commands() {
+        let mut usage = HashMap::new();
+        usage.insert("shoutout".to_owned(), 25);
+        usage.insert("help".to_owned(), 2);
+
+        let ranked = slash_command_matches_ranked("", usize::MAX, &usage);
+        assert_eq!(ranked.first().map(|c| c.name), Some("shoutout"));
+    }
 }

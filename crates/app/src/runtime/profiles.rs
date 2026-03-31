@@ -7,6 +7,13 @@ use tracing::{info, warn};
 
 use crate::runtime::assets::fetch_and_decode_raw;
 
+fn non_empty_opt(input: Option<String>) -> Option<String> {
+    input.and_then(|v| {
+        let trimmed = v.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    })
+}
+
 /// Fetch a user profile appropriate for the channel platform.
 pub(crate) async fn fetch_user_profile_for_channel(
     login: &str,
@@ -90,6 +97,9 @@ pub(crate) async fn fetch_twitch_user_profile(login: &str, evt_tx: mpsc::Sender<
         /// User's chosen chat colour, e.g. `"#FF6905"`.
         #[serde(rename = "chatColor")]
         chat_color: Option<String>,
+        /// Optional pronouns label from profile providers.
+        #[serde(default, alias = "pronouns", alias = "pronoun")]
+        pronouns: Option<String>,
         /// Non-null while the channel is live.
         stream: Option<IvrStream>,
         /// Info about the most recent broadcast.
@@ -178,6 +188,7 @@ pub(crate) async fn fetch_twitch_user_profile(login: &str, evt_tx: mpsc::Sender<
         followers: user.followers,
         is_partner: user.roles.as_ref().map_or(false, |r| r.is_partner),
         is_affiliate: user.roles.as_ref().map_or(false, |r| r.is_affiliate),
+        pronouns: non_empty_opt(user.pronouns),
         chat_color: user.chat_color,
         is_live,
         stream_title,
@@ -429,6 +440,7 @@ pub(crate) async fn fetch_kick_user_profile(login: &str, evt_tx: mpsc::Sender<Ap
             followers: None,
             is_partner: false,
             is_affiliate: false,
+            pronouns: None,
             chat_color: None,
             is_live: false,
             stream_title: None,
@@ -554,6 +566,7 @@ pub(crate) async fn fetch_kick_user_profile(login: &str, evt_tx: mpsc::Sender<Ap
         followers,
         is_partner: user.as_ref().and_then(|u| u.is_verified).unwrap_or(false),
         is_affiliate: false,
+        pronouns: None,
         chat_color: None,
         is_live,
         stream_title,
