@@ -11,6 +11,9 @@ use tracing::{debug, info, warn};
 const EVENTSUB_WS_URL: &str = "wss://eventsub.wss.twitch.tv/ws";
 const RECONNECT_BACKOFF_SECS: &[u64] = &[1, 2, 5, 10, 20, 30];
 
+/// EventSub event deduplication cache size (number of recent event IDs to track).
+const EVENT_DEDUP_CACHE_SIZE: usize = 10000;
+
 #[derive(Debug, Clone)]
 pub enum EventSubCommand {
     SetAuth {
@@ -54,16 +57,56 @@ pub enum EventSubNoticeKind {
         redemption_id: Option<String>,
         user_input: Option<String>,
         status: Option<String>,
+        is_update: bool,
     },
     PollLifecycle {
         title: String,
         phase: String,
         status: Option<String>,
+        details: Option<String>,
     },
     PredictionLifecycle {
         title: String,
         phase: String,
         status: Option<String>,
+        details: Option<String>,
+    },
+    AutoModMessageHold {
+        message_id: String,
+        sender_user_id: String,
+        sender_login: String,
+        text: String,
+        reason: Option<String>,
+    },
+    AutoModMessageUpdate {
+        message_id: String,
+        status: String,
+    },
+    UnbanRequestCreate {
+        request_id: String,
+        user_id: String,
+        user_login: String,
+        text: Option<String>,
+        created_at: Option<String>,
+    },
+    UnbanRequestResolve {
+        request_id: String,
+        status: String,
+    },
+    ChannelBan {
+        user_login: String,
+        reason: Option<String>,
+        ends_at: Option<String>,
+    },
+    ChannelUnban {
+        user_login: String,
+    },
+    ModerationAction {
+        moderator_login: String,
+        action: String,
+        target_login: Option<String>,
+        target_message_id: Option<String>,
+        source_channel_login: Option<String>,
     },
     StreamOnline,
     StreamOffline,
@@ -71,6 +114,8 @@ pub enum EventSubNoticeKind {
 
 #[derive(Debug, Clone)]
 pub struct EventSubNotice {
+    /// EventSub metadata.message_id; stable per notification event.
+    pub event_id: Option<String>,
     pub broadcaster_id: String,
     pub broadcaster_login: Option<String>,
     pub kind: EventSubNoticeKind,
@@ -103,6 +148,34 @@ pub struct EventSubSession {
     watched_broadcasters: HashSet<String>,
     http: reqwest::Client,
     resumed_once: bool,
+    /// Deduplication cache: tracks recent event IDs to prevent duplicate processing.
+    seen_event_ids: LruCache,
+}
+
+/// Simple LRU cache for event ID deduplication.
+struct LruCache {
+    items: Vec<String>,
+    capacity: usize,
+}
+
+impl LruCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            items: Vec::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn contains(&self, key: &str) -> bool {
+        self.items.iter().any(|s| s == key)
+    }
+
+    fn insert(&mut self, key: String) {
+        if self.items.len() >= self.capacity {
+            self.items.remove(0);
+        }
+        self.items.push(key);
+    }
 }
 
 impl EventSubSession {
@@ -114,6 +187,7 @@ impl EventSubSession {
             watched_broadcasters: HashSet::new(),
             http: reqwest::Client::new(),
             resumed_once: false,
+            seen_event_ids: LruCache::new(EVENT_DEDUP_CACHE_SIZE),
         }
     }
 
@@ -290,6 +364,21 @@ impl EventSubSession {
                                         .and_then(|m| m.get("subscription_type"))
                                         .and_then(Value::as_str)
                                         .unwrap_or("");
+                                    
+                                    let event_id = parsed
+                                        .get("metadata")
+                                        .and_then(|m| m.get("message_id"))
+                                        .and_then(Value::as_str);
+
+                                    // Deduplicate: skip if we've already seen this event ID.
+                                    if let Some(eid) = event_id {
+                                        if self.seen_event_ids.contains(eid) {
+                                            debug!("Skipping duplicate EventSub notification: {eid}");
+                                            continue;
+                                        }
+                                        self.seen_event_ids.insert(eid.to_owned());
+                                    }
+
                                     if let Some(notice) = parse_notice(&parsed, sub_type) {
                                         self.emit(EventSubEvent::Notice(notice)).await;
                                     }
@@ -431,6 +520,11 @@ fn subscription_specs(broadcaster_id: &str, moderator_user_id: &str) -> Vec<Subs
             condition: json!({"broadcaster_user_id": bid}),
         },
         SubscriptionSpec {
+            kind: "channel.channel_points_custom_reward_redemption.update",
+            version: "1",
+            condition: json!({"broadcaster_user_id": bid}),
+        },
+        SubscriptionSpec {
             kind: "channel.poll.begin",
             version: "1",
             condition: json!({"broadcaster_user_id": bid}),
@@ -476,6 +570,63 @@ fn subscription_specs(broadcaster_id: &str, moderator_user_id: &str) -> Vec<Subs
                 "moderator_user_id": mid,
             }),
         });
+
+        out.push(SubscriptionSpec {
+            kind: "automod.message.hold",
+            version: "2",
+            condition: json!({
+                "broadcaster_user_id": bid,
+                "moderator_user_id": mid,
+            }),
+        });
+        out.push(SubscriptionSpec {
+            kind: "automod.message.update",
+            version: "1",
+            condition: json!({
+                "broadcaster_user_id": bid,
+                "moderator_user_id": mid,
+            }),
+        });
+        out.push(SubscriptionSpec {
+            kind: "channel.unban_request.create",
+            version: "1",
+            condition: json!({
+                "broadcaster_user_id": bid,
+                "moderator_user_id": mid,
+            }),
+        });
+        out.push(SubscriptionSpec {
+            kind: "channel.unban_request.resolve",
+            version: "1",
+            condition: json!({
+                "broadcaster_user_id": bid,
+                "moderator_user_id": mid,
+            }),
+        });
+        out.push(SubscriptionSpec {
+            kind: "channel.ban",
+            version: "1",
+            condition: json!({
+                "broadcaster_user_id": bid,
+                "moderator_user_id": mid,
+            }),
+        });
+        out.push(SubscriptionSpec {
+            kind: "channel.unban",
+            version: "1",
+            condition: json!({
+                "broadcaster_user_id": bid,
+                "moderator_user_id": mid,
+            }),
+        });
+        out.push(SubscriptionSpec {
+            kind: "channel.moderate",
+            version: "2",
+            condition: json!({
+                "broadcaster_user_id": bid,
+                "moderator_user_id": mid,
+            }),
+        });
     }
 
     out
@@ -485,6 +636,13 @@ fn parse_notice(root: &Value, sub_type: &str) -> Option<EventSubNotice> {
     let payload = root.get("payload")?;
     let event = payload.get("event")?;
     let subscription = payload.get("subscription");
+    let event_id = root
+        .get("metadata")
+        .and_then(|m| m.get("message_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
 
     let broadcaster_id = event
         .get("broadcaster_user_id")
@@ -567,7 +725,8 @@ fn parse_notice(root: &Value, sub_type: &str) -> Option<EventSubNotice> {
                 .and_then(|v| u32::try_from(v).ok())
                 .unwrap_or(0),
         },
-        "channel.channel_points_custom_reward_redemption.add" => {
+        "channel.channel_points_custom_reward_redemption.add"
+        | "channel.channel_points_custom_reward_redemption.update" => {
             let reward = event.get("reward");
             EventSubNoticeKind::ChannelPointsRedemption {
                 user_login: pick_non_empty(
@@ -608,6 +767,7 @@ fn parse_notice(root: &Value, sub_type: &str) -> Option<EventSubNotice> {
                     event.get("redemption_status").and_then(Value::as_str),
                 )
                 .map(str::to_owned),
+                is_update: sub_type.ends_with(".update"),
             }
         }
         "channel.poll.begin" | "channel.poll.progress" | "channel.poll.end" => {
@@ -624,6 +784,7 @@ fn parse_notice(root: &Value, sub_type: &str) -> Option<EventSubNotice> {
                     .to_owned(),
                 phase,
                 status: event.get("status").and_then(Value::as_str).map(str::to_owned),
+                details: summarize_poll_details(event),
             }
         }
         "channel.prediction.begin"
@@ -643,6 +804,161 @@ fn parse_notice(root: &Value, sub_type: &str) -> Option<EventSubNotice> {
                     .to_owned(),
                 phase,
                 status: event.get("status").and_then(Value::as_str).map(str::to_owned),
+                details: summarize_prediction_details(event),
+            }
+        }
+        "automod.message.hold" => {
+            let message = event.get("message");
+            let sender = message.and_then(|m| m.get("sender"));
+            let reason_text = event
+                .get("reason")
+                .and_then(|r| {
+                    r.get("reason")
+                        .and_then(Value::as_str)
+                        .or_else(|| r.get("type").and_then(Value::as_str))
+                })
+                .map(str::to_owned)
+                .or_else(|| event.get("reason").map(|r| r.to_string()));
+
+            EventSubNoticeKind::AutoModMessageHold {
+                message_id: pick_non_empty(
+                    event.get("message_id").and_then(Value::as_str),
+                    event.get("msg_id").and_then(Value::as_str),
+                    "",
+                )
+                .to_owned(),
+                sender_user_id: pick_non_empty(
+                    event.get("user_id").and_then(Value::as_str),
+                    sender.and_then(|s| s.get("user_id")).and_then(Value::as_str),
+                    "",
+                )
+                .to_owned(),
+                sender_login: pick_non_empty(
+                    event.get("user_login").and_then(Value::as_str),
+                    sender
+                        .and_then(|s| s.get("user_login"))
+                        .and_then(Value::as_str),
+                    "unknown",
+                )
+                .to_owned(),
+                text: pick_non_empty(
+                    message.and_then(|m| m.get("text")).and_then(Value::as_str),
+                    event.get("text").and_then(Value::as_str),
+                    "",
+                )
+                .to_owned(),
+                reason: reason_text,
+            }
+        }
+        "automod.message.update" => EventSubNoticeKind::AutoModMessageUpdate {
+            message_id: pick_non_empty(
+                event.get("message_id").and_then(Value::as_str),
+                event.get("msg_id").and_then(Value::as_str),
+                "",
+            )
+            .to_owned(),
+            status: pick_non_empty(
+                event.get("status").and_then(Value::as_str),
+                event.get("action").and_then(Value::as_str),
+                "UNKNOWN",
+            )
+            .to_owned(),
+        },
+        "channel.unban_request.create" => EventSubNoticeKind::UnbanRequestCreate {
+            request_id: pick_non_empty(
+                event.get("id").and_then(Value::as_str),
+                event.get("unban_request_id").and_then(Value::as_str),
+                "",
+            )
+            .to_owned(),
+            user_id: pick_non_empty(
+                event.get("user_id").and_then(Value::as_str),
+                event.get("requester_user_id").and_then(Value::as_str),
+                "",
+            )
+            .to_owned(),
+            user_login: pick_non_empty(
+                event.get("user_login").and_then(Value::as_str),
+                event.get("requester_user_login").and_then(Value::as_str),
+                "unknown",
+            )
+            .to_owned(),
+            text: pick_optional_non_empty(
+                event.get("text").and_then(Value::as_str),
+                event.get("message").and_then(Value::as_str),
+            )
+            .map(str::to_owned),
+            created_at: pick_optional_non_empty(
+                event.get("created_at").and_then(Value::as_str),
+                event.get("requested_at").and_then(Value::as_str),
+            )
+            .map(str::to_owned),
+        },
+        "channel.unban_request.resolve" => EventSubNoticeKind::UnbanRequestResolve {
+            request_id: pick_non_empty(
+                event.get("id").and_then(Value::as_str),
+                event.get("unban_request_id").and_then(Value::as_str),
+                "",
+            )
+            .to_owned(),
+            status: pick_non_empty(
+                event.get("status").and_then(Value::as_str),
+                event.get("resolution_status").and_then(Value::as_str),
+                "UNKNOWN",
+            )
+            .to_owned(),
+        },
+        "channel.ban" => EventSubNoticeKind::ChannelBan {
+            user_login: pick_non_empty(
+                event.get("user_login").and_then(Value::as_str),
+                event.get("user_name").and_then(Value::as_str),
+                "unknown",
+            )
+            .to_owned(),
+            reason: pick_optional_non_empty(
+                event.get("reason").and_then(Value::as_str),
+                event.get("moderator_message").and_then(Value::as_str),
+            )
+            .map(str::to_owned),
+            ends_at: pick_optional_non_empty(
+                event.get("ends_at").and_then(Value::as_str),
+                event.get("expires_at").and_then(Value::as_str),
+            )
+            .map(str::to_owned),
+        },
+        "channel.unban" => EventSubNoticeKind::ChannelUnban {
+            user_login: pick_non_empty(
+                event.get("user_login").and_then(Value::as_str),
+                event.get("user_name").and_then(Value::as_str),
+                "unknown",
+            )
+            .to_owned(),
+        },
+        "channel.moderate" => {
+            let action = parse_moderation_action(event);
+            EventSubNoticeKind::ModerationAction {
+                moderator_login: pick_non_empty(
+                    event.get("moderator_user_login").and_then(Value::as_str),
+                    event.get("moderator_user_name").and_then(Value::as_str),
+                    "a moderator",
+                )
+                .to_owned(),
+                action,
+                target_login: pick_optional_non_empty(
+                    event.get("user_login").and_then(Value::as_str),
+                    event.get("target_user_login").and_then(Value::as_str),
+                )
+                .map(str::to_owned),
+                target_message_id: parse_moderation_target_message_id(event),
+                source_channel_login: pick_optional_non_empty(
+                    event
+                        .get("source_broadcaster_user_login")
+                        .and_then(Value::as_str),
+                    event
+                        .get("source_broadcaster_user_name")
+                        .and_then(Value::as_str),
+                )
+                .map(str::to_owned),
             }
         }
         "stream.online" => EventSubNoticeKind::StreamOnline,
@@ -651,6 +967,7 @@ fn parse_notice(root: &Value, sub_type: &str) -> Option<EventSubNotice> {
     };
 
     Some(EventSubNotice {
+        event_id,
         broadcaster_id,
         broadcaster_login,
         kind,
@@ -674,5 +991,555 @@ fn normalize_tier(raw: Option<&str>) -> String {
         "Prime" | "prime" => "Prime".to_owned(),
         other if !other.trim().is_empty() => other.to_owned(),
         _ => "Unknown tier".to_owned(),
+    }
+}
+
+fn parse_moderation_action(event: &Value) -> String {
+    let Some(action) = event.get("action") else {
+        return "updated moderation state".to_owned();
+    };
+
+    if let Some(action_str) = action.as_str() {
+        let trimmed = action_str.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_owned();
+        }
+    }
+
+    if let Some(action_obj) = action.as_object() {
+        if let Some(kind) = action_obj
+            .get("type")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+        {
+            return kind.to_owned();
+        }
+
+        for key in [
+            "ban",
+            "unban",
+            "timeout",
+            "untimeout",
+            "warn",
+            "delete",
+            "clear",
+            "slow",
+            "slowoff",
+            "followers",
+            "followersoff",
+            "subscribers",
+            "subscribersoff",
+            "emoteonly",
+            "emoteonlyoff",
+            "uniquechat",
+            "uniquechatoff",
+            "raid",
+            "unraid",
+            "mod",
+            "unmod",
+            "vip",
+            "unvip",
+            "monitor",
+            "unmonitor",
+            "restrict",
+            "unrestrict",
+        ] {
+            if let Some(value) = action_obj.get(key) {
+                if key == "timeout" {
+                    let seconds = value
+                        .get("duration_seconds")
+                        .and_then(Value::as_u64)
+                        .or_else(|| value.get("duration").and_then(Value::as_u64));
+                    if let Some(seconds) = seconds {
+                        return format!("timeout_{seconds}s");
+                    }
+                }
+                if key == "slow" {
+                    let seconds = value
+                        .get("wait_time_seconds")
+                        .and_then(Value::as_u64)
+                        .or_else(|| value.get("duration_seconds").and_then(Value::as_u64));
+                    if let Some(seconds) = seconds {
+                        return format!("slow_{seconds}s");
+                    }
+                }
+                if key == "followers" {
+                    let minutes = value
+                        .get("follow_duration_minutes")
+                        .and_then(Value::as_u64)
+                        .or_else(|| value.get("duration_minutes").and_then(Value::as_u64));
+                    if let Some(minutes) = minutes {
+                        return format!("followers_{minutes}m");
+                    }
+                }
+                return key.to_owned();
+            }
+        }
+
+        if let Some(first_key) = action_obj.keys().next() {
+            if !first_key.trim().is_empty() {
+                return first_key.to_owned();
+            }
+        }
+    }
+
+    "updated moderation state".to_owned()
+}
+
+fn parse_moderation_target_message_id(event: &Value) -> Option<String> {
+    if let Some(message_id) = event
+        .get("message_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(message_id.to_owned());
+    }
+
+    event
+        .get("action")
+        .and_then(|value| find_nested_string_field(value, "message_id"))
+}
+
+fn find_nested_string_field(value: &Value, field_name: &str) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            if let Some(found) = map
+                .get(field_name)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return Some(found.to_owned());
+            }
+            for nested in map.values() {
+                if let Some(found) = find_nested_string_field(nested, field_name) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(items) => {
+            for nested in items {
+                if let Some(found) = find_nested_string_field(nested, field_name) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn summarize_poll_details(event: &Value) -> Option<String> {
+    let choices = event.get("choices")?.as_array()?;
+    if choices.is_empty() {
+        return None;
+    }
+
+    let mut rows: Vec<(String, u64)> = choices
+        .iter()
+        .filter_map(|choice| {
+            let title = choice
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())?
+                .to_owned();
+            let votes = choice
+                .get("votes")
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    let points = choice
+                        .get("channel_points_votes")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let bits = choice
+                        .get("bits_votes")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    Some(points.saturating_add(bits))
+                })
+                .unwrap_or(0);
+            Some((title, votes))
+        })
+        .collect();
+
+    if rows.is_empty() {
+        return None;
+    }
+
+    rows.sort_by(|(a_title, a_votes), (b_title, b_votes)| {
+        b_votes.cmp(a_votes).then_with(|| a_title.cmp(b_title))
+    });
+    let total: u64 = rows.iter().map(|(_, votes)| *votes).sum();
+
+    let summary = rows
+        .into_iter()
+        .take(3)
+        .map(|(title, votes)| {
+            if total > 0 {
+                let pct = ((votes as f64 / total as f64) * 100.0).round() as u64;
+                format!("{title} {pct}% ({votes})")
+            } else {
+                format!("{title} ({votes})")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    if summary.is_empty() {
+        None
+    } else {
+        Some(format!("Top: {summary}"))
+    }
+}
+
+fn summarize_prediction_details(event: &Value) -> Option<String> {
+    let outcomes = event.get("outcomes")?.as_array()?;
+    if outcomes.is_empty() {
+        return None;
+    }
+
+    let winning_id = event
+        .get("winning_outcome_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+
+    let mut rows: Vec<(String, u64, u64, bool)> = outcomes
+        .iter()
+        .filter_map(|outcome| {
+            let title = outcome
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())?
+                .to_owned();
+            let points = outcome
+                .get("channel_points")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let users = outcome.get("users").and_then(Value::as_u64).unwrap_or(0);
+            let is_winner = winning_id
+                .as_deref()
+                .and_then(|wid| outcome.get("id").and_then(Value::as_str).map(|id| id == wid))
+                .unwrap_or(false);
+            Some((title, points, users, is_winner))
+        })
+        .collect();
+
+    if rows.is_empty() {
+        return None;
+    }
+
+    rows.sort_by(|(a_title, a_points, _, _), (b_title, b_points, _, _)| {
+        b_points.cmp(a_points).then_with(|| a_title.cmp(b_title))
+    });
+    let total_points: u64 = rows.iter().map(|(_, points, _, _)| *points).sum();
+
+    let summary = rows
+        .into_iter()
+        .take(3)
+        .map(|(title, points, users, is_winner)| {
+            let winner = if is_winner { " [winner]" } else { "" };
+            if total_points > 0 {
+                let pct = ((points as f64 / total_points as f64) * 100.0).round() as u64;
+                format!("{title} {pct}% ({} pts, {} users){winner}", compact_u64(points), users)
+            } else {
+                format!("{title} ({} pts, {} users){winner}", compact_u64(points), users)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    if summary.is_empty() {
+        None
+    } else {
+        Some(format!("Top: {summary}"))
+    }
+}
+
+fn compact_u64(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}K", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{parse_notice, subscription_specs, EventSubNoticeKind};
+
+    #[test]
+    fn moderator_scoped_subscriptions_include_ban_and_moderate_topics() {
+        let specs = subscription_specs("123", "456");
+        let mut kinds: Vec<&str> = specs.iter().map(|s| s.kind).collect();
+        kinds.sort_unstable();
+
+        assert!(kinds.contains(&"channel.ban"));
+        assert!(kinds.contains(&"channel.unban"));
+        assert!(kinds.contains(&"channel.moderate"));
+    }
+
+    #[test]
+    fn parse_channel_ban_notice_extracts_user_and_reason() {
+        let payload = json!({
+            "payload": {
+                "event": {
+                    "broadcaster_user_id": "123",
+                    "broadcaster_user_login": "streamer",
+                    "user_login": "troublemaker",
+                    "reason": "spam",
+                    "ends_at": "2026-03-31T12:00:00Z"
+                }
+            }
+        });
+
+        let notice = parse_notice(&payload, "channel.ban").expect("channel.ban parsed");
+        match notice.kind {
+            EventSubNoticeKind::ChannelBan {
+                user_login,
+                reason,
+                ends_at,
+            } => {
+                assert_eq!(user_login, "troublemaker");
+                assert_eq!(reason.as_deref(), Some("spam"));
+                assert_eq!(ends_at.as_deref(), Some("2026-03-31T12:00:00Z"));
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_notice_extracts_event_id_from_metadata() {
+        let payload = json!({
+            "metadata": {
+                "message_id": "evt-123"
+            },
+            "payload": {
+                "event": {
+                    "broadcaster_user_id": "123",
+                    "broadcaster_user_login": "streamer",
+                    "user_login": "troublemaker"
+                }
+            }
+        });
+
+        let notice = parse_notice(&payload, "channel.ban").expect("channel.ban parsed");
+        assert_eq!(notice.event_id.as_deref(), Some("evt-123"));
+    }
+
+    #[test]
+    fn parse_channel_moderate_notice_extracts_action_and_target() {
+        let payload = json!({
+            "payload": {
+                "event": {
+                    "broadcaster_user_id": "123",
+                    "broadcaster_user_login": "streamer",
+                    "moderator_user_login": "mod_jane",
+                    "target_user_login": "viewer123",
+                    "action": {
+                        "type": "warn"
+                    }
+                }
+            }
+        });
+
+        let notice = parse_notice(&payload, "channel.moderate").expect("channel.moderate parsed");
+        match notice.kind {
+            EventSubNoticeKind::ModerationAction {
+                moderator_login,
+                action,
+                target_login,
+                target_message_id,
+                source_channel_login,
+            } => {
+                assert_eq!(moderator_login, "mod_jane");
+                assert_eq!(action, "warn");
+                assert_eq!(target_login.as_deref(), Some("viewer123"));
+                assert_eq!(target_message_id, None);
+                assert_eq!(source_channel_login, None);
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_channel_moderate_delete_extracts_message_id() {
+        let payload = json!({
+            "payload": {
+                "event": {
+                    "broadcaster_user_id": "123",
+                    "broadcaster_user_login": "streamer",
+                    "moderator_user_login": "mod_jane",
+                    "target_user_login": "viewer123",
+                    "action": {
+                        "delete": {
+                            "message_id": "abc-123"
+                        }
+                    }
+                }
+            }
+        });
+
+        let notice = parse_notice(&payload, "channel.moderate").expect("channel.moderate parsed");
+        match notice.kind {
+            EventSubNoticeKind::ModerationAction {
+                action,
+                target_message_id,
+                source_channel_login,
+                ..
+            } => {
+                assert_eq!(action, "delete");
+                assert_eq!(target_message_id.as_deref(), Some("abc-123"));
+                assert_eq!(source_channel_login, None);
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_channel_moderate_extracts_shared_chat_source_channel() {
+        let payload = json!({
+            "payload": {
+                "event": {
+                    "broadcaster_user_id": "123",
+                    "broadcaster_user_login": "streamer",
+                    "moderator_user_login": "mod_jane",
+                    "target_user_login": "viewer123",
+                    "source_broadcaster_user_login": "partner_stream",
+                    "action": {
+                        "type": "ban"
+                    }
+                }
+            }
+        });
+
+        let notice = parse_notice(&payload, "channel.moderate").expect("channel.moderate parsed");
+        match notice.kind {
+            EventSubNoticeKind::ModerationAction {
+                action,
+                source_channel_login,
+                ..
+            } => {
+                assert_eq!(action, "ban");
+                assert_eq!(source_channel_login.as_deref(), Some("partner_stream"));
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_channel_moderate_timeout_extracts_duration_action() {
+        let payload = json!({
+            "payload": {
+                "event": {
+                    "broadcaster_user_id": "123",
+                    "broadcaster_user_login": "streamer",
+                    "moderator_user_login": "mod_jane",
+                    "target_user_login": "viewer123",
+                    "action": {
+                        "timeout": {
+                            "duration_seconds": 600
+                        }
+                    }
+                }
+            }
+        });
+
+        let notice = parse_notice(&payload, "channel.moderate").expect("channel.moderate parsed");
+        match notice.kind {
+            EventSubNoticeKind::ModerationAction { action, .. } => {
+                assert_eq!(action, "timeout_600s");
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_channel_moderate_slow_extracts_wait_seconds() {
+        let payload = json!({
+            "payload": {
+                "event": {
+                    "broadcaster_user_id": "123",
+                    "broadcaster_user_login": "streamer",
+                    "moderator_user_login": "mod_jane",
+                    "action": {
+                        "slow": {
+                            "wait_time_seconds": 15
+                        }
+                    }
+                }
+            }
+        });
+
+        let notice = parse_notice(&payload, "channel.moderate").expect("channel.moderate parsed");
+        match notice.kind {
+            EventSubNoticeKind::ModerationAction { action, .. } => {
+                assert_eq!(action, "slow_15s");
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_poll_progress_includes_choice_summary_details() {
+        let payload = json!({
+            "payload": {
+                "event": {
+                    "broadcaster_user_id": "123",
+                    "title": "Best snack?",
+                    "status": "ACTIVE",
+                    "choices": [
+                        {"title": "Pizza", "votes": 120},
+                        {"title": "Burgers", "votes": 80}
+                    ]
+                }
+            }
+        });
+
+        let notice = parse_notice(&payload, "channel.poll.progress").expect("channel.poll.progress parsed");
+        match notice.kind {
+            EventSubNoticeKind::PollLifecycle { details, .. } => {
+                let details = details.expect("poll details");
+                assert!(details.contains("Pizza"));
+                assert!(details.contains("Burgers"));
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_prediction_progress_includes_outcome_summary_details() {
+        let payload = json!({
+            "payload": {
+                "event": {
+                    "broadcaster_user_id": "123",
+                    "title": "Will boss die?",
+                    "status": "ACTIVE",
+                    "outcomes": [
+                        {"id": "o1", "title": "Yes", "channel_points": 1500, "users": 21},
+                        {"id": "o2", "title": "No", "channel_points": 500, "users": 8}
+                    ]
+                }
+            }
+        });
+
+        let notice = parse_notice(&payload, "channel.prediction.progress")
+            .expect("channel.prediction.progress parsed");
+        match notice.kind {
+            EventSubNoticeKind::PredictionLifecycle { details, .. } => {
+                let details = details.expect("prediction details");
+                assert!(details.contains("Yes"));
+                assert!(details.contains("No"));
+                assert!(details.contains("pts"));
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
     }
 }

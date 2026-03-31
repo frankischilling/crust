@@ -128,6 +128,38 @@ impl ChannelState {
         }
     }
 
+    /// Update the status for the most recent channel points redemption message
+    /// with the given redemption id.
+    ///
+    /// Returns `true` when a matching message was found and updated.
+    pub fn update_redemption_status(&mut self, redemption_id: &str, status: &str) -> bool {
+        let redemption_id = redemption_id.trim();
+        let status = status.trim();
+        if redemption_id.is_empty() || status.is_empty() {
+            return false;
+        }
+
+        for m in self.messages.iter_mut().rev() {
+            if let super::MsgKind::ChannelPointsReward {
+                redemption_id: rid,
+                status: current_status,
+                ..
+            } = &mut m.msg_kind
+            {
+                let matches = rid
+                    .as_deref()
+                    .map(|id| id.eq_ignore_ascii_case(redemption_id))
+                    .unwrap_or(false);
+                if matches {
+                    *current_status = Some(status.to_owned());
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
     /// Prepend historical messages (e.g. from recent-messages API) to the
     /// front of the buffer. Duplicates (matched by `server_id`) are skipped,
     /// and the total remains bounded by `MAX_MESSAGES`.

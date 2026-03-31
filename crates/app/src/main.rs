@@ -1,6 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use directories::ProjectDirs;
@@ -11,7 +12,9 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use chrono::Utc;
-use crust_core::events::{AppCommand, AppEvent, ConnectionState};
+use crust_core::events::{
+    AppCommand, AppEvent, AutoModQueueItem, ConnectionState, UnbanRequestItem,
+};
 use crust_core::model::{
     Badge, ChannelId, ChatMessage, EmoteCatalogEntry, MessageFlags, MessageId, MsgKind, Sender,
     UserId,
@@ -59,6 +62,9 @@ const TWITCH_EVT_SIZE: usize = 4096;
 const KICK_EVT_SIZE: usize = 4096;
 const IRC_EVT_SIZE: usize = 4096;
 const EVENTSUB_EVT_SIZE: usize = 1024;
+const EVENTSUB_NOTICE_DEDUP_WINDOW: Duration = Duration::from_secs(45);
+const EVENTSUB_NOTICE_DEDUP_MAX_ENTRIES: usize = 4096;
+const MODERATION_CMD_COOLDOWN: Duration = Duration::from_millis(500);
 const TWITCH_MAX_MESSAGE_CHARS: usize = 500;
 const TWITCH_GQL_URL: &str = "https://gql.twitch.tv/gql";
 const TWITCH_WEB_CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
@@ -464,6 +470,10 @@ enum TokenValidationResult {
         token: String,
         result: Result<ValidateInfo, ValidateError>,
     },
+    Refresh {
+        token: String,
+        result: Result<ValidateInfo, ValidateError>,
+    },
 }
 
 /// Central reducer: receives raw Twitch/Kick events + UI commands, tokenizes
@@ -493,6 +503,13 @@ async fn reducer_loop(
     let mut pending_images: HashSet<String> = HashSet::new();
     // Track URLs we've already kicked off a link-preview fetch for.
     let mut pending_link_previews: HashSet<String> = HashSet::new();
+    // Track recent EventSub metadata.message_id values to avoid applying
+    // duplicated moderation/state events after websocket reconnects.
+    let mut seen_eventsub_notice_ids: HashMap<String, Instant> = HashMap::new();
+    let mut seen_eventsub_notice_gc_at = Instant::now();
+    // Simple per-channel cooldown for local moderation actions to avoid
+    // accidental duplicate requests from rapid clicks/hotkeys.
+    let mut moderation_cmd_cooldowns: HashMap<String, Instant> = HashMap::new();
 
     // 7TV cosmetics cache: global badges/paints + per-user resolved styles.
     let (stv_update_tx, mut stv_update_rx) = mpsc::channel::<SevenTvCosmeticUpdate>(512);
@@ -706,9 +723,29 @@ async fn reducer_loop(
     let _ = evt_tx
         .send(AppEvent::GeneralSettingsUpdated {
             show_timestamps: settings.show_timestamps,
+            show_timestamp_seconds: settings.show_timestamp_seconds,
+            use_24h_timestamps: settings.use_24h_timestamps,
+            local_log_indexing_enabled: settings.local_log_indexing_enabled,
             auto_join: settings.auto_join.clone(),
             highlights: settings.highlights.clone(),
             ignores: settings.ignores.clone(),
+            desktop_notifications_enabled: settings.desktop_notifications_enabled,
+        })
+        .await;
+    let _ = evt_tx
+        .send(AppEvent::SlashUsageCountsUpdated {
+            usage_counts: settings
+                .slash_usage_counts
+                .iter()
+                .map(|(name, count)| (name.clone(), *count))
+                .collect(),
+        })
+        .await;
+    let _ = evt_tx
+        .send(AppEvent::EmotePickerPreferencesUpdated {
+            favorites: settings.emote_picker_favorites.clone(),
+            recent: settings.emote_picker_recent.clone(),
+            provider_boost: settings.emote_picker_provider_boost.clone(),
         })
         .await;
     let _ = evt_tx
@@ -875,12 +912,14 @@ async fn reducer_loop(
                         });
                         // Load persisted local chat history first (SQLite),
                         // then merge remote history on top.
-                        if let Some(store) = chat_logs.clone() {
+                        if settings.local_log_indexing_enabled {
+                            if let Some(store) = chat_logs.clone() {
                             let ch_local = channel.clone();
                             let etx_local = evt_tx.clone();
                             tokio::spawn(async move {
                                 load_local_recent_messages(ch_local, store, etx_local).await;
                             });
+                            }
                         }
                         // Load recent chat history
                         let ch_hist = channel.clone();
@@ -1106,9 +1145,11 @@ async fn reducer_loop(
                         }
 
                         let channel = msg.channel.clone();
-                        if let Some(store) = chat_logs.as_ref() {
+                        if settings.local_log_indexing_enabled {
+                            if let Some(store) = chat_logs.as_ref() {
                             if let Err(e) = store.append_message(&msg) {
                                 warn!("chat-log: failed to persist Twitch message: {e}");
+                            }
                             }
                         }
                         let _ = evt_tx.send(AppEvent::MessageReceived {
@@ -1181,6 +1222,11 @@ async fn reducer_loop(
                         }).await;
                     }
                     TwitchEvent::ChatCleared { channel } => {
+                        let _ = evt_tx
+                            .send(AppEvent::ChannelMessagesCleared {
+                                channel: channel.clone(),
+                            })
+                            .await;
                         let msg = make_system_message(
                             local_msg_id, channel.clone(),
                             "Chat was cleared by a moderator.".to_owned(),
@@ -1381,9 +1427,11 @@ async fn reducer_loop(
                         }
 
                         let channel = msg.channel.clone();
-                        if let Some(store) = chat_logs.as_ref() {
+                        if settings.local_log_indexing_enabled {
+                            if let Some(store) = chat_logs.as_ref() {
                             if let Err(e) = store.append_message(&msg) {
                                 warn!("chat-log: failed to persist Kick message: {e}");
+                            }
                             }
                         }
                         let _ = evt_tx.send(AppEvent::MessageReceived {
@@ -1411,6 +1459,11 @@ async fn reducer_loop(
                         }).await;
                     }
                     KickEvent::ChatCleared { channel } => {
+                        let _ = evt_tx
+                            .send(AppEvent::ChannelMessagesCleared {
+                                channel: channel.clone(),
+                            })
+                            .await;
                         let msg = make_system_message(
                             local_msg_id, channel.clone(),
                             "Chat was cleared by a moderator.".to_owned(),
@@ -1635,9 +1688,11 @@ async fn reducer_loop(
                         }
 
                         let channel = msg.channel.clone();
-                        if let Some(store) = chat_logs.as_ref() {
+                        if settings.local_log_indexing_enabled {
+                            if let Some(store) = chat_logs.as_ref() {
                             if let Err(e) = store.append_message(&msg) {
                                 warn!("chat-log: failed to persist IRC message: {e}");
+                            }
                             }
                         }
                         let _ = evt_tx.send(AppEvent::MessageReceived {
@@ -1673,6 +1728,19 @@ async fn reducer_loop(
                         }
                     }
                     EventSubEvent::Notice(notice) => {
+                        if let Some(event_id) = notice.event_id.as_deref() {
+                            let now = Instant::now();
+                            if should_drop_duplicate_eventsub_notice(
+                                &mut seen_eventsub_notice_ids,
+                                event_id,
+                                now,
+                                &mut seen_eventsub_notice_gc_at,
+                            ) {
+                                debug!("Skipping duplicate EventSub notice id={event_id}");
+                                continue;
+                            }
+                        }
+
                         let channel = channel_room_ids
                             .iter()
                             .find(|(_, room_id)| *room_id == &notice.broadcaster_id)
@@ -1685,6 +1753,176 @@ async fn reducer_loop(
                             });
 
                         if let Some(channel) = channel {
+                            match &notice.kind {
+                                EventSubNoticeKind::AutoModMessageHold {
+                                    message_id,
+                                    sender_user_id,
+                                    sender_login,
+                                    text,
+                                    reason,
+                                } => {
+                                    if !message_id.trim().is_empty() {
+                                        let _ = evt_tx
+                                            .send(AppEvent::AutoModQueueAppend {
+                                                channel: channel.clone(),
+                                                item: AutoModQueueItem {
+                                                    message_id: message_id.clone(),
+                                                    sender_user_id: sender_user_id.clone(),
+                                                    sender_login: sender_login.clone(),
+                                                    text: text.clone(),
+                                                    reason: reason.clone(),
+                                                },
+                                            })
+                                            .await;
+                                    }
+                                }
+                                EventSubNoticeKind::AutoModMessageUpdate {
+                                    message_id,
+                                    status,
+                                } => {
+                                    if !message_id.trim().is_empty() {
+                                        let _ = evt_tx
+                                            .send(AppEvent::AutoModQueueRemove {
+                                                channel: channel.clone(),
+                                                message_id: message_id.clone(),
+                                                action: Some(status.clone()),
+                                            })
+                                            .await;
+                                    }
+                                }
+                                EventSubNoticeKind::UnbanRequestCreate {
+                                    request_id,
+                                    user_id,
+                                    user_login,
+                                    text,
+                                    created_at,
+                                } => {
+                                    if !request_id.trim().is_empty() {
+                                        let _ = evt_tx
+                                            .send(AppEvent::UnbanRequestUpsert {
+                                                channel: channel.clone(),
+                                                request: UnbanRequestItem {
+                                                    request_id: request_id.clone(),
+                                                    user_id: user_id.clone(),
+                                                    user_login: user_login.clone(),
+                                                    text: text.clone(),
+                                                    created_at: created_at.clone(),
+                                                    status: Some("PENDING".to_owned()),
+                                                },
+                                            })
+                                            .await;
+                                    }
+                                }
+                                EventSubNoticeKind::UnbanRequestResolve {
+                                    request_id,
+                                    status,
+                                } => {
+                                    if !request_id.trim().is_empty() {
+                                        let _ = evt_tx
+                                            .send(AppEvent::UnbanRequestResolved {
+                                                channel: channel.clone(),
+                                                request_id: request_id.clone(),
+                                                status: status.clone(),
+                                            })
+                                            .await;
+                                    }
+                                }
+                                EventSubNoticeKind::ChannelBan { user_login, .. } => {
+                                    if !user_login.trim().is_empty() {
+                                        let _ = evt_tx
+                                            .send(AppEvent::UserMessagesCleared {
+                                                channel: channel.clone(),
+                                                login: user_login.clone(),
+                                            })
+                                            .await;
+                                    }
+                                }
+                                EventSubNoticeKind::ModerationAction {
+                                    action,
+                                    target_login,
+                                    target_message_id,
+                                    ..
+                                } => {
+                                    if let Some((emote_only, followers_only, slow, subs_only, r9k)) =
+                                        room_state_update_from_moderation_action(action)
+                                    {
+                                        let _ = evt_tx
+                                            .send(AppEvent::RoomStateUpdated {
+                                                channel: channel.clone(),
+                                                emote_only,
+                                                followers_only,
+                                                slow,
+                                                subs_only,
+                                                r9k,
+                                            })
+                                            .await;
+                                    }
+
+                                    if let Some(effect) = moderation_action_effect_from_notice(
+                                        action,
+                                        target_login.as_deref(),
+                                        target_message_id.as_deref(),
+                                    ) {
+                                        match effect {
+                                            ModerationActionEffect::ChannelMessagesCleared => {
+                                                let _ = evt_tx
+                                                    .send(AppEvent::ChannelMessagesCleared {
+                                                        channel: channel.clone(),
+                                                    })
+                                                    .await;
+                                            }
+                                            ModerationActionEffect::UserMessagesCleared(login) => {
+                                                let _ = evt_tx
+                                                    .send(AppEvent::UserMessagesCleared {
+                                                        channel: channel.clone(),
+                                                        login,
+                                                    })
+                                                    .await;
+                                            }
+                                            ModerationActionEffect::MessageDeleted(server_id) => {
+                                                let _ = evt_tx
+                                                    .send(AppEvent::MessageDeleted {
+                                                        channel: channel.clone(),
+                                                        server_id,
+                                                    })
+                                                    .await;
+                                            }
+                                        }
+                                    }
+                                }
+                                EventSubNoticeKind::StreamOnline
+                                | EventSubNoticeKind::StreamOffline => {
+                                    let is_live =
+                                        stream_status_is_live_from_notice(&notice.kind).unwrap_or(false);
+                                    let login = notice
+                                        .broadcaster_login
+                                        .as_deref()
+                                        .map(str::trim)
+                                        .filter(|s| !s.is_empty())
+                                        .map(str::to_ascii_lowercase)
+                                        .unwrap_or_else(|| {
+                                            channel.display_name().to_ascii_lowercase()
+                                        });
+
+                                    if !login.is_empty() {
+                                        let _ = evt_tx
+                                            .send(AppEvent::StreamStatusUpdated {
+                                                login: login.clone(),
+                                                is_live,
+                                            })
+                                            .await;
+
+                                        if is_live {
+                                            let etx = evt_tx.clone();
+                                            tokio::spawn(async move {
+                                                fetch_twitch_user_profile(&login, etx).await;
+                                            });
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+
                             let (msg_kind, text) = eventsub_notice_to_message(&notice.kind);
                             let msg = make_system_message(
                                 local_msg_id,
@@ -2265,6 +2503,9 @@ async fn reducer_loop(
                     }
                     AppCommand::SetGeneralSettings {
                         show_timestamps,
+                        show_timestamp_seconds,
+                        use_24h_timestamps,
+                        local_log_indexing_enabled,
                         auto_join,
                         highlights,
                         ignores,
@@ -2306,6 +2547,9 @@ async fn reducer_loop(
                         }
 
                         settings.show_timestamps = show_timestamps;
+                        settings.show_timestamp_seconds = show_timestamp_seconds;
+                        settings.use_24h_timestamps = use_24h_timestamps;
+                        settings.local_log_indexing_enabled = local_log_indexing_enabled;
                         settings.auto_join = sanitized_auto_join.clone();
                         settings.highlights = sanitized_highlights.clone();
                         settings.ignores = sanitized_ignores.clone();
@@ -2320,9 +2564,119 @@ async fn reducer_loop(
                         let _ = evt_tx
                             .send(AppEvent::GeneralSettingsUpdated {
                                 show_timestamps: settings.show_timestamps,
+                                show_timestamp_seconds: settings.show_timestamp_seconds,
+                                use_24h_timestamps: settings.use_24h_timestamps,
+                                local_log_indexing_enabled: settings
+                                    .local_log_indexing_enabled,
                                 auto_join: settings.auto_join.clone(),
                                 highlights: settings.highlights.clone(),
                                 ignores: settings.ignores.clone(),
+                                desktop_notifications_enabled: settings
+                                    .desktop_notifications_enabled,
+                            })
+                            .await;
+                    }
+                    AppCommand::SetSlashUsageCounts { usage_counts } => {
+                        let mut sanitized: BTreeMap<String, u32> = BTreeMap::new();
+                        for (raw_name, count) in usage_counts {
+                            let key = raw_name
+                                .trim()
+                                .trim_start_matches('/')
+                                .to_ascii_lowercase();
+                            if key.is_empty() {
+                                continue;
+                            }
+                            let entry = sanitized.entry(key).or_insert(0);
+                            *entry = entry.saturating_add(count);
+                        }
+
+                        // Keep only the most-used commands to avoid unbounded growth
+                        // from arbitrary slash tokens.
+                        const MAX_SLASH_USAGE_ENTRIES: usize = 128;
+                        if sanitized.len() > MAX_SLASH_USAGE_ENTRIES {
+                            let mut ranked: Vec<(String, u32)> = sanitized.into_iter().collect();
+                            ranked.sort_by(|(a_name, a_count), (b_name, b_count)| {
+                                b_count.cmp(a_count).then_with(|| a_name.cmp(b_name))
+                            });
+                            ranked.truncate(MAX_SLASH_USAGE_ENTRIES);
+                            ranked.sort_by(|(a_name, _), (b_name, _)| a_name.cmp(b_name));
+                            sanitized = ranked.into_iter().collect();
+                        }
+
+                        settings.slash_usage_counts = sanitized.clone();
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save slash usage counts: {e}");
+                            }
+                        }
+
+                        let _ = evt_tx
+                            .send(AppEvent::SlashUsageCountsUpdated {
+                                usage_counts: sanitized.into_iter().collect(),
+                            })
+                            .await;
+                    }
+                    AppCommand::SetEmotePickerPreferences {
+                        favorites,
+                        recent,
+                        provider_boost,
+                    } => {
+                        let mut seen_favs: HashSet<String> = HashSet::new();
+                        let mut sanitized_favorites: Vec<String> = Vec::new();
+                        for raw in favorites {
+                            let trimmed = raw.trim();
+                            if trimmed.is_empty() {
+                                continue;
+                            }
+                            let key = trimmed.to_ascii_lowercase();
+                            if seen_favs.insert(key) {
+                                sanitized_favorites.push(trimmed.to_owned());
+                            }
+                        }
+
+                        let mut seen_recent: HashSet<String> = HashSet::new();
+                        let mut sanitized_recent: Vec<String> = Vec::new();
+                        for raw in recent {
+                            let trimmed = raw.trim();
+                            if trimmed.is_empty() {
+                                continue;
+                            }
+                            let key = trimmed.to_ascii_lowercase();
+                            if seen_recent.insert(key) {
+                                sanitized_recent.push(trimmed.to_owned());
+                            }
+                            if sanitized_recent.len() >= 80 {
+                                break;
+                            }
+                        }
+
+                        let sanitized_boost = provider_boost
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_ascii_lowercase)
+                            .filter(|s| {
+                                matches!(
+                                    s.as_str(),
+                                    "twitch" | "7tv" | "bttv" | "ffz" | "emoji"
+                                )
+                            });
+
+                        settings.emote_picker_favorites = sanitized_favorites.clone();
+                        settings.emote_picker_recent = sanitized_recent.clone();
+                        settings.emote_picker_provider_boost = sanitized_boost.clone();
+
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save emote picker preferences: {e}");
+                            }
+                        }
+
+                        let _ = evt_tx
+                            .send(AppEvent::EmotePickerPreferencesUpdated {
+                                favorites: sanitized_favorites,
+                                recent: sanitized_recent,
+                                provider_boost: sanitized_boost,
                             })
                             .await;
                     }
@@ -2381,6 +2735,77 @@ async fn reducer_loop(
                                     settings.split_header_show_viewer_count,
                             })
                             .await;
+                    }
+                    AppCommand::SetHighlightRules { rules } => {
+                        settings.highlight_rules = rules.clone();
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save highlight rules: {e}");
+                            }
+                        }
+                        let _ = evt_tx
+                            .send(AppEvent::HighlightRulesUpdated { rules })
+                            .await;
+                    }
+                    AppCommand::SetFilterRecords { records } => {
+                        settings.filter_records = records.clone();
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save filter records: {e}");
+                            }
+                        }
+                        let _ = evt_tx
+                            .send(AppEvent::FilterRecordsUpdated { records })
+                            .await;
+                    }
+                    AppCommand::SetModActionPresets { presets } => {
+                        settings.mod_action_presets = presets.clone();
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save mod action presets: {e}");
+                            }
+                        }
+                        let _ = evt_tx
+                            .send(AppEvent::ModActionPresetsUpdated { presets })
+                            .await;
+                    }
+                    AppCommand::SetNotificationSettings {
+                        desktop_notifications_enabled,
+                    } => {
+                        settings.desktop_notifications_enabled = desktop_notifications_enabled;
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save notification settings: {e}");
+                            }
+                        }
+                    }
+                    AppCommand::RefreshAuth => {
+                        // Re-validate the stored OAuth token without forcing a
+                        // full logout/login flow.  If the token is still valid,
+                        // this is a no-op.  If invalid, the validate path will
+                        // emit AppEvent::AuthExpired so the UI can prompt the user.
+                        let active_user = settings.username.trim();
+                        let token_opt = if active_user.is_empty() {
+                            settings_store.as_ref().and_then(|s| s.load_token())
+                        } else {
+                            settings_store.as_ref().and_then(|s| {
+                                s.load_account_token(active_user).or_else(|| s.load_token())
+                            })
+                        };
+
+                        if let Some(token) = token_opt {
+                            let tx = token_val_tx.clone();
+                            tokio::spawn(async move {
+                                let result = validate_token(&token).await;
+                                let _ = tx
+                                    .send(TokenValidationResult::Refresh { token, result })
+                                    .await;
+                            });
+                        } else {
+                            let _ = evt_tx
+                                .send(AppEvent::AuthExpired)
+                                .await;
+                        }
                     }
                     AppCommand::SendMessage {
                         channel,
@@ -2662,6 +3087,23 @@ async fn reducer_loop(
                         tokio::spawn(async move { fetch_twitch_user_profile(&login, etx).await; });
                     }
                     AppCommand::TimeoutUser { channel, login, user_id, seconds, reason } => {
+                        if let Some(remaining) = moderation_command_remaining_cooldown(
+                            &mut moderation_cmd_cooldowns,
+                            &channel,
+                            Instant::now(),
+                        ) {
+                            let _ = evt_tx
+                                .send(AppEvent::Error {
+                                    context: "Moderation".into(),
+                                    message: format!(
+                                        "Moderation action is on cooldown. Try again in {}ms.",
+                                        remaining.as_millis()
+                                    ),
+                                })
+                                .await;
+                            continue;
+                        }
+
                         let broadcaster_id = channel_room_ids.get(&channel).cloned();
                         let moderator_id   = auth_user_id.clone();
                         let token          = settings.oauth_token.clone();
@@ -2678,7 +3120,39 @@ async fn reducer_loop(
                             ).await;
                         });
                     }
+                    AppCommand::DeleteMessage { channel, message_id } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let moderator_id   = auth_user_id.clone();
+                        let token          = settings.oauth_token.clone();
+                        let client_id      = helix_client_id.clone();
+                        let evt_tx2        = evt_tx.clone();
+                        let ch_name        = channel.clone();
+                        tokio::spawn(async move {
+                            helix_delete_message(
+                                &token, client_id.as_deref(),
+                                broadcaster_id.as_deref(), moderator_id.as_deref(),
+                                &message_id, &ch_name, evt_tx2,
+                            ).await;
+                        });
+                    }
                     AppCommand::BanUser { channel, login, user_id, reason } => {
+                        if let Some(remaining) = moderation_command_remaining_cooldown(
+                            &mut moderation_cmd_cooldowns,
+                            &channel,
+                            Instant::now(),
+                        ) {
+                            let _ = evt_tx
+                                .send(AppEvent::Error {
+                                    context: "Moderation".into(),
+                                    message: format!(
+                                        "Moderation action is on cooldown. Try again in {}ms.",
+                                        remaining.as_millis()
+                                    ),
+                                })
+                                .await;
+                            continue;
+                        }
+
                         let broadcaster_id = channel_room_ids.get(&channel).cloned();
                         let moderator_id   = auth_user_id.clone();
                         let token          = settings.oauth_token.clone();
@@ -2696,6 +3170,23 @@ async fn reducer_loop(
                         });
                     }
                     AppCommand::UnbanUser { channel, login, user_id } => {
+                        if let Some(remaining) = moderation_command_remaining_cooldown(
+                            &mut moderation_cmd_cooldowns,
+                            &channel,
+                            Instant::now(),
+                        ) {
+                            let _ = evt_tx
+                                .send(AppEvent::Error {
+                                    context: "Moderation".into(),
+                                    message: format!(
+                                        "Moderation action is on cooldown. Try again in {}ms.",
+                                        remaining.as_millis()
+                                    ),
+                                })
+                                .await;
+                            continue;
+                        }
+
                         let broadcaster_id = channel_room_ids.get(&channel).cloned();
                         let moderator_id   = auth_user_id.clone();
                         let token          = settings.oauth_token.clone();
@@ -2709,6 +3200,84 @@ async fn reducer_loop(
                                 &user_id, &login, &ch_name, evt_tx2,
                             ).await;
                         });
+                    }
+                    AppCommand::ResolveAutoModMessage {
+                        channel,
+                        message_id,
+                        sender_user_id,
+                        action,
+                    } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let moderator_id = auth_user_id.clone();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        let ch_name = channel.clone();
+                        tokio::spawn(async move {
+                            helix_resolve_automod_message(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                moderator_id.as_deref(),
+                                &message_id,
+                                &sender_user_id,
+                                &action,
+                                &ch_name,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::FetchUnbanRequests { channel } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let moderator_id = auth_user_id.clone();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        let ch_name = channel.clone();
+                        tokio::spawn(async move {
+                            helix_fetch_unban_requests(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                moderator_id.as_deref(),
+                                &ch_name,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::ResolveUnbanRequest {
+                        channel,
+                        request_id,
+                        approve,
+                        resolution_text,
+                    } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let moderator_id = auth_user_id.clone();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        let ch_name = channel.clone();
+                        tokio::spawn(async move {
+                            helix_resolve_unban_request(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                moderator_id.as_deref(),
+                                &request_id,
+                                approve,
+                                resolution_text.as_deref(),
+                                &ch_name,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::OpenModerationTools { channel } => {
+                        let _ = evt_tx
+                            .send(AppEvent::OpenModerationTools { channel })
+                            .await;
                     }
                     AppCommand::UpdateRewardRedemptionStatus {
                         channel,
@@ -2744,6 +3313,7 @@ async fn reducer_loop(
                         title,
                         choices,
                         duration_secs,
+                        channel_points_per_vote,
                     } => {
                         let broadcaster_id = channel_room_ids.get(&channel).cloned();
                         let token = settings.oauth_token.clone();
@@ -2757,6 +3327,7 @@ async fn reducer_loop(
                                 &title,
                                 &choices,
                                 duration_secs,
+                                channel_points_per_vote,
                                 &channel,
                                 evt_tx2,
                             )
@@ -2977,6 +3548,16 @@ async fn reducer_loop(
                         before_ts_ms,
                         limit,
                     } => {
+                        if !settings.local_log_indexing_enabled {
+                            let _ = evt_tx
+                                .send(AppEvent::Error {
+                                    context: "History".into(),
+                                    message:
+                                        "Local log indexing is disabled in settings.".into(),
+                                })
+                                .await;
+                            continue;
+                        }
                         let Some(store) = chat_logs.clone() else {
                             let _ = evt_tx
                                 .send(AppEvent::Error {
@@ -3145,6 +3726,54 @@ async fn reducer_loop(
                             }
                         }
                     }
+                    TokenValidationResult::Refresh { token, result } => {
+                        match result {
+                            Ok(info) => {
+                                let login = info.login;
+                                let client_id = info.client_id;
+
+                                if !client_id.is_empty() {
+                                    helix_client_id = Some(client_id);
+                                }
+                                // Keep legacy and active-account token fields in sync.
+                                settings.oauth_token = token.clone();
+                                if !settings.username.is_empty() {
+                                    if let Some(acc) = settings
+                                        .accounts
+                                        .iter_mut()
+                                        .find(|a| a.username == settings.username)
+                                    {
+                                        acc.oauth_token = token.clone();
+                                    }
+                                }
+                                if let Some(store) = &settings_store {
+                                    let _ = store.save(&settings);
+                                    if !settings.username.is_empty() {
+                                        store.try_save_account_keyring(&settings.username, &token);
+                                    }
+                                }
+
+                                // If the runtime lost auth state, re-authenticate silently.
+                                if auth_username.is_none() {
+                                    auth_in_progress = true;
+                                    let nick = if login.is_empty() {
+                                        settings.username.clone()
+                                    } else {
+                                        login
+                                    };
+                                    let _ = sess_tx
+                                        .send(SessionCommand::Authenticate { token, nick })
+                                        .await;
+                                }
+                            }
+                            Err(ValidateError::Unauthorized) => {
+                                let _ = evt_tx.send(AppEvent::AuthExpired).await;
+                            }
+                            Err(ValidateError::Transient(e)) => {
+                                warn!("RefreshAuth transient validation error: {e}");
+                            }
+                        }
+                    }
                 }
             }
 
@@ -3222,17 +3851,31 @@ fn format_eventsub_notice_text(kind: &EventSubNoticeKind) -> String {
             cost,
             user_input,
             status,
+            is_update,
             ..
         } => {
-            let mut out = format!(
-                "{user_login} redeemed '{reward_title}' ({} points)",
-                cost
-            );
-            if let Some(input) = user_input.as_deref().filter(|s| !s.trim().is_empty()) {
-                out.push_str(&format!(": {input}"));
-            }
-            if let Some(status) = status.as_deref().filter(|s| !s.trim().is_empty()) {
-                out.push_str(&format!(" [{status}]"));
+            let mut out = if *is_update {
+                if let Some(status) = status.as_deref().filter(|s| !s.trim().is_empty()) {
+                    format!(
+                        "Redemption '{reward_title}' from {user_login} is now {status}."
+                    )
+                } else {
+                    format!("Redemption '{reward_title}' from {user_login} was updated.")
+                }
+            } else {
+                format!(
+                    "{user_login} redeemed '{reward_title}' ({} points)",
+                    cost
+                )
+            };
+
+            if !*is_update {
+                if let Some(input) = user_input.as_deref().filter(|s| !s.trim().is_empty()) {
+                    out.push_str(&format!(": {input}"));
+                }
+                if let Some(status) = status.as_deref().filter(|s| !s.trim().is_empty()) {
+                    out.push_str(&format!(" [{status}]"));
+                }
             }
             out
         }
@@ -3240,22 +3883,114 @@ fn format_eventsub_notice_text(kind: &EventSubNoticeKind) -> String {
             title,
             phase,
             status,
+            details,
         } => {
-            if let Some(status) = status.as_deref().filter(|s| !s.is_empty()) {
+            let mut out = if let Some(status) = status.as_deref().filter(|s| !s.is_empty()) {
                 format!("Poll {phase}: {title} ({status})")
             } else {
                 format!("Poll {phase}: {title}")
+            };
+            if let Some(details) = details.as_deref().filter(|s| !s.trim().is_empty()) {
+                out.push_str(&format!(" - {details}"));
             }
+            out
         }
         EventSubNoticeKind::PredictionLifecycle {
             title,
             phase,
             status,
+            details,
         } => {
-            if let Some(status) = status.as_deref().filter(|s| !s.is_empty()) {
+            let mut out = if let Some(status) = status.as_deref().filter(|s| !s.is_empty()) {
                 format!("Prediction {phase}: {title} ({status})")
             } else {
                 format!("Prediction {phase}: {title}")
+            };
+            if let Some(details) = details.as_deref().filter(|s| !s.trim().is_empty()) {
+                out.push_str(&format!(" - {details}"));
+            }
+            out
+        }
+        EventSubNoticeKind::AutoModMessageHold {
+            sender_login,
+            text,
+            reason,
+            ..
+        } => {
+            let mut out = format!("AutoMod held a message from {sender_login}");
+            if !text.trim().is_empty() {
+                out.push_str(&format!(": {text}"));
+            }
+            if let Some(reason) = reason.as_deref().filter(|s| !s.trim().is_empty()) {
+                out.push_str(&format!(" ({reason})"));
+            }
+            out
+        }
+        EventSubNoticeKind::AutoModMessageUpdate { message_id, status } => {
+            if message_id.trim().is_empty() {
+                format!("AutoMod message was resolved as {status}.")
+            } else {
+                format!("AutoMod message {message_id} was resolved as {status}.")
+            }
+        }
+        EventSubNoticeKind::UnbanRequestCreate {
+            user_login,
+            text,
+            ..
+        } => {
+            if let Some(text) = text.as_deref().filter(|s| !s.trim().is_empty()) {
+                format!("Unban request from {user_login}: {text}")
+            } else {
+                format!("Unban request from {user_login}.")
+            }
+        }
+        EventSubNoticeKind::UnbanRequestResolve { request_id, status } => {
+            if request_id.trim().is_empty() {
+                format!("Unban request resolved as {status}.")
+            } else {
+                format!("Unban request {request_id} resolved as {status}.")
+            }
+        }
+        EventSubNoticeKind::ChannelBan {
+            user_login,
+            reason,
+            ends_at,
+        } => {
+            let mut out = if let Some(ends_at) = ends_at.as_deref().filter(|s| !s.trim().is_empty()) {
+                format!("{user_login} was timed out until {ends_at}.")
+            } else {
+                format!("{user_login} was banned.")
+            };
+            if let Some(reason) = reason.as_deref().filter(|s| !s.trim().is_empty()) {
+                out.push_str(&format!(" Reason: {reason}"));
+            }
+            out
+        }
+        EventSubNoticeKind::ChannelUnban { user_login } => {
+            format!("{user_login} was unbanned.")
+        }
+        EventSubNoticeKind::ModerationAction {
+            moderator_login,
+            action,
+            target_login,
+            target_message_id: _,
+            source_channel_login,
+        } => {
+            let action_label = action
+                .replace('_', " ")
+                .replace('.', " ")
+                .trim()
+                .to_owned();
+            let source_suffix = source_channel_login
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| format!(" in #{}", s.trim_start_matches('#')))
+                .unwrap_or_default();
+            if let Some(target) = target_login.as_deref().filter(|s| !s.trim().is_empty()) {
+                format!("{moderator_login} performed {action_label} on {target}{source_suffix}.")
+            } else {
+                format!("{moderator_login} performed {action_label}{source_suffix}.")
             }
         }
         EventSubNoticeKind::StreamOnline => "Stream is now live.".to_owned(),
@@ -3273,6 +4008,7 @@ fn eventsub_notice_to_message(kind: &EventSubNoticeKind) -> (MsgKind, String) {
             redemption_id,
             user_input,
             status,
+            is_update: _,
         } => {
             let text = format_eventsub_notice_text(kind);
             (
@@ -3288,7 +4024,197 @@ fn eventsub_notice_to_message(kind: &EventSubNoticeKind) -> (MsgKind, String) {
                 text,
             )
         }
+        EventSubNoticeKind::ChannelBan {
+            user_login,
+            reason: _,
+            ends_at,
+        } => {
+            let text = format_eventsub_notice_text(kind);
+            if let Some(seconds) = parse_timeout_seconds(ends_at.as_deref()) {
+                (
+                    MsgKind::Timeout {
+                        login: user_login.clone(),
+                        seconds,
+                    },
+                    text,
+                )
+            } else if ends_at
+                .as_deref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+            {
+                (
+                    MsgKind::Timeout {
+                        login: user_login.clone(),
+                        seconds: 0,
+                    },
+                    text,
+                )
+            } else {
+                (
+                    MsgKind::Ban {
+                        login: user_login.clone(),
+                    },
+                    text,
+                )
+            }
+        }
         _ => (MsgKind::SystemInfo, format_eventsub_notice_text(kind)),
+    }
+}
+
+fn should_drop_duplicate_eventsub_notice(
+    seen: &mut HashMap<String, Instant>,
+    event_id: &str,
+    now: Instant,
+    gc_at: &mut Instant,
+) -> bool {
+    let id = event_id.trim();
+    if id.is_empty() {
+        return false;
+    }
+
+    // Trim expired entries periodically or whenever the map grows past the cap.
+    if now.duration_since(*gc_at) >= Duration::from_secs(10)
+        || seen.len() >= EVENTSUB_NOTICE_DEDUP_MAX_ENTRIES
+    {
+        seen.retain(|_, ts| now.duration_since(*ts) <= EVENTSUB_NOTICE_DEDUP_WINDOW);
+        *gc_at = now;
+    }
+
+    if let Some(seen_at) = seen.get(id) {
+        if now.duration_since(*seen_at) <= EVENTSUB_NOTICE_DEDUP_WINDOW {
+            return true;
+        }
+    }
+
+    seen.insert(id.to_owned(), now);
+    false
+}
+
+fn stream_status_is_live_from_notice(kind: &EventSubNoticeKind) -> Option<bool> {
+    match kind {
+        EventSubNoticeKind::StreamOnline => Some(true),
+        EventSubNoticeKind::StreamOffline => Some(false),
+        _ => None,
+    }
+}
+
+fn moderation_command_remaining_cooldown(
+    cooldowns: &mut HashMap<String, Instant>,
+    channel: &ChannelId,
+    now: Instant,
+) -> Option<Duration> {
+    let key = channel.as_str().to_ascii_lowercase();
+    if let Some(last) = cooldowns.get(&key) {
+        let elapsed = now.duration_since(*last);
+        if elapsed < MODERATION_CMD_COOLDOWN {
+            return Some(MODERATION_CMD_COOLDOWN - elapsed);
+        }
+    }
+
+    cooldowns.insert(key, now);
+    None
+}
+
+fn parse_timeout_seconds(ends_at: Option<&str>) -> Option<u32> {
+    let ends_at = ends_at?.trim();
+    if ends_at.is_empty() {
+        return None;
+    }
+    let parsed = chrono::DateTime::parse_from_rfc3339(ends_at).ok()?;
+    let now = Utc::now();
+    let end_utc = parsed.with_timezone(&Utc);
+    let remaining = (end_utc - now).num_seconds().max(0);
+    u32::try_from(remaining).ok()
+}
+
+fn room_state_update_from_moderation_action(
+    action: &str,
+) -> Option<(Option<bool>, Option<i32>, Option<u32>, Option<bool>, Option<bool>)> {
+    let normalized = action.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let mut emote_only = None;
+    let mut followers_only = None;
+    let mut slow = None;
+    let mut subs_only = None;
+    let mut r9k = None;
+
+    match normalized.as_str() {
+        "emoteonly" => emote_only = Some(true),
+        "emoteonlyoff" => emote_only = Some(false),
+        "subscribers" => subs_only = Some(true),
+        "subscribersoff" => subs_only = Some(false),
+        "followers" => followers_only = Some(0),
+        "followersoff" => followers_only = Some(-1),
+        "slow" => slow = Some(0),
+        "slowoff" => slow = Some(0),
+        "uniquechat" => r9k = Some(true),
+        "uniquechatoff" => r9k = Some(false),
+        _ => {
+            if let Some(value) = normalized
+                .strip_prefix("slow_")
+                .and_then(|s| s.strip_suffix('s'))
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                slow = Some(value);
+            } else if let Some(value) = normalized
+                .strip_prefix("followers_")
+                .and_then(|s| s.strip_suffix('m'))
+                .and_then(|s| s.parse::<i32>().ok())
+            {
+                followers_only = Some(value.max(0));
+            }
+        }
+    }
+
+    if emote_only.is_none()
+        && followers_only.is_none()
+        && slow.is_none()
+        && subs_only.is_none()
+        && r9k.is_none()
+    {
+        None
+    } else {
+        Some((emote_only, followers_only, slow, subs_only, r9k))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModerationActionEffect {
+    ChannelMessagesCleared,
+    UserMessagesCleared(String),
+    MessageDeleted(String),
+}
+
+fn moderation_action_effect_from_notice(
+    action: &str,
+    target_login: Option<&str>,
+    target_message_id: Option<&str>,
+) -> Option<ModerationActionEffect> {
+    let normalized = action.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    match normalized.as_str() {
+        "clear" => Some(ModerationActionEffect::ChannelMessagesCleared),
+        "delete" => target_message_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| ModerationActionEffect::MessageDeleted(s.to_owned())),
+        "ban" | "timeout" => target_login
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| ModerationActionEffect::UserMessagesCleared(s.to_owned())),
+        _ if normalized.starts_with("timeout_") => target_login
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| ModerationActionEffect::UserMessagesCleared(s.to_owned())),
+        _ => None,
     }
 }
 
@@ -4770,6 +5696,87 @@ async fn load_recent_messages(
 /// Call `POST /helix/moderation/bans` to timeout or permanently ban a user.
 ///
 /// `duration_secs` = `None` → permanent ban; `Some(n)` → timeout for `n` seconds.
+async fn helix_delete_message(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    moderator_id: Option<&str>,
+    message_id: &str,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (Some(cid), Some(bid), Some(mid)) = (client_id, broadcaster_id, moderator_id) else {
+        warn!(
+            "helix_delete_message: missing credentials (cid={:?} bid={:?} mid={:?})",
+            client_id, broadcaster_id, moderator_id
+        );
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Moderation".into(),
+                message: "Cannot moderate: missing Twitch credentials. Reconnect and try again."
+                    .into(),
+            })
+            .await;
+        return;
+    };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    let url = format!(
+        "https://api.twitch.tv/helix/moderation/chat?broadcaster_id={bid}&moderator_id={mid}&message_id={message_id}"
+    );
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .delete(&url)
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("helix_delete_message: request failed: {e}");
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Moderation".into(),
+                    message: format!("Moderation delete request failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let status = resp.status();
+    if status.as_u16() == 401 {
+        let _ = evt_tx.send(AppEvent::AuthExpired).await;
+        return;
+    }
+
+    if status.is_success() {
+        info!("Moderation: deleted message in #{channel}");
+        emit_helix_system_info(
+            evt_tx,
+            channel,
+            "Moderation: message deleted.".into(),
+        )
+        .await;
+        return;
+    } else {
+        let body_text = resp.text().await.unwrap_or_default();
+        warn!("helix_delete_message: HTTP {status} - {body_text}");
+        let helix_msg = serde_json::from_str::<serde_json::Value>(&body_text)
+            .ok()
+            .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_owned))
+            .unwrap_or_else(|| format!("HTTP {status}"));
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Moderation".into(),
+                message: format!("Msg deletion failed: {helix_msg}"),
+            })
+            .await;
+    }
+}
+
 /// On failure, injects a local error message into the channel so the user can see what went wrong.
 async fn helix_ban_user(
     token: &str,
@@ -4967,6 +5974,396 @@ async fn helix_unban_user(
             })
             .await;
     }
+}
+
+/// Resolve a held AutoMod message via
+/// `POST /helix/moderation/automod/message`.
+async fn helix_resolve_automod_message(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    moderator_id: Option<&str>,
+    message_id: &str,
+    sender_user_id: &str,
+    action: &str,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (cid, bid, mid) =
+        match require_helix_moderation_context(client_id, broadcaster_id, moderator_id) {
+            Ok(v) => v,
+            Err(msg) => {
+                let _ = evt_tx
+                    .send(AppEvent::Error {
+                        context: "AutoMod".into(),
+                        message: msg,
+                    })
+                    .await;
+                return;
+            }
+        };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    if bare.trim().is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "AutoMod".into(),
+                message: "You must be logged in to resolve AutoMod messages.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let msg_id = message_id.trim();
+    let user_id = sender_user_id.trim();
+    if msg_id.is_empty() || user_id.is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "AutoMod".into(),
+                message: "Cannot resolve AutoMod item: missing message or user identifier.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let action_norm = action.trim().to_ascii_uppercase();
+    if action_norm != "ALLOW" && action_norm != "DENY" {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "AutoMod".into(),
+                message: format!("Unsupported AutoMod action: {action}"),
+            })
+            .await;
+        return;
+    }
+
+    #[derive(serde::Serialize)]
+    struct AutoModResolveBody<'a> {
+        user_id: &'a str,
+        msg_id: &'a str,
+        action: &'a str,
+    }
+
+    let url = "https://api.twitch.tv/helix/moderation/automod/message";
+    let client = reqwest::Client::new();
+    let resp = match client
+        .post(url)
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .query(&[
+            ("broadcaster_id", bid),
+            ("moderator_id", mid),
+        ])
+        .json(&AutoModResolveBody {
+            user_id,
+            msg_id,
+            action: &action_norm,
+        })
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "AutoMod".into(),
+                    message: format!("AutoMod resolve request failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let status = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        let _ = evt_tx
+            .send(AppEvent::AutoModQueueRemove {
+                channel: channel.clone(),
+                message_id: msg_id.to_owned(),
+                action: Some(action_norm.clone()),
+            })
+            .await;
+        emit_helix_system_info(
+            evt_tx,
+            channel,
+            format!("AutoMod: {action_norm} message {msg_id}."),
+        )
+        .await;
+        return;
+    }
+
+    let msg = helix_error_message(status, &body_text);
+    let _ = evt_tx
+        .send(AppEvent::Error {
+            context: "AutoMod".into(),
+            message: format!("Could not resolve AutoMod message: {msg}"),
+        })
+        .await;
+}
+
+/// Fetch pending unban requests via
+/// `GET /helix/moderation/unban_requests`.
+async fn helix_fetch_unban_requests(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    moderator_id: Option<&str>,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (cid, bid, mid) =
+        match require_helix_moderation_context(client_id, broadcaster_id, moderator_id) {
+            Ok(v) => v,
+            Err(msg) => {
+                let _ = evt_tx
+                    .send(AppEvent::UnbanRequestsFailed {
+                        channel: channel.clone(),
+                        error: msg,
+                    })
+                    .await;
+                return;
+            }
+        };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    if bare.trim().is_empty() {
+        let msg = "You must be logged in to fetch unban requests.".to_owned();
+        let _ = evt_tx
+            .send(AppEvent::UnbanRequestsFailed {
+                channel: channel.clone(),
+                error: msg,
+            })
+            .await;
+        return;
+    }
+
+    #[derive(serde::Deserialize)]
+    struct HelixUnbanRequest {
+        id: String,
+        user_id: String,
+        user_login: String,
+        text: Option<String>,
+        created_at: Option<String>,
+        status: Option<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Pagination {
+        cursor: Option<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct HelixUnbanRequestsResponse {
+        data: Vec<HelixUnbanRequest>,
+        #[serde(default)]
+        pagination: Option<Pagination>,
+    }
+
+    let client = reqwest::Client::new();
+    let mut cursor: Option<String> = None;
+    let mut requests: Vec<UnbanRequestItem> = Vec::new();
+
+    loop {
+        let mut query: Vec<(&str, String)> = vec![
+            ("broadcaster_id", bid.to_owned()),
+            ("moderator_id", mid.to_owned()),
+            ("status", "pending".to_owned()),
+            ("first", "100".to_owned()),
+        ];
+        if let Some(cur) = cursor.as_deref().filter(|s| !s.is_empty()) {
+            query.push(("after", cur.to_owned()));
+        }
+
+        let resp = match client
+            .get("https://api.twitch.tv/helix/moderation/unban_requests")
+            .header("Authorization", format!("Bearer {bare}"))
+            .header("Client-Id", cid)
+            .query(&query)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = evt_tx
+                    .send(AppEvent::UnbanRequestsFailed {
+                        channel: channel.clone(),
+                        error: format!("Unban request fetch failed: {e}"),
+                    })
+                    .await;
+                return;
+            }
+        };
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let _ = evt_tx
+                .send(AppEvent::UnbanRequestsFailed {
+                    channel: channel.clone(),
+                    error: helix_error_message(status, &body),
+                })
+                .await;
+            return;
+        }
+
+        let parsed = match serde_json::from_str::<HelixUnbanRequestsResponse>(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = evt_tx
+                    .send(AppEvent::UnbanRequestsFailed {
+                        channel: channel.clone(),
+                        error: format!("Failed to parse unban request response: {e}"),
+                    })
+                    .await;
+                return;
+            }
+        };
+
+        requests.extend(parsed.data.into_iter().map(|item| UnbanRequestItem {
+            request_id: item.id,
+            user_id: item.user_id,
+            user_login: item.user_login,
+            text: item.text,
+            created_at: item.created_at,
+            status: item.status,
+        }));
+
+        cursor = parsed.pagination.and_then(|p| p.cursor);
+        if cursor.as_deref().map_or(true, |s| s.is_empty()) {
+            break;
+        }
+    }
+
+    let _ = evt_tx
+        .send(AppEvent::UnbanRequestsLoaded {
+            channel: channel.clone(),
+            requests,
+        })
+        .await;
+}
+
+/// Resolve an unban request via
+/// `PATCH /helix/moderation/unban_requests`.
+async fn helix_resolve_unban_request(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    moderator_id: Option<&str>,
+    request_id: &str,
+    approve: bool,
+    resolution_text: Option<&str>,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (cid, bid, mid) =
+        match require_helix_moderation_context(client_id, broadcaster_id, moderator_id) {
+            Ok(v) => v,
+            Err(msg) => {
+                let _ = evt_tx
+                    .send(AppEvent::Error {
+                        context: "Unban Requests".into(),
+                        message: msg,
+                    })
+                    .await;
+                return;
+            }
+        };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    if bare.trim().is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Unban Requests".into(),
+                message: "You must be logged in to resolve unban requests.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let request_id = request_id.trim();
+    if request_id.is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Unban Requests".into(),
+                message: "Missing unban request id.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let status_raw = if approve { "approved" } else { "denied" };
+    let status_emit = status_raw.to_ascii_uppercase();
+
+    #[derive(serde::Serialize)]
+    struct ResolveUnbanBody<'a> {
+        unban_request_id: &'a str,
+        status: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resolution_text: Option<&'a str>,
+    }
+
+    let trimmed_resolution = resolution_text
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let req = ResolveUnbanBody {
+        unban_request_id: request_id,
+        status: status_raw,
+        resolution_text: trimmed_resolution,
+    };
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .patch("https://api.twitch.tv/helix/moderation/unban_requests")
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .query(&[
+            ("broadcaster_id", bid),
+            ("moderator_id", mid),
+        ])
+        .json(&req)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Unban Requests".into(),
+                    message: format!("Resolve unban request failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let http_status = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+    if http_status.is_success() {
+        let _ = evt_tx
+            .send(AppEvent::UnbanRequestResolved {
+                channel: channel.clone(),
+                request_id: request_id.to_owned(),
+                status: status_emit.clone(),
+            })
+            .await;
+        emit_helix_system_info(
+            evt_tx,
+            channel,
+            format!("Unban request {request_id} resolved as {status_emit}."),
+        )
+        .await;
+        return;
+    }
+
+    let msg = helix_error_message(http_status, &body_text);
+    let _ = evt_tx
+        .send(AppEvent::Error {
+            context: "Unban Requests".into(),
+            message: format!("Could not resolve unban request: {msg}"),
+        })
+        .await;
 }
 
 /// Update a channel-points redemption status via
@@ -5645,6 +7042,7 @@ async fn helix_create_poll(
     title: &str,
     choices: &[String],
     duration_secs: u32,
+    channel_points_per_vote: Option<u32>,
     channel: &ChannelId,
     evt_tx: mpsc::Sender<AppEvent>,
 ) {
@@ -5683,13 +7081,22 @@ async fn helix_create_poll(
         title: &'a str,
         choices: Vec<PollChoice<'a>>,
         duration: u32,
+        channel_points_voting_enabled: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        channel_points_per_vote: Option<u32>,
     }
+
+    let points_per_vote = channel_points_per_vote
+        .map(|v| v.clamp(1, 1_000_000))
+        .filter(|v| *v > 0);
 
     let req = PollBody {
         broadcaster_id: bid,
         title,
         choices: choices.iter().map(|c| PollChoice { title: c }).collect(),
         duration: duration_secs,
+        channel_points_voting_enabled: points_per_vote.is_some(),
+        channel_points_per_vote: points_per_vote,
     };
 
     let client = reqwest::Client::new();
@@ -5718,11 +7125,20 @@ async fn helix_create_poll(
         emit_helix_system_info(
             evt_tx,
             channel,
-            format!(
-                "Started poll: {title} ({} choices, {}s)",
-                choices.len(),
-                duration_secs
-            ),
+            if let Some(points) = points_per_vote {
+                format!(
+                    "Started poll: {title} ({} choices, {}s, {} points/vote)",
+                    choices.len(),
+                    duration_secs,
+                    points
+                )
+            } else {
+                format!(
+                    "Started poll: {title} ({} choices, {}s)",
+                    choices.len(),
+                    duration_secs
+                )
+            },
         )
         .await;
         return;
@@ -6559,8 +7975,20 @@ fn open_url_in_browser(url: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_twitch_pinned_snapshot_json, APP_INITIAL_INNER_SIZE, APP_MIN_INNER_SIZE};
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    use super::{
+        format_eventsub_notice_text, moderation_action_effect_from_notice,
+        moderation_command_remaining_cooldown,
+        parse_twitch_pinned_snapshot_json,
+        should_drop_duplicate_eventsub_notice, stream_status_is_live_from_notice,
+        ModerationActionEffect, MODERATION_CMD_COOLDOWN, EVENTSUB_NOTICE_DEDUP_WINDOW,
+        APP_INITIAL_INNER_SIZE, APP_MIN_INNER_SIZE,
+    };
+    use crust_core::model::ChannelId;
     use crate::runtime::system_messages::is_twitch_pinned_notice;
+    use crust_twitch::eventsub::EventSubNoticeKind;
 
     #[test]
     fn twitch_pinned_notice_detects_multi_line_pin_card_text() {
@@ -6640,5 +8068,142 @@ mod tests {
         assert!(APP_MIN_INNER_SIZE[0] < 300.0);
         assert_eq!(APP_MIN_INNER_SIZE[1], 200.0);
         assert!(APP_INITIAL_INNER_SIZE[0] > APP_MIN_INNER_SIZE[0]);
+    }
+
+    #[test]
+    fn moderation_action_effect_maps_clear_to_channel_clear() {
+        let effect = moderation_action_effect_from_notice("clear", None, None);
+        assert_eq!(effect, Some(ModerationActionEffect::ChannelMessagesCleared));
+    }
+
+    #[test]
+    fn moderation_action_effect_maps_delete_to_message_deleted() {
+        let effect = moderation_action_effect_from_notice("delete", None, Some("msg-1"));
+        assert_eq!(
+            effect,
+            Some(ModerationActionEffect::MessageDeleted("msg-1".to_owned()))
+        );
+    }
+
+    #[test]
+    fn moderation_action_effect_maps_timeout_to_user_clear() {
+        let effect = moderation_action_effect_from_notice("timeout_600s", Some("viewer"), None);
+        assert_eq!(
+            effect,
+            Some(ModerationActionEffect::UserMessagesCleared(
+                "viewer".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn eventsub_notice_dedup_drops_repeated_notice_ids_within_window() {
+        let mut seen: HashMap<String, Instant> = HashMap::new();
+        let mut gc_at = Instant::now();
+        let now = Instant::now();
+
+        assert!(!should_drop_duplicate_eventsub_notice(
+            &mut seen,
+            "evt-123",
+            now,
+            &mut gc_at,
+        ));
+        assert!(should_drop_duplicate_eventsub_notice(
+            &mut seen,
+            "evt-123",
+            now + Duration::from_secs(1),
+            &mut gc_at,
+        ));
+    }
+
+    #[test]
+    fn eventsub_notice_dedup_allows_same_id_after_window_expires() {
+        let mut seen: HashMap<String, Instant> = HashMap::new();
+        let mut gc_at = Instant::now() - Duration::from_secs(20);
+        let now = Instant::now();
+
+        assert!(!should_drop_duplicate_eventsub_notice(
+            &mut seen,
+            "evt-123",
+            now,
+            &mut gc_at,
+        ));
+        assert!(!should_drop_duplicate_eventsub_notice(
+            &mut seen,
+            "evt-123",
+            now + EVENTSUB_NOTICE_DEDUP_WINDOW + Duration::from_secs(1),
+            &mut gc_at,
+        ));
+    }
+
+    #[test]
+    fn moderation_notice_text_includes_shared_chat_source_channel() {
+        let text = format_eventsub_notice_text(&EventSubNoticeKind::ModerationAction {
+            moderator_login: "mod_jane".to_owned(),
+            action: "ban".to_owned(),
+            target_login: Some("viewer123".to_owned()),
+            target_message_id: None,
+            source_channel_login: Some("partner_stream".to_owned()),
+        });
+
+        assert!(text.contains("mod_jane performed ban on viewer123 in #partner_stream."));
+    }
+
+    #[test]
+    fn stream_status_helper_maps_online_and_offline_notices() {
+        assert_eq!(
+            stream_status_is_live_from_notice(&EventSubNoticeKind::StreamOnline),
+            Some(true)
+        );
+        assert_eq!(
+            stream_status_is_live_from_notice(&EventSubNoticeKind::StreamOffline),
+            Some(false)
+        );
+        assert_eq!(
+            stream_status_is_live_from_notice(&EventSubNoticeKind::ChannelUnban {
+                user_login: "viewer".to_owned()
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn moderation_cooldown_blocks_rapid_repeated_actions_in_same_channel() {
+        let mut cooldowns = HashMap::new();
+        let channel = ChannelId::new("somechannel");
+        let now = Instant::now();
+
+        assert_eq!(
+            moderation_command_remaining_cooldown(&mut cooldowns, &channel, now),
+            None
+        );
+        let remaining = moderation_command_remaining_cooldown(
+            &mut cooldowns,
+            &channel,
+            now + Duration::from_millis(100),
+        );
+        assert!(remaining.is_some());
+        assert!(remaining.unwrap() <= MODERATION_CMD_COOLDOWN);
+    }
+
+    #[test]
+    fn moderation_cooldown_is_per_channel() {
+        let mut cooldowns = HashMap::new();
+        let chan_a = ChannelId::new("one");
+        let chan_b = ChannelId::new("two");
+        let now = Instant::now();
+
+        assert_eq!(
+            moderation_command_remaining_cooldown(&mut cooldowns, &chan_a, now),
+            None
+        );
+        assert_eq!(
+            moderation_command_remaining_cooldown(
+                &mut cooldowns,
+                &chan_b,
+                now + Duration::from_millis(100),
+            ),
+            None
+        );
     }
 }

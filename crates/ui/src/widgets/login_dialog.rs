@@ -172,7 +172,7 @@ impl LoginDialog {
                     }
 
                     ui.label(
-                        RichText::new("Get a token at twitchtokengenerator.com  (chat:edit + chat:read scopes)")
+                        RichText::new("Get a token at twitchtokengenerator.com  (chat:edit + chat:read; for polls/points also add channel:manage:polls and channel:manage:redemptions)")
                             .font(t::small())
                             .color(t::text_muted()),
                     );

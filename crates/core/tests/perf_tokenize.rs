@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use crust_core::format::{parse_twitch_emotes_tag, tokenize};
-use crust_core::highlight::{is_highlighted, HighlightRule};
+use crust_core::highlight::{is_highlighted_rules, HighlightRule};
 
 fn report(label: &str, ops: usize, elapsed: Duration) {
     let secs = elapsed.as_secs_f64();
@@ -88,14 +88,14 @@ fn perf_highlight_rule_matching() {
     let msg = "big RAID incoming with giveaway winner announcement";
 
     for _ in 0..10_000 {
-        let _ = is_highlighted(&rules, msg);
+        let _ = is_highlighted_rules(&rules, msg);
     }
 
     let iterations = 200_000usize;
     let start = Instant::now();
     let mut hits = 0usize;
     for _ in 0..iterations {
-        if is_highlighted(&rules, msg) {
+        if is_highlighted_rules(&rules, msg) {
             hits += 1;
         }
     }

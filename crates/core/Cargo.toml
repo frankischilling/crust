@@ -11,3 +11,4 @@ smallvec = { workspace = true }
 chrono = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+regex.workspace = true

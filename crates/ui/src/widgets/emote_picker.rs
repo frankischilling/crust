@@ -39,6 +39,13 @@ enum PickerView {
     Provider(usize),
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EmotePickerPreferences {
+    pub favorites: Vec<String>,
+    pub recent: Vec<String>,
+    pub provider_boost: Option<String>,
+}
+
 /// Cached per-tab data.
 struct CachedTab {
     indices: Vec<usize>, // indices into combined
@@ -53,6 +60,18 @@ struct CachedView {
     all_indices: Vec<usize>,
     /// Combined catalog (external emotes + emoji entries).
     combined: Vec<EmoteCatalogEntry>,
+    /// First visible index per URL (stable lookup for favorites/recent).
+    index_by_url: HashMap<String, usize>,
+}
+
+/// Cached ranked indices for the currently selected view.
+struct CachedDisplay {
+    filter: String,
+    catalog_len: usize,
+    active_view: PickerView,
+    provider_boost: Option<String>,
+    rank_revision: u64,
+    indices: Arc<[usize]>,
 }
 
 /// Floating emote picker window with provider tabs.
@@ -64,6 +83,8 @@ pub struct EmotePicker {
     requested: HashSet<String>,
     /// Cached filtered/grouped view.
     cache: Option<CachedView>,
+    /// Cached ranked indices for the current filter/tab/ranking preferences.
+    display_cache: Option<CachedDisplay>,
     /// Last size we logged to avoid spamming every frame.
     last_logged_size: Option<Vec2>,
     /// Cached static textures for animated emotes (first frame).
@@ -78,6 +99,8 @@ pub struct EmotePicker {
     usage_by_url: HashMap<String, u32>,
     /// Optional provider boost key, e.g. "7tv".
     provider_boost: Option<String>,
+    /// Bumped whenever ranking inputs change (favorites/recent/usage).
+    rank_revision: u64,
 }
 
 impl Default for EmotePicker {
@@ -88,6 +111,7 @@ impl Default for EmotePicker {
             active_view: PickerView::All,
             requested: HashSet::new(),
             cache: None,
+            display_cache: None,
             last_logged_size: None,
             static_frames: HashMap::new(),
             emoji_entries: emoji_catalog_entries(),
@@ -95,6 +119,7 @@ impl Default for EmotePicker {
             recent_urls: Vec::new(),
             usage_by_url: HashMap::new(),
             provider_boost: None,
+            rank_revision: 0,
         }
     }
 }
@@ -105,9 +130,15 @@ impl EmotePicker {
         if self.open {
             self.filter.clear();
             self.cache = None;
+            self.display_cache = None;
             self.active_view = PickerView::All;
             self.last_logged_size = None;
         }
+    }
+
+    fn bump_rank_revision(&mut self) {
+        self.rank_revision = self.rank_revision.wrapping_add(1);
+        self.display_cache = None;
     }
 
     fn note_pick(&mut self, entry: &EmoteCatalogEntry) {
@@ -119,6 +150,8 @@ impl EmotePicker {
         if self.recent_urls.len() > RECENT_LIMIT {
             self.recent_urls.truncate(RECENT_LIMIT);
         }
+
+        self.bump_rank_revision();
     }
 
     fn toggle_favorite_url(&mut self, url: &str) {
@@ -127,6 +160,49 @@ impl EmotePicker {
         } else {
             self.favorite_urls.insert(url.to_owned());
         }
+
+        self.bump_rank_revision();
+    }
+
+    pub fn preferences(&self) -> EmotePickerPreferences {
+        let mut favorites: Vec<String> = self.favorite_urls.iter().cloned().collect();
+        favorites.sort_by_cached_key(|v| v.to_ascii_lowercase());
+        EmotePickerPreferences {
+            favorites,
+            recent: self.recent_urls.clone(),
+            provider_boost: self.provider_boost.clone(),
+        }
+    }
+
+    pub fn apply_preferences(&mut self, prefs: &EmotePickerPreferences) {
+        self.favorite_urls = prefs
+            .favorites
+            .iter()
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+            .collect();
+
+        self.recent_urls = prefs
+            .recent
+            .iter()
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if self.recent_urls.len() > RECENT_LIMIT {
+            self.recent_urls.truncate(RECENT_LIMIT);
+        }
+
+        self.provider_boost = prefs
+            .provider_boost
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_ascii_lowercase)
+            .filter(|v| matches!(v.as_str(), "twitch" | "7tv" | "bttv" | "ffz" | "emoji"));
+
+        self.bump_rank_revision();
     }
 
     /// Rebuild the cached view if the filter or catalog has changed.
@@ -138,6 +214,8 @@ impl EmotePicker {
         if !need {
             return;
         }
+
+        self.display_cache = None;
 
         // Build the combined catalog: external emotes + emoji entries.
         let mut combined: Vec<EmoteCatalogEntry> = catalog.to_vec();
@@ -187,37 +265,110 @@ impl EmotePicker {
             .flat_map(|t| t.indices.iter().copied())
             .collect();
 
+        let mut index_by_url: HashMap<String, usize> = HashMap::with_capacity(all_indices.len());
+        for &idx in &all_indices {
+            let url = combined[idx].url.clone();
+            index_by_url.entry(url).or_insert(idx);
+        }
+
         self.cache = Some(CachedView {
             filter: self.filter.clone(),
             catalog_len: catalog.len(),
             tabs,
             all_indices,
             combined,
+            index_by_url,
         });
     }
 
     fn favorite_indices(&self, view: &CachedView) -> Vec<usize> {
-        view.all_indices
+        self.favorite_urls
             .iter()
-            .copied()
-            .filter(|&idx| self.favorite_urls.contains(view.combined[idx].url.as_str()))
+            .filter_map(|url| view.index_by_url.get(url).copied())
             .collect()
     }
 
-    fn recent_indices(&self, view: &CachedView) -> Vec<usize> {
-        let mut by_url: HashMap<&str, usize> = HashMap::new();
-        for &idx in &view.all_indices {
-            let url = view.combined[idx].url.as_str();
-            by_url.entry(url).or_insert(idx);
-        }
+    fn favorite_count(&self, view: &CachedView) -> usize {
+        self.favorite_urls
+            .iter()
+            .filter(|url| view.index_by_url.contains_key(*url))
+            .count()
+    }
 
+    fn recent_indices(&self, view: &CachedView) -> Vec<usize> {
         let mut out = Vec::new();
         for url in &self.recent_urls {
-            if let Some(&idx) = by_url.get(url.as_str()) {
+            if let Some(&idx) = view.index_by_url.get(url) {
                 out.push(idx);
             }
         }
         out
+    }
+
+    fn recent_count(&self, view: &CachedView) -> usize {
+        self.recent_urls
+            .iter()
+            .filter(|url| view.index_by_url.contains_key(*url))
+            .count()
+    }
+
+    fn display_indices_for(
+        &mut self,
+        active_view: PickerView,
+        provider_boost: Option<&str>,
+    ) -> Arc<[usize]> {
+        let view = self.cache.as_ref().expect("cache initialized");
+        let provider_boost = provider_boost.map(str::to_owned);
+
+        let cache_hit = self
+            .display_cache
+            .as_ref()
+            .map(|c| {
+                c.filter == self.filter
+                    && c.catalog_len == view.catalog_len
+                    && c.active_view == active_view
+                    && c.provider_boost == provider_boost
+                    && c.rank_revision == self.rank_revision
+            })
+            .unwrap_or(false);
+
+        if cache_hit {
+            return self
+                .display_cache
+                .as_ref()
+                .expect("display cache exists on hit")
+                .indices
+                .clone();
+        }
+
+        let mut indices: Vec<usize> = match active_view {
+            PickerView::All => view.all_indices.clone(),
+            PickerView::Favorites => self.favorite_indices(view),
+            PickerView::Recent => self.recent_indices(view),
+            PickerView::Provider(ti) => view
+                .tabs
+                .get(ti)
+                .map(|t| t.indices.clone())
+                .unwrap_or_default(),
+        };
+
+        self.rank_indices(
+            &mut indices,
+            &view.combined,
+            active_view == PickerView::Recent,
+            provider_boost.as_deref(),
+        );
+
+        let indices = Arc::<[usize]>::from(indices);
+        self.display_cache = Some(CachedDisplay {
+            filter: self.filter.clone(),
+            catalog_len: view.catalog_len,
+            active_view,
+            provider_boost,
+            rank_revision: self.rank_revision,
+            indices: indices.clone(),
+        });
+        indices
     }
 
     fn rank_indices(
@@ -225,13 +376,14 @@ impl EmotePicker {
         indices: &mut [usize],
         combined: &[EmoteCatalogEntry],
         keep_recent_order: bool,
+        provider_boost: Option<&str>,
     ) {
         if keep_recent_order {
             return;
         }
 
         let query = self.filter.to_ascii_lowercase();
-        let boosted = self.provider_boost.as_deref();
+        let boosted = provider_boost;
         let recent_rank: HashMap<&str, usize> = self
             .recent_urls
             .iter()
@@ -239,34 +391,57 @@ impl EmotePicker {
             .map(|(i, url)| (url.as_str(), i))
             .collect();
 
-        indices.sort_by(|&a, &b| {
-            let ea = &combined[a];
-            let eb = &combined[b];
+        struct RankItem {
+            idx: usize,
+            prefix: bool,
+            favorite: bool,
+            boosted: bool,
+            usage: u32,
+            recent: usize,
+            code_len: usize,
+            code_lower: String,
+        }
 
-            let a_prefix = !query.is_empty() && ea.code.to_ascii_lowercase().starts_with(&query);
-            let b_prefix = !query.is_empty() && eb.code.to_ascii_lowercase().starts_with(&query);
+        let mut ranked: Vec<RankItem> = indices
+            .iter()
+            .copied()
+            .map(|idx| {
+                let entry = &combined[idx];
+                let code_lower = entry.code.to_ascii_lowercase();
+                RankItem {
+                    idx,
+                    prefix: !query.is_empty() && code_lower.starts_with(&query),
+                    favorite: self.favorite_urls.contains(entry.url.as_str()),
+                    boosted: boosted.map(|p| entry.provider == p).unwrap_or(false),
+                    usage: self
+                        .usage_by_url
+                        .get(entry.url.as_str())
+                        .copied()
+                        .unwrap_or(0),
+                    recent: recent_rank
+                        .get(entry.url.as_str())
+                        .copied()
+                        .unwrap_or(usize::MAX),
+                    code_len: entry.code.len(),
+                    code_lower,
+                }
+            })
+            .collect();
 
-            let a_fav = self.favorite_urls.contains(ea.url.as_str());
-            let b_fav = self.favorite_urls.contains(eb.url.as_str());
-
-            let a_boost = boosted.map(|p| ea.provider == p).unwrap_or(false);
-            let b_boost = boosted.map(|p| eb.provider == p).unwrap_or(false);
-
-            let a_usage = self.usage_by_url.get(ea.url.as_str()).copied().unwrap_or(0);
-            let b_usage = self.usage_by_url.get(eb.url.as_str()).copied().unwrap_or(0);
-
-            let a_recent = recent_rank.get(ea.url.as_str()).copied().unwrap_or(usize::MAX);
-            let b_recent = recent_rank.get(eb.url.as_str()).copied().unwrap_or(usize::MAX);
-
-            b_prefix
-                .cmp(&a_prefix)
-                .then_with(|| b_fav.cmp(&a_fav))
-                .then_with(|| b_boost.cmp(&a_boost))
-                .then_with(|| b_usage.cmp(&a_usage))
-                .then_with(|| a_recent.cmp(&b_recent))
-                .then_with(|| ea.code.len().cmp(&eb.code.len()))
-                .then_with(|| ea.code.to_ascii_lowercase().cmp(&eb.code.to_ascii_lowercase()))
+        ranked.sort_by(|a, b| {
+            b.prefix
+                .cmp(&a.prefix)
+                .then_with(|| b.favorite.cmp(&a.favorite))
+                .then_with(|| b.boosted.cmp(&a.boosted))
+                .then_with(|| b.usage.cmp(&a.usage))
+                .then_with(|| a.recent.cmp(&b.recent))
+                .then_with(|| a.code_len.cmp(&b.code_len))
+                .then_with(|| a.code_lower.cmp(&b.code_lower))
         });
+
+        for (slot, item) in indices.iter_mut().zip(ranked.into_iter()) {
+            *slot = item.idx;
+        }
     }
 
     /// Show the emote picker window. Returns the emote code to insert if one was clicked.
@@ -316,10 +491,10 @@ impl EmotePicker {
                 ui.add_space(2.0);
 
                 self.ensure_cache(catalog);
-                let view = self.cache.as_ref().expect("cache initialized");
 
                 // View tabs
                 ui.horizontal_wrapped(|ui| {
+                    let view = self.cache.as_ref().expect("cache initialized");
                     ui.spacing_mut().item_spacing.x = 2.0;
 
                     let all_count = view.all_indices.len();
@@ -333,7 +508,7 @@ impl EmotePicker {
                         next_active_view = PickerView::All;
                     }
 
-                    let favorite_count = self.favorite_indices(view).len();
+                    let favorite_count = self.favorite_count(view);
                     if ui
                         .selectable_label(
                             next_active_view == PickerView::Favorites,
@@ -344,7 +519,7 @@ impl EmotePicker {
                         next_active_view = PickerView::Favorites;
                     }
 
-                    let recent_count = self.recent_indices(view).len();
+                    let recent_count = self.recent_count(view);
                     if ui
                         .selectable_label(
                             next_active_view == PickerView::Recent,
@@ -387,22 +562,8 @@ impl EmotePicker {
                 });
                 ui.separator();
 
-                let mut display_indices: Vec<usize> = match next_active_view {
-                    PickerView::All => view.all_indices.clone(),
-                    PickerView::Favorites => self.favorite_indices(view),
-                    PickerView::Recent => self.recent_indices(view),
-                    PickerView::Provider(ti) => view
-                        .tabs
-                        .get(ti)
-                        .map(|t| t.indices.clone())
-                        .unwrap_or_default(),
-                };
-
-                self.rank_indices(
-                    &mut display_indices,
-                    &view.combined,
-                    next_active_view == PickerView::Recent,
-                );
+                let display_indices =
+                    self.display_indices_for(next_active_view, next_provider_boost.as_deref());
 
                 if display_indices.is_empty() {
                     ui.vertical_centered(|ui| {
@@ -423,6 +584,7 @@ impl EmotePicker {
                 let mut fetches_this_frame = 0usize;
                 let pointer_pos = ui.input(|i| i.pointer.hover_pos());
                 let mut has_animated_visible = false;
+                let view = self.cache.as_ref().expect("cache initialized");
 
                 ScrollArea::vertical()
                     .max_height(available_h)
@@ -483,7 +645,11 @@ impl EmotePicker {
                                 if has_bytes {
                                     let &(w, h, ref raw) = emote_bytes.get(entry.url.as_str()).unwrap();
                                     let animated = is_likely_animated_url(&entry.url);
-                                    if animated && !animate_emotes {
+                                    // Keep 7TV animation hover-only to avoid repaint storms in dense lists.
+                                    let animate_in_grid = animated
+                                        && animate_emotes
+                                        && (entry.provider != "7tv" || is_hovered);
+                                    if animated && !animate_in_grid {
                                         if !self.static_frames.contains_key(&entry.url) {
                                             if let Some(img) = decode_static_frame(raw) {
                                                 let tex = ui.ctx().load_texture(
@@ -512,7 +678,7 @@ impl EmotePicker {
                                             ui.painter().rect_filled(cell_rect, 3.0, t::tooltip_bg());
                                         }
                                     } else {
-                                        if animated && animate_emotes {
+                                        if animate_in_grid {
                                             has_animated_visible = true;
                                         }
                                         let size = fit_size(w, h, EMOTE_SIZE);

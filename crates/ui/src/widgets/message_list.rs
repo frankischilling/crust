@@ -2,15 +2,15 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use egui::{Color32, Id, Label, LayerId, Order, RichText, ScrollArea, Ui, Vec2};
+use egui::{Color32, Id, Label, RichText, ScrollArea, Ui, Vec2};
 use image::DynamicImage;
-use regex::{Regex, RegexBuilder};
 use tokio::sync::mpsc;
 
 use crust_core::{
     events::{AppCommand, LinkPreview},
     model::{
-        Badge, ChannelId, ChatMessage, MessageFlags, MsgKind, ReplyInfo, SenderNamePaint, Span,
+        filters::FilterAction, Badge, ChannelId, ChatMessage, MessageFlags, MsgKind, ReplyInfo,
+        SenderNamePaint, Span,
     },
 };
 
@@ -269,145 +269,9 @@ fn map_snapshot_ids_to_indices(snapshot_ids: &[u64], live_ids: &[u64]) -> Vec<us
         .collect()
 }
 
-#[derive(Clone)]
-enum HighlightMatcher {
-    Substring(String),
-    Regex(Regex),
-}
-
-#[derive(Clone)]
-pub(crate) struct HighlightRule {
-    channel_scope: Option<String>,
-    sender_scope: Option<String>,
-    mention_only: bool,
-    matcher: HighlightMatcher,
-}
-
-impl HighlightRule {
-    fn matches_scope(&self, msg: &ChatMessage, channel: &ChannelId) -> bool {
-        if let Some(channel_scope) = self.channel_scope.as_deref() {
-            let display = channel.display_name().to_ascii_lowercase();
-            let full = channel.as_str().to_ascii_lowercase();
-            if channel_scope != display.as_str() && channel_scope != full.as_str() {
-                return false;
-            }
-        }
-
-        if let Some(sender_scope) = self.sender_scope.as_deref() {
-            if !msg.sender.login.eq_ignore_ascii_case(sender_scope) {
-                return false;
-            }
-        }
-
-        if self.mention_only && !msg.flags.is_mention {
-            return false;
-        }
-
-        true
-    }
-
-    fn matches_message(&self, lowered_text: &str, raw_text: &str) -> bool {
-        match &self.matcher {
-            HighlightMatcher::Substring(term) => lowered_text.contains(term),
-            HighlightMatcher::Regex(re) => re.is_match(raw_text),
-        }
-    }
-}
-
-pub(crate) fn compile_highlight_rules(lines: &[String]) -> Vec<HighlightRule> {
-    lines
-        .iter()
-        .filter_map(|line| parse_highlight_rule(line))
-        .collect()
-}
-
-fn parse_highlight_rule(line: &str) -> Option<HighlightRule> {
-    let raw = line.trim();
-    if raw.is_empty() {
-        return None;
-    }
-
-    let mut rest = raw;
-    let mut channel_scope: Option<String> = None;
-    let mut sender_scope: Option<String> = None;
-    let mut mention_only = false;
-
-    loop {
-        if let Some(after) = rest.strip_prefix("channel=") {
-            let (scope, next) = split_first_token(after);
-            if scope.is_empty() {
-                return None;
-            }
-            channel_scope = Some(scope.to_ascii_lowercase());
-            rest = next;
-            continue;
-        }
-        if let Some(after) = rest.strip_prefix("from=") {
-            let (scope, next) = split_first_token(after);
-            if scope.is_empty() {
-                return None;
-            }
-            sender_scope = Some(scope.to_ascii_lowercase());
-            rest = next;
-            continue;
-        }
-        if let Some(next) = rest.strip_prefix("mention ") {
-            mention_only = true;
-            rest = next.trim_start();
-            continue;
-        }
-        if rest == "mention" {
-            mention_only = true;
-            rest = "";
-            continue;
-        }
-        if let Some(next) = rest.strip_prefix("mentions ") {
-            mention_only = true;
-            rest = next.trim_start();
-            continue;
-        }
-        if rest == "mentions" {
-            mention_only = true;
-            rest = "";
-            continue;
-        }
-        break;
-    }
-
-    let matcher = if let Some(pattern) = rest.strip_prefix("re:") {
-        let pattern = pattern.trim();
-        if pattern.is_empty() {
-            return None;
-        }
-        let re = RegexBuilder::new(pattern)
-            .case_insensitive(true)
-            .build()
-            .ok()?;
-        HighlightMatcher::Regex(re)
-    } else {
-        let lowered = rest.trim().to_ascii_lowercase();
-        if lowered.is_empty() {
-            return None;
-        }
-        HighlightMatcher::Substring(lowered)
-    };
-
-    Some(HighlightRule {
-        channel_scope,
-        sender_scope,
-        mention_only,
-        matcher,
-    })
-}
-
-fn split_first_token(input: &str) -> (&str, &str) {
-    if let Some(idx) = input.find(char::is_whitespace) {
-        let head = &input[..idx];
-        let tail = input[idx..].trim_start();
-        (head.trim(), tail)
-    } else {
-        (input.trim(), "")
-    }
+#[derive(Clone, Copy)]
+pub struct KeywordHighlightMatch {
+    pub color: Option<egui::Color32>,
 }
 
 /// Scrollable, bottom-anchored list of chat messages with inline emote images.
@@ -431,15 +295,36 @@ pub struct MessageList<'a> {
     animate_emotes: bool,
     /// Whether timestamps should be shown for each message.
     show_timestamps: bool,
+    /// Whether timestamps should include seconds.
+    show_timestamp_seconds: bool,
+    /// Whether timestamps should use 24-hour clock format.
+    use_24h_timestamps: bool,
     /// Whether the local user can moderate in this channel.
     can_moderate: bool,
     /// Ignored usernames (lowercase) hidden from the message list.
     ignored_logins: &'a HashSet<String>,
     /// Compiled highlight rules used for local keyword highlighting.
-    highlight_rules: &'a [HighlightRule],
+    highlight_rules: &'a [crust_core::highlight::HighlightMatch],
+    /// Compiled filter records used for hiding messages.
+    filter_records: &'a [crust_core::model::filters::CompiledFilter],
+    /// Moderation action presets
+    mod_action_presets: &'a [crust_core::model::mod_actions::ModActionPreset],
 }
 
 impl<'a> MessageList<'a> {
+    fn message_filter_action(&self, msg: &ChatMessage) -> Option<FilterAction> {
+        if self.filter_records.is_empty() {
+            return None;
+        }
+
+        crust_core::model::filters::check_filters(
+            self.filter_records,
+            Some(self.channel),
+            &msg.raw_text,
+            &msg.sender.login,
+        )
+    }
+
     pub(crate) fn new(
         messages: &'a VecDeque<ChatMessage>,
         emote_bytes: &'a HashMap<String, (u32, u32, Arc<[u8]>)>,
@@ -451,9 +336,13 @@ impl<'a> MessageList<'a> {
         collapse_long_message_lines: usize,
         animate_emotes: bool,
         show_timestamps: bool,
+        show_timestamp_seconds: bool,
+        use_24h_timestamps: bool,
         can_moderate: bool,
         ignored_logins: &'a HashSet<String>,
-        highlight_rules: &'a [HighlightRule],
+        highlight_rules: &'a [crust_core::highlight::HighlightMatch],
+        filter_records: &'a [crust_core::model::filters::CompiledFilter],
+        mod_action_presets: &'a [crust_core::model::mod_actions::ModActionPreset],
     ) -> Self {
         Self {
             messages,
@@ -466,9 +355,13 @@ impl<'a> MessageList<'a> {
             collapse_long_message_lines: collapse_long_message_lines.max(1),
             animate_emotes,
             show_timestamps,
+            show_timestamp_seconds,
+            use_24h_timestamps,
             can_moderate,
             ignored_logins,
             highlight_rules,
+            filter_records,
+            mod_action_presets,
         }
     }
 
@@ -494,12 +387,20 @@ impl<'a> MessageList<'a> {
 
         let search_filtering = self.search.map(|s| s.is_filtering()).unwrap_or(false);
         let is_visible_message = |msg: &ChatMessage| {
-            if self.ignored_logins.is_empty() {
-                return true;
+            if !self.ignored_logins.is_empty() {
+                let login = msg.sender.login.as_str();
+                if self.ignored_logins.contains(login)
+                    || self.ignored_logins.contains(&login.to_ascii_lowercase())
+                {
+                    return false;
+                }
             }
-            let login = msg.sender.login.as_str();
-            !self.ignored_logins.contains(login)
-                && !self.ignored_logins.contains(&login.to_ascii_lowercase())
+
+            if matches!(self.message_filter_action(msg), Some(FilterAction::Hide)) {
+                return false;
+            }
+
+            true
         };
         // PERF: use VisibleIndices enum to avoid O(n) Vec allocation when
         // no search filter is active (the common case).
@@ -829,8 +730,16 @@ impl<'a> MessageList<'a> {
                 for vi in hot_plan.active_start..(hot_plan.active_start + hot_plan.active_len) {
                     let msg_idx = visible_indices.get(vi);
                     let msg = &self.messages[msg_idx];
+                    let dimmed = matches!(self.message_filter_action(msg), Some(FilterAction::Dim));
                     let top_y = ui.next_widget_position().y;
-                    self.render_message(ui, msg, &rctx, &mut static_frames, &mut user_color_cache);
+                    self.render_message(
+                        ui,
+                        msg,
+                        dimmed,
+                        &rctx,
+                        &mut static_frames,
+                        &mut user_color_cache,
+                    );
                     let measured = ui.next_widget_position().y - top_y;
                     if measured > 0.0 {
                         height_cache.insert(msg.id.0, measured);
@@ -1005,9 +914,17 @@ impl<'a> MessageList<'a> {
             let mut rendered_rows = 0usize;
             for i in first..last {
                 let msg = &self.messages[visible_indices.get(hot_plan.active_start + i)];
+                let dimmed = matches!(self.message_filter_action(msg), Some(FilterAction::Dim));
                 let top_y = ui.next_widget_position().y;
 
-                self.render_message(ui, msg, &rctx, &mut static_frames, &mut user_color_cache);
+                self.render_message(
+                    ui,
+                    msg,
+                    dimmed,
+                    &rctx,
+                    &mut static_frames,
+                    &mut user_color_cache,
+                );
 
                 let measured = ui.next_widget_position().y - top_y;
                 rendered_rows += 1;
@@ -1243,9 +1160,76 @@ impl<'a> MessageList<'a> {
         })
     }
 
+    fn resolve_server_id_for_actions(&self, msg: &ChatMessage) -> Option<String> {
+        if let Some(server_id) = msg
+            .server_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(server_id.to_owned());
+        }
+
+        // Fresh local echoes can temporarily have no msg-id until Twitch echoes
+        // the same payload back. Try to resolve that server-id from a near match.
+        self.messages.iter().rev().find_map(|candidate| {
+            let server_id = candidate
+                .server_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())?;
+
+            if candidate.channel != msg.channel {
+                return None;
+            }
+            if !candidate
+                .sender
+                .login
+                .eq_ignore_ascii_case(&msg.sender.login)
+            {
+                return None;
+            }
+            if candidate.raw_text != msg.raw_text {
+                return None;
+            }
+
+            let delta_ms = (candidate.timestamp.timestamp_millis() - msg.timestamp.timestamp_millis())
+                .unsigned_abs();
+            if delta_ms > 10_000 {
+                return None;
+            }
+
+            Some(server_id.to_owned())
+        })
+    }
+
+    fn redemption_is_terminal(status: Option<&str>) -> bool {
+        status
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.eq_ignore_ascii_case("fulfilled")
+                    || s.eq_ignore_ascii_case("canceled")
+                    || s.eq_ignore_ascii_case("cancelled")
+            })
+            .unwrap_or(false)
+    }
+
+    fn redemption_can_update(
+        reward_id: Option<&str>,
+        redemption_id: Option<&str>,
+        status: Option<&str>,
+    ) -> bool {
+        !Self::redemption_is_terminal(status)
+            && reward_id.map(str::trim).is_some_and(|s| !s.is_empty())
+            && redemption_id.map(str::trim).is_some_and(|s| !s.is_empty())
+    }
+
     fn show_message_context_menu(&self, ui: &mut Ui, msg: &ChatMessage, reply_key: Id) {
+        let resolved_server_id = self.resolve_server_id_for_actions(msg);
+
         if let Some(info) = Self::reply_info_for_message(msg) {
-            if ui.button("↩  Reply").clicked() {
+            if ui.button("Reply").clicked() {
                 ui.ctx().data_mut(|d| d.insert_temp(reply_key, info));
                 ui.close_menu();
             }
@@ -1257,48 +1241,99 @@ impl<'a> MessageList<'a> {
             } else {
                 "Cannot reply to this message yet (missing message id)"
             };
-            ui.add_enabled(false, egui::Button::new("↩  Reply"))
+            ui.add_enabled(false, egui::Button::new("Reply"))
                 .on_hover_text(hint);
         }
 
         ui.separator();
-        if ui.button("📋  Copy message").clicked() {
+        ui.label(RichText::new("Message").small().color(t::text_muted()));
+        if ui.button("Copy message text").clicked() {
             ui.ctx().copy_text(msg.raw_text.clone());
             ui.close_menu();
         }
-        if ui.button("👤  Copy username").clicked() {
+        if let Some(server_id) = resolved_server_id.as_deref() {
+            if ui.button("Copy message ID").clicked() {
+                ui.ctx().copy_text(server_id.to_owned());
+                ui.close_menu();
+            }
+        }
+
+        ui.separator();
+        ui.label(RichText::new("User").small().color(t::text_muted()));
+        if ui.button("Copy username").clicked() {
             ui.ctx().copy_text(msg.sender.login.clone());
             ui.close_menu();
+        }
+        if !msg.sender.login.trim().is_empty() {
+            if ui.button("Open user card").clicked() {
+                let _ = self.cmd_tx.try_send(AppCommand::ShowUserCard {
+                    login: msg.sender.login.clone(),
+                    channel: self.channel.clone(),
+                });
+                ui.close_menu();
+            }
         }
 
         if self.can_moderate && msg.channel.is_twitch() {
             ui.separator();
-            ui.label(RichText::new("Moderation").small().color(t::text_muted()));
+            ui.label(RichText::new("Mod actions").small().color(t::text_muted()));
+
+            if let Some(server_id) = resolved_server_id.as_deref() {
+                if ui.button("Delete message").clicked() {
+                    let _ = self.cmd_tx.try_send(AppCommand::SendMessage {
+                        channel: msg.channel.clone(),
+                        text: format!("/delete {server_id}"),
+                        reply_to_msg_id: None,
+                        reply: None,
+                    });
+                    ui.close_menu();
+                }
+            } else {
+                ui.add_enabled(false, egui::Button::new("Delete message"))
+                    .on_hover_text("Cannot delete this message yet (missing message id)");
+            }
 
             let target_user_id = msg.sender.user_id.0.trim();
             let can_user_action = !target_user_id.is_empty() && !msg.sender.login.trim().is_empty();
 
             if can_user_action {
-                for (label, seconds) in [
-                    ("⏱  Timeout 30s", 30u32),
-                    ("⏱  Timeout 5m", 5 * 60),
-                    ("⏱  Timeout 10m", 10 * 60),
-                    ("⏱  Timeout 1h", 60 * 60),
-                    ("⏱  Timeout 1d", 24 * 60 * 60),
-                ] {
-                    if ui.button(label).clicked() {
-                        let _ = self.cmd_tx.try_send(AppCommand::TimeoutUser {
-                            channel: self.channel.clone(),
-                            login: msg.sender.login.clone(),
-                            user_id: target_user_id.to_owned(),
-                            seconds,
-                            reason: None,
-                        });
-                        ui.close_menu();
+                ui.menu_button("Timeouts", |ui| {
+                    for (label, seconds) in [
+                        ("1m", 60u32),
+                        ("10m", 10 * 60),
+                        ("1h", 60 * 60),
+                    ] {
+                        if ui.button(format!("Timeout {label}")).clicked() {
+                            let _ = self.cmd_tx.try_send(AppCommand::TimeoutUser {
+                                channel: self.channel.clone(),
+                                login: msg.sender.login.clone(),
+                                user_id: target_user_id.to_owned(),
+                                seconds,
+                                reason: None,
+                            });
+                            ui.close_menu();
+                        }
                     }
+                });
+
+                if !self.mod_action_presets.is_empty() {
+                    ui.menu_button("Presets", |ui| {
+                        for preset in self.mod_action_presets {
+                            if ui.button(&preset.label).clicked() {
+                                let command = preset.expand(&msg.sender.login, self.channel.display_name());
+                                let _ = self.cmd_tx.try_send(AppCommand::SendMessage {
+                                    channel: self.channel.clone(),
+                                    text: command,
+                                    reply_to_msg_id: None,
+                                    reply: None,
+                                });
+                                ui.close_menu();
+                            }
+                        }
+                    });
                 }
 
-                if ui.button("🚫  Ban user").clicked() {
+                if ui.button("Ban user").clicked() {
                     let _ = self.cmd_tx.try_send(AppCommand::BanUser {
                         channel: self.channel.clone(),
                         login: msg.sender.login.clone(),
@@ -1308,7 +1343,7 @@ impl<'a> MessageList<'a> {
                     ui.close_menu();
                 }
 
-                if ui.button("♻  Unban user").clicked() {
+                if ui.button("Unban user").clicked() {
                     let _ = self.cmd_tx.try_send(AppCommand::UnbanUser {
                         channel: self.channel.clone(),
                         login: msg.sender.login.clone(),
@@ -1317,9 +1352,9 @@ impl<'a> MessageList<'a> {
                     ui.close_menu();
                 }
             } else {
-                ui.add_enabled(false, egui::Button::new("⏱  Timeout presets"));
-                ui.add_enabled(false, egui::Button::new("🚫  Ban user"));
-                ui.add_enabled(false, egui::Button::new("♻  Unban user"));
+                ui.add_enabled(false, egui::Button::new("Timeouts"));
+                ui.add_enabled(false, egui::Button::new("Ban user"));
+                ui.add_enabled(false, egui::Button::new("Unban user"));
             }
 
             let channel_login = self.channel.display_name().trim().to_ascii_lowercase();
@@ -1327,13 +1362,28 @@ impl<'a> MessageList<'a> {
                 ui.separator();
                 ui.label(RichText::new("Workflows").small().color(t::text_muted()));
 
-                if ui.button("🛡  Open mod view").clicked() {
+                if ui.button("Open mod view").clicked() {
                     let _ = self.cmd_tx.try_send(AppCommand::OpenUrl {
                         url: format!("https://www.twitch.tv/moderator/{channel_login}/chat"),
                     });
                     ui.close_menu();
                 }
-                if ui.button("🧰  Open AutoMod queue").clicked() {
+                if ui.button("Open in-app moderation tools").clicked() {
+                    let _ = self.cmd_tx.try_send(AppCommand::OpenModerationTools {
+                        channel: Some(self.channel.clone()),
+                    });
+                    ui.close_menu();
+                }
+                if ui.button("Refresh in-app unban requests").clicked() {
+                    let _ = self.cmd_tx.try_send(AppCommand::FetchUnbanRequests {
+                        channel: self.channel.clone(),
+                    });
+                    let _ = self.cmd_tx.try_send(AppCommand::OpenModerationTools {
+                        channel: Some(self.channel.clone()),
+                    });
+                    ui.close_menu();
+                }
+                if ui.button("Open AutoMod queue").clicked() {
                     let _ = self.cmd_tx.try_send(AppCommand::OpenUrl {
                         url: format!(
                             "https://dashboard.twitch.tv/u/{channel_login}/settings/moderation/automod"
@@ -1341,7 +1391,7 @@ impl<'a> MessageList<'a> {
                     });
                     ui.close_menu();
                 }
-                if ui.button("📨  Open unban requests").clicked() {
+                if ui.button("Open unban requests").clicked() {
                     let _ = self.cmd_tx.try_send(AppCommand::OpenUrl {
                         url: format!(
                             "https://dashboard.twitch.tv/u/{channel_login}/community/unban-requests"
@@ -1349,7 +1399,7 @@ impl<'a> MessageList<'a> {
                     });
                     ui.close_menu();
                 }
-                if ui.button("🧾  Open user logs (IVR)").clicked() {
+                if ui.button("Open user logs (IVR)").clicked() {
                     let _ = self.cmd_tx.try_send(AppCommand::OpenUrl {
                         url: format!(
                             "https://logs.ivr.fi/?channel={channel_login}&username={}",
@@ -1372,23 +1422,15 @@ impl<'a> MessageList<'a> {
                 ui.separator();
                 ui.label(RichText::new("Redemption").small().color(t::text_muted()));
 
-                let is_terminal = status
-                    .as_deref()
-                    .map(|s| {
-                        s.eq_ignore_ascii_case("fulfilled")
-                            || s.eq_ignore_ascii_case("canceled")
-                            || s.eq_ignore_ascii_case("cancelled")
-                    })
-                    .unwrap_or(false);
-                let can_update = !is_terminal
-                    && reward_id.as_deref().map(str::trim).is_some_and(|s| !s.is_empty())
-                    && redemption_id
-                        .as_deref()
-                        .map(str::trim)
-                        .is_some_and(|s| !s.is_empty());
+                let can_update = Self::redemption_can_update(
+                    reward_id.as_deref(),
+                    redemption_id.as_deref(),
+                    status.as_deref(),
+                );
+                let is_terminal = Self::redemption_is_terminal(status.as_deref());
 
                 if can_update {
-                    if ui.button("✅  Mark fulfilled").clicked() {
+                    if ui.button("Mark fulfilled").clicked() {
                         let _ = self.cmd_tx.try_send(AppCommand::UpdateRewardRedemptionStatus {
                             channel: self.channel.clone(),
                             reward_id: reward_id.clone().unwrap_or_default(),
@@ -1400,7 +1442,7 @@ impl<'a> MessageList<'a> {
                         ui.close_menu();
                     }
 
-                    if ui.button("❌  Reject redemption").clicked() {
+                    if ui.button("Reject redemption").clicked() {
                         let _ = self.cmd_tx.try_send(AppCommand::UpdateRewardRedemptionStatus {
                             channel: self.channel.clone(),
                             reward_id: reward_id.clone().unwrap_or_default(),
@@ -1417,9 +1459,9 @@ impl<'a> MessageList<'a> {
                     } else {
                         "Missing reward/redemption id from EventSub payload."
                     };
-                    ui.add_enabled(false, egui::Button::new("✅  Mark fulfilled"))
+                    ui.add_enabled(false, egui::Button::new("Mark fulfilled"))
                         .on_hover_text(reason);
-                    ui.add_enabled(false, egui::Button::new("❌  Reject redemption"))
+                    ui.add_enabled(false, egui::Button::new("Reject redemption"))
                         .on_hover_text(reason);
                 }
             }
@@ -1470,6 +1512,21 @@ impl<'a> MessageList<'a> {
         panel_rect: egui::Rect,
         paused_new_rows: usize,
     ) {
+        fn clamp_rect_to_panel(rect: egui::Rect, panel: egui::Rect, pad: f32) -> egui::Rect {
+            let max_w = (panel.width() - 2.0 * pad).max(1.0);
+            let max_h = (panel.height() - 2.0 * pad).max(1.0);
+            let size = egui::vec2(rect.width().min(max_w), rect.height().min(max_h));
+            let x = rect
+                .min
+                .x
+                .clamp(panel.min.x + pad, panel.max.x - pad - size.x);
+            let y = rect
+                .min
+                .y
+                .clamp(panel.min.y + pad, panel.max.y - pad - size.y);
+            egui::Rect::from_min_size(egui::pos2(x, y), size)
+        }
+
         let paused_key = egui::Id::new("scroll_paused").with(self.channel.as_str());
         let wheel_key = egui::Id::new("scroll_wheel_this_frame").with(self.channel.as_str());
         let prev_offset_key = egui::Id::new("scroll_prev_offset").with(self.channel.as_str());
@@ -1534,36 +1591,57 @@ impl<'a> MessageList<'a> {
 
         let show_resume_button = scroll_paused || !at_bottom;
         let resume_btn_rect = if show_resume_button {
-            let btn_size = egui::vec2(170.0, 28.0);
+            let btn_label = "Resume scrolling";
+            let estimated_btn_w = (btn_label.chars().count() as f32 * 7.0 + 34.0)
+                .clamp(140.0, (panel_rect.width() - 16.0).max(120.0));
+            let btn_size = egui::vec2(estimated_btn_w, 28.0);
             let btn_center = egui::pos2(panel_rect.center().x, panel_rect.bottom() - 36.0);
-            Some(egui::Rect::from_center_size(btn_center, btn_size))
+            let rect = egui::Rect::from_center_size(btn_center, btn_size);
+            Some(clamp_rect_to_panel(rect, panel_rect, 8.0))
         } else {
             None
         };
 
         if scroll_paused {
-            let badge_size = egui::vec2(190.0, 24.0);
+            let raw_text = if paused_new_rows > 0 {
+                format!("Paused - {paused_new_rows} new")
+            } else {
+                "Paused".to_owned()
+            };
+            let estimated_badge_w = (raw_text.chars().count() as f32 * 6.8 + 24.0)
+                .clamp(92.0, (panel_rect.width() - 16.0).max(92.0));
+            let badge_size = egui::vec2(estimated_badge_w, 24.0);
             let paused_rect = if let Some(btn_rect) = resume_btn_rect {
                 let x = btn_rect.center().x - badge_size.x * 0.5;
                 let y = (btn_rect.min.y - 8.0 - badge_size.y).max(panel_rect.top() + 8.0);
-                egui::Rect::from_min_size(egui::pos2(x, y), badge_size)
+                clamp_rect_to_panel(
+                    egui::Rect::from_min_size(egui::pos2(x, y), badge_size),
+                    panel_rect,
+                    8.0,
+                )
             } else {
-                egui::Rect::from_min_size(panel_rect.left_top() + egui::vec2(8.0, 8.0), badge_size)
+                clamp_rect_to_panel(
+                    egui::Rect::from_min_size(
+                        panel_rect.left_top() + egui::vec2(8.0, 8.0),
+                        badge_size,
+                    ),
+                    panel_rect,
+                    8.0,
+                )
             };
-            let fg_layer = LayerId::new(
-                Order::Middle,
-                Id::new("paused_badge_layer").with(self.channel.as_str()),
-            );
-            let painter = ui.ctx().layer_painter(fg_layer);
+            let painter = ui.painter().with_clip_rect(panel_rect);
             painter.rect_filled(
                 paused_rect,
                 6.0,
                 Color32::from_rgba_unmultiplied(0, 0, 0, 160),
             );
-            let text = if paused_new_rows > 0 {
-                format!("Paused · {paused_new_rows} new")
+            let max_chars = (((paused_rect.width() - 16.0) / 6.8).floor() as usize).max(4);
+            let text = if raw_text.chars().count() > max_chars {
+                let mut trimmed: String = raw_text.chars().take(max_chars.saturating_sub(1)).collect();
+                trimmed.push('…');
+                trimmed
             } else {
-                "Paused".to_owned()
+                raw_text
             };
             painter.text(
                 paused_rect.center(),
@@ -1575,13 +1653,7 @@ impl<'a> MessageList<'a> {
         }
 
         if let Some(btn_rect) = resume_btn_rect {
-            // Paint a floating button in the middle UI order so modal
-            // windows (e.g. settings) can still appear above it.
-            let fg_layer = LayerId::new(
-                Order::Middle,
-                Id::new("resume_scroll_layer").with(self.channel.as_str()),
-            );
-            let painter = ui.ctx().layer_painter(fg_layer);
+            let painter = ui.painter().with_clip_rect(panel_rect);
 
             // Button background
             painter.rect_filled(btn_rect, 8.0, t::accent_dim());
@@ -1596,7 +1668,7 @@ impl<'a> MessageList<'a> {
             painter.text(
                 btn_rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "↓ Resume scrolling",
+                "Resume scrolling",
                 egui::FontId::proportional(12.0),
                 Color32::WHITE,
             );
@@ -1628,6 +1700,7 @@ impl<'a> MessageList<'a> {
         &self,
         ui: &mut Ui,
         msg: &ChatMessage,
+        dimmed: bool,
         rctx: &RenderCtx,
         static_frames: &mut HashMap<String, StaticFrameCacheEntry>,
         user_color_cache: &mut HashMap<String, Color32>,
@@ -1651,12 +1724,15 @@ impl<'a> MessageList<'a> {
             (Some(hl_id), Some(msg_id)) if hl_id == msg_id => rctx.highlight_alpha,
             _ => 0.0,
         };
-        let keyword_highlight = self.message_matches_keyword_highlight(msg);
+        let keyword_highlight_match = self.message_keyword_highlight(msg);
+        let keyword_highlight = keyword_highlight_match.is_some();
+        let keyword_highlight_color = keyword_highlight_match.and_then(|m| m.color);
         let bg = message_row_background(
             &msg.flags,
             &msg.msg_kind,
             highlight_alpha,
             keyword_highlight,
+            keyword_highlight_color,
         );
 
         // Context-menu approach:
@@ -1713,10 +1789,14 @@ impl<'a> MessageList<'a> {
                 // even when the label wins the hit test.
                 ui.style_mut().interaction.selectable_labels = false;
 
+                if dimmed {
+                    ui.set_opacity(if msg.flags.is_history { 0.35 } else { 0.45 });
+                }
+
                 // History messages are rendered at reduced opacity so they
                 // read as older context while still being fully legible.
                 if msg.flags.is_history {
-                    ui.set_opacity(0.55);
+                    ui.set_opacity(if dimmed { 0.35 } else { 0.55 });
                 }
                 if let Some(ref rep) = msg.reply {
                     ui.horizontal(|ui| {
@@ -1777,7 +1857,12 @@ impl<'a> MessageList<'a> {
                 // Rendered inside the Frame so the background fill covers
                 // the banner as well, and the interaction rect is contiguous.
                 if let Some((label, stripe_color)) =
-                    notification_label(&msg.flags, &msg.msg_kind, keyword_highlight)
+                    notification_label(
+                        &msg.flags,
+                        &msg.msg_kind,
+                        keyword_highlight,
+                        keyword_highlight_color,
+                    )
                 {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
@@ -1806,11 +1891,11 @@ impl<'a> MessageList<'a> {
 
                         if self.show_timestamps {
                             // Timestamp
-                            let ts = msg
-                                .timestamp
-                                .with_timezone(&chrono::Local)
-                                .format("%H:%M")
-                                .to_string();
+                            let ts = format_message_timestamp(
+                                &msg.timestamp,
+                                self.show_timestamp_seconds,
+                                self.use_24h_timestamps,
+                            );
                             ui.add(Label::new(
                                 RichText::new(ts).color(t::timestamp()).font(t::small()),
                             ));
@@ -1982,7 +2067,12 @@ impl<'a> MessageList<'a> {
             // Left accent strip for mentions and highlights - a vivid 3 px bar on
             // the left edge of the row so the eye finds them instantly in fast chat.
             if let Some(bar_col) =
-                message_left_accent_color(&msg.flags, &msg.msg_kind, keyword_highlight)
+                message_left_accent_color(
+                    &msg.flags,
+                    &msg.msg_kind,
+                    keyword_highlight,
+                    keyword_highlight_color,
+                )
             {
                 let r = msg_frame_resp.rect;
                 let strip = egui::Rect::from_min_size(r.left_top(), egui::vec2(3.0, r.height()));
@@ -1991,19 +2081,23 @@ impl<'a> MessageList<'a> {
         }); // end push_id
     }
 
-    fn message_matches_keyword_highlight(&self, msg: &ChatMessage) -> bool {
+    fn message_keyword_highlight(&self, msg: &ChatMessage) -> Option<KeywordHighlightMatch> {
         if self.highlight_rules.is_empty() {
-            return false;
+            return None;
         }
         if msg.raw_text.is_empty() {
-            return false;
+            return None;
         }
-        let lowered = msg.raw_text.to_ascii_lowercase();
-        self.highlight_rules
-            .iter()
-            .any(|rule| {
-                rule.matches_scope(msg, self.channel)
-                    && rule.matches_message(lowered.as_str(), msg.raw_text.as_str())
+        crust_core::highlight::first_match_context(
+            self.highlight_rules,
+            &msg.raw_text,
+            &msg.sender.login,
+            &msg.sender.display_name,
+            self.channel.display_name(),
+            msg.flags.is_mention,
+        )
+            .map(|(color, _show_in_mentions, _has_alert, _has_sound)| KeywordHighlightMatch {
+                color: color.map(|[r, g, b]| Color32::from_rgb(r, g, b)),
             })
     }
 
@@ -2142,7 +2236,11 @@ impl<'a> MessageList<'a> {
 
                         if self.show_timestamps {
                             // Timestamp
-                            let ts = msg.timestamp.format("%H:%M").to_string();
+                            let ts = format_message_timestamp(
+                                &msg.timestamp,
+                                self.show_timestamp_seconds,
+                                self.use_24h_timestamps,
+                            );
                             ui.add(Label::new(
                                 RichText::new(ts).color(t::timestamp()).font(t::small()),
                             ));
@@ -2155,6 +2253,63 @@ impl<'a> MessageList<'a> {
                             RichText::new(text).italics().color(accent).font(t::small())
                         };
                         ui.add(Label::new(rich).wrap());
+
+                        if self.can_moderate {
+                            if let MsgKind::ChannelPointsReward {
+                                reward_id,
+                                redemption_id,
+                                status,
+                                user_login,
+                                reward_title,
+                                ..
+                            } = &msg.msg_kind
+                            {
+                                let can_update = Self::redemption_can_update(
+                                    reward_id.as_deref(),
+                                    redemption_id.as_deref(),
+                                    status.as_deref(),
+                                );
+                                if can_update {
+                                    ui.add_space(4.0);
+                                    if ui.small_button("Approve").clicked() {
+                                        let _ = self.cmd_tx.try_send(
+                                            AppCommand::UpdateRewardRedemptionStatus {
+                                                channel: self.channel.clone(),
+                                                reward_id: reward_id
+                                                    .as_ref()
+                                                    .cloned()
+                                                    .unwrap_or_default(),
+                                                redemption_id: redemption_id
+                                                    .as_ref()
+                                                    .cloned()
+                                                    .unwrap_or_default(),
+                                                status: "FULFILLED".to_owned(),
+                                                user_login: user_login.clone(),
+                                                reward_title: reward_title.clone(),
+                                            },
+                                        );
+                                    }
+                                    if ui.small_button("Reject").clicked() {
+                                        let _ = self.cmd_tx.try_send(
+                                            AppCommand::UpdateRewardRedemptionStatus {
+                                                channel: self.channel.clone(),
+                                                reward_id: reward_id
+                                                    .as_ref()
+                                                    .cloned()
+                                                    .unwrap_or_default(),
+                                                redemption_id: redemption_id
+                                                    .as_ref()
+                                                    .cloned()
+                                                    .unwrap_or_default(),
+                                                status: "CANCELED".to_owned(),
+                                                user_login: user_login.clone(),
+                                                reward_title: reward_title.clone(),
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     });
                 });
         }); // end push_id
@@ -2488,6 +2643,23 @@ impl<'a> MessageList<'a> {
                 .sense(egui::Sense::click())
                 .fit_to_exact_size(size),
         )
+    }
+}
+
+fn format_message_timestamp(
+    ts: &chrono::DateTime<chrono::Utc>,
+    show_seconds: bool,
+    use_24h: bool,
+) -> String {
+    let local = ts.with_timezone(&chrono::Local);
+    if use_24h && show_seconds {
+        local.format("%H:%M:%S").to_string()
+    } else if use_24h {
+        local.format("%H:%M").to_string()
+    } else if show_seconds {
+        local.format("%I:%M:%S %p").to_string()
+    } else {
+        local.format("%I:%M %p").to_string()
     }
 }
 
@@ -3696,11 +3868,15 @@ fn notification_label(
     flags: &MessageFlags,
     kind: &MsgKind,
     keyword_highlight: bool,
+    keyword_highlight_color: Option<Color32>,
 ) -> Option<(&'static str, Color32)> {
     if flags.is_highlighted {
         Some(("Highlighted Message", t::twitch_purple()))
     } else if keyword_highlight {
-        Some(("Keyword Highlight", t::twitch_purple()))
+        Some((
+            "Keyword Highlight",
+            keyword_highlight_color.unwrap_or_else(t::twitch_purple),
+        ))
     } else if flags.is_mention {
         Some(("Mention", Color32::from_rgb(210, 140, 40)))
     } else if flags.is_pinned {
@@ -3723,6 +3899,7 @@ fn message_row_background(
     kind: &MsgKind,
     highlight_alpha: f32,
     keyword_highlight: bool,
+    keyword_highlight_color: Option<Color32>,
 ) -> Color32 {
     if highlight_alpha > 0.0 {
         let a = (50.0 * highlight_alpha) as u8;
@@ -3730,7 +3907,11 @@ fn message_row_background(
     } else if flags.is_highlighted {
         Color32::from_rgba_unmultiplied(145, 70, 255, 22)
     } else if keyword_highlight {
-        Color32::from_rgba_unmultiplied(145, 70, 255, 18)
+        if let Some(color) = keyword_highlight_color {
+            Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 18)
+        } else {
+            Color32::from_rgba_unmultiplied(145, 70, 255, 18)
+        }
     } else if flags.is_mention {
         Color32::from_rgba_unmultiplied(210, 140, 40, 24)
     } else if flags.is_pinned {
@@ -3756,6 +3937,7 @@ fn message_left_accent_color(
     flags: &MessageFlags,
     kind: &MsgKind,
     keyword_highlight: bool,
+    keyword_highlight_color: Option<Color32>,
 ) -> Option<Color32> {
     if flags.is_mention && matches!(kind, MsgKind::Sub { is_gift: true, .. }) {
         Some(t::raid_cyan())
@@ -3764,7 +3946,7 @@ fn message_left_accent_color(
     } else if flags.is_highlighted {
         Some(Color32::from_rgb(255, 210, 30))
     } else if keyword_highlight {
-        Some(t::twitch_purple())
+        Some(keyword_highlight_color.unwrap_or_else(t::twitch_purple))
     } else if matches!(kind, MsgKind::ChannelPointsReward { .. }) {
         Some(Color32::from_rgb(120, 85, 195))
     } else if flags.is_pinned {
@@ -3840,7 +4022,7 @@ mod tests {
             is_first_msg: true,
             ..MessageFlags::default()
         };
-        let bg = message_row_background(&flags, &MsgKind::Chat, 0.0, false);
+        let bg = message_row_background(&flags, &MsgKind::Chat, 0.0, false, None);
         assert_ne!(bg, Color32::TRANSPARENT);
     }
 
@@ -3851,7 +4033,7 @@ mod tests {
             ..MessageFlags::default()
         };
         assert_eq!(
-            message_left_accent_color(&flags, &MsgKind::Chat, false),
+            message_left_accent_color(&flags, &MsgKind::Chat, false, None),
             Some(t::green())
         );
     }
@@ -3863,8 +4045,28 @@ mod tests {
             ..MessageFlags::default()
         };
         assert_eq!(
-            notification_label(&flags, &MsgKind::Chat, false),
+            notification_label(&flags, &MsgKind::Chat, false, None),
             Some(("Pinned Message", t::gold()))
+        );
+    }
+
+    
+
+    #[test]
+    fn keyword_highlight_uses_custom_color_when_present() {
+        let flags = MessageFlags::default();
+        let custom = Color32::from_rgb(12, 180, 120);
+        assert_eq!(
+            message_left_accent_color(&flags, &MsgKind::Chat, true, Some(custom)),
+            Some(custom)
+        );
+        assert_eq!(
+            notification_label(&flags, &MsgKind::Chat, true, Some(custom)),
+            Some(("Keyword Highlight", custom))
+        );
+        assert_eq!(
+            message_row_background(&flags, &MsgKind::Chat, 0.0, true, Some(custom)),
+            Color32::from_rgba_unmultiplied(12, 180, 120, 18)
         );
     }
 

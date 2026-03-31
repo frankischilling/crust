@@ -211,12 +211,15 @@ impl<'a> ChatInput<'a> {
                     // At narrow widths, hide Send button and emote picker to maximise input
                     let show_send_btn = input_width > 250.0;
                     let show_emote_btn = input_width > 200.0;
+                    let is_twitch_channel = !self.channel.is_irc() && !self.channel.is_kick();
+                    let show_counter = is_twitch_channel && !buf.is_empty();
+                    let counter_reserve = if show_counter { 70.0 } else { 0.0 };
                     let reserve = if show_send_btn && show_emote_btn {
-                        t::BAR_H + 58.0 + t::TOOLBAR_SPACING.x * 2.0
+                        t::BAR_H + 58.0 + t::TOOLBAR_SPACING.x * 2.0 + counter_reserve
                     } else if show_emote_btn {
-                        t::BAR_H + t::TOOLBAR_SPACING.x
+                        t::BAR_H + t::TOOLBAR_SPACING.x + counter_reserve
                     } else {
-                        0.0
+                        counter_reserve
                     };
                     let text_width = (ui.available_width() - reserve).max(40.0);
                     let te_output = ui
@@ -524,7 +527,6 @@ impl<'a> ChatInput<'a> {
                     ui.ctx().data_mut(|d| d.insert_temp(ac_id, ac_sel));
 
                     const TWITCH_MAX_CHARS: usize = 500;
-                    let is_twitch_channel = !self.channel.is_irc() && !self.channel.is_kick();
                     let mut twitch_char_count = if is_twitch_channel {
                         buf.chars().count()
                     } else {
@@ -599,6 +601,7 @@ impl<'a> ChatInput<'a> {
                     // Character count - Twitch has a 500-char limit.
                     // Show only for Twitch channels when the user has typed something.
                     if !buf.is_empty() && is_twitch_channel {
+                        let compact_counter = ui.available_width() < 110.0;
                         let color = if twitch_char_count > TWITCH_MAX_CHARS {
                             t::red()
                         } else if twitch_char_count > 400 {
@@ -611,7 +614,10 @@ impl<'a> ChatInput<'a> {
                                 .font(t::tiny())
                                 .color(color),
                         );
-                        if twitch_over_limit && !self.prevent_overlong_twitch_messages {
+                        if twitch_over_limit
+                            && !self.prevent_overlong_twitch_messages
+                            && !compact_counter
+                        {
                             let over_by = twitch_char_count - TWITCH_MAX_CHARS;
                             ui.label(
                                 RichText::new(format!("Over by {over_by} chars"))
