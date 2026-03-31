@@ -3192,7 +3192,7 @@ fn prefetch_emote_images(
 /// Chatterino's bundled Twitch global badge dataset, used as a reliable
 /// fallback when live badge APIs are unavailable or return an unexpected shape.
 const CHATTERINO_TWITCH_BADGES_JSON: &str =
-    include_str!("../../../chatterino2/resources/twitch-badges.json");
+    include_str!("../../../chatterino2-master/resources/twitch-badges.json");
 
 /// Resolve a badge image URL from the badge map.
 ///

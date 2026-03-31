@@ -175,6 +175,859 @@ impl UserProfilePopup {
         self.profile.as_ref().map(|p| p.id.as_str())
     }
 
+    fn popup_title(&self) -> String {
+        if self.loading {
+            format!("@{}", self.loading_login)
+        } else if let Some(ref p) = self.profile {
+            format!("@{}", p.login)
+        } else {
+            "User Profile".to_owned()
+        }
+    }
+
+    fn current_channel_name(&self) -> String {
+        self.channel
+            .as_ref()
+            .map(|c| c.as_str().to_owned())
+            .unwrap_or_default()
+    }
+
+    fn render_loading_state(ui: &mut egui::Ui) {
+        ui.add_space(20.0);
+        ui.vertical_centered(|ui| {
+            ui.label(
+                RichText::new("Loading profile…")
+                    .color(t::text_secondary())
+                    .italics(),
+            );
+        });
+        ui.add_space(20.0);
+    }
+
+    fn render_unavailable_state(ui: &mut egui::Ui) {
+        ui.add_space(8.0);
+        ui.label(RichText::new("Profile unavailable.").color(t::red()));
+        ui.add_space(8.0);
+    }
+
+    fn render_profile_header(
+        &self,
+        ui: &mut egui::Ui,
+        profile: &UserProfile,
+        emote_bytes: &HashMap<String, (u32, u32, Arc<[u8]>)>,
+        stv_avatars: &HashMap<String, String>,
+    ) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 12.0;
+
+            const AV: f32 = 76.0;
+            let (av_rect, _) = ui.allocate_exact_size(Vec2::splat(AV), egui::Sense::hover());
+
+            let stv_av = stv_avatars.get(&profile.id);
+            let avatar_entry = stv_av
+                .and_then(|url| emote_bytes.get(url.as_str()).map(|e| (url.as_str(), e)))
+                .or_else(|| {
+                    profile
+                        .avatar_url
+                        .as_deref()
+                        .and_then(|url| emote_bytes.get(url).map(|e| (url, e)))
+                });
+
+            if let Some((logo, (_, _, ref raw))) = avatar_entry {
+                let uri = super::bytes_uri(logo, raw.as_ref());
+                ui.painter()
+                    .circle_filled(av_rect.center(), AV / 2.0, t::bg_raised());
+                ui.put(
+                    av_rect,
+                    egui::Image::from_bytes(uri, egui::load::Bytes::Shared(raw.clone()))
+                        .fit_to_exact_size(Vec2::splat(AV))
+                        .corner_radius(CornerRadius::same(AV as u8 / 2)),
+                );
+            } else {
+                let initial = profile
+                    .display_name
+                    .chars()
+                    .next()
+                    .and_then(|c| c.to_uppercase().next())
+                    .unwrap_or('?');
+                let p = ui.painter();
+                p.circle_filled(av_rect.center(), AV / 2.0, t::accent_dim());
+                p.circle_stroke(
+                    av_rect.center(),
+                    AV / 2.0,
+                    egui::Stroke::new(2.0, t::accent()),
+                );
+                p.text(
+                    av_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    initial.to_string(),
+                    egui::FontId::proportional(28.0),
+                    t::text_primary(),
+                );
+            }
+
+            if profile.is_live {
+                let dot_center = egui::pos2(av_rect.max.x - 6.0, av_rect.max.y - 6.0);
+                ui.painter().circle_filled(dot_center, 7.0, t::bg_base());
+                ui.painter().circle_filled(dot_center, 5.0, t::red());
+            }
+
+            ui.vertical(|ui| {
+                ui.add_space(2.0);
+
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.add(egui::Label::new(
+                        RichText::new(&profile.display_name)
+                            .strong()
+                            .size(16.0)
+                            .color(t::text_primary()),
+                    ));
+                    if profile.is_live {
+                        egui::Frame::new()
+                            .fill(Color32::from_rgba_unmultiplied(200, 40, 40, 200))
+                            .corner_radius(t::RADIUS_SM)
+                            .inner_margin(egui::Margin::symmetric(5, 2))
+                            .show(ui, |ui| {
+                                ui.add(egui::Label::new(
+                                    RichText::new("● LIVE")
+                                        .color(Color32::WHITE)
+                                        .size(10.0)
+                                        .strong(),
+                                ));
+                            });
+                    }
+                    if profile.is_banned {
+                        egui::Frame::new()
+                            .fill(Color32::from_rgba_unmultiplied(200, 30, 30, 160))
+                            .corner_radius(t::RADIUS_SM)
+                            .inner_margin(egui::Margin::symmetric(5, 2))
+                            .show(ui, |ui| {
+                                ui.add(egui::Label::new(
+                                    RichText::new("BANNED")
+                                        .color(Color32::WHITE)
+                                        .size(10.0)
+                                        .strong(),
+                                ));
+                            });
+                    }
+                });
+
+                if profile.login.to_lowercase() != profile.display_name.to_lowercase() {
+                    ui.add(egui::Label::new(
+                        RichText::new(format!("@{}", profile.login))
+                            .color(t::text_secondary())
+                            .small(),
+                    ));
+                }
+
+                ui.add_space(2.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(3.0, 2.0);
+                    if profile.is_partner {
+                        role_pill(ui, "Partner", t::accent());
+                    } else if profile.is_affiliate {
+                        role_pill(ui, "Affiliate", t::text_secondary());
+                    }
+                    if let Some(ref hex) = profile.chat_color {
+                        if let Some(c) = parse_hex_color(hex) {
+                            egui::Frame::new()
+                                .fill(Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 35))
+                                .corner_radius(t::RADIUS_SM)
+                                .inner_margin(egui::Margin::symmetric(5, 2))
+                                .stroke(egui::Stroke::new(1.0, c))
+                                .show(ui, |ui| {
+                                    ui.add(egui::Label::new(
+                                        RichText::new("● Chat color").color(c).small(),
+                                    ));
+                                });
+                        }
+                    }
+                });
+
+                if !self.badges.is_empty() {
+                    ui.add_space(3.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
+                        for badge in &self.badges {
+                            let badge_name = badge_display_name(&badge.name, &badge.version);
+                            if let Some(url) = &badge.url {
+                                if let Some((_, _, ref raw)) = emote_bytes.get(url.as_str()) {
+                                    let uri = super::bytes_uri(url, raw.as_ref());
+                                    const BS: f32 = 18.0;
+                                    let (brect, _) =
+                                        ui.allocate_exact_size(Vec2::splat(BS), egui::Sense::hover());
+                                    ui.put(
+                                        brect,
+                                        egui::Image::from_bytes(
+                                            uri,
+                                            egui::load::Bytes::Shared(raw.clone()),
+                                        )
+                                        .fit_to_exact_size(Vec2::splat(BS)),
+                                    );
+                                    if ui.rect_contains_pointer(brect) {
+                                        egui::show_tooltip_text(
+                                            ui.ctx(),
+                                            ui.layer_id(),
+                                            egui::Id::new(url.as_str()),
+                                            &badge_name,
+                                        );
+                                    }
+                                    continue;
+                                }
+                            }
+                            badge_text_pill(ui, &badge_name);
+                        }
+                    });
+                }
+            });
+        });
+    }
+
+    fn render_quick_actions(
+        &self,
+        ui: &mut egui::Ui,
+        profile: &UserProfile,
+        actions: &mut Vec<PopupAction>,
+    ) {
+        let display_differs = !profile
+            .display_name
+            .eq_ignore_ascii_case(profile.login.as_str());
+
+        egui::Frame::new()
+            .fill(t::bg_card())
+            .stroke(egui::Stroke::new(1.0, t::border_subtle()))
+            .corner_radius(t::RADIUS_SM)
+            .inner_margin(egui::Margin::symmetric(6, 5))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+
+                    if small_action_btn(ui, "Copy login") {
+                        ui.ctx().copy_text(profile.login.clone());
+                    }
+                    if display_differs && small_action_btn(ui, "Copy display") {
+                        ui.ctx().copy_text(profile.display_name.clone());
+                    }
+                    if small_action_btn(ui, "Copy user ID") {
+                        ui.ctx().copy_text(profile.id.clone());
+                    }
+                    if let Some(url) = profile.avatar_url.as_ref() {
+                        if small_action_btn(ui, "Open avatar") {
+                            actions.push(PopupAction::OpenUrl { url: url.clone() });
+                        }
+                    }
+                });
+            });
+    }
+
+    fn render_live_info(&self, ui: &mut egui::Ui, profile: &UserProfile) {
+        if !profile.is_live {
+            return;
+        }
+
+        ui.add_space(6.0);
+        egui::Frame::new()
+            .fill(Color32::from_rgba_unmultiplied(200, 40, 40, 18))
+            .corner_radius(t::RADIUS)
+            .stroke(egui::Stroke::new(
+                1.0,
+                Color32::from_rgba_unmultiplied(200, 60, 60, 80),
+            ))
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                if let Some(ref title) = profile.stream_title {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(title)
+                                .color(t::text_primary())
+                                .small()
+                                .strong(),
+                        )
+                        .wrap(),
+                    );
+                }
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    if let Some(ref game) = profile.stream_game {
+                        ui.add(egui::Label::new(
+                            RichText::new(format!("🎮 {game}"))
+                                .color(t::accent())
+                                .small(),
+                        ));
+                    }
+                    if let Some(v) = profile.stream_viewers {
+                        ui.add(egui::Label::new(
+                            RichText::new(format!("👁 {}", fmt_count(v)))
+                                .color(t::text_secondary())
+                                .small(),
+                        ));
+                    }
+                    if let Some(ref started) = profile.last_broadcast_at {
+                        let uptime = fmt_uptime(started);
+                        if !uptime.is_empty() {
+                            ui.add(egui::Label::new(
+                                RichText::new(format!("⏱ {uptime}"))
+                                    .color(t::text_secondary())
+                                    .small(),
+                            ));
+                        }
+                    }
+                });
+            });
+    }
+
+    fn render_tab_bar(&mut self, ui: &mut egui::Ui, profile: &UserProfile, actions: &mut Vec<PopupAction>) {
+        let mut tabs: Vec<(&str, ProfileTab)> = vec![("Profile", ProfileTab::Profile)];
+        if self.is_mod {
+            tabs.push(("Moderation", ProfileTab::Moderation));
+            tabs.push(("Logs", ProfileTab::Logs));
+        }
+        tabs.push(("IVR Logs", ProfileTab::IvrLogs));
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for (tab_label, tab_val) in &tabs {
+                let active = self.active_tab == *tab_val;
+                let fg = if active {
+                    t::text_primary()
+                } else {
+                    t::text_secondary()
+                };
+                let bg = if active {
+                    t::bg_raised()
+                } else {
+                    Color32::TRANSPARENT
+                };
+                let resp = egui::Frame::new()
+                    .fill(bg)
+                    .corner_radius(CornerRadius::same(4))
+                    .stroke(if active {
+                        egui::Stroke::new(1.0, t::border_subtle())
+                    } else {
+                        egui::Stroke::NONE
+                    })
+                    .inner_margin(egui::Margin::symmetric(10, 4))
+                    .show(ui, |ui| {
+                        ui.add(egui::Label::new(
+                            RichText::new(*tab_label).color(fg).small().strong(),
+                        ));
+                    })
+                    .response;
+                if resp.interact(egui::Sense::click()).clicked() {
+                    self.active_tab = *tab_val;
+                    self.ban_confirm = false;
+                    if *tab_val == ProfileTab::IvrLogs && !self.ivr_logs_requested {
+                        actions.push(PopupAction::FetchIvrLogs {
+                            channel: self.current_channel_name(),
+                            username: profile.login.clone(),
+                        });
+                    }
+                }
+            }
+        });
+        ui.add_space(4.0);
+    }
+
+    fn render_logs_tab(&self, ui: &mut egui::Ui) {
+        let log_count = self.logs.len();
+        egui::Frame::new()
+            .fill(if t::is_light() {
+                Color32::from_rgba_unmultiplied(0, 0, 0, 20)
+            } else {
+                Color32::from_rgba_unmultiplied(0, 0, 0, 60)
+            })
+            .corner_radius(t::RADIUS_SM)
+            .inner_margin(egui::Margin::symmetric(6, 4))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(if log_count == 0 {
+                        "No messages from this user in the current session.".to_owned()
+                    } else {
+                        format!(
+                            "{log_count} message{} (current session, newest first)",
+                            if log_count == 1 { "" } else { "s" }
+                        )
+                    })
+                    .color(t::text_muted())
+                    .small(),
+                );
+            });
+
+        ui.add_space(4.0);
+
+        egui::ScrollArea::vertical()
+            .id_salt("user_logs_scroll")
+            .max_height(320.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                if self.logs.is_empty() {
+                    ui.add_space(8.0);
+                    ui.centered_and_justified(|ui| {
+                        ui.label(RichText::new("No recent messages.").color(t::text_muted()).small());
+                    });
+                }
+                for msg in &self.logs {
+                    let time_str = msg.timestamp.format("%H:%M:%S").to_string();
+                    let text = chat_message_text(msg);
+
+                    let is_action = msg.flags.is_action;
+                    let is_deleted = msg.flags.is_deleted;
+
+                    egui::Frame::new()
+                        .fill(if is_deleted {
+                            Color32::from_rgba_unmultiplied(150, 30, 30, 20)
+                        } else {
+                            Color32::TRANSPARENT
+                        })
+                        .inner_margin(egui::Margin::symmetric(4, 2))
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                ui.add(egui::Label::new(
+                                    RichText::new(&time_str)
+                                        .color(t::text_muted())
+                                        .small()
+                                        .monospace(),
+                                ));
+                                let msg_color = if is_deleted {
+                                    t::text_muted()
+                                } else if is_action {
+                                    Color32::from_rgba_unmultiplied(200, 200, 255, 230)
+                                } else {
+                                    t::text_primary()
+                                };
+                                let rich = RichText::new(&text).color(msg_color).small();
+                                let rich = if is_action || is_deleted {
+                                    rich.italics()
+                                } else {
+                                    rich
+                                };
+                                ui.add(egui::Label::new(rich).wrap());
+                            });
+                        });
+                    ui.add_space(1.0);
+                }
+            });
+    }
+
+    fn render_profile_tab(&self, ui: &mut egui::Ui, profile: &UserProfile) {
+        egui::Frame::new()
+            .fill(t::bg_card())
+            .stroke(egui::Stroke::new(1.0, t::border_subtle()))
+            .corner_radius(t::RADIUS_SM)
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                let mut add_row = |label: &str, value: String| {
+                    ui.horizontal(|ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(RichText::new(label).color(t::text_secondary()).small());
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.label(RichText::new(value).color(t::text_primary()).small());
+                            },
+                        );
+                    });
+                    ui.add_space(2.0);
+                };
+
+                if let Some(f) = profile.followers {
+                    add_row("Followers", fmt_count(f));
+                }
+                if let Some(ref ts) = profile.created_at {
+                    add_row("Account age", fmt_account_age(ts));
+                    add_row("Joined", fmt_join_date(ts));
+                }
+                if !profile.is_live {
+                    if let Some(ref ts) = profile.last_broadcast_at {
+                        add_row("Last live", fmt_join_date(ts));
+                    }
+                }
+            });
+
+        if !profile.description.is_empty() {
+            ui.add_space(5.0);
+            egui::Frame::new()
+                .fill(t::bg_card())
+                .stroke(egui::Stroke::new(1.0, t::border_subtle()))
+                .corner_radius(t::RADIUS_SM)
+                .inner_margin(egui::Margin::symmetric(8, 6))
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Bio").small().strong().color(t::text_secondary()));
+                    ui.add_space(2.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&profile.description)
+                                .color(t::text_secondary())
+                                .small(),
+                        )
+                        .wrap(),
+                    );
+                });
+        }
+
+        if profile.is_banned {
+            ui.add_space(5.0);
+            egui::Frame::new()
+                .fill(Color32::from_rgba_unmultiplied(200, 30, 30, 25))
+                .corner_radius(t::RADIUS_SM)
+                .inner_margin(egui::Margin::symmetric(8, 5))
+                .show(ui, |ui| {
+                    let reason = profile.ban_reason.as_deref().unwrap_or("No reason provided");
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!("⚠ Suspended: {reason}"))
+                                .color(t::red())
+                                .small(),
+                        )
+                        .wrap(),
+                    );
+                });
+        }
+    }
+
+    fn render_moderation_tab(
+        &mut self,
+        ui: &mut egui::Ui,
+        profile: &UserProfile,
+        actions: &mut Vec<PopupAction>,
+    ) {
+        let Some(channel) = self.channel.clone() else {
+            return;
+        };
+
+        let login = profile.login.clone();
+        let user_id = profile.id.clone();
+
+        ui.label(
+            RichText::new("Reason (optional)")
+                .color(t::text_secondary())
+                .small(),
+        );
+        ui.add_space(2.0);
+        ui.add_sized(
+            [ui.available_width(), 22.0],
+            egui::TextEdit::singleline(&mut self.mod_reason)
+                .hint_text("e.g. spam, hate speech…")
+                .font(t::small()),
+        );
+        ui.add_space(6.0);
+
+        section_label(ui, "Timeout");
+        ui.add_space(3.0);
+        egui::Grid::new("timeout_presets_row1")
+            .num_columns(6)
+            .spacing([4.0, 4.0])
+            .show(ui, |ui| {
+                const ROW1: &[(&str, u32)] =
+                    &[("1s", 1), ("30s", 30), ("1m", 60), ("5m", 300), ("10m", 600), ("30m", 1_800)];
+                for &(lbl, secs) in ROW1 {
+                    if timeout_btn(ui, lbl) {
+                        actions.push(PopupAction::Timeout {
+                            channel: channel.clone(),
+                            login: login.clone(),
+                            user_id: user_id.clone(),
+                            seconds: secs,
+                            reason: reason_opt(&self.mod_reason),
+                        });
+                    }
+                }
+                ui.end_row();
+                const ROW2: &[(&str, u32)] =
+                    &[("1h", 3_600), ("8h", 28_800), ("24h", 86_400), ("7d", 604_800), ("14d", 1_209_600)];
+                for &(lbl, secs) in ROW2 {
+                    if timeout_btn(ui, lbl) {
+                        actions.push(PopupAction::Timeout {
+                            channel: channel.clone(),
+                            login: login.clone(),
+                            user_id: user_id.clone(),
+                            seconds: secs,
+                            reason: reason_opt(&self.mod_reason),
+                        });
+                    }
+                }
+            });
+
+        ui.add_space(3.0);
+        ui.horizontal(|ui| {
+            let resp = ui.add_sized(
+                [80.0, 20.0],
+                egui::TextEdit::singleline(&mut self.timeout_custom)
+                    .hint_text("custom (s)")
+                    .font(t::small()),
+            );
+            let pressed = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let go_btn = ui.add_sized([38.0, 20.0], egui::Button::new(RichText::new("Go").small()));
+            if pressed || go_btn.clicked() {
+                if let Ok(secs) = self.timeout_custom.trim().parse::<u32>() {
+                    if secs > 0 {
+                        actions.push(PopupAction::Timeout {
+                            channel: channel.clone(),
+                            login: login.clone(),
+                            user_id: user_id.clone(),
+                            seconds: secs,
+                            reason: reason_opt(&self.mod_reason),
+                        });
+                        self.timeout_custom.clear();
+                    }
+                }
+            }
+        });
+
+        ui.add_space(8.0);
+        section_label(ui, "Lift restriction");
+        ui.add_space(3.0);
+        if ui
+            .add(
+                egui::Button::new(
+                    RichText::new("Untimeout / Unban")
+                        .small()
+                        .color(Color32::WHITE),
+                )
+                .fill(Color32::from_rgba_unmultiplied(40, 180, 90, 200))
+                .min_size(egui::vec2(160.0, 24.0)),
+            )
+            .clicked()
+        {
+            actions.push(PopupAction::Unban {
+                channel: channel.clone(),
+                login: login.clone(),
+                user_id: user_id.clone(),
+            });
+        }
+
+        ui.add_space(8.0);
+        section_label(ui, "Permanent ban");
+        ui.add_space(3.0);
+        if self.ban_confirm {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let confirm = ui.add(
+                    egui::Button::new(
+                        RichText::new("Confirm ban")
+                            .small()
+                            .color(Color32::WHITE),
+                    )
+                    .fill(Color32::from_rgba_unmultiplied(200, 30, 30, 230))
+                    .min_size(egui::vec2(120.0, 24.0)),
+                );
+                let cancel = ui.add(
+                    egui::Button::new(RichText::new("Cancel").small())
+                        .min_size(egui::vec2(60.0, 24.0)),
+                );
+                if confirm.clicked() {
+                    actions.push(PopupAction::Ban {
+                        channel: channel.clone(),
+                        login: login.clone(),
+                        user_id: user_id.clone(),
+                        reason: reason_opt(&self.mod_reason),
+                    });
+                    self.ban_confirm = false;
+                }
+                if cancel.clicked() {
+                    self.ban_confirm = false;
+                }
+            });
+        } else if ui
+            .add(
+                egui::Button::new(RichText::new("Ban user").small().color(Color32::WHITE))
+                    .fill(Color32::from_rgba_unmultiplied(180, 40, 40, 180))
+                    .min_size(egui::vec2(100.0, 24.0)),
+            )
+            .clicked()
+        {
+            self.ban_confirm = true;
+        }
+    }
+
+    fn render_ivr_logs_tab(
+        &mut self,
+        ui: &mut egui::Ui,
+        profile: &UserProfile,
+        actions: &mut Vec<PopupAction>,
+    ) {
+        let ivr_url = format!(
+            "https://logs.ivr.fi/?channel={}&username={}",
+            self.channel.as_ref().map(|c| c.as_str()).unwrap_or(""),
+            profile.login,
+        );
+
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new("Open in Browser")
+                            .small()
+                            .color(t::accent()),
+                    )
+                    .fill(t::bg_raised())
+                    .min_size(egui::vec2(130.0, 22.0)),
+                )
+                .clicked()
+            {
+                actions.push(PopupAction::OpenUrl {
+                    url: ivr_url.clone(),
+                });
+            }
+            if !self.ivr_logs_loading {
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("↻ Refresh").small())
+                            .min_size(egui::vec2(70.0, 22.0)),
+                    )
+                    .clicked()
+                {
+                    actions.push(PopupAction::FetchIvrLogs {
+                        channel: self.current_channel_name(),
+                        username: profile.login.clone(),
+                    });
+                }
+            }
+        });
+        ui.add_space(4.0);
+
+        if self.ivr_logs_loading {
+            ui.add_space(8.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new("Fetching logs…")
+                        .color(t::text_secondary())
+                        .italics(),
+                );
+            });
+            ui.add_space(8.0);
+            return;
+        }
+
+        if let Some(ref err) = self.ivr_logs_error {
+            ui.add_space(4.0);
+            egui::Frame::new()
+                .fill(Color32::from_rgba_unmultiplied(200, 30, 30, 25))
+                .corner_radius(t::RADIUS_SM)
+                .inner_margin(egui::Margin::symmetric(8, 5))
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(RichText::new(format!("⚠ {err}")).color(t::red()).small())
+                            .wrap(),
+                    );
+                });
+            return;
+        }
+
+        if !self.ivr_logs_requested {
+            ui.add_space(8.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new("Click the IVR Logs tab to load external chat history.")
+                        .color(t::text_muted())
+                        .small(),
+                );
+            });
+            ui.add_space(8.0);
+            return;
+        }
+
+        let log_count = self.ivr_logs.len();
+        egui::Frame::new()
+            .fill(if t::is_light() {
+                Color32::from_rgba_unmultiplied(0, 0, 0, 20)
+            } else {
+                Color32::from_rgba_unmultiplied(0, 0, 0, 60)
+            })
+            .corner_radius(t::RADIUS_SM)
+            .inner_margin(egui::Margin::symmetric(6, 4))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(if log_count == 0 {
+                        "No external logs found for this user.".to_owned()
+                    } else {
+                        format!(
+                            "{log_count} message{} (from logs.ivr.fi, newest first)",
+                            if log_count == 1 { "" } else { "s" }
+                        )
+                    })
+                    .color(t::text_muted())
+                    .small(),
+                );
+            });
+        ui.add_space(4.0);
+
+        if self.ivr_logs.is_empty() {
+            ui.add_space(8.0);
+            ui.centered_and_justified(|ui| {
+                ui.label(RichText::new("No messages.").color(t::text_muted()).small());
+            });
+            return;
+        }
+
+        const ROW_HEIGHT: f32 = 22.0;
+        let total_rows = self.ivr_logs.len();
+        egui::ScrollArea::vertical()
+            .id_salt("ivr_logs_scroll")
+            .max_height(320.0)
+            .auto_shrink([false, true])
+            .show_rows(ui, ROW_HEIGHT, total_rows, |ui, row_range| {
+                for idx in row_range {
+                    let entry = &self.ivr_logs[idx];
+                    let time_str = fmt_ivr_timestamp(&entry.timestamp);
+                    let is_timeout = entry.msg_type == 2;
+
+                    egui::Frame::new()
+                        .fill(if is_timeout {
+                            Color32::from_rgba_unmultiplied(150, 30, 30, 20)
+                        } else {
+                            Color32::TRANSPARENT
+                        })
+                        .inner_margin(egui::Margin::symmetric(4, 2))
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                ui.add(egui::Label::new(
+                                    RichText::new(&time_str)
+                                        .color(t::text_muted())
+                                        .small()
+                                        .monospace(),
+                                ));
+                                let msg_color = if is_timeout { t::red() } else { t::text_primary() };
+                                let rich = RichText::new(&entry.text).color(msg_color).small();
+                                let rich = if is_timeout { rich.italics() } else { rich };
+                                ui.add(egui::Label::new(rich).wrap());
+                            });
+                        });
+                    ui.add_space(1.0);
+                }
+            });
+    }
+
+    fn render_footer(&self, ui: &mut egui::Ui, profile: &UserProfile) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 14.0;
+            let (primary_label, primary_url) =
+                if self.channel.as_ref().map(|c| c.is_kick()).unwrap_or(false) {
+                    (
+                        "View on Kick".to_owned(),
+                        format!("https://kick.com/{}", profile.login),
+                    )
+                } else {
+                    (
+                        "View on Twitch".to_owned(),
+                        format!("https://twitch.tv/{}", profile.login),
+                    )
+                };
+            ui.hyperlink_to(RichText::new(primary_label).small().color(t::accent()), primary_url);
+            let logs_url = format!(
+                "https://logs.ivr.fi/?channel={}&username={}",
+                self.channel.as_ref().map(|c| c.as_str()).unwrap_or(""),
+                profile.login,
+            );
+            ui.hyperlink_to(
+                RichText::new("Lookup logs").small().color(t::text_secondary()),
+                logs_url,
+            );
+        });
+    }
+
     /// Render the popup, returning any actions the user triggered.
     pub fn show(
         &mut self,
@@ -186,15 +1039,10 @@ impl UserProfilePopup {
             return Vec::new();
         }
 
-        let title = if self.loading {
-            format!("@{}", self.loading_login)
-        } else if let Some(ref p) = self.profile {
-            format!("@{}", p.login)
-        } else {
-            "User Profile".to_owned()
-        };
+        let title = self.popup_title();
 
         let mut actions: Vec<PopupAction> = Vec::new();
+        let mut open = self.open;
 
         egui::Window::new(title)
             .collapsible(false)
@@ -202,28 +1050,17 @@ impl UserProfilePopup {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .min_width((ctx.screen_rect().width() - 40.0).min(360.0))
             .max_width((ctx.screen_rect().width() - 20.0).min(430.0))
-            .open(&mut self.open)
+            .open(&mut open)
             .show(ctx, |ui| {
                 ui.style_mut().spacing.item_spacing = egui::vec2(4.0, 3.0);
 
-                // ── Loading spinner ──────────────────────────────────────
                 if self.loading {
-                    ui.add_space(20.0);
-                    ui.vertical_centered(|ui| {
-                        ui.label(
-                            RichText::new("Loading profile…")
-                                .color(t::text_secondary())
-                                .italics(),
-                        );
-                    });
-                    ui.add_space(20.0);
+                    Self::render_loading_state(ui);
                     return;
                 }
 
-                let Some(ref profile) = self.profile else {
-                    ui.add_space(8.0);
-                    ui.label(RichText::new("Profile unavailable.").color(t::red()));
-                    ui.add_space(8.0);
+                let Some(profile) = self.profile.clone() else {
+                    Self::render_unavailable_state(ui);
                     return;
                 };
 
@@ -235,853 +1072,36 @@ impl UserProfilePopup {
                 );
                 ui.add_space(6.0);
 
-                // ── Header: avatar + name + badges ───────────────────────
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 12.0;
-
-                    const AV: f32 = 76.0;
-                    let (av_rect, _) =
-                        ui.allocate_exact_size(Vec2::splat(AV), egui::Sense::hover());
-
-                    // Avatar: prefer 7TV animated avatar, fall back to Twitch,
-                    // then initial-letter circle.
-                    let stv_av = stv_avatars.get(&profile.id);
-                    let avatar_entry = stv_av
-                        .and_then(|url| emote_bytes.get(url.as_str()).map(|e| (url.as_str(), e)))
-                        .or_else(|| {
-                            profile
-                                .avatar_url
-                                .as_deref()
-                                .and_then(|url| emote_bytes.get(url).map(|e| (url, e)))
-                        });
-
-                    if let Some((logo, (_, _, ref raw))) = avatar_entry {
-                        let uri = super::bytes_uri(logo, raw.as_ref());
-                        ui.painter()
-                            .circle_filled(av_rect.center(), AV / 2.0, t::bg_raised());
-                        ui.put(
-                            av_rect,
-                            egui::Image::from_bytes(uri, egui::load::Bytes::Shared(raw.clone()))
-                                .fit_to_exact_size(Vec2::splat(AV))
-                                .corner_radius(CornerRadius::same(AV as u8 / 2)),
-                        );
-                    } else {
-                        let initial = profile
-                            .display_name
-                            .chars()
-                            .next()
-                            .and_then(|c| c.to_uppercase().next())
-                            .unwrap_or('?');
-                        let p = ui.painter();
-                        p.circle_filled(av_rect.center(), AV / 2.0, t::accent_dim());
-                        p.circle_stroke(
-                            av_rect.center(),
-                            AV / 2.0,
-                            egui::Stroke::new(2.0, t::accent()),
-                        );
-                        p.text(
-                            av_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            initial.to_string(),
-                            egui::FontId::proportional(28.0),
-                            t::text_primary(),
-                        );
-                    }
-
-                    // Live pulse dot overlay on avatar bottom-right corner
-                    if profile.is_live {
-                        let dot_center = egui::pos2(av_rect.max.x - 6.0, av_rect.max.y - 6.0);
-                        ui.painter().circle_filled(dot_center, 7.0, t::bg_base());
-                        ui.painter().circle_filled(dot_center, 5.0, t::red());
-                    }
-
-                    ui.vertical(|ui| {
-                        ui.add_space(2.0);
-
-                        // Display name + LIVE / BANNED pills
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 6.0;
-                            ui.add(egui::Label::new(
-                                RichText::new(&profile.display_name)
-                                    .strong()
-                                    .size(16.0)
-                                    .color(t::text_primary()),
-                            ));
-                            if profile.is_live {
-                                egui::Frame::new()
-                                    .fill(Color32::from_rgba_unmultiplied(200, 40, 40, 200))
-                                    .corner_radius(t::RADIUS_SM)
-                                    .inner_margin(egui::Margin::symmetric(5, 2))
-                                    .show(ui, |ui| {
-                                        ui.add(egui::Label::new(
-                                            RichText::new("● LIVE")
-                                                .color(Color32::WHITE)
-                                                .size(10.0)
-                                                .strong(),
-                                        ));
-                                    });
-                            }
-                            if profile.is_banned {
-                                egui::Frame::new()
-                                    .fill(Color32::from_rgba_unmultiplied(200, 30, 30, 160))
-                                    .corner_radius(t::RADIUS_SM)
-                                    .inner_margin(egui::Margin::symmetric(5, 2))
-                                    .show(ui, |ui| {
-                                        ui.add(egui::Label::new(
-                                            RichText::new("BANNED")
-                                                .color(Color32::WHITE)
-                                                .size(10.0)
-                                                .strong(),
-                                        ));
-                                    });
-                            }
-                        });
-
-                        // @login (only if it differs from display name)
-                        if profile.login.to_lowercase() != profile.display_name.to_lowercase() {
-                            ui.add(egui::Label::new(
-                                RichText::new(format!("@{}", profile.login))
-                                    .color(t::text_secondary())
-                                    .small(),
-                            ));
-                        }
-
-                        // Role pills + chat colour
-                        ui.add_space(2.0);
-                        ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing = egui::vec2(3.0, 2.0);
-                            if profile.is_partner {
-                                role_pill(ui, "✓ Partner", t::accent());
-                            } else if profile.is_affiliate {
-                                role_pill(ui, "Affiliate", Color32::from_rgb(140, 100, 220));
-                            }
-                            if let Some(ref hex) = profile.chat_color {
-                                if let Some(c) = parse_hex_color(hex) {
-                                    egui::Frame::new()
-                                        .fill(Color32::from_rgba_unmultiplied(
-                                            c.r(),
-                                            c.g(),
-                                            c.b(),
-                                            35,
-                                        ))
-                                        .corner_radius(t::RADIUS_SM)
-                                        .inner_margin(egui::Margin::symmetric(5, 2))
-                                        .stroke(egui::Stroke::new(1.0, c))
-                                        .show(ui, |ui| {
-                                            ui.add(egui::Label::new(
-                                                RichText::new("● Chat color").color(c).small(),
-                                            ));
-                                        });
-                                }
-                            }
-                        });
-
-                        // Badges row
-                        if !self.badges.is_empty() {
-                            ui.add_space(3.0);
-                            ui.horizontal_wrapped(|ui| {
-                                ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
-                                for badge in &self.badges {
-                                    let badge_name =
-                                        badge_display_name(&badge.name, &badge.version);
-                                    if let Some(url) = &badge.url {
-                                        if let Some((_, _, ref raw)) = emote_bytes.get(url.as_str())
-                                        {
-                                            let uri = super::bytes_uri(url, raw.as_ref());
-                                            const BS: f32 = 18.0;
-                                            let (brect, _) = ui.allocate_exact_size(
-                                                Vec2::splat(BS),
-                                                egui::Sense::hover(),
-                                            );
-                                            ui.put(
-                                                brect,
-                                                egui::Image::from_bytes(
-                                                    uri,
-                                                    egui::load::Bytes::Shared(raw.clone()),
-                                                )
-                                                .fit_to_exact_size(Vec2::splat(BS)),
-                                            );
-                                            if ui.rect_contains_pointer(brect) {
-                                                egui::show_tooltip_text(
-                                                    ui.ctx(),
-                                                    ui.layer_id(),
-                                                    egui::Id::new(url.as_str()),
-                                                    &badge_name,
-                                                );
-                                            }
-                                            continue;
-                                        }
-                                    }
-                                    badge_text_pill(ui, &badge_name);
-                                }
-                            });
-                        }
-                    });
-                });
-
-                // ── Live stream info card ────────────────────────────────
-                if profile.is_live {
-                    ui.add_space(6.0);
-                    egui::Frame::new()
-                        .fill(Color32::from_rgba_unmultiplied(200, 40, 40, 18))
-                        .corner_radius(t::RADIUS)
-                        .stroke(egui::Stroke::new(
-                            1.0,
-                            Color32::from_rgba_unmultiplied(200, 60, 60, 80),
-                        ))
-                        .inner_margin(egui::Margin::symmetric(8, 6))
-                        .show(ui, |ui| {
-                            if let Some(ref title) = profile.stream_title {
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(title)
-                                            .color(t::text_primary())
-                                            .small()
-                                            .strong(),
-                                    )
-                                    .wrap(),
-                                );
-                            }
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 8.0;
-                                if let Some(ref game) = profile.stream_game {
-                                    ui.add(egui::Label::new(
-                                        RichText::new(format!("🎮 {game}"))
-                                            .color(t::accent())
-                                            .small(),
-                                    ));
-                                }
-                                if let Some(v) = profile.stream_viewers {
-                                    ui.add(egui::Label::new(
-                                        RichText::new(format!("👁 {}", fmt_count(v)))
-                                            .color(t::text_secondary())
-                                            .small(),
-                                    ));
-                                }
-                                if let Some(ref started) = profile.last_broadcast_at {
-                                    let uptime = fmt_uptime(started);
-                                    if !uptime.is_empty() {
-                                        ui.add(egui::Label::new(
-                                            RichText::new(format!("⏱ {uptime}"))
-                                                .color(t::text_secondary())
-                                                .small(),
-                                        ));
-                                    }
-                                }
-                            });
-                        });
-                }
+                self.render_profile_header(ui, &profile, emote_bytes, stv_avatars);
+                ui.add_space(4.0);
+                self.render_quick_actions(ui, &profile, &mut actions);
+                self.render_live_info(ui, &profile);
 
                 ui.add_space(6.0);
                 ui.separator();
                 ui.add_space(2.0);
+                self.render_tab_bar(ui, &profile, &mut actions);
 
-                // ── Tab bar ───────────────────────────────────────────
-                {
-                    let mut tabs: Vec<(&str, ProfileTab)> = vec![
-                        ("Profile", ProfileTab::Profile),
-                    ];
-                    if self.is_mod {
-                        tabs.push(("Moderation", ProfileTab::Moderation));
-                        tabs.push(("Logs", ProfileTab::Logs));
+                match self.active_tab {
+                    ProfileTab::Profile => self.render_profile_tab(ui, &profile),
+                    ProfileTab::Moderation if self.is_mod => {
+                        self.render_moderation_tab(ui, &profile, &mut actions)
                     }
-                    tabs.push(("IVR Logs", ProfileTab::IvrLogs));
-
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 2.0;
-                        for (tab_label, tab_val) in &tabs {
-                            let active = self.active_tab == *tab_val;
-                            let fg = if active {
-                                t::text_primary()
-                            } else {
-                                t::text_secondary()
-                            };
-                            let bg = if active {
-                                Color32::from_rgba_unmultiplied(145, 95, 255, 35)
-                            } else {
-                                Color32::TRANSPARENT
-                            };
-                            let resp = egui::Frame::new()
-                                .fill(bg)
-                                .corner_radius(CornerRadius::same(4))
-                                .inner_margin(egui::Margin::symmetric(10, 4))
-                                .show(ui, |ui| {
-                                    ui.add(egui::Label::new(
-                                        RichText::new(*tab_label).color(fg).small().strong(),
-                                    ));
-                                })
-                                .response;
-                            if resp.interact(egui::Sense::click()).clicked() {
-                                self.active_tab = *tab_val;
-                                self.ban_confirm = false;
-                                // Trigger IVR log fetch on first visit
-                                if *tab_val == ProfileTab::IvrLogs && !self.ivr_logs_requested {
-                                    let ch = self.channel.as_ref().map(|c| c.as_str().to_owned()).unwrap_or_default();
-                                    actions.push(PopupAction::FetchIvrLogs {
-                                        channel: ch,
-                                        username: profile.login.clone(),
-                                    });
-                                }
-                            }
-                        }
-                    });
-                    ui.add_space(4.0);
-                }
-
-                // ── Logs tab ─────────────────────────────────────────────
-                if self.is_mod && self.active_tab == ProfileTab::Logs {
-                    let log_count = self.logs.len();
-                    egui::Frame::new()
-                        .fill(if t::is_light() {
-                            Color32::from_rgba_unmultiplied(0, 0, 0, 20)
-                        } else {
-                            Color32::from_rgba_unmultiplied(0, 0, 0, 60)
-                        })
-                        .corner_radius(t::RADIUS_SM)
-                        .inner_margin(egui::Margin::symmetric(6, 4))
-                        .show(ui, |ui| {
-                            ui.label(
-                                RichText::new(if log_count == 0 {
-                                    "No messages from this user in the current session.".to_owned()
-                                } else {
-                                    format!(
-                                        "{log_count} message{} (current session, newest first)",
-                                        if log_count == 1 { "" } else { "s" }
-                                    )
-                                })
-                                .color(t::text_muted())
-                                .small(),
-                            );
-                        });
-
-                    ui.add_space(4.0);
-
-                    egui::ScrollArea::vertical()
-                        .id_salt("user_logs_scroll")
-                        .max_height(320.0)
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| {
-                            if self.logs.is_empty() {
-                                ui.add_space(8.0);
-                                ui.centered_and_justified(|ui| {
-                                    ui.label(
-                                        RichText::new("No recent messages.")
-                                            .color(t::text_muted())
-                                            .small(),
-                                    );
-                                });
-                            }
-                            for msg in &self.logs {
-                                let time_str = msg.timestamp.format("%H:%M:%S").to_string();
-                                let text = if msg.raw_text.is_empty() {
-                                    // Fallback: reconstruct from spans
-                                    msg.spans
-                                        .iter()
-                                        .filter_map(|s| match s {
-                                            crust_core::model::Span::Text { text, .. } => {
-                                                Some(text.as_str())
-                                            }
-                                            crust_core::model::Span::Mention { login } => {
-                                                Some(login.as_str())
-                                            }
-                                            _ => None,
-                                        })
-                                        .collect::<Vec<_>>()
-                                        .join(" ")
-                                } else {
-                                    msg.raw_text.clone()
-                                };
-
-                                let is_action = msg.flags.is_action;
-                                let is_deleted = msg.flags.is_deleted;
-
-                                egui::Frame::new()
-                                    .fill(if is_deleted {
-                                        Color32::from_rgba_unmultiplied(150, 30, 30, 20)
-                                    } else {
-                                        Color32::TRANSPARENT
-                                    })
-                                    .inner_margin(egui::Margin::symmetric(4, 2))
-                                    .show(ui, |ui| {
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.spacing_mut().item_spacing.x = 4.0;
-                                            ui.add(egui::Label::new(
-                                                RichText::new(&time_str)
-                                                    .color(t::text_muted())
-                                                    .small()
-                                                    .monospace(),
-                                            ));
-                                            let msg_color = if is_deleted {
-                                                t::text_muted()
-                                            } else if is_action {
-                                                Color32::from_rgba_unmultiplied(200, 200, 255, 230)
-                                            } else {
-                                                t::text_primary()
-                                            };
-                                            let rich =
-                                                RichText::new(&text).color(msg_color).small();
-                                            let rich = if is_action || is_deleted {
-                                                rich.italics()
-                                            } else {
-                                                rich
-                                            };
-                                            ui.add(egui::Label::new(rich).wrap());
-                                        });
-                                    });
-                                ui.add_space(1.0);
-                            }
-                        });
-                }
-
-                // ── Profile tab ──────────────────────────────────────────
-                if self.active_tab == ProfileTab::Profile {
-                    egui::Grid::new("profile_stats")
-                        .num_columns(2)
-                        .spacing([12.0, 4.0])
-                        .show(ui, |ui| {
-                            if let Some(f) = profile.followers {
-                                ui.label(
-                                    RichText::new("Followers").color(t::text_secondary()).small(),
-                                );
-                                ui.label(
-                                    RichText::new(fmt_count(f)).strong().color(t::text_primary()),
-                                );
-                                ui.end_row();
-                            }
-                            if let Some(ref ts) = profile.created_at {
-                                ui.label(
-                                    RichText::new("Account age")
-                                        .color(t::text_secondary())
-                                        .small(),
-                                );
-                                ui.label(RichText::new(fmt_account_age(ts)).color(t::text_primary()));
-                                ui.end_row();
-                                ui.label(RichText::new("Joined").color(t::text_secondary()).small());
-                                ui.label(RichText::new(fmt_join_date(ts)).color(t::text_primary()));
-                                ui.end_row();
-                            }
-                            if !profile.is_live {
-                                if let Some(ref ts) = profile.last_broadcast_at {
-                                    ui.label(
-                                        RichText::new("Last live").color(t::text_secondary()).small(),
-                                    );
-                                    ui.label(
-                                        RichText::new(fmt_join_date(ts)).color(t::text_secondary()),
-                                    );
-                                    ui.end_row();
-                                }
-                            }
-                        });
-
-                    if !profile.description.is_empty() {
-                        ui.add_space(5.0);
-                        ui.separator();
-                        ui.add_space(3.0);
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(&profile.description)
-                                    .color(t::text_secondary())
-                                    .small(),
-                            )
-                            .wrap(),
-                        );
-                    }
-
-                    if profile.is_banned {
-                        ui.add_space(5.0);
-                        egui::Frame::new()
-                            .fill(Color32::from_rgba_unmultiplied(200, 30, 30, 25))
-                            .corner_radius(t::RADIUS_SM)
-                            .inner_margin(egui::Margin::symmetric(8, 5))
-                            .show(ui, |ui| {
-                                let reason = profile
-                                    .ban_reason
-                                    .as_deref()
-                                    .unwrap_or("No reason provided");
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(format!("⚠ Suspended: {reason}"))
-                                            .color(t::red())
-                                            .small(),
-                                    )
-                                    .wrap(),
-                                );
-                            });
-                    }
-                }
-
-                // ── Moderation tab ───────────────────────────────────────
-                if self.is_mod && self.active_tab == ProfileTab::Moderation {
-                    if let Some(ref channel) = self.channel.clone() {
-                        let login = profile.login.clone();
-                        let user_id = profile.id.clone();
-
-                        // ── Reason field ──────────────────────────────────
-                        ui.label(
-                            RichText::new("Reason (optional)")
-                                .color(t::text_secondary())
-                                .small(),
-                        );
-                        ui.add_space(2.0);
-                        ui.add_sized(
-                            [ui.available_width(), 22.0],
-                            egui::TextEdit::singleline(&mut self.mod_reason)
-                                .hint_text("e.g. spam, hate speech…")
-                                .font(t::small()),
-                        );
-                        ui.add_space(6.0);
-
-                        // ── Timeout presets ───────────────────────────────
-                        section_label(ui, "Timeout");
-                        ui.add_space(3.0);
-                        // Two rows of 6 preset buttons
-                        egui::Grid::new("timeout_presets_row1")
-                            .num_columns(6)
-                            .spacing([4.0, 4.0])
-                            .show(ui, |ui| {
-                                const ROW1: &[(&str, u32)] = &[
-                                    ("1s", 1),
-                                    ("30s", 30),
-                                    ("1m", 60),
-                                    ("5m", 300),
-                                    ("10m", 600),
-                                    ("30m", 1_800),
-                                ];
-                                for &(lbl, secs) in ROW1 {
-                                    if timeout_btn(ui, lbl) {
-                                        actions.push(PopupAction::Timeout {
-                                            channel: channel.clone(),
-                                            login: login.clone(),
-                                            user_id: user_id.clone(),
-                                            seconds: secs,
-                                            reason: reason_opt(&self.mod_reason),
-                                        });
-                                    }
-                                }
-                                ui.end_row();
-                                const ROW2: &[(&str, u32)] = &[
-                                    ("1h", 3_600),
-                                    ("8h", 28_800),
-                                    ("24h", 86_400),
-                                    ("7d", 604_800),
-                                    ("14d", 1_209_600),
-                                ];
-                                for &(lbl, secs) in ROW2 {
-                                    if timeout_btn(ui, lbl) {
-                                        actions.push(PopupAction::Timeout {
-                                            channel: channel.clone(),
-                                            login: login.clone(),
-                                            user_id: user_id.clone(),
-                                            seconds: secs,
-                                            reason: reason_opt(&self.mod_reason),
-                                        });
-                                    }
-                                }
-                            });
-
-                        // Custom timeout
-                        ui.add_space(3.0);
-                        ui.horizontal(|ui| {
-                            let resp = ui.add_sized(
-                                [80.0, 20.0],
-                                egui::TextEdit::singleline(&mut self.timeout_custom)
-                                    .hint_text("custom (s)")
-                                    .font(t::small()),
-                            );
-                            let pressed =
-                                resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                            let go_btn = ui.add_sized(
-                                [38.0, 20.0],
-                                egui::Button::new(RichText::new("Go").small()),
-                            );
-                            if pressed || go_btn.clicked() {
-                                if let Ok(secs) = self.timeout_custom.trim().parse::<u32>() {
-                                    if secs > 0 {
-                                        actions.push(PopupAction::Timeout {
-                                            channel: channel.clone(),
-                                            login: login.clone(),
-                                            user_id: user_id.clone(),
-                                            seconds: secs,
-                                            reason: reason_opt(&self.mod_reason),
-                                        });
-                                        self.timeout_custom.clear();
-                                    }
-                                }
-                            }
-                        });
-
-                        ui.add_space(8.0);
-
-                        // ── Lift restriction ──────────────────────────────
-                        section_label(ui, "Lift restriction");
-                        ui.add_space(3.0);
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("↩ Untimeout / Unban")
-                                        .small()
-                                        .color(Color32::WHITE),
-                                )
-                                .fill(Color32::from_rgba_unmultiplied(40, 180, 90, 200))
-                                .min_size(egui::vec2(160.0, 24.0)),
-                            )
-                            .clicked()
-                        {
-                            actions.push(PopupAction::Unban {
-                                channel: channel.clone(),
-                                login: login.clone(),
-                                user_id: user_id.clone(),
-                            });
-                        }
-
-                        ui.add_space(8.0);
-
-                        // ── Permanent ban (two-click confirm) ─────────────
-                        section_label(ui, "Permanent ban");
-                        ui.add_space(3.0);
-                        if self.ban_confirm {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 6.0;
-                                let confirm = ui.add(
-                                    egui::Button::new(
-                                        RichText::new("⚠ Confirm ban")
-                                            .small()
-                                            .color(Color32::WHITE),
-                                    )
-                                    .fill(Color32::from_rgba_unmultiplied(200, 30, 30, 230))
-                                    .min_size(egui::vec2(120.0, 24.0)),
-                                );
-                                let cancel = ui.add(
-                                    egui::Button::new(RichText::new("Cancel").small())
-                                        .min_size(egui::vec2(60.0, 24.0)),
-                                );
-                                if confirm.clicked() {
-                                    actions.push(PopupAction::Ban {
-                                        channel: channel.clone(),
-                                        login: login.clone(),
-                                        user_id: user_id.clone(),
-                                        reason: reason_opt(&self.mod_reason),
-                                    });
-                                    self.ban_confirm = false;
-                                }
-                                if cancel.clicked() {
-                                    self.ban_confirm = false;
-                                }
-                            });
-                        } else if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("🚫 Ban user").small().color(Color32::WHITE),
-                                )
-                                .fill(Color32::from_rgba_unmultiplied(180, 40, 40, 180))
-                                .min_size(egui::vec2(100.0, 24.0)),
-                            )
-                            .clicked()
-                        {
-                            self.ban_confirm = true;
-                        }
-                    }
-                }
-
-                // ── IVR Logs tab ─────────────────────────────────────────
-                if self.active_tab == ProfileTab::IvrLogs {
-                    // "Open in Browser" button
-                    let ivr_url = format!(
-                        "https://logs.ivr.fi/?channel={}&username={}",
-                        self.channel.as_ref().map(|c| c.as_str()).unwrap_or(""),
-                        profile.login,
-                    );
-                    ui.horizontal(|ui| {
-                        if ui.add(
-                            egui::Button::new(
-                                RichText::new("Open in Browser ↗")
-                                    .small()
-                                    .color(t::accent()),
-                            )
-                            .fill(Color32::from_rgba_unmultiplied(145, 95, 255, 25))
-                            .min_size(egui::vec2(130.0, 22.0)),
-                        ).clicked() {
-                            actions.push(PopupAction::OpenUrl { url: ivr_url.clone() });
-                        }
-                        // Refresh button
-                        if !self.ivr_logs_loading {
-                            if ui.add(
-                                egui::Button::new(RichText::new("↻ Refresh").small())
-                                    .min_size(egui::vec2(70.0, 22.0)),
-                            ).clicked() {
-                                let ch = self.channel.as_ref().map(|c| c.as_str().to_owned()).unwrap_or_default();
-                                actions.push(PopupAction::FetchIvrLogs {
-                                    channel: ch,
-                                    username: profile.login.clone(),
-                                });
-                            }
-                        }
-                    });
-                    ui.add_space(4.0);
-
-                    if self.ivr_logs_loading {
-                        ui.add_space(8.0);
-                        ui.vertical_centered(|ui| {
-                            ui.label(
-                                RichText::new("Fetching logs…")
-                                    .color(t::text_secondary())
-                                    .italics(),
-                            );
-                        });
-                        ui.add_space(8.0);
-                    } else if let Some(ref err) = self.ivr_logs_error {
-                        ui.add_space(4.0);
-                        egui::Frame::new()
-                            .fill(Color32::from_rgba_unmultiplied(200, 30, 30, 25))
-                            .corner_radius(t::RADIUS_SM)
-                            .inner_margin(egui::Margin::symmetric(8, 5))
-                            .show(ui, |ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(format!("⚠ {err}"))
-                                            .color(t::red())
-                                            .small(),
-                                    ).wrap(),
-                                );
-                            });
-                    } else if !self.ivr_logs_requested {
-                        // Not yet fetched - show prompt
-                        ui.add_space(8.0);
-                        ui.vertical_centered(|ui| {
-                            ui.label(
-                                RichText::new("Click the IVR Logs tab to load external chat history.")
-                                    .color(t::text_muted())
-                                    .small(),
-                            );
-                        });
-                        ui.add_space(8.0);
-                    } else {
-                        // Show log count header
-                        let log_count = self.ivr_logs.len();
-                        egui::Frame::new()
-                            .fill(if t::is_light() {
-                                Color32::from_rgba_unmultiplied(0, 0, 0, 20)
-                            } else {
-                                Color32::from_rgba_unmultiplied(0, 0, 0, 60)
-                            })
-                            .corner_radius(t::RADIUS_SM)
-                            .inner_margin(egui::Margin::symmetric(6, 4))
-                            .show(ui, |ui| {
-                                ui.label(
-                                    RichText::new(if log_count == 0 {
-                                        "No external logs found for this user.".to_owned()
-                                    } else {
-                                        format!(
-                                            "{log_count} message{} (from logs.ivr.fi, newest first)",
-                                            if log_count == 1 { "" } else { "s" }
-                                        )
-                                    })
-                                    .color(t::text_muted())
-                                    .small(),
-                                );
-                            });
-
-                        ui.add_space(4.0);
-
-                        if self.ivr_logs.is_empty() {
-                            ui.add_space(8.0);
-                            ui.centered_and_justified(|ui| {
-                                ui.label(
-                                    RichText::new("No messages.")
-                                        .color(t::text_muted())
-                                        .small(),
-                                );
-                            });
-                        } else {
-                            // Virtual scrolling: only render the rows visible
-                            // in the viewport.  Each row is ~22 px tall; egui
-                            // uses this estimate to size the scroll bar and
-                            // skip off-screen rows entirely.
-                            const ROW_HEIGHT: f32 = 22.0;
-                            let total_rows = self.ivr_logs.len();
-                            egui::ScrollArea::vertical()
-                                .id_salt("ivr_logs_scroll")
-                                .max_height(320.0)
-                                .auto_shrink([false, true])
-                                .show_rows(ui, ROW_HEIGHT, total_rows, |ui, row_range| {
-                                    for idx in row_range {
-                                        let entry = &self.ivr_logs[idx];
-                                        let time_str = fmt_ivr_timestamp(&entry.timestamp);
-                                        let is_timeout = entry.msg_type == 2;
-
-                                        egui::Frame::new()
-                                            .fill(if is_timeout {
-                                                Color32::from_rgba_unmultiplied(150, 30, 30, 20)
-                                            } else {
-                                                Color32::TRANSPARENT
-                                            })
-                                            .inner_margin(egui::Margin::symmetric(4, 2))
-                                            .show(ui, |ui| {
-                                                ui.horizontal_wrapped(|ui| {
-                                                    ui.spacing_mut().item_spacing.x = 4.0;
-                                                    ui.add(egui::Label::new(
-                                                        RichText::new(&time_str)
-                                                            .color(t::text_muted())
-                                                            .small()
-                                                            .monospace(),
-                                                    ));
-                                                    let msg_color = if is_timeout {
-                                                        t::red()
-                                                    } else {
-                                                        t::text_primary()
-                                                    };
-                                                    let rich = RichText::new(&entry.text)
-                                                        .color(msg_color)
-                                                        .small();
-                                                    let rich = if is_timeout { rich.italics() } else { rich };
-                                                    ui.add(egui::Label::new(rich).wrap());
-                                                });
-                                            });
-                                        ui.add_space(1.0);
-                                    }
-                                });
-                        }
-                    }
+                    ProfileTab::Logs if self.is_mod => self.render_logs_tab(ui),
+                    ProfileTab::IvrLogs => self.render_ivr_logs_tab(ui, &profile, &mut actions),
+                    _ => {}
                 }
 
                 ui.add_space(8.0);
                 ui.separator();
                 ui.add_space(3.0);
 
-                // ── Footer ───────────────────────────────────────────────
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 14.0;
-                    let (primary_label, primary_url) =
-                        if self.channel.as_ref().map(|c| c.is_kick()).unwrap_or(false) {
-                            (
-                                "View on Kick ↗".to_owned(),
-                                format!("https://kick.com/{}", profile.login),
-                            )
-                        } else {
-                            (
-                                "View on Twitch ↗".to_owned(),
-                                format!("https://twitch.tv/{}", profile.login),
-                            )
-                        };
-                    ui.hyperlink_to(
-                        RichText::new(primary_label).small().color(t::accent()),
-                        primary_url,
-                    );
-                    let logs_url = format!(
-                        "https://logs.ivr.fi/?channel={}&username={}",
-                        self.channel.as_ref().map(|c| c.as_str()).unwrap_or(""),
-                        profile.login,
-                    );
-                    ui.hyperlink_to(
-                        RichText::new("Lookup logs ↗")
-                            .small()
-                            .color(t::text_secondary()),
-                        logs_url,
-                    );
-                });
+                self.render_footer(ui, &profile);
 
                 ui.add_space(4.0);
             });
+
+        self.open = open;
 
         // Close the popup after a mod action so the user doesn't have to.
         let has_mod_action = actions.iter().any(|a| {
@@ -1166,11 +1186,23 @@ fn section_label(ui: &mut egui::Ui, text: &str) {
     ));
 }
 
+/// Render a compact action button used in the usercard quick-actions strip.
+fn small_action_btn(ui: &mut egui::Ui, label: &str) -> bool {
+    ui.add(
+        egui::Button::new(RichText::new(label).small())
+            .fill(t::bg_raised())
+            .stroke(egui::Stroke::new(1.0, t::border_subtle()))
+            .min_size(egui::vec2(72.0, 20.0)),
+    )
+    .clicked()
+}
+
 /// Render a small timeout-preset button; returns true if clicked.
 fn timeout_btn(ui: &mut egui::Ui, label: &str) -> bool {
     ui.add(
         egui::Button::new(RichText::new(label).small())
-            .fill(Color32::from_rgba_unmultiplied(200, 140, 30, 60))
+            .fill(t::bg_raised())
+            .stroke(egui::Stroke::new(1.0, t::border_subtle()))
             .min_size(egui::vec2(36.0, 20.0)),
     )
     .clicked()
@@ -1184,6 +1216,23 @@ fn reason_opt(buf: &str) -> Option<String> {
     } else {
         Some(s.to_owned())
     }
+}
+
+/// Resolve user log row text, reconstructing from spans when raw_text is absent.
+fn chat_message_text(msg: &ChatMessage) -> String {
+    if !msg.raw_text.is_empty() {
+        return msg.raw_text.clone();
+    }
+
+    msg.spans
+        .iter()
+        .filter_map(|s| match s {
+            crust_core::model::Span::Text { text, .. } => Some(text.as_str()),
+            crust_core::model::Span::Mention { login } => Some(login.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Parse a CSS hex color string (`#RRGGBB`) into an egui Color32.

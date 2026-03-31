@@ -321,6 +321,7 @@ fn top_tab_metrics(window_width: f32, style: TabVisualStyle) -> TopTabMetrics {
 struct ToolbarVisibility {
     compact_controls: bool,
     compact_account: bool,
+    ultra_compact_account: bool,
     show_logo: bool,
     show_connection_label: bool,
     show_join_button: bool,
@@ -329,32 +330,225 @@ struct ToolbarVisibility {
     show_sidebar_actions: bool,
     show_overflow_menu: bool,
     show_perf_toggle: bool,
+    show_perf_in_overflow: bool,
     show_stats_toggle: bool,
+    show_stats_in_overflow: bool,
     show_irc_toggle: bool,
     show_irc_in_overflow: bool,
     show_emote_count: bool,
 }
 
-fn toolbar_visibility(bar_width: f32, irc_beta_enabled: bool) -> ToolbarVisibility {
-    let compact_controls = bar_width < 900.0;
-    let compact_account = bar_width < 980.0;
-    let ultra_narrow = bar_width < 430.0;
-    ToolbarVisibility {
-        compact_controls,
-        compact_account,
-        show_logo: bar_width > 720.0,
-        show_connection_label: bar_width > 900.0,
-        show_join_button: true,
-        show_join_text: bar_width >= 1080.0,
-        show_join_in_overflow: ultra_narrow,
-        show_sidebar_actions: bar_width > 320.0,
-        show_overflow_menu: ultra_narrow,
-        show_perf_toggle: bar_width > 760.0,
-        show_stats_toggle: bar_width > 760.0,
-        show_irc_toggle: bar_width > 840.0 && irc_beta_enabled,
-        show_irc_in_overflow: ultra_narrow && irc_beta_enabled,
-        show_emote_count: bar_width > 1160.0,
+const TOOLBAR_ROW_PADDING_W: f32 = 28.0;
+const TOOLBAR_GROUP_FRAME_W: f32 = 14.0;
+const TOOLBAR_SEPARATOR_W: f32 = 8.0;
+const TOOLBAR_LOGO_W: f32 = 54.0;
+const TOOLBAR_DOT_W: f32 = 12.0;
+const TOOLBAR_CONN_LABEL_W: f32 = 92.0;
+const TOOLBAR_JOIN_LABEL_W: f32 = 32.0;
+const TOOLBAR_ACCOUNT_PILL_W: f32 = 118.0;
+const TOOLBAR_OVERFLOW_W: f32 = 30.0;
+const TOOLBAR_EMOTE_LABEL_W: f32 = 94.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolbarDegradeStep {
+    HideEmoteCount,
+    HideJoinText,
+    HideConnectionLabel,
+    HideLogo,
+    HideIrcToggle,
+    HideStatsToggle,
+    HidePerfToggle,
+    CompactAccount,
+    CompactControls,
+    UltraCompactAccount,
+    HideSidebarActions,
+    HideJoinButton,
+}
+
+fn estimate_icon_button_width(compact: bool) -> f32 {
+    if compact {
+        t::ICON_BTN_SM
+    } else {
+        t::ICON_BTN
     }
+}
+
+fn estimate_toolbar_group_width(icon_count: usize, icon_spacing: f32, compact: bool) -> f32 {
+    if icon_count == 0 {
+        return 0.0;
+    }
+    TOOLBAR_GROUP_FRAME_W
+        + icon_count as f32 * estimate_icon_button_width(compact)
+        + icon_count.saturating_sub(1) as f32 * icon_spacing
+}
+
+fn estimate_toolbar_required_width(visibility: &ToolbarVisibility) -> f32 {
+    let mut width = TOOLBAR_ROW_PADDING_W;
+
+    if visibility.show_logo {
+        width += TOOLBAR_LOGO_W + 8.0;
+    }
+
+    let mut left_group = TOOLBAR_DOT_W;
+    if visibility.show_connection_label {
+        left_group += TOOLBAR_CONN_LABEL_W + 4.0;
+    }
+    if visibility.show_join_button {
+        left_group += estimate_icon_button_width(visibility.compact_controls) + 4.0;
+        if visibility.show_join_text {
+            left_group += TOOLBAR_JOIN_LABEL_W + 4.0;
+        }
+    }
+    width += TOOLBAR_GROUP_FRAME_W + left_group;
+
+    if visibility.show_sidebar_actions {
+        width += 6.0 + estimate_toolbar_group_width(2, 4.0, visibility.compact_controls);
+    }
+
+    let account_width = if visibility.compact_account {
+        estimate_icon_button_width(visibility.ultra_compact_account)
+    } else {
+        TOOLBAR_ACCOUNT_PILL_W
+    };
+    width += 8.0 + account_width;
+
+    if !visibility.compact_controls || visibility.show_emote_count || visibility.show_overflow_menu {
+        width += TOOLBAR_SEPARATOR_W;
+    }
+
+    if visibility.show_overflow_menu {
+        width += TOOLBAR_OVERFLOW_W;
+        if visibility.show_emote_count {
+            width += TOOLBAR_SEPARATOR_W;
+        }
+    }
+
+    if visibility.show_emote_count {
+        width += TOOLBAR_EMOTE_LABEL_W + TOOLBAR_SEPARATOR_W;
+    }
+
+    let mut icon_count = 1; // settings
+    if visibility.show_perf_toggle {
+        icon_count += 1;
+    }
+    if visibility.show_stats_toggle {
+        icon_count += 1;
+    }
+    if visibility.show_irc_toggle {
+        icon_count += 1;
+    }
+    width + estimate_toolbar_group_width(icon_count, 4.0, visibility.compact_controls)
+}
+
+fn apply_toolbar_degrade_step(visibility: &mut ToolbarVisibility, step: ToolbarDegradeStep) {
+    match step {
+        ToolbarDegradeStep::HideEmoteCount => visibility.show_emote_count = false,
+        ToolbarDegradeStep::HideJoinText => visibility.show_join_text = false,
+        ToolbarDegradeStep::HideConnectionLabel => visibility.show_connection_label = false,
+        ToolbarDegradeStep::HideLogo => visibility.show_logo = false,
+        ToolbarDegradeStep::HideIrcToggle => visibility.show_irc_toggle = false,
+        ToolbarDegradeStep::HideStatsToggle => visibility.show_stats_toggle = false,
+        ToolbarDegradeStep::HidePerfToggle => visibility.show_perf_toggle = false,
+        ToolbarDegradeStep::CompactAccount => visibility.compact_account = true,
+        ToolbarDegradeStep::CompactControls => visibility.compact_controls = true,
+        ToolbarDegradeStep::UltraCompactAccount => visibility.ultra_compact_account = true,
+        ToolbarDegradeStep::HideSidebarActions => visibility.show_sidebar_actions = false,
+        ToolbarDegradeStep::HideJoinButton => {
+            visibility.show_join_button = false;
+            visibility.show_join_text = false;
+            visibility.show_join_in_overflow = true;
+        }
+    }
+}
+
+fn finalize_toolbar_visibility(visibility: &mut ToolbarVisibility, irc_beta_enabled: bool) {
+    if !irc_beta_enabled {
+        visibility.show_irc_toggle = false;
+        visibility.show_irc_in_overflow = false;
+    } else {
+        visibility.show_irc_in_overflow = !visibility.show_irc_toggle;
+    }
+
+    visibility.show_perf_in_overflow = !visibility.show_perf_toggle;
+    visibility.show_stats_in_overflow = !visibility.show_stats_toggle;
+
+    if !visibility.show_join_button {
+        visibility.show_join_text = false;
+        visibility.show_join_in_overflow = true;
+    }
+
+    visibility.show_overflow_menu = visibility.show_join_in_overflow
+        || visibility.show_perf_in_overflow
+        || visibility.show_stats_in_overflow
+        || visibility.show_irc_in_overflow;
+}
+
+fn toolbar_visibility(bar_width: f32, irc_beta_enabled: bool) -> ToolbarVisibility {
+    let mut visibility = ToolbarVisibility {
+        compact_controls: false,
+        compact_account: false,
+        ultra_compact_account: false,
+        show_logo: true,
+        show_connection_label: true,
+        show_join_button: true,
+        show_join_text: true,
+        show_join_in_overflow: false,
+        show_sidebar_actions: true,
+        show_overflow_menu: false,
+        show_perf_toggle: true,
+        show_perf_in_overflow: false,
+        show_stats_toggle: true,
+        show_stats_in_overflow: false,
+        show_irc_toggle: irc_beta_enabled,
+        show_irc_in_overflow: false,
+        show_emote_count: true,
+    };
+
+    const STEPS: [ToolbarDegradeStep; 12] = [
+        ToolbarDegradeStep::HideEmoteCount,
+        ToolbarDegradeStep::HideJoinText,
+        ToolbarDegradeStep::HideConnectionLabel,
+        ToolbarDegradeStep::HideLogo,
+        ToolbarDegradeStep::HideIrcToggle,
+        ToolbarDegradeStep::HideStatsToggle,
+        ToolbarDegradeStep::HidePerfToggle,
+        ToolbarDegradeStep::CompactAccount,
+        ToolbarDegradeStep::CompactControls,
+        ToolbarDegradeStep::UltraCompactAccount,
+        ToolbarDegradeStep::HideSidebarActions,
+        ToolbarDegradeStep::HideJoinButton,
+    ];
+
+    for step in STEPS {
+        finalize_toolbar_visibility(&mut visibility, irc_beta_enabled);
+        if estimate_toolbar_required_width(&visibility) <= bar_width {
+            break;
+        }
+        apply_toolbar_degrade_step(&mut visibility, step);
+    }
+
+    finalize_toolbar_visibility(&mut visibility, irc_beta_enabled);
+
+    // Extreme fallback to keep controls coherent on tiny windows.
+    if estimate_toolbar_required_width(&visibility) > bar_width {
+        visibility.compact_controls = true;
+        visibility.compact_account = true;
+        visibility.ultra_compact_account = true;
+        visibility.show_logo = false;
+        visibility.show_connection_label = false;
+        visibility.show_join_text = false;
+        visibility.show_sidebar_actions = false;
+        visibility.show_perf_toggle = false;
+        visibility.show_stats_toggle = false;
+        visibility.show_irc_toggle = false;
+        if bar_width < 300.0 {
+            visibility.show_join_button = false;
+            visibility.show_join_in_overflow = true;
+        }
+        finalize_toolbar_visibility(&mut visibility, irc_beta_enabled);
+    }
+
+    visibility
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1396,9 +1590,8 @@ impl CrustApp {
         &mut self,
         ui: &mut egui::Ui,
         compact_account: bool,
-        bar_width: f32,
+        ultra_compact: bool,
     ) {
-        let ultra_compact = bar_width < 660.0;
         if self.state.auth.logged_in {
             let name = self
                 .state
@@ -1407,8 +1600,7 @@ impl CrustApp {
                 .as_deref()
                 .unwrap_or("User")
                 .to_owned();
-            let display_name =
-                truncate_with_ellipsis(&name, if bar_width < 980.0 { 12 } else { 20 });
+            let display_name = truncate_with_ellipsis(&name, if compact_account { 14 } else { 20 });
             let initial = name
                 .chars()
                 .next()
@@ -2084,7 +2276,11 @@ impl eframe::App for CrustApp {
                             t::TOOLBAR_SPACING
                         };
 
-                        self.show_topbar_account_button(ui, compact_account, bar_width);
+                        self.show_topbar_account_button(
+                            ui,
+                            compact_account,
+                            visibility.ultra_compact_account,
+                        );
                         if !visibility.compact_controls
                             || visibility.show_emote_count
                             || visibility.show_overflow_menu
@@ -2156,13 +2352,20 @@ impl eframe::App for CrustApp {
 
                                 ui.separator();
 
-                                if ui.button(RichText::new("Perf overlay").font(t::small())).clicked()
+                                if visibility.show_perf_in_overflow
+                                    && ui
+                                        .button(RichText::new("Perf overlay").font(t::small()))
+                                        .clicked()
                                 {
                                     self.perf.visible = !self.perf.visible;
                                     ui.close_menu();
                                 }
 
-                                if ui.button(RichText::new("Analytics").font(t::small())).clicked() {
+                                if visibility.show_stats_in_overflow
+                                    && ui
+                                        .button(RichText::new("Analytics").font(t::small()))
+                                        .clicked()
+                                {
                                     self.analytics_visible = !self.analytics_visible;
                                     ui.close_menu();
                                 }
@@ -4331,5 +4534,28 @@ mod tests {
 
         let shown = toolbar_visibility(900.0, true);
         assert!(shown.show_irc_toggle);
+    }
+
+    #[test]
+    fn toolbar_keeps_regular_icon_size_until_space_is_tight() {
+        let visibility = toolbar_visibility(520.0, true);
+        assert!(visibility.show_join_button);
+        assert!(visibility.show_perf_toggle);
+        assert!(visibility.show_stats_toggle);
+        assert!(!visibility.compact_controls);
+    }
+
+    #[test]
+    fn toolbar_hides_diagnostics_before_hiding_core_actions() {
+        let visibility = toolbar_visibility(350.0, true);
+        assert!(visibility.show_join_button);
+        assert!(!visibility.show_perf_toggle);
+        assert!(!visibility.show_stats_toggle);
+        assert!(!visibility.show_irc_toggle);
+        assert!(visibility.show_perf_in_overflow);
+        assert!(visibility.show_stats_in_overflow);
+        assert!(visibility.show_irc_in_overflow);
+        assert!(visibility.show_overflow_menu);
+        assert!(!visibility.compact_controls);
     }
 }
