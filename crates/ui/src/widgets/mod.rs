@@ -1,3 +1,4 @@
+pub mod account_switcher;
 pub mod analytics;
 pub mod channel_list;
 pub mod chat_input;

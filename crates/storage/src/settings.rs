@@ -1,5 +1,8 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use crust_core::highlight::HighlightRule;
+use crust_core::model::ModActionPreset;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
@@ -37,9 +40,30 @@ pub struct AppSettings {
     /// Ignored usernames (lowercase).
     #[serde(default)]
     pub ignores: Vec<String>,
+    /// Favorited emote URLs in the emote picker.
+    #[serde(default)]
+    pub emote_picker_favorites: Vec<String>,
+    /// Recently used emote URLs in the emote picker (most-recent first).
+    #[serde(default)]
+    pub emote_picker_recent: Vec<String>,
+    /// Optional preferred provider boost for emote picker ranking.
+    #[serde(default)]
+    pub emote_picker_provider_boost: Option<String>,
     /// Message timestamps on/off.
     #[serde(default = "bool_true")]
     pub show_timestamps: bool,
+    /// Include seconds in rendered chat timestamps.
+    #[serde(default)]
+    pub show_timestamp_seconds: bool,
+    /// Use 24-hour clock formatting for rendered chat timestamps.
+    #[serde(default = "bool_true")]
+    pub use_24h_timestamps: bool,
+    /// Persist chat messages into the local SQLite log index.
+    #[serde(default = "bool_true")]
+    pub local_log_indexing_enabled: bool,
+    /// Slash command usage counts for autocomplete ranking.
+    #[serde(default)]
+    pub slash_usage_counts: BTreeMap<String, u32>,
     /// OAuth token for the *active* account (legacy/fallback field kept for
     /// backward compatibility with configs that pre-date multi-account support).
     #[serde(default)]
@@ -111,6 +135,28 @@ pub struct AppSettings {
     /// Whether split headers show viewer counts when available.
     #[serde(default = "bool_true")]
     pub split_header_show_viewer_count: bool,
+    // ── Highlight rules (chatterino-style per-rule config) ──────────────
+    /// Structured highlight rules (replaces the flat `highlights` string list).
+    /// When empty on load and `highlights` is non-empty, a migration populates it.
+    #[serde(default)]
+    pub highlight_rules: Vec<HighlightRule>,
+    /// Structured filter records for hiding messages.
+    #[serde(default)]
+    pub filter_records: Vec<crust_core::model::filters::FilterRecord>,
+    // ── Moderation action presets ────────────────────────────────────────
+    /// Saved moderation action presets shown in the user-card Moderation tab.
+    /// When empty, the UI falls back to [`ModActionPreset::defaults()`].
+    #[serde(default)]
+    pub mod_action_presets: Vec<ModActionPreset>,
+    // ── Desktop notifications ────────────────────────────────────────────
+    /// Fire an OS desktop notification when a highlight rule with
+    /// `show_in_mentions = true` matches an incoming message.
+    #[serde(default)]
+    pub desktop_notifications_enabled: bool,
+    // ── Watched channels for stream status notifications ────────────────────
+    /// Channels being watched for live/offline notifications.
+    #[serde(default)]
+    pub watched_channels: Vec<crust_core::notifications::WatchedChannel>,
 }
 
 fn default_theme() -> String {
@@ -121,6 +167,9 @@ fn default_font_size() -> f32 {
 }
 fn bool_true() -> bool {
     true
+}
+fn bool_false() -> bool {
+    false
 }
 fn default_collapse_long_message_lines() -> usize {
     8
@@ -141,7 +190,14 @@ impl Default for AppSettings {
             auto_join: Vec::new(),
             highlights: Vec::new(),
             ignores: Vec::new(),
+            emote_picker_favorites: Vec::new(),
+            emote_picker_recent: Vec::new(),
+            emote_picker_provider_boost: None,
             show_timestamps: true,
+            show_timestamp_seconds: bool_false(),
+            use_24h_timestamps: true,
+            local_log_indexing_enabled: true,
+            slash_usage_counts: BTreeMap::new(),
             oauth_token: String::new(),
             accounts: Vec::new(),
             default_account: String::new(),
@@ -165,6 +221,11 @@ impl Default for AppSettings {
             split_header_show_title: true,
             split_header_show_game: false,
             split_header_show_viewer_count: true,
+            highlight_rules: Vec::new(),
+            filter_records: Vec::new(),
+            mod_action_presets: Vec::new(),
+            desktop_notifications_enabled: false,
+            watched_channels: Vec::new(),
         }
     }
 }
@@ -180,6 +241,24 @@ fn account_keyring_key(username: &str) -> String {
 
 pub struct SettingsStore {
     config_path: PathBuf,
+}
+
+fn remove_account_from_settings(settings: &mut AppSettings, username: &str) {
+    settings.accounts.retain(|a| a.username != username);
+
+    if settings.default_account == username {
+        settings.default_account.clear();
+    }
+
+    if settings.username == username {
+        if let Some(next) = settings.accounts.first() {
+            settings.username = next.username.clone();
+            settings.oauth_token = next.oauth_token.clone();
+        } else {
+            settings.username.clear();
+            settings.oauth_token.clear();
+        }
+    }
 }
 
 impl SettingsStore {
@@ -217,6 +296,15 @@ impl SettingsStore {
                 }
                 if !matches!(cfg.tab_style.as_str(), "compact" | "normal") {
                     cfg.tab_style = default_tab_style();
+                }
+                // Migration: convert legacy plain-string highlights to structured rules.
+                if cfg.highlight_rules.is_empty() && !cfg.highlights.is_empty() {
+                    cfg.highlight_rules = cfg
+                        .highlights
+                        .iter()
+                        .filter(|s| !s.trim().is_empty())
+                        .map(|kw| HighlightRule::new(kw.trim()))
+                        .collect();
                 }
                 cfg
             }
@@ -302,16 +390,7 @@ impl SettingsStore {
             let _ = entry.delete_credential();
         }
         let mut settings = self.load();
-        settings.accounts.retain(|a| a.username != username);
-        // If the deleted account was the active one, point to the next available.
-        if settings.username == username {
-            settings.username = settings
-                .accounts
-                .first()
-                .map(|a| a.username.clone())
-                .unwrap_or_default();
-            settings.oauth_token = String::new();
-        }
+        remove_account_from_settings(&mut settings, username);
         self.save(&settings)
     }
 
@@ -373,6 +452,8 @@ impl SettingsStore {
 #[cfg(test)]
 mod tests {
     use super::AppSettings;
+    use super::AccountEntry;
+    use super::remove_account_from_settings;
 
     #[test]
     fn legacy_configs_pick_up_new_appearance_defaults() {
@@ -425,5 +506,89 @@ split_header_show_viewer_count = false
         assert!(!cfg.split_header_show_title);
         assert!(cfg.split_header_show_game);
         assert!(!cfg.split_header_show_viewer_count);
+    }
+
+    #[test]
+    fn legacy_config_without_highlight_rules_parses() {
+        let cfg: AppSettings = toml::from_str(
+            r#"
+theme = "dark"
+font_size = 13.0
+"#,
+        )
+        .expect("legacy config should parse without highlight_rules");
+
+        assert!(cfg.highlight_rules.is_empty());
+        assert!(cfg.filter_records.is_empty());
+        assert!(cfg.mod_action_presets.is_empty());
+    }
+
+    #[test]
+    fn removing_default_account_clears_default_field() {
+        let mut cfg = AppSettings {
+            default_account: "alpha".to_owned(),
+            accounts: vec![
+                AccountEntry {
+                    username: "alpha".to_owned(),
+                    oauth_token: "tok-a".to_owned(),
+                },
+                AccountEntry {
+                    username: "beta".to_owned(),
+                    oauth_token: "tok-b".to_owned(),
+                },
+            ],
+            ..AppSettings::default()
+        };
+
+        remove_account_from_settings(&mut cfg, "alpha");
+
+        assert!(cfg.default_account.is_empty());
+        assert_eq!(cfg.accounts.len(), 1);
+        assert_eq!(cfg.accounts[0].username, "beta");
+    }
+
+    #[test]
+    fn removing_active_account_moves_to_first_remaining_and_syncs_token() {
+        let mut cfg = AppSettings {
+            username: "alpha".to_owned(),
+            oauth_token: "tok-a".to_owned(),
+            accounts: vec![
+                AccountEntry {
+                    username: "alpha".to_owned(),
+                    oauth_token: "tok-a".to_owned(),
+                },
+                AccountEntry {
+                    username: "beta".to_owned(),
+                    oauth_token: "tok-b".to_owned(),
+                },
+            ],
+            ..AppSettings::default()
+        };
+
+        remove_account_from_settings(&mut cfg, "alpha");
+
+        assert_eq!(cfg.username, "beta");
+        assert_eq!(cfg.oauth_token, "tok-b");
+    }
+
+    #[test]
+    fn removing_last_active_account_clears_identity_fields() {
+        let mut cfg = AppSettings {
+            username: "alpha".to_owned(),
+            oauth_token: "tok-a".to_owned(),
+            default_account: "alpha".to_owned(),
+            accounts: vec![AccountEntry {
+                username: "alpha".to_owned(),
+                oauth_token: "tok-a".to_owned(),
+            }],
+            ..AppSettings::default()
+        };
+
+        remove_account_from_settings(&mut cfg, "alpha");
+
+        assert!(cfg.accounts.is_empty());
+        assert!(cfg.username.is_empty());
+        assert!(cfg.oauth_token.is_empty());
+        assert!(cfg.default_account.is_empty());
     }
 }

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 /// Metadata for one built-in slash command.
 #[derive(Clone, Copy)]
 pub struct SlashCommandInfo {
@@ -28,6 +30,180 @@ const BUILTIN_SLASH_COMMANDS: &[SlashCommandInfo] = &[
         name: "chatters",
         usage: "/chatters",
         summary: "Show the current chatter count in this channel.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "poll",
+        usage: "/poll <title> | <choice1> | <choice2> [--duration <15..1800>] OR /poll --title \"...\" --choice \"...\" --choice \"...\" [--duration 60|1m] [--points <n>]",
+        summary: "Create a Twitch poll (mod/broadcaster only).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "endpoll",
+        usage: "/endpoll",
+        summary: "End the active Twitch poll and archive results.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "cancelpoll",
+        usage: "/cancelpoll",
+        summary: "Cancel the active Twitch poll.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "vote",
+        usage: "/vote <choice number>",
+        summary: "Vote in the active Twitch poll.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "redeem",
+        usage: "/redeem <reward name>",
+        summary: "Redeem a channel points reward by name.",
+        aliases: &["reward"],
+    },
+    SlashCommandInfo {
+        name: "prediction",
+        usage: "/prediction <title> | <outcome1> | <outcome2> [--duration <30..1800>]",
+        summary: "Create a Twitch prediction (mod/broadcaster only).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "lockprediction",
+        usage: "/lockprediction",
+        summary: "Lock wagering on the active Twitch prediction.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "endprediction",
+        usage: "/endprediction <winning outcome index>",
+        summary: "Resolve the active Twitch prediction.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "cancelprediction",
+        usage: "/cancelprediction",
+        summary: "Cancel the active Twitch prediction.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "commercial",
+        usage: "/commercial [30|60|90|120|150|180]",
+        summary: "Start a Twitch commercial break (mod/broadcaster only).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "marker",
+        usage: "/marker [description]",
+        summary: "Create a Twitch stream marker (mod/broadcaster only).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "announce",
+        usage: "/announce <message> [--color primary|blue|green|orange|purple]",
+        summary: "Send a Twitch announcement banner (mod/broadcaster only).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "shoutout",
+        usage: "/shoutout <channel>",
+        summary: "Send a Twitch shoutout to another channel (mod/broadcaster only).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "unbanrequests",
+        usage: "/unbanrequests",
+        summary: "Fetch pending Twitch unban requests for this channel.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "resolveunban",
+        usage: "/resolveunban <request_id> <approve|deny> [reason]",
+        summary: "Resolve a Twitch unban request by id.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "automod",
+        usage: "/automod <allow|deny> <message_id> <sender_user_id>",
+        summary: "Approve or deny a held AutoMod message by id.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "modtools",
+        usage: "/modtools",
+        summary: "Open the in-app moderation tools window for this channel.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "requests",
+        usage: "/requests [channel]",
+        summary: "Open Twitch channel points reward queue for a channel.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "lowtrust",
+        usage: "/lowtrust",
+        summary: "Open low-trust moderation workflows (channel-dependent).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "mods",
+        usage: "/mods",
+        summary: "List current channel moderators (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "vips",
+        usage: "/vips",
+        summary: "List current channel VIPs (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "clip",
+        usage: "/clip",
+        summary: "Create a Twitch clip from the current stream (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "warn",
+        usage: "/warn <user> [reason]",
+        summary: "Issue a moderation warning (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "monitor",
+        usage: "/monitor <user>",
+        summary: "Mark a user as monitored/low-trust (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "unmonitor",
+        usage: "/unmonitor <user>",
+        summary: "Remove monitored/low-trust status (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "restrict",
+        usage: "/restrict <user>",
+        summary: "Restrict a low-trust user (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "unrestrict",
+        usage: "/unrestrict <user>",
+        summary: "Lift a low-trust restriction (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "ignore",
+        usage: "/ignore <user>",
+        summary: "Ignore a user locally/server-side depending on backend.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "unignore",
+        usage: "/unignore <user>",
+        summary: "Remove an ignore on a user.",
         aliases: &[],
     },
     SlashCommandInfo {
@@ -181,10 +357,166 @@ const BUILTIN_SLASH_COMMANDS: &[SlashCommandInfo] = &[
         aliases: &[],
     },
     SlashCommandInfo {
+        name: "timeout",
+        usage: "/timeout <user> [seconds] [reason]",
+        summary: "Twitch moderation timeout command (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "ban",
+        usage: "/ban <user> [reason]",
+        summary: "Twitch moderation ban command (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "unban",
+        usage: "/unban <user>",
+        summary: "Lift a Twitch ban or timeout (server-side).",
+        aliases: &["untimeout"],
+    },
+    SlashCommandInfo {
+        name: "slow",
+        usage: "/slow [seconds]",
+        summary: "Enable Twitch slow mode (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "slowoff",
+        usage: "/slowoff",
+        summary: "Disable Twitch slow mode (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "followers",
+        usage: "/followers [minutes]",
+        summary: "Enable followers-only mode (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "followersoff",
+        usage: "/followersoff",
+        summary: "Disable followers-only mode (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "subscribers",
+        usage: "/subscribers",
+        summary: "Enable subscribers-only mode (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "subscribersoff",
+        usage: "/subscribersoff",
+        summary: "Disable subscribers-only mode (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "emoteonly",
+        usage: "/emoteonly",
+        summary: "Enable emote-only mode (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "emoteonlyoff",
+        usage: "/emoteonlyoff",
+        summary: "Disable emote-only mode (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "uniquechat",
+        usage: "/uniquechat",
+        summary: "Enable unique-chat mode (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "uniquechatoff",
+        usage: "/uniquechatoff",
+        summary: "Disable unique-chat mode (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "clear",
+        usage: "/clear",
+        summary: "Clear channel chat for everyone (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "delete",
+        usage: "/delete <message-id>",
+        summary: "Delete a specific Twitch message (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "mod",
+        usage: "/mod <user>",
+        summary: "Grant moderator role (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "unmod",
+        usage: "/unmod <user>",
+        summary: "Remove moderator role (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "vip",
+        usage: "/vip <user>",
+        summary: "Grant VIP role (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "unvip",
+        usage: "/unvip <user>",
+        summary: "Remove VIP role (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "color",
+        usage: "/color <name>",
+        summary: "Set your Twitch name color (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "raid",
+        usage: "/raid <channel>",
+        summary: "Start a Twitch raid (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "unraid",
+        usage: "/unraid",
+        summary: "Cancel an outgoing Twitch raid (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "block",
+        usage: "/block <user>",
+        summary: "Block a Twitch user (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "unblock",
+        usage: "/unblock <user>",
+        summary: "Unblock a Twitch user (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "me",
+        usage: "/me <message>",
+        summary: "Send an action-style message (server-side).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
         name: "w",
         usage: "/w <user> <msg>",
         summary: "Send a Twitch whisper.",
         aliases: &["whisper"],
+    },
+    SlashCommandInfo {
+        name: "r",
+        usage: "/r <msg>",
+        summary: "Reply to your most recent whisper (server-side).",
+        aliases: &[],
     },
 ];
 
@@ -210,6 +542,7 @@ Built-in commands:\n",
     out.push_str(
         "\nAliases:\n\
   /whisper is the same as /w\n\
+    /untimeout is the same as /unban\n\
 \n\
 Anonymous mode:\n\
     Plain messages and server-side slash commands require login.\n\
@@ -270,41 +603,144 @@ pub fn replace_slash_token(buf: &mut String, command: &str) {
 
 /// Find command suggestions for a slash query.
 pub fn slash_command_matches(query: &str, limit: usize) -> Vec<&'static SlashCommandInfo> {
+    let usage_counts: HashMap<String, u32> = HashMap::new();
+    slash_command_matches_ranked(query, limit, &usage_counts)
+}
+
+/// Find command suggestions for a slash query, weighted by command usage.
+pub fn slash_command_matches_ranked(
+    query: &str,
+    limit: usize,
+    usage_counts: &HashMap<String, u32>,
+) -> Vec<&'static SlashCommandInfo> {
     let q = query.to_ascii_lowercase();
-    let mut matches: Vec<&SlashCommandInfo> = built_in_commands()
+    let mut matches: Vec<(&SlashCommandInfo, u8)> = built_in_commands()
         .iter()
-        .filter(|cmd| {
+        .filter_map(|cmd| {
             if q.is_empty() {
-                true
-            } else {
-                cmd.name.to_ascii_lowercase().contains(&q)
-                    || cmd
-                        .aliases
-                        .iter()
-                        .any(|a| a.to_ascii_lowercase().contains(&q))
+                return Some((cmd, 1));
             }
+
+            let name = cmd.name.to_ascii_lowercase();
+            let aliases: Vec<String> = cmd
+                .aliases
+                .iter()
+                .map(|al| al.to_ascii_lowercase())
+                .collect();
+
+            let exact = name == q || aliases.iter().any(|al| al == &q);
+            if exact {
+                return Some((cmd, 0));
+            }
+
+            let prefix = name.starts_with(&q) || aliases.iter().any(|al| al.starts_with(&q));
+            if prefix {
+                return Some((cmd, 1));
+            }
+
+            let contains = name.contains(&q) || aliases.iter().any(|al| al.contains(&q));
+            if contains {
+                return Some((cmd, 2));
+            }
+
+            let summary_contains = cmd.summary.to_ascii_lowercase().contains(&q)
+                || cmd.usage.to_ascii_lowercase().contains(&q);
+            if summary_contains {
+                return Some((cmd, 3));
+            }
+
+            None
         })
         .collect();
 
-    if !q.is_empty() {
-        matches.sort_by(|a, b| {
-            let a_name = a.name.to_ascii_lowercase();
-            let b_name = b.name.to_ascii_lowercase();
-            let a_prefix = a_name.starts_with(&q)
-                || a.aliases
-                    .iter()
-                    .any(|al| al.to_ascii_lowercase().starts_with(&q));
-            let b_prefix = b_name.starts_with(&q)
-                || b.aliases
-                    .iter()
-                    .any(|al| al.to_ascii_lowercase().starts_with(&q));
-            b_prefix
-                .cmp(&a_prefix)
-                .then_with(|| a_name.len().cmp(&b_name.len()))
-                .then_with(|| a_name.cmp(&b_name))
-        });
-    }
+    matches.sort_by(|(a, a_rank), (b, b_rank)| {
+        let a_name = a.name.to_ascii_lowercase();
+        let b_name = b.name.to_ascii_lowercase();
+        let a_usage = usage_weight(a, usage_counts);
+        let b_usage = usage_weight(b, usage_counts);
+
+        a_rank
+            .cmp(b_rank)
+            .then_with(|| b_usage.cmp(&a_usage))
+            .then_with(|| a_name.len().cmp(&b_name.len()))
+            .then_with(|| a_name.cmp(&b_name))
+    });
 
     matches.truncate(limit);
-    matches
+    matches.into_iter().map(|(cmd, _)| cmd).collect()
+}
+
+fn usage_weight(cmd: &SlashCommandInfo, usage_counts: &HashMap<String, u32>) -> u32 {
+    let mut out = usage_counts
+        .get(&cmd.name.to_ascii_lowercase())
+        .copied()
+        .unwrap_or(0);
+    for alias in cmd.aliases {
+        out = out.saturating_add(
+            usage_counts
+                .get(&alias.to_ascii_lowercase())
+                .copied()
+                .unwrap_or(0),
+        );
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::{
+        built_in_commands, extract_slash_query, slash_command_matches, slash_command_matches_ranked,
+    };
+
+    #[test]
+    fn slash_query_detects_root_slash() {
+        assert_eq!(extract_slash_query("/"), Some(""));
+    }
+
+    #[test]
+    fn slash_matches_return_all_for_empty_query() {
+        let all = slash_command_matches("", usize::MAX);
+        assert_eq!(all.len(), built_in_commands().len());
+    }
+
+    #[test]
+    fn slash_matches_include_prediction_commands() {
+        let pred = slash_command_matches("pred", usize::MAX);
+        assert!(pred.iter().any(|c| c.name == "prediction"));
+    }
+
+    #[test]
+    fn slash_matches_include_new_moderation_discovery_commands() {
+        let modtools = slash_command_matches("modtoo", usize::MAX);
+        assert!(modtools.iter().any(|c| c.name == "modtools"));
+
+        let lowtrust = slash_command_matches("restrict", usize::MAX);
+        assert!(lowtrust.iter().any(|c| c.name == "restrict"));
+        assert!(lowtrust.iter().any(|c| c.name == "unrestrict"));
+    }
+
+    #[test]
+    fn slash_matches_include_commercial_command() {
+        let matches = slash_command_matches("comm", usize::MAX);
+        assert!(matches.iter().any(|c| c.name == "commercial"));
+    }
+
+    #[test]
+    fn slash_matches_support_substring_discovery() {
+        // Discovery should find commands by meaningful substrings.
+        let noisy = slash_command_matches("edict", usize::MAX);
+        assert!(noisy.iter().any(|c| c.name == "prediction"));
+    }
+
+    #[test]
+    fn slash_matches_prioritize_recently_used_commands() {
+        let mut usage = HashMap::new();
+        usage.insert("shoutout".to_owned(), 25);
+        usage.insert("help".to_owned(), 2);
+
+        let ranked = slash_command_matches_ranked("", usize::MAX, &usage);
+        assert_eq!(ranked.first().map(|c| c.name), Some("shoutout"));
+    }
 }

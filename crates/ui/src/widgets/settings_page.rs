@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 
-use egui::{Context, Margin, RichText};
+use egui::{Color32, Context, Margin, RichText};
+
+use crust_core::highlight::HighlightRule;
 
 use crate::app::{ChannelLayout, TabVisualStyle};
 use crate::theme as t;
@@ -11,6 +13,7 @@ use super::chrome;
 pub enum SettingsSection {
     Appearance,
     Chat,
+    Highlights,
     Filters,
     Channels,
     Integrations,
@@ -27,6 +30,7 @@ impl SettingsSection {
         match self {
             Self::Appearance => "Appearance",
             Self::Chat => "Chat",
+            Self::Highlights => "Highlights",
             Self::Filters => "Filters",
             Self::Channels => "Channels",
             Self::Integrations => "Integrations",
@@ -37,7 +41,8 @@ impl SettingsSection {
         match self {
             Self::Appearance => "Theme and window behavior",
             Self::Chat => "Message rendering and input limits",
-            Self::Filters => "Highlights and ignored users",
+            Self::Highlights => "Highlight rules and ignored users",
+            Self::Filters => "Message filtering and moderation",
             Self::Channels => "Auto-join channel management",
             Self::Integrations => "Kick/IRC beta and NickServ",
         }
@@ -63,6 +68,9 @@ pub struct SettingsPageState {
     pub collapse_long_message_lines: usize,
     pub animations_when_focused: bool,
     pub show_timestamps: bool,
+    pub show_timestamp_seconds: bool,
+    pub use_24h_timestamps: bool,
+    pub local_log_indexing_enabled: bool,
     pub highlights_buf: String,
     pub ignores_buf: String,
     pub auto_join_buf: String,
@@ -77,6 +85,15 @@ pub struct SettingsPageState {
     pub split_header_show_title: bool,
     pub split_header_show_game: bool,
     pub split_header_show_viewer_count: bool,
+    /// Editable structured highlight rules (mirrors AppSettings.highlight_rules).
+    pub highlight_rules: Vec<HighlightRule>,
+    /// Per-rule draft pattern buffer (indexed parallel to highlight_rules).
+    pub highlight_rule_bufs: Vec<String>,
+    pub filter_records: Vec<crust_core::model::filters::FilterRecord>,
+    pub filter_record_bufs: Vec<String>,
+    pub mod_action_presets: Vec<crust_core::model::mod_actions::ModActionPreset>,
+    /// Desktop notification toggle.
+    pub desktop_notifications_enabled: bool,
 }
 
 pub fn parse_settings_lines(input: &str, lowercase: bool) -> Vec<String> {
@@ -101,10 +118,11 @@ pub fn parse_settings_lines(input: &str, lowercase: bool) -> Vec<String> {
     out
 }
 
-fn settings_sections() -> [SettingsSection; 5] {
+fn settings_sections() -> [SettingsSection; 6] {
     [
         SettingsSection::Appearance,
         SettingsSection::Chat,
+        SettingsSection::Highlights,
         SettingsSection::Filters,
         SettingsSection::Channels,
         SettingsSection::Integrations,
@@ -297,10 +315,9 @@ fn render_settings_content(
                     });
                     ui.checkbox(&mut state.sidebar_visible, "Show sidebar in sidebar mode");
                     ui.checkbox(&mut state.analytics_visible, "Show analytics panel");
-                    ui.add_enabled_ui(state.irc_beta_enabled, |ui| {
+                    if state.irc_beta_enabled {
                         ui.checkbox(&mut state.irc_status_visible, "Show IRC status panel");
-                    });
-                    if !state.irc_beta_enabled {
+                    } else {
                         ui.label(
                             RichText::new("Enable IRC beta to use the IRC diagnostics panel.")
                                 .font(t::tiny())
@@ -337,6 +354,17 @@ fn render_settings_content(
                 }
                 SettingsSection::Chat => {
                     ui.checkbox(&mut state.show_timestamps, "Show message timestamps");
+                    ui.add_enabled_ui(state.show_timestamps, |ui| {
+                        ui.checkbox(&mut state.use_24h_timestamps, "Use 24-hour clock");
+                        ui.checkbox(
+                            &mut state.show_timestamp_seconds,
+                            "Include seconds in timestamps",
+                        );
+                    });
+                    ui.checkbox(
+                        &mut state.local_log_indexing_enabled,
+                        "Enable local chat log indexing",
+                    );
                     ui.checkbox(
                         &mut state.collapse_long_messages,
                         "Collapse long chat messages",
@@ -408,12 +436,250 @@ fn render_settings_content(
                             "Animate only while window is focused"
                         },
                     );
-                }
-                SettingsSection::Filters => {
+                    
+                    ui.add_space(8.0);
                     ui.label(
-                        RichText::new("Highlight keywords (one per line or comma-separated)")
+                        RichText::new("Moderation Action Presets")
                             .font(t::small())
-                            .color(t::text_secondary()),
+                            .strong()
+                            .color(t::text_primary()),
+                    );
+                    ui.label(
+                        RichText::new("Variables: {user}, {channel}")
+                            .font(t::tiny())
+                            .color(t::text_muted()),
+                    );
+                    ui.add_space(4.0);
+
+                    let mut delete_preset_idx: Option<usize> = None;
+
+                    egui::Grid::new("mod_presets_grid")
+                        .num_columns(3)
+                        .spacing(egui::vec2(8.0, 4.0))
+                        .show(ui, |ui| {
+                            // Header row
+                            ui.label(RichText::new("Label").font(t::tiny()).color(t::text_muted()));
+                            ui.label(RichText::new("Command").font(t::tiny()).color(t::text_muted()));
+                            ui.label(RichText::new("").font(t::tiny()));
+                            ui.end_row();
+
+                            for (i, preset) in state.mod_action_presets.iter_mut().enumerate() {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut preset.label)
+                                        .desired_width(if compact { 60.0 } else { 80.0 })
+                                        .hint_text("Label"),
+                                );
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut preset.command_template)
+                                        .desired_width(if compact { 120.0 } else { 200.0 })
+                                        .hint_text("/timeout {user} 600"),
+                                );
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("❌").font(t::tiny()).color(Color32::from_rgb(220, 80, 80)),
+                                        )
+                                        .min_size(egui::vec2(24.0, 20.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    delete_preset_idx = Some(i);
+                                }
+                                ui.end_row();
+                            }
+                        });
+
+                    if let Some(i) = delete_preset_idx {
+                        state.mod_action_presets.remove(i);
+                    }
+                    if ui.button("+ Add preset").clicked() {
+                        state.mod_action_presets.push(crust_core::model::mod_actions::ModActionPreset {
+                            label: "".into(),
+                            command_template: "".into(),
+                            icon_url: None,
+                        });
+                    }
+                }
+                SettingsSection::Highlights => {
+                    // ── Highlight rules table ─────────────────────────────
+                    ui.label(
+                        RichText::new("Highlight Rules")
+                            .font(t::small())
+                            .strong()
+                            .color(t::text_primary()),
+                    );
+                    ui.label(
+                        RichText::new("Messages matching a rule will be tinted.\nUse Alert and Sound toggles for additional feedback.")
+                            .font(t::tiny())
+                            .color(t::text_muted()),
+                    );
+                    ui.add_space(4.0);
+
+                    // Sync buf length with rule length.
+                    while state.highlight_rule_bufs.len() < state.highlight_rules.len() {
+                        let pat = state
+                            .highlight_rules
+                            .get(state.highlight_rule_bufs.len())
+                            .map(|r| r.pattern.clone())
+                            .unwrap_or_default();
+                        state.highlight_rule_bufs.push(pat);
+                    }
+                    state.highlight_rule_bufs.truncate(state.highlight_rules.len());
+
+                    let mut delete_idx: Option<usize> = None;
+                    let action_btn_size = egui::vec2(26.0, 22.0);
+
+                    egui::Grid::new("highlight_rules_grid")
+                        .num_columns(7)
+                        .spacing(egui::vec2(8.0, 6.0))
+                        .show(ui, |ui| {
+                            // Header row
+                            ui.label(RichText::new("On").font(t::tiny()).color(t::text_muted()));
+                            ui.label(RichText::new("Pattern").font(t::tiny()).color(t::text_muted()));
+                            ui.label(RichText::new("Re").font(t::tiny()).color(t::text_muted())
+                                .strong());
+                            ui.label(RichText::new("Aa").font(t::tiny()).color(t::text_muted()));
+                            ui.label(RichText::new("Alert").font(t::tiny()).color(t::text_muted()));
+                            ui.label(RichText::new("Sound").font(t::tiny()).color(t::text_muted()));
+                            ui.label(RichText::new("").font(t::tiny()));
+                            ui.end_row();
+
+                            for (i, rule) in state.highlight_rules.iter_mut().enumerate() {
+                                // Enabled toggle
+                                ui.checkbox(&mut rule.enabled, "");
+
+                                // Pattern text field
+                                let buf = &mut state.highlight_rule_bufs[i];
+                                let te = egui::TextEdit::singleline(buf)
+                                    .desired_width(if compact { 90.0 } else { 140.0 })
+                                    .hint_text("keyword")
+                                    .text_color(if rule.enabled {
+                                        t::text_primary()
+                                    } else {
+                                        t::text_muted()
+                                    });
+                                let resp = ui.add(te);
+                                if resp.changed() {
+                                    rule.pattern = buf.clone();
+                                }
+
+                                // Regex toggle ("Re")
+                                let re_col = if rule.is_regex {
+                                    Color32::from_rgb(120, 200, 255)
+                                } else {
+                                    t::text_muted()
+                                };
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("Re").font(t::tiny()).color(re_col),
+                                        )
+                                        .min_size(action_btn_size),
+                                    )
+                                    .clicked()
+                                {
+                                    rule.is_regex = !rule.is_regex;
+                                }
+
+                                // Case-sensitive toggle ("Aa")
+                                let aa_col = if rule.case_sensitive {
+                                    Color32::from_rgb(255, 200, 100)
+                                } else {
+                                    t::text_muted()
+                                };
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("Aa").font(t::tiny()).color(aa_col),
+                                        )
+                                        .min_size(action_btn_size),
+                                    )
+                                    .clicked()
+                                {
+                                    rule.case_sensitive = !rule.case_sensitive;
+                                }
+
+                                // Visual alert toggle
+                                let alert_col = if rule.has_alert {
+                                    Color32::from_rgb(255, 150, 80)
+                                } else {
+                                    t::text_muted()
+                                };
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("⚠").font(t::tiny()).color(alert_col),
+                                        )
+                                        .min_size(action_btn_size),
+                                    )
+                                    .on_hover_text("Show visual alert/flash on match")
+                                    .clicked()
+                                {
+                                    rule.has_alert = !rule.has_alert;
+                                }
+
+                                // Sound notification toggle
+                                let sound_col = if rule.has_sound {
+                                    Color32::from_rgb(100, 255, 150)
+                                } else {
+                                    t::text_muted()
+                                };
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("🔊").font(t::tiny()).color(sound_col),
+                                        )
+                                        .min_size(action_btn_size),
+                                    )
+                                    .on_hover_text("Play sound notification on match")
+                                    .clicked()
+                                {
+                                    rule.has_sound = !rule.has_sound;
+                                }
+
+                                // Delete button
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("🗑").font(t::tiny()).color(
+                                                Color32::from_rgb(220, 80, 80),
+                                            ),
+                                        )
+                                        .min_size(action_btn_size),
+                                    )
+                                    .clicked()
+                                {
+                                    delete_idx = Some(i);
+                                }
+
+                                ui.end_row();
+                            }
+                        });
+
+                    if let Some(idx) = delete_idx {
+                        state.highlight_rules.remove(idx);
+                        state.highlight_rule_bufs.remove(idx);
+                    }
+
+                    if ui.button("+ Add rule").clicked() {
+                        let new_rule = HighlightRule::new("");
+                        state.highlight_rule_bufs.push(String::new());
+                        state.highlight_rules.push(new_rule);
+                    }
+
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("Keyword Highlights (Legacy)")
+                            .font(t::small())
+                            .strong()
+                            .color(t::text_primary()),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "Used for compatibility with older highlight lists. One per line or comma-separated.",
+                        )
+                        .font(t::tiny())
+                        .color(t::text_muted()),
                     );
                     ui.add(
                         egui::TextEdit::multiline(&mut state.highlights_buf)
@@ -423,18 +689,23 @@ fn render_settings_content(
                             } else if compact {
                                 4
                             } else {
-                                6
+                                5
                             }),
                     );
                     ui.label(
                         RichText::new(format!(
-                            "{} keyword(s)",
+                            "{} keyword highlight(s)",
                             parse_settings_lines(&state.highlights_buf, false).len()
                         ))
                         .font(t::tiny())
                         .color(t::text_muted()),
                     );
+
                     ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+
+                    // ── Ignored users ─────────────────────────────────────
                     ui.label(
                         RichText::new("Ignored usernames (one per line or comma-separated)")
                             .font(t::small())
@@ -458,6 +729,172 @@ fn render_settings_content(
                         ))
                         .font(t::tiny())
                         .color(t::text_muted()),
+                    );
+                    ui.add_space(4.0);
+                }
+                SettingsSection::Filters => {
+                    // ── Filter Records table ──────────────────────────────
+                    ui.label(
+                        RichText::new("Filter Records (Hide/Dim Messages)")
+                            .font(t::small())
+                            .strong()
+                            .color(t::text_primary()),
+                    );
+                    ui.label(
+                        RichText::new("Messages matching an active filter will be hidden or dimmed.")
+                            .font(t::tiny())
+                            .color(t::text_muted()),
+                    );
+                    ui.add_space(4.0);
+
+                    // Sync buf length with filter length.
+                    while state.filter_record_bufs.len() < state.filter_records.len() {
+                        let pat = state
+                            .filter_records
+                            .get(state.filter_record_bufs.len())
+                            .map(|r| r.pattern.clone())
+                            .unwrap_or_default();
+                        state.filter_record_bufs.push(pat);
+                    }
+                    state.filter_record_bufs.truncate(state.filter_records.len());
+
+                    let mut filter_delete_idx: Option<usize> = None;
+
+                    egui::Grid::new("filter_records_grid")
+                        .num_columns(7)
+                        .spacing(egui::vec2(4.0, 4.0))
+                        .show(ui, |ui| {
+                            // Header row
+                            ui.label(RichText::new("On").font(t::tiny()).color(t::text_muted()));
+                            ui.label(RichText::new("Name").font(t::tiny()).color(t::text_muted()));
+                            ui.label(RichText::new("Pattern").font(t::tiny()).color(t::text_muted()));
+                            ui.label(RichText::new("Re").font(t::tiny()).color(t::text_muted()).strong());
+                            ui.label(RichText::new("User").font(t::tiny()).color(t::text_muted()));
+                            ui.label(RichText::new("Act").font(t::tiny()).color(t::text_muted()));
+                            ui.label(RichText::new("").font(t::tiny()));
+                            ui.end_row();
+
+                            for (i, filter) in state.filter_records.iter_mut().enumerate() {
+                                // Enabled toggle
+                                ui.checkbox(&mut filter.enabled, "");
+
+                                // Name text field
+                                ui.add(egui::TextEdit::singleline(&mut filter.name).desired_width(60.0).hint_text("Name"));
+
+                                // Pattern text field
+                                let buf = &mut state.filter_record_bufs[i];
+                                let te = egui::TextEdit::singleline(buf)
+                                    .desired_width(if compact { 90.0 } else { 140.0 })
+                                    .hint_text("regex or keyword")
+                                    .text_color(if filter.enabled {
+                                        t::text_primary()
+                                    } else {
+                                        t::text_muted()
+                                    });
+                                let resp = ui.add(te);
+                                if resp.changed() {
+                                    filter.pattern = buf.clone();
+                                }
+
+                                // Regex toggle ("Re")
+                                let re_col = if filter.is_regex {
+                                    Color32::from_rgb(120, 200, 255)
+                                } else {
+                                    t::text_muted()
+                                };
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("Re").font(t::tiny()).color(re_col),
+                                        )
+                                        .min_size(egui::vec2(24.0, 20.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    filter.is_regex = !filter.is_regex;
+                                }
+
+                                // Filter sender toggle
+                                let user_col = if filter.filter_sender {
+                                    Color32::from_rgb(255, 180, 100)
+                                } else {
+                                    t::text_muted()
+                                };
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("👤").font(t::tiny()).color(user_col),
+                                        )
+                                        .min_size(egui::vec2(24.0, 20.0)),
+                                    )
+                                    .on_hover_text("Filter by username instead of message content")
+                                    .clicked()
+                                {
+                                    filter.filter_sender = !filter.filter_sender;
+                                }
+
+                                // Action toggle (Hide/Dim)
+                                use crust_core::model::filters::FilterAction;
+                                let action_text = match filter.action {
+                                    FilterAction::Hide => "🚫",
+                                    FilterAction::Dim => "🔅",
+                                };
+                                let action_col = match filter.action {
+                                    FilterAction::Hide => Color32::from_rgb(220, 80, 80),
+                                    FilterAction::Dim => Color32::from_rgb(150, 150, 150),
+                                };
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new(action_text).font(t::tiny()).color(action_col),
+                                        )
+                                        .min_size(egui::vec2(24.0, 20.0)),
+                                    )
+                                    .on_hover_text("Toggle action: Hide vs Dim")
+                                    .clicked()
+                                {
+                                    filter.action = match filter.action {
+                                        FilterAction::Hide => FilterAction::Dim,
+                                        FilterAction::Dim => FilterAction::Hide,
+                                    };
+                                }
+
+                                // Delete button
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("🗑").font(t::tiny()).color(
+                                                Color32::from_rgb(220, 80, 80),
+                                            ),
+                                        )
+                                        .min_size(egui::vec2(20.0, 20.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    filter_delete_idx = Some(i);
+                                }
+
+                                ui.end_row();
+                            }
+                        });
+
+                    if let Some(idx) = filter_delete_idx {
+                        state.filter_records.remove(idx);
+                        state.filter_record_bufs.remove(idx);
+                    }
+
+                    if ui.button("+ Add filter").clicked() {
+                        use crust_core::model::filters::{FilterRecord, FilterScope};
+                        let new_filter = FilterRecord::new("New Filter", "", FilterScope::Global);
+                        state.filter_record_bufs.push(String::new());
+                        state.filter_records.push(new_filter);
+                    }
+
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("💡 Tip: Use regex mode for advanced patterns like \\b(spam|scam)\\b")
+                            .font(t::tiny())
+                            .color(t::text_muted()),
                     );
                 }
                 SettingsSection::Channels => {
@@ -495,44 +932,52 @@ fn render_settings_content(
                     ui.checkbox(&mut state.kick_beta_enabled, "Kick compatibility (beta)");
                     ui.checkbox(&mut state.irc_beta_enabled, "IRC chat compatibility (beta)");
                     ui.add_space(8.0);
-                    ui.label(
-                        RichText::new("IRC NickServ Auto-Identify")
-                            .font(t::small())
-                            .strong()
-                            .color(t::text_primary()),
-                    );
-                    if compact {
-                        ui.label("Username:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut state.irc_nickserv_user)
-                                .desired_width(f32::INFINITY),
+                    if state.irc_beta_enabled {
+                        ui.label(
+                            RichText::new("IRC NickServ Auto-Identify")
+                                .font(t::small())
+                                .strong()
+                                .color(t::text_primary()),
                         );
-                        ui.label("Password:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut state.irc_nickserv_pass)
-                                .desired_width(f32::INFINITY)
-                                .password(true),
-                        );
-                    } else {
-                        egui::Grid::new("settings_irc_auth_grid")
-                            .num_columns(2)
-                            .spacing(egui::vec2(8.0, 6.0))
-                            .show(ui, |ui| {
-                                ui.label("Username:");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut state.irc_nickserv_user)
-                                        .desired_width(f32::INFINITY),
-                                );
-                                ui.end_row();
+                        if compact {
+                            ui.label("Username:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut state.irc_nickserv_user)
+                                    .desired_width(f32::INFINITY),
+                            );
+                            ui.label("Password:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut state.irc_nickserv_pass)
+                                    .desired_width(f32::INFINITY)
+                                    .password(true),
+                            );
+                        } else {
+                            egui::Grid::new("settings_irc_auth_grid")
+                                .num_columns(2)
+                                .spacing(egui::vec2(8.0, 6.0))
+                                .show(ui, |ui| {
+                                    ui.label("Username:");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut state.irc_nickserv_user)
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                    ui.end_row();
 
-                                ui.label("Password:");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut state.irc_nickserv_pass)
-                                        .desired_width(f32::INFINITY)
-                                        .password(true),
-                                );
-                                ui.end_row();
-                            });
+                                    ui.label("Password:");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut state.irc_nickserv_pass)
+                                            .desired_width(f32::INFINITY)
+                                            .password(true),
+                                    );
+                                    ui.end_row();
+                                });
+                        }
+                    } else {
+                        ui.label(
+                            RichText::new("Enable IRC beta to configure NickServ auto-identify.")
+                                .font(t::tiny())
+                                .color(t::text_muted()),
+                        );
                     }
                     ui.add_space(8.0);
                     ui.label(
@@ -560,6 +1005,7 @@ pub fn show_settings_page(
         .open(settings_open)
         .collapsible(false)
         .resizable(true)
+        .order(egui::Order::Foreground)
         .default_pos(settings_default_pos)
         .default_size(egui::vec2(760.0, 560.0))
         .show(ctx, |ui| {

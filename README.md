@@ -2,7 +2,7 @@
 
 A native Twitch chat client written in Rust.
 
-`crust` is a hobby project inspired by Chatterino, built as a multi-crate Rust workspace with an `egui` desktop UI, a Twitch IRC/WebSocket session layer, emote provider integrations, and local settings/log storage.
+`crust` is a hobby project built as a multi-crate Rust workspace with an `egui` desktop UI, a Twitch IRC/WebSocket session layer, emote provider integrations, and local settings/log storage.
 
 ## Screenshots
 
@@ -14,9 +14,23 @@ A native Twitch chat client written in Rust.
 
 ![Multi-channel tabs](img/demo5.png)
 
+![Mod tabs](img/demo8.png)
+
 ## Current status
 
 Active early-stage project. The app builds and runs, and core chat workflows are in place. APIs and internals may still change.
+
+## Reference baseline
+
+crust uses `chatterino2-master` as the default north-star baseline for feature behavior and bug-fix outcomes.
+
+When `chatterino2-master` and `chatterino7-chatterino7` differ, crust prefers `chatterino2-master`.
+
+See:
+
+- [docs/REFERENCE_POLICY.md](docs/REFERENCE_POLICY.md)
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## Features
 
@@ -70,6 +84,19 @@ Release build:
 ```bash
 cargo run -p crust --release
 ```
+
+### Windows release binary
+
+Build and package a Windows release zip from PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_release.ps1
+```
+
+Artifacts are produced at:
+
+- `target\\release\\crust.exe`
+- `dist\\windows\\crust-v0.1.0-windows-x64.zip`
 
 ### Running on WSL
 

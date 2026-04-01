@@ -8,5 +8,34 @@ plugin system
 
 multi account sytem, better modderation, chatter anyalitcs, custom stream dealy
 
-tall unicode chats are too wide anddont look correct
+Start implementation bing bang
 
+EventSub realtime pipeline
+Follows, subs, gift subs, raids, channel points, poll/prediction lifecycle, stream online/offline, reconnect/backfill handling.
+
+Channel points parity
+Redemption messages, reward metadata, moderator handling actions, better redemption UI.
+
+Moderation UX parity
+Right-click user menu with fast actions, timeout presets, mod logs, AutoMod queue, unban request workflow.
+
+Filter/highlight engine
+Per-channel and global rules, regex support, user/content filters, highlight sounds/colors, mention rules.
+
+Usercard depth
+Follow age, account age, pronouns, shared channels, recent messages, richer badge/role context.
+
+Message behavior parity
+Reply/thread polish, clearer deleted/cleared rendering, system notice consistency, better timestamp/settings granularity.
+
+Command and input parity
+Full Twitch command coverage, better slash help/discovery, smarter ranking/history in command suggestions.
+
+Tab/split/navigation polish
+More Chatterino-like split workflows, tab unread/mention behavior parity, keyboard channel navigation improvements.
+
+Emote UX parity
+Favorites/recent emotes, provider priority controls, richer picker/search behavior and usage-based ranking.
+
+History/search tooling
+Reliable recent-message fetch on join, stronger in-channel search, optional local log indexing.

@@ -24,6 +24,7 @@ pub struct MessageSearchState {
     pub username: String,
     pub keyword: String,
     pub regex: String,
+    request_load_more_local: bool,
     compiled_regex: Option<Regex>,
     compiled_pattern: String,
     regex_error: Option<String>,
@@ -51,10 +52,19 @@ impl MessageSearchState {
         self.username.clear();
         self.keyword.clear();
         self.regex.clear();
+        self.request_load_more_local = false;
         self.compiled_regex = None;
         self.compiled_pattern.clear();
         self.regex_error = None;
         self.focus_keyword = true;
+    }
+
+    pub fn request_load_more_local(&mut self) {
+        self.request_load_more_local = true;
+    }
+
+    pub fn take_load_more_local_request(&mut self) -> bool {
+        std::mem::take(&mut self.request_load_more_local)
     }
 
     pub fn is_filtering(&self) -> bool {
@@ -289,6 +299,13 @@ fn show_message_search_contents(
                 }
             }
             if ui
+                .add(Button::new(RichText::new("Load older logs").font(t::small())))
+                .on_hover_text("Load older local SQLite logs before the oldest visible message")
+                .clicked()
+            {
+                search.request_load_more_local();
+            }
+            if ui
                 .add(Button::new(RichText::new("Clear").font(t::small())))
                 .on_hover_text("Clear all filters")
                 .clicked()
@@ -399,7 +416,7 @@ fn show_message_search_contents(
     } else {
         ui.label(
             RichText::new(
-                "All filters are combined. Username and keyword ignore case. Press Esc to close.",
+                "All filters are combined. Username and keyword ignore case. Use Load older logs to search deeper local history.",
             )
             .font(t::small())
             .color(t::text_muted()),

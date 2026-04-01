@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use egui::{CentralPanel, Color32, Context, Frame, Margin, RichText, SidePanel, TopBottomPanel};
@@ -7,7 +7,10 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 use crust_core::{
-    events::{AppCommand, AppEvent, ConnectionState, LinkPreview},
+    events::{
+        AppCommand, AppEvent, AutoModQueueItem, ConnectionState, LinkPreview,
+        UnbanRequestItem,
+    },
     model::{
         ChannelId, ChannelState, EmoteCatalogEntry, MsgKind, ReplyInfo, IRC_SERVER_CONTROL_CHANNEL,
     },
@@ -16,6 +19,7 @@ use crust_core::{
 
 use crate::commands::render_help_message;
 use crate::perf::{ChatPerfStats, PerfOverlay};
+use crate::stream_status::{StreamStatusTracker, StreamStatusUpdate};
 use crate::theme as t;
 use crate::widgets::{
     analytics::AnalyticsPanel,
@@ -24,6 +28,7 @@ use crate::widgets::{
     chat_input::ChatInput,
     chrome::{self, ChromeIcon, IconButtonState},
     emote_picker::EmotePicker,
+    emote_picker::EmotePickerPreferences,
     info_bars::{show_channel_info_bars, StreamStatusInfo},
     irc_status::IrcStatusPanel,
     join_dialog::JoinDialog,
@@ -46,18 +51,31 @@ use crate::widgets::{
 const REPAINT_ANIM_MS: u64 = 33;
 const REPAINT_HOUSEKEEPING_MS: u64 = 2_000;
 const STREAM_REFRESH_SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+const STREAM_REFRESH_ACTIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+const STREAM_REFRESH_BACKGROUND_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(60);
+const STREAM_NOTIFICATION_STARTUP_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(8);
+const AUTH_REFRESH_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const AUTH_REFRESH_INFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const EVENT_TOAST_MAX_ACTIVE: usize = 5;
+const EVENT_TOAST_QUEUE_MAX: usize = 24;
+const EVENT_TOAST_STAGGER: std::time::Duration = std::time::Duration::from_millis(650);
+const EVENT_TOAST_TTL_SECS: f32 = 5.0;
 const NARROW_WINDOW_THRESHOLD: f32 = 520.0;
 const VERY_NARROW_WINDOW_THRESHOLD: f32 = 320.0;
 const REGULAR_MIN_CENTRAL_WIDTH: f32 = 250.0;
 const NARROW_MIN_CENTRAL_WIDTH: f32 = 120.0;
 const REGULAR_STATUS_BAR_HEIGHT: f32 = 44.0;
-const NARROW_STATUS_BAR_HEIGHT: f32 = REGULAR_STATUS_BAR_HEIGHT;
+const NARROW_STATUS_BAR_HEIGHT: f32 = 36.0;
+const VERY_NARROW_STATUS_BAR_HEIGHT: f32 = 30.0;
 const ANALYTICS_DEFAULT_W: f32 = 220.0;
 const ANALYTICS_MIN_W: f32 = 180.0;
 const ANALYTICS_MAX_W: f32 = 340.0;
 const ANALYTICS_COMPACT_DEFAULT_W: f32 = 176.0;
 const ANALYTICS_COMPACT_MIN_W: f32 = 140.0;
 const ANALYTICS_COMPACT_MAX_W: f32 = 260.0;
+const LOCAL_HISTORY_SEARCH_PAGE: usize = 800;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ResponsiveLayout {
@@ -78,6 +96,8 @@ fn responsive_layout(window_width: f32) -> ResponsiveLayout {
     ResponsiveLayout {
         force_top_tabs: narrow,
         status_bar_height: if very_narrow {
+            VERY_NARROW_STATUS_BAR_HEIGHT
+        } else if narrow {
             NARROW_STATUS_BAR_HEIGHT
         } else {
             REGULAR_STATUS_BAR_HEIGHT
@@ -593,6 +613,8 @@ pub struct CrustApp {
     emote_ram_bytes: usize,
     /// Chat message history for Up/Down arrow recall.
     message_history: Vec<String>,
+    /// Slash command usage frequency for autocomplete ranking.
+    slash_usage_counts: HashMap<String, u32>,
     /// Controls whether the left channel sidebar is visible (Sidebar mode only).
     sidebar_visible: bool,
     /// Where channel tabs are rendered: left sidebar or top strip.
@@ -617,13 +639,25 @@ pub struct CrustApp {
     stream_statuses: HashMap<String, StreamStatusInfo>,
     /// When each channel's stream status was last fetched.
     stream_status_fetched: HashMap<String, std::time::Instant>,
+    /// Channel logins currently being fetched for stream status.
+    stream_status_fetch_inflight: HashSet<String>,
     /// Last time we scanned channels to schedule stale stream-status refreshes.
     last_stream_refresh_scan: std::time::Instant,
+    /// Last time we forced a refresh for the active Twitch channel.
+    last_active_stream_refresh: std::time::Instant,
     /// Cached live-status map derived from `stream_statuses`; rebuilt only on
     /// change rather than every frame.
     live_map_cache: HashMap<String, bool>,
+    /// Tracks watched channels and suppresses duplicate live/offline transitions.
+    stream_tracker: StreamStatusTracker,
     /// Short-lived pop-in banners for Sub / Raid / Bits events (cap 5).
     event_toasts: Vec<EventToast>,
+    /// Backlog of toasts waiting for paced rendering.
+    event_toast_queue: VecDeque<EventToast>,
+    /// Last time a toast was emitted from the queue.
+    last_event_toast_emit: Option<std::time::Instant>,
+    /// Suppress stream live/offline toasts during startup sync.
+    suppress_stream_toasts_until: std::time::Instant,
     /// Settings dialog visibility.
     settings_open: bool,
     /// Current section selected in the settings page.
@@ -649,6 +683,12 @@ pub struct CrustApp {
     animations_when_focused: bool,
     /// Show chat timestamps before each message.
     show_timestamps: bool,
+    /// Include seconds in chat timestamps.
+    show_timestamp_seconds: bool,
+    /// Use 24-hour clock formatting for chat timestamps.
+    use_24h_timestamps: bool,
+    /// Persist incoming chat rows to local SQLite history.
+    local_log_indexing_enabled: bool,
     /// Whether split headers show stream title metadata.
     split_header_show_title: bool,
     /// Whether split headers show stream game/category metadata.
@@ -657,8 +697,23 @@ pub struct CrustApp {
     split_header_show_viewer_count: bool,
     /// Highlight keyword list from settings.
     highlights: Vec<String>,
-    /// Lowercased highlight keywords used by message rendering.
-    highlights_lower: Vec<String>,
+    /// Compiled highlight rules (substring / regex / scope) used by message rendering.
+    highlight_rules: Vec<crust_core::highlight::HighlightMatch>,
+    /// Settings dialog state for highlight rules
+    settings_highlight_rules: Vec<crust_core::highlight::HighlightRule>,
+    settings_highlight_rule_bufs: Vec<String>,
+    
+    /// Compiled filter records for hiding messages.
+    filter_records: Vec<crust_core::model::filters::CompiledFilter>,
+    /// Settings dialog state for filter records.
+    settings_filter_records: Vec<crust_core::model::filters::FilterRecord>,
+    settings_filter_record_bufs: Vec<String>,
+    
+    /// User-defined moderation action presets
+    mod_action_presets: Vec<crust_core::model::mod_actions::ModActionPreset>,
+    settings_mod_action_presets: Vec<crust_core::model::mod_actions::ModActionPreset>,
+
+    desktop_notifications_enabled: bool,
     /// Ignored usernames from settings.
     ignores: Vec<String>,
     /// Fast lookup set for ignored usernames.
@@ -681,6 +736,20 @@ pub struct CrustApp {
     message_search: HashMap<ChannelId, MessageSearchState>,
     /// Sorted chatter names per channel, rebuilt only when membership changes.
     sorted_chatters: HashMap<ChannelId, Vec<String>>,
+    /// Last emote picker preferences acknowledged by runtime settings.
+    emote_picker_prefs_last_saved: Option<EmotePickerPreferences>,
+    /// Moderation tools dialog visibility.
+    mod_tools_open: bool,
+    /// Held AutoMod queue keyed by channel.
+    automod_queue: HashMap<ChannelId, Vec<AutoModQueueItem>>,
+    /// Pending unban requests keyed by channel.
+    unban_requests: HashMap<ChannelId, Vec<UnbanRequestItem>>,
+    /// Draft resolution text keyed by `channel::request_id`.
+    unban_resolution_drafts: HashMap<String, String>,
+    /// True while a background auth refresh is in-flight.
+    auth_refresh_inflight: bool,
+    /// Last time we attempted an auth refresh after a 401/AuthExpired event.
+    last_auth_refresh_attempt: Option<std::time::Instant>,
 }
 
 /// Apply the Crust colour palette to egui, reading the current dark/light
@@ -771,6 +840,7 @@ impl CrustApp {
             link_previews: HashMap::new(),
             emote_ram_bytes: 0,
             message_history: Vec::new(),
+            slash_usage_counts: HashMap::new(),
             sidebar_visible: true,
             channel_layout: ChannelLayout::default(),
             tab_style: TabVisualStyle::default(),
@@ -783,9 +853,16 @@ impl CrustApp {
             loading_screen: LoadingScreen::default(),
             stream_statuses: HashMap::new(),
             stream_status_fetched: HashMap::new(),
+            stream_status_fetch_inflight: HashSet::new(),
             last_stream_refresh_scan: std::time::Instant::now(),
+            last_active_stream_refresh: std::time::Instant::now(),
             live_map_cache: HashMap::new(),
+            stream_tracker: StreamStatusTracker::default(),
             event_toasts: Vec::new(),
+            event_toast_queue: VecDeque::new(),
+            last_event_toast_emit: None,
+            suppress_stream_toasts_until: std::time::Instant::now()
+                + STREAM_NOTIFICATION_STARTUP_GRACE,
             settings_open: false,
             settings_section: SettingsSection::default(),
             kick_beta_enabled: false,
@@ -798,11 +875,22 @@ impl CrustApp {
             collapse_long_message_lines: 8,
             animations_when_focused: true,
             show_timestamps: true,
+            show_timestamp_seconds: false,
+            use_24h_timestamps: true,
+            local_log_indexing_enabled: true,
             split_header_show_title: true,
             split_header_show_game: false,
             split_header_show_viewer_count: true,
             highlights: Vec::new(),
-            highlights_lower: Vec::new(),
+            highlight_rules: Vec::new(),
+            settings_highlight_rules: Vec::new(),
+            settings_highlight_rule_bufs: Vec::new(),
+            filter_records: Vec::new(),
+            settings_filter_records: Vec::new(),
+            settings_filter_record_bufs: Vec::new(),
+            mod_action_presets: Vec::new(),
+            settings_mod_action_presets: Vec::new(),
+            desktop_notifications_enabled: false,
             ignores: Vec::new(),
             ignores_set: HashSet::new(),
             auto_join_channels: Vec::new(),
@@ -814,6 +902,13 @@ impl CrustApp {
             split_panes: SplitPanes::default(),
             message_search: HashMap::new(),
             sorted_chatters: HashMap::new(),
+            emote_picker_prefs_last_saved: None,
+            mod_tools_open: false,
+            automod_queue: HashMap::new(),
+            unban_requests: HashMap::new(),
+            unban_resolution_drafts: HashMap::new(),
+            auth_refresh_inflight: false,
+            last_auth_refresh_attempt: None,
         }
     }
 
@@ -845,6 +940,399 @@ impl CrustApp {
             split_header_show_game: self.split_header_show_game,
             split_header_show_viewer_count: self.split_header_show_viewer_count,
         });
+    }
+
+    fn request_stream_status_refresh(&mut self, login: &str) {
+        let login = login.trim().to_ascii_lowercase();
+        if !is_valid_twitch_login(&login) {
+            return;
+        }
+        if self.stream_status_fetch_inflight.contains(&login) {
+            return;
+        }
+
+        self.stream_status_fetch_inflight.insert(login.clone());
+        self.send_cmd(AppCommand::FetchUserProfile { login });
+    }
+
+    fn request_user_attention(&self, ctx: &Context, attention: egui::UserAttentionType) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(attention));
+    }
+
+    fn truncate_notification_text(text: &str, max_chars: usize) -> String {
+        let mut flattened = text.trim().replace('\n', " ");
+        if flattened.chars().count() <= max_chars {
+            return flattened;
+        }
+
+        let keep = max_chars.saturating_sub(3);
+        let mut truncated = String::with_capacity(max_chars);
+        for (i, ch) in flattened.chars().enumerate() {
+            if i >= keep {
+                break;
+            }
+            truncated.push(ch);
+        }
+        truncated.push_str("...");
+        flattened.clear();
+        truncated
+    }
+
+    fn dispatch_desktop_notification(&self, title: &str, body: &str, with_sound: bool) {
+        #[cfg(target_os = "windows")]
+        {
+            if with_sound {
+                // Best-effort audible cue that does not depend on toast support.
+                Self::play_windows_notification_beep();
+            }
+
+            let mut shell_candidates: Vec<std::path::PathBuf> = Vec::new();
+            if let Some(windir) = std::env::var_os("WINDIR") {
+                let base = std::path::PathBuf::from(windir);
+                shell_candidates.push(
+                    base.join("System32")
+                        .join("WindowsPowerShell")
+                        .join("v1.0")
+                        .join("powershell.exe"),
+                );
+                shell_candidates.push(
+                    base.join("Sysnative")
+                        .join("WindowsPowerShell")
+                        .join("v1.0")
+                        .join("powershell.exe"),
+                );
+            }
+            shell_candidates.push(std::path::PathBuf::from("powershell.exe"));
+            shell_candidates.push(std::path::PathBuf::from("powershell"));
+            shell_candidates.push(std::path::PathBuf::from("pwsh.exe"));
+            shell_candidates.push(std::path::PathBuf::from("pwsh"));
+
+            let title = title.to_owned();
+            let body = body.to_owned();
+            let sound_flag = if with_sound {
+                "1".to_owned()
+            } else {
+                "0".to_owned()
+            };
+
+            std::thread::spawn(move || {
+                let script = r#"
+$ErrorActionPreference = 'Stop'
+$title = $env:CRUST_NOTIFY_TITLE
+$body = $env:CRUST_NOTIFY_BODY
+$withSound = $env:CRUST_NOTIFY_SOUND -eq '1'
+$shown = $false
+
+try {
+  [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
+  [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] > $null
+
+  $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+  $xml.LoadXml('<toast><visual><binding template="ToastGeneric"><text></text><text></text></binding></visual></toast>')
+
+  $textNodes = $xml.GetElementsByTagName('text')
+  $textNodes.Item(0).InnerText = $title
+  $textNodes.Item(1).InnerText = $body
+
+  $audio = $xml.CreateElement('audio')
+  if ($withSound) {
+    $audio.SetAttribute('src', 'ms-winsoundevent:Notification.Default')
+  } else {
+    $audio.SetAttribute('silent', 'true')
+  }
+  $xml.DocumentElement.AppendChild($audio) > $null
+
+  $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+    $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('PowerShell')
+    if ($notifier.Setting.ToString() -eq 'Enabled') {
+        $notifier.Show($toast)
+        $shown = $true
+    }
+} catch {}
+
+if (-not $shown) {
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        Add-Type -AssemblyName System.Drawing
+
+        $form = New-Object System.Windows.Forms.Form
+        $form.Text = $title
+        $form.StartPosition = 'Manual'
+        $form.FormBorderStyle = 'FixedToolWindow'
+        $form.ShowInTaskbar = $false
+        $form.TopMost = $true
+        $form.Width = 380
+        $form.Height = 120
+
+        $work = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+        $x = [Math]::Max(0, $work.Right - $form.Width - 16)
+        $y = [Math]::Max(0, $work.Bottom - $form.Height - 16)
+        $form.Location = New-Object System.Drawing.Point($x, $y)
+
+        $label = New-Object System.Windows.Forms.Label
+        $label.AutoSize = $false
+        $label.Left = 12
+        $label.Top = 12
+        $label.Width = 352
+        $label.Height = 64
+        $label.Text = $body
+        $label.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+        $form.Controls.Add($label)
+
+        $timer = New-Object System.Windows.Forms.Timer
+        $timer.Interval = 4200
+        $timer.add_Tick({
+            $timer.Stop()
+            $form.Close()
+        })
+        $form.add_Shown({ $timer.Start() })
+
+        [void]$form.ShowDialog()
+        $shown = $true
+    } catch {}
+}
+
+if (-not $shown -and $withSound) {
+  try { [System.Media.SystemSounds]::Asterisk.Play() } catch {}
+}
+
+if ($shown) {
+  exit 0
+}
+
+exit 1
+
+"#;
+
+                let mut delivered = false;
+                let mut last_error: Option<String> = None;
+                for shell in shell_candidates {
+                    let mut cmd = std::process::Command::new(&shell);
+                    #[cfg(target_os = "windows")]
+                    {
+                        use std::os::windows::process::CommandExt as _;
+                        const DETACHED_PROCESS: u32 = 0x0000_0008;
+                        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                        cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
+                    }
+                    cmd.arg("-NoProfile")
+                        .arg("-STA")
+                        .arg("-NonInteractive")
+                        .arg("-ExecutionPolicy")
+                        .arg("Bypass")
+                        .arg("-WindowStyle")
+                        .arg("Hidden")
+                        .arg("-Command")
+                        .arg(script)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .env("CRUST_NOTIFY_TITLE", &title)
+                        .env("CRUST_NOTIFY_BODY", &body)
+                        .env("CRUST_NOTIFY_SOUND", &sound_flag);
+
+                    match cmd.status() {
+                        Ok(status) if status.success() => {
+                            delivered = true;
+                            break;
+                        }
+                        Ok(status) => {
+                            last_error = Some(format!("{} (exit code {:?})", shell.display(), status.code()));
+                        }
+                        Err(error) => {
+                            last_error = Some(format!("{} ({error})", shell.display()));
+                        }
+                    }
+                }
+
+                if !delivered {
+                    if let Some(error) = last_error {
+                        warn!("Failed to dispatch desktop notification popup: {error}");
+                    } else {
+                        warn!("Failed to dispatch desktop notification popup: no shell candidates available");
+                    }
+                }
+            });
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (title, body, with_sound);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn play_windows_notification_beep() {
+        // SAFETY: These Win32 calls use documented constants/pointers and do
+        // not transfer ownership.
+        unsafe {
+            #[link(name = "winmm")]
+            unsafe extern "system" {
+                fn PlaySoundW(
+                    psz_sound: *const u16,
+                    hmod: *mut core::ffi::c_void,
+                    fdw_sound: u32,
+                ) -> i32;
+                fn MessageBeep(u_type: u32) -> i32;
+                fn Beep(freq: u32, duration: u32) -> i32;
+            }
+
+            const SND_ASYNC: u32 = 0x0000_0001;
+            const SND_NODEFAULT: u32 = 0x0000_0002;
+            const SND_ALIAS: u32 = 0x0001_0000;
+            const SND_SYSTEM: u32 = 0x0020_0000;
+            let flags = SND_ALIAS | SND_ASYNC | SND_SYSTEM | SND_NODEFAULT;
+
+            for alias in ["SystemNotification", "SystemAsterisk", "SystemExclamation"] {
+                let wide: Vec<u16> = alias.encode_utf16().chain(std::iter::once(0)).collect();
+                if PlaySoundW(wide.as_ptr(), std::ptr::null_mut(), flags) != 0 {
+                    return;
+                }
+            }
+
+            // Fallback chain if alias playback is unavailable.
+            let _ = MessageBeep(0x0000_0040);
+            let _ = Beep(880, 120);
+        }
+    }
+
+    fn push_event_toast(&mut self, text: String, hue: Color32, confetti: bool) {
+        self.enqueue_event_toast(EventToast {
+            text,
+            hue,
+            confetti,
+            born: std::time::Instant::now(),
+        });
+    }
+
+    fn enqueue_event_toast(&mut self, toast: EventToast) {
+        if self.event_toast_queue.len() >= EVENT_TOAST_QUEUE_MAX {
+            self.event_toast_queue.pop_front();
+        }
+        self.event_toast_queue.push_back(toast);
+        self.flush_event_toast_queue();
+    }
+
+    fn flush_event_toast_queue(&mut self) {
+        let now = std::time::Instant::now();
+        let can_emit = self
+            .last_event_toast_emit
+            .map(|last| now.duration_since(last) >= EVENT_TOAST_STAGGER)
+            .unwrap_or(true);
+
+        if !can_emit {
+            return;
+        }
+
+        let Some(mut toast) = self.event_toast_queue.pop_front() else {
+            return;
+        };
+
+        toast.born = now;
+        if self.event_toasts.len() >= EVENT_TOAST_MAX_ACTIVE {
+            self.event_toasts.remove(0);
+        }
+        self.event_toasts.push(toast);
+        self.last_event_toast_emit = Some(now);
+    }
+
+    fn handle_stream_status_transition(
+        &mut self,
+        ctx: &Context,
+        login: &str,
+        is_live: bool,
+        title: Option<String>,
+        game: Option<String>,
+        viewers: Option<u64>,
+    ) {
+        use crust_core::notifications::Platform;
+
+        let viewer_count = viewers.map(|v| v.min(u32::MAX as u64) as u32);
+
+        if !self.stream_tracker.is_watching(login, Platform::Twitch) {
+            self.stream_tracker
+                .watch_channel(login.to_owned(), Platform::Twitch, None);
+        }
+
+        let Some(update) = self.stream_tracker.update_stream_status(
+            login,
+            Platform::Twitch,
+            is_live,
+            title,
+            game,
+            viewer_count,
+        ) else {
+            return;
+        };
+
+        let suppress_stream_toasts = self.loading_screen.is_active()
+            || std::time::Instant::now() < self.suppress_stream_toasts_until;
+
+        match update {
+            StreamStatusUpdate::Live(payload) => {
+                if suppress_stream_toasts {
+                    return;
+                }
+                let mut text = format!("{} is live", payload.display_name);
+                if let Some(stream_title) = payload.title.as_deref().filter(|s| !s.is_empty()) {
+                    text = format!("{} is live: {}", payload.display_name, stream_title);
+                }
+                self.push_event_toast(text, t::raid_cyan(), false);
+                if self.desktop_notifications_enabled {
+                    self.request_user_attention(ctx, egui::UserAttentionType::Informational);
+                }
+            }
+            StreamStatusUpdate::Offline(payload) => {
+                if suppress_stream_toasts {
+                    return;
+                }
+                self.push_event_toast(format!("{} went offline", payload.channel_name), t::text_muted(), false);
+            }
+        }
+    }
+
+    fn active_moderation_channel(&self) -> Option<ChannelId> {
+        let active = self.state.active_channel.as_ref()?;
+        if !active.is_twitch() {
+            return None;
+        }
+        let ch = self.state.channels.get(active)?;
+        let is_broadcaster = self
+            .state
+            .auth
+            .username
+            .as_deref()
+            .map(|u| u.eq_ignore_ascii_case(active.display_name()))
+            .unwrap_or(false);
+        if ch.is_mod || is_broadcaster {
+            Some(active.clone())
+        } else {
+            None
+        }
+    }
+
+    fn unban_draft_key(channel: &ChannelId, request_id: &str) -> String {
+        format!("{}::{request_id}", channel.as_str())
+    }
+
+    fn normalize_unban_requests(requests: &mut Vec<UnbanRequestItem>) {
+        requests.retain(|request| {
+            request
+                .status
+                .as_deref()
+                .map(|status| status.eq_ignore_ascii_case("pending"))
+                .unwrap_or(true)
+        });
+
+        requests.sort_by(|a, b| {
+            b.created_at
+                .as_deref()
+                .cmp(&a.created_at.as_deref())
+                .then_with(|| a.request_id.cmp(&b.request_id))
+        });
+
+        let mut seen_ids = HashSet::new();
+        requests.retain(|request| seen_ids.insert(request.request_id.clone()));
     }
 
     fn drain_events(&mut self, ctx: &Context) -> u32 {
@@ -927,16 +1415,33 @@ impl CrustApp {
                 // Kick off an immediate stream-status fetch for the new channel (Twitch only).
                 if channel.is_twitch() {
                     let login = channel.display_name().to_ascii_lowercase();
-                    if is_valid_twitch_login(&login) {
-                        self.stream_status_fetched
-                            .insert(login.clone(), std::time::Instant::now());
-                        self.send_cmd(AppCommand::FetchUserProfile { login });
-                    }
+                    self.stream_tracker.watch_channel(
+                        login.clone(),
+                        crust_core::notifications::Platform::Twitch,
+                        None,
+                    );
+                    self.request_stream_status_refresh(&login);
                 }
             }
             AppEvent::ChannelParted { channel } => {
                 self.state.leave_channel(&channel);
                 self.sorted_chatters.remove(&channel);
+                self.automod_queue.remove(&channel);
+                self.unban_requests.remove(&channel);
+                let prefix = format!("{}::", channel.as_str());
+                self.unban_resolution_drafts
+                    .retain(|k, _| !k.starts_with(&prefix));
+                if channel.is_twitch() {
+                    let login = channel.display_name().to_ascii_lowercase();
+                    self.stream_tracker.unwatch_channel(
+                        &login,
+                        crust_core::notifications::Platform::Twitch,
+                    );
+                    self.stream_statuses.remove(&login);
+                    self.live_map_cache.remove(&login);
+                    self.stream_status_fetched.remove(&login);
+                    self.stream_status_fetch_inflight.remove(&login);
+                }
                 if self
                     .pending_reply
                     .as_ref()
@@ -954,6 +1459,12 @@ impl CrustApp {
                 if let Some(cached) = self.sorted_chatters.remove(&old_channel) {
                     self.sorted_chatters.insert(new_channel.clone(), cached);
                 }
+                if let Some(queue) = self.automod_queue.remove(&old_channel) {
+                    self.automod_queue.insert(new_channel.clone(), queue);
+                }
+                if let Some(requests) = self.unban_requests.remove(&old_channel) {
+                    self.unban_requests.insert(new_channel.clone(), requests);
+                }
                 if let Some(reply) = self.pending_reply.as_mut() {
                     if reply.channel == old_channel {
                         reply.channel = new_channel;
@@ -965,7 +1476,10 @@ impl CrustApp {
                     ch.topic = Some(topic);
                 }
             }
-            AppEvent::MessageReceived { channel, message } => {
+            AppEvent::MessageReceived {
+                channel,
+                mut message,
+            } => {
                 if channel.is_irc() && !self.state.channels.contains_key(&channel) {
                     // IRC can deliver messages on targets we haven't opened yet
                     // (e.g. direct messages or status-targeted channel forms).
@@ -973,6 +1487,44 @@ impl CrustApp {
                     self.state.join_channel(channel.clone());
                     self.sorted_chatters.entry(channel.clone()).or_default();
                 }
+
+                // Channel points redemption update events should patch the
+                // original redemption row in place instead of adding a second
+                // line for the same redemption lifecycle.
+                let terminal_redemption_update = match &message.msg_kind {
+                    MsgKind::ChannelPointsReward {
+                        redemption_id,
+                        status,
+                        ..
+                    } => {
+                        let rid = redemption_id
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty());
+                        let st = status
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty());
+                        let is_terminal = st
+                            .map(|s| {
+                                s.eq_ignore_ascii_case("fulfilled")
+                                    || s.eq_ignore_ascii_case("canceled")
+                                    || s.eq_ignore_ascii_case("cancelled")
+                            })
+                            .unwrap_or(false);
+                        rid.zip(st).filter(|_| is_terminal)
+                    }
+                    _ => None,
+                };
+
+                if let Some((rid, st)) = terminal_redemption_update {
+                    if let Some(ch) = self.state.channels.get_mut(&channel) {
+                        if ch.update_redemption_status(rid, st) {
+                            return;
+                        }
+                    }
+                }
+
                 if let Some(server_id) = message.server_id.as_deref() {
                     let duplicate = self
                         .state
@@ -990,83 +1542,97 @@ impl CrustApp {
                 }
                 let is_active = self.state.active_channel.as_ref() == Some(&channel);
 
+                let highlight_match = crust_core::highlight::first_match_context(
+                    &self.highlight_rules,
+                    &message.raw_text,
+                    &message.sender.login,
+                    &message.sender.display_name,
+                    channel.display_name(),
+                    message.flags.is_mention,
+                );
+                if highlight_match.is_some() {
+                    message.flags.is_highlighted = true;
+                }
+                let (highlight_mentions, _highlight_alert, highlight_sound) = highlight_match
+                    .map(|(_, show_in_mentions, has_alert, has_sound)| {
+                        (show_in_mentions, has_alert, has_sound)
+                    })
+                    .unwrap_or((false, false, false));
+
                 // Generate a short-lived event toast for high-visibility events.
-                if self.event_toasts.len() < 5 {
-                    // Only pop banners for the channel the user is watching.
-                    let maybe_toast: Option<EventToast> = if !is_active {
-                        None
-                    } else {
-                        match &message.msg_kind {
-                            MsgKind::Sub {
-                                display_name,
-                                months,
-                                is_gift,
-                                plan,
-                                ..
-                            } => {
-                                let gifted_to_me = *is_gift && message.flags.is_mention;
-                                let text = if gifted_to_me {
-                                    format!("🎉🎊  You received a gifted {} sub!", plan)
-                                } else if *is_gift {
-                                    format!("🎁  {} received a gifted {} sub!", display_name, plan)
-                                } else if *months <= 1 {
-                                    format!("⭐  {} just subscribed with {}!", display_name, plan)
+                // Only pop banners for the channel the user is watching.
+                let maybe_toast: Option<EventToast> = if !is_active {
+                    None
+                } else {
+                    match &message.msg_kind {
+                        MsgKind::Sub {
+                            display_name,
+                            months,
+                            is_gift,
+                            plan,
+                            ..
+                        } => {
+                            let gifted_to_me = *is_gift && message.flags.is_mention;
+                            let text = if gifted_to_me {
+                                format!("🎉🎊  You received a gifted {} sub!", plan)
+                            } else if *is_gift {
+                                format!("🎁  {} received a gifted {} sub!", display_name, plan)
+                            } else if *months <= 1 {
+                                format!("⭐  {} just subscribed with {}!", display_name, plan)
+                            } else {
+                                format!("⭐  {} resubscribed x{}!", display_name, months)
+                            };
+                            Some(EventToast {
+                                text,
+                                hue: if gifted_to_me {
+                                    t::raid_cyan()
                                 } else {
-                                    format!("⭐  {} resubscribed x{}!", display_name, months)
-                                };
-                                Some(EventToast {
-                                    text,
-                                    hue: if gifted_to_me {
-                                        t::raid_cyan()
-                                    } else {
-                                        t::gold()
-                                    },
-                                    confetti: gifted_to_me,
-                                    born: std::time::Instant::now(),
-                                })
-                            }
-                            MsgKind::Raid {
-                                display_name,
-                                viewer_count,
-                            } => Some(EventToast {
-                                text: format!(
-                                    "🚀  {} is raiding with {} viewers!",
-                                    display_name, viewer_count
-                                ),
-                                hue: t::raid_cyan(),
-                                confetti: false,
+                                    t::gold()
+                                },
+                                confetti: gifted_to_me,
                                 born: std::time::Instant::now(),
-                            }),
-                            MsgKind::Bits { amount } if *amount >= 100 => Some(EventToast {
-                                text: format!(
-                                    "💎  {} cheered {} bits!",
-                                    message.sender.display_name, amount
-                                ),
-                                hue: t::bits_orange(),
-                                confetti: false,
-                                born: std::time::Instant::now(),
-                            }),
-                            _ if message.flags.is_pinned => Some(EventToast {
-                                text: format!(
-                                    "📌  {} sent a pinned message",
-                                    message.sender.display_name
-                                ),
-                                hue: t::gold(),
-                                confetti: false,
-                                born: std::time::Instant::now(),
-                            }),
-                            _ => None,
+                            })
                         }
-                    };
-                    if let Some(toast) = maybe_toast {
-                        if self.event_toasts.len() >= 5 {
-                            self.event_toasts.remove(0);
-                        }
-                        self.event_toasts.push(toast);
+                        MsgKind::Raid {
+                            display_name,
+                            viewer_count,
+                        } => Some(EventToast {
+                            text: format!(
+                                "🚀  {} is raiding with {} viewers!",
+                                display_name, viewer_count
+                            ),
+                            hue: t::raid_cyan(),
+                            confetti: false,
+                            born: std::time::Instant::now(),
+                        }),
+                        MsgKind::Bits { amount } if *amount >= 100 => Some(EventToast {
+                            text: format!(
+                                "💎  {} cheered {} bits!",
+                                message.sender.display_name, amount
+                            ),
+                            hue: t::bits_orange(),
+                            confetti: false,
+                            born: std::time::Instant::now(),
+                        }),
+                        _ if message.flags.is_pinned => Some(EventToast {
+                            text: format!(
+                                "📌  {} sent a pinned message",
+                                message.sender.display_name
+                            ),
+                            hue: t::gold(),
+                            confetti: false,
+                            born: std::time::Instant::now(),
+                        }),
+                        _ => None,
                     }
+                };
+                if let Some(toast) = maybe_toast {
+                    self.enqueue_event_toast(toast);
                 }
 
                 let mut rebuilt_chatters: Option<Vec<String>> = None;
+                let mut request_attention: Option<egui::UserAttentionType> = None;
+                let mut desktop_notification: Option<(String, String, bool)> = None;
                 if let Some(ch) = self.state.channels.get_mut(&channel) {
                     // Track the sender for @username autocomplete.
                     // Only real user messages (Chat, Bits, Sub with text) are
@@ -1101,12 +1667,55 @@ impl CrustApp {
                                 || message.flags.is_highlighted
                                 || message.flags.is_first_msg
                                 || message.flags.is_pinned
+                                || highlight_mentions
                             {
                                 ch.unread_mentions += 1;
                             }
                         }
+
+                        if self.desktop_notifications_enabled
+                            && !message.flags.is_history
+                            && (message.flags.is_mention || highlight_mentions || highlight_sound)
+                        {
+                            let sender = if message.sender.display_name.trim().is_empty() {
+                                message.sender.login.as_str()
+                            } else {
+                                message.sender.display_name.trim()
+                            };
+                            let context = if message.flags.is_mention {
+                                "Mention"
+                            } else {
+                                "Highlight"
+                            };
+                            let title = Self::truncate_notification_text(
+                                &format!("{} - {context}", channel.display_name()),
+                                80,
+                            );
+                            let body = if message.raw_text.trim().is_empty() {
+                                format!("{sender} sent a highlighted message")
+                            } else {
+                                format!("{sender}: {}", message.raw_text.trim())
+                            };
+                            let body = Self::truncate_notification_text(&body, 220);
+                            let notification_sound =
+                                highlight_sound || message.flags.is_mention || highlight_mentions;
+                            desktop_notification = Some((title, body, notification_sound));
+
+                            request_attention = Some(if highlight_sound {
+                                egui::UserAttentionType::Critical
+                            } else {
+                                egui::UserAttentionType::Informational
+                            });
+                        }
+
                         ch.push_message(message);
                     }
+                }
+                if let Some(attention) = request_attention {
+                    self.request_user_attention(ctx, attention);
+                }
+                if let Some((title, body, with_sound)) = desktop_notification {
+                    self.dispatch_desktop_notification(&title, &body, with_sound);
                 }
                 if let Some(cached) = rebuilt_chatters {
                     self.sorted_chatters.insert(channel, cached);
@@ -1195,6 +1804,7 @@ impl CrustApp {
                 }
             }
             AppEvent::Authenticated { username, user_id } => {
+                self.auth_refresh_inflight = false;
                 // Clear the previous account's avatar so it doesn't flash
                 // while the new one is fetched.
                 self.state.auth.avatar_url = None;
@@ -1203,6 +1813,7 @@ impl CrustApp {
                 self.state.auth.user_id = Some(user_id);
             }
             AppEvent::LoggedOut => {
+                self.auth_refresh_inflight = false;
                 self.state.auth.logged_in = false;
                 self.state.auth.username = None;
                 self.state.auth.user_id = None;
@@ -1258,8 +1869,18 @@ impl CrustApp {
                 );
                 // Keep the cheap live-map cache in sync.
                 self.live_map_cache.insert(login.clone(), profile.is_live);
+                self.stream_status_fetch_inflight.remove(&login);
                 self.stream_status_fetched
-                    .insert(login, std::time::Instant::now());
+                    .insert(login.clone(), std::time::Instant::now());
+
+                self.handle_stream_status_transition(
+                    ctx,
+                    &login,
+                    profile.is_live,
+                    profile.stream_title.clone(),
+                    profile.stream_game.clone(),
+                    profile.stream_viewers,
+                );
                 // This event is also used for channel live-status refresh.
                 // Only drive the popup when it explicitly requested this login.
                 if self.user_profile_popup.accepts_profile(&profile.login) {
@@ -1288,6 +1909,65 @@ impl CrustApp {
                         })
                         .unwrap_or_default();
                     self.user_profile_popup.set_logs(logs);
+
+                    let mod_logs: Vec<_> = ch
+                        .as_ref()
+                        .and_then(|c| self.state.channels.get(c))
+                        .map(|s| {
+                            s.messages
+                                .iter()
+                                .rev()
+                                .filter(|m| {
+                                    matches!(
+                                        &m.msg_kind,
+                                        crust_core::model::MsgKind::Timeout { login, .. }
+                                            if login.eq_ignore_ascii_case(&profile.login)
+                                    ) || matches!(
+                                        &m.msg_kind,
+                                        crust_core::model::MsgKind::Ban { login }
+                                            if login.eq_ignore_ascii_case(&profile.login)
+                                    )
+                                })
+                                .take(120)
+                                .cloned()
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    self.user_profile_popup.set_mod_logs(mod_logs);
+
+                    // Build shared-channel context from all locally-known tabs.
+                    let mut shared_channels: Vec<String> = self
+                        .state
+                        .channels
+                        .iter()
+                        .filter_map(|(cid, state)| {
+                            let seen_in_chatters = state
+                                .chatters
+                                .iter()
+                                .any(|name| name.eq_ignore_ascii_case(&profile.login));
+                            let seen_in_messages = state
+                                .messages
+                                .iter()
+                                .rev()
+                                .take(400)
+                                .any(|m| m.sender.login.eq_ignore_ascii_case(&profile.login));
+                            if !(seen_in_chatters || seen_in_messages) {
+                                return None;
+                            }
+                            let label = if cid.is_kick() {
+                                format!("kick:{}", cid.display_name())
+                            } else if cid.is_irc() {
+                                format!("irc:{}", cid.display_name())
+                            } else {
+                                format!("#{}", cid.display_name())
+                            };
+                            Some(label)
+                        })
+                        .collect();
+                    shared_channels.sort_by_key(|name| name.to_ascii_lowercase());
+                    shared_channels.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+                    self.user_profile_popup.set_shared_channels(shared_channels);
+
                     // If we have a 7TV animated avatar for this user, ensure
                     // its bytes are prefetched so it renders immediately.
                     if let Some(stv_url) = self.stv_avatars.get(&profile.id) {
@@ -1300,7 +1980,44 @@ impl CrustApp {
                     self.user_profile_popup.set_profile(profile);
                 }
             }
+            AppEvent::StreamStatusUpdated { login, is_live } => {
+                let login = login.to_ascii_lowercase();
+                let (title, game, viewers) = {
+                    let entry = self
+                        .stream_statuses
+                        .entry(login.clone())
+                        .or_insert(StreamStatusInfo {
+                            is_live,
+                            title: None,
+                            game: None,
+                            viewers: None,
+                        });
+                    entry.is_live = is_live;
+                    if !is_live {
+                        entry.viewers = None;
+                    }
+                    (entry.title.clone(), entry.game.clone(), entry.viewers)
+                };
+
+                self.live_map_cache.insert(login.clone(), is_live);
+                self.stream_status_fetch_inflight.remove(&login);
+                self.stream_status_fetched
+                    .insert(login.clone(), std::time::Instant::now());
+
+                self.handle_stream_status_transition(
+                    ctx,
+                    &login,
+                    is_live,
+                    title,
+                    game,
+                    viewers,
+                );
+            }
             AppEvent::UserProfileUnavailable { login } => {
+                let login_lc = login.to_ascii_lowercase();
+                self.stream_status_fetch_inflight.remove(&login_lc);
+                self.stream_status_fetched
+                    .insert(login_lc.clone(), std::time::Instant::now());
                 if self.user_profile_popup.accepts_profile(&login) {
                     self.user_profile_popup.set_unavailable(&login);
                 }
@@ -1394,19 +2111,21 @@ impl CrustApp {
             }
             AppEvent::GeneralSettingsUpdated {
                 show_timestamps,
+                show_timestamp_seconds,
+                use_24h_timestamps,
+                local_log_indexing_enabled,
                 auto_join,
                 highlights,
                 ignores,
+                desktop_notifications_enabled,
             } => {
                 self.show_timestamps = show_timestamps;
+                self.show_timestamp_seconds = show_timestamp_seconds;
+                self.use_24h_timestamps = use_24h_timestamps;
+                self.local_log_indexing_enabled = local_log_indexing_enabled;
+                self.desktop_notifications_enabled = desktop_notifications_enabled;
                 self.auto_join_channels = auto_join;
                 self.highlights = highlights;
-                self.highlights_lower = self
-                    .highlights
-                    .iter()
-                    .map(|s| s.to_ascii_lowercase())
-                    .filter(|s| !s.is_empty())
-                    .collect();
                 self.ignores = ignores;
                 self.ignores_set = self
                     .ignores
@@ -1416,6 +2135,22 @@ impl CrustApp {
                 self.auto_join_buf = self.auto_join_channels.join("\n");
                 self.highlights_buf = self.highlights.join("\n");
                 self.ignores_buf = self.ignores.join("\n");
+            }
+            AppEvent::SlashUsageCountsUpdated { usage_counts } => {
+                self.slash_usage_counts = usage_counts.into_iter().collect();
+            }
+            AppEvent::EmotePickerPreferencesUpdated {
+                favorites,
+                recent,
+                provider_boost,
+            } => {
+                let prefs = EmotePickerPreferences {
+                    favorites,
+                    recent,
+                    provider_boost,
+                };
+                self.emote_picker.apply_preferences(&prefs);
+                self.emote_picker_prefs_last_saved = Some(prefs);
             }
             AppEvent::AppearanceSettingsUpdated {
                 channel_layout,
@@ -1439,6 +2174,61 @@ impl CrustApp {
                 self.split_header_show_title = split_header_show_title;
                 self.split_header_show_game = split_header_show_game;
                 self.split_header_show_viewer_count = split_header_show_viewer_count;
+            }
+            AppEvent::HighlightRulesUpdated { rules } => {
+                // Rebuild the compiled rule set used by message rendering.
+                self.highlight_rules = crust_core::highlight::compile_rules(&rules);
+                // Keep the settings page state in sync so re-opening the
+                // dialog shows the current rules without lag.
+                self.settings_highlight_rules = rules.clone();
+                self.settings_highlight_rule_bufs = rules
+                    .iter()
+                    .map(|r| r.pattern.clone())
+                    .collect();
+            }
+            AppEvent::FilterRecordsUpdated { records } => {
+                self.filter_records = crust_core::model::filters::compile_filters(&records);
+                self.settings_filter_records = records.clone();
+                self.settings_filter_record_bufs = records
+                    .iter()
+                    .map(|r| r.pattern.clone())
+                    .collect();
+            }
+            AppEvent::ModActionPresetsUpdated { presets } => {
+                self.mod_action_presets = presets.clone();
+                self.settings_mod_action_presets = presets;
+            }
+            AppEvent::AuthExpired => {
+                warn!("Auth expired — checking refresh path");
+                let now = std::time::Instant::now();
+                let can_retry = self
+                    .last_auth_refresh_attempt
+                    .map(|last| now.duration_since(last) >= AUTH_REFRESH_RETRY_INTERVAL)
+                    .unwrap_or(true);
+
+                if !self.auth_refresh_inflight && can_retry {
+                    self.auth_refresh_inflight = true;
+                    self.last_auth_refresh_attempt = Some(now);
+                    self.send_cmd(AppCommand::RefreshAuth);
+                    self.send_cmd(AppCommand::InjectLocalMessage {
+                        channel: self
+                            .state
+                            .active_channel
+                            .clone()
+                            .unwrap_or_else(|| ChannelId::new("system")),
+                        text: "\u{26a0}\u{fe0f} Twitch auth check failed. Trying token refresh...".into(),
+                    });
+                } else {
+                    self.auth_refresh_inflight = false;
+                    self.send_cmd(AppCommand::InjectLocalMessage {
+                        channel: self
+                            .state
+                            .active_channel
+                            .clone()
+                            .unwrap_or_else(|| ChannelId::new("system")),
+                        text: "\u{26a0}\u{fe0f} Your Twitch token has expired. Please re-authenticate in Settings \u{2192} Account.".into(),
+                    });
+                }
             }
             AppEvent::ChannelEmotesLoaded { .. } => {
                 // Re-tokenization is now handled by EmoteCatalogUpdated which
@@ -1472,6 +2262,87 @@ impl CrustApp {
                         ch.room_state.r9k = v;
                     }
                 }
+            }
+            AppEvent::AutoModQueueAppend { channel, item } => {
+                let queue = self.automod_queue.entry(channel).or_default();
+                if let Some(existing) = queue
+                    .iter_mut()
+                    .find(|existing| existing.message_id == item.message_id)
+                {
+                    *existing = item;
+                } else {
+                    queue.push(item);
+                }
+            }
+            AppEvent::AutoModQueueRemove {
+                channel,
+                message_id,
+                action,
+            } => {
+                if let Some(queue) = self.automod_queue.get_mut(&channel) {
+                    queue.retain(|item| item.message_id != message_id);
+                }
+                if let Some(action) = action {
+                    self.send_cmd(AppCommand::InjectLocalMessage {
+                        channel,
+                        text: format!("[AutoMod] Message {message_id} resolved: {action}"),
+                    });
+                }
+            }
+            AppEvent::UnbanRequestsLoaded { channel, requests } => {
+                let mut requests = requests;
+                Self::normalize_unban_requests(&mut requests);
+                let keep_ids: HashSet<String> =
+                    requests.iter().map(|item| item.request_id.clone()).collect();
+                let prefix = format!("{}::", channel.as_str());
+                self.unban_resolution_drafts.retain(|k, _| {
+                    if !k.starts_with(&prefix) {
+                        return true;
+                    }
+                    let request_id = &k[prefix.len()..];
+                    keep_ids.contains(request_id)
+                });
+                self.unban_requests.insert(channel, requests);
+            }
+            AppEvent::UnbanRequestsFailed { channel, error } => {
+                self.send_cmd(AppCommand::InjectLocalMessage {
+                    channel,
+                    text: format!("[Unban Requests] {error}"),
+                });
+            }
+            AppEvent::UnbanRequestUpsert { channel, request } => {
+                let requests = self.unban_requests.entry(channel).or_default();
+                if let Some(existing) = requests
+                    .iter_mut()
+                    .find(|existing| existing.request_id == request.request_id)
+                {
+                    *existing = request;
+                } else {
+                    requests.push(request);
+                }
+                Self::normalize_unban_requests(requests);
+            }
+            AppEvent::UnbanRequestResolved {
+                channel,
+                request_id,
+                status: _,
+            } => {
+                if let Some(requests) = self.unban_requests.get_mut(&channel) {
+                    requests.retain(|request| request.request_id != request_id);
+                }
+                self.unban_resolution_drafts
+                    .remove(&Self::unban_draft_key(&channel, &request_id));
+            }
+            AppEvent::OpenModerationTools { channel } => {
+                if let Some(channel) = channel {
+                    if self.state.channels.contains_key(&channel) {
+                        self.activate_channel(channel.clone());
+                    }
+                    if channel.is_twitch() {
+                        self.send_cmd(AppCommand::FetchUnbanRequests { channel });
+                    }
+                }
+                self.mod_tools_open = true;
             }
             AppEvent::SenderCosmeticsUpdated {
                 user_id,
@@ -1558,6 +2429,14 @@ impl CrustApp {
 
     fn message_search_mut(&mut self, channel: &ChannelId) -> &mut MessageSearchState {
         self.message_search.entry(channel.clone()).or_default()
+    }
+
+    fn request_older_local_history(&self, channel: &ChannelId, oldest_loaded_ts_ms: i64) {
+        self.send_cmd(AppCommand::LoadOlderLocalHistory {
+            channel: channel.clone(),
+            before_ts_ms: oldest_loaded_ts_ms,
+            limit: LOCAL_HISTORY_SEARCH_PAGE,
+        });
     }
 
     fn static_avatar_texture_for(
@@ -1775,12 +2654,167 @@ impl CrustApp {
             }
         }
     }
+
+    fn record_slash_usage_from_text(&mut self, text: &str) {
+        let trimmed = text.trim_start();
+        if !trimmed.starts_with('/') {
+            return;
+        }
+        let without_slash = &trimmed[1..];
+        let Some(token) = without_slash.split_whitespace().next() else {
+            return;
+        };
+        let cmd = token.trim().to_ascii_lowercase();
+        if cmd.is_empty() {
+            return;
+        }
+        let entry = self.slash_usage_counts.entry(cmd).or_insert(0);
+        *entry = entry.saturating_add(1);
+        self.send_cmd(AppCommand::SetSlashUsageCounts {
+            usage_counts: self
+                .slash_usage_counts
+                .iter()
+                .map(|(name, count)| (name.clone(), *count))
+                .collect(),
+        });
+    }
+
+    fn activate_channel(&mut self, channel: ChannelId) {
+        if let Some(state) = self.state.channels.get_mut(&channel) {
+            state.mark_read();
+        }
+        if !self.split_panes.panes.is_empty() {
+            let focused = self.split_panes.focused;
+            if let Some(pane) = self.split_panes.panes.get_mut(focused) {
+                pane.channel = channel.clone();
+                pane.input_buf.clear();
+            }
+        }
+        self.state.active_channel = Some(channel);
+    }
+
+    fn next_channel_target(&self, reverse: bool) -> Option<ChannelId> {
+        let len = self.state.channel_order.len();
+        if len == 0 {
+            return None;
+        }
+
+        let current_idx = self
+            .state
+            .active_channel
+            .as_ref()
+            .and_then(|active| self.state.channel_order.iter().position(|ch| ch == active))
+            .unwrap_or(0);
+
+        let find_by = |predicate: &dyn Fn(&ChannelId) -> bool| -> Option<ChannelId> {
+            for step in 1..=len {
+                let idx = if reverse {
+                    (current_idx + len - (step % len)) % len
+                } else {
+                    (current_idx + step) % len
+                };
+                let ch = &self.state.channel_order[idx];
+                if predicate(ch) {
+                    return Some(ch.clone());
+                }
+            }
+            None
+        };
+
+        find_by(&|ch| {
+            self.state
+                .channels
+                .get(ch)
+                .map(|s| s.unread_mentions > 0)
+                .unwrap_or(false)
+        })
+        .or_else(|| {
+            find_by(&|ch| {
+                self.state
+                    .channels
+                    .get(ch)
+                    .map(|s| s.unread_count > 0)
+                    .unwrap_or(false)
+            })
+        })
+        .or_else(|| {
+            let idx = if reverse {
+                (current_idx + len - 1) % len
+            } else {
+                (current_idx + 1) % len
+            };
+            self.state.channel_order.get(idx).cloned()
+        })
+    }
+
+    fn handle_channel_shortcuts(&mut self, ctx: &Context) {
+        let (next, prev, direct_idx) = ctx.input_mut(|i| {
+            let ctrl_shift = egui::Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            };
+            let next = i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab)
+                || i.consume_key(egui::Modifiers::CTRL, egui::Key::PageDown)
+                || i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowRight);
+            let prev = i.consume_key(ctrl_shift, egui::Key::Tab)
+                || i.consume_key(egui::Modifiers::CTRL, egui::Key::PageUp)
+                || i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowLeft);
+            let direct_idx = [
+                egui::Key::Num1,
+                egui::Key::Num2,
+                egui::Key::Num3,
+                egui::Key::Num4,
+                egui::Key::Num5,
+                egui::Key::Num6,
+                egui::Key::Num7,
+                egui::Key::Num8,
+                egui::Key::Num9,
+            ]
+            .iter()
+            .position(|key| i.consume_key(egui::Modifiers::CTRL, *key));
+            (next, prev, direct_idx)
+        });
+
+        if let Some(idx) = direct_idx {
+            if let Some(target) = self.state.channel_order.get(idx).cloned() {
+                self.activate_channel(target);
+            }
+            return;
+        }
+
+        let reverse = if next {
+            Some(false)
+        } else if prev {
+            Some(true)
+        } else {
+            None
+        };
+
+        let Some(reverse) = reverse else {
+            return;
+        };
+
+        if let Some(target) = self.next_channel_target(reverse) {
+            self.activate_channel(target);
+        }
+    }
 }
 
 // eframe::App implementation
 
 impl eframe::App for CrustApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        if self.auth_refresh_inflight
+            && self
+                .last_auth_refresh_attempt
+                .map(|t| t.elapsed() >= AUTH_REFRESH_INFLIGHT_TIMEOUT)
+                .unwrap_or(false)
+        {
+            self.auth_refresh_inflight = false;
+        }
+
+        self.handle_channel_shortcuts(ctx);
         self.handle_search_shortcuts(ctx);
 
         let events = self.drain_events(ctx);
@@ -1834,12 +2868,33 @@ impl eframe::App for CrustApp {
             }
         }
 
-        // Periodic stream-status refresh: re-fetch every 60 s per channel.
+        // Periodic stream-status refresh: re-fetch the active Twitch channel
+        // at a higher cadence and all joined channels on a slower interval.
         // Throttle the stale-scan itself to avoid per-frame channel iteration.
-        const STREAM_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
+        if self.last_active_stream_refresh.elapsed() >= STREAM_REFRESH_ACTIVE_INTERVAL {
+            self.last_active_stream_refresh = std::time::Instant::now();
+            let active_login = self
+                .state
+                .active_channel
+                .as_ref()
+                .filter(|ch| ch.is_twitch())
+                .map(|ch| ch.display_name().to_ascii_lowercase());
+            if let Some(login) = active_login {
+                let is_stale = self
+                    .stream_status_fetched
+                    .get(&login)
+                    .map(|t| t.elapsed() >= STREAM_REFRESH_ACTIVE_INTERVAL)
+                    .unwrap_or(true);
+                if is_stale {
+                    self.request_stream_status_refresh(&login);
+                }
+            }
+        }
+
         if self.last_stream_refresh_scan.elapsed() >= STREAM_REFRESH_SCAN_INTERVAL {
             self.last_stream_refresh_scan = std::time::Instant::now();
             let mut stale: Vec<String> = Vec::new();
+            let mut seen: HashSet<String> = HashSet::new();
             for ch in &self.state.channel_order {
                 if !ch.is_twitch() {
                     continue;
@@ -1848,26 +2903,48 @@ impl eframe::App for CrustApp {
                 if !is_valid_twitch_login(&login) {
                     continue;
                 }
+                if !seen.insert(login.clone()) {
+                    continue;
+                }
                 let is_stale = self
                     .stream_status_fetched
                     .get(&login)
-                    .map(|t| t.elapsed() >= STREAM_REFRESH)
+                    .map(|t| t.elapsed() >= STREAM_REFRESH_BACKGROUND_INTERVAL)
+                    .unwrap_or(true);
+                if is_stale {
+                    stale.push(login);
+                }
+            }
+
+            for watched in self
+                .stream_tracker
+                .get_watched_channels(crust_core::notifications::Platform::Twitch)
+            {
+                let login = watched.channel_name.to_ascii_lowercase();
+                if !is_valid_twitch_login(&login) {
+                    continue;
+                }
+                if !seen.insert(login.clone()) {
+                    continue;
+                }
+                let is_stale = self
+                    .stream_status_fetched
+                    .get(&login)
+                    .map(|t| t.elapsed() >= STREAM_REFRESH_BACKGROUND_INTERVAL)
                     .unwrap_or(true);
                 if is_stale {
                     stale.push(login);
                 }
             }
             for login in stale {
-                self.stream_status_fetched
-                    .insert(login.clone(), std::time::Instant::now());
-                self.send_cmd(AppCommand::FetchUserProfile { login });
+                self.request_stream_status_refresh(&login);
             }
         }
 
         // Render profile popup and dispatch any actions.
         for action in self
             .user_profile_popup
-            .show(ctx, &self.emote_bytes, &self.stv_avatars)
+            .show(ctx, &self.emote_bytes, &self.stv_avatars, &self.mod_action_presets)
         {
             match action {
                 PopupAction::Timeout {
@@ -1915,6 +2992,19 @@ impl eframe::App for CrustApp {
                 }
                 PopupAction::OpenUrl { url } => {
                     self.send_cmd(AppCommand::OpenUrl { url });
+                }
+                PopupAction::OpenModerationTools { channel } => {
+                    self.send_cmd(AppCommand::OpenModerationTools {
+                        channel: Some(channel),
+                    });
+                }
+                PopupAction::ExecuteCommand { channel, command } => {
+                    self.send_cmd(AppCommand::SendMessage {
+                        channel,
+                        text: command,
+                        reply_to_msg_id: None,
+                        reply: None,
+                    });
                 }
             }
         }
@@ -1971,6 +3061,9 @@ impl eframe::App for CrustApp {
                 collapse_long_message_lines: self.collapse_long_message_lines,
                 animations_when_focused: self.animations_when_focused,
                 show_timestamps: self.show_timestamps,
+                show_timestamp_seconds: self.show_timestamp_seconds,
+                use_24h_timestamps: self.use_24h_timestamps,
+                local_log_indexing_enabled: self.local_log_indexing_enabled,
                 highlights_buf: self.highlights_buf.clone(),
                 ignores_buf: self.ignores_buf.clone(),
                 auto_join_buf: self.auto_join_buf.clone(),
@@ -1985,10 +3078,16 @@ impl eframe::App for CrustApp {
                 split_header_show_title: self.split_header_show_title,
                 split_header_show_game: self.split_header_show_game,
                 split_header_show_viewer_count: self.split_header_show_viewer_count,
+                desktop_notifications_enabled: self.desktop_notifications_enabled,
+                highlight_rules: self.settings_highlight_rules.clone(),
+                highlight_rule_bufs: self.settings_highlight_rule_bufs.clone(),
+                filter_records: self.settings_filter_records.clone(),
+                filter_record_bufs: self.settings_filter_record_bufs.clone(),
+                mod_action_presets: self.settings_mod_action_presets.clone(),
             };
             let appearance_before = self.appearance_snapshot();
             let stats = SettingsStats {
-                highlights_count: self.highlights.len(),
+                highlights_count: self.settings_highlight_rules.len(),
                 ignores_count: self.ignores.len(),
                 auto_join_count: self.auto_join_channels.len(),
             };
@@ -2084,7 +3183,31 @@ impl eframe::App for CrustApp {
             if self.appearance_snapshot() != appearance_before {
                 self.send_appearance_settings();
             }
+            if state.highlight_rules != self.settings_highlight_rules {
+                self.send_cmd(crust_core::events::AppCommand::SetHighlightRules {
+                    rules: state.highlight_rules.clone(),
+                });
+            }
+            if state.filter_records != self.settings_filter_records {
+                self.send_cmd(crust_core::events::AppCommand::SetFilterRecords {
+                    records: state.filter_records.clone(),
+                });
+            }
+            if state.mod_action_presets != self.settings_mod_action_presets {
+                self.send_cmd(crust_core::events::AppCommand::SetModActionPresets {
+                    presets: state.mod_action_presets.clone(),
+                });
+            }
+            if state.desktop_notifications_enabled != self.desktop_notifications_enabled {
+                self.desktop_notifications_enabled = state.desktop_notifications_enabled;
+                self.send_cmd(AppCommand::SetNotificationSettings {
+                    desktop_notifications_enabled: self.desktop_notifications_enabled,
+                });
+            }
             if state.show_timestamps != self.show_timestamps
+                || state.show_timestamp_seconds != self.show_timestamp_seconds
+                || state.use_24h_timestamps != self.use_24h_timestamps
+                || state.local_log_indexing_enabled != self.local_log_indexing_enabled
                 || state.highlights_buf != self.highlights_buf
                 || state.ignores_buf != self.ignores_buf
                 || state.auto_join_buf != self.auto_join_buf
@@ -2094,12 +3217,10 @@ impl eframe::App for CrustApp {
                 let auto_join = parse_settings_lines(&state.auto_join_buf, false);
 
                 self.show_timestamps = state.show_timestamps;
+                self.show_timestamp_seconds = state.show_timestamp_seconds;
+                self.use_24h_timestamps = state.use_24h_timestamps;
+                self.local_log_indexing_enabled = state.local_log_indexing_enabled;
                 self.highlights = highlights.clone();
-                self.highlights_lower = highlights
-                    .iter()
-                    .map(|s| s.to_ascii_lowercase())
-                    .filter(|s| !s.is_empty())
-                    .collect();
                 self.ignores = ignores.clone();
                 self.ignores_set = ignores.iter().cloned().collect();
                 self.auto_join_channels = auto_join.clone();
@@ -2109,10 +3230,260 @@ impl eframe::App for CrustApp {
 
                 self.send_cmd(AppCommand::SetGeneralSettings {
                     show_timestamps: self.show_timestamps,
+                    show_timestamp_seconds: self.show_timestamp_seconds,
+                    use_24h_timestamps: self.use_24h_timestamps,
+                    local_log_indexing_enabled: self.local_log_indexing_enabled,
                     auto_join,
                     highlights,
                     ignores,
                 });
+            }
+        }
+
+        let moderation_channel = self.active_moderation_channel();
+
+        if self.mod_tools_open {
+            let mut window_open = self.mod_tools_open;
+            let mut refresh_channel: Option<ChannelId> = None;
+            let mut automod_actions: Vec<(String, String, String)> = Vec::new();
+            let mut unban_actions: Vec<(String, bool, Option<String>)> = Vec::new();
+
+            egui::Window::new("Moderation Tools")
+                .open(&mut window_open)
+                .default_size(egui::vec2(540.0, 520.0))
+                .show(ctx, |ui| {
+                    let Some(channel) = moderation_channel.clone() else {
+                        ui.label(
+                            RichText::new(
+                                "Open a Twitch channel where you are a moderator to use moderation tools.",
+                            )
+                            .color(t::text_muted())
+                            .font(t::small()),
+                        );
+                        return;
+                    };
+
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("Channel: #{}", channel.display_name()))
+                                .font(t::small())
+                                .strong(),
+                        );
+                        if ui
+                            .button(RichText::new("Refresh unban requests").font(t::small()))
+                            .clicked()
+                        {
+                            refresh_channel = Some(channel.clone());
+                        }
+                    });
+
+                    ui.separator();
+                    ui.label(RichText::new("AutoMod Queue").font(t::small()).strong());
+
+                    let queue_items = self
+                        .automod_queue
+                        .get(&channel)
+                        .cloned()
+                        .unwrap_or_default();
+                    if queue_items.is_empty() {
+                        ui.label(
+                            RichText::new("No held AutoMod messages.")
+                                .color(t::text_muted())
+                                .font(t::small()),
+                        );
+                    } else {
+                        egui::ScrollArea::vertical().max_height(210.0).show(ui, |ui| {
+                            for item in queue_items {
+                                chrome::card_frame().show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(format!("@{}", item.sender_login))
+                                                .font(t::small())
+                                                .strong(),
+                                        );
+                                        ui.separator();
+                                        ui.label(
+                                            RichText::new(format!("id: {}", item.message_id))
+                                                .font(t::tiny())
+                                                .color(t::text_muted()),
+                                        );
+                                    });
+
+                                    if let Some(reason) =
+                                        item.reason.as_deref().filter(|s| !s.trim().is_empty())
+                                    {
+                                        ui.label(
+                                            RichText::new(format!(" AutoMod: {reason} "))
+                                                .font(t::small())
+                                                .color(Color32::WHITE)
+                                                .background_color(t::red()),
+                                        );
+                                    }
+
+                                    ui.label(RichText::new(item.text.clone()).font(t::small()));
+
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .button(
+                                                RichText::new("Allow")
+                                                    .font(t::small())
+                                                    .color(t::green()),
+                                            )
+                                            .clicked()
+                                        {
+                                            automod_actions.push((
+                                                item.message_id.clone(),
+                                                item.sender_user_id.clone(),
+                                                "ALLOW".to_owned(),
+                                            ));
+                                        }
+                                        if ui
+                                            .button(
+                                                RichText::new("Deny")
+                                                    .font(t::small())
+                                                    .color(t::red()),
+                                            )
+                                            .clicked()
+                                        {
+                                            automod_actions.push((
+                                                item.message_id.clone(),
+                                                item.sender_user_id.clone(),
+                                                "DENY".to_owned(),
+                                            ));
+                                        }
+                                    });
+                                });
+                                ui.add_space(6.0);
+                            }
+                        });
+                    }
+
+                    ui.separator();
+                    ui.label(
+                        RichText::new("Pending Unban Requests")
+                            .font(t::small())
+                            .strong(),
+                    );
+
+                    let requests = self
+                        .unban_requests
+                        .get(&channel)
+                        .cloned()
+                        .unwrap_or_default();
+                    if requests.is_empty() {
+                        ui.label(
+                            RichText::new("No pending unban requests loaded.")
+                                .color(t::text_muted())
+                                .font(t::small()),
+                        );
+                    } else {
+                        egui::ScrollArea::vertical().max_height(230.0).show(ui, |ui| {
+                            for request in requests {
+                                let key = Self::unban_draft_key(&channel, &request.request_id);
+                                let draft = self.unban_resolution_drafts.entry(key).or_default();
+
+                                chrome::card_frame().show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(format!("@{}", request.user_login))
+                                                .font(t::small())
+                                                .strong(),
+                                        );
+                                        if let Some(created_at) = request
+                                            .created_at
+                                            .as_deref()
+                                            .filter(|s| !s.trim().is_empty())
+                                        {
+                                            ui.separator();
+                                            ui.label(
+                                                RichText::new(created_at)
+                                                    .font(t::tiny())
+                                                    .color(t::text_muted()),
+                                            );
+                                        }
+                                    });
+
+                                    if let Some(text) =
+                                        request.text.as_deref().filter(|s| !s.trim().is_empty())
+                                    {
+                                        ui.label(RichText::new(text).font(t::small()));
+                                    }
+
+                                    ui.add(
+                                        egui::TextEdit::singleline(draft)
+                                            .hint_text("Resolution text (optional)")
+                                            .desired_width(f32::INFINITY),
+                                    );
+
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .button(
+                                                RichText::new("Approve")
+                                                    .font(t::small())
+                                                    .color(t::green()),
+                                            )
+                                            .clicked()
+                                        {
+                                            let resolution = draft.trim();
+                                            unban_actions.push((
+                                                request.request_id.clone(),
+                                                true,
+                                                if resolution.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(resolution.to_owned())
+                                                },
+                                            ));
+                                        }
+                                        if ui
+                                            .button(
+                                                RichText::new("Deny")
+                                                    .font(t::small())
+                                                    .color(t::red()),
+                                            )
+                                            .clicked()
+                                        {
+                                            let resolution = draft.trim();
+                                            unban_actions.push((
+                                                request.request_id.clone(),
+                                                false,
+                                                if resolution.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(resolution.to_owned())
+                                                },
+                                            ));
+                                        }
+                                    });
+                                });
+                                ui.add_space(6.0);
+                            }
+                        });
+                    }
+                });
+
+            self.mod_tools_open = window_open;
+
+            if let Some(channel) = refresh_channel {
+                self.send_cmd(AppCommand::FetchUnbanRequests { channel });
+            }
+            if let Some(channel) = moderation_channel {
+                for (message_id, sender_user_id, action) in automod_actions {
+                    self.send_cmd(AppCommand::ResolveAutoModMessage {
+                        channel: channel.clone(),
+                        message_id,
+                        sender_user_id,
+                        action,
+                    });
+                }
+                for (request_id, approve, resolution_text) in unban_actions {
+                    self.send_cmd(AppCommand::ResolveUnbanRequest {
+                        channel: channel.clone(),
+                        request_id,
+                        approve,
+                        resolution_text,
+                    });
+                }
             }
         }
 
@@ -2129,6 +3500,8 @@ impl eframe::App for CrustApp {
         } else {
             self.channel_layout
         };
+        let moderation_channel_toolbar = self.active_moderation_channel();
+        let moderation_available = moderation_channel_toolbar.is_some();
 
         TopBottomPanel::top("status_bar")
             .exact_height(responsive.status_bar_height)
@@ -2307,6 +3680,18 @@ impl eframe::App for CrustApp {
                                     ui.close_menu();
                                 }
 
+                                if moderation_available
+                                    && ui
+                                        .button(RichText::new("Moderation tools").font(t::small()))
+                                        .clicked()
+                                {
+                                    self.mod_tools_open = true;
+                                    if let Some(channel) = moderation_channel_toolbar.clone() {
+                                        self.send_cmd(AppCommand::FetchUnbanRequests { channel });
+                                    }
+                                    ui.close_menu();
+                                }
+
                                 ui.separator();
 
                                 let sidebar_open = self.channel_layout == ChannelLayout::Sidebar
@@ -2394,6 +3779,18 @@ impl eframe::App for CrustApp {
                         chrome::toolbar_group_frame().show(ui, |ui| {
                             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                 ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                                let mod_button = ui.add_enabled(
+                                    moderation_available,
+                                    egui::Button::new(RichText::new("Mod").font(t::tiny())),
+                                );
+                                if mod_button.clicked() {
+                                    self.mod_tools_open = !self.mod_tools_open;
+                                    if self.mod_tools_open {
+                                        if let Some(channel) = moderation_channel_toolbar.clone() {
+                                            self.send_cmd(AppCommand::FetchUnbanRequests { channel });
+                                        }
+                                    }
+                                }
                                 if chrome::icon_button(
                                         ui,
                                         ChromeIcon::Settings,
@@ -2806,18 +4203,7 @@ impl eframe::App for CrustApp {
 
         // Apply channel-list actions gathered above.
         if let Some(ch) = ch_selected {
-            if let Some(state) = self.state.channels.get_mut(&ch) {
-                state.mark_read();
-            }
-            // In split mode, switch the focused pane's channel.
-            if !self.split_panes.panes.is_empty() {
-                let f = self.split_panes.focused;
-                if let Some(pane) = self.split_panes.panes.get_mut(f) {
-                    pane.channel = ch.clone();
-                    pane.input_buf.clear();
-                }
-            }
-            self.state.active_channel = Some(ch);
+            self.activate_channel(ch);
         }
         if let Some(ch) = ch_closed {
             if self
@@ -3125,6 +4511,7 @@ impl eframe::App for CrustApp {
                                 emote_bytes: &self.emote_bytes,
                                 pending_reply: None,
                                 message_history: &self.message_history,
+                                slash_usage_counts: &self.slash_usage_counts,
                                 known_channels: &self.state.channel_order,
                                 chatters: chatters_sorted,
                                 prevent_overlong_twitch_messages: self
@@ -3148,6 +4535,7 @@ impl eframe::App for CrustApp {
                                         self.message_history.remove(0);
                                     }
                                 }
+                                self.record_slash_usage_from_text(&text);
                                 let is_mod = self
                                     .state
                                     .channels
@@ -3270,6 +4658,14 @@ impl eframe::App for CrustApp {
                                             search,
                                         ) + pane_inner_pad;
                                     }
+                                    if search.take_load_more_local_request() {
+                                        let oldest_ts = ch_state
+                                            .messages
+                                            .front()
+                                            .map(|m| m.timestamp.timestamp_millis())
+                                            .unwrap_or(i64::MAX);
+                                        self.request_older_local_history(&ch, oldest_ts);
+                                    }
                                 }
                             }
                         }
@@ -3290,7 +4686,7 @@ impl eframe::App for CrustApp {
                                     )
                                 })
                                 .unwrap_or(false);
-                            let _is_mod = ch_state.is_mod || is_bc;
+                            let is_mod = ch_state.is_mod || is_bc;
                             let mut msg_ui = pane_ui.new_child(
                                 egui::UiBuilder::new()
                                     .max_rect(msg_rect)
@@ -3308,8 +4704,13 @@ impl eframe::App for CrustApp {
                                 self.collapse_long_message_lines,
                                 animations_allowed,
                                 self.show_timestamps,
+                                self.show_timestamp_seconds,
+                                self.use_24h_timestamps,
+                                is_mod,
                                 &self.ignores_set,
-                                &self.highlights_lower,
+                                &self.highlight_rules,
+                                &self.filter_records,
+                                &self.mod_action_presets,
                             )
                             .show(&mut msg_ui);
                             frame_chat_stats.accumulate(&ml.perf_stats);
@@ -3429,6 +4830,7 @@ impl eframe::App for CrustApp {
                                 emote_bytes: &self.emote_bytes,
                                 pending_reply: active_reply.as_ref(),
                                 message_history: &self.message_history,
+                                slash_usage_counts: &self.slash_usage_counts,
                                 known_channels: &self.state.channel_order,
                                 chatters: chatters_sorted,
                                 prevent_overlong_twitch_messages: self
@@ -3447,6 +4849,7 @@ impl eframe::App for CrustApp {
                                         self.message_history.remove(0);
                                     }
                                 }
+                                self.record_slash_usage_from_text(&text);
                                 let reply_to_msg_id =
                                     active_reply.as_ref().map(|r| r.parent_msg_id.clone());
                                 if active_reply.is_some() {
@@ -3609,6 +5012,14 @@ impl eframe::App for CrustApp {
                                     ) + 10.0;
                                     ui.allocate_space(egui::vec2(0.0, search_h));
                                 }
+                                if search.take_load_more_local_request() {
+                                    let oldest_ts = state
+                                        .messages
+                                        .front()
+                                        .map(|m| m.timestamp.timestamp_millis())
+                                        .unwrap_or(i64::MAX);
+                                    self.request_older_local_history(&active_ch, oldest_ts);
+                                }
                             }
                         }
                         let is_broadcaster = self
@@ -3643,8 +5054,13 @@ impl eframe::App for CrustApp {
                             self.collapse_long_message_lines,
                             animations_allowed,
                             self.show_timestamps,
+                            self.show_timestamp_seconds,
+                            self.use_24h_timestamps,
+                            is_mod,
                             &self.ignores_set,
-                            &self.highlights_lower,
+                            &self.highlight_rules,
+                            &self.filter_records,
+                            &self.mod_action_presets,
                         )
                         .show(&mut msg_ui);
                         frame_chat_stats.accumulate(&ml_result.perf_stats);
@@ -3673,6 +5089,16 @@ impl eframe::App for CrustApp {
                     });
                 }
             });
+
+        let picker_prefs = self.emote_picker.preferences();
+        if self.emote_picker_prefs_last_saved.as_ref() != Some(&picker_prefs) {
+            self.send_cmd(AppCommand::SetEmotePickerPreferences {
+                favorites: picker_prefs.favorites.clone(),
+                recent: picker_prefs.recent.clone(),
+                provider_boost: picker_prefs.provider_boost.clone(),
+            });
+            self.emote_picker_prefs_last_saved = Some(picker_prefs);
+        }
 
         // -- Split drop-zone overlay -----------------------------------------
         // Pulsing translucent overlay shown over the central area when a
@@ -3722,8 +5148,9 @@ impl eframe::App for CrustApp {
         // -- Event toast overlay ---------------------------------------------
         // Expire toasts older than 5 s, then render remaining ones as stacked
         // floating banners anchored to the top-right of the screen.
+        self.flush_event_toast_queue();
         self.event_toasts
-            .retain(|t| t.born.elapsed().as_secs_f32() < 5.0);
+            .retain(|t| t.born.elapsed().as_secs_f32() < EVENT_TOAST_TTL_SECS);
         for (i, toast) in self.event_toasts.iter().enumerate() {
             let age = toast.born.elapsed().as_secs_f32();
             let opacity = if age < 0.25 {
@@ -3808,7 +5235,7 @@ impl eframe::App for CrustApp {
                 });
         }
         // Keep animating while toasts are live.
-        if !self.event_toasts.is_empty() {
+        if !self.event_toasts.is_empty() || !self.event_toast_queue.is_empty() {
             ctx.request_repaint_after(std::time::Duration::from_millis(30));
         }
 
@@ -4089,7 +5516,7 @@ fn parse_slash_command(
     channel: &ChannelId,
     reply_to_msg_id: Option<String>,
     reply: Option<ReplyInfo>,
-    _is_mod: bool,
+    is_mod: bool,
     chatters_count: usize,
     kick_beta_enabled: bool,
     irc_beta_enabled: bool,
@@ -4125,6 +5552,593 @@ fn parse_slash_command(
             Some(AppCommand::InjectLocalMessage {
                 channel: channel.clone(),
                 text: msg,
+            })
+        }
+
+        // Twitch Helix poll management.
+        "poll" => {
+            if !channel.is_twitch() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Poll commands are only supported for Twitch channels.".to_owned(),
+                });
+            }
+            if !is_mod {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Poll commands require moderator or broadcaster permissions."
+                        .to_owned(),
+                });
+            }
+
+            let usage = "Usage: /poll <title> | <choice 1> | <choice 2> [| ...] [--duration <15..1800>] OR /poll --title \"<title>\" --choice \"<choice 1>\" --choice \"<choice 2>\" [--duration <15..1800>|<60s|1m>] [--points <n>]";
+            if rest.is_empty() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: usage.to_owned(),
+                });
+            }
+
+            let parsed = if rest.contains("--title") || rest.contains("--choice") {
+                parse_poll_flag_args(rest)
+            } else {
+                let (spec, duration_opt) = extract_duration_flag(rest);
+                let (spec, points_opt) = extract_points_flag(&spec);
+                let duration_secs = duration_opt.unwrap_or(60).clamp(15, 1800);
+                let parts = parse_pipe_args(&spec);
+                if parts.len() < 3 {
+                    None
+                } else {
+                    Some(ParsedPollSpec {
+                        title: parts[0].clone(),
+                        choices: parts[1..].to_vec(),
+                        duration_secs,
+                        channel_points_per_vote: points_opt,
+                    })
+                }
+            };
+
+            let Some(parsed) = parsed else {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: usage.to_owned(),
+                });
+            };
+
+            let choices = parsed.choices;
+            if choices.len() > 5 {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Twitch polls support 2 to 5 choices.".to_owned(),
+                });
+            }
+
+            Some(AppCommand::CreatePoll {
+                channel: channel.clone(),
+                title: parsed.title,
+                choices,
+                duration_secs: parsed.duration_secs,
+                channel_points_per_vote: parsed.channel_points_per_vote,
+            })
+        }
+
+        "endpoll" => {
+            if !channel.is_twitch() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Poll commands are only supported for Twitch channels.".to_owned(),
+                });
+            }
+            if !is_mod {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Poll commands require moderator or broadcaster permissions."
+                        .to_owned(),
+                });
+            }
+            Some(AppCommand::EndPoll {
+                channel: channel.clone(),
+                status: "ARCHIVED".to_owned(),
+            })
+        }
+
+        "cancelpoll" => {
+            if !channel.is_twitch() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Poll commands are only supported for Twitch channels.".to_owned(),
+                });
+            }
+            if !is_mod {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Poll commands require moderator or broadcaster permissions."
+                        .to_owned(),
+                });
+            }
+            Some(AppCommand::EndPoll {
+                channel: channel.clone(),
+                status: "TERMINATED".to_owned(),
+            })
+        }
+
+        // Twitch viewer participation commands.
+        "vote" => {
+            if !channel.is_twitch() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Poll voting is only supported for Twitch channels.".to_owned(),
+                });
+            }
+            if rest.trim().is_empty() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Usage: /vote <choice number>".to_owned(),
+                });
+            }
+            Some(AppCommand::SendMessage {
+                channel: channel.clone(),
+                text: text.to_owned(),
+                reply_to_msg_id: None,
+                reply: None,
+            })
+        }
+
+        "redeem" | "reward" => {
+            if !channel.is_twitch() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Channel points redemption is only supported for Twitch channels."
+                        .to_owned(),
+                });
+            }
+            if rest.trim().is_empty() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Usage: /redeem <reward name>".to_owned(),
+                });
+            }
+            Some(AppCommand::SendMessage {
+                channel: channel.clone(),
+                text: format!("/redeem {}", rest.trim()),
+                reply_to_msg_id: None,
+                reply: None,
+            })
+        }
+
+        // Twitch Helix prediction management.
+        "prediction" => {
+            if !channel.is_twitch() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Prediction commands are only supported for Twitch channels.".to_owned(),
+                });
+            }
+            if !is_mod {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Prediction commands require moderator or broadcaster permissions."
+                        .to_owned(),
+                });
+            }
+
+            let usage = "Usage: /prediction <title> | <outcome 1> | <outcome 2> [| ...] [--duration <30..1800>]";
+            if rest.is_empty() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: usage.to_owned(),
+                });
+            }
+
+            let (spec, duration_opt) = extract_duration_flag(rest);
+            let duration_secs = duration_opt.unwrap_or(120).clamp(30, 1800);
+            let parts = parse_pipe_args(&spec);
+            if parts.len() < 3 {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: usage.to_owned(),
+                });
+            }
+            let title = parts[0].clone();
+            let outcomes = parts[1..].to_vec();
+            if outcomes.len() > 10 {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Twitch predictions support 2 to 10 outcomes.".to_owned(),
+                });
+            }
+
+            Some(AppCommand::CreatePrediction {
+                channel: channel.clone(),
+                title,
+                outcomes,
+                duration_secs,
+            })
+        }
+
+        "lockprediction" => {
+            if !channel.is_twitch() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Prediction commands are only supported for Twitch channels.".to_owned(),
+                });
+            }
+            if !is_mod {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Prediction commands require moderator or broadcaster permissions."
+                        .to_owned(),
+                });
+            }
+            Some(AppCommand::LockPrediction {
+                channel: channel.clone(),
+            })
+        }
+
+        "endprediction" => {
+            if !channel.is_twitch() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Prediction commands are only supported for Twitch channels.".to_owned(),
+                });
+            }
+            if !is_mod {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Prediction commands require moderator or broadcaster permissions."
+                        .to_owned(),
+                });
+            }
+            let idx: usize = match rest.trim().parse() {
+                Ok(v) if v >= 1 => v,
+                _ => {
+                    return Some(AppCommand::InjectLocalMessage {
+                        channel: channel.clone(),
+                        text: "Usage: /endprediction <winning outcome index starting at 1>"
+                            .to_owned(),
+                    });
+                }
+            };
+            Some(AppCommand::ResolvePrediction {
+                channel: channel.clone(),
+                winning_outcome_index: idx,
+            })
+        }
+
+        "cancelprediction" => {
+            if !channel.is_twitch() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Prediction commands are only supported for Twitch channels.".to_owned(),
+                });
+            }
+            if !is_mod {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Prediction commands require moderator or broadcaster permissions."
+                        .to_owned(),
+                });
+            }
+            Some(AppCommand::CancelPrediction {
+                channel: channel.clone(),
+            })
+        }
+
+        "commercial" => {
+            if !channel.is_twitch() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Commercial commands are only supported for Twitch channels.".to_owned(),
+                });
+            }
+            if !is_mod {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Commercial commands require moderator or broadcaster permissions."
+                        .to_owned(),
+                });
+            }
+
+            let usage = "Usage: /commercial [30|60|90|120|150|180]";
+            let length_secs = if rest.is_empty() {
+                30
+            } else {
+                match rest.trim().parse::<u32>() {
+                    Ok(v) if matches!(v, 30 | 60 | 90 | 120 | 150 | 180) => v,
+                    _ => {
+                        return Some(AppCommand::InjectLocalMessage {
+                            channel: channel.clone(),
+                            text: usage.to_owned(),
+                        });
+                    }
+                }
+            };
+
+            Some(AppCommand::StartCommercial {
+                channel: channel.clone(),
+                length_secs,
+            })
+        }
+
+        "marker" => {
+            if !channel.is_twitch() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Marker commands are only supported for Twitch channels.".to_owned(),
+                });
+            }
+            if !is_mod {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Marker commands require moderator or broadcaster permissions."
+                        .to_owned(),
+                });
+            }
+
+            let description = if rest.is_empty() {
+                None
+            } else {
+                let desc = rest.trim();
+                if desc.chars().count() > 140 {
+                    return Some(AppCommand::InjectLocalMessage {
+                        channel: channel.clone(),
+                        text: "Usage: /marker [description up to 140 characters]".to_owned(),
+                    });
+                }
+                Some(desc.to_owned())
+            };
+
+            Some(AppCommand::CreateStreamMarker {
+                channel: channel.clone(),
+                description,
+            })
+        }
+
+        "announce" => {
+            if !channel.is_twitch() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Announcement commands are only supported for Twitch channels."
+                        .to_owned(),
+                });
+            }
+            if !is_mod {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Announcement commands require moderator or broadcaster permissions."
+                        .to_owned(),
+                });
+            }
+
+            let usage =
+                "Usage: /announce <message> [--color primary|blue|green|orange|purple]";
+            let (message, color) = extract_color_flag(rest);
+            let message = message.trim();
+            if message.is_empty() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: usage.to_owned(),
+                });
+            }
+            if message.chars().count() > 500 {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Announcement message must be 500 characters or fewer.".to_owned(),
+                });
+            }
+
+            Some(AppCommand::SendAnnouncement {
+                channel: channel.clone(),
+                message: message.to_owned(),
+                color,
+            })
+        }
+
+        "shoutout" => {
+            if !channel.is_twitch() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Shoutout commands are only supported for Twitch channels.".to_owned(),
+                });
+            }
+            if !is_mod {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Shoutout commands require moderator or broadcaster permissions."
+                        .to_owned(),
+                });
+            }
+
+            let usage = "Usage: /shoutout <channel>";
+            let target = rest
+                .split_whitespace()
+                .next()
+                .map(|raw| raw.trim_start_matches('@').trim_start_matches('#'))
+                .unwrap_or("")
+                .trim();
+            if target.is_empty() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: usage.to_owned(),
+                });
+            }
+            let target_login = target.to_ascii_lowercase();
+            let is_valid_login = {
+                let len = target_login.len();
+                (3..=25).contains(&len)
+                    && target_login
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            };
+            if !is_valid_login {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: usage.to_owned(),
+                });
+            }
+
+            Some(AppCommand::SendShoutout {
+                channel: channel.clone(),
+                target_login,
+            })
+        }
+
+        "unbanrequests" => {
+            if !channel.is_twitch() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Unban request commands are only supported for Twitch channels."
+                        .to_owned(),
+                });
+            }
+            if !is_mod {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Unban request commands require moderator or broadcaster permissions."
+                        .to_owned(),
+                });
+            }
+            Some(AppCommand::FetchUnbanRequests {
+                channel: channel.clone(),
+            })
+        }
+
+        "resolveunban" => {
+            if !channel.is_twitch() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Unban request commands are only supported for Twitch channels."
+                        .to_owned(),
+                });
+            }
+            if !is_mod {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Unban request commands require moderator or broadcaster permissions."
+                        .to_owned(),
+                });
+            }
+
+            let usage = "Usage: /resolveunban <request_id> <approve|deny> [reason]";
+            let mut parts = rest.split_whitespace();
+            let request_id = parts.next().unwrap_or("").trim();
+            let action = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+            if request_id.is_empty() || action.is_empty() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: usage.to_owned(),
+                });
+            }
+
+            let approve = match action.as_str() {
+                "approve" | "approved" | "allow" => true,
+                "deny" | "denied" | "reject" => false,
+                _ => {
+                    return Some(AppCommand::InjectLocalMessage {
+                        channel: channel.clone(),
+                        text: usage.to_owned(),
+                    });
+                }
+            };
+
+            let resolution_text = parts.collect::<Vec<_>>().join(" ");
+            Some(AppCommand::ResolveUnbanRequest {
+                channel: channel.clone(),
+                request_id: request_id.to_owned(),
+                approve,
+                resolution_text: if resolution_text.trim().is_empty() {
+                    None
+                } else {
+                    Some(resolution_text)
+                },
+            })
+        }
+
+        "automod" => {
+            if !channel.is_twitch() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "AutoMod commands are only supported for Twitch channels.".to_owned(),
+                });
+            }
+            if !is_mod {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "AutoMod commands require moderator or broadcaster permissions."
+                        .to_owned(),
+                });
+            }
+
+            let usage = "Usage: /automod <allow|deny> <message_id> <sender_user_id>";
+            let mut parts = rest.split_whitespace();
+            let action_raw = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+            let message_id = parts.next().unwrap_or("").trim();
+            let sender_user_id = parts.next().unwrap_or("").trim();
+
+            if action_raw.is_empty() || message_id.is_empty() || sender_user_id.is_empty() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: usage.to_owned(),
+                });
+            }
+
+            let action = match action_raw.as_str() {
+                "allow" | "approve" => "ALLOW",
+                "deny" | "reject" => "DENY",
+                _ => {
+                    return Some(AppCommand::InjectLocalMessage {
+                        channel: channel.clone(),
+                        text: usage.to_owned(),
+                    });
+                }
+            };
+
+            Some(AppCommand::ResolveAutoModMessage {
+                channel: channel.clone(),
+                message_id: message_id.to_owned(),
+                sender_user_id: sender_user_id.to_owned(),
+                action: action.to_owned(),
+            })
+        }
+
+        "requests" => {
+            let usage = "Usage: /requests [channel]";
+            let target = if let Some(raw_target) = rest.split_whitespace().next() {
+                parse_twitch_channel_login_arg(raw_target)
+            } else if channel.is_twitch() {
+                parse_twitch_channel_login_arg(channel.display_name())
+            } else {
+                None
+            };
+
+            let Some(target) = target else {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: usage.to_owned(),
+                });
+            };
+
+            Some(AppCommand::OpenUrl {
+                url: format!("https://www.twitch.tv/popout/{target}/reward-queue"),
+            })
+        }
+
+        "modtools" | "lowtrust" => {
+            if !channel.is_twitch() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Moderation tools are only supported for Twitch channels.".to_owned(),
+                });
+            }
+            if !is_mod {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Moderation tools require moderator or broadcaster permissions."
+                        .to_owned(),
+                });
+            }
+            Some(AppCommand::OpenModerationTools {
+                channel: Some(channel.clone()),
             })
         }
 
@@ -4340,6 +6354,24 @@ fn parse_slash_command(
             })
         }
 
+        "untimeout" => {
+            let target = rest.trim();
+            if target.is_empty() {
+                Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Usage: /untimeout <user>".to_owned(),
+                })
+            } else {
+                let fwd = format!("/unban {target}");
+                Some(AppCommand::SendMessage {
+                    channel: channel.clone(),
+                    text: fwd,
+                    reply_to_msg_id,
+                    reply: reply.clone(),
+                })
+            }
+        }
+
         // /w <user> <message>  - Twitch whisper (pass straight through).
         "w" | "whisper" => Some(AppCommand::SendMessage {
             channel: channel.clone(),
@@ -4351,7 +6383,7 @@ fn parse_slash_command(
         // Everything else falls through to IRC
         // Standard Twitch chat commands (/ban, /timeout, /unban, /slow,
         // /subscribers, /emoteonly, /clear, /mod, /vip, /color, /delete,
-        // /raid, /host, /commercial, /uniquechat, /marker, /block, /unblock,
+        // /raid, /host, /uniquechat, /block, /unblock,
         // /r, /w, etc.) are handled server-side.
         _ => None,
     }
@@ -4408,6 +6440,245 @@ fn parse_irc_channel_arg(current: &ChannelId, raw: &str) -> Option<ChannelId> {
     // Strip exactly one leading '#' for internal storage.
     let ch = arg.strip_prefix('#').unwrap_or(arg);
     Some(ChannelId::irc(t.host, t.port, t.tls, ch))
+}
+
+fn parse_pipe_args(spec: &str) -> Vec<String> {
+    spec.split('|')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+struct ParsedPollSpec {
+    title: String,
+    choices: Vec<String>,
+    duration_secs: u32,
+    channel_points_per_vote: Option<u32>,
+}
+
+fn split_quoted_args(input: &str) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut escaped = false;
+
+    for ch in input.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+
+        if in_quotes && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            continue;
+        }
+
+        if ch.is_whitespace() && !in_quotes {
+            if !current.is_empty() {
+                args.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+
+        current.push(ch);
+    }
+
+    if !current.is_empty() {
+        args.push(current);
+    }
+
+    args
+}
+
+fn parse_poll_duration_token(raw: &str) -> Option<u32> {
+    let value = raw.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return None;
+    }
+
+    if let Some(minutes) = value.strip_suffix('m') {
+        let mins = minutes.parse::<u32>().ok()?;
+        return mins.checked_mul(60);
+    }
+
+    if let Some(seconds) = value.strip_suffix('s') {
+        return seconds.parse::<u32>().ok();
+    }
+
+    value.parse::<u32>().ok()
+}
+
+fn parse_poll_flag_args(input: &str) -> Option<ParsedPollSpec> {
+    let tokens = split_quoted_args(input);
+    if tokens.is_empty() {
+        return None;
+    }
+
+    let mut title: Option<String> = None;
+    let mut choices: Vec<String> = Vec::new();
+    let mut duration_secs: Option<u32> = None;
+    let mut channel_points_per_vote: Option<u32> = None;
+
+    let mut i = 0usize;
+    while i < tokens.len() {
+        match tokens[i].as_str() {
+            "--title" => {
+                let value = tokens.get(i + 1)?.trim();
+                if value.is_empty() {
+                    return None;
+                }
+                title = Some(value.to_owned());
+                i += 2;
+            }
+            "--choice" => {
+                let value = tokens.get(i + 1)?.trim();
+                if value.is_empty() {
+                    return None;
+                }
+                choices.push(value.to_owned());
+                i += 2;
+            }
+            "--duration" => {
+                let value = tokens.get(i + 1)?;
+                duration_secs = parse_poll_duration_token(value);
+                if duration_secs.is_none() {
+                    return None;
+                }
+                i += 2;
+            }
+            "--points" => {
+                let value = tokens.get(i + 1)?;
+                let parsed = value.parse::<u32>().ok().filter(|v| *v > 0)?;
+                channel_points_per_vote = Some(parsed);
+                i += 2;
+            }
+            _ => return None,
+        }
+    }
+
+    let title = title?.trim().to_owned();
+    if title.is_empty() {
+        return None;
+    }
+    if choices.len() < 2 {
+        return None;
+    }
+
+    Some(ParsedPollSpec {
+        title,
+        choices,
+        duration_secs: duration_secs.unwrap_or(60).clamp(15, 1800),
+        channel_points_per_vote,
+    })
+}
+
+fn extract_duration_flag(input: &str) -> (String, Option<u32>) {
+    let mut cleaned_tokens: Vec<&str> = Vec::new();
+    let mut duration: Option<u32> = None;
+
+    let tokens: Vec<&str> = input.split_whitespace().collect();
+    let mut i = 0usize;
+    while i < tokens.len() {
+        if tokens[i] == "--duration" {
+            if let Some(next) = tokens.get(i + 1) {
+                if let Ok(v) = next.parse::<u32>() {
+                    duration = Some(v);
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        cleaned_tokens.push(tokens[i]);
+        i += 1;
+    }
+
+    (cleaned_tokens.join(" "), duration)
+}
+
+fn extract_points_flag(input: &str) -> (String, Option<u32>) {
+    let mut cleaned_tokens: Vec<&str> = Vec::new();
+    let mut points: Option<u32> = None;
+
+    let tokens: Vec<&str> = input.split_whitespace().collect();
+    let mut i = 0usize;
+    while i < tokens.len() {
+        if tokens[i] == "--points" {
+            if let Some(next) = tokens.get(i + 1) {
+                if let Ok(v) = next.parse::<u32>() {
+                    points = Some(v.max(1));
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        cleaned_tokens.push(tokens[i]);
+        i += 1;
+    }
+
+    (cleaned_tokens.join(" "), points)
+}
+
+fn parse_twitch_channel_login_arg(raw: &str) -> Option<String> {
+    let mut login = raw.trim();
+    if login.is_empty() {
+        return None;
+    }
+
+    if let Some(stripped) = login.strip_prefix("https://www.twitch.tv/") {
+        login = stripped;
+    } else if let Some(stripped) = login.strip_prefix("http://www.twitch.tv/") {
+        login = stripped;
+    } else if let Some(stripped) = login.strip_prefix("https://twitch.tv/") {
+        login = stripped;
+    } else if let Some(stripped) = login.strip_prefix("http://twitch.tv/") {
+        login = stripped;
+    }
+
+    let login = login
+        .trim_start_matches('#')
+        .trim_start_matches('@')
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    if is_valid_twitch_login(&login) {
+        Some(login)
+    } else {
+        None
+    }
+}
+
+fn extract_color_flag(input: &str) -> (String, Option<String>) {
+    let mut cleaned_tokens: Vec<&str> = Vec::new();
+    let mut color: Option<String> = None;
+
+    let tokens: Vec<&str> = input.split_whitespace().collect();
+    let mut i = 0usize;
+    while i < tokens.len() {
+        if tokens[i] == "--color" {
+            if let Some(next) = tokens.get(i + 1) {
+                let candidate = next.trim().to_ascii_lowercase();
+                if matches!(candidate.as_str(), "primary" | "blue" | "green" | "orange" | "purple") {
+                    color = Some(candidate);
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        cleaned_tokens.push(tokens[i]);
+        i += 1;
+    }
+
+    (cleaned_tokens.join(" "), color)
 }
 
 fn parse_irc_join_args(current: &ChannelId, raw: &str) -> Option<(ChannelId, Option<String>)> {
@@ -4489,7 +6760,12 @@ fn build_emote_lookup(catalog: &[EmoteCatalogEntry]) -> HashMap<&str, &EmoteCata
 
 #[cfg(test)]
 mod tests {
-    use super::{responsive_layout, top_tab_metrics, toolbar_visibility, TabVisualStyle};
+    use super::{
+        parse_slash_command, responsive_layout, top_tab_metrics, toolbar_visibility,
+        TabVisualStyle,
+    };
+    use crust_core::events::AppCommand;
+    use crust_core::model::ChannelId;
     use crate::theme as t;
 
     #[test]
@@ -4557,5 +6833,341 @@ mod tests {
         assert!(visibility.show_irc_in_overflow);
         assert!(visibility.show_overflow_menu);
         assert!(!visibility.compact_controls);
+    }
+
+    #[test]
+    fn slash_commercial_rejects_invalid_duration_argument() {
+        let channel = ChannelId::new("somechannel");
+        let parsed = parse_slash_command(
+            "/commercial 45",
+            &channel,
+            None,
+            None,
+            true,
+            0,
+            true,
+            true,
+        );
+
+        match parsed {
+            Some(AppCommand::InjectLocalMessage { text, .. }) => {
+                assert_eq!(text, "Usage: /commercial [30|60|90|120|150|180]");
+            }
+            other => panic!("expected usage local message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_commercial_accepts_supported_duration_argument() {
+        let channel = ChannelId::new("somechannel");
+        let parsed = parse_slash_command(
+            "/commercial 90",
+            &channel,
+            None,
+            None,
+            true,
+            0,
+            true,
+            true,
+        );
+
+        match parsed {
+            Some(AppCommand::StartCommercial { length_secs, .. }) => {
+                assert_eq!(length_secs, 90);
+            }
+            other => panic!("expected StartCommercial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_marker_rejects_description_over_140_chars() {
+        let channel = ChannelId::new("somechannel");
+        let long = format!("/marker {}", "x".repeat(141));
+        let parsed = parse_slash_command(&long, &channel, None, None, true, 0, true, true);
+
+        match parsed {
+            Some(AppCommand::InjectLocalMessage { text, .. }) => {
+                assert_eq!(text, "Usage: /marker [description up to 140 characters]");
+            }
+            other => panic!("expected usage local message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_marker_accepts_trimmed_description() {
+        let channel = ChannelId::new("somechannel");
+        let parsed = parse_slash_command(
+            "/marker   clutch moment   ",
+            &channel,
+            None,
+            None,
+            true,
+            0,
+            true,
+            true,
+        );
+
+        match parsed {
+            Some(AppCommand::CreateStreamMarker { description, .. }) => {
+                assert_eq!(description.as_deref(), Some("clutch moment"));
+            }
+            other => panic!("expected CreateStreamMarker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_poll_pipe_syntax_supports_points_flag() {
+        let channel = ChannelId::new("somechannel");
+        let parsed = parse_slash_command(
+            "/poll Best pet? | Cat | Dog --duration 90 --points 250",
+            &channel,
+            None,
+            None,
+            true,
+            0,
+            true,
+            true,
+        );
+
+        match parsed {
+            Some(AppCommand::CreatePoll {
+                title,
+                choices,
+                duration_secs,
+                channel_points_per_vote,
+                ..
+            }) => {
+                assert_eq!(title, "Best pet?");
+                assert_eq!(choices, vec!["Cat".to_owned(), "Dog".to_owned()]);
+                assert_eq!(duration_secs, 90);
+                assert_eq!(channel_points_per_vote, Some(250));
+            }
+            other => panic!("expected CreatePoll, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_poll_chatterino_flags_map_to_create_poll() {
+        let channel = ChannelId::new("somechannel");
+        let parsed = parse_slash_command(
+            "/poll --title \"Best fruit\" --choice \"Apple\" --choice \"Pear\" --duration 2m --points 100",
+            &channel,
+            None,
+            None,
+            true,
+            0,
+            true,
+            true,
+        );
+
+        match parsed {
+            Some(AppCommand::CreatePoll {
+                title,
+                choices,
+                duration_secs,
+                channel_points_per_vote,
+                ..
+            }) => {
+                assert_eq!(title, "Best fruit");
+                assert_eq!(choices, vec!["Apple".to_owned(), "Pear".to_owned()]);
+                assert_eq!(duration_secs, 120);
+                assert_eq!(channel_points_per_vote, Some(100));
+            }
+            other => panic!("expected CreatePoll, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_unbanrequests_maps_to_fetch_command() {
+        let channel = ChannelId::new("somechannel");
+        let parsed = parse_slash_command(
+            "/unbanrequests",
+            &channel,
+            None,
+            None,
+            true,
+            0,
+            true,
+            true,
+        );
+
+        match parsed {
+            Some(AppCommand::FetchUnbanRequests { channel }) => {
+                assert_eq!(channel.as_str(), "somechannel");
+            }
+            other => panic!("expected FetchUnbanRequests, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_requests_defaults_to_current_channel_queue() {
+        let channel = ChannelId::new("somechannel");
+        let parsed = parse_slash_command("/requests", &channel, None, None, false, 0, true, true);
+
+        match parsed {
+            Some(AppCommand::OpenUrl { url }) => {
+                assert_eq!(url, "https://www.twitch.tv/popout/somechannel/reward-queue");
+            }
+            other => panic!("expected OpenUrl for reward queue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_requests_accepts_channel_argument() {
+        let channel = ChannelId::kick("somekickchannel");
+        let parsed = parse_slash_command(
+            "/requests #targetchannel",
+            &channel,
+            None,
+            None,
+            false,
+            0,
+            true,
+            true,
+        );
+
+        match parsed {
+            Some(AppCommand::OpenUrl { url }) => {
+                assert_eq!(url, "https://www.twitch.tv/popout/targetchannel/reward-queue");
+            }
+            other => panic!("expected OpenUrl for reward queue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_vote_maps_to_send_message() {
+        let channel = ChannelId::new("somechannel");
+        let parsed = parse_slash_command(
+            "/vote 2",
+            &channel,
+            None,
+            None,
+            false,
+            0,
+            true,
+            true,
+        );
+
+        match parsed {
+            Some(AppCommand::SendMessage { text, .. }) => {
+                assert_eq!(text, "/vote 2");
+            }
+            other => panic!("expected SendMessage for /vote, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_redeem_maps_alias_to_redeem_command() {
+        let channel = ChannelId::new("somechannel");
+        let parsed = parse_slash_command(
+            "/reward Highlight my message",
+            &channel,
+            None,
+            None,
+            false,
+            0,
+            true,
+            true,
+        );
+
+        match parsed {
+            Some(AppCommand::SendMessage { text, .. }) => {
+                assert_eq!(text, "/redeem Highlight my message");
+            }
+            other => panic!("expected SendMessage for /redeem, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_automod_maps_allow_action() {
+        let channel = ChannelId::new("somechannel");
+        let parsed = parse_slash_command(
+            "/automod allow msg-1 user-2",
+            &channel,
+            None,
+            None,
+            true,
+            0,
+            true,
+            true,
+        );
+
+        match parsed {
+            Some(AppCommand::ResolveAutoModMessage {
+                message_id,
+                sender_user_id,
+                action,
+                ..
+            }) => {
+                assert_eq!(message_id, "msg-1");
+                assert_eq!(sender_user_id, "user-2");
+                assert_eq!(action, "ALLOW");
+            }
+            other => panic!("expected ResolveAutoModMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_modtools_maps_to_open_tools_command() {
+        let channel = ChannelId::new("somechannel");
+        let parsed = parse_slash_command("/modtools", &channel, None, None, true, 0, true, true);
+
+        match parsed {
+            Some(AppCommand::OpenModerationTools { channel }) => {
+                assert_eq!(channel.as_ref().map(|c| c.as_str()), Some("somechannel"));
+            }
+            other => panic!("expected OpenModerationTools, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_resolveunban_maps_with_reason() {
+        let channel = ChannelId::new("somechannel");
+        let parsed = parse_slash_command(
+            "/resolveunban req-42 deny appeal rejected",
+            &channel,
+            None,
+            None,
+            true,
+            0,
+            true,
+            true,
+        );
+
+        match parsed {
+            Some(AppCommand::ResolveUnbanRequest {
+                request_id,
+                approve,
+                resolution_text,
+                ..
+            }) => {
+                assert_eq!(request_id, "req-42");
+                assert!(!approve);
+                assert_eq!(resolution_text.as_deref(), Some("appeal rejected"));
+            }
+            other => panic!("expected ResolveUnbanRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_untimeout_alias_maps_to_unban_forward() {
+        let channel = ChannelId::new("somechannel");
+        let parsed = parse_slash_command(
+            "/untimeout troublemaker",
+            &channel,
+            None,
+            None,
+            true,
+            0,
+            true,
+            true,
+        );
+
+        match parsed {
+            Some(AppCommand::SendMessage { text, .. }) => {
+                assert_eq!(text, "/unban troublemaker");
+            }
+            other => panic!("expected SendMessage forwarding to /unban, got {other:?}"),
+        }
     }
 }

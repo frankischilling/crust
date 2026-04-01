@@ -1,27 +1,23 @@
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use directories::ProjectDirs;
 use eframe::egui;
-use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use chrono::Utc;
-use crust_core::events::{AppCommand, AppEvent, ConnectionState};
+use crust_core::events::{
+    AppCommand, AppEvent, AutoModQueueItem, ConnectionState, UnbanRequestItem,
+};
 use crust_core::model::{
-    Badge, ChannelId, ChatMessage, EmoteCatalogEntry, MessageFlags, MessageId, MsgKind, Sender,
-    UserId,
+    Badge, ChannelId, ChatMessage, MessageFlags, MessageId, MsgKind, Sender, UserId,
 };
 use crust_emotes::{
     cache::EmoteCache,
-    providers::{
-        BttvProvider, EmoteInfo, FfzProvider, KickProvider, SevenTvProvider, TwitchGlobalProvider,
-    },
-    EmoteProvider,
+    providers::EmoteInfo,
 };
 use crust_kick::session::{KickEvent, KickSession, KickSessionCommand};
 use crust_storage::{AppSettings, LogStore, SettingsStore};
@@ -29,7 +25,7 @@ use crust_twitch::session::generic_irc::{
     is_raw_irc_protocol_line, GenericIrcEvent, GenericIrcSession, GenericIrcSessionCommand,
 };
 use crust_twitch::{
-    parse_line, parse_privmsg_irc,
+    eventsub::{EventSubCommand, EventSubEvent, EventSubNoticeKind, EventSubSession},
     session::client::{SessionCommand, TwitchEvent, TwitchSession},
 };
 use crust_ui::CrustApp;
@@ -40,6 +36,24 @@ use seventv::{
 };
 
 use runtime::assets::fetch_emote_image;
+use runtime::badges::{
+    load_badge_map_cache_into, load_channel_badges, load_global_badges, resolve_badge_url,
+    BadgeMap,
+};
+use runtime::emote_loading::{
+    load_channel_emotes, load_global_emotes, load_kick_channel_emotes, load_personal_7tv_emotes,
+};
+use runtime::eventsub_notices::{
+    eventsub_notice_to_message, moderation_action_effect_from_notice,
+    room_state_update_from_moderation_action, should_drop_duplicate_eventsub_notice,
+    should_emit_eventsub_notice_message, stream_status_is_live_from_notice,
+    ModerationActionEffect,
+};
+#[cfg(test)]
+use runtime::eventsub_notices::format_eventsub_notice_text;
+use runtime::history::{
+    load_local_older_messages, load_local_recent_messages, load_recent_messages,
+};
 use runtime::link_preview::fetch_link_preview;
 use runtime::profiles::{
     fetch_ivr_logs, fetch_self_avatar, fetch_twitch_user_profile, fetch_user_profile_for_channel,
@@ -57,6 +71,8 @@ const EVT_CHANNEL_SIZE: usize = 4096;
 const TWITCH_EVT_SIZE: usize = 4096;
 const KICK_EVT_SIZE: usize = 4096;
 const IRC_EVT_SIZE: usize = 4096;
+const EVENTSUB_EVT_SIZE: usize = 1024;
+const MODERATION_CMD_COOLDOWN: Duration = Duration::from_millis(500);
 const TWITCH_MAX_MESSAGE_CHARS: usize = 500;
 const TWITCH_GQL_URL: &str = "https://gql.twitch.tv/gql";
 const TWITCH_WEB_CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
@@ -82,6 +98,9 @@ static HISTORY_MSG_ID: std::sync::atomic::AtomicU64 =
 /// providers are all preserved (important for the emote picker catalog).
 type EmoteIndex = Arc<RwLock<std::collections::HashMap<String, EmoteInfo>>>;
 
+/// Track which emote codes are global (vs channel-specific).
+type GlobalCodes = Arc<RwLock<std::collections::HashSet<String>>>;
+
 /// Build the compound key used in [`EmoteIndex`].
 #[inline]
 fn emote_key(provider: &str, code: &str) -> String {
@@ -103,98 +122,6 @@ fn resolve_emote<'a>(
         }
     }
     None
-}
-
-/// Shared badge map: (scope, set_name, version) → image URL.
-/// `scope` is `""` for global badges, or the channel name for channel-specific badges.
-type BadgeMap = Arc<RwLock<std::collections::HashMap<(String, String, String), String>>>;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BadgeCacheEntry {
-    scope: String,
-    name: String,
-    version: String,
-    url: String,
-}
-
-fn badge_cache_path() -> Option<PathBuf> {
-    let dirs = ProjectDirs::from("dev", "crust", "crust")?;
-    Some(dirs.cache_dir().join("badges").join("badge_map.json"))
-}
-
-fn load_badge_map_cache_into(map: &BadgeMap) -> usize {
-    let Some(path) = badge_cache_path() else {
-        return 0;
-    };
-    let data = match std::fs::read_to_string(&path) {
-        Ok(v) => v,
-        Err(_) => return 0,
-    };
-
-    let parsed = match serde_json::from_str::<Vec<BadgeCacheEntry>>(&data) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("Failed to parse badge cache {:?}: {e}", path);
-            return 0;
-        }
-    };
-
-    let mut guard = map.write().unwrap();
-    for entry in &parsed {
-        guard.insert(
-            (
-                entry.scope.clone(),
-                entry.name.clone(),
-                entry.version.clone(),
-            ),
-            entry.url.clone(),
-        );
-    }
-    parsed.len()
-}
-
-fn persist_badge_map_cache(map: &BadgeMap) {
-    let Some(path) = badge_cache_path() else {
-        return;
-    };
-    let Some(parent) = path.parent() else {
-        return;
-    };
-
-    let snapshot: Vec<BadgeCacheEntry> = {
-        let guard = map.read().unwrap();
-        guard
-            .iter()
-            .map(|((scope, name, version), url)| BadgeCacheEntry {
-                scope: scope.clone(),
-                name: name.clone(),
-                version: version.clone(),
-                url: url.clone(),
-            })
-            .collect()
-    };
-
-    let payload = match serde_json::to_vec(&snapshot) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("Failed to serialize badge cache: {e}");
-            return;
-        }
-    };
-
-    if let Err(e) = std::fs::create_dir_all(parent) {
-        warn!("Failed to create badge cache dir {:?}: {e}", parent);
-        return;
-    }
-
-    let tmp = path.with_extension("json.tmp");
-    if let Err(e) = std::fs::write(&tmp, payload) {
-        warn!("Failed writing temporary badge cache {:?}: {e}", tmp);
-        return;
-    }
-    if let Err(e) = std::fs::rename(&tmp, &path) {
-        warn!("Failed replacing badge cache {:?}: {e}", path);
-    }
 }
 
 fn main() -> Result<()> {
@@ -262,6 +189,10 @@ fn main() -> Result<()> {
     // Generic IRC session channels
     let (irc_evt_tx, irc_evt_rx) = mpsc::channel::<GenericIrcEvent>(IRC_EVT_SIZE);
     let (irc_cmd_tx, irc_cmd_rx) = mpsc::channel::<GenericIrcSessionCommand>(128);
+
+    // Twitch EventSub channels
+    let (eventsub_evt_tx, eventsub_evt_rx) = mpsc::channel::<EventSubEvent>(EVENTSUB_EVT_SIZE);
+    let (eventsub_cmd_tx, eventsub_cmd_rx) = mpsc::channel::<EventSubCommand>(128);
 
     // Emote index shared between loaders and reducer
     let emote_index: EmoteIndex = Arc::new(RwLock::new(std::collections::HashMap::new()));
@@ -346,6 +277,12 @@ fn main() -> Result<()> {
         });
     }
 
+    // Spawn Twitch EventSub websocket/session manager.
+    rt.spawn({
+        let session = EventSubSession::new(eventsub_evt_tx, eventsub_cmd_rx);
+        session.run()
+    });
+
     // Load global emotes in background
     rt.spawn({
         let idx = emote_index.clone();
@@ -379,10 +316,12 @@ fn main() -> Result<()> {
             tw_evt_rx,
             kick_evt_rx,
             irc_evt_rx,
+            eventsub_evt_rx,
             evt_tx,
             sess_cmd_tx,
             kick_cmd_tx,
             irc_cmd_tx,
+            eventsub_cmd_tx,
             idx,
             cache,
             bm,
@@ -450,6 +389,10 @@ enum TokenValidationResult {
         token: String,
         result: Result<ValidateInfo, ValidateError>,
     },
+    Refresh {
+        token: String,
+        result: Result<ValidateInfo, ValidateError>,
+    },
 }
 
 /// Central reducer: receives raw Twitch/Kick events + UI commands, tokenizes
@@ -459,10 +402,12 @@ async fn reducer_loop(
     mut tw_rx: mpsc::Receiver<TwitchEvent>,
     mut kick_rx: mpsc::Receiver<KickEvent>,
     mut irc_rx: mpsc::Receiver<GenericIrcEvent>,
+    mut eventsub_rx: mpsc::Receiver<EventSubEvent>,
     evt_tx: mpsc::Sender<AppEvent>,
     sess_tx: mpsc::Sender<SessionCommand>,
     kick_tx: mpsc::Sender<KickSessionCommand>,
     irc_tx: mpsc::Sender<GenericIrcSessionCommand>,
+    eventsub_tx: mpsc::Sender<EventSubCommand>,
     emote_index: EmoteIndex,
     emote_cache: Option<EmoteCache>,
     badge_map: BadgeMap,
@@ -477,6 +422,13 @@ async fn reducer_loop(
     let mut pending_images: HashSet<String> = HashSet::new();
     // Track URLs we've already kicked off a link-preview fetch for.
     let mut pending_link_previews: HashSet<String> = HashSet::new();
+    // Track recent EventSub metadata.message_id values to avoid applying
+    // duplicated moderation/state events after websocket reconnects.
+    let mut seen_eventsub_notice_ids: HashMap<String, Instant> = HashMap::new();
+    let mut seen_eventsub_notice_gc_at = Instant::now();
+    // Simple per-channel cooldown for local moderation actions to avoid
+    // accidental duplicate requests from rapid clicks/hotkeys.
+    let mut moderation_cmd_cooldowns: HashMap<String, Instant> = HashMap::new();
 
     // 7TV cosmetics cache: global badges/paints + per-user resolved styles.
     let (stv_update_tx, mut stv_update_rx) = mpsc::channel::<SevenTvCosmeticUpdate>(512);
@@ -690,9 +642,29 @@ async fn reducer_loop(
     let _ = evt_tx
         .send(AppEvent::GeneralSettingsUpdated {
             show_timestamps: settings.show_timestamps,
+            show_timestamp_seconds: settings.show_timestamp_seconds,
+            use_24h_timestamps: settings.use_24h_timestamps,
+            local_log_indexing_enabled: settings.local_log_indexing_enabled,
             auto_join: settings.auto_join.clone(),
             highlights: settings.highlights.clone(),
             ignores: settings.ignores.clone(),
+            desktop_notifications_enabled: settings.desktop_notifications_enabled,
+        })
+        .await;
+    let _ = evt_tx
+        .send(AppEvent::SlashUsageCountsUpdated {
+            usage_counts: settings
+                .slash_usage_counts
+                .iter()
+                .map(|(name, count)| (name.clone(), *count))
+                .collect(),
+        })
+        .await;
+    let _ = evt_tx
+        .send(AppEvent::EmotePickerPreferencesUpdated {
+            favorites: settings.emote_picker_favorites.clone(),
+            recent: settings.emote_picker_recent.clone(),
+            provider_boost: settings.emote_picker_provider_boost.clone(),
         })
         .await;
     let _ = evt_tx
@@ -813,6 +785,11 @@ async fn reducer_loop(
                     TwitchEvent::RoomState { channel, room_id, emote_only, followers_only, slow, subs_only, r9k } => {
                         info!("Got room-id {room_id} for #{channel}");
                         channel_room_ids.insert(channel.clone(), room_id.clone());
+                        let _ = eventsub_tx
+                            .send(EventSubCommand::WatchChannel {
+                                broadcaster_id: room_id.clone(),
+                            })
+                            .await;
 
                         // Forward room-mode updates to the UI.
                         let _ = evt_tx.send(AppEvent::RoomStateUpdated {
@@ -854,12 +831,14 @@ async fn reducer_loop(
                         });
                         // Load persisted local chat history first (SQLite),
                         // then merge remote history on top.
-                        if let Some(store) = chat_logs.clone() {
+                        if settings.local_log_indexing_enabled {
+                            if let Some(store) = chat_logs.clone() {
                             let ch_local = channel.clone();
                             let etx_local = evt_tx.clone();
                             tokio::spawn(async move {
                                 load_local_recent_messages(ch_local, store, etx_local).await;
                             });
+                            }
                         }
                         // Load recent chat history
                         let ch_hist = channel.clone();
@@ -900,6 +879,22 @@ async fn reducer_loop(
 
                         auth_username = Some(username.clone());
                         auth_user_id = Some(user_id.clone());
+                        sync_eventsub_auth(
+                            &eventsub_tx,
+                            &settings,
+                            helix_client_id.as_deref(),
+                            Some(&user_id),
+                        )
+                        .await;
+
+                        for broadcaster_id in channel_room_ids.values() {
+                            let _ = eventsub_tx
+                                .send(EventSubCommand::WatchChannel {
+                                    broadcaster_id: broadcaster_id.clone(),
+                                })
+                                .await;
+                        }
+
                         let _ = evt_tx.send(AppEvent::Authenticated {
                             username,
                             user_id: user_id.clone(),
@@ -1069,9 +1064,11 @@ async fn reducer_loop(
                         }
 
                         let channel = msg.channel.clone();
-                        if let Some(store) = chat_logs.as_ref() {
+                        if settings.local_log_indexing_enabled {
+                            if let Some(store) = chat_logs.as_ref() {
                             if let Err(e) = store.append_message(&msg) {
                                 warn!("chat-log: failed to persist Twitch message: {e}");
+                            }
                             }
                         }
                         let _ = evt_tx.send(AppEvent::MessageReceived {
@@ -1144,6 +1141,11 @@ async fn reducer_loop(
                         }).await;
                     }
                     TwitchEvent::ChatCleared { channel } => {
+                        let _ = evt_tx
+                            .send(AppEvent::ChannelMessagesCleared {
+                                channel: channel.clone(),
+                            })
+                            .await;
                         let msg = make_system_message(
                             local_msg_id, channel.clone(),
                             "Chat was cleared by a moderator.".to_owned(),
@@ -1344,9 +1346,11 @@ async fn reducer_loop(
                         }
 
                         let channel = msg.channel.clone();
-                        if let Some(store) = chat_logs.as_ref() {
+                        if settings.local_log_indexing_enabled {
+                            if let Some(store) = chat_logs.as_ref() {
                             if let Err(e) = store.append_message(&msg) {
                                 warn!("chat-log: failed to persist Kick message: {e}");
+                            }
                             }
                         }
                         let _ = evt_tx.send(AppEvent::MessageReceived {
@@ -1374,6 +1378,11 @@ async fn reducer_loop(
                         }).await;
                     }
                     KickEvent::ChatCleared { channel } => {
+                        let _ = evt_tx
+                            .send(AppEvent::ChannelMessagesCleared {
+                                channel: channel.clone(),
+                            })
+                            .await;
                         let msg = make_system_message(
                             local_msg_id, channel.clone(),
                             "Chat was cleared by a moderator.".to_owned(),
@@ -1598,15 +1607,268 @@ async fn reducer_loop(
                         }
 
                         let channel = msg.channel.clone();
-                        if let Some(store) = chat_logs.as_ref() {
+                        if settings.local_log_indexing_enabled {
+                            if let Some(store) = chat_logs.as_ref() {
                             if let Err(e) = store.append_message(&msg) {
                                 warn!("chat-log: failed to persist IRC message: {e}");
+                            }
                             }
                         }
                         let _ = evt_tx.send(AppEvent::MessageReceived {
                             channel,
                             message: msg,
                         }).await;
+                    }
+                }
+            }
+
+            // Twitch EventSub notifications and reconnect/backfill signals.
+            Some(eventsub_evt) = eventsub_rx.recv() => {
+                match eventsub_evt {
+                    EventSubEvent::Connected { resumed } => {
+                        info!("EventSub connected (resumed={resumed})");
+                    }
+                    EventSubEvent::Reconnecting { attempt } => {
+                        debug!("EventSub reconnect attempt {attempt}");
+                    }
+                    EventSubEvent::BackfillRequested => {
+                        // Refresh per-channel profile snapshots after reconnect so
+                        // online/offline title/game UI catches up immediately.
+                        let twitch_channels: Vec<String> = channel_room_ids
+                            .keys()
+                            .filter(|ch| ch.is_twitch())
+                            .map(|ch| ch.display_name().to_owned())
+                            .collect();
+                        for login in twitch_channels {
+                            let etx = evt_tx.clone();
+                            tokio::spawn(async move {
+                                fetch_twitch_user_profile(&login, etx).await;
+                            });
+                        }
+                    }
+                    EventSubEvent::Notice(notice) => {
+                        if let Some(event_id) = notice.event_id.as_deref() {
+                            let now = Instant::now();
+                            if should_drop_duplicate_eventsub_notice(
+                                &mut seen_eventsub_notice_ids,
+                                event_id,
+                                now,
+                                &mut seen_eventsub_notice_gc_at,
+                            ) {
+                                debug!("Skipping duplicate EventSub notice id={event_id}");
+                                continue;
+                            }
+                        }
+
+                        let channel = channel_room_ids
+                            .iter()
+                            .find(|(_, room_id)| *room_id == &notice.broadcaster_id)
+                            .map(|(ch, _)| ch.clone())
+                            .or_else(|| {
+                                notice
+                                    .broadcaster_login
+                                    .as_ref()
+                                    .map(|login| ChannelId::new(login.clone()))
+                            });
+
+                        if let Some(channel) = channel {
+                            match &notice.kind {
+                                EventSubNoticeKind::AutoModMessageHold {
+                                    message_id,
+                                    sender_user_id,
+                                    sender_login,
+                                    text,
+                                    reason,
+                                } => {
+                                    if !message_id.trim().is_empty() {
+                                        let _ = evt_tx
+                                            .send(AppEvent::AutoModQueueAppend {
+                                                channel: channel.clone(),
+                                                item: AutoModQueueItem {
+                                                    message_id: message_id.clone(),
+                                                    sender_user_id: sender_user_id.clone(),
+                                                    sender_login: sender_login.clone(),
+                                                    text: text.clone(),
+                                                    reason: reason.clone(),
+                                                },
+                                            })
+                                            .await;
+                                    }
+                                }
+                                EventSubNoticeKind::AutoModMessageUpdate {
+                                    message_id,
+                                    status,
+                                } => {
+                                    if !message_id.trim().is_empty() {
+                                        let _ = evt_tx
+                                            .send(AppEvent::AutoModQueueRemove {
+                                                channel: channel.clone(),
+                                                message_id: message_id.clone(),
+                                                action: Some(status.clone()),
+                                            })
+                                            .await;
+                                    }
+                                }
+                                EventSubNoticeKind::UnbanRequestCreate {
+                                    request_id,
+                                    user_id,
+                                    user_login,
+                                    text,
+                                    created_at,
+                                } => {
+                                    if !request_id.trim().is_empty() {
+                                        let _ = evt_tx
+                                            .send(AppEvent::UnbanRequestUpsert {
+                                                channel: channel.clone(),
+                                                request: UnbanRequestItem {
+                                                    request_id: request_id.clone(),
+                                                    user_id: user_id.clone(),
+                                                    user_login: user_login.clone(),
+                                                    text: text.clone(),
+                                                    created_at: created_at.clone(),
+                                                    status: Some("PENDING".to_owned()),
+                                                },
+                                            })
+                                            .await;
+                                    }
+                                }
+                                EventSubNoticeKind::UnbanRequestResolve {
+                                    request_id,
+                                    status,
+                                } => {
+                                    if !request_id.trim().is_empty() {
+                                        let _ = evt_tx
+                                            .send(AppEvent::UnbanRequestResolved {
+                                                channel: channel.clone(),
+                                                request_id: request_id.clone(),
+                                                status: status.clone(),
+                                            })
+                                            .await;
+                                    }
+                                }
+                                EventSubNoticeKind::ChannelBan { user_login, .. } => {
+                                    if !user_login.trim().is_empty() {
+                                        let _ = evt_tx
+                                            .send(AppEvent::UserMessagesCleared {
+                                                channel: channel.clone(),
+                                                login: user_login.clone(),
+                                            })
+                                            .await;
+                                    }
+                                }
+                                EventSubNoticeKind::ModerationAction {
+                                    action,
+                                    target_login,
+                                    target_message_id,
+                                    ..
+                                } => {
+                                    if let Some((emote_only, followers_only, slow, subs_only, r9k)) =
+                                        room_state_update_from_moderation_action(action)
+                                    {
+                                        let _ = evt_tx
+                                            .send(AppEvent::RoomStateUpdated {
+                                                channel: channel.clone(),
+                                                emote_only,
+                                                followers_only,
+                                                slow,
+                                                subs_only,
+                                                r9k,
+                                            })
+                                            .await;
+                                    }
+
+                                    if let Some(effect) = moderation_action_effect_from_notice(
+                                        action,
+                                        target_login.as_deref(),
+                                        target_message_id.as_deref(),
+                                    ) {
+                                        match effect {
+                                            ModerationActionEffect::ChannelMessagesCleared => {
+                                                let _ = evt_tx
+                                                    .send(AppEvent::ChannelMessagesCleared {
+                                                        channel: channel.clone(),
+                                                    })
+                                                    .await;
+                                            }
+                                            ModerationActionEffect::UserMessagesCleared(login) => {
+                                                let _ = evt_tx
+                                                    .send(AppEvent::UserMessagesCleared {
+                                                        channel: channel.clone(),
+                                                        login,
+                                                    })
+                                                    .await;
+                                            }
+                                            ModerationActionEffect::MessageDeleted(server_id) => {
+                                                let _ = evt_tx
+                                                    .send(AppEvent::MessageDeleted {
+                                                        channel: channel.clone(),
+                                                        server_id,
+                                                    })
+                                                    .await;
+                                            }
+                                        }
+                                    }
+                                }
+                                EventSubNoticeKind::StreamOnline
+                                | EventSubNoticeKind::StreamOffline => {
+                                    let is_live =
+                                        stream_status_is_live_from_notice(&notice.kind).unwrap_or(false);
+                                    let login = notice
+                                        .broadcaster_login
+                                        .as_deref()
+                                        .map(str::trim)
+                                        .filter(|s| !s.is_empty())
+                                        .map(str::to_ascii_lowercase)
+                                        .unwrap_or_else(|| {
+                                            channel.display_name().to_ascii_lowercase()
+                                        });
+
+                                    if !login.is_empty() {
+                                        let _ = evt_tx
+                                            .send(AppEvent::StreamStatusUpdated {
+                                                login: login.clone(),
+                                                is_live,
+                                            })
+                                            .await;
+
+                                        if is_live {
+                                            let etx = evt_tx.clone();
+                                            tokio::spawn(async move {
+                                                fetch_twitch_user_profile(&login, etx).await;
+                                            });
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+
+                            if should_emit_eventsub_notice_message(&notice.kind) {
+                                let (msg_kind, text) = eventsub_notice_to_message(&notice.kind);
+                                let msg = make_system_message(
+                                    local_msg_id,
+                                    channel.clone(),
+                                    text,
+                                    Utc::now(),
+                                    msg_kind,
+                                );
+                                local_msg_id += 1;
+                                let _ = evt_tx
+                                    .send(AppEvent::MessageReceived {
+                                        channel,
+                                        message: msg,
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                    EventSubEvent::Error(message) => {
+                        warn!("EventSub error: {message}");
+                        let _ = evt_tx
+                            .send(AppEvent::Error {
+                                context: "EventSub".into(),
+                                message,
+                            })
+                            .await;
                     }
                 }
             }
@@ -1851,6 +2113,11 @@ async fn reducer_loop(
                             let _ = sess_tx.send(SessionCommand::LeaveChannel(channel.clone())).await;
                         }
                         let _ = evt_tx.send(AppEvent::ChannelParted { channel: channel.clone() }).await;
+                        if let Some(broadcaster_id) = channel_room_ids.remove(&channel) {
+                            let _ = eventsub_tx
+                                .send(EventSubCommand::UnwatchChannel { broadcaster_id })
+                                .await;
+                        }
                         // Persist to settings
                         joined_channels.remove(&channel.0.to_lowercase());
                         save_channels(&settings_store, &mut settings, &joined_channels);
@@ -1914,6 +2181,7 @@ async fn reducer_loop(
                         }
                         auth_username = None;
                         auth_user_id = None;
+                        let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
                         let _ = sess_tx.send(SessionCommand::LogoutAndReconnect).await;
                         let _ = evt_tx.send(AppEvent::LoggedOut).await;
                         // Broadcast updated account list.
@@ -1951,6 +2219,7 @@ async fn reducer_loop(
                             auth_username = None;
                             auth_user_id = None;
                             let _ = evt_tx.send(AppEvent::LoggedOut).await;
+                            let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
                             auth_in_progress = true;
                             let _ = sess_tx.send(SessionCommand::Authenticate {
                                 token,
@@ -1998,6 +2267,7 @@ async fn reducer_loop(
                                     auth_username = None;
                                     auth_user_id = None;
                                     settings.username = String::new();
+                                    let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
                                     let _ = sess_tx.send(SessionCommand::LogoutAndReconnect).await;
                                     let _ = evt_tx.send(AppEvent::LoggedOut).await;
                                 }
@@ -2005,6 +2275,7 @@ async fn reducer_loop(
                                 auth_username = None;
                                 auth_user_id = None;
                                 settings.username = String::new();
+                                let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
                                 let _ = sess_tx.send(SessionCommand::LogoutAndReconnect).await;
                                 let _ = evt_tx.send(AppEvent::LoggedOut).await;
                             }
@@ -2153,6 +2424,9 @@ async fn reducer_loop(
                     }
                     AppCommand::SetGeneralSettings {
                         show_timestamps,
+                        show_timestamp_seconds,
+                        use_24h_timestamps,
+                        local_log_indexing_enabled,
                         auto_join,
                         highlights,
                         ignores,
@@ -2194,6 +2468,9 @@ async fn reducer_loop(
                         }
 
                         settings.show_timestamps = show_timestamps;
+                        settings.show_timestamp_seconds = show_timestamp_seconds;
+                        settings.use_24h_timestamps = use_24h_timestamps;
+                        settings.local_log_indexing_enabled = local_log_indexing_enabled;
                         settings.auto_join = sanitized_auto_join.clone();
                         settings.highlights = sanitized_highlights.clone();
                         settings.ignores = sanitized_ignores.clone();
@@ -2208,9 +2485,119 @@ async fn reducer_loop(
                         let _ = evt_tx
                             .send(AppEvent::GeneralSettingsUpdated {
                                 show_timestamps: settings.show_timestamps,
+                                show_timestamp_seconds: settings.show_timestamp_seconds,
+                                use_24h_timestamps: settings.use_24h_timestamps,
+                                local_log_indexing_enabled: settings
+                                    .local_log_indexing_enabled,
                                 auto_join: settings.auto_join.clone(),
                                 highlights: settings.highlights.clone(),
                                 ignores: settings.ignores.clone(),
+                                desktop_notifications_enabled: settings
+                                    .desktop_notifications_enabled,
+                            })
+                            .await;
+                    }
+                    AppCommand::SetSlashUsageCounts { usage_counts } => {
+                        let mut sanitized: BTreeMap<String, u32> = BTreeMap::new();
+                        for (raw_name, count) in usage_counts {
+                            let key = raw_name
+                                .trim()
+                                .trim_start_matches('/')
+                                .to_ascii_lowercase();
+                            if key.is_empty() {
+                                continue;
+                            }
+                            let entry = sanitized.entry(key).or_insert(0);
+                            *entry = entry.saturating_add(count);
+                        }
+
+                        // Keep only the most-used commands to avoid unbounded growth
+                        // from arbitrary slash tokens.
+                        const MAX_SLASH_USAGE_ENTRIES: usize = 128;
+                        if sanitized.len() > MAX_SLASH_USAGE_ENTRIES {
+                            let mut ranked: Vec<(String, u32)> = sanitized.into_iter().collect();
+                            ranked.sort_by(|(a_name, a_count), (b_name, b_count)| {
+                                b_count.cmp(a_count).then_with(|| a_name.cmp(b_name))
+                            });
+                            ranked.truncate(MAX_SLASH_USAGE_ENTRIES);
+                            ranked.sort_by(|(a_name, _), (b_name, _)| a_name.cmp(b_name));
+                            sanitized = ranked.into_iter().collect();
+                        }
+
+                        settings.slash_usage_counts = sanitized.clone();
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save slash usage counts: {e}");
+                            }
+                        }
+
+                        let _ = evt_tx
+                            .send(AppEvent::SlashUsageCountsUpdated {
+                                usage_counts: sanitized.into_iter().collect(),
+                            })
+                            .await;
+                    }
+                    AppCommand::SetEmotePickerPreferences {
+                        favorites,
+                        recent,
+                        provider_boost,
+                    } => {
+                        let mut seen_favs: HashSet<String> = HashSet::new();
+                        let mut sanitized_favorites: Vec<String> = Vec::new();
+                        for raw in favorites {
+                            let trimmed = raw.trim();
+                            if trimmed.is_empty() {
+                                continue;
+                            }
+                            let key = trimmed.to_ascii_lowercase();
+                            if seen_favs.insert(key) {
+                                sanitized_favorites.push(trimmed.to_owned());
+                            }
+                        }
+
+                        let mut seen_recent: HashSet<String> = HashSet::new();
+                        let mut sanitized_recent: Vec<String> = Vec::new();
+                        for raw in recent {
+                            let trimmed = raw.trim();
+                            if trimmed.is_empty() {
+                                continue;
+                            }
+                            let key = trimmed.to_ascii_lowercase();
+                            if seen_recent.insert(key) {
+                                sanitized_recent.push(trimmed.to_owned());
+                            }
+                            if sanitized_recent.len() >= 80 {
+                                break;
+                            }
+                        }
+
+                        let sanitized_boost = provider_boost
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_ascii_lowercase)
+                            .filter(|s| {
+                                matches!(
+                                    s.as_str(),
+                                    "twitch" | "7tv" | "bttv" | "ffz" | "emoji"
+                                )
+                            });
+
+                        settings.emote_picker_favorites = sanitized_favorites.clone();
+                        settings.emote_picker_recent = sanitized_recent.clone();
+                        settings.emote_picker_provider_boost = sanitized_boost.clone();
+
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save emote picker preferences: {e}");
+                            }
+                        }
+
+                        let _ = evt_tx
+                            .send(AppEvent::EmotePickerPreferencesUpdated {
+                                favorites: sanitized_favorites,
+                                recent: sanitized_recent,
+                                provider_boost: sanitized_boost,
                             })
                             .await;
                     }
@@ -2269,6 +2656,77 @@ async fn reducer_loop(
                                     settings.split_header_show_viewer_count,
                             })
                             .await;
+                    }
+                    AppCommand::SetHighlightRules { rules } => {
+                        settings.highlight_rules = rules.clone();
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save highlight rules: {e}");
+                            }
+                        }
+                        let _ = evt_tx
+                            .send(AppEvent::HighlightRulesUpdated { rules })
+                            .await;
+                    }
+                    AppCommand::SetFilterRecords { records } => {
+                        settings.filter_records = records.clone();
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save filter records: {e}");
+                            }
+                        }
+                        let _ = evt_tx
+                            .send(AppEvent::FilterRecordsUpdated { records })
+                            .await;
+                    }
+                    AppCommand::SetModActionPresets { presets } => {
+                        settings.mod_action_presets = presets.clone();
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save mod action presets: {e}");
+                            }
+                        }
+                        let _ = evt_tx
+                            .send(AppEvent::ModActionPresetsUpdated { presets })
+                            .await;
+                    }
+                    AppCommand::SetNotificationSettings {
+                        desktop_notifications_enabled,
+                    } => {
+                        settings.desktop_notifications_enabled = desktop_notifications_enabled;
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save notification settings: {e}");
+                            }
+                        }
+                    }
+                    AppCommand::RefreshAuth => {
+                        // Re-validate the stored OAuth token without forcing a
+                        // full logout/login flow.  If the token is still valid,
+                        // this is a no-op.  If invalid, the validate path will
+                        // emit AppEvent::AuthExpired so the UI can prompt the user.
+                        let active_user = settings.username.trim();
+                        let token_opt = if active_user.is_empty() {
+                            settings_store.as_ref().and_then(|s| s.load_token())
+                        } else {
+                            settings_store.as_ref().and_then(|s| {
+                                s.load_account_token(active_user).or_else(|| s.load_token())
+                            })
+                        };
+
+                        if let Some(token) = token_opt {
+                            let tx = token_val_tx.clone();
+                            tokio::spawn(async move {
+                                let result = validate_token(&token).await;
+                                let _ = tx
+                                    .send(TokenValidationResult::Refresh { token, result })
+                                    .await;
+                            });
+                        } else {
+                            let _ = evt_tx
+                                .send(AppEvent::AuthExpired)
+                                .await;
+                        }
                     }
                     AppCommand::SendMessage {
                         channel,
@@ -2550,6 +3008,23 @@ async fn reducer_loop(
                         tokio::spawn(async move { fetch_twitch_user_profile(&login, etx).await; });
                     }
                     AppCommand::TimeoutUser { channel, login, user_id, seconds, reason } => {
+                        if let Some(remaining) = moderation_command_remaining_cooldown(
+                            &mut moderation_cmd_cooldowns,
+                            &channel,
+                            Instant::now(),
+                        ) {
+                            let _ = evt_tx
+                                .send(AppEvent::Error {
+                                    context: "Moderation".into(),
+                                    message: format!(
+                                        "Moderation action is on cooldown. Try again in {}ms.",
+                                        remaining.as_millis()
+                                    ),
+                                })
+                                .await;
+                            continue;
+                        }
+
                         let broadcaster_id = channel_room_ids.get(&channel).cloned();
                         let moderator_id   = auth_user_id.clone();
                         let token          = settings.oauth_token.clone();
@@ -2566,7 +3041,39 @@ async fn reducer_loop(
                             ).await;
                         });
                     }
+                    AppCommand::DeleteMessage { channel, message_id } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let moderator_id   = auth_user_id.clone();
+                        let token          = settings.oauth_token.clone();
+                        let client_id      = helix_client_id.clone();
+                        let evt_tx2        = evt_tx.clone();
+                        let ch_name        = channel.clone();
+                        tokio::spawn(async move {
+                            helix_delete_message(
+                                &token, client_id.as_deref(),
+                                broadcaster_id.as_deref(), moderator_id.as_deref(),
+                                &message_id, &ch_name, evt_tx2,
+                            ).await;
+                        });
+                    }
                     AppCommand::BanUser { channel, login, user_id, reason } => {
+                        if let Some(remaining) = moderation_command_remaining_cooldown(
+                            &mut moderation_cmd_cooldowns,
+                            &channel,
+                            Instant::now(),
+                        ) {
+                            let _ = evt_tx
+                                .send(AppEvent::Error {
+                                    context: "Moderation".into(),
+                                    message: format!(
+                                        "Moderation action is on cooldown. Try again in {}ms.",
+                                        remaining.as_millis()
+                                    ),
+                                })
+                                .await;
+                            continue;
+                        }
+
                         let broadcaster_id = channel_room_ids.get(&channel).cloned();
                         let moderator_id   = auth_user_id.clone();
                         let token          = settings.oauth_token.clone();
@@ -2584,6 +3091,23 @@ async fn reducer_loop(
                         });
                     }
                     AppCommand::UnbanUser { channel, login, user_id } => {
+                        if let Some(remaining) = moderation_command_remaining_cooldown(
+                            &mut moderation_cmd_cooldowns,
+                            &channel,
+                            Instant::now(),
+                        ) {
+                            let _ = evt_tx
+                                .send(AppEvent::Error {
+                                    context: "Moderation".into(),
+                                    message: format!(
+                                        "Moderation action is on cooldown. Try again in {}ms.",
+                                        remaining.as_millis()
+                                    ),
+                                })
+                                .await;
+                            continue;
+                        }
+
                         let broadcaster_id = channel_room_ids.get(&channel).cloned();
                         let moderator_id   = auth_user_id.clone();
                         let token          = settings.oauth_token.clone();
@@ -2596,6 +3120,318 @@ async fn reducer_loop(
                                 broadcaster_id.as_deref(), moderator_id.as_deref(),
                                 &user_id, &login, &ch_name, evt_tx2,
                             ).await;
+                        });
+                    }
+                    AppCommand::ResolveAutoModMessage {
+                        channel,
+                        message_id,
+                        sender_user_id,
+                        action,
+                    } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let moderator_id = auth_user_id.clone();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        let ch_name = channel.clone();
+                        tokio::spawn(async move {
+                            helix_resolve_automod_message(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                moderator_id.as_deref(),
+                                &message_id,
+                                &sender_user_id,
+                                &action,
+                                &ch_name,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::FetchUnbanRequests { channel } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let moderator_id = auth_user_id.clone();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        let ch_name = channel.clone();
+                        tokio::spawn(async move {
+                            helix_fetch_unban_requests(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                moderator_id.as_deref(),
+                                &ch_name,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::ResolveUnbanRequest {
+                        channel,
+                        request_id,
+                        approve,
+                        resolution_text,
+                    } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let moderator_id = auth_user_id.clone();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        let ch_name = channel.clone();
+                        tokio::spawn(async move {
+                            helix_resolve_unban_request(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                moderator_id.as_deref(),
+                                &request_id,
+                                approve,
+                                resolution_text.as_deref(),
+                                &ch_name,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::OpenModerationTools { channel } => {
+                        let _ = evt_tx
+                            .send(AppEvent::OpenModerationTools { channel })
+                            .await;
+                    }
+                    AppCommand::UpdateRewardRedemptionStatus {
+                        channel,
+                        reward_id,
+                        redemption_id,
+                        status,
+                        user_login,
+                        reward_title,
+                    } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        let ch_name = channel.clone();
+                        tokio::spawn(async move {
+                            helix_update_reward_redemption_status(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                &reward_id,
+                                &redemption_id,
+                                &status,
+                                &user_login,
+                                &reward_title,
+                                &ch_name,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::CreatePoll {
+                        channel,
+                        title,
+                        choices,
+                        duration_secs,
+                        channel_points_per_vote,
+                    } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        tokio::spawn(async move {
+                            helix_create_poll(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                &title,
+                                &choices,
+                                duration_secs,
+                                channel_points_per_vote,
+                                &channel,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::EndPoll { channel, status } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        tokio::spawn(async move {
+                            helix_end_poll(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                &status,
+                                &channel,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::CreatePrediction {
+                        channel,
+                        title,
+                        outcomes,
+                        duration_secs,
+                    } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        tokio::spawn(async move {
+                            helix_create_prediction(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                &title,
+                                &outcomes,
+                                duration_secs,
+                                &channel,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::LockPrediction { channel } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        tokio::spawn(async move {
+                            helix_lock_prediction(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                &channel,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::ResolvePrediction {
+                        channel,
+                        winning_outcome_index,
+                    } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        tokio::spawn(async move {
+                            helix_resolve_prediction(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                winning_outcome_index,
+                                &channel,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::CancelPrediction { channel } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        tokio::spawn(async move {
+                            helix_cancel_prediction(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                &channel,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::StartCommercial {
+                        channel,
+                        length_secs,
+                    } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        tokio::spawn(async move {
+                            helix_start_commercial(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                length_secs,
+                                &channel,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::CreateStreamMarker {
+                        channel,
+                        description,
+                    } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        tokio::spawn(async move {
+                            helix_create_stream_marker(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                description.as_deref(),
+                                &channel,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::SendAnnouncement {
+                        channel,
+                        message,
+                        color,
+                    } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let moderator_id = auth_user_id.clone();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        tokio::spawn(async move {
+                            helix_send_announcement(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                moderator_id.as_deref(),
+                                &message,
+                                color.as_deref(),
+                                &channel,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::SendShoutout {
+                        channel,
+                        target_login,
+                    } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let moderator_id = auth_user_id.clone();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        tokio::spawn(async move {
+                            helix_send_shoutout(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                moderator_id.as_deref(),
+                                &target_login,
+                                &channel,
+                                evt_tx2,
+                            )
+                            .await;
                         });
                     }
                     AppCommand::ClearLocalMessages { channel } => {
@@ -2628,6 +3464,36 @@ async fn reducer_loop(
                             fetch_ivr_logs(&channel, &username, etx).await;
                         });
                     }
+                    AppCommand::LoadOlderLocalHistory {
+                        channel,
+                        before_ts_ms,
+                        limit,
+                    } => {
+                        if !settings.local_log_indexing_enabled {
+                            let _ = evt_tx
+                                .send(AppEvent::Error {
+                                    context: "History".into(),
+                                    message:
+                                        "Local log indexing is disabled in settings.".into(),
+                                })
+                                .await;
+                            continue;
+                        }
+                        let Some(store) = chat_logs.clone() else {
+                            let _ = evt_tx
+                                .send(AppEvent::Error {
+                                    context: "History".into(),
+                                    message: "Local history is unavailable on this system.".into(),
+                                })
+                                .await;
+                            continue;
+                        };
+                        let etx = evt_tx.clone();
+                        tokio::spawn(async move {
+                            load_local_older_messages(channel, before_ts_ms, limit, store, etx)
+                                .await;
+                        });
+                    }
                 }
             }
 
@@ -2648,6 +3514,13 @@ async fn reducer_loop(
                                         let _ = store.save(&settings);
                                     }
                                 }
+                                sync_eventsub_auth(
+                                    &eventsub_tx,
+                                    &settings,
+                                    helix_client_id.as_deref(),
+                                    auth_user_id.as_deref(),
+                                )
+                                .await;
                                 // auth_in_progress was already set to true before spawn
                                 let _ = sess_tx
                                     .send(SessionCommand::Authenticate { token, nick: login })
@@ -2656,6 +3529,7 @@ async fn reducer_loop(
                             Err(ValidateError::Unauthorized) => {
                                 warn!("Saved token rejected by Twitch, clearing and starting anonymous");
                                 auth_in_progress = false;
+                                let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
                                 if let Some(store) = &settings_store {
                                     let _ = store.delete_token();
                                 }
@@ -2664,6 +3538,7 @@ async fn reducer_loop(
                             Err(ValidateError::Transient(e)) => {
                                 warn!("Token validation failed ({e}), keeping token and starting anonymous");
                                 auth_in_progress = false;
+                                let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
                                 let _ = evt_tx.send(AppEvent::LoggedOut).await;
                             }
                         }
@@ -2697,6 +3572,7 @@ async fn reducer_loop(
                                     auth_user_id = None;
                                     let _ = evt_tx.send(AppEvent::LoggedOut).await;
                                 }
+                                let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
                                 auth_in_progress = true;
                                 let _ = sess_tx.send(SessionCommand::Authenticate {
                                     token,
@@ -2748,6 +3624,7 @@ async fn reducer_loop(
                                     auth_user_id = None;
                                     let _ = evt_tx.send(AppEvent::LoggedOut).await;
                                 }
+                                let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
                                 auth_in_progress = true;
                                 let _ = sess_tx.send(SessionCommand::Authenticate {
                                     token,
@@ -2770,6 +3647,54 @@ async fn reducer_loop(
                             }
                         }
                     }
+                    TokenValidationResult::Refresh { token, result } => {
+                        match result {
+                            Ok(info) => {
+                                let login = info.login;
+                                let client_id = info.client_id;
+
+                                if !client_id.is_empty() {
+                                    helix_client_id = Some(client_id);
+                                }
+                                // Keep legacy and active-account token fields in sync.
+                                settings.oauth_token = token.clone();
+                                if !settings.username.is_empty() {
+                                    if let Some(acc) = settings
+                                        .accounts
+                                        .iter_mut()
+                                        .find(|a| a.username == settings.username)
+                                    {
+                                        acc.oauth_token = token.clone();
+                                    }
+                                }
+                                if let Some(store) = &settings_store {
+                                    let _ = store.save(&settings);
+                                    if !settings.username.is_empty() {
+                                        store.try_save_account_keyring(&settings.username, &token);
+                                    }
+                                }
+
+                                // If the runtime lost auth state, re-authenticate silently.
+                                if auth_username.is_none() {
+                                    auth_in_progress = true;
+                                    let nick = if login.is_empty() {
+                                        settings.username.clone()
+                                    } else {
+                                        login
+                                    };
+                                    let _ = sess_tx
+                                        .send(SessionCommand::Authenticate { token, nick })
+                                        .await;
+                                }
+                            }
+                            Err(ValidateError::Unauthorized) => {
+                                let _ = evt_tx.send(AppEvent::AuthExpired).await;
+                            }
+                            Err(ValidateError::Transient(e)) => {
+                                warn!("RefreshAuth transient validation error: {e}");
+                            }
+                        }
+                    }
                 }
             }
 
@@ -2778,6 +3703,47 @@ async fn reducer_loop(
     }
 
     info!("Reducer loop exiting");
+}
+
+async fn sync_eventsub_auth(
+    eventsub_tx: &mpsc::Sender<EventSubCommand>,
+    settings: &AppSettings,
+    helix_client_id: Option<&str>,
+    auth_user_id: Option<&str>,
+) {
+    let token = settings.oauth_token.trim();
+    let cid = helix_client_id.unwrap_or("").trim();
+    let uid = auth_user_id.unwrap_or("").trim();
+
+    if token.is_empty() || cid.is_empty() || uid.is_empty() {
+        let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
+        return;
+    }
+
+    let _ = eventsub_tx
+        .send(EventSubCommand::SetAuth {
+            token: token.to_owned(),
+            client_id: cid.to_owned(),
+            user_id: uid.to_owned(),
+        })
+        .await;
+}
+
+fn moderation_command_remaining_cooldown(
+    cooldowns: &mut HashMap<String, Instant>,
+    channel: &ChannelId,
+    now: Instant,
+) -> Option<Duration> {
+    let key = channel.as_str().to_ascii_lowercase();
+    if let Some(last) = cooldowns.get(&key) {
+        let elapsed = now.duration_since(*last);
+        if elapsed < MODERATION_CMD_COOLDOWN {
+            return Some(MODERATION_CMD_COOLDOWN - elapsed);
+        }
+    }
+
+    cooldowns.insert(key, now);
+    None
 }
 
 /// Parse Kick inline emote tags like `[emote:<id>:<code>]` and return:
@@ -2855,1356 +3821,94 @@ fn kick_inline_emote_url(id: &str) -> String {
     format!("https://files.kick.com/emotes/{id}/fullsize")
 }
 
-// Emote loading
-
-/// Load global emotes from BTTV, FFZ, 7TV and register in the shared index.
-type GlobalCodes = Arc<RwLock<std::collections::HashSet<String>>>;
-
-async fn load_global_emotes(
-    index: &EmoteIndex,
-    cache: &Option<EmoteCache>,
-    evt_tx: &mpsc::Sender<AppEvent>,
-    global_codes: &GlobalCodes,
-) {
-    info!("Loading global emotes…");
-
-    let bttv = BttvProvider::new();
-    let ffz = FfzProvider::new();
-    let stv = SevenTvProvider::new();
-    let twg = TwitchGlobalProvider::new();
-
-    let (b, f, s, t) = tokio::join!(
-        bttv.load_global(),
-        ffz.load_global(),
-        stv.load_global(),
-        twg.load_global(),
-    );
-
-    let total = b.len() + f.len() + s.len() + t.len();
-    info!(
-        "Loaded {total} global emotes (BTTV={}, FFZ={}, 7TV={}, Twitch={})",
-        b.len(),
-        f.len(),
-        s.len(),
-        t.len(),
-    );
-
-    // Collect URLs of the newly-loaded emotes for prefetching.
-    let new_urls: Vec<String> = f
-        .iter()
-        .chain(b.iter())
-        .chain(s.iter())
-        .chain(t.iter())
-        .map(|e| e.url_1x.clone())
-        .collect();
-
-    // Insert each provider under its own compound key so duplicates across
-    // providers are preserved in the catalog.
-    {
-        let mut idx = index.write().unwrap();
-        for e in f {
-            idx.insert(emote_key(&e.provider, &e.code), e);
-        }
-        for e in b {
-            idx.insert(emote_key(&e.provider, &e.code), e);
-        }
-        for e in s {
-            idx.insert(emote_key(&e.provider, &e.code), e);
-        }
-        for e in t {
-            idx.insert(emote_key(&e.provider, &e.code), e);
-        }
-    }
-
-    // Also register with EmoteCache if available
-    if let Some(cache) = cache {
-        let idx = index.read().unwrap();
-        let emotes: Vec<EmoteInfo> = idx.values().cloned().collect();
-        drop(idx);
-        cache.register(emotes);
-    }
-
-    // Record global codes
-    {
-        let idx = index.read().unwrap();
-        let mut gc = global_codes.write().unwrap();
-        for info in idx.values() {
-            gc.insert(info.code.clone());
-        }
-    }
-
-    // Send catalog snapshot to the UI
-    send_emote_catalog(index, evt_tx, global_codes).await;
-
-    // Eagerly prefetch only the newly-loaded emote images
-    prefetch_emote_images(new_urls, cache, evt_tx);
-}
-
-/// Load channel-specific emotes from BTTV, FFZ, 7TV.
-/// Load the authenticated viewer's personal 7TV emote set and merge into the global index.
-async fn load_personal_7tv_emotes(
-    user_id: &str,
-    index: &EmoteIndex,
-    cache: &Option<EmoteCache>,
-    evt_tx: &mpsc::Sender<AppEvent>,
-    global_codes: &GlobalCodes,
-) {
-    info!("Loading personal 7TV emotes for user-id {user_id}");
-    let stv = SevenTvProvider::new();
-    let emotes = stv.load_channel(user_id).await;
-    if emotes.is_empty() {
-        info!("No personal 7TV emotes found for user-id {user_id}");
-        return;
-    }
-    info!(
-        "Loaded {} personal 7TV emotes for user-id {user_id}",
-        emotes.len()
-    );
-    let new_urls: Vec<String> = emotes.iter().map(|e| e.url_1x.clone()).collect();
-    {
-        let mut idx = index.write().unwrap();
-        for e in emotes {
-            idx.insert(emote_key(&e.provider, &e.code), e);
-        }
-    }
-    send_emote_catalog(index, evt_tx, global_codes).await;
-    prefetch_emote_images(new_urls, cache, evt_tx);
-}
-
-async fn load_channel_emotes(
-    channel_name: &str,
-    room_id: &str,
-    index: &EmoteIndex,
-    cache: &Option<EmoteCache>,
-    evt_tx: &mpsc::Sender<AppEvent>,
-    global_codes: &GlobalCodes,
-) {
-    info!("Loading channel emotes for #{channel_name} (room-id {room_id})");
-
-    let bttv = BttvProvider::new();
-    let ffz = FfzProvider::new();
-    let stv = SevenTvProvider::new();
-
-    let (b, f, s) = tokio::join!(
-        bttv.load_channel(room_id),
-        ffz.load_channel(room_id),
-        stv.load_channel(room_id),
-    );
-
-    let total = b.len() + f.len() + s.len();
-    if total == 0 {
-        warn!("No channel emotes found for #{channel_name}");
-        let _ = evt_tx
-            .send(AppEvent::ChannelEmotesLoaded {
-                channel: ChannelId::new(channel_name),
-                count: 0,
-            })
-            .await;
-        return;
-    }
-    info!(
-        "Loaded {total} channel emotes for #{channel_name} (BTTV={}, FFZ={}, 7TV={})",
-        b.len(),
-        f.len(),
-        s.len()
-    );
-
-    // Collect URLs of the newly-loaded emotes for prefetching.
-    let new_urls: Vec<String> = f
-        .iter()
-        .chain(b.iter())
-        .chain(s.iter())
-        .map(|e| e.url_1x.clone())
-        .collect();
-
-    {
-        let mut idx = index.write().unwrap();
-        for e in f {
-            idx.insert(emote_key(&e.provider, &e.code), e);
-        }
-        for e in b {
-            idx.insert(emote_key(&e.provider, &e.code), e);
-        }
-        for e in s {
-            idx.insert(emote_key(&e.provider, &e.code), e);
-        }
-    }
-
-    if let Some(cache) = cache {
-        let idx = index.read().unwrap();
-        let emotes: Vec<EmoteInfo> = idx.values().cloned().collect();
-        drop(idx);
-        cache.register(emotes);
-    }
-
-    // Send catalog snapshot to the UI
-    send_emote_catalog(index, evt_tx, global_codes).await;
-
-    let _ = evt_tx
-        .send(AppEvent::ChannelEmotesLoaded {
-            channel: ChannelId::new(channel_name),
-            count: total,
-        })
-        .await;
-
-    // Eagerly prefetch only the newly-loaded channel emote images
-    prefetch_emote_images(new_urls, cache, evt_tx);
-}
-
-/// Load Kick channel emotes from Kick-native and 7TV(Kick) providers.
-async fn load_kick_channel_emotes(
-    channel: &ChannelId,
-    kick_user_id: u64,
-    index: &EmoteIndex,
-    cache: &Option<EmoteCache>,
-    evt_tx: &mpsc::Sender<AppEvent>,
-    global_codes: &GlobalCodes,
-) {
-    let slug = channel.display_name().to_owned();
-    info!(
-        "Loading Kick emotes for {} (kick user-id {kick_user_id})",
-        channel.display_name()
-    );
-
-    let kick = KickProvider::new();
-    let stv = SevenTvProvider::new();
-
-    let (kick_emotes, stv_emotes) = tokio::join!(kick.load_channel(&slug), async {
-        if kick_user_id > 0 {
-            stv.load_kick_channel(&kick_user_id.to_string()).await
-        } else {
-            vec![]
-        }
-    },);
-
-    let total = kick_emotes.len() + stv_emotes.len();
-    if total == 0 {
-        warn!("No Kick emotes found for {}", channel.display_name());
-        let _ = evt_tx
-            .send(AppEvent::ChannelEmotesLoaded {
-                channel: channel.clone(),
-                count: 0,
-            })
-            .await;
-        return;
-    }
-
-    info!(
-        "Loaded {total} Kick channel emotes for {} (Kick={}, 7TV={})",
-        channel.display_name(),
-        kick_emotes.len(),
-        stv_emotes.len(),
-    );
-
-    let new_urls: Vec<String> = kick_emotes
-        .iter()
-        .chain(stv_emotes.iter())
-        .map(|e| e.url_1x.clone())
-        .collect();
-
-    {
-        let mut idx = index.write().unwrap();
-        for e in kick_emotes {
-            idx.insert(emote_key(&e.provider, &e.code), e);
-        }
-        for e in stv_emotes {
-            idx.insert(emote_key(&e.provider, &e.code), e);
-        }
-    }
-
-    if let Some(cache) = cache {
-        let idx = index.read().unwrap();
-        let emotes: Vec<EmoteInfo> = idx.values().cloned().collect();
-        drop(idx);
-        cache.register(emotes);
-    }
-
-    send_emote_catalog(index, evt_tx, global_codes).await;
-
-    let _ = evt_tx
-        .send(AppEvent::ChannelEmotesLoaded {
-            channel: channel.clone(),
-            count: total,
-        })
-        .await;
-
-    prefetch_emote_images(new_urls, cache, evt_tx);
-}
-
-/// Build a catalog snapshot from the emote index and send it to the UI.
-async fn send_emote_catalog(
-    index: &EmoteIndex,
-    evt_tx: &mpsc::Sender<AppEvent>,
-    global_codes: &GlobalCodes,
-) {
-    let entries: Vec<EmoteCatalogEntry> = {
-        let idx = index.read().unwrap();
-        let gc = global_codes.read().unwrap();
-        idx.values()
-            .map(|e| {
-                let scope = if gc.contains(&e.code) {
-                    "global"
-                } else {
-                    "channel"
-                };
-                EmoteCatalogEntry {
-                    code: e.code.clone(),
-                    provider: e.provider.clone(),
-                    url: e.url_1x.clone(),
-                    scope: scope.to_owned(),
-                }
-            })
-            .collect()
-    };
-    let _ = evt_tx
-        .send(AppEvent::EmoteCatalogUpdated { emotes: entries })
-        .await;
-}
-
-/// Eagerly prefetch emote images in the background so they're available
-/// in the emote picker and `:` autocomplete without waiting for lazy fetch.
-fn prefetch_emote_images(
-    urls: Vec<String>,
-    cache: &Option<EmoteCache>,
-    evt_tx: &mpsc::Sender<AppEvent>,
-) {
-    if urls.is_empty() {
-        return;
-    }
-    info!("Prefetching {} emote images…", urls.len());
-    let _ = evt_tx.try_send(AppEvent::ImagePrefetchQueued { count: urls.len() });
-
-    let sem = Arc::new(tokio::sync::Semaphore::new(20));
-
-    for url in urls {
-        let sem = sem.clone();
-        let cache = cache.clone();
-        let evt_tx = evt_tx.clone();
-        tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
-            fetch_emote_image(&url, &cache, &evt_tx).await;
-        });
-    }
-}
-
-// Badge loading
-
-/// Chatterino's bundled Twitch global badge dataset, used as a reliable
-/// fallback when live badge APIs are unavailable or return an unexpected shape.
-const CHATTERINO_TWITCH_BADGES_JSON: &str =
-    include_str!("../../../chatterino2-master/resources/twitch-badges.json");
-
-/// Resolve a badge image URL from the badge map.
-///
-/// Twitch IRC sends some badge versions as cumulative counts (e.g.
-/// `subscriber/28`, `bits/5000`) that don't directly match the fixed tier
-/// version keys stored by the badge API (e.g. `"0"`, `"3"`, `"6"`, `"24"`).
-/// When an exact match is not found this function falls back to the highest
-/// available version that is numerically ≤ the requested version, which
-/// selects the correct tier image without requiring a perfect key match.
-fn resolve_badge_url(
-    map: &std::collections::HashMap<(String, String, String), String>,
-    scope: &str,
-    name: &str,
-    version: &str,
-) -> Option<String> {
-    // Try channel-specific scope first, then fall back to global.
-    let scopes: &[&str] = if scope.is_empty() {
-        &[""]
-    } else {
-        &[scope, ""]
-    };
-    for s in scopes {
-        // Fast path: exact match.
-        if let Some(url) = map.get(&(s.to_string(), name.to_owned(), version.to_owned())) {
-            return Some(url.clone());
-        }
-        // Slow path: numeric fallback - find the highest available version ≤ version.
-        if let Ok(target) = version.parse::<u64>() {
-            let mut best: Option<(u64, &String)> = None;
-            for ((sc, n, v), url) in map {
-                if sc.as_str() == *s && n == name {
-                    if let Ok(candidate) = v.parse::<u64>() {
-                        if candidate <= target && best.map_or(true, |(b, _)| candidate > b) {
-                            best = Some((candidate, url));
-                        }
-                    }
-                }
-            }
-            if let Some((_, url)) = best {
-                return Some(url.clone());
-            }
-        }
-    }
-    None
-}
-
-/// Parse IVR badge response (flat JSON array) and insert into the badge map.
-fn parse_ivr_badge_response(
-    body: &str,
-    scope: &str,
-    map: &mut std::collections::HashMap<(String, String, String), String>,
-) {
-    #[derive(serde::Deserialize)]
-    struct Version {
-        id: String,
-        image_url_1x: String,
-        #[serde(default)]
-        image_url_2x: Option<String>,
-        #[serde(default)]
-        image_url_4x: Option<String>,
-    }
-    #[derive(serde::Deserialize)]
-    struct BadgeSet {
-        set_id: String,
-        versions: Vec<Version>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct ChatterinoBadgeVersion {
-        id: String,
-        image: String,
-    }
-
-    fn normalize_badge_url(url: String) -> String {
-        let url = if url.starts_with("//") {
-            format!("https:{url}")
-        } else {
-            url
-        };
-
-        // Some badge datasets (including Chatterino's bundled JSON) use
-        // base URLs that end in `/` and require a scale suffix (`/1`, `/2`, `/3`).
-        // Use `/3` (closest to Chatterino's high-res badge rendering).
-        if url.contains("/badges/v1/") {
-            let trimmed = url.trim_end_matches('/');
-            let tail = trimmed.rsplit('/').next().unwrap_or("");
-            let has_explicit_scale = matches!(tail, "1" | "2" | "3" | "4");
-            if !has_explicit_scale {
-                return format!("{trimmed}/3");
-            }
-        }
-
-        url
-    }
-
-    fn badge_set_aliases(set_id: &str) -> Vec<String> {
-        let mut out = Vec::with_capacity(3);
-        out.push(set_id.to_owned());
-
-        if set_id.contains('-') {
-            let alt = set_id.replace('-', "_");
-            if !out.iter().any(|v| v == &alt) {
-                out.push(alt);
-            }
-        }
-        if set_id.contains('_') {
-            let alt = set_id.replace('_', "-");
-            if !out.iter().any(|v| v == &alt) {
-                out.push(alt);
-            }
-        }
-
-        out
-    }
-
-    let scope = scope.to_owned();
-
-    // IVR classic shape: [{ set_id, versions: [...] }]
-    if let Ok(sets) = serde_json::from_str::<Vec<BadgeSet>>(body) {
-        for set in sets {
-            for ver in set.versions {
-                let version_id = ver.id;
-                let url = normalize_badge_url(
-                    ver.image_url_4x
-                        .or(ver.image_url_2x)
-                        .unwrap_or(ver.image_url_1x),
-                );
-
-                for set_id in badge_set_aliases(&set.set_id) {
-                    map.insert((scope.clone(), set_id, version_id.clone()), url.clone());
-                }
-            }
-        }
-        return;
-    }
-
-    // Chatterino/bundled shape: { "set_id": [{ id, image, ... }, ...], ... }
-    if let Ok(sets) =
-        serde_json::from_str::<std::collections::HashMap<String, Vec<ChatterinoBadgeVersion>>>(
-            body,
-        )
-    {
-        for (set_id, versions) in sets {
-            for ver in versions {
-                let url = normalize_badge_url(ver.image);
-                for alias in badge_set_aliases(&set_id) {
-                    map.insert((scope.clone(), alias, ver.id.clone()), url.clone());
-                }
-            }
-        }
-    }
-}
-
-/// Parse Twitch legacy badges.v1 response and insert into the badge map.
-///
-/// Shape:
-/// `{ "badge_sets": { "set_id": { "versions": { "1": { image_url_*x }}}}}`
-fn parse_badges_v1_response(
-    body: &str,
-    scope: &str,
-    map: &mut std::collections::HashMap<(String, String, String), String>,
-) {
-    #[derive(serde::Deserialize)]
-    struct Version {
-        #[serde(default)]
-        image_url_1x: Option<String>,
-        #[serde(default)]
-        image_url_2x: Option<String>,
-        #[serde(default)]
-        image_url_4x: Option<String>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct BadgeSet {
-        versions: std::collections::HashMap<String, Version>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct Payload {
-        badge_sets: std::collections::HashMap<String, BadgeSet>,
-    }
-
-    fn normalize_badge_url(url: String) -> String {
-        if url.starts_with("//") {
-            format!("https:{url}")
-        } else {
-            url
-        }
-    }
-
-    fn badge_set_aliases(set_id: &str) -> Vec<String> {
-        let mut out = Vec::with_capacity(3);
-        out.push(set_id.to_owned());
-        if set_id.contains('-') {
-            let alt = set_id.replace('-', "_");
-            if !out.iter().any(|v| v == &alt) {
-                out.push(alt);
-            }
-        }
-        if set_id.contains('_') {
-            let alt = set_id.replace('_', "-");
-            if !out.iter().any(|v| v == &alt) {
-                out.push(alt);
-            }
-        }
-        out
-    }
-
-    let payload = match serde_json::from_str::<Payload>(body) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-
-    let scope = scope.to_owned();
-    for (set_id, set) in payload.badge_sets {
-        for (version_id, ver) in set.versions {
-            let url = ver
-                .image_url_4x
-                .or(ver.image_url_2x)
-                .or(ver.image_url_1x)
-                .map(normalize_badge_url);
-            let Some(url) = url else {
-                continue;
-            };
-            for alias in badge_set_aliases(&set_id) {
-                map.insert((scope.clone(), alias, version_id.clone()), url.clone());
-            }
-        }
-    }
-}
-
-fn parse_helix_badge_response(
-    body: &str,
-    scope: &str,
-    map: &mut std::collections::HashMap<(String, String, String), String>,
-) {
-    #[derive(serde::Deserialize)]
-    struct Version {
-        id: String,
-        image_url_1x: String,
-        #[serde(default)]
-        image_url_2x: Option<String>,
-        #[serde(default)]
-        image_url_4x: Option<String>,
-    }
-    #[derive(serde::Deserialize)]
-    struct BadgeSet {
-        set_id: String,
-        versions: Vec<Version>,
-    }
-    #[derive(serde::Deserialize)]
-    struct Payload {
-        data: Vec<BadgeSet>,
-    }
-
-    fn normalize_badge_url(url: String) -> String {
-        if url.starts_with("//") {
-            format!("https:{url}")
-        } else {
-            url
-        }
-    }
-
-    fn badge_set_aliases(set_id: &str) -> Vec<String> {
-        let mut out = Vec::with_capacity(3);
-        out.push(set_id.to_owned());
-        if set_id.contains('-') {
-            let alt = set_id.replace('-', "_");
-            if !out.iter().any(|v| v == &alt) {
-                out.push(alt);
-            }
-        }
-        if set_id.contains('_') {
-            let alt = set_id.replace('_', "-");
-            if !out.iter().any(|v| v == &alt) {
-                out.push(alt);
-            }
-        }
-        out
-    }
-
-    let payload = match serde_json::from_str::<Payload>(body) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-
-    let scope = scope.to_owned();
-    for set in payload.data {
-        for ver in set.versions {
-            let url = normalize_badge_url(
-                ver.image_url_4x
-                    .or(ver.image_url_2x)
-                    .unwrap_or(ver.image_url_1x),
-            );
-            for alias in badge_set_aliases(&set.set_id) {
-                map.insert((scope.clone(), alias, ver.id.clone()), url.clone());
-            }
-        }
-    }
-}
-
-fn normalize_oauth_token(token: Option<&str>) -> Option<String> {
-    let raw = token?.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    Some(raw.strip_prefix("oauth:").unwrap_or(raw).to_owned())
-}
-
-async fn helix_auth_from_token(oauth_token: Option<&str>) -> Option<(String, String)> {
-    let bearer = normalize_oauth_token(oauth_token)?;
-    match validate_token(&bearer).await {
-        Ok(info) => Some((info.client_id, bearer)),
-        Err(e) => {
-            warn!("Helix auth setup failed while validating token: {e}");
-            None
-        }
-    }
-}
-
-async fn load_global_badges_v1_fallback(
-    badge_map: &BadgeMap,
-    cache: &Option<EmoteCache>,
-    evt_tx: &mpsc::Sender<AppEvent>,
-) {
-    if !host_resolves("badges.twitch.tv").await {
-        warn_badges_twitch_unresolved_once();
-        return;
-    }
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .user_agent("crust-badges/1.0")
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-    if let Some(text) = fetch_badge_payload_with_retries(
-        &client,
-        &["https://badges.twitch.tv/v1/badges/global/display"],
-        "badges.twitch.tv global fallback",
-        None,
-    )
-    .await
-    {
-        let new_urls = {
-            let mut map = badge_map.write().unwrap();
-            let before: std::collections::HashSet<String> = map.values().cloned().collect();
-            parse_badges_v1_response(&text, "", &mut map);
-            map.values()
-                .filter(|u| !before.contains(*u))
-                .cloned()
-                .collect::<Vec<_>>()
-        };
-        if !new_urls.is_empty() {
-            info!(
-                "Loaded {} global badges via badges.twitch.tv fallback",
-                new_urls.len()
-            );
-            prefetch_badge_images(new_urls, cache, evt_tx);
-            persist_badge_map_cache(badge_map);
-        }
-    }
-}
-
-async fn load_channel_badges_v1_fallback(
-    room_id: &str,
-    channel: &str,
-    badge_map: &BadgeMap,
-    cache: &Option<EmoteCache>,
-    evt_tx: &mpsc::Sender<AppEvent>,
-) {
-    if !host_resolves("badges.twitch.tv").await {
-        warn_badges_twitch_unresolved_once();
-        return;
-    }
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .user_agent("crust-badges/1.0")
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-    let url = format!("https://badges.twitch.tv/v1/badges/channels/{room_id}/display");
-    if let Some(text) = fetch_badge_payload_with_retries(
-        &client,
-        &[url.as_str()],
-        &format!("badges.twitch.tv channel fallback (room={room_id})"),
-        None,
-    )
-    .await
-    {
-        let new_urls = {
-            let mut map = badge_map.write().unwrap();
-            let before: std::collections::HashSet<String> = map.values().cloned().collect();
-            parse_badges_v1_response(&text, channel, &mut map);
-            map.values()
-                .filter(|u| !before.contains(*u))
-                .cloned()
-                .collect::<Vec<_>>()
-        };
-        if !new_urls.is_empty() {
-            info!(
-                "Loaded {} channel badges for room {room_id} via badges.twitch.tv fallback",
-                new_urls.len()
-            );
-            prefetch_badge_images(new_urls, cache, evt_tx);
-            persist_badge_map_cache(badge_map);
-        }
-    }
-}
-
-/// Load global Twitch badges via IVR API (no auth required).
-async fn load_global_badges(
-    badge_map: &BadgeMap,
-    cache: &Option<EmoteCache>,
-    evt_tx: &mpsc::Sender<AppEvent>,
-    oauth_token: Option<String>,
-) {
-    // Seed global badges from Chatterino's bundled catalog first so badge
-    // images still work when live API calls fail.
-    let bundled_urls = {
-        let mut map = badge_map.write().unwrap();
-        let before: std::collections::HashSet<String> = map.values().cloned().collect();
-        parse_ivr_badge_response(CHATTERINO_TWITCH_BADGES_JSON, "", &mut map);
-        map.values()
-            .filter(|u| !before.contains(*u))
-            .cloned()
-            .collect::<Vec<_>>()
-    };
-    if !bundled_urls.is_empty() {
-        info!(
-            "Loaded {} global badges from bundled Chatterino dataset",
-            bundled_urls.len()
-        );
-        prefetch_badge_images(bundled_urls, cache, evt_tx);
-        persist_badge_map_cache(badge_map);
-    }
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .user_agent("crust-badges/1.0")
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-    let helix_auth = helix_auth_from_token(oauth_token.as_deref()).await;
-    if let Some((ref client_id, ref token)) = helix_auth {
-        if let Some(text) = fetch_badge_payload_with_retries(
-            &client,
-            &["https://api.twitch.tv/helix/chat/badges/global"],
-            "Helix global badges",
-            Some((client_id.as_str(), token.as_str())),
-        )
-        .await
-        {
-            let new_urls = {
-                let mut map = badge_map.write().unwrap();
-                let before: std::collections::HashSet<String> = map.values().cloned().collect();
-                parse_helix_badge_response(&text, "", &mut map);
-                let after_count = map.len();
-                let new: Vec<String> = map
-                    .values()
-                    .filter(|u| !before.contains(*u))
-                    .cloned()
-                    .collect();
-                info!("Loaded {} global badges via Helix", after_count - before.len());
-                new
-            };
-            prefetch_badge_images(new_urls, cache, evt_tx);
-            persist_badge_map_cache(badge_map);
-            return;
-        }
-    }
-
-    if let Some(text) = fetch_badge_payload_with_retries(
-        &client,
-        &["https://api.ivr.fi/v2/twitch/badges/global"],
-        "IVR global badges",
-        None,
-    )
-    .await
-    {
-        let new_urls = {
-            let mut map = badge_map.write().unwrap();
-            let before: std::collections::HashSet<String> = map.values().cloned().collect();
-            parse_ivr_badge_response(&text, "", &mut map);
-            let after_count = map.len();
-            let new: Vec<String> = map
-                .values()
-                .filter(|u| !before.contains(*u))
-                .cloned()
-                .collect();
-            info!("Loaded {} global badges via IVR", after_count - before.len());
-            new
-        };
-        prefetch_badge_images(new_urls, cache, evt_tx);
-        persist_badge_map_cache(badge_map);
-    } else {
-        load_global_badges_v1_fallback(badge_map, cache, evt_tx).await;
-    }
-}
-
-/// Load channel-specific Twitch badges via IVR API (no auth required).
-async fn load_channel_badges(
-    room_id: &str,
-    channel: &str,
-    badge_map: &BadgeMap,
-    cache: &Option<EmoteCache>,
-    evt_tx: &mpsc::Sender<AppEvent>,
-    oauth_token: Option<String>,
-) {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .user_agent("crust-badges/1.0")
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-    let helix_auth = helix_auth_from_token(oauth_token.as_deref()).await;
-    if let Some((ref client_id, ref token)) = helix_auth {
-        let helix = format!("https://api.twitch.tv/helix/chat/badges?broadcaster_id={room_id}");
-        if let Some(text) = fetch_badge_payload_with_retries(
-            &client,
-            &[helix.as_str()],
-            &format!("Helix channel badges (room={room_id}, login={channel})"),
-            Some((client_id.as_str(), token.as_str())),
-        )
-        .await
-        {
-            let new_urls = {
-                let mut map = badge_map.write().unwrap();
-                let before: std::collections::HashSet<String> = map.values().cloned().collect();
-                parse_helix_badge_response(&text, channel, &mut map);
-                let new: Vec<String> = map
-                    .values()
-                    .filter(|u| !before.contains(*u))
-                    .cloned()
-                    .collect();
-                info!(
-                    "Loaded {} channel badges for room {room_id} via Helix",
-                    new.len()
-                );
-                new
-            };
-            prefetch_badge_images(new_urls, cache, evt_tx);
-            persist_badge_map_cache(badge_map);
-            return;
-        }
-    }
-
-    let ivr_by_id = format!("https://api.ivr.fi/v2/twitch/badges/channel?id={room_id}");
-    let ivr_by_login = format!("https://api.ivr.fi/v2/twitch/badges/channel?login={channel}");
-    if let Some(text) = fetch_badge_payload_with_retries(
-        &client,
-        &[ivr_by_id.as_str(), ivr_by_login.as_str()],
-        &format!("IVR channel badges (room={room_id}, login={channel})"),
-        None,
-    )
-    .await
-    {
-        let new_urls = {
-            let mut map = badge_map.write().unwrap();
-            let before: std::collections::HashSet<String> = map.values().cloned().collect();
-            parse_ivr_badge_response(&text, channel, &mut map);
-            let new: Vec<String> = map
-                .values()
-                .filter(|u| !before.contains(*u))
-                .cloned()
-                .collect();
-            info!(
-                "Loaded {} channel badges for room {room_id} via IVR",
-                new.len()
-            );
-            new
-        };
-        prefetch_badge_images(new_urls, cache, evt_tx);
-        persist_badge_map_cache(badge_map);
-    } else {
-        load_channel_badges_v1_fallback(room_id, channel, badge_map, cache, evt_tx).await;
-    }
-}
-
-async fn fetch_badge_payload_with_retries(
-    client: &reqwest::Client,
-    urls: &[&str],
-    label: &str,
-    auth: Option<(&str, &str)>,
-) -> Option<String> {
-    const ATTEMPTS: usize = 3;
-    for attempt in 0..ATTEMPTS {
-        for url in urls {
-            let mut req = client.get(*url);
-            if let Some((client_id, bearer)) = auth {
-                req = req
-                    .header("Client-Id", client_id)
-                    .header("Authorization", format!("Bearer {bearer}"));
-            }
-            match req.send().await {
-                Ok(resp) if resp.status().is_success() => match resp.text().await {
-                    Ok(text) => return Some(text),
-                    Err(e) => warn!("{label} body-read failed for {url}: {e}"),
-                },
-                Ok(resp) => warn!("{label} returned HTTP {} for {url}", resp.status()),
-                Err(e) => warn!("{label} request failed for {url}: {e}"),
-            }
-        }
-        if attempt + 1 < ATTEMPTS {
-            let delay_ms = 300 * (attempt as u64 + 1);
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-        }
-    }
-    None
-}
-
-async fn host_resolves(host: &str) -> bool {
-    match tokio::net::lookup_host((host, 443)).await {
-        Ok(mut addrs) => addrs.next().is_some(),
-        Err(_) => false,
-    }
-}
-
-fn warn_badges_twitch_unresolved_once() {
-    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        warn!(
-            "Skipping badges.twitch.tv fallback: host is not resolvable in this environment"
-        );
-    }
-}
-
-/// Eagerly prefetch a list of badge image URLs so they appear instantly
-/// in messages without waiting for the first chat message to trigger a fetch.
-fn prefetch_badge_images(
-    urls: Vec<String>,
-    cache: &Option<EmoteCache>,
-    evt_tx: &mpsc::Sender<AppEvent>,
-) {
-    if urls.is_empty() {
-        return;
-    }
-    info!("Prefetching {} badge images…", urls.len());
-    let _ = evt_tx.try_send(AppEvent::ImagePrefetchQueued { count: urls.len() });
-    let sem = Arc::new(tokio::sync::Semaphore::new(20));
-    for url in urls {
-        let sem = sem.clone();
-        let cache = cache.clone();
-        let evt_tx = evt_tx.clone();
-        tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
-            fetch_emote_image(&url, &cache, &evt_tx).await;
-        });
-    }
-}
-
-// Recent message history
-
-/// Load locally persisted chat history from SQLite and replay it as
-/// `AppEvent::HistoryLoaded` for the channel.
-async fn load_local_recent_messages(
-    channel: ChannelId,
-    log_store: LogStore,
-    evt_tx: mpsc::Sender<AppEvent>,
-) {
-    let channel_for_query = channel.clone();
-    let loaded = tokio::task::spawn_blocking(move || {
-        log_store.recent_messages(&channel_for_query, LogStore::default_recent_limit())
-    })
-    .await;
-
-    let mut messages = match loaded {
-        Ok(Ok(rows)) => rows,
-        Ok(Err(e)) => {
-            warn!(
-                "chat-history: local SQLite load failed for #{}: {e}",
-                channel.display_name()
-            );
-            return;
-        }
-        Err(e) => {
-            warn!(
-                "chat-history: local SQLite task failed for #{}: {e}",
-                channel.display_name()
-            );
-            return;
-        }
-    };
-
-    if messages.is_empty() {
-        return;
-    }
-
-    for msg in &mut messages {
-        msg.id = MessageId(HISTORY_MSG_ID.fetch_sub(1, std::sync::atomic::Ordering::Relaxed));
-        msg.flags.is_history = true;
-        msg.channel = channel.clone();
-    }
-
-    info!(
-        "chat-history: loaded {} local SQLite messages for #{}",
-        messages.len(),
-        channel.display_name()
-    );
-    let _ = evt_tx
-        .send(AppEvent::HistoryLoaded { channel, messages })
-        .await;
-}
-
-/// Fetch recent messages for a channel and send `AppEvent::HistoryLoaded`.
-/// Primary source: recent-messages.robotty.de (covers all channels, correct
-/// path uses a hyphen: /recent-messages/).  Fallback: logs.ivr.fi (large
-/// channels only, returns objects with a "raw" IRC line field, newest-first).
-async fn load_recent_messages(
-    channel: &str,
-    local_nick: Option<&str>,
-    emote_index: &EmoteIndex,
-    badge_map: &BadgeMap,
-    emote_cache: &Option<EmoteCache>,
-    evt_tx: &mpsc::Sender<AppEvent>,
-    stv_update_tx: &mpsc::Sender<SevenTvCosmeticUpdate>,
-) {
-    let ch = channel.trim_start_matches('#');
-    let channel_id = crust_core::model::ChannelId::new(ch);
-
-    info!("chat-history: fetching recent messages for #{ch}…");
-
-    // NOTE: the correct path is /recent-messages/ (hyphen), not /recent_messages/.
-    let robotty_url =
-        format!("https://recent-messages.robotty.de/api/v2/recent-messages/{ch}?limit=800");
-    let ivr_url = format!("https://logs.ivr.fi/channel/{ch}?json=1&reverse=true&limit=800");
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-
-    // Try robotty first; it covers all channels (including small ones).
-    // Fall back to IVR if robotty fails or returns nothing.
-    #[allow(unused_assignments)]
-    let mut robotty_err: Option<String> = None;
-    let raw_lines: Vec<String> = 'fetch: {
-        match client
-            .get(&robotty_url)
-            .header("Accept", "application/json")
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                let status = resp.status();
-                if status.is_success() {
-                    match resp.text().await {
-                        Ok(text) => {
-                            #[derive(serde::Deserialize)]
-                            struct RobottyResponse {
-                                messages: Vec<String>,
-                            }
-                            match serde_json::from_str::<RobottyResponse>(&text) {
-                                Ok(p) if !p.messages.is_empty() => {
-                                    info!(
-                                        "chat-history: robotty returned {} raw lines for #{ch}",
-                                        p.messages.len()
-                                    );
-                                    break 'fetch p.messages;
-                                }
-                                Ok(_) => {
-                                    robotty_err = Some("robotty returned 0 messages".to_owned());
-                                }
-                                Err(e) => {
-                                    robotty_err = Some(format!("robotty JSON parse failed: {e}"));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            robotty_err = Some(format!("robotty body read failed: {e}"));
-                        }
-                    }
-                } else {
-                    robotty_err = Some(format!("robotty HTTP {status}"));
-                }
-            }
-            Err(e) => {
-                robotty_err = Some(format!("robotty request failed: {e}"));
-            }
-        }
-
-        if let Some(ref err) = robotty_err {
-            info!("chat-history: {err}, trying IVR fallback for #{ch}");
-        }
-
-        // IVR fallback
-        match client
-            .get(&ivr_url)
-            .header("Accept", "application/json")
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {
-                match resp.text().await {
-                    Ok(text) => {
-                        #[derive(serde::Deserialize)]
-                        struct IvrMsg {
-                            raw: String,
-                        }
-                        #[derive(serde::Deserialize)]
-                        struct IvrResp {
-                            messages: Vec<IvrMsg>,
-                        }
-                        match serde_json::from_str::<IvrResp>(&text) {
-                            Ok(mut p) if !p.messages.is_empty() => {
-                                p.messages.reverse(); // IVR is newest-first
-                                info!(
-                                    "chat-history: IVR returned {} raw lines for #{ch}",
-                                    p.messages.len()
-                                );
-                                break 'fetch p.messages.into_iter().map(|m| m.raw).collect();
-                            }
-                            Ok(_) => {
-                                warn!("chat-history: both sources returned 0 messages for #{ch}");
-                            }
-                            Err(e) => {
-                                warn!("chat-history: IVR JSON parse failed for #{ch}: {e}");
-                            }
-                        }
-                        Vec::new()
-                    }
-                    Err(e) => {
-                        warn!("chat-history: IVR body read failed for #{ch}: {e}");
-                        Vec::new()
-                    }
-                }
-            }
-            Ok(resp) => {
-                warn!(
-                    "chat-history: both sources failed for #{ch} (IVR HTTP {})",
-                    resp.status()
-                );
-                Vec::new()
-            }
-            Err(e) => {
-                warn!("chat-history: both sources failed for #{ch}: {e}");
-                Vec::new()
-            }
-        }
-    };
-
-    if raw_lines.is_empty() {
-        info!("chat-history: loaded 0 historical messages for #{ch}");
-        let _ = evt_tx
-            .send(AppEvent::HistoryLoaded {
-                channel: channel_id,
-                messages: Vec::new(),
-            })
-            .await;
-        return;
-    }
-
-    let raw_line_count = raw_lines.len();
-
-    // ── Snapshot shared state once before the parse loop ────────────────────
-    // Taking these locks inside the loop (800+ times) is expensive; snapshot
-    // once and release immediately so other tasks aren't blocked.
-    let emote_snapshot: HashMap<String, EmoteInfo> = {
-        let guard = emote_index.read().unwrap();
-        guard.clone()
-    };
-    let badge_snapshot: HashMap<(String, String, String), String> = {
-        let bm = badge_map.read().unwrap();
-        bm.clone()
-    };
-    let local_nick_owned = local_nick.map(str::to_owned);
-    let channel_scope = ch.to_owned();
-
-    // ── Move the CPU-bound parse + tokenize loop off the async executor ──────
-    // Tokenization and IRC parsing are synchronous CPU work.  Running them
-    // directly on the tokio thread pool starves other async tasks; moving to
-    // spawn_blocking gives those threads back.
-    let (messages, image_urls) = tokio::task::spawn_blocking(move || {
-        let mut messages: Vec<ChatMessage> = Vec::with_capacity(raw_lines.len());
-        // Deduplicate image fetch URLs across all history messages.
-        let mut seen_urls: HashSet<String> = HashSet::new();
-        let mut image_urls: Vec<String> = Vec::new();
-
-        for line in &raw_lines {
-            let irc_msg = match parse_line(line) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if irc_msg.command != "PRIVMSG" {
-                continue;
-            }
-
-            let id = HISTORY_MSG_ID.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            let mut msg = match parse_privmsg_irc(&irc_msg, local_nick_owned.as_deref(), id) {
-                Some(m) => m,
-                None => continue,
-            };
-
-            // Tokenize spans
-            msg.spans = crust_core::format::tokenize(
-                &msg.raw_text,
-                msg.flags.is_action,
-                &msg.twitch_emotes,
-                &|code| {
-                    resolve_emote(&emote_snapshot, code).map(|info| {
-                        (
-                            info.id.clone(),
-                            info.code.clone(),
-                            info.url_1x.clone(),
-                            info.provider.clone(),
-                            info.url_4x.clone().or_else(|| info.url_2x.clone()),
-                        )
-                    })
-                },
-            );
-
-            // Resolve badge URLs from the snapshot (no lock needed)
-            for badge in &mut msg.sender.badges {
-                badge.url =
-                    resolve_badge_url(&badge_snapshot, &channel_scope, &badge.name, &badge.version);
-            }
-
-            // Mention detection
-            if let Some(ref nick) = local_nick_owned {
-                let nick_lower = nick.to_lowercase();
-                let text_lower = msg.raw_text.to_lowercase();
-                // @mention or bare username as a whole word
-                let has_mention = text_lower.contains(&format!("@{nick_lower}"))
-                    || text_lower
-                        .split(|c: char| !c.is_alphanumeric() && c != '_')
-                        .any(|w| w == nick_lower);
-                let is_reply_to_me = msg
-                    .reply
-                    .as_ref()
-                    .map(|r| r.parent_user_login.to_lowercase() == nick_lower)
-                    .unwrap_or(false);
-                msg.flags.is_mention = has_mention || is_reply_to_me;
-            }
-
-            // Collect unique image URLs (emotes, emoji, badges) for batch prefetch
-            for span in &msg.spans {
-                let url = match span {
-                    crust_core::Span::Emote { url, .. } => Some(url.clone()),
-                    crust_core::Span::Emoji { url, .. } => Some(url.clone()),
-                    _ => None,
-                };
-                if let Some(u) = url {
-                    if seen_urls.insert(u.clone()) {
-                        image_urls.push(u);
-                    }
-                }
-            }
-            for badge in &msg.sender.badges {
-                if let Some(ref u) = badge.url {
-                    if seen_urls.insert(u.clone()) {
-                        image_urls.push(u.clone());
-                    }
-                }
-            }
-
-            messages.push(msg);
-        }
-        (messages, image_urls)
-    })
-    .await
-    .unwrap_or_default();
-
-    if messages.is_empty() {
-        info!("chat-history: parsed 0 PRIVMSG lines from {raw_line_count} raw lines for #{ch}");
-        let _ = evt_tx
-            .send(AppEvent::HistoryLoaded {
-                channel: channel_id,
-                messages,
-            })
-            .await;
-        return;
-    }
-
-    info!("chat-history: loaded {} messages for #{ch}", messages.len());
-
-    // Collect unique Twitch user-ids from history so 7TV can resolve
-    // their cosmetics (paints/badges) retroactively.
-    {
-        let mut history_user_ids: Vec<String> = messages
-            .iter()
-            .map(|m| m.sender.user_id.0.trim().to_owned())
-            .filter(|id| !id.is_empty())
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        history_user_ids.sort();
-        if !history_user_ids.is_empty() {
-            let _ = stv_update_tx
-                .send(SevenTvCosmeticUpdate::BatchUserLookup {
-                    user_ids: history_user_ids,
-                })
-                .await;
-        }
-    }
-
-    // Batch-prefetch all unique image URLs with a semaphore (same path as
-    // emote/badge prefetch, which also emits ImagePrefetchQueued for the
-    // loading screen counter).
-    if !image_urls.is_empty() {
-        prefetch_emote_images(image_urls, emote_cache, evt_tx);
-    }
-
-    let _ = evt_tx
-        .send(AppEvent::HistoryLoaded {
-            channel: channel_id,
-            messages,
-        })
-        .await;
-}
+// Emote and chat history loading helpers live in runtime modules.
 
 // Token validation
 
 /// Call `POST /helix/moderation/bans` to timeout or permanently ban a user.
 ///
 /// `duration_secs` = `None` → permanent ban; `Some(n)` → timeout for `n` seconds.
+async fn helix_delete_message(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    moderator_id: Option<&str>,
+    message_id: &str,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (Some(cid), Some(bid), Some(mid)) = (client_id, broadcaster_id, moderator_id) else {
+        warn!(
+            "helix_delete_message: missing credentials (cid={:?} bid={:?} mid={:?})",
+            client_id, broadcaster_id, moderator_id
+        );
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Moderation".into(),
+                message: "Cannot moderate: missing Twitch credentials. Reconnect and try again."
+                    .into(),
+            })
+            .await;
+        return;
+    };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    let url = format!(
+        "https://api.twitch.tv/helix/moderation/chat?broadcaster_id={bid}&moderator_id={mid}&message_id={message_id}"
+    );
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .delete(&url)
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("helix_delete_message: request failed: {e}");
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Moderation".into(),
+                    message: format!("Moderation delete request failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let status = resp.status();
+    if status.as_u16() == 401 {
+        let _ = evt_tx.send(AppEvent::AuthExpired).await;
+        return;
+    }
+
+    if status.is_success() {
+        info!("Moderation: deleted message in #{channel}");
+        emit_helix_system_info(
+            evt_tx,
+            channel,
+            "Moderation: message deleted.".into(),
+        )
+        .await;
+        return;
+    } else {
+        let body_text = resp.text().await.unwrap_or_default();
+        warn!("helix_delete_message: HTTP {status} - {body_text}");
+        let helix_msg = serde_json::from_str::<serde_json::Value>(&body_text)
+            .ok()
+            .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_owned))
+            .unwrap_or_else(|| format!("HTTP {status}"));
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Moderation".into(),
+                message: format!("Msg deletion failed: {helix_msg}"),
+            })
+            .await;
+    }
+}
+
 /// On failure, injects a local error message into the channel so the user can see what went wrong.
 async fn helix_ban_user(
     token: &str,
@@ -4299,6 +4003,13 @@ async fn helix_ban_user(
             "permanently banned".into()
         };
         info!("Moderation: {target_login} {verb} in #{channel}");
+        emit_helix_system_info(
+            evt_tx,
+            channel,
+            format!("Moderation: {target_login} {verb}."),
+        )
+        .await;
+        return;
     } else {
         let body_text = resp.text().await.unwrap_or_default();
         warn!("helix_ban_user: HTTP {status} - {body_text}");
@@ -4374,6 +4085,13 @@ async fn helix_unban_user(
     let status = resp.status();
     if status.is_success() || status.as_u16() == 204 {
         info!("Moderation: {target_login} unbanned/untimedout in #{channel}");
+        emit_helix_system_info(
+            evt_tx,
+            channel,
+            format!("Moderation: {target_login} unbanned/untimed out."),
+        )
+        .await;
+        return;
     } else {
         let body_text = resp.text().await.unwrap_or_default();
         warn!("helix_unban_user: HTTP {status} - {body_text}");
@@ -4388,6 +4106,1716 @@ async fn helix_unban_user(
             })
             .await;
     }
+}
+
+/// Resolve a held AutoMod message via
+/// `POST /helix/moderation/automod/message`.
+async fn helix_resolve_automod_message(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    moderator_id: Option<&str>,
+    message_id: &str,
+    sender_user_id: &str,
+    action: &str,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (cid, bid, mid) =
+        match require_helix_moderation_context(client_id, broadcaster_id, moderator_id) {
+            Ok(v) => v,
+            Err(msg) => {
+                let _ = evt_tx
+                    .send(AppEvent::Error {
+                        context: "AutoMod".into(),
+                        message: msg,
+                    })
+                    .await;
+                return;
+            }
+        };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    if bare.trim().is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "AutoMod".into(),
+                message: "You must be logged in to resolve AutoMod messages.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let msg_id = message_id.trim();
+    let user_id = sender_user_id.trim();
+    if msg_id.is_empty() || user_id.is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "AutoMod".into(),
+                message: "Cannot resolve AutoMod item: missing message or user identifier.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let action_norm = action.trim().to_ascii_uppercase();
+    if action_norm != "ALLOW" && action_norm != "DENY" {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "AutoMod".into(),
+                message: format!("Unsupported AutoMod action: {action}"),
+            })
+            .await;
+        return;
+    }
+
+    #[derive(serde::Serialize)]
+    struct AutoModResolveBody<'a> {
+        user_id: &'a str,
+        msg_id: &'a str,
+        action: &'a str,
+    }
+
+    let url = "https://api.twitch.tv/helix/moderation/automod/message";
+    let client = reqwest::Client::new();
+    let resp = match client
+        .post(url)
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .query(&[
+            ("broadcaster_id", bid),
+            ("moderator_id", mid),
+        ])
+        .json(&AutoModResolveBody {
+            user_id,
+            msg_id,
+            action: &action_norm,
+        })
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "AutoMod".into(),
+                    message: format!("AutoMod resolve request failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let status = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        let _ = evt_tx
+            .send(AppEvent::AutoModQueueRemove {
+                channel: channel.clone(),
+                message_id: msg_id.to_owned(),
+                action: Some(action_norm.clone()),
+            })
+            .await;
+        emit_helix_system_info(
+            evt_tx,
+            channel,
+            format!("AutoMod: {action_norm} message {msg_id}."),
+        )
+        .await;
+        return;
+    }
+
+    let msg = helix_error_message(status, &body_text);
+    let _ = evt_tx
+        .send(AppEvent::Error {
+            context: "AutoMod".into(),
+            message: format!("Could not resolve AutoMod message: {msg}"),
+        })
+        .await;
+}
+
+/// Fetch pending unban requests via
+/// `GET /helix/moderation/unban_requests`.
+async fn helix_fetch_unban_requests(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    moderator_id: Option<&str>,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (cid, bid, mid) =
+        match require_helix_moderation_context(client_id, broadcaster_id, moderator_id) {
+            Ok(v) => v,
+            Err(msg) => {
+                let _ = evt_tx
+                    .send(AppEvent::UnbanRequestsFailed {
+                        channel: channel.clone(),
+                        error: msg,
+                    })
+                    .await;
+                return;
+            }
+        };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    if bare.trim().is_empty() {
+        let msg = "You must be logged in to fetch unban requests.".to_owned();
+        let _ = evt_tx
+            .send(AppEvent::UnbanRequestsFailed {
+                channel: channel.clone(),
+                error: msg,
+            })
+            .await;
+        return;
+    }
+
+    #[derive(serde::Deserialize)]
+    struct HelixUnbanRequest {
+        id: String,
+        user_id: String,
+        user_login: String,
+        text: Option<String>,
+        created_at: Option<String>,
+        status: Option<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Pagination {
+        cursor: Option<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct HelixUnbanRequestsResponse {
+        data: Vec<HelixUnbanRequest>,
+        #[serde(default)]
+        pagination: Option<Pagination>,
+    }
+
+    let client = reqwest::Client::new();
+    let mut cursor: Option<String> = None;
+    let mut requests: Vec<UnbanRequestItem> = Vec::new();
+
+    loop {
+        let mut query: Vec<(&str, String)> = vec![
+            ("broadcaster_id", bid.to_owned()),
+            ("moderator_id", mid.to_owned()),
+            ("status", "pending".to_owned()),
+            ("first", "100".to_owned()),
+        ];
+        if let Some(cur) = cursor.as_deref().filter(|s| !s.is_empty()) {
+            query.push(("after", cur.to_owned()));
+        }
+
+        let resp = match client
+            .get("https://api.twitch.tv/helix/moderation/unban_requests")
+            .header("Authorization", format!("Bearer {bare}"))
+            .header("Client-Id", cid)
+            .query(&query)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = evt_tx
+                    .send(AppEvent::UnbanRequestsFailed {
+                        channel: channel.clone(),
+                        error: format!("Unban request fetch failed: {e}"),
+                    })
+                    .await;
+                return;
+            }
+        };
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let _ = evt_tx
+                .send(AppEvent::UnbanRequestsFailed {
+                    channel: channel.clone(),
+                    error: helix_error_message(status, &body),
+                })
+                .await;
+            return;
+        }
+
+        let parsed = match serde_json::from_str::<HelixUnbanRequestsResponse>(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = evt_tx
+                    .send(AppEvent::UnbanRequestsFailed {
+                        channel: channel.clone(),
+                        error: format!("Failed to parse unban request response: {e}"),
+                    })
+                    .await;
+                return;
+            }
+        };
+
+        requests.extend(parsed.data.into_iter().map(|item| UnbanRequestItem {
+            request_id: item.id,
+            user_id: item.user_id,
+            user_login: item.user_login,
+            text: item.text,
+            created_at: item.created_at,
+            status: item.status,
+        }));
+
+        cursor = parsed.pagination.and_then(|p| p.cursor);
+        if cursor.as_deref().map_or(true, |s| s.is_empty()) {
+            break;
+        }
+    }
+
+    let _ = evt_tx
+        .send(AppEvent::UnbanRequestsLoaded {
+            channel: channel.clone(),
+            requests,
+        })
+        .await;
+}
+
+/// Resolve an unban request via
+/// `PATCH /helix/moderation/unban_requests`.
+async fn helix_resolve_unban_request(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    moderator_id: Option<&str>,
+    request_id: &str,
+    approve: bool,
+    resolution_text: Option<&str>,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (cid, bid, mid) =
+        match require_helix_moderation_context(client_id, broadcaster_id, moderator_id) {
+            Ok(v) => v,
+            Err(msg) => {
+                let _ = evt_tx
+                    .send(AppEvent::Error {
+                        context: "Unban Requests".into(),
+                        message: msg,
+                    })
+                    .await;
+                return;
+            }
+        };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    if bare.trim().is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Unban Requests".into(),
+                message: "You must be logged in to resolve unban requests.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let request_id = request_id.trim();
+    if request_id.is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Unban Requests".into(),
+                message: "Missing unban request id.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let status_raw = if approve { "approved" } else { "denied" };
+    let status_emit = status_raw.to_ascii_uppercase();
+
+    #[derive(serde::Serialize)]
+    struct ResolveUnbanBody<'a> {
+        unban_request_id: &'a str,
+        status: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resolution_text: Option<&'a str>,
+    }
+
+    let trimmed_resolution = resolution_text
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let req = ResolveUnbanBody {
+        unban_request_id: request_id,
+        status: status_raw,
+        resolution_text: trimmed_resolution,
+    };
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .patch("https://api.twitch.tv/helix/moderation/unban_requests")
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .query(&[
+            ("broadcaster_id", bid),
+            ("moderator_id", mid),
+        ])
+        .json(&req)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Unban Requests".into(),
+                    message: format!("Resolve unban request failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let http_status = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+    if http_status.is_success() {
+        let _ = evt_tx
+            .send(AppEvent::UnbanRequestResolved {
+                channel: channel.clone(),
+                request_id: request_id.to_owned(),
+                status: status_emit.clone(),
+            })
+            .await;
+        return;
+    }
+
+    let msg = helix_error_message(http_status, &body_text);
+    let _ = evt_tx
+        .send(AppEvent::Error {
+            context: "Unban Requests".into(),
+            message: format!("Could not resolve unban request: {msg}"),
+        })
+        .await;
+}
+
+/// Update a channel-points redemption status via
+/// `PATCH /helix/channel_points/custom_rewards/redemptions`.
+async fn helix_update_reward_redemption_status(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    reward_id: &str,
+    redemption_id: &str,
+    status: &str,
+    user_login: &str,
+    reward_title: &str,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (Some(cid), Some(bid)) = (client_id, broadcaster_id) else {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Channel Points".into(),
+                message: "Cannot update redemption: missing Twitch credentials.".into(),
+            })
+            .await;
+        return;
+    };
+
+    if reward_id.trim().is_empty() || redemption_id.trim().is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Channel Points".into(),
+                message: "Cannot update redemption: missing reward/redemption identifiers.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let status_norm = status.trim().to_ascii_uppercase();
+    if status_norm != "FULFILLED" && status_norm != "CANCELED" {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Channel Points".into(),
+                message: format!("Unsupported redemption status: {status}"),
+            })
+            .await;
+        return;
+    }
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    let url = format!(
+        "https://api.twitch.tv/helix/channel_points/custom_rewards/redemptions\
+         ?broadcaster_id={bid}&reward_id={reward_id}&id={redemption_id}"
+    );
+
+    #[derive(serde::Serialize)]
+    struct RedemptionStatusBody<'a> {
+        status: &'a str,
+    }
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .patch(&url)
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .json(&RedemptionStatusBody {
+            status: &status_norm,
+        })
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Channel Points".into(),
+                    message: format!("Redemption update request failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let http_status = resp.status();
+    if http_status.is_success() {
+        let action = if status_norm == "FULFILLED" {
+            "approved"
+        } else {
+            "rejected"
+        };
+        emit_helix_system_info(
+            evt_tx,
+            channel,
+            format!("{action} redemption '{reward_title}' from {user_login}."),
+        )
+        .await;
+        return;
+    }
+
+    let body = resp.text().await.unwrap_or_default();
+    let helix_msg = helix_error_message(http_status, &body);
+    let _ = evt_tx
+        .send(AppEvent::Error {
+            context: "Channel Points".into(),
+            message: format!("Could not update redemption: {helix_msg}"),
+        })
+        .await;
+}
+
+async fn emit_helix_system_info(evt_tx: mpsc::Sender<AppEvent>, channel: &ChannelId, text: String) {
+    let msg = make_system_message(
+        HISTORY_MSG_ID.fetch_sub(1, std::sync::atomic::Ordering::Relaxed),
+        channel.clone(),
+        text,
+        Utc::now(),
+        MsgKind::SystemInfo,
+    );
+    let _ = evt_tx
+        .send(AppEvent::MessageReceived {
+            channel: channel.clone(),
+            message: msg,
+        })
+        .await;
+}
+
+fn helix_error_message(status: reqwest::StatusCode, body_text: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body_text)
+        .ok()
+        .and_then(|v| {
+            v.get("message")
+                .and_then(|m| m.as_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| format!("HTTP {status}"))
+}
+
+fn require_helix_context<'a>(
+    client_id: Option<&'a str>,
+    broadcaster_id: Option<&'a str>,
+) -> Result<(&'a str, &'a str), String> {
+    let cid = client_id.ok_or_else(|| "Missing Twitch Client-ID.".to_owned())?;
+    let bid = broadcaster_id.ok_or_else(|| {
+        "Channel metadata not ready yet. Wait a moment, then retry command.".to_owned()
+    })?;
+    Ok((cid, bid))
+}
+
+fn require_helix_moderation_context<'a>(
+    client_id: Option<&'a str>,
+    broadcaster_id: Option<&'a str>,
+    moderator_id: Option<&'a str>,
+) -> Result<(&'a str, &'a str, &'a str), String> {
+    let (cid, bid) = require_helix_context(client_id, broadcaster_id)?;
+    let mid = moderator_id.ok_or_else(|| {
+        "Missing moderator identity. Reconnect and try again once chat auth finishes.".to_owned()
+    })?;
+    Ok((cid, bid, mid))
+}
+
+async fn helix_user_id_by_login(
+    bare_token: &str,
+    client_id: &str,
+    login: &str,
+) -> Result<String, String> {
+    #[derive(serde::Deserialize)]
+    struct UserItem {
+        id: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct UsersResponse {
+        data: Vec<UserItem>,
+    }
+
+    let url = format!("https://api.twitch.tv/helix/users?login={login}");
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(url)
+        .header("Authorization", format!("Bearer {bare_token}"))
+        .header("Client-Id", client_id)
+        .send()
+        .await
+        .map_err(|e| format!("Lookup user '{login}' failed: {e}"))?;
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "Lookup user '{login}' failed: {}",
+            helix_error_message(status, &body)
+        ));
+    }
+
+    let parsed = serde_json::from_str::<UsersResponse>(&body)
+        .map_err(|e| format!("Failed to parse user lookup response: {e}"))?;
+    let user = parsed
+        .data
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("Could not find Twitch channel '{login}'."))?;
+    Ok(user.id)
+}
+
+async fn helix_send_announcement(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    moderator_id: Option<&str>,
+    message: &str,
+    color: Option<&str>,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (cid, bid, mid) =
+        match require_helix_moderation_context(client_id, broadcaster_id, moderator_id) {
+            Ok(v) => v,
+            Err(msg) => {
+                let _ = evt_tx
+                    .send(AppEvent::Error {
+                        context: "Announcement".into(),
+                        message: msg,
+                    })
+                    .await;
+                return;
+            }
+        };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    if bare.trim().is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Announcement".into(),
+                message: "You must be logged in to send announcements.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Announcement".into(),
+                message: "Announcement message cannot be empty.".into(),
+            })
+            .await;
+        return;
+    }
+    if trimmed.chars().count() > 500 {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Announcement".into(),
+                message: "Announcement message must be 500 characters or fewer.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let normalized_color = color
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(str::to_ascii_lowercase)
+        .filter(|c| matches!(c.as_str(), "primary" | "blue" | "green" | "orange" | "purple"));
+
+    #[derive(serde::Serialize)]
+    struct AnnouncementBody<'a> {
+        message: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        color: Option<&'a str>,
+    }
+
+    let url = format!(
+        "https://api.twitch.tv/helix/chat/announcements?broadcaster_id={bid}&moderator_id={mid}"
+    );
+    let req = AnnouncementBody {
+        message: trimmed,
+        color: normalized_color.as_deref(),
+    };
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .post(url)
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .json(&req)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Announcement".into(),
+                    message: format!("Send announcement request failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let status = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        let color_note = normalized_color
+            .as_deref()
+            .map(|c| format!(" ({c})"))
+            .unwrap_or_default();
+        emit_helix_system_info(
+            evt_tx,
+            channel,
+            format!("Sent announcement{color_note}: {trimmed}"),
+        )
+        .await;
+        return;
+    }
+
+    let msg = helix_error_message(status, &body_text);
+    let _ = evt_tx
+        .send(AppEvent::Error {
+            context: "Announcement".into(),
+            message: format!("Could not send announcement: {msg}"),
+        })
+        .await;
+}
+
+async fn helix_send_shoutout(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    moderator_id: Option<&str>,
+    target_login: &str,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (cid, bid, mid) =
+        match require_helix_moderation_context(client_id, broadcaster_id, moderator_id) {
+            Ok(v) => v,
+            Err(msg) => {
+                let _ = evt_tx
+                    .send(AppEvent::Error {
+                        context: "Shoutout".into(),
+                        message: msg,
+                    })
+                    .await;
+                return;
+            }
+        };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    if bare.trim().is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Shoutout".into(),
+                message: "You must be logged in to send shoutouts.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let login = target_login.trim().trim_start_matches('@').to_ascii_lowercase();
+    if login.is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Shoutout".into(),
+                message: "Usage: /shoutout <channel>".into(),
+            })
+            .await;
+        return;
+    }
+    if login.eq_ignore_ascii_case(channel.display_name()) {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Shoutout".into(),
+                message: "You cannot shout out the current channel.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let to_broadcaster_id = match helix_user_id_by_login(bare, cid, &login).await {
+        Ok(id) => id,
+        Err(msg) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Shoutout".into(),
+                    message: msg,
+                })
+                .await;
+            return;
+        }
+    };
+
+    let url = format!(
+        "https://api.twitch.tv/helix/chat/shoutouts?from_broadcaster_id={bid}&to_broadcaster_id={to_broadcaster_id}&moderator_id={mid}"
+    );
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .post(url)
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Shoutout".into(),
+                    message: format!("Send shoutout request failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let status = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        emit_helix_system_info(evt_tx, channel, format!("Sent shoutout to {login}."))
+            .await;
+        return;
+    }
+
+    let msg = helix_error_message(status, &body_text);
+    let _ = evt_tx
+        .send(AppEvent::Error {
+            context: "Shoutout".into(),
+            message: format!("Could not send shoutout: {msg}"),
+        })
+        .await;
+}
+
+async fn helix_start_commercial(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    length_secs: u32,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (cid, bid) = match require_helix_context(client_id, broadcaster_id) {
+        Ok(v) => v,
+        Err(msg) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Commercial".into(),
+                    message: msg,
+                })
+                .await;
+            return;
+        }
+    };
+
+    if !matches!(length_secs, 30 | 60 | 90 | 120 | 150 | 180) {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Commercial".into(),
+                message: "Commercial length must be one of 30, 60, 90, 120, 150, or 180 seconds."
+                    .into(),
+            })
+            .await;
+        return;
+    }
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    if bare.trim().is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Commercial".into(),
+                message: "You must be logged in to start a commercial.".into(),
+            })
+            .await;
+        return;
+    }
+
+    #[derive(serde::Serialize)]
+    struct CommercialBody<'a> {
+        broadcaster_id: &'a str,
+        length: u32,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CommercialData {
+        length: Option<u32>,
+        message: Option<String>,
+        retry_after: Option<u32>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CommercialResponse {
+        data: Vec<CommercialData>,
+    }
+
+    let req = CommercialBody {
+        broadcaster_id: bid,
+        length: length_secs,
+    };
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .post("https://api.twitch.tv/helix/channels/commercial")
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .json(&req)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Commercial".into(),
+                    message: format!("Start commercial request failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let status = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        let info = serde_json::from_str::<CommercialResponse>(&body_text)
+            .ok()
+            .and_then(|payload| payload.data.into_iter().next());
+        let confirmed_len = info
+            .as_ref()
+            .and_then(|d| d.length)
+            .unwrap_or(length_secs);
+        let server_msg = info
+            .as_ref()
+            .and_then(|d| d.message.as_deref())
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or("Commercial started.");
+        let retry_hint = info
+            .as_ref()
+            .and_then(|d| d.retry_after)
+            .map(|retry| format!(" Next one available in {retry}s."))
+            .unwrap_or_default();
+        emit_helix_system_info(
+            evt_tx,
+            channel,
+            format!("Started {confirmed_len}s commercial. {server_msg}{retry_hint}"),
+        )
+        .await;
+        return;
+    }
+
+    let msg = helix_error_message(status, &body_text);
+    let _ = evt_tx
+        .send(AppEvent::Error {
+            context: "Commercial".into(),
+            message: format!("Could not start commercial: {msg}"),
+        })
+        .await;
+}
+
+async fn helix_create_stream_marker(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    description: Option<&str>,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (cid, bid) = match require_helix_context(client_id, broadcaster_id) {
+        Ok(v) => v,
+        Err(msg) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Marker".into(),
+                    message: msg,
+                })
+                .await;
+            return;
+        }
+    };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    if bare.trim().is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Marker".into(),
+                message: "You must be logged in to create a stream marker.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let description = description.map(str::trim).filter(|d| !d.is_empty());
+    if let Some(desc) = description {
+        if desc.chars().count() > 140 {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Marker".into(),
+                    message: "Marker description must be 140 characters or fewer.".into(),
+                })
+                .await;
+            return;
+        }
+    }
+
+    #[derive(serde::Serialize)]
+    struct MarkerBody<'a> {
+        user_id: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<&'a str>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct MarkerData {
+        id: Option<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct MarkerResponse {
+        data: Vec<MarkerData>,
+    }
+
+    let req = MarkerBody {
+        user_id: bid,
+        description,
+    };
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .post("https://api.twitch.tv/helix/streams/markers")
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .json(&req)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Marker".into(),
+                    message: format!("Create marker request failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let status = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        let marker_id = serde_json::from_str::<MarkerResponse>(&body_text)
+            .ok()
+            .and_then(|payload| payload.data.into_iter().next())
+            .and_then(|entry| entry.id);
+        let mut summary = if let Some(desc) = description {
+            format!("Created stream marker: {desc}")
+        } else {
+            "Created stream marker.".to_owned()
+        };
+        if let Some(id) = marker_id {
+            summary.push_str(&format!(" (id: {id})"));
+        }
+        emit_helix_system_info(evt_tx, channel, summary).await;
+        return;
+    }
+
+    let msg = helix_error_message(status, &body_text);
+    let _ = evt_tx
+        .send(AppEvent::Error {
+            context: "Marker".into(),
+            message: format!("Could not create stream marker: {msg}"),
+        })
+        .await;
+}
+
+async fn helix_create_poll(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    title: &str,
+    choices: &[String],
+    duration_secs: u32,
+    channel_points_per_vote: Option<u32>,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (cid, bid) = match require_helix_context(client_id, broadcaster_id) {
+        Ok(v) => v,
+        Err(msg) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Poll".into(),
+                    message: msg,
+                })
+                .await;
+            return;
+        }
+    };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    if bare.trim().is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Poll".into(),
+                message: "You must be logged in to manage polls.".into(),
+            })
+            .await;
+        return;
+    }
+
+    #[derive(serde::Serialize)]
+    struct PollChoice<'a> {
+        title: &'a str,
+    }
+
+    #[derive(serde::Serialize)]
+    struct PollBody<'a> {
+        broadcaster_id: &'a str,
+        title: &'a str,
+        choices: Vec<PollChoice<'a>>,
+        duration: u32,
+        channel_points_voting_enabled: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        channel_points_per_vote: Option<u32>,
+    }
+
+    let points_per_vote = channel_points_per_vote
+        .map(|v| v.clamp(1, 1_000_000))
+        .filter(|v| *v > 0);
+
+    let req = PollBody {
+        broadcaster_id: bid,
+        title,
+        choices: choices.iter().map(|c| PollChoice { title: c }).collect(),
+        duration: duration_secs,
+        channel_points_voting_enabled: points_per_vote.is_some(),
+        channel_points_per_vote: points_per_vote,
+    };
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .post("https://api.twitch.tv/helix/polls")
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .json(&req)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Poll".into(),
+                    message: format!("Create poll request failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let status = resp.status();
+    if status.is_success() {
+        emit_helix_system_info(
+            evt_tx,
+            channel,
+            if let Some(points) = points_per_vote {
+                format!(
+                    "Started poll: {title} ({} choices, {}s, {} points/vote)",
+                    choices.len(),
+                    duration_secs,
+                    points
+                )
+            } else {
+                format!(
+                    "Started poll: {title} ({} choices, {}s)",
+                    choices.len(),
+                    duration_secs
+                )
+            },
+        )
+        .await;
+        return;
+    }
+
+    let body_text = resp.text().await.unwrap_or_default();
+    let msg = helix_error_message(status, &body_text);
+    let _ = evt_tx
+        .send(AppEvent::Error {
+            context: "Poll".into(),
+            message: format!("Could not create poll: {msg}"),
+        })
+        .await;
+}
+
+async fn helix_find_active_poll(
+    bare_token: &str,
+    client_id: &str,
+    broadcaster_id: &str,
+) -> Result<(String, String), String> {
+    #[derive(serde::Deserialize)]
+    struct PollItem {
+        id: String,
+        title: String,
+        status: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct PollList {
+        data: Vec<PollItem>,
+    }
+
+    let url = format!(
+        "https://api.twitch.tv/helix/polls?broadcaster_id={broadcaster_id}&first=20"
+    );
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(url)
+        .header("Authorization", format!("Bearer {bare_token}"))
+        .header("Client-Id", client_id)
+        .send()
+        .await
+        .map_err(|e| format!("Fetch active poll failed: {e}"))?;
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "Fetch active poll failed: {}",
+            helix_error_message(status, &body)
+        ));
+    }
+
+    let parsed = serde_json::from_str::<PollList>(&body)
+        .map_err(|e| format!("Failed to parse poll list: {e}"))?;
+    let active = parsed
+        .data
+        .into_iter()
+        .find(|p| p.status.eq_ignore_ascii_case("ACTIVE"))
+        .ok_or_else(|| "No active poll found in this channel.".to_owned())?;
+    Ok((active.id, active.title))
+}
+
+async fn helix_end_poll(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    status: &str,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (cid, bid) = match require_helix_context(client_id, broadcaster_id) {
+        Ok(v) => v,
+        Err(msg) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Poll".into(),
+                    message: msg,
+                })
+                .await;
+            return;
+        }
+    };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    if bare.trim().is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Poll".into(),
+                message: "You must be logged in to manage polls.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let (poll_id, poll_title) = match helix_find_active_poll(bare, cid, bid).await {
+        Ok(v) => v,
+        Err(msg) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Poll".into(),
+                    message: msg,
+                })
+                .await;
+            return;
+        }
+    };
+
+    #[derive(serde::Serialize)]
+    struct EndPollBody<'a> {
+        broadcaster_id: &'a str,
+        id: &'a str,
+        status: &'a str,
+    }
+
+    let req = EndPollBody {
+        broadcaster_id: bid,
+        id: &poll_id,
+        status,
+    };
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .patch("https://api.twitch.tv/helix/polls")
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .json(&req)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Poll".into(),
+                    message: format!("End poll request failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let http_status = resp.status();
+    if http_status.is_success() {
+        let verb = if status.eq_ignore_ascii_case("TERMINATED") {
+            "Canceled"
+        } else {
+            "Ended"
+        };
+        emit_helix_system_info(evt_tx, channel, format!("{verb} poll: {poll_title}"))
+            .await;
+        return;
+    }
+
+    let body_text = resp.text().await.unwrap_or_default();
+    let msg = helix_error_message(http_status, &body_text);
+    let _ = evt_tx
+        .send(AppEvent::Error {
+            context: "Poll".into(),
+            message: format!("Could not update poll: {msg}"),
+        })
+        .await;
+}
+
+#[derive(Debug, Clone)]
+struct HelixPredictionOutcome {
+    id: String,
+    title: String,
+}
+
+#[derive(Debug, Clone)]
+struct HelixPredictionState {
+    id: String,
+    title: String,
+    status: String,
+    outcomes: Vec<HelixPredictionOutcome>,
+}
+
+async fn helix_find_manageable_prediction(
+    bare_token: &str,
+    client_id: &str,
+    broadcaster_id: &str,
+) -> Result<HelixPredictionState, String> {
+    #[derive(serde::Deserialize)]
+    struct OutcomeItem {
+        id: String,
+        title: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct PredictionItem {
+        id: String,
+        title: String,
+        status: String,
+        outcomes: Vec<OutcomeItem>,
+    }
+    #[derive(serde::Deserialize)]
+    struct PredictionList {
+        data: Vec<PredictionItem>,
+    }
+
+    let url = format!(
+        "https://api.twitch.tv/helix/predictions?broadcaster_id={broadcaster_id}&first=20"
+    );
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(url)
+        .header("Authorization", format!("Bearer {bare_token}"))
+        .header("Client-Id", client_id)
+        .send()
+        .await
+        .map_err(|e| format!("Fetch active prediction failed: {e}"))?;
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "Fetch active prediction failed: {}",
+            helix_error_message(status, &body)
+        ));
+    }
+
+    let parsed = serde_json::from_str::<PredictionList>(&body)
+        .map_err(|e| format!("Failed to parse prediction list: {e}"))?;
+    let selected = parsed
+        .data
+        .into_iter()
+        .find(|p| {
+            p.status.eq_ignore_ascii_case("LOCKED") || p.status.eq_ignore_ascii_case("ACTIVE")
+        })
+        .ok_or_else(|| "No active or locked prediction found in this channel.".to_owned())?;
+
+    Ok(HelixPredictionState {
+        id: selected.id,
+        title: selected.title,
+        status: selected.status,
+        outcomes: selected
+            .outcomes
+            .into_iter()
+            .map(|o| HelixPredictionOutcome {
+                id: o.id,
+                title: o.title,
+            })
+            .collect(),
+    })
+}
+
+async fn helix_create_prediction(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    title: &str,
+    outcomes: &[String],
+    duration_secs: u32,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (cid, bid) = match require_helix_context(client_id, broadcaster_id) {
+        Ok(v) => v,
+        Err(msg) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Prediction".into(),
+                    message: msg,
+                })
+                .await;
+            return;
+        }
+    };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    if bare.trim().is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Prediction".into(),
+                message: "You must be logged in to manage predictions.".into(),
+            })
+            .await;
+        return;
+    }
+
+    #[derive(serde::Serialize)]
+    struct PredictionOutcome<'a> {
+        title: &'a str,
+    }
+
+    #[derive(serde::Serialize)]
+    struct PredictionBody<'a> {
+        broadcaster_id: &'a str,
+        title: &'a str,
+        outcomes: Vec<PredictionOutcome<'a>>,
+        prediction_window: u32,
+    }
+
+    let req = PredictionBody {
+        broadcaster_id: bid,
+        title,
+        outcomes: outcomes
+            .iter()
+            .map(|outcome| PredictionOutcome { title: outcome })
+            .collect(),
+        prediction_window: duration_secs,
+    };
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .post("https://api.twitch.tv/helix/predictions")
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .json(&req)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Prediction".into(),
+                    message: format!("Create prediction request failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let status = resp.status();
+    if status.is_success() {
+        emit_helix_system_info(
+            evt_tx,
+            channel,
+            format!(
+                "Started prediction: {title} ({} outcomes, {}s)",
+                outcomes.len(),
+                duration_secs
+            ),
+        )
+        .await;
+        return;
+    }
+
+    let body_text = resp.text().await.unwrap_or_default();
+    let msg = helix_error_message(status, &body_text);
+    let _ = evt_tx
+        .send(AppEvent::Error {
+            context: "Prediction".into(),
+            message: format!("Could not create prediction: {msg}"),
+        })
+        .await;
+}
+
+async fn helix_patch_prediction_status(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+    desired_status: &str,
+    winning_outcome_index: Option<usize>,
+) {
+    let (cid, bid) = match require_helix_context(client_id, broadcaster_id) {
+        Ok(v) => v,
+        Err(msg) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Prediction".into(),
+                    message: msg,
+                })
+                .await;
+            return;
+        }
+    };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    if bare.trim().is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Prediction".into(),
+                message: "You must be logged in to manage predictions.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let prediction = match helix_find_manageable_prediction(bare, cid, bid).await {
+        Ok(v) => v,
+        Err(msg) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Prediction".into(),
+                    message: msg,
+                })
+                .await;
+            return;
+        }
+    };
+
+    if desired_status.eq_ignore_ascii_case("LOCKED")
+        && !prediction.status.eq_ignore_ascii_case("ACTIVE")
+    {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Prediction".into(),
+                message: format!(
+                    "Prediction is {} and cannot be locked.",
+                    prediction.status
+                ),
+            })
+            .await;
+        return;
+    }
+
+    let winning_outcome_id = if let Some(index_1based) = winning_outcome_index {
+        let index = index_1based.saturating_sub(1);
+        let Some(outcome) = prediction.outcomes.get(index) else {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Prediction".into(),
+                    message: format!(
+                        "Outcome index {} is out of range. Available outcomes: {}.",
+                        index_1based,
+                        prediction.outcomes.len()
+                    ),
+                })
+                .await;
+            return;
+        };
+        Some((outcome.id.clone(), outcome.title.clone()))
+    } else {
+        None
+    };
+
+    #[derive(serde::Serialize)]
+    struct PatchPredictionBody<'a> {
+        broadcaster_id: &'a str,
+        id: &'a str,
+        status: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        winning_outcome_id: Option<&'a str>,
+    }
+
+    let req = PatchPredictionBody {
+        broadcaster_id: bid,
+        id: &prediction.id,
+        status: desired_status,
+        winning_outcome_id: winning_outcome_id.as_ref().map(|(id, _)| id.as_str()),
+    };
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .patch("https://api.twitch.tv/helix/predictions")
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .json(&req)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Prediction".into(),
+                    message: format!("Update prediction request failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let http_status = resp.status();
+    if http_status.is_success() {
+        let summary = if desired_status.eq_ignore_ascii_case("LOCKED") {
+            format!("Locked prediction: {}", prediction.title)
+        } else if desired_status.eq_ignore_ascii_case("CANCELED") {
+            format!("Canceled prediction: {}", prediction.title)
+        } else if desired_status.eq_ignore_ascii_case("RESOLVED") {
+            let winner = winning_outcome_id
+                .as_ref()
+                .map(|(_, title)| title.as_str())
+                .unwrap_or("<unknown>");
+            format!("Resolved prediction: {} (winner: {})", prediction.title, winner)
+        } else {
+            format!("Updated prediction: {}", prediction.title)
+        };
+        emit_helix_system_info(evt_tx, channel, summary).await;
+        return;
+    }
+
+    let body_text = resp.text().await.unwrap_or_default();
+    let msg = helix_error_message(http_status, &body_text);
+    let _ = evt_tx
+        .send(AppEvent::Error {
+            context: "Prediction".into(),
+            message: format!("Could not update prediction: {msg}"),
+        })
+        .await;
+}
+
+async fn helix_lock_prediction(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    helix_patch_prediction_status(
+        token,
+        client_id,
+        broadcaster_id,
+        channel,
+        evt_tx,
+        "LOCKED",
+        None,
+    )
+    .await;
+}
+
+async fn helix_resolve_prediction(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    winning_outcome_index: usize,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    helix_patch_prediction_status(
+        token,
+        client_id,
+        broadcaster_id,
+        channel,
+        evt_tx,
+        "RESOLVED",
+        Some(winning_outcome_index),
+    )
+    .await;
+}
+
+async fn helix_cancel_prediction(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    helix_patch_prediction_status(
+        token,
+        client_id,
+        broadcaster_id,
+        channel,
+        evt_tx,
+        "CANCELED",
+        None,
+    )
+    .await;
 }
 
 /// Error returned by [`validate_token`].
@@ -4673,8 +6101,21 @@ fn open_url_in_browser(url: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_twitch_pinned_snapshot_json, APP_INITIAL_INNER_SIZE, APP_MIN_INNER_SIZE};
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    use super::{
+        format_eventsub_notice_text, moderation_action_effect_from_notice,
+        moderation_command_remaining_cooldown,
+        parse_twitch_pinned_snapshot_json,
+        should_drop_duplicate_eventsub_notice, should_emit_eventsub_notice_message,
+        stream_status_is_live_from_notice,
+        ModerationActionEffect, MODERATION_CMD_COOLDOWN,
+        APP_INITIAL_INNER_SIZE, APP_MIN_INNER_SIZE,
+    };
+    use crust_core::model::ChannelId;
     use crate::runtime::system_messages::is_twitch_pinned_notice;
+    use crust_twitch::eventsub::EventSubNoticeKind;
 
     #[test]
     fn twitch_pinned_notice_detects_multi_line_pin_card_text() {
@@ -4755,4 +6196,174 @@ mod tests {
         assert_eq!(APP_MIN_INNER_SIZE[1], 200.0);
         assert!(APP_INITIAL_INNER_SIZE[0] > APP_MIN_INNER_SIZE[0]);
     }
+
+    #[test]
+    fn moderation_action_effect_maps_clear_to_channel_clear() {
+        let effect = moderation_action_effect_from_notice("clear", None, None);
+        assert_eq!(effect, Some(ModerationActionEffect::ChannelMessagesCleared));
+    }
+
+    #[test]
+    fn moderation_action_effect_maps_delete_to_message_deleted() {
+        let effect = moderation_action_effect_from_notice("delete", None, Some("msg-1"));
+        assert_eq!(
+            effect,
+            Some(ModerationActionEffect::MessageDeleted("msg-1".to_owned()))
+        );
+    }
+
+    #[test]
+    fn moderation_action_effect_maps_timeout_to_user_clear() {
+        let effect = moderation_action_effect_from_notice("timeout_600s", Some("viewer"), None);
+        assert_eq!(
+            effect,
+            Some(ModerationActionEffect::UserMessagesCleared(
+                "viewer".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn eventsub_notice_dedup_drops_repeated_notice_ids_within_window() {
+        let mut seen: HashMap<String, Instant> = HashMap::new();
+        let mut gc_at = Instant::now();
+        let now = Instant::now();
+
+        assert!(!should_drop_duplicate_eventsub_notice(
+            &mut seen,
+            "evt-123",
+            now,
+            &mut gc_at,
+        ));
+        assert!(should_drop_duplicate_eventsub_notice(
+            &mut seen,
+            "evt-123",
+            now + Duration::from_secs(1),
+            &mut gc_at,
+        ));
+    }
+
+    #[test]
+    fn eventsub_notice_dedup_allows_same_id_after_window_expires() {
+        let mut seen: HashMap<String, Instant> = HashMap::new();
+        let mut gc_at = Instant::now() - Duration::from_secs(20);
+        let now = Instant::now();
+
+        assert!(!should_drop_duplicate_eventsub_notice(
+            &mut seen,
+            "evt-123",
+            now,
+            &mut gc_at,
+        ));
+        assert!(!should_drop_duplicate_eventsub_notice(
+            &mut seen,
+            "evt-123",
+            now + Duration::from_secs(45) + Duration::from_secs(1),
+            &mut gc_at,
+        ));
+    }
+
+    #[test]
+    fn moderation_notice_text_includes_shared_chat_source_channel() {
+        let text = format_eventsub_notice_text(&EventSubNoticeKind::ModerationAction {
+            moderator_login: "mod_jane".to_owned(),
+            action: "ban".to_owned(),
+            target_login: Some("viewer123".to_owned()),
+            target_message_id: None,
+            source_channel_login: Some("partner_stream".to_owned()),
+        });
+
+        assert!(text.contains("mod_jane performed ban on viewer123 in #partner_stream."));
+    }
+
+    #[test]
+    fn eventsub_notice_emission_suppresses_overlap_with_irc_moderation() {
+        assert!(!should_emit_eventsub_notice_message(
+            &EventSubNoticeKind::ChannelBan {
+                user_login: "viewer".to_owned(),
+                reason: None,
+                ends_at: None,
+            }
+        ));
+        assert!(!should_emit_eventsub_notice_message(
+            &EventSubNoticeKind::ChannelUnban {
+                user_login: "viewer".to_owned(),
+            }
+        ));
+        assert!(should_emit_eventsub_notice_message(
+            &EventSubNoticeKind::UnbanRequestResolve {
+                request_id: "req-1".to_owned(),
+                status: "APPROVED".to_owned(),
+            }
+        ));
+        assert!(should_emit_eventsub_notice_message(
+            &EventSubNoticeKind::UnbanRequestCreate {
+                request_id: "req-1".to_owned(),
+                user_id: "u1".to_owned(),
+                user_login: "viewer".to_owned(),
+                text: Some("please unban".to_owned()),
+                created_at: Some("2026-03-31T19:35:00Z".to_owned()),
+            }
+        ));
+    }
+
+    #[test]
+    fn stream_status_helper_maps_online_and_offline_notices() {
+        assert_eq!(
+            stream_status_is_live_from_notice(&EventSubNoticeKind::StreamOnline),
+            Some(true)
+        );
+        assert_eq!(
+            stream_status_is_live_from_notice(&EventSubNoticeKind::StreamOffline),
+            Some(false)
+        );
+        assert_eq!(
+            stream_status_is_live_from_notice(&EventSubNoticeKind::ChannelUnban {
+                user_login: "viewer".to_owned()
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn moderation_cooldown_blocks_rapid_repeated_actions_in_same_channel() {
+        let mut cooldowns = HashMap::new();
+        let channel = ChannelId::new("somechannel");
+        let now = Instant::now();
+
+        assert_eq!(
+            moderation_command_remaining_cooldown(&mut cooldowns, &channel, now),
+            None
+        );
+        let remaining = moderation_command_remaining_cooldown(
+            &mut cooldowns,
+            &channel,
+            now + Duration::from_millis(100),
+        );
+        assert!(remaining.is_some());
+        assert!(remaining.unwrap() <= MODERATION_CMD_COOLDOWN);
+    }
+
+    #[test]
+    fn moderation_cooldown_is_per_channel() {
+        let mut cooldowns = HashMap::new();
+        let chan_a = ChannelId::new("one");
+        let chan_b = ChannelId::new("two");
+        let now = Instant::now();
+
+        assert_eq!(
+            moderation_command_remaining_cooldown(&mut cooldowns, &chan_a, now),
+            None
+        );
+        assert_eq!(
+            moderation_command_remaining_cooldown(
+                &mut cooldowns,
+                &chan_b,
+                now + Duration::from_millis(100),
+            ),
+            None
+        );
+    }
 }
+
+

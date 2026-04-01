@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+use crate::highlight::HighlightRule;
 use crate::model::{
-    Badge, ChannelId, ChatMessage, EmoteCatalogEntry, ReplyInfo, SenderNamePaint, SystemNotice,
-    UserProfile,
+    Badge, ChannelId, ChatMessage, EmoteCatalogEntry, ModActionPreset, ReplyInfo,
+    SenderNamePaint, SystemNotice, UserProfile,
 };
 
 /// A single chat log entry from the IVR logs API.
@@ -16,6 +17,27 @@ pub struct IvrLogEntry {
     pub display_name: String,
     /// 1 = normal message, 2 = timeout/ban event.
     pub msg_type: u8,
+}
+
+/// A held AutoMod message entry that can be approved or denied by moderators.
+#[derive(Debug, Clone)]
+pub struct AutoModQueueItem {
+    pub message_id: String,
+    pub sender_user_id: String,
+    pub sender_login: String,
+    pub text: String,
+    pub reason: Option<String>,
+}
+
+/// A pending unban request entry from Twitch moderation APIs/EventSub.
+#[derive(Debug, Clone)]
+pub struct UnbanRequestItem {
+    pub request_id: String,
+    pub user_id: String,
+    pub user_login: String,
+    pub text: Option<String>,
+    pub created_at: Option<String>,
+    pub status: Option<String>,
 }
 // LinkPreview: Open Graph / Twitter Card metadata for a URL
 
@@ -85,6 +107,40 @@ pub enum AppCommand {
         login: String,
         user_id: String,
     },
+    /// Approve or deny a held AutoMod message via Twitch Helix.
+    ResolveAutoModMessage {
+        channel: ChannelId,
+        message_id: String,
+        sender_user_id: String,
+        /// `ALLOW` or `DENY`.
+        action: String,
+    },
+    /// Fetch pending unban requests for a channel via Twitch Helix.
+    FetchUnbanRequests {
+        channel: ChannelId,
+    },
+    /// Approve or deny a pending unban request via Twitch Helix.
+    ResolveUnbanRequest {
+        channel: ChannelId,
+        request_id: String,
+        approve: bool,
+        resolution_text: Option<String>,
+    },
+    /// Open the moderation tools window in the UI.
+    OpenModerationTools {
+        /// Optional channel to focus when opening the tools.
+        channel: Option<ChannelId>,
+    },
+    /// Update a channel-points redemption status via Twitch Helix.
+    /// `status` should be `FULFILLED` or `CANCELED`.
+    UpdateRewardRedemptionStatus {
+        channel: ChannelId,
+        reward_id: String,
+        redemption_id: String,
+        status: String,
+        user_login: String,
+        reward_title: String,
+    },
     /// Clears all messages in the channel display (visual-only, not sent to Twitch).
     ClearLocalMessages { channel: ChannelId },
     /// Opens a URL in the system default browser.
@@ -135,12 +191,32 @@ pub enum AppCommand {
     SetGeneralSettings {
         /// Show per-message timestamps in chat.
         show_timestamps: bool,
+        /// Include seconds in chat timestamps.
+        show_timestamp_seconds: bool,
+        /// Use 24-hour clock formatting for chat timestamps.
+        use_24h_timestamps: bool,
+        /// Persist new chat messages into the local SQLite log index.
+        local_log_indexing_enabled: bool,
         /// Channels to auto-join at startup/reconnect.
         auto_join: Vec<String>,
         /// Highlight keywords (free-form, case-insensitive matching ready).
         highlights: Vec<String>,
         /// Ignored usernames (lowercase expected).
         ignores: Vec<String>,
+    },
+    /// Persist slash command usage counts used to rank autocomplete.
+    SetSlashUsageCounts {
+        /// Command usage pairs of (`command_name`, `count`).
+        usage_counts: Vec<(String, u32)>,
+    },
+    /// Persist emote picker user preferences.
+    SetEmotePickerPreferences {
+        /// Favorited emote URLs.
+        favorites: Vec<String>,
+        /// Recently used emote URLs (most-recent first).
+        recent: Vec<String>,
+        /// Optional boosted provider key (`twitch`, `7tv`, `bttv`, `ffz`, `emoji`).
+        provider_boost: Option<String>,
     },
     /// Persist appearance and shell layout settings.
     SetAppearanceSettings {
@@ -167,6 +243,88 @@ pub enum AppCommand {
     },
     /// Fetch external chat logs for a user from the IVR logs API.
     FetchIvrLogs { channel: String, username: String },
+    /// Load older locally persisted chat history (SQLite) before the oldest
+    /// currently loaded message timestamp.
+    LoadOlderLocalHistory {
+        channel: ChannelId,
+        /// Exclusive upper timestamp bound (Unix ms).
+        before_ts_ms: i64,
+        /// Maximum number of rows to load.
+        limit: usize,
+    },
+    /// Create a Twitch poll via Helix (`POST /helix/polls`).
+    CreatePoll {
+        channel: ChannelId,
+        title: String,
+        choices: Vec<String>,
+        duration_secs: u32,
+        /// Optional channel-points per extra vote. When set, Helix poll
+        /// creation enables channel-points voting.
+        channel_points_per_vote: Option<u32>,
+    },
+    /// End or cancel the active Twitch poll via Helix (`PATCH /helix/polls`).
+    /// `status` should be `ARCHIVED` (normal end) or `TERMINATED` (cancel).
+    EndPoll {
+        channel: ChannelId,
+        status: String,
+    },
+    /// Create a Twitch prediction via Helix (`POST /helix/predictions`).
+    CreatePrediction {
+        channel: ChannelId,
+        title: String,
+        outcomes: Vec<String>,
+        duration_secs: u32,
+    },
+    /// Lock the active Twitch prediction via Helix (`PATCH /helix/predictions`, status=LOCKED).
+    LockPrediction {
+        channel: ChannelId,
+    },
+    /// Resolve the active Twitch prediction with a 1-based outcome index.
+    ResolvePrediction {
+        channel: ChannelId,
+        winning_outcome_index: usize,
+    },
+    /// Cancel the active Twitch prediction via Helix (`PATCH /helix/predictions`, status=CANCELED).
+    CancelPrediction {
+        channel: ChannelId,
+    },
+    /// Start a Twitch commercial via Helix (`POST /helix/channels/commercial`).
+    StartCommercial {
+        channel: ChannelId,
+        length_secs: u32,
+    },
+    /// Create a Twitch stream marker via Helix (`POST /helix/streams/markers`).
+    CreateStreamMarker {
+        channel: ChannelId,
+        description: Option<String>,
+    },
+    /// Send a Twitch channel announcement via Helix (`POST /helix/chat/announcements`).
+    SendAnnouncement {
+        channel: ChannelId,
+        message: String,
+        color: Option<String>,
+    },
+    /// Send a Twitch shoutout via Helix (`POST /helix/chat/shoutouts`).
+    SendShoutout {
+        channel: ChannelId,
+        target_login: String,
+    },
+    /// Delete a single message via Helix (`DELETE /helix/moderation/chat`).
+    DeleteMessage {
+        channel: ChannelId,
+        /// Server-assigned message ID (from `ChatMessage::server_id`).
+        message_id: String,
+    },
+    /// Persist an updated ordered list of highlight rules.
+    SetHighlightRules { rules: Vec<HighlightRule> },
+    /// Persist an updated ordered list of filter records.
+    SetFilterRecords { records: Vec<crate::model::FilterRecord> },
+    /// Persist an updated ordered list of moderation action presets.
+    SetModActionPresets { presets: Vec<ModActionPreset> },
+    /// Refresh authentication after a 401 — re-validate the stored token.
+    RefreshAuth,
+    /// Persist desktop notification toggle.
+    SetNotificationSettings { desktop_notifications_enabled: bool },
 }
 
 // Events (runtime to UI): notifications sent from runtime to UI
@@ -228,6 +386,14 @@ pub enum AppEvent {
     /// Twitch user profile loaded from the IVR API.
     UserProfileLoaded {
         profile: UserProfile,
+    },
+    /// Twitch stream status changed (from EventSub), allowing immediate
+    /// live/offline indicators before full profile refresh completes.
+    StreamStatusUpdated {
+        /// Broadcaster login (lowercase preferred).
+        login: String,
+        /// `true` when stream is live, `false` when offline.
+        is_live: bool,
     },
     /// A user profile lookup finished without data (network/API/user not found).
     UserProfileUnavailable {
@@ -309,12 +475,30 @@ pub enum AppEvent {
     GeneralSettingsUpdated {
         /// Show per-message timestamps in chat.
         show_timestamps: bool,
+        /// Include seconds in chat timestamps.
+        show_timestamp_seconds: bool,
+        /// Use 24-hour clock formatting for chat timestamps.
+        use_24h_timestamps: bool,
+        /// Persist new chat messages into the local SQLite log index.
+        local_log_indexing_enabled: bool,
         /// Channels to auto-join at startup/reconnect.
         auto_join: Vec<String>,
         /// Highlight keywords.
         highlights: Vec<String>,
         /// Ignored usernames (lowercase).
         ignores: Vec<String>,
+        /// Enable desktop notifications for highlight rules with `show_in_mentions`.
+        desktop_notifications_enabled: bool,
+    },
+    /// Slash command usage counts loaded/updated from persistent storage.
+    SlashUsageCountsUpdated {
+        usage_counts: Vec<(String, u32)>,
+    },
+    /// Emote picker preferences loaded/updated from persistent storage.
+    EmotePickerPreferencesUpdated {
+        favorites: Vec<String>,
+        recent: Vec<String>,
+        provider_boost: Option<String>,
     },
     /// Appearance and shell layout settings loaded/updated from storage.
     AppearanceSettingsUpdated {
@@ -365,6 +549,50 @@ pub enum AppEvent {
         username: String,
         error: String,
     },
+    /// A held AutoMod message has entered the moderation queue.
+    AutoModQueueAppend {
+        channel: ChannelId,
+        item: AutoModQueueItem,
+    },
+    /// Remove a held AutoMod message from the moderation queue.
+    AutoModQueueRemove {
+        channel: ChannelId,
+        message_id: String,
+        action: Option<String>,
+    },
+    /// Unban requests snapshot loaded for a channel.
+    UnbanRequestsLoaded {
+        channel: ChannelId,
+        requests: Vec<UnbanRequestItem>,
+    },
+    /// Failed to fetch unban requests.
+    UnbanRequestsFailed {
+        channel: ChannelId,
+        error: String,
+    },
+    /// A new unban request was created.
+    UnbanRequestUpsert {
+        channel: ChannelId,
+        request: UnbanRequestItem,
+    },
+    /// A pending unban request was resolved.
+    UnbanRequestResolved {
+        channel: ChannelId,
+        request_id: String,
+        status: String,
+    },
+    /// Request that the UI opens moderation tools.
+    OpenModerationTools {
+        channel: Option<ChannelId>,
+    },
+    /// Updated highlight rules list (sent after persistence).
+    HighlightRulesUpdated { rules: Vec<HighlightRule> },
+    /// Updated filter records list.
+    FilterRecordsUpdated { records: Vec<crate::model::FilterRecord> },
+    /// Updated moderation action preset list.
+    ModActionPresetsUpdated { presets: Vec<ModActionPreset> },
+    /// Auth has expired; prompt user to re-authenticate.
+    AuthExpired,
 }
 
 // ConnectionState: connection status enumeration

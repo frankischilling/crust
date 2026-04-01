@@ -5,7 +5,7 @@ use egui::{Color32, Id, Key, LayerId, Order, Pos2, RichText, Stroke, Ui, Vec2};
 use image::DynamicImage;
 
 use crate::commands::{
-    extract_slash_query, replace_slash_token, slash_command_matches, SlashCommandInfo,
+    extract_slash_query, replace_slash_token, slash_command_matches_ranked, SlashCommandInfo,
 };
 use crate::theme as t;
 use crust_core::model::{ChannelId, EmoteCatalogEntry, ReplyInfo, IRC_SERVER_CONTROL_CHANNEL};
@@ -13,6 +13,7 @@ use crust_core::model::{ChannelId, EmoteCatalogEntry, ReplyInfo, IRC_SERVER_CONT
 const AUTOCOMPLETE_MAX: usize = 10;
 const AUTOCOMPLETE_EMOTE_SIZE: f32 = 20.0;
 const SLASH_AUTOCOMPLETE_MAX: usize = 10;
+const SLASH_AUTOCOMPLETE_MATCH_LIMIT: usize = usize::MAX;
 const USERNAME_AUTOCOMPLETE_MAX: usize = 10;
 /// Maximum number of Tab-completion matches to cycle through.
 const TAB_COMPLETE_MAX: usize = 50;
@@ -69,6 +70,8 @@ pub struct ChatInput<'a> {
     pub pending_reply: Option<&'a ReplyInfo>,
     /// Previously-sent messages for Up/Down recall.
     pub message_history: &'a [String],
+    /// Slash command usage counts used to improve autocomplete ranking.
+    pub slash_usage_counts: &'a HashMap<String, u32>,
     /// All open channel tabs (used for `/join` channel suggestions on IRC).
     pub known_channels: &'a [ChannelId],
     /// Chatters currently in the channel (sorted, for `@` username autocomplete).
@@ -98,9 +101,6 @@ impl<'a> ChatInput<'a> {
             toggle_emote_picker: false,
             dismiss_reply: false,
         };
-
-        // Persistent autocomplete state via egui temp storage
-        let ac_id = Id::new("emote_autocomplete");
 
         // Reply banner
         if let Some(rep) = self.pending_reply {
@@ -182,7 +182,7 @@ impl<'a> ChatInput<'a> {
                     // Pre-check autocompletes before TextEdit consumes keys.
                     let pre_emote_matches = find_autocomplete_matches(buf, self.emote_catalog);
                     let pre_username_matches = find_username_matches(buf, self.chatters);
-                    let pre_slash_matches = find_slash_matches(buf);
+                    let pre_slash_matches = find_slash_matches(buf, self.slash_usage_counts);
                     let pre_join_matches =
                         find_join_channel_matches(buf, self.channel, self.known_channels);
                     let autocomplete_active = !pre_emote_matches.is_empty()
@@ -211,12 +211,15 @@ impl<'a> ChatInput<'a> {
                     // At narrow widths, hide Send button and emote picker to maximise input
                     let show_send_btn = input_width > 250.0;
                     let show_emote_btn = input_width > 200.0;
+                    let is_twitch_channel = !self.channel.is_irc() && !self.channel.is_kick();
+                    let show_counter = is_twitch_channel && !buf.is_empty();
+                    let counter_reserve = if show_counter { 70.0 } else { 0.0 };
                     let reserve = if show_send_btn && show_emote_btn {
-                        t::BAR_H + 58.0 + t::TOOLBAR_SPACING.x * 2.0
+                        t::BAR_H + 58.0 + t::TOOLBAR_SPACING.x * 2.0 + counter_reserve
                     } else if show_emote_btn {
-                        t::BAR_H + t::TOOLBAR_SPACING.x
+                        t::BAR_H + t::TOOLBAR_SPACING.x + counter_reserve
                     } else {
-                        0.0
+                        counter_reserve
                     };
                     let text_width = (ui.available_width() - reserve).max(40.0);
                     let te_output = ui
@@ -239,6 +242,9 @@ impl<'a> ChatInput<'a> {
                         .inner;
                     let resp = te_output.response;
                     let text_edit_id = resp.id;
+                    let ac_id = text_edit_id.with("autocomplete_selection");
+                    let tab_id = text_edit_id.with("tab_complete_state");
+                    let hist_id = text_edit_id.with("msg_history_state");
 
                     // ── Paint red wavy underlines under misspelled words ──
                     {
@@ -275,7 +281,7 @@ impl<'a> ChatInput<'a> {
                         Vec::new()
                     };
                     let slash_matches = if matches.is_empty() && username_matches.is_empty() {
-                        find_slash_matches(buf)
+                        find_slash_matches(buf, self.slash_usage_counts)
                     } else {
                         Vec::new()
                     };
@@ -334,10 +340,10 @@ impl<'a> ChatInput<'a> {
                         ac_sel = ac_sel.clamp(0, n - 1);
 
                         if consumed_up {
-                            ac_sel = (ac_sel - 1).rem_euclid(n);
+                            ac_sel = (ac_sel - 1).max(0);
                         }
                         if consumed_down {
-                            ac_sel = (ac_sel + 1).rem_euclid(n);
+                            ac_sel = (ac_sel + 1).min(n - 1);
                         }
                         if consumed_tab || consumed_enter {
                             accepted_slash_cmd =
@@ -367,7 +373,6 @@ impl<'a> ChatInput<'a> {
                         ac_sel = 0;
 
                         // ── Bare-word Tab completion (emotes + usernames) ──
-                        let tab_id = Id::new("tab_complete_state");
                         if consumed_tab {
                             let mut ts: TabState = ui
                                 .ctx()
@@ -453,7 +458,6 @@ impl<'a> ChatInput<'a> {
                         }
 
                         // ── Message history (Up / Down) ──
-                        let hist_id = Id::new("msg_history_state");
                         if (consumed_up || consumed_down) && !self.message_history.is_empty() {
                             let mut hs: HistState = ui
                                 .ctx()
@@ -523,7 +527,6 @@ impl<'a> ChatInput<'a> {
                     ui.ctx().data_mut(|d| d.insert_temp(ac_id, ac_sel));
 
                     const TWITCH_MAX_CHARS: usize = 500;
-                    let is_twitch_channel = !self.channel.is_irc() && !self.channel.is_kick();
                     let mut twitch_char_count = if is_twitch_channel {
                         buf.chars().count()
                     } else {
@@ -554,12 +557,10 @@ impl<'a> ChatInput<'a> {
                         result.send = Some(buf.trim().to_owned());
                         buf.clear();
                         // Reset history navigation on send
-                        ui.ctx().data_mut(|d| {
-                            d.insert_temp(Id::new("msg_history_state"), HistState::default())
-                        });
-                        ui.ctx().data_mut(|d| {
-                            d.insert_temp(Id::new("tab_complete_state"), TabState::default())
-                        });
+                        ui.ctx()
+                            .data_mut(|d| d.insert_temp(hist_id, HistState::default()));
+                        ui.ctx()
+                            .data_mut(|d| d.insert_temp(tab_id, TabState::default()));
                         resp.request_focus();
                     }
 
@@ -600,6 +601,7 @@ impl<'a> ChatInput<'a> {
                     // Character count - Twitch has a 500-char limit.
                     // Show only for Twitch channels when the user has typed something.
                     if !buf.is_empty() && is_twitch_channel {
+                        let compact_counter = ui.available_width() < 110.0;
                         let color = if twitch_char_count > TWITCH_MAX_CHARS {
                             t::red()
                         } else if twitch_char_count > 400 {
@@ -612,7 +614,10 @@ impl<'a> ChatInput<'a> {
                                 .font(t::tiny())
                                 .color(color),
                         );
-                        if twitch_over_limit && !self.prevent_overlong_twitch_messages {
+                        if twitch_over_limit
+                            && !self.prevent_overlong_twitch_messages
+                            && !compact_counter
+                        {
                             let over_by = twitch_char_count - TWITCH_MAX_CHARS;
                             ui.label(
                                 RichText::new(format!("Over by {over_by} chars"))
@@ -765,7 +770,10 @@ impl<'a> ChatInput<'a> {
             egui::vec2(popup_width, popup_h),
         );
 
-        let layer_id = LayerId::new(Order::Foreground, Id::new("emote_autocomplete_popup"));
+        let layer_id = LayerId::new(
+            Order::Foreground,
+            text_resp.id.with("emote_autocomplete_popup"),
+        );
         let painter = ui.ctx().layer_painter(layer_id);
 
         // Background + border
@@ -788,7 +796,7 @@ impl<'a> ChatInput<'a> {
 
         let mut clicked_emote: Option<String> = None;
         let mut has_animated_preview = false;
-        let static_id = Id::new("ac_static_frames");
+        let static_id = text_resp.id.with("ac_static_frames");
         let mut static_frames: HashMap<String, egui::TextureHandle> = ui
             .ctx()
             .data_mut(|d| d.get_temp(static_id).unwrap_or_default());
@@ -799,7 +807,7 @@ impl<'a> ChatInput<'a> {
             .show(&mut popup_ui, |ui| {
                 for (i, entry) in matches.iter().enumerate() {
                     let is_selected = i as i32 == selected;
-                    let row_id = Id::new("ac_row").with(i);
+                    let row_id = text_resp.id.with("ac_row").with(i);
 
                     let row_bg = if is_selected {
                         t::active_channel_bg()
@@ -960,17 +968,34 @@ impl<'a> ChatInput<'a> {
         matches: &[&SlashCommandInfo],
         selected: i32,
     ) -> Option<String> {
+        if matches.is_empty() {
+            return None;
+        }
+
+        let selected = selected.clamp(0, matches.len() as i32 - 1);
+        let visible_rows = SLASH_AUTOCOMPLETE_MAX.min(matches.len());
+        let window_start = if matches.len() <= visible_rows {
+            0
+        } else {
+            let half = (visible_rows / 2) as i32;
+            let max_start = (matches.len() - visible_rows) as i32;
+            (selected - half).clamp(0, max_start) as usize
+        };
+        let window_end = (window_start + visible_rows).min(matches.len());
+
         let input_rect = text_resp.rect;
         let popup_width = input_rect.width().min(460.0);
-        let row_h = 24.0;
-        let popup_h =
-            (matches.len() as f32 * row_h).min(SLASH_AUTOCOMPLETE_MAX as f32 * row_h) + 8.0;
+        let row_h = 36.0;
+        let popup_h = visible_rows as f32 * row_h + 8.0;
         let popup_rect = egui::Rect::from_min_size(
             egui::pos2(input_rect.left(), input_rect.top() - popup_h - 4.0),
             egui::vec2(popup_width, popup_h),
         );
 
-        let layer_id = LayerId::new(Order::Foreground, Id::new("slash_autocomplete_popup"));
+        let layer_id = LayerId::new(
+            Order::Foreground,
+            text_resp.id.with("slash_autocomplete_popup"),
+        );
         let painter = ui.ctx().layer_painter(layer_id);
         painter.rect_filled(popup_rect, 6.0, t::bg_raised());
         painter.rect_stroke(
@@ -989,58 +1014,51 @@ impl<'a> ChatInput<'a> {
         popup_ui.set_clip_rect(popup_rect);
 
         let mut clicked_cmd: Option<String> = None;
-        egui::ScrollArea::vertical()
-            .id_salt(text_resp.id.with("slash_ac_scroll"))
-            .auto_shrink([false; 2])
-            .show(&mut popup_ui, |ui| {
-                for (i, entry) in matches.iter().enumerate() {
-                    let is_selected = i as i32 == selected;
-                    let row_id = Id::new("slash_ac_row").with(i);
-                    let row_bg = if is_selected {
-                        t::active_channel_bg()
+        for (offset, entry) in matches[window_start..window_end].iter().enumerate() {
+            let idx = window_start + offset;
+            let is_selected = idx as i32 == selected;
+            let row_id = text_resp.id.with("slash_ac_row").with(idx);
+            let row_bg = if is_selected {
+                t::active_channel_bg()
+            } else {
+                Color32::TRANSPARENT
+            };
+
+            let frame_resp = egui::Frame::new()
+                .fill(row_bg)
+                .corner_radius(3.0)
+                .inner_margin(egui::Margin::symmetric(8, 4))
+                .show(&mut popup_ui, |ui| {
+                    let cmd_col = if is_selected {
+                        t::text_primary()
                     } else {
-                        Color32::TRANSPARENT
+                        t::accent()
                     };
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new(entry.usage)
+                                .font(t::small())
+                                .color(cmd_col)
+                                .strong(),
+                        );
+                        ui.add_sized(
+                            [ui.available_width(), 14.0],
+                            egui::Label::new(
+                                RichText::new(entry.summary)
+                                    .font(t::small())
+                                    .color(t::text_muted()),
+                            )
+                            .truncate(),
+                        );
+                    });
+                });
 
-                    let frame_resp = egui::Frame::new()
-                        .fill(row_bg)
-                        .corner_radius(3.0)
-                        .inner_margin(egui::Margin::symmetric(6, 3))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                let cmd_col = if is_selected {
-                                    t::text_primary()
-                                } else {
-                                    t::accent()
-                                };
-                                ui.label(
-                                    RichText::new(entry.usage)
-                                        .font(t::small())
-                                        .color(cmd_col)
-                                        .strong(),
-                                );
-                                let rem = ui.available_width();
-                                if rem > 80.0 {
-                                    ui.add_sized(
-                                        [rem, 14.0],
-                                        egui::Label::new(
-                                            RichText::new(entry.summary)
-                                                .font(t::small())
-                                                .color(t::text_muted()),
-                                        )
-                                        .truncate(),
-                                    );
-                                }
-                            });
-                        });
-
-                    let row_rect = frame_resp.response.rect;
-                    let click_resp = ui.interact(row_rect, row_id, egui::Sense::click());
-                    if click_resp.clicked() {
-                        clicked_cmd = Some(entry.name.to_owned());
-                    }
-                }
-            });
+            let row_rect = frame_resp.response.rect;
+            let click_resp = popup_ui.interact(row_rect, row_id, egui::Sense::click());
+            if click_resp.clicked() {
+                clicked_cmd = Some(entry.name.to_owned());
+            }
+        }
 
         clicked_cmd
     }
@@ -1062,7 +1080,10 @@ impl<'a> ChatInput<'a> {
             egui::vec2(popup_width, popup_h),
         );
 
-        let layer_id = LayerId::new(Order::Foreground, Id::new("join_autocomplete_popup"));
+        let layer_id = LayerId::new(
+            Order::Foreground,
+            text_resp.id.with("join_autocomplete_popup"),
+        );
         let painter = ui.ctx().layer_painter(layer_id);
         painter.rect_filled(popup_rect, 6.0, t::bg_raised());
         painter.rect_stroke(
@@ -1087,7 +1108,7 @@ impl<'a> ChatInput<'a> {
             .show(&mut popup_ui, |ui| {
                 for (i, channel) in matches.iter().enumerate() {
                     let is_selected = i as i32 == selected;
-                    let row_id = Id::new("join_ac_row").with(i);
+                    let row_id = text_resp.id.with("join_ac_row").with(i);
                     let row_bg = if is_selected {
                         t::active_channel_bg()
                     } else {
@@ -1144,7 +1165,10 @@ impl<'a> ChatInput<'a> {
             egui::vec2(popup_width, popup_h),
         );
 
-        let layer_id = LayerId::new(Order::Foreground, Id::new("username_autocomplete_popup"));
+        let layer_id = LayerId::new(
+            Order::Foreground,
+            text_resp.id.with("username_autocomplete_popup"),
+        );
         let painter = ui.ctx().layer_painter(layer_id);
         painter.rect_filled(popup_rect, 6.0, t::bg_raised());
         painter.rect_stroke(
@@ -1169,7 +1193,7 @@ impl<'a> ChatInput<'a> {
             .show(&mut popup_ui, |ui| {
                 for (i, username) in matches.iter().enumerate() {
                     let is_selected = i as i32 == selected;
-                    let row_id = Id::new("username_ac_row").with(i);
+                    let row_id = text_resp.id.with("username_ac_row").with(i);
                     let row_bg = if is_selected {
                         t::active_channel_bg()
                     } else {
@@ -1240,11 +1264,14 @@ fn find_autocomplete_matches<'a>(
 }
 
 /// Find slash commands matching an in-progress `/command` token.
-fn find_slash_matches(buf: &str) -> Vec<&'static SlashCommandInfo> {
+fn find_slash_matches(
+    buf: &str,
+    usage_counts: &HashMap<String, u32>,
+) -> Vec<&'static SlashCommandInfo> {
     let Some(query) = extract_slash_query(buf) else {
         return Vec::new();
     };
-    slash_command_matches(query, SLASH_AUTOCOMPLETE_MAX)
+    slash_command_matches_ranked(query, SLASH_AUTOCOMPLETE_MATCH_LIMIT, usage_counts)
 }
 
 /// Find usernames matching an `@partial` token at the end of the input buffer.

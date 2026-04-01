@@ -314,10 +314,10 @@ impl<'a> ChannelList<'a> {
                                     |ui| {
                                         if unread_mentions > 0 {
                                             // Mentions / highlights badge - amber
-                                            let label = if unread_count > 99 {
+                                            let label = if unread_mentions > 99 {
                                                 "99+".to_owned()
                                             } else {
-                                                format!("{unread_count}")
+                                                format!("{unread_mentions}")
                                             };
                                             ui.label(
                                                 RichText::new(label)

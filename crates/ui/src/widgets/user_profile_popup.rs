@@ -37,6 +37,9 @@ pub enum PopupAction {
     FetchIvrLogs { channel: String, username: String },
     /// Open a URL in the system browser.
     OpenUrl { url: String },
+    OpenModerationTools { channel: ChannelId },
+    /// Execute an arbitrary chat command (e.g. from a mod action preset).
+    ExecuteCommand { channel: ChannelId, command: String },
 }
 
 // ─── Tab state ────────────────────────────────────────────────────────────────
@@ -46,6 +49,7 @@ enum ProfileTab {
     #[default]
     Profile,
     Moderation,
+    ModLogs,
     Logs,
     IvrLogs,
 }
@@ -78,6 +82,8 @@ pub struct UserProfilePopup {
     ban_confirm: bool,
     /// Recent messages from this user in the current channel (most-recent first).
     logs: Vec<ChatMessage>,
+    /// Recent moderation actions targeting this user in the current channel.
+    mod_logs: Vec<ChatMessage>,
     /// External IVR chat logs fetched from logs.ivr.fi.
     ivr_logs: Vec<IvrLogEntry>,
     /// Whether IVR logs are currently being fetched.
@@ -86,6 +92,8 @@ pub struct UserProfilePopup {
     ivr_logs_error: Option<String>,
     /// Whether IVR logs have been requested for the current popup session.
     ivr_logs_requested: bool,
+    /// Channels where this user appears in local state (chatters or recent messages).
+    shared_channels: Vec<String>,
 }
 
 impl UserProfilePopup {
@@ -109,16 +117,28 @@ impl UserProfilePopup {
         self.timeout_custom.clear();
         self.ban_confirm = false;
         self.logs.clear();
+        self.mod_logs.clear();
         self.ivr_logs.clear();
         self.ivr_logs_loading = false;
         self.ivr_logs_error = None;
         self.ivr_logs_requested = false;
+        self.shared_channels.clear();
     }
 
     /// Store pre-filtered chat logs for this user (called from `app.rs` when
     /// the profile is loaded).  Expects messages in most-recent-first order.
     pub fn set_logs(&mut self, logs: Vec<ChatMessage>) {
         self.logs = logs;
+    }
+
+    /// Store pre-filtered moderation actions targeting this user.
+    pub fn set_mod_logs(&mut self, logs: Vec<ChatMessage>) {
+        self.mod_logs = logs;
+    }
+
+    /// Store channels shared with the viewed user (computed from local state).
+    pub fn set_shared_channels(&mut self, channels: Vec<String>) {
+        self.shared_channels = channels;
     }
 
     /// Store external IVR chat logs.
@@ -343,6 +363,9 @@ impl UserProfilePopup {
                                 });
                         }
                     }
+                    for role in badge_role_labels(&self.badges) {
+                        role_pill(ui, &role, t::text_secondary());
+                    }
                 });
 
                 if !self.badges.is_empty() {
@@ -479,9 +502,10 @@ impl UserProfilePopup {
 
     fn render_tab_bar(&mut self, ui: &mut egui::Ui, profile: &UserProfile, actions: &mut Vec<PopupAction>) {
         let mut tabs: Vec<(&str, ProfileTab)> = vec![("Profile", ProfileTab::Profile)];
+        tabs.push(("Logs", ProfileTab::Logs));
         if self.is_mod {
             tabs.push(("Moderation", ProfileTab::Moderation));
-            tabs.push(("Logs", ProfileTab::Logs));
+            tabs.push(("Mod Logs", ProfileTab::ModLogs));
         }
         tabs.push(("IVR Logs", ProfileTab::IvrLogs));
 
@@ -611,6 +635,77 @@ impl UserProfilePopup {
             });
     }
 
+    fn render_mod_logs_tab(&self, ui: &mut egui::Ui) {
+        let log_count = self.mod_logs.len();
+        egui::Frame::new()
+            .fill(if t::is_light() {
+                Color32::from_rgba_unmultiplied(0, 0, 0, 20)
+            } else {
+                Color32::from_rgba_unmultiplied(0, 0, 0, 60)
+            })
+            .corner_radius(t::RADIUS_SM)
+            .inner_margin(egui::Margin::symmetric(6, 4))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(if log_count == 0 {
+                        "No moderation actions for this user in the current session.".to_owned()
+                    } else {
+                        format!(
+                            "{log_count} moderation action{} (newest first)",
+                            if log_count == 1 { "" } else { "s" }
+                        )
+                    })
+                    .color(t::text_muted())
+                    .small(),
+                );
+            });
+
+        ui.add_space(4.0);
+
+        egui::ScrollArea::vertical()
+            .id_salt("user_mod_logs_scroll")
+            .max_height(320.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                if self.mod_logs.is_empty() {
+                    ui.add_space(8.0);
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            RichText::new("No recent moderation actions.")
+                                .color(t::text_muted())
+                                .small(),
+                        );
+                    });
+                }
+                for msg in &self.mod_logs {
+                    let time_str = msg.timestamp.format("%H:%M:%S").to_string();
+                    egui::Frame::new()
+                        .fill(Color32::from_rgba_unmultiplied(180, 120, 20, 18))
+                        .inner_margin(egui::Margin::symmetric(4, 2))
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                ui.add(egui::Label::new(
+                                    RichText::new(&time_str)
+                                        .color(t::text_muted())
+                                        .small()
+                                        .monospace(),
+                                ));
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&msg.raw_text)
+                                            .color(t::text_primary())
+                                            .small(),
+                                    )
+                                    .wrap(),
+                                );
+                            });
+                        });
+                    ui.add_space(1.0);
+                }
+            });
+    }
+
     fn render_profile_tab(&self, ui: &mut egui::Ui, profile: &UserProfile) {
         egui::Frame::new()
             .fill(t::bg_card())
@@ -635,9 +730,34 @@ impl UserProfilePopup {
                 if let Some(f) = profile.followers {
                     add_row("Followers", fmt_count(f));
                 }
+                if let Some(ref pronouns) = profile.pronouns {
+                    add_row("Pronouns", pronouns.clone());
+                }
+                if let Some(ref ts) = profile.followed_at {
+                    let age = fmt_follow_age(ts);
+                    if !age.is_empty() {
+                        add_row("Follow age", age);
+                    }
+                }
                 if let Some(ref ts) = profile.created_at {
                     add_row("Account age", fmt_account_age(ts));
                     add_row("Joined", fmt_join_date(ts));
+                }
+                if !self.shared_channels.is_empty() {
+                    let count = self.shared_channels.len();
+                    let preview = self
+                        .shared_channels
+                        .iter()
+                        .take(3)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let suffix = if count > 3 {
+                        format!(" +{} more", count - 3)
+                    } else {
+                        String::new()
+                    };
+                    add_row("Shared channels", format!("{count} ({preview}{suffix})"));
                 }
                 if !profile.is_live {
                     if let Some(ref ts) = profile.last_broadcast_at {
@@ -645,6 +765,30 @@ impl UserProfilePopup {
                     }
                 }
             });
+
+        if !self.shared_channels.is_empty() {
+            ui.add_space(5.0);
+            egui::Frame::new()
+                .fill(t::bg_card())
+                .stroke(egui::Stroke::new(1.0, t::border_subtle()))
+                .corner_radius(t::RADIUS_SM)
+                .inner_margin(egui::Margin::symmetric(8, 6))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new("Shared Channels")
+                            .small()
+                            .strong()
+                            .color(t::text_secondary()),
+                    );
+                    ui.add_space(3.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                        for channel in &self.shared_channels {
+                            badge_text_pill(ui, channel);
+                        }
+                    });
+                });
+        }
 
         if !profile.description.is_empty() {
             ui.add_space(5.0);
@@ -692,6 +836,7 @@ impl UserProfilePopup {
         ui: &mut egui::Ui,
         profile: &UserProfile,
         actions: &mut Vec<PopupAction>,
+        presets: &[crust_core::model::mod_actions::ModActionPreset],
     ) {
         let Some(channel) = self.channel.clone() else {
             return;
@@ -699,6 +844,7 @@ impl UserProfilePopup {
 
         let login = profile.login.clone();
         let user_id = profile.id.clone();
+        let channel_name = channel.display_name().to_ascii_lowercase();
 
         ui.label(
             RichText::new("Reason (optional)")
@@ -714,40 +860,32 @@ impl UserProfilePopup {
         );
         ui.add_space(6.0);
 
-        section_label(ui, "Timeout");
+        section_label(ui, "Quick Actions");
         ui.add_space(3.0);
-        egui::Grid::new("timeout_presets_row1")
-            .num_columns(6)
-            .spacing([4.0, 4.0])
-            .show(ui, |ui| {
-                const ROW1: &[(&str, u32)] =
-                    &[("1s", 1), ("30s", 30), ("1m", 60), ("5m", 300), ("10m", 600), ("30m", 1_800)];
-                for &(lbl, secs) in ROW1 {
-                    if timeout_btn(ui, lbl) {
-                        actions.push(PopupAction::Timeout {
-                            channel: channel.clone(),
-                            login: login.clone(),
-                            user_id: user_id.clone(),
-                            seconds: secs,
-                            reason: reason_opt(&self.mod_reason),
-                        });
+        
+        let default_presets = crust_core::model::mod_actions::ModActionPreset::defaults();
+        let active_presets = if presets.is_empty() {
+            default_presets.as_slice()
+        } else {
+            presets
+        };
+
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+            for preset in active_presets {
+                if ui.button(RichText::new(&preset.label).small()).clicked() {
+                    let mut cmd = preset.expand(&login, &channel_name);
+                    if let Some(reason) = reason_opt(&self.mod_reason) {
+                        cmd.push(' ');
+                        cmd.push_str(&reason);
                     }
+                    actions.push(PopupAction::ExecuteCommand {
+                        channel: channel.clone(),
+                        command: cmd,
+                    });
                 }
-                ui.end_row();
-                const ROW2: &[(&str, u32)] =
-                    &[("1h", 3_600), ("8h", 28_800), ("24h", 86_400), ("7d", 604_800), ("14d", 1_209_600)];
-                for &(lbl, secs) in ROW2 {
-                    if timeout_btn(ui, lbl) {
-                        actions.push(PopupAction::Timeout {
-                            channel: channel.clone(),
-                            login: login.clone(),
-                            user_id: user_id.clone(),
-                            seconds: secs,
-                            reason: reason_opt(&self.mod_reason),
-                        });
-                    }
-                }
-            });
+            }
+        });
 
         ui.add_space(3.0);
         ui.horizontal(|ui| {
@@ -794,6 +932,39 @@ impl UserProfilePopup {
                 channel: channel.clone(),
                 login: login.clone(),
                 user_id: user_id.clone(),
+            });
+        }
+
+        let channel_login = channel.display_name().to_ascii_lowercase();
+        if !channel_login.is_empty() {
+            ui.add_space(8.0);
+            section_label(ui, "Workflows");
+            ui.add_space(3.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Open mod view").clicked() {
+                    actions.push(PopupAction::OpenUrl {
+                        url: format!("https://www.twitch.tv/moderator/{channel_login}/chat"),
+                    });
+                }
+                if ui.button("Open AutoMod").clicked() {
+                    actions.push(PopupAction::OpenUrl {
+                        url: format!(
+                            "https://dashboard.twitch.tv/u/{channel_login}/settings/moderation/automod"
+                        ),
+                    });
+                }
+                if ui.button("In-app mod tools").clicked() {
+                    actions.push(PopupAction::OpenModerationTools {
+                        channel: channel.clone(),
+                    });
+                }
+                if ui.button("Unban requests").clicked() {
+                    actions.push(PopupAction::OpenUrl {
+                        url: format!(
+                            "https://dashboard.twitch.tv/u/{channel_login}/community/unban-requests"
+                        ),
+                    });
+                }
             });
         }
 
@@ -1034,6 +1205,7 @@ impl UserProfilePopup {
         ctx: &egui::Context,
         emote_bytes: &HashMap<String, (u32, u32, Arc<[u8]>)>,
         stv_avatars: &HashMap<String, String>,
+        presets: &[crust_core::model::mod_actions::ModActionPreset],
     ) -> Vec<PopupAction> {
         if !self.open {
             return Vec::new();
@@ -1085,9 +1257,10 @@ impl UserProfilePopup {
                 match self.active_tab {
                     ProfileTab::Profile => self.render_profile_tab(ui, &profile),
                     ProfileTab::Moderation if self.is_mod => {
-                        self.render_moderation_tab(ui, &profile, &mut actions)
+                        self.render_moderation_tab(ui, &profile, &mut actions, presets)
                     }
-                    ProfileTab::Logs if self.is_mod => self.render_logs_tab(ui),
+                    ProfileTab::ModLogs if self.is_mod => self.render_mod_logs_tab(ui),
+                    ProfileTab::Logs => self.render_logs_tab(ui),
                     ProfileTab::IvrLogs => self.render_ivr_logs_tab(ui, &profile, &mut actions),
                     _ => {}
                 }
@@ -1107,7 +1280,7 @@ impl UserProfilePopup {
         let has_mod_action = actions.iter().any(|a| {
             matches!(
                 a,
-                PopupAction::Timeout { .. } | PopupAction::Ban { .. } | PopupAction::Unban { .. }
+                PopupAction::Timeout { .. } | PopupAction::Ban { .. } | PopupAction::Unban { .. } | PopupAction::ExecuteCommand { .. }
             )
         });
         if has_mod_action {
@@ -1193,17 +1366,6 @@ fn small_action_btn(ui: &mut egui::Ui, label: &str) -> bool {
             .fill(t::bg_raised())
             .stroke(egui::Stroke::new(1.0, t::border_subtle()))
             .min_size(egui::vec2(72.0, 20.0)),
-    )
-    .clicked()
-}
-
-/// Render a small timeout-preset button; returns true if clicked.
-fn timeout_btn(ui: &mut egui::Ui, label: &str) -> bool {
-    ui.add(
-        egui::Button::new(RichText::new(label).small())
-            .fill(t::bg_raised())
-            .stroke(egui::Stroke::new(1.0, t::border_subtle()))
-            .min_size(egui::vec2(36.0, 20.0)),
     )
     .clicked()
 }
@@ -1351,6 +1513,36 @@ fn fmt_account_age(ts: &str) -> String {
             }
         }
     }
+}
+
+/// Compute follow age from an ISO follow timestamp.
+fn fmt_follow_age(ts: &str) -> String {
+    fmt_account_age(ts)
+}
+
+/// Convert known badge identifiers into role labels shown near profile identity.
+fn badge_role_labels(badges: &[Badge]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for badge in badges {
+        let key = badge.name.to_ascii_lowercase();
+        let label = match key.as_str() {
+            "broadcaster" => Some("Broadcaster"),
+            "moderator" => Some("Moderator"),
+            "vip" => Some("VIP"),
+            "founder" => Some("Founder"),
+            "subscriber" => Some("Subscriber"),
+            "staff" => Some("Staff"),
+            "admin" => Some("Admin"),
+            "global_mod" | "global-mod" => Some("Global Mod"),
+            _ => None,
+        };
+        if let Some(label) = label {
+            if !out.iter().any(|v| v.eq_ignore_ascii_case(label)) {
+                out.push(label.to_owned());
+            }
+        }
+    }
+    out
 }
 
 /// Format an active stream as a live uptime string ("1h 23m", "45m").
