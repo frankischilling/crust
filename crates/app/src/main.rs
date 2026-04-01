@@ -13,7 +13,8 @@ use crust_core::events::{
     AppCommand, AppEvent, AutoModQueueItem, ConnectionState, UnbanRequestItem,
 };
 use crust_core::model::{
-    Badge, ChannelId, ChatMessage, MessageFlags, MessageId, MsgKind, Sender, UserId,
+    Badge, ChannelId, ChatMessage, MessageFlags, MessageId, MsgKind, Sender, TwitchEmotePos,
+    UserId,
 };
 use crust_emotes::{
     cache::EmoteCache,
@@ -52,11 +53,13 @@ use runtime::eventsub_notices::{
 #[cfg(test)]
 use runtime::eventsub_notices::format_eventsub_notice_text;
 use runtime::history::{
-    load_local_older_messages, load_local_recent_messages, load_recent_messages,
+    load_local_older_messages, load_local_recent_messages, load_local_recent_whispers,
+    load_recent_messages,
 };
 use runtime::link_preview::fetch_link_preview;
 use runtime::profiles::{
-    fetch_ivr_logs, fetch_self_avatar, fetch_twitch_user_profile, fetch_user_profile_for_channel,
+    fetch_ivr_logs, fetch_self_avatar, fetch_twitch_stream_status, fetch_twitch_user_profile,
+    fetch_user_profile_for_channel,
 };
 use runtime::system_messages::{
     build_sub_text, extract_irc_msg_echo, format_timeout_text, is_twitch_pinned_notice,
@@ -66,7 +69,7 @@ use runtime::system_messages::{
 mod runtime;
 mod seventv;
 
-const CMD_CHANNEL_SIZE: usize = 128;
+const CMD_CHANNEL_SIZE: usize = 512;
 const EVT_CHANNEL_SIZE: usize = 4096;
 const TWITCH_EVT_SIZE: usize = 4096;
 const KICK_EVT_SIZE: usize = 4096;
@@ -76,6 +79,7 @@ const MODERATION_CMD_COOLDOWN: Duration = Duration::from_millis(500);
 const TWITCH_MAX_MESSAGE_CHARS: usize = 500;
 const TWITCH_GQL_URL: &str = "https://gql.twitch.tv/gql";
 const TWITCH_WEB_CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
+const WHISPER_HISTORY_CHANNEL_PREFIX: &str = "whisper:";
 const APP_INITIAL_INNER_SIZE: [f32; 2] = [1100.0, 700.0];
 const APP_MIN_INNER_SIZE: [f32; 2] = [220.0, 200.0];
 
@@ -461,6 +465,7 @@ async fn reducer_loop(
     // Track authenticated user info for local echo messages
     let mut auth_username: Option<String> = None;
     let mut auth_user_id: Option<String> = None;
+    let mut whisper_history_loaded_for: Option<String> = None;
     let mut local_msg_id: u64 = 1_000_000; // offset to avoid collisions with session IDs
                                            // Helix API credentials extracted from the validate response.
                                            // Required for moderation calls (timeout / ban) via POST /helix/moderation/bans.
@@ -900,6 +905,23 @@ async fn reducer_loop(
                             user_id: user_id.clone(),
                         }).await;
 
+                        if whisper_history_loaded_for
+                            .as_deref()
+                            != auth_username.as_deref()
+                        {
+                            whisper_history_loaded_for = auth_username.clone();
+                            if settings.local_log_indexing_enabled {
+                                if let Some(store) = chat_logs.clone() {
+                                    let etx_whisper = evt_tx.clone();
+                                    let self_login = auth_username.clone();
+                                    tokio::spawn(async move {
+                                        load_local_recent_whispers(store, self_login, etx_whisper)
+                                            .await;
+                                    });
+                                }
+                            }
+                        }
+
                         if join_now {
                             let twitch_restore: Vec<ChannelId> = parsed_auto_join_channels(&settings)
                                 .into_iter()
@@ -1075,6 +1097,45 @@ async fn reducer_loop(
                             channel,
                             message: msg,
                         }).await;
+                    }
+                    TwitchEvent::Whisper {
+                        from_login,
+                        from_display_name,
+                        target_login,
+                        text,
+                        twitch_emotes,
+                        is_self,
+                        timestamp,
+                    } => {
+                        if settings.local_log_indexing_enabled && !is_self {
+                            if let Some(store) = chat_logs.as_ref() {
+                                if let Err(e) = persist_whisper_message(
+                                    store,
+                                    auth_username.as_deref(),
+                                    &from_login,
+                                    &from_display_name,
+                                    &target_login,
+                                    &text,
+                                    &twitch_emotes,
+                                    is_self,
+                                    timestamp,
+                                ) {
+                                    warn!("whisper-history: failed to persist whisper: {e}");
+                                }
+                            }
+                        }
+                        let _ = evt_tx
+                            .send(AppEvent::WhisperReceived {
+                                from_login,
+                                from_display_name,
+                                target_login,
+                                text,
+                                twitch_emotes,
+                                is_self,
+                                timestamp,
+                                is_history: false,
+                            })
+                            .await;
                     }
                     TwitchEvent::MessageDeleted { channel, server_id } => {
                         let _ = evt_tx.send(AppEvent::MessageDeleted { channel, server_id }).await;
@@ -1641,8 +1702,16 @@ async fn reducer_loop(
                             .collect();
                         for login in twitch_channels {
                             let etx = evt_tx.clone();
+                            let token = settings.oauth_token.clone();
+                            let client_id = helix_client_id.clone();
                             tokio::spawn(async move {
-                                fetch_twitch_user_profile(&login, etx).await;
+                                fetch_twitch_user_profile(
+                                    &login,
+                                    Some(token.as_str()),
+                                    client_id.as_deref(),
+                                    etx,
+                                )
+                                .await;
                             });
                         }
                     }
@@ -1828,13 +1897,24 @@ async fn reducer_loop(
                                             .send(AppEvent::StreamStatusUpdated {
                                                 login: login.clone(),
                                                 is_live,
+                                                title: None,
+                                                game: None,
+                                                viewers: None,
                                             })
                                             .await;
 
                                         if is_live {
                                             let etx = evt_tx.clone();
+                                            let token = settings.oauth_token.clone();
+                                            let client_id = helix_client_id.clone();
                                             tokio::spawn(async move {
-                                                fetch_twitch_user_profile(&login, etx).await;
+                                                fetch_twitch_user_profile(
+                                                    &login,
+                                                    Some(token.as_str()),
+                                                    client_id.as_deref(),
+                                                    etx,
+                                                )
+                                                .await;
                                             });
                                         }
                                     }
@@ -2181,6 +2261,7 @@ async fn reducer_loop(
                         }
                         auth_username = None;
                         auth_user_id = None;
+                        whisper_history_loaded_for = None;
                         let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
                         let _ = sess_tx.send(SessionCommand::LogoutAndReconnect).await;
                         let _ = evt_tx.send(AppEvent::LoggedOut).await;
@@ -2218,6 +2299,7 @@ async fn reducer_loop(
                             // UI clears the old avatar immediately.
                             auth_username = None;
                             auth_user_id = None;
+                            whisper_history_loaded_for = None;
                             let _ = evt_tx.send(AppEvent::LoggedOut).await;
                             let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
                             auth_in_progress = true;
@@ -2266,6 +2348,7 @@ async fn reducer_loop(
                                 } else {
                                     auth_username = None;
                                     auth_user_id = None;
+                                    whisper_history_loaded_for = None;
                                     settings.username = String::new();
                                     let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
                                     let _ = sess_tx.send(SessionCommand::LogoutAndReconnect).await;
@@ -2274,6 +2357,7 @@ async fn reducer_loop(
                             } else {
                                 auth_username = None;
                                 auth_user_id = None;
+                                whisper_history_loaded_for = None;
                                 settings.username = String::new();
                                 let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
                                 let _ = sess_tx.send(SessionCommand::LogoutAndReconnect).await;
@@ -2734,6 +2818,61 @@ async fn reducer_loop(
                         mut reply_to_msg_id,
                         reply,
                     } => {
+                        if channel.is_twitch() {
+                            if let Some((target_login, whisper_text)) =
+                                parse_outgoing_whisper_command(&text)
+                            {
+                                let token = settings.oauth_token.clone();
+                                let client_id = helix_client_id.clone();
+                                let from_user_id = auth_user_id.clone();
+                                let from_login = auth_username.clone();
+                                let whisper_twitch_emotes = {
+                                    let emote_guard = emote_index.read().unwrap();
+                                    infer_twitch_emote_positions_from_text(
+                                        &emote_guard,
+                                        &whisper_text,
+                                    )
+                                };
+                                if settings.local_log_indexing_enabled {
+                                    if let Some(store) = chat_logs.as_ref() {
+                                        if let Some(sender_login) = from_login
+                                            .as_deref()
+                                            .and_then(normalize_whisper_login)
+                                        {
+                                            if let Err(e) = persist_whisper_message(
+                                                store,
+                                                Some(sender_login.as_str()),
+                                                &sender_login,
+                                                &sender_login,
+                                                &target_login,
+                                                &whisper_text,
+                                                &whisper_twitch_emotes,
+                                                true,
+                                                Utc::now(),
+                                            ) {
+                                                warn!("whisper-history: failed to persist sent whisper: {e}");
+                                            }
+                                        }
+                                    }
+                                }
+                                let evt_tx2 = evt_tx.clone();
+                                tokio::spawn(async move {
+                                    helix_send_whisper(
+                                        &token,
+                                        client_id.as_deref(),
+                                        from_user_id.as_deref(),
+                                        from_login.as_deref(),
+                                        &target_login,
+                                        &whisper_text,
+                                        whisper_twitch_emotes,
+                                        evt_tx2,
+                                    )
+                                    .await;
+                                });
+                                continue;
+                            }
+                        }
+
                         if reply_to_msg_id.is_none() {
                             reply_to_msg_id =
                                 reply.as_ref().map(|r| r.parent_msg_id.clone());
@@ -3003,9 +3142,82 @@ async fn reducer_loop(
                             }
                         }
                     }
+                    AppCommand::SendWhisper { target_login, text } => {
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let from_user_id = auth_user_id.clone();
+                        let from_login = auth_username.clone();
+                        let whisper_text = text.trim().to_owned();
+                        let whisper_twitch_emotes = {
+                            let emote_guard = emote_index.read().unwrap();
+                            infer_twitch_emote_positions_from_text(&emote_guard, &whisper_text)
+                        };
+                        if settings.local_log_indexing_enabled {
+                            if let Some(store) = chat_logs.as_ref() {
+                                if !whisper_text.is_empty() {
+                                    if let Some(sender_login) = from_login
+                                        .as_deref()
+                                        .and_then(normalize_whisper_login)
+                                    {
+                                        if let Err(e) = persist_whisper_message(
+                                            store,
+                                            Some(sender_login.as_str()),
+                                            &sender_login,
+                                            &sender_login,
+                                            &target_login,
+                                            &whisper_text,
+                                            &whisper_twitch_emotes,
+                                            true,
+                                            Utc::now(),
+                                        ) {
+                                            warn!("whisper-history: failed to persist sent whisper: {e}");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let evt_tx2 = evt_tx.clone();
+                        tokio::spawn(async move {
+                            helix_send_whisper(
+                                &token,
+                                client_id.as_deref(),
+                                from_user_id.as_deref(),
+                                from_login.as_deref(),
+                                &target_login,
+                                &whisper_text,
+                                whisper_twitch_emotes,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
                     AppCommand::FetchUserProfile { login } => {
                         let etx = evt_tx.clone();
-                        tokio::spawn(async move { fetch_twitch_user_profile(&login, etx).await; });
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        tokio::spawn(async move {
+                            fetch_twitch_user_profile(
+                                &login,
+                                Some(token.as_str()),
+                                client_id.as_deref(),
+                                etx,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::FetchStreamStatus { login } => {
+                        let etx = evt_tx.clone();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        tokio::spawn(async move {
+                            fetch_twitch_stream_status(
+                                &login,
+                                Some(token.as_str()),
+                                client_id.as_deref(),
+                                etx,
+                            )
+                            .await;
+                        });
                     }
                     AppCommand::TimeoutUser { channel, login, user_id, seconds, reason } => {
                         if let Some(remaining) = moderation_command_remaining_cooldown(
@@ -3454,8 +3666,17 @@ async fn reducer_loop(
                     }
                     AppCommand::ShowUserCard { login, channel } => {
                         let etx = evt_tx.clone();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
                         tokio::spawn(async move {
-                            fetch_user_profile_for_channel(&login, &channel, etx).await;
+                            fetch_user_profile_for_channel(
+                                &login,
+                                &channel,
+                                Some(token.as_str()),
+                                client_id.as_deref(),
+                                etx,
+                            )
+                            .await;
                         });
                     }
                     AppCommand::FetchIvrLogs { channel, username } => {
@@ -3503,6 +3724,7 @@ async fn reducer_loop(
                     TokenValidationResult::Startup { token, result } => {
                         match result {
                             Ok(info) => {
+                                warn_missing_whisper_scope(&evt_tx, &info.scopes).await;
                                 let login = info.login;
                                 info!("Saved token valid for user: {login}");
                                 if !info.client_id.is_empty() {
@@ -3546,6 +3768,7 @@ async fn reducer_loop(
                     TokenValidationResult::Login { token, result } => {
                         match result {
                             Ok(info) => {
+                                warn_missing_whisper_scope(&evt_tx, &info.scopes).await;
                                 let login = info.login;
                                 info!("Token valid for user: {login}");
                                 if !info.client_id.is_empty() {
@@ -3598,6 +3821,7 @@ async fn reducer_loop(
                     TokenValidationResult::AddAccount { token, result } => {
                         match result {
                             Ok(info) => {
+                                warn_missing_whisper_scope(&evt_tx, &info.scopes).await;
                                 let login = info.login;
                                 info!("AddAccount: token valid for {login}");
                                 if !info.client_id.is_empty() {
@@ -3650,6 +3874,7 @@ async fn reducer_loop(
                     TokenValidationResult::Refresh { token, result } => {
                         match result {
                             Ok(info) => {
+                                warn_missing_whisper_scope(&evt_tx, &info.scopes).await;
                                 let login = info.login;
                                 let client_id = info.client_id;
 
@@ -4647,6 +4872,172 @@ fn require_helix_moderation_context<'a>(
     Ok((cid, bid, mid))
 }
 
+fn parse_outgoing_whisper_command(text: &str) -> Option<(String, String)> {
+    let trimmed = text.trim();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+
+    let without_slash = trimmed.strip_prefix('/')?;
+    let (cmd, rest) = without_slash
+        .split_once(char::is_whitespace)
+        .map(|(c, r)| (c.trim().to_ascii_lowercase(), r.trim()))
+        .unwrap_or_else(|| (without_slash.trim().to_ascii_lowercase(), ""));
+    if !matches!(cmd.as_str(), "w" | "whisper") {
+        return None;
+    }
+
+    let (raw_target, raw_message) = rest
+        .split_once(char::is_whitespace)
+        .map(|(target, message)| (target.trim(), message.trim()))
+        .unwrap_or((rest.trim(), ""));
+    if raw_target.is_empty() || raw_message.is_empty() {
+        return None;
+    }
+
+    let target_login = raw_target
+        .trim_start_matches('@')
+        .trim_start_matches('#')
+        .to_ascii_lowercase();
+    let valid_target = {
+        let len = target_login.len();
+        (3..=25).contains(&len)
+            && target_login
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    };
+    if !valid_target {
+        return None;
+    }
+
+    Some((target_login, raw_message.to_owned()))
+}
+
+fn normalize_whisper_login(login: &str) -> Option<String> {
+    let login = login
+        .trim()
+        .trim_start_matches('@')
+        .trim_start_matches('#')
+        .to_ascii_lowercase();
+    let len = login.len();
+    if !(3..=25).contains(&len) {
+        return None;
+    }
+    if !login
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    {
+        return None;
+    }
+    Some(login)
+}
+
+fn whisper_thread_channel_id(partner_login: &str) -> ChannelId {
+    ChannelId(format!("{WHISPER_HISTORY_CHANNEL_PREFIX}{partner_login}"))
+}
+
+fn infer_twitch_emote_positions_from_text(
+    idx: &std::collections::HashMap<String, EmoteInfo>,
+    text: &str,
+) -> Vec<TwitchEmotePos> {
+    let mut out = Vec::new();
+    let mut cursor_chars = 0usize;
+
+    for word in text.split_inclusive(' ') {
+        let word_char_len = word.chars().count();
+        let trimmed = word.trim();
+        if !trimmed.is_empty() {
+            let leading_ws = word.chars().take_while(|c| c.is_whitespace()).count();
+            let trimmed_len = trimmed.chars().count();
+            if trimmed_len > 0 {
+                if let Some(info) = idx.get(&emote_key("twitch", trimmed)) {
+                    let start = cursor_chars + leading_ws;
+                    let end = start + trimmed_len - 1;
+                    out.push(TwitchEmotePos {
+                        id: info.id.clone(),
+                        start,
+                        end,
+                    });
+                }
+            }
+        }
+        cursor_chars += word_char_len;
+    }
+
+    out
+}
+
+fn persist_whisper_message(
+    log_store: &LogStore,
+    local_login: Option<&str>,
+    from_login: &str,
+    from_display_name: &str,
+    target_login: &str,
+    text: &str,
+    twitch_emotes: &[TwitchEmotePos],
+    is_self: bool,
+    timestamp: chrono::DateTime<Utc>,
+) -> Result<(), crust_storage::StorageError> {
+    let from_login = normalize_whisper_login(from_login);
+    let target_login = normalize_whisper_login(target_login);
+    let local_login = local_login.and_then(normalize_whisper_login);
+
+    let partner_login = if is_self {
+        target_login
+            .clone()
+            .or_else(|| from_login.clone())
+            .or(local_login)
+    } else {
+        from_login
+            .clone()
+            .or(target_login.clone())
+            .or(local_login)
+    };
+    let Some(partner_login) = partner_login else {
+        return Ok(());
+    };
+
+    let sender_login = from_login.unwrap_or_else(|| partner_login.clone());
+    let sender_display_name = if from_display_name.trim().is_empty() {
+        sender_login.clone()
+    } else {
+        from_display_name.trim().to_owned()
+    };
+
+    let msg = ChatMessage {
+        id: MessageId(0),
+        server_id: None,
+        timestamp,
+        channel: whisper_thread_channel_id(&partner_login),
+        sender: Sender {
+            user_id: UserId(sender_login.clone()),
+            login: sender_login,
+            display_name: sender_display_name,
+            color: None,
+            name_paint: None,
+            badges: Vec::new(),
+        },
+        raw_text: text.trim().to_owned(),
+        spans: Default::default(),
+        twitch_emotes: twitch_emotes.to_vec(),
+        flags: MessageFlags {
+            is_action: false,
+            is_highlighted: false,
+            is_deleted: false,
+            is_first_msg: false,
+            is_pinned: false,
+            is_self,
+            is_mention: false,
+            custom_reward_id: None,
+            is_history: false,
+        },
+        reply: None,
+        msg_kind: MsgKind::Chat,
+    };
+
+    log_store.append_message(&msg)
+}
+
 async fn helix_user_id_by_login(
     bare_token: &str,
     client_id: &str,
@@ -4688,6 +5079,187 @@ async fn helix_user_id_by_login(
         .next()
         .ok_or_else(|| format!("Could not find Twitch channel '{login}'."))?;
     Ok(user.id)
+}
+
+async fn helix_send_whisper(
+    token: &str,
+    client_id: Option<&str>,
+    from_user_id: Option<&str>,
+    from_login: Option<&str>,
+    target_login: &str,
+    text: &str,
+    twitch_emotes: Vec<TwitchEmotePos>,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    info!("Whisper send requested to {}", target_login.trim());
+    let cid = match client_id {
+        Some(cid) => cid,
+        None => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Whisper".into(),
+                    message: "Missing Twitch Client-ID.".into(),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let sender_id = match from_user_id.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(id) => id,
+        None => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Whisper".into(),
+                    message: "You must be logged in to send whispers.".into(),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    if bare.trim().is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Whisper".into(),
+                message: "You must be logged in to send whispers.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let login = target_login
+        .trim()
+        .trim_start_matches('@')
+        .to_ascii_lowercase();
+    if login.is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Whisper".into(),
+                message: "Usage: /w <user> <message>".into(),
+            })
+            .await;
+        return;
+    }
+
+    if from_login
+        .map(|current| current.eq_ignore_ascii_case(&login))
+        .unwrap_or(false)
+    {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Whisper".into(),
+                message: "You cannot whisper yourself.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let trimmed_text = text.trim();
+    if trimmed_text.is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Whisper".into(),
+                message: "Whisper message cannot be empty.".into(),
+            })
+            .await;
+        return;
+    }
+    if trimmed_text.chars().count() > TWITCH_MAX_MESSAGE_CHARS {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Whisper".into(),
+                message: format!(
+                    "Whisper too long (>{TWITCH_MAX_MESSAGE_CHARS} characters)."
+                ),
+            })
+            .await;
+        return;
+    }
+
+    let to_user_id = match helix_user_id_by_login(bare, cid, &login).await {
+        Ok(id) => id,
+        Err(msg) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Whisper".into(),
+                    message: msg,
+                })
+                .await;
+            return;
+        }
+    };
+
+    #[derive(serde::Serialize)]
+    struct WhisperBody<'a> {
+        message: &'a str,
+    }
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .post("https://api.twitch.tv/helix/whispers")
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .query(&[("from_user_id", sender_id), ("to_user_id", to_user_id.as_str())])
+        .json(&WhisperBody {
+            message: trimmed_text,
+        })
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Whisper".into(),
+                    message: format!("Send whisper request failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let status = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        let sender_login = from_login
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| sender_id.to_owned());
+        let now = Utc::now();
+        info!("Whisper send succeeded to {login}");
+        let _ = evt_tx
+            .send(AppEvent::WhisperReceived {
+                from_login: sender_login.clone(),
+                from_display_name: sender_login,
+                target_login: login,
+                text: trimmed_text.to_owned(),
+                twitch_emotes,
+                is_self: true,
+                timestamp: now,
+                is_history: false,
+            })
+            .await;
+        return;
+    }
+
+    let mut msg = helix_error_message(status, &body_text);
+    if body_text.contains("MISSING_REQUIRED_SCOPE")
+        || msg
+            .to_ascii_lowercase()
+            .contains("missing required scope")
+    {
+        msg.push_str(" Re-login with a token that includes user:manage:whispers.");
+    }
+    warn!("Whisper send failed to {login}: {msg}");
+    let _ = evt_tx
+        .send(AppEvent::Error {
+            context: "Whisper".into(),
+            message: format!("Could not send whisper to {login}: {msg}"),
+        })
+        .await;
 }
 
 async fn helix_send_announcement(
@@ -5847,6 +6419,8 @@ struct ValidateInfo {
     user_id: String,
     /// Client-id of the application the token was issued to.
     client_id: String,
+    /// OAuth scopes currently granted by this token.
+    scopes: Vec<String>,
 }
 
 /// Validate a Twitch OAuth token via the Twitch API and return the login name.
@@ -5877,6 +6451,8 @@ async fn validate_token(token: &str) -> Result<ValidateInfo, ValidateError> {
         user_id: String,
         #[serde(default)]
         client_id: String,
+        #[serde(default)]
+        scopes: Vec<String>,
     }
 
     let body = resp.json::<ValidateResponse>().await.map_err(|e| {
@@ -5887,7 +6463,25 @@ async fn validate_token(token: &str) -> Result<ValidateInfo, ValidateError> {
         login: body.login,
         user_id: body.user_id,
         client_id: body.client_id,
+        scopes: body.scopes,
     })
+}
+
+fn token_has_scope(scopes: &[String], required: &str) -> bool {
+    scopes.iter().any(|scope| scope.eq_ignore_ascii_case(required))
+}
+
+async fn warn_missing_whisper_scope(evt_tx: &mpsc::Sender<AppEvent>, scopes: &[String]) {
+    if token_has_scope(scopes, "user:manage:whispers") {
+        return;
+    }
+
+    let _ = evt_tx
+        .send(AppEvent::Error {
+            context: "Whisper".into(),
+            message: "Your token is missing scope user:manage:whispers, so /w and /whisper will fail. Re-login with that scope enabled.".into(),
+        })
+        .await;
 }
 
 #[derive(Debug, Clone)]

@@ -509,7 +509,7 @@ const BUILTIN_SLASH_COMMANDS: &[SlashCommandInfo] = &[
     SlashCommandInfo {
         name: "w",
         usage: "/w <user> <msg>",
-        summary: "Send a Twitch whisper.",
+        summary: "Send a Twitch whisper (Helix).",
         aliases: &["whisper"],
     },
     SlashCommandInfo {

@@ -166,6 +166,36 @@ impl LogStore {
         Ok(out)
     }
 
+    /// List distinct channel ids that begin with `prefix`, ordered by most
+    /// recent message timestamp descending.
+    pub fn recent_channels_with_prefix(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, StorageError> {
+        let safe_limit = limit.clamp(1, 1_000) as i64;
+        let like_pattern = format!("{prefix}%");
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| StorageError::Io(std::io::Error::other("chat log DB mutex poisoned")))?;
+        let mut stmt = conn.prepare(
+            "SELECT channel
+             FROM chat_messages
+             WHERE channel LIKE ?1
+             GROUP BY channel
+             ORDER BY MAX(ts_ms) DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![like_pattern, safe_limit], |row| row.get::<_, String>(0))?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// Compatibility wrapper: append a plain text line as a chat message.
     pub async fn append(
         &self,

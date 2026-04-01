@@ -718,11 +718,103 @@ impl<'a> ChatInput<'a> {
                     }
 
                     let mut spell_replace: Option<(usize, usize, String)> = None;
+                    let mut context_send_now = false;
+                    let mut context_cut_input = false;
+                    let mut context_copy_input = false;
+                    let mut context_paste_input = false;
+                    let mut context_select_all = false;
+                    let mut context_clear_input = false;
+                    let mut context_insert_help = false;
                     resp.context_menu(|ui| {
+                        if ui
+                            .add_enabled(
+                                !buf.is_empty(),
+                                egui::Button::new(RichText::new("Cut").font(t::small())),
+                            )
+                            .clicked()
+                        {
+                            context_cut_input = true;
+                            ui.close_menu();
+                        }
+
+                        if ui
+                            .add_enabled(
+                                !buf.is_empty(),
+                                egui::Button::new(RichText::new("Copy").font(t::small())),
+                            )
+                            .clicked()
+                        {
+                            context_copy_input = true;
+                            ui.close_menu();
+                        }
+
+                        if ui
+                            .button(RichText::new("Paste").font(t::small()))
+                            .clicked()
+                        {
+                            context_paste_input = true;
+                            ui.close_menu();
+                        }
+
+                        if ui
+                            .add_enabled(
+                                !buf.is_empty(),
+                                egui::Button::new(RichText::new("Select all").font(t::small())),
+                            )
+                            .clicked()
+                        {
+                            context_select_all = true;
+                            ui.close_menu();
+                        }
+
+                        ui.separator();
+
+                        let send_now_resp = ui.add_enabled(
+                            can_submit,
+                            egui::Button::new(RichText::new("Send now").font(t::small())),
+                        );
+                        if send_now_resp.clicked() {
+                            context_send_now = true;
+                            ui.close_menu();
+                        }
+
+                        if ui
+                            .add_enabled(
+                                !buf.is_empty(),
+                                egui::Button::new(RichText::new("Copy input").font(t::small())),
+                            )
+                            .clicked()
+                        {
+                            context_copy_input = true;
+                            ui.close_menu();
+                        }
+
+                        if ui
+                            .add_enabled(
+                                !buf.is_empty(),
+                                egui::Button::new(RichText::new("Clear input").font(t::small())),
+                            )
+                            .clicked()
+                        {
+                            context_clear_input = true;
+                            ui.close_menu();
+                        }
+
+                        if ui
+                            .button(RichText::new("Insert /help").font(t::small()))
+                            .clicked()
+                        {
+                            context_insert_help = true;
+                            ui.close_menu();
+                        }
+
+                        ui.separator();
+
                         let sc: Option<SpellCtx> = ui.ctx().data_mut(|d| d.get_temp(sc_id));
                         if let Some(sc) = sc {
+                            let display_word = normalize_spell_menu_word(&sc.word);
                             ui.label(
-                                RichText::new(format!("\"{}\" – misspelled", sc.word))
+                                RichText::new(format!("\"{}\" - misspelled", display_word))
                                     .color(t::red())
                                     .strong(),
                             );
@@ -741,6 +833,50 @@ impl<'a> ChatInput<'a> {
                             ui.label(RichText::new("Spelling OK ✓").color(t::green()));
                         }
                     });
+
+                    if context_copy_input {
+                        ui.ctx().copy_text(buf.clone());
+                    }
+
+                    if context_cut_input {
+                        ui.ctx().copy_text(buf.clone());
+                        buf.clear();
+                        move_cursor_to_end(ui.ctx(), text_edit_id, 0);
+                        ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
+                    }
+
+                    if context_paste_input {
+                        ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                    }
+
+                    if context_select_all {
+                        select_all_text(ui.ctx(), text_edit_id, buf.chars().count());
+                        ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
+                    }
+
+                    if context_send_now && can_submit {
+                        result.send = Some(buf.trim().to_owned());
+                        buf.clear();
+                        ui.ctx()
+                            .data_mut(|d| d.insert_temp(hist_id, HistState::default()));
+                        ui.ctx()
+                            .data_mut(|d| d.insert_temp(tab_id, TabState::default()));
+                        resp.request_focus();
+                    }
+
+                    if context_clear_input {
+                        buf.clear();
+                        move_cursor_to_end(ui.ctx(), text_edit_id, 0);
+                        ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
+                    }
+
+                    if context_insert_help {
+                        *buf = "/help".to_owned();
+                        move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
+                        ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
+                    }
 
                     if let Some((start, end, replacement)) = spell_replace {
                         let new_len = start + replacement.len();
@@ -919,6 +1055,9 @@ impl<'a> ChatInput<'a> {
 
                     // Make the row clickable on the foreground layer
                     let row_rect = frame_resp.response.rect;
+                    if is_selected {
+                        ui.scroll_to_rect(row_rect, Some(egui::Align::Center));
+                    }
                     let click_resp = ui.interact(row_rect, row_id, egui::Sense::click());
 
                     // If an animated emote row is hovered, render its animated preview.
@@ -1138,6 +1277,9 @@ impl<'a> ChatInput<'a> {
                         });
 
                     let row_rect = frame_resp.response.rect;
+                    if is_selected {
+                        ui.scroll_to_rect(row_rect, Some(egui::Align::Center));
+                    }
                     let click_resp = ui.interact(row_rect, row_id, egui::Sense::click());
                     if click_resp.clicked() {
                         clicked = Some(channel.clone());
@@ -1222,6 +1364,9 @@ impl<'a> ChatInput<'a> {
                         });
 
                     let row_rect = frame_resp.response.rect;
+                    if is_selected {
+                        ui.scroll_to_rect(row_rect, Some(egui::Align::Center));
+                    }
                     let click_resp = ui.interact(row_rect, row_id, egui::Sense::click());
                     if click_resp.clicked() {
                         clicked_username = Some(username.clone());
@@ -1360,6 +1505,17 @@ fn find_join_channel_matches(
         .collect()
 }
 
+fn normalize_spell_menu_word(word: &str) -> String {
+    let trimmed = word.trim();
+    if trimmed.contains(char::is_whitespace) {
+        let collapsed: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+        if !collapsed.is_empty() {
+            return collapsed;
+        }
+    }
+    trimmed.to_owned()
+}
+
 /// Extract the in-progress `/join` query token (without validation).
 fn extract_join_query(buf: &str) -> Option<&str> {
     let trimmed_start = buf.trim_start();
@@ -1446,6 +1602,16 @@ fn move_cursor_to_end(ctx: &egui::Context, id: egui::Id, char_pos: usize) {
     if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
         let cursor = CCursor::new(char_pos);
         state.cursor.set_char_range(Some(CCursorRange::one(cursor)));
+        egui::TextEdit::store_state(ctx, id, state);
+    }
+}
+
+fn select_all_text(ctx: &egui::Context, id: egui::Id, total_chars: usize) {
+    use egui::text::{CCursor, CCursorRange};
+    if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
+        state
+            .cursor
+            .set_char_range(Some(CCursorRange::two(CCursor::new(0), CCursor::new(total_chars))));
         egui::TextEdit::store_state(ctx, id, state);
     }
 }

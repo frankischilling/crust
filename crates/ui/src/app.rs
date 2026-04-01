@@ -1,9 +1,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
+use chrono::{DateTime, Local, Utc};
 use egui::{CentralPanel, Color32, Context, Frame, Margin, RichText, SidePanel, TopBottomPanel};
 use image::DynamicImage;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tracing::warn;
 
 use crust_core::{
@@ -12,7 +14,9 @@ use crust_core::{
         UnbanRequestItem,
     },
     model::{
-        ChannelId, ChannelState, EmoteCatalogEntry, MsgKind, ReplyInfo, IRC_SERVER_CONTROL_CHANNEL,
+        ChannelId, ChannelState, EmoteCatalogEntry, MsgKind, ReplyInfo, Span,
+        TwitchEmotePos,
+        IRC_SERVER_CONTROL_CHANNEL,
     },
     AppState,
 };
@@ -51,9 +55,20 @@ use crate::widgets::{
 const REPAINT_ANIM_MS: u64 = 33;
 const REPAINT_HOUSEKEEPING_MS: u64 = 2_000;
 const STREAM_REFRESH_SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-const STREAM_REFRESH_ACTIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
-const STREAM_REFRESH_BACKGROUND_INTERVAL: std::time::Duration =
+const STREAM_REFRESH_ACTIVE_LIVE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(8);
+const STREAM_REFRESH_ACTIVE_OFFLINE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(30);
+const STREAM_REFRESH_ACTIVE_UNKNOWN_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(15);
+const STREAM_REFRESH_BACKGROUND_LIVE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(45);
+const STREAM_REFRESH_BACKGROUND_OFFLINE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(120);
+const STREAM_REFRESH_BACKGROUND_UNKNOWN_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(60);
+const STREAM_REFRESH_INFLIGHT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(25);
 const STREAM_NOTIFICATION_STARTUP_GRACE: std::time::Duration =
     std::time::Duration::from_secs(8);
 const AUTH_REFRESH_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -76,6 +91,8 @@ const ANALYTICS_COMPACT_DEFAULT_W: f32 = 176.0;
 const ANALYTICS_COMPACT_MIN_W: f32 = 140.0;
 const ANALYTICS_COMPACT_MAX_W: f32 = 260.0;
 const LOCAL_HISTORY_SEARCH_PAGE: usize = 800;
+const MAX_WHISPERS_PER_THREAD: usize = 250;
+const WHISPER_EMOTE_SIZE: f32 = 20.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ResponsiveLayout {
@@ -152,6 +169,17 @@ struct EventToast {
 struct PendingReply {
     channel: ChannelId,
     info: ReplyInfo,
+}
+
+#[derive(Clone)]
+struct WhisperLine {
+    from_login: String,
+    from_display_name: String,
+    text: String,
+    twitch_emotes: Vec<TwitchEmotePos>,
+    spans: Vec<Span>,
+    timestamp: DateTime<Utc>,
+    is_self: bool,
 }
 
 // ── Split-pane state ─────────────────────────────────────────────────────
@@ -353,6 +381,8 @@ struct ToolbarVisibility {
     show_perf_in_overflow: bool,
     show_stats_toggle: bool,
     show_stats_in_overflow: bool,
+    show_whispers_toggle: bool,
+    show_whispers_in_overflow: bool,
     show_irc_toggle: bool,
     show_irc_in_overflow: bool,
     show_emote_count: bool,
@@ -375,6 +405,7 @@ enum ToolbarDegradeStep {
     HideJoinText,
     HideConnectionLabel,
     HideLogo,
+    HideWhispersToggle,
     HideIrcToggle,
     HideStatsToggle,
     HidePerfToggle,
@@ -454,6 +485,9 @@ fn estimate_toolbar_required_width(visibility: &ToolbarVisibility) -> f32 {
     if visibility.show_stats_toggle {
         icon_count += 1;
     }
+    if visibility.show_whispers_toggle {
+        icon_count += 1;
+    }
     if visibility.show_irc_toggle {
         icon_count += 1;
     }
@@ -466,6 +500,7 @@ fn apply_toolbar_degrade_step(visibility: &mut ToolbarVisibility, step: ToolbarD
         ToolbarDegradeStep::HideJoinText => visibility.show_join_text = false,
         ToolbarDegradeStep::HideConnectionLabel => visibility.show_connection_label = false,
         ToolbarDegradeStep::HideLogo => visibility.show_logo = false,
+        ToolbarDegradeStep::HideWhispersToggle => visibility.show_whispers_toggle = false,
         ToolbarDegradeStep::HideIrcToggle => visibility.show_irc_toggle = false,
         ToolbarDegradeStep::HideStatsToggle => visibility.show_stats_toggle = false,
         ToolbarDegradeStep::HidePerfToggle => visibility.show_perf_toggle = false,
@@ -491,6 +526,7 @@ fn finalize_toolbar_visibility(visibility: &mut ToolbarVisibility, irc_beta_enab
 
     visibility.show_perf_in_overflow = !visibility.show_perf_toggle;
     visibility.show_stats_in_overflow = !visibility.show_stats_toggle;
+    visibility.show_whispers_in_overflow = !visibility.show_whispers_toggle;
 
     if !visibility.show_join_button {
         visibility.show_join_text = false;
@@ -500,6 +536,7 @@ fn finalize_toolbar_visibility(visibility: &mut ToolbarVisibility, irc_beta_enab
     visibility.show_overflow_menu = visibility.show_join_in_overflow
         || visibility.show_perf_in_overflow
         || visibility.show_stats_in_overflow
+        || visibility.show_whispers_in_overflow
         || visibility.show_irc_in_overflow;
 }
 
@@ -519,16 +556,19 @@ fn toolbar_visibility(bar_width: f32, irc_beta_enabled: bool) -> ToolbarVisibili
         show_perf_in_overflow: false,
         show_stats_toggle: true,
         show_stats_in_overflow: false,
+        show_whispers_toggle: true,
+        show_whispers_in_overflow: false,
         show_irc_toggle: irc_beta_enabled,
         show_irc_in_overflow: false,
         show_emote_count: true,
     };
 
-    const STEPS: [ToolbarDegradeStep; 12] = [
+    const STEPS: [ToolbarDegradeStep; 13] = [
         ToolbarDegradeStep::HideEmoteCount,
         ToolbarDegradeStep::HideJoinText,
         ToolbarDegradeStep::HideConnectionLabel,
         ToolbarDegradeStep::HideLogo,
+        ToolbarDegradeStep::HideWhispersToggle,
         ToolbarDegradeStep::HideIrcToggle,
         ToolbarDegradeStep::HideStatsToggle,
         ToolbarDegradeStep::HidePerfToggle,
@@ -560,6 +600,7 @@ fn toolbar_visibility(bar_width: f32, irc_beta_enabled: bool) -> ToolbarVisibili
         visibility.show_sidebar_actions = false;
         visibility.show_perf_toggle = false;
         visibility.show_stats_toggle = false;
+        visibility.show_whispers_toggle = false;
         visibility.show_irc_toggle = false;
         if bar_width < 300.0 {
             visibility.show_join_button = false;
@@ -633,6 +674,20 @@ pub struct CrustApp {
     irc_status_panel: IrcStatusPanel,
     /// Whether the IRC status window is visible.
     irc_status_visible: bool,
+    /// Whether the whisper management window is visible.
+    whispers_visible: bool,
+    /// Whisper threads keyed by partner login.
+    whisper_threads: HashMap<String, VecDeque<WhisperLine>>,
+    /// Preferred display name per whisper thread partner.
+    whisper_display_names: HashMap<String, String>,
+    /// Recency-ordered whisper thread keys.
+    whisper_order: Vec<String>,
+    /// Per-thread unread whisper counts.
+    whisper_unread: HashMap<String, u32>,
+    /// Currently selected whisper thread login.
+    active_whisper_login: Option<String>,
+    /// Deduplicates whisper emote/emoji image fetches while loading.
+    whisper_pending_images: HashSet<String>,
     /// Startup loading overlay (shown until initial emotes + history are ready).
     loading_screen: LoadingScreen,
     /// Cached stream status per channel (key = channel login, lowercase).
@@ -640,7 +695,10 @@ pub struct CrustApp {
     /// When each channel's stream status was last fetched.
     stream_status_fetched: HashMap<String, std::time::Instant>,
     /// Channel logins currently being fetched for stream status.
-    stream_status_fetch_inflight: HashSet<String>,
+    ///
+    /// Value stores when the fetch started so stale in-flight entries can be
+    /// retried if no event returns.
+    stream_status_fetch_inflight: HashMap<String, std::time::Instant>,
     /// Last time we scanned channels to schedule stale stream-status refreshes.
     last_stream_refresh_scan: std::time::Instant,
     /// Last time we forced a refresh for the active Twitch channel.
@@ -850,10 +908,17 @@ impl CrustApp {
             analytics_visible: false,
             irc_status_panel: IrcStatusPanel::default(),
             irc_status_visible: false,
+            whispers_visible: false,
+            whisper_threads: HashMap::new(),
+            whisper_display_names: HashMap::new(),
+            whisper_order: Vec::new(),
+            whisper_unread: HashMap::new(),
+            active_whisper_login: None,
+            whisper_pending_images: HashSet::new(),
             loading_screen: LoadingScreen::default(),
             stream_statuses: HashMap::new(),
             stream_status_fetched: HashMap::new(),
-            stream_status_fetch_inflight: HashSet::new(),
+            stream_status_fetch_inflight: HashMap::new(),
             last_stream_refresh_scan: std::time::Instant::now(),
             last_active_stream_refresh: std::time::Instant::now(),
             live_map_cache: HashMap::new(),
@@ -947,12 +1012,35 @@ impl CrustApp {
         if !is_valid_twitch_login(&login) {
             return;
         }
-        if self.stream_status_fetch_inflight.contains(&login) {
-            return;
+        if let Some(started_at) = self.stream_status_fetch_inflight.get(&login) {
+            if started_at.elapsed() < STREAM_REFRESH_INFLIGHT_TIMEOUT {
+                return;
+            }
         }
 
-        self.stream_status_fetch_inflight.insert(login.clone());
-        self.send_cmd(AppCommand::FetchUserProfile { login });
+        self.stream_status_fetch_inflight
+            .insert(login.clone(), std::time::Instant::now());
+        self.send_cmd(AppCommand::FetchStreamStatus { login });
+    }
+
+    fn stream_refresh_interval_for(
+        &self,
+        login: &str,
+        is_active_channel: bool,
+    ) -> std::time::Duration {
+        let live_state = self
+            .stream_statuses
+            .get(login)
+            .map(|status| status.is_live);
+
+        match (is_active_channel, live_state) {
+            (true, Some(true)) => STREAM_REFRESH_ACTIVE_LIVE_INTERVAL,
+            (true, Some(false)) => STREAM_REFRESH_ACTIVE_OFFLINE_INTERVAL,
+            (true, None) => STREAM_REFRESH_ACTIVE_UNKNOWN_INTERVAL,
+            (false, Some(true)) => STREAM_REFRESH_BACKGROUND_LIVE_INTERVAL,
+            (false, Some(false)) => STREAM_REFRESH_BACKGROUND_OFFLINE_INTERVAL,
+            (false, None) => STREAM_REFRESH_BACKGROUND_UNKNOWN_INTERVAL,
+        }
     }
 
     fn request_user_attention(&self, ctx: &Context, attention: egui::UserAttentionType) {
@@ -1333,6 +1421,679 @@ exit 1
 
         let mut seen_ids = HashSet::new();
         requests.retain(|request| seen_ids.insert(request.request_id.clone()));
+    }
+
+    fn normalize_whisper_login(login: &str) -> Option<String> {
+        let normalized = login
+            .trim()
+            .trim_start_matches('#')
+            .trim_start_matches('@')
+            .to_ascii_lowercase();
+        if normalized.is_empty() {
+            None
+        } else {
+            Some(normalized)
+        }
+    }
+
+    fn tokenize_whisper_text(&self, text: &str, twitch_emotes: &[TwitchEmotePos]) -> Vec<Span> {
+        let emote_map = build_emote_lookup(&self.emote_catalog);
+        tokenize_whisper_text(text, twitch_emotes, &emote_map)
+    }
+
+    fn queue_whisper_span_images(&mut self, spans: &[Span]) {
+        for span in spans {
+            let url = match span {
+                Span::Emote { url, .. } | Span::Emoji { url, .. } => Some(url.as_str()),
+                _ => None,
+            };
+            let Some(url) = url else {
+                continue;
+            };
+            if self.emote_bytes.contains_key(url) {
+                continue;
+            }
+            if self.whisper_pending_images.insert(url.to_owned()) {
+                self.send_cmd(AppCommand::FetchImage {
+                    url: url.to_owned(),
+                });
+            }
+        }
+    }
+
+    fn render_whisper_line_body(&mut self, ui: &mut egui::Ui, line: &WhisperLine, text_color: Color32) {
+        if line.text.trim().is_empty() {
+            ui.label(
+                RichText::new("(empty whisper)")
+                    .font(t::small())
+                    .color(t::text_muted()),
+            );
+            return;
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            for span in &line.spans {
+                match span {
+                    Span::Text { text, .. } => {
+                        if !text.is_empty() {
+                            ui.label(RichText::new(text).font(t::small()).color(text_color));
+                        }
+                    }
+                    Span::Emote { code, url, .. } => {
+                        if let Some(&(w, h, ref raw)) = self.emote_bytes.get(url.as_str()) {
+                            let size = whisper_fit_size(w, h, WHISPER_EMOTE_SIZE);
+                            let uri = bytes_uri(url, raw.as_ref());
+                            ui.add(
+                                egui::Image::from_bytes(
+                                    uri,
+                                    egui::load::Bytes::Shared(raw.clone()),
+                                )
+                                .fit_to_exact_size(size),
+                            );
+                        } else {
+                            ui.label(
+                                RichText::new(code)
+                                    .font(t::small())
+                                    .italics()
+                                    .color(t::text_secondary()),
+                            );
+                            if self.whisper_pending_images.insert(url.clone()) {
+                                self.send_cmd(AppCommand::FetchImage { url: url.clone() });
+                            }
+                        }
+                    }
+                    Span::Emoji { text, url } => {
+                        if let Some(&(w, h, ref raw)) = self.emote_bytes.get(url.as_str()) {
+                            let size = whisper_fit_size(w, h, WHISPER_EMOTE_SIZE);
+                            let uri = bytes_uri(url, raw.as_ref());
+                            ui.add(
+                                egui::Image::from_bytes(
+                                    uri,
+                                    egui::load::Bytes::Shared(raw.clone()),
+                                )
+                                .fit_to_exact_size(size),
+                            );
+                        } else {
+                            ui.label(RichText::new(text).font(t::small()).color(text_color));
+                            if self.whisper_pending_images.insert(url.clone()) {
+                                self.send_cmd(AppCommand::FetchImage { url: url.clone() });
+                            }
+                        }
+                    }
+                    Span::Mention { login } => {
+                        ui.label(
+                            RichText::new(format!("@{login}"))
+                                .font(t::small())
+                                .strong()
+                                .color(t::mention()),
+                        );
+                    }
+                    Span::Url { text, .. } => {
+                        ui.label(
+                            RichText::new(text)
+                                .font(t::small())
+                                .color(t::link())
+                                .underline(),
+                        );
+                    }
+                    Span::Badge { name, version } => {
+                        ui.label(
+                            RichText::new(format!("[{name}/{version}]"))
+                                .font(t::small())
+                                .color(t::text_muted()),
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    fn whisper_unread_total(&self) -> u32 {
+        self.whisper_unread.values().copied().sum()
+    }
+
+    fn touch_whisper_thread_order(&mut self, login: &str) {
+        if let Some(idx) = self.whisper_order.iter().position(|entry| entry == login) {
+            self.whisper_order.remove(idx);
+        }
+        self.whisper_order.insert(0, login.to_owned());
+    }
+
+    fn mark_whisper_thread_read(&mut self, login: &str) {
+        self.whisper_unread.remove(login);
+    }
+
+    fn open_whisper_compose(&mut self, partner_login: &str) {
+        if let Some(channel) = self
+            .state
+            .active_channel
+            .as_ref()
+            .filter(|channel| channel.is_twitch())
+            .cloned()
+            .or_else(|| {
+                self.state
+                    .channel_order
+                    .iter()
+                    .find(|channel| channel.is_twitch())
+                    .cloned()
+            })
+        {
+            self.activate_channel(channel);
+            self.chat_input_buf = format!("/w {partner_login} ");
+        }
+    }
+
+    fn render_whisper_thread_list(
+        &mut self,
+        ui: &mut egui::Ui,
+        thread_order: &[String],
+        current_thread: &mut String,
+        select_thread: &mut Option<String>,
+        compact_layout: bool,
+    ) {
+        ui.label(
+            RichText::new("Threads")
+                .font(t::small())
+                .strong()
+                .color(t::text_secondary()),
+        );
+        ui.add_space(4.0);
+
+        let pane_width = ui.available_width().max(120.0);
+        let title_chars = ((pane_width / 9.0) as usize).clamp(12, 26);
+        let preview_chars = ((pane_width / 6.0) as usize).clamp(20, 60);
+        let row_height = if compact_layout { 56.0 } else { 64.0 };
+        let selected_fill = if t::is_light() {
+            Color32::from_rgb(225, 218, 246)
+        } else {
+            Color32::from_rgb(49, 39, 73)
+        };
+        let idle_fill = if t::is_light() {
+            t::bg_dialog()
+        } else {
+            t::bg_surface()
+        };
+
+        egui::ScrollArea::vertical()
+            .id_salt(("whisper_threads", compact_layout))
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for login in thread_order {
+                    let is_selected = login == current_thread;
+                    let unread = self.whisper_unread.get(login).copied().unwrap_or(0);
+                    let last_line = self
+                        .whisper_threads
+                        .get(login)
+                        .and_then(|thread| thread.back())
+                        .cloned();
+                    let display_name = self
+                        .whisper_display_names
+                        .get(login)
+                        .filter(|name| !name.trim().is_empty())
+                        .cloned()
+                        .unwrap_or_else(|| login.clone());
+                    let preview = last_line
+                        .as_ref()
+                        .map(|line| {
+                            if line.text.trim().is_empty() {
+                                "(empty whisper)".to_owned()
+                            } else {
+                                truncate_with_ellipsis(line.text.trim(), preview_chars)
+                            }
+                        })
+                        .unwrap_or_default();
+                    let ts = last_line
+                        .as_ref()
+                        .map(|line| self.format_whisper_timestamp(line.timestamp))
+                        .unwrap_or_default();
+
+                    let row = egui::Frame::new()
+                        .fill(if is_selected {
+                            selected_fill
+                        } else {
+                            idle_fill
+                        })
+                        .stroke(if is_selected {
+                            egui::Stroke::new(1.0, t::accent())
+                        } else {
+                            t::stroke_subtle()
+                        })
+                        .corner_radius(t::RADIUS)
+                        .inner_margin(Margin::symmetric(8, 6))
+                        .show(ui, |ui| {
+                            ui.set_min_height(row_height);
+                            ui.horizontal(|ui| {
+                                let title =
+                                    truncate_with_ellipsis(&format!("@{display_name}"), title_chars);
+                                ui.label(
+                                    RichText::new(title)
+                                        .font(t::small())
+                                        .strong()
+                                        .color(if is_selected {
+                                            t::text_primary()
+                                        } else {
+                                            t::text_primary()
+                                        }),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if !ts.is_empty() {
+                                            ui.label(
+                                                RichText::new(ts)
+                                                    .font(t::tiny())
+                                                    .color(t::text_secondary()),
+                                            );
+                                        }
+                                    },
+                                );
+                            });
+                            ui.add_space(2.0);
+                            ui.horizontal(|ui| {
+                                if !preview.is_empty() {
+                                    ui.label(
+                                        RichText::new(preview)
+                                            .font(t::tiny())
+                                            .color(t::text_secondary()),
+                                    );
+                                }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if unread > 0 {
+                                            chrome::pill(
+                                                ui,
+                                                compact_badge_count(unread).to_string(),
+                                                t::gold(),
+                                                Color32::from_rgba_unmultiplied(170, 120, 20, 50),
+                                            );
+                                        }
+                                    },
+                                );
+                            });
+                        });
+
+                    let row_response = ui.interact(
+                        row.response.rect,
+                        ui.id().with(("whisper_thread_row", login)),
+                        egui::Sense::click(),
+                    );
+                    if row_response.clicked() {
+                        *current_thread = login.clone();
+                        *select_thread = Some(login.clone());
+                    }
+                    ui.add_space(4.0);
+                }
+            });
+    }
+
+    fn render_whisper_conversation_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        current_thread: &str,
+        mark_read_thread: &mut Option<String>,
+        compose_thread: &mut Option<String>,
+        compact_layout: bool,
+    ) {
+        let display_name = self
+            .whisper_display_names
+            .get(current_thread)
+            .filter(|name| !name.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| current_thread.to_owned());
+        let lines = self
+            .whisper_threads
+            .get(current_thread)
+            .cloned()
+            .unwrap_or_default();
+        let self_fill = if t::is_light() {
+            Color32::from_rgb(227, 219, 248)
+        } else {
+            Color32::from_rgb(63, 49, 96)
+        };
+        let self_stroke = if t::is_light() {
+            Color32::from_rgb(153, 128, 214)
+        } else {
+            Color32::from_rgb(120, 98, 182)
+        };
+        let self_text = if t::is_light() {
+            Color32::from_rgb(31, 24, 52)
+        } else {
+            Color32::from_rgb(242, 236, 255)
+        };
+        let self_meta = if t::is_light() {
+            Color32::from_rgb(92, 74, 142)
+        } else {
+            Color32::from_rgb(186, 168, 232)
+        };
+
+        let other_fill = if t::is_light() {
+            Color32::from_rgb(245, 246, 252)
+        } else {
+            Color32::from_rgb(34, 36, 48)
+        };
+        let other_stroke = if t::is_light() {
+            Color32::from_rgb(203, 206, 224)
+        } else {
+            Color32::from_rgb(62, 66, 88)
+        };
+        let other_text = t::text_primary();
+        let other_meta = t::text_secondary();
+
+        egui::Frame::new()
+            .fill(t::bg_surface())
+            .stroke(t::stroke_subtle())
+            .corner_radius(t::RADIUS)
+            .inner_margin(Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(format!("@{display_name}"))
+                            .font(t::small())
+                            .strong(),
+                    );
+                    ui.label(
+                        RichText::new(format!("{} messages", lines.len()))
+                            .font(t::tiny())
+                            .color(t::text_secondary()),
+                    );
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if ui.button(RichText::new("Reply").font(t::small())).clicked() {
+                                *compose_thread = Some(current_thread.to_owned());
+                            }
+                            if ui
+                                .button(RichText::new("Mark read").font(t::small()))
+                                .clicked()
+                            {
+                                *mark_read_thread = Some(current_thread.to_owned());
+                            }
+                        },
+                    );
+                });
+            });
+
+        ui.add_space(6.0);
+
+        let messages_height = ui.available_height();
+        if messages_height <= 0.0 {
+            return;
+        }
+
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), messages_height),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                egui::Frame::new()
+                    .fill(t::bg_base())
+                    .stroke(t::stroke_subtle())
+                    .corner_radius(t::RADIUS)
+                    .inner_margin(Margin::symmetric(8, 8))
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt(("whisper_messages", compact_layout))
+                            .auto_shrink([false, false])
+                            .stick_to_bottom(true)
+                            .show(ui, |ui| {
+                                if lines.is_empty() {
+                                    ui.label(
+                                        RichText::new("No messages in this thread yet.")
+                                            .font(t::small())
+                                            .color(t::text_muted()),
+                                    );
+                                    return;
+                                }
+
+                                for line in lines {
+                                    let bubble_max_width = if compact_layout {
+                                        (ui.available_width() * 0.9).max(140.0)
+                                    } else {
+                                        (ui.available_width() * 0.76).max(220.0)
+                                    };
+                                    if line.is_self {
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::TOP),
+                                            |ui| {
+                                                ui.allocate_ui_with_layout(
+                                                    egui::vec2(bubble_max_width, 0.0),
+                                                    egui::Layout::top_down(egui::Align::Min),
+                                                    |ui| {
+                                                        egui::Frame::new()
+                                                            .fill(self_fill)
+                                                            .stroke(egui::Stroke::new(1.0, self_stroke))
+                                                            .corner_radius(t::RADIUS)
+                                                            .inner_margin(Margin::symmetric(10, 8))
+                                                            .show(ui, |ui| {
+                                                                self.render_whisper_line_body(
+                                                                    ui, &line, self_text,
+                                                                );
+                                                                ui.with_layout(
+                                                                    egui::Layout::right_to_left(
+                                                                        egui::Align::Center,
+                                                                    ),
+                                                                    |ui| {
+                                                                        ui.label(
+                                                                            RichText::new(
+                                                                                self.format_whisper_timestamp(line.timestamp),
+                                                                            )
+                                                                            .font(t::tiny())
+                                                                            .color(self_meta),
+                                                                        );
+                                                                    },
+                                                                );
+                                                            });
+                                                    },
+                                                );
+                                            },
+                                        );
+                                    } else {
+                                        ui.with_layout(
+                                            egui::Layout::left_to_right(egui::Align::TOP),
+                                            |ui| {
+                                                ui.allocate_ui_with_layout(
+                                                    egui::vec2(bubble_max_width, 0.0),
+                                                    egui::Layout::top_down(egui::Align::Min),
+                                                    |ui| {
+                                                        egui::Frame::new()
+                                                            .fill(other_fill)
+                                                            .stroke(egui::Stroke::new(1.0, other_stroke))
+                                                            .corner_radius(t::RADIUS)
+                                                            .inner_margin(Margin::symmetric(10, 8))
+                                                            .show(ui, |ui| {
+                                                                let sender_label = if line
+                                                                    .from_display_name
+                                                                    .trim()
+                                                                    .is_empty()
+                                                                {
+                                                                    line.from_login.clone()
+                                                                } else {
+                                                                    line.from_display_name.clone()
+                                                                };
+                                                                if !sender_label.trim().is_empty() {
+                                                                    ui.label(
+                                                                        RichText::new(sender_label)
+                                                                        .font(t::tiny())
+                                                                        .strong()
+                                                                        .color(other_meta),
+                                                                    );
+                                                                    ui.add_space(2.0);
+                                                                }
+                                                                self.render_whisper_line_body(
+                                                                    ui, &line, other_text,
+                                                                );
+                                                                ui.with_layout(
+                                                                    egui::Layout::right_to_left(
+                                                                        egui::Align::Center,
+                                                                    ),
+                                                                    |ui| {
+                                                                        ui.label(
+                                                                            RichText::new(
+                                                                                self.format_whisper_timestamp(line.timestamp),
+                                                                            )
+                                                                            .font(t::tiny())
+                                                                            .color(other_meta),
+                                                                        );
+                                                                    },
+                                                                );
+                                                            });
+                                                    },
+                                                );
+                                            },
+                                        );
+                                    }
+                                    ui.add_space(4.0);
+                                }
+                            });
+                    });
+            },
+        );
+    }
+
+    fn show_whispers_window(&mut self, ctx: &Context) {
+        if !self.whispers_visible {
+            return;
+        }
+
+        let mut window_open = self.whispers_visible;
+        let thread_order = self.whisper_order.clone();
+        let mut select_thread: Option<String> = None;
+        let mut mark_read_thread: Option<String> = None;
+        let mut compose_thread: Option<String> = None;
+
+        egui::Window::new("Whispers")
+            .open(&mut window_open)
+            .default_size(egui::vec2(760.0, 500.0))
+            .min_width(340.0)
+            .show(ctx, |ui| {
+                if thread_order.is_empty() {
+                    ui.label(
+                        RichText::new(
+                            "No whispers yet. Incoming whispers will appear here for quick reply and tracking.",
+                        )
+                        .font(t::small())
+                        .color(t::text_muted()),
+                    );
+                    return;
+                }
+
+                let mut active_thread = self
+                    .active_whisper_login
+                    .clone()
+                    .or_else(|| thread_order.first().cloned());
+                if active_thread
+                    .as_ref()
+                    .map(|current| !thread_order.iter().any(|entry| entry == current))
+                    .unwrap_or(false)
+                {
+                    active_thread = thread_order.first().cloned();
+                }
+                let active_thread = active_thread.unwrap_or_else(|| thread_order[0].clone());
+                let mut current_thread = active_thread.clone();
+
+                let compact_layout = ui.available_width() < 680.0;
+                if compact_layout {
+                    let thread_area_height = (ui.available_height() * 0.35).clamp(84.0, 180.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), thread_area_height),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            chrome::card_frame().show(ui, |ui| {
+                                self.render_whisper_thread_list(
+                                    ui,
+                                    &thread_order,
+                                    &mut current_thread,
+                                    &mut select_thread,
+                                    true,
+                                );
+                            });
+                        },
+                    );
+                    ui.add_space(8.0);
+                    self.render_whisper_conversation_panel(
+                        ui,
+                        &current_thread,
+                        &mut mark_read_thread,
+                        &mut compose_thread,
+                        true,
+                    );
+                } else {
+                    ui.horizontal(|ui| {
+                        let pane_height = ui.available_height();
+                        let thread_pane_width = (ui.available_width() * 0.30).clamp(160.0, 280.0);
+
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(thread_pane_width, pane_height),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                self.render_whisper_thread_list(
+                                    ui,
+                                    &thread_order,
+                                    &mut current_thread,
+                                    &mut select_thread,
+                                    false,
+                                );
+                            },
+                        );
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+
+                        ui.allocate_ui_with_layout(
+                            ui.available_size(),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                self.render_whisper_conversation_panel(
+                                    ui,
+                                    &current_thread,
+                                    &mut mark_read_thread,
+                                    &mut compose_thread,
+                                    false,
+                                );
+                            },
+                        );
+                    });
+                }
+            });
+
+        self.whispers_visible = window_open;
+        if let Some(thread) = select_thread {
+            self.active_whisper_login = Some(thread.clone());
+            self.mark_whisper_thread_read(&thread);
+        }
+        if let Some(thread) = mark_read_thread {
+            self.mark_whisper_thread_read(&thread);
+        }
+        if let Some(thread) = compose_thread {
+            self.mark_whisper_thread_read(&thread);
+            self.open_whisper_compose(&thread);
+        }
+        if self.whispers_visible
+            && self.active_whisper_login.is_none()
+            && !self.whisper_order.is_empty()
+        {
+            if let Some(active) = self.whisper_order.first().cloned() {
+                self.active_whisper_login = Some(active.clone());
+                self.mark_whisper_thread_read(&active);
+            }
+        }
+    }
+
+    fn format_whisper_timestamp(&self, timestamp: DateTime<Utc>) -> String {
+        let local = timestamp.with_timezone(&Local);
+        if self.use_24h_timestamps {
+            if self.show_timestamp_seconds {
+                local.format("%H:%M:%S").to_string()
+            } else {
+                local.format("%H:%M").to_string()
+            }
+        } else if self.show_timestamp_seconds {
+            local.format("%I:%M:%S %p").to_string()
+        } else {
+            local.format("%I:%M %p").to_string()
+        }
     }
 
     fn drain_events(&mut self, ctx: &Context) -> u32 {
@@ -1721,6 +2482,99 @@ exit 1
                     self.sorted_chatters.insert(channel, cached);
                 }
             }
+            AppEvent::WhisperReceived {
+                from_login,
+                from_display_name,
+                target_login,
+                text,
+                twitch_emotes,
+                is_self,
+                timestamp,
+                is_history,
+            } => {
+                let from_login_norm = Self::normalize_whisper_login(&from_login);
+                let target_login_norm = Self::normalize_whisper_login(&target_login);
+                let partner_login = if is_self {
+                    target_login_norm.or(from_login_norm)
+                } else {
+                    from_login_norm.or(target_login_norm)
+                };
+                let Some(partner_login) = partner_login else {
+                    return;
+                };
+
+                let display_name = if is_self {
+                    if target_login.trim().is_empty() {
+                        partner_login.clone()
+                    } else {
+                        target_login.trim().to_owned()
+                    }
+                } else if from_display_name.trim().is_empty() {
+                    partner_login.clone()
+                } else {
+                    from_display_name.trim().to_owned()
+                };
+                self.whisper_display_names
+                    .insert(partner_login.clone(), display_name.clone());
+
+                let text = text.to_owned();
+                let spans = self.tokenize_whisper_text(&text, &twitch_emotes);
+                self.queue_whisper_span_images(&spans);
+                let notification_body_text = text.trim().to_owned();
+
+                let line = WhisperLine {
+                    from_login: from_login.trim().to_owned(),
+                    from_display_name: from_display_name.trim().to_owned(),
+                    text,
+                    twitch_emotes,
+                    spans,
+                    timestamp,
+                    is_self,
+                };
+
+                let thread = self
+                    .whisper_threads
+                    .entry(partner_login.clone())
+                    .or_default();
+                thread.push_back(line);
+                while thread.len() > MAX_WHISPERS_PER_THREAD {
+                    thread.pop_front();
+                }
+
+                self.touch_whisper_thread_order(&partner_login);
+
+                if self.active_whisper_login.is_none() {
+                    self.active_whisper_login = Some(partner_login.clone());
+                }
+
+                let thread_is_focused = self.whispers_visible
+                    && self
+                        .active_whisper_login
+                        .as_deref()
+                        .map(|v| v.eq_ignore_ascii_case(&partner_login))
+                        .unwrap_or(false);
+                if thread_is_focused {
+                    self.mark_whisper_thread_read(&partner_login);
+                } else if !is_history {
+                    *self
+                        .whisper_unread
+                        .entry(partner_login.clone())
+                        .or_insert(0) += 1;
+                    if self.desktop_notifications_enabled {
+                        let title = Self::truncate_notification_text(
+                            &format!("Whisper from {display_name}"),
+                            80,
+                        );
+                        let body = if notification_body_text.trim().is_empty() {
+                            "(empty whisper)".to_owned()
+                        } else {
+                            Self::truncate_notification_text(notification_body_text.trim(), 220)
+                        };
+                        self.dispatch_desktop_notification(&title, &body, true);
+                        self.request_user_attention(ctx, egui::UserAttentionType::Informational);
+                    }
+                }
+            }
             AppEvent::MessageDeleted { channel, server_id } => {
                 if let Some(ch) = self.state.channels.get_mut(&channel) {
                     ch.delete_message(&server_id);
@@ -1736,6 +2590,7 @@ exit 1
                 height,
                 raw_bytes,
             } => {
+                self.whisper_pending_images.remove(&uri);
                 // Stub events (empty bytes) are emitted by failed fetches just
                 // to advance the loading-screen image counter; skip actual insert.
                 if !raw_bytes.is_empty() {
@@ -1755,6 +2610,8 @@ exit 1
                 // BTTV/FFZ/7TV emotes like LUL) get resolved.
                 let emote_map = build_emote_lookup(&self.emote_catalog);
                 if !emote_map.is_empty() {
+                    let mut whisper_urls_to_fetch: HashSet<String> = HashSet::new();
+
                     for ch in self.state.channels.values_mut() {
                         for msg in ch.messages.iter_mut() {
                             if !matches!(msg.msg_kind, MsgKind::Chat | MsgKind::Bits { .. }) {
@@ -1801,6 +2658,27 @@ exit 1
                             }
                         }
                     }
+
+                    for thread in self.whisper_threads.values_mut() {
+                        for line in thread.iter_mut() {
+                            let new_spans =
+                                tokenize_whisper_text(&line.text, &line.twitch_emotes, &emote_map);
+                            for span in &new_spans {
+                                if let Span::Emote { url, .. } | Span::Emoji { url, .. } = span {
+                                    if !self.emote_bytes.contains_key(url.as_str()) {
+                                        whisper_urls_to_fetch.insert(url.clone());
+                                    }
+                                }
+                            }
+                            line.spans = new_spans;
+                        }
+                    }
+
+                    for url in whisper_urls_to_fetch {
+                        if self.whisper_pending_images.insert(url.clone()) {
+                            self.send_cmd(AppCommand::FetchImage { url });
+                        }
+                    }
                 }
             }
             AppEvent::Authenticated { username, user_id } => {
@@ -1818,6 +2696,13 @@ exit 1
                 self.state.auth.username = None;
                 self.state.auth.user_id = None;
                 self.state.auth.avatar_url = None;
+                self.whispers_visible = false;
+                self.whisper_threads.clear();
+                self.whisper_display_names.clear();
+                self.whisper_order.clear();
+                self.whisper_unread.clear();
+                self.active_whisper_login = None;
+                self.whisper_pending_images.clear();
             }
             AppEvent::Error { context, message } => {
                 tracing::error!("[{context}] {message}");
@@ -1980,7 +2865,13 @@ exit 1
                     self.user_profile_popup.set_profile(profile);
                 }
             }
-            AppEvent::StreamStatusUpdated { login, is_live } => {
+            AppEvent::StreamStatusUpdated {
+                login,
+                is_live,
+                title,
+                game,
+                viewers,
+            } => {
                 let login = login.to_ascii_lowercase();
                 let (title, game, viewers) = {
                     let entry = self
@@ -1994,7 +2885,19 @@ exit 1
                         });
                     entry.is_live = is_live;
                     if !is_live {
+                        entry.title = None;
+                        entry.game = None;
                         entry.viewers = None;
+                    } else {
+                        if title.is_some() {
+                            entry.title = title.clone();
+                        }
+                        if game.is_some() {
+                            entry.game = game.clone();
+                        }
+                        if viewers.is_some() {
+                            entry.viewers = viewers;
+                        }
                     }
                     (entry.title.clone(), entry.game.clone(), entry.viewers)
                 };
@@ -2411,8 +3314,18 @@ exit 1
     }
 
     fn send_cmd(&self, cmd: AppCommand) {
-        if self.cmd_tx.try_send(cmd).is_err() {
-            warn!("Command channel full/closed");
+        match self.cmd_tx.try_send(cmd) {
+            Ok(()) => {}
+            Err(TrySendError::Full(cmd)) => {
+                // User actions (send message/slash commands) should not be
+                // silently dropped under transient command bursts.
+                if self.cmd_tx.blocking_send(cmd).is_err() {
+                    warn!("Command channel closed");
+                }
+            }
+            Err(TrySendError::Closed(_)) => {
+                warn!("Command channel closed");
+            }
         }
     }
 
@@ -2871,7 +3784,7 @@ impl eframe::App for CrustApp {
         // Periodic stream-status refresh: re-fetch the active Twitch channel
         // at a higher cadence and all joined channels on a slower interval.
         // Throttle the stale-scan itself to avoid per-frame channel iteration.
-        if self.last_active_stream_refresh.elapsed() >= STREAM_REFRESH_ACTIVE_INTERVAL {
+        if self.last_active_stream_refresh.elapsed() >= STREAM_REFRESH_SCAN_INTERVAL {
             self.last_active_stream_refresh = std::time::Instant::now();
             let active_login = self
                 .state
@@ -2880,10 +3793,11 @@ impl eframe::App for CrustApp {
                 .filter(|ch| ch.is_twitch())
                 .map(|ch| ch.display_name().to_ascii_lowercase());
             if let Some(login) = active_login {
+                let refresh_interval = self.stream_refresh_interval_for(&login, true);
                 let is_stale = self
                     .stream_status_fetched
                     .get(&login)
-                    .map(|t| t.elapsed() >= STREAM_REFRESH_ACTIVE_INTERVAL)
+                    .map(|t| t.elapsed() >= refresh_interval)
                     .unwrap_or(true);
                 if is_stale {
                     self.request_stream_status_refresh(&login);
@@ -2906,10 +3820,11 @@ impl eframe::App for CrustApp {
                 if !seen.insert(login.clone()) {
                     continue;
                 }
+                let refresh_interval = self.stream_refresh_interval_for(&login, false);
                 let is_stale = self
                     .stream_status_fetched
                     .get(&login)
-                    .map(|t| t.elapsed() >= STREAM_REFRESH_BACKGROUND_INTERVAL)
+                    .map(|t| t.elapsed() >= refresh_interval)
                     .unwrap_or(true);
                 if is_stale {
                     stale.push(login);
@@ -2927,10 +3842,11 @@ impl eframe::App for CrustApp {
                 if !seen.insert(login.clone()) {
                     continue;
                 }
+                let refresh_interval = self.stream_refresh_interval_for(&login, false);
                 let is_stale = self
                     .stream_status_fetched
                     .get(&login)
-                    .map(|t| t.elapsed() >= STREAM_REFRESH_BACKGROUND_INTERVAL)
+                    .map(|t| t.elapsed() >= refresh_interval)
                     .unwrap_or(true);
                 if is_stale {
                     stale.push(login);
@@ -3487,6 +4403,8 @@ impl eframe::App for CrustApp {
             }
         }
 
+        self.show_whispers_window(ctx);
+
         // -- Top bar -----------------------------------------------------------
         // Auto-collapse sidebar into top tabs when window is very narrow so
         // the chat area always has usable space for a super-thin layout.
@@ -3502,6 +4420,7 @@ impl eframe::App for CrustApp {
         };
         let moderation_channel_toolbar = self.active_moderation_channel();
         let moderation_available = moderation_channel_toolbar.is_some();
+        let whisper_unread_total = self.whisper_unread_total();
 
         TopBottomPanel::top("status_bar")
             .exact_height(responsive.status_bar_height)
@@ -3755,6 +4674,31 @@ impl eframe::App for CrustApp {
                                     ui.close_menu();
                                 }
 
+                                if visibility.show_whispers_in_overflow {
+                                    let whispers_label = if whisper_unread_total > 0 {
+                                        format!("Whispers ({whisper_unread_total})")
+                                    } else {
+                                        "Whispers".to_owned()
+                                    };
+                                    if ui
+                                        .button(RichText::new(whispers_label).font(t::small()))
+                                        .clicked()
+                                    {
+                                        self.whispers_visible = !self.whispers_visible;
+                                        if self.whispers_visible {
+                                            if let Some(active) = self
+                                                .active_whisper_login
+                                                .clone()
+                                                .or_else(|| self.whisper_order.first().cloned())
+                                            {
+                                                self.active_whisper_login = Some(active.clone());
+                                                self.mark_whisper_thread_read(&active);
+                                            }
+                                        }
+                                        ui.close_menu();
+                                    }
+                                }
+
                                 if visibility.show_irc_in_overflow
                                     && ui.button(RichText::new("IRC status").font(t::small())).clicked()
                                 {
@@ -3833,6 +4777,37 @@ impl eframe::App for CrustApp {
                                     .clicked()
                                 {
                                     self.analytics_visible = !self.analytics_visible;
+                                }
+                                if visibility.show_whispers_toggle {
+                                    let tooltip = if whisper_unread_total > 0 {
+                                        format!("Open whispers ({whisper_unread_total} unread)")
+                                    } else {
+                                        "Open whispers".to_owned()
+                                    };
+                                    if chrome::icon_button(
+                                        ui,
+                                        ChromeIcon::Whisper,
+                                        &tooltip,
+                                        IconButtonState {
+                                            selected: self.whispers_visible,
+                                            compact: visibility.compact_controls,
+                                            ..Default::default()
+                                        },
+                                    )
+                                    .clicked()
+                                    {
+                                        self.whispers_visible = !self.whispers_visible;
+                                        if self.whispers_visible {
+                                            if let Some(active) = self
+                                                .active_whisper_login
+                                                .clone()
+                                                .or_else(|| self.whisper_order.first().cloned())
+                                            {
+                                                self.active_whisper_login = Some(active.clone());
+                                                self.mark_whisper_thread_read(&active);
+                                            }
+                                        }
+                                    }
                                 }
                                 if visibility.show_irc_toggle
                                     && chrome::icon_button(
@@ -4598,20 +5573,18 @@ impl eframe::App for CrustApp {
                                                 can_mod,
                                             );
                                     }
-                                    let _ = self.cmd_tx.try_send(cmd);
+                                    self.send_cmd(cmd);
                                 } else {
                                     if ch.is_irc() {
                                         self.irc_status_panel
                                             .note_outgoing(&ch, &text);
                                     }
-                                    let _ = self.cmd_tx.try_send(
-                                        AppCommand::SendMessage {
-                                            channel: ch.clone(),
-                                            text,
-                                            reply_to_msg_id: None,
-                                            reply: None,
-                                        },
-                                    );
+                                    self.send_cmd(AppCommand::SendMessage {
+                                        channel: ch.clone(),
+                                        text,
+                                        reply_to_msg_id: None,
+                                        reply: None,
+                                    });
                                 }
                             }
                             if inp.toggle_emote_picker {
@@ -5579,24 +6552,7 @@ fn parse_slash_command(
                 });
             }
 
-            let parsed = if rest.contains("--title") || rest.contains("--choice") {
-                parse_poll_flag_args(rest)
-            } else {
-                let (spec, duration_opt) = extract_duration_flag(rest);
-                let (spec, points_opt) = extract_points_flag(&spec);
-                let duration_secs = duration_opt.unwrap_or(60).clamp(15, 1800);
-                let parts = parse_pipe_args(&spec);
-                if parts.len() < 3 {
-                    None
-                } else {
-                    Some(ParsedPollSpec {
-                        title: parts[0].clone(),
-                        choices: parts[1..].to_vec(),
-                        duration_secs,
-                        channel_points_per_vote: points_opt,
-                    })
-                }
-            };
+            let parsed = parse_poll_flag_args(rest).or_else(|| parse_poll_pipe_args(rest));
 
             let Some(parsed) = parsed else {
                 return Some(AppCommand::InjectLocalMessage {
@@ -5676,9 +6632,22 @@ fn parse_slash_command(
                     text: "Usage: /vote <choice number>".to_owned(),
                 });
             }
+
+            let Some(choice_number) = rest
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .filter(|choice| *choice > 0)
+            else {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Usage: /vote <choice number>".to_owned(),
+                });
+            };
+
             Some(AppCommand::SendMessage {
                 channel: channel.clone(),
-                text: text.to_owned(),
+                text: format!("/vote {choice_number}"),
                 reply_to_msg_id: None,
                 reply: None,
             })
@@ -6372,19 +7341,47 @@ fn parse_slash_command(
             }
         }
 
-        // /w <user> <message>  - Twitch whisper (pass straight through).
-        "w" | "whisper" => Some(AppCommand::SendMessage {
-            channel: channel.clone(),
-            text: text.to_owned(),
-            reply_to_msg_id,
-            reply: reply.clone(),
-        }),
+        // /w <user> <message>  - Twitch whisper via Helix.
+        "w" | "whisper" => {
+            if !channel.is_twitch() {
+                return Some(AppCommand::SendMessage {
+                    channel: channel.clone(),
+                    text: text.to_owned(),
+                    reply_to_msg_id,
+                    reply: reply.clone(),
+                });
+            }
+
+            let usage = "Usage: /w <user> <message>";
+            let (raw_target, raw_message) = rest
+                .split_once(char::is_whitespace)
+                .map(|(target, message)| (target.trim(), message.trim()))
+                .unwrap_or((rest.trim(), ""));
+
+            let Some(target_login) = parse_twitch_channel_login_arg(raw_target) else {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: usage.to_owned(),
+                });
+            };
+            if raw_message.is_empty() {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: usage.to_owned(),
+                });
+            }
+
+            Some(AppCommand::SendWhisper {
+                target_login,
+                text: raw_message.to_owned(),
+            })
+        }
 
         // Everything else falls through to IRC
         // Standard Twitch chat commands (/ban, /timeout, /unban, /slow,
         // /subscribers, /emoteonly, /clear, /mod, /vip, /color, /delete,
         // /raid, /host, /uniquechat, /block, /unblock,
-        // /r, /w, etc.) are handled server-side.
+        // /r, etc.) are handled server-side.
         _ => None,
     }
 }
@@ -6515,6 +7512,52 @@ fn parse_poll_duration_token(raw: &str) -> Option<u32> {
     value.parse::<u32>().ok()
 }
 
+fn parse_poll_points_token(raw: &str) -> Option<u32> {
+    raw.trim().parse::<u32>().ok().filter(|value| *value > 0)
+}
+
+fn parse_poll_pipe_args(input: &str) -> Option<ParsedPollSpec> {
+    let mut cleaned_tokens: Vec<&str> = Vec::new();
+    let mut duration_secs: Option<u32> = None;
+    let mut channel_points_per_vote: Option<u32> = None;
+
+    let tokens: Vec<&str> = input.split_whitespace().collect();
+    let mut i = 0usize;
+    while i < tokens.len() {
+        match tokens[i] {
+            "--duration" | "-d" => {
+                let value = tokens.get(i + 1)?;
+                duration_secs = parse_poll_duration_token(value);
+                if duration_secs.is_none() {
+                    return None;
+                }
+                i += 2;
+            }
+            "--points" | "-p" => {
+                let value = tokens.get(i + 1)?;
+                channel_points_per_vote = Some(parse_poll_points_token(value)?);
+                i += 2;
+            }
+            _ => {
+                cleaned_tokens.push(tokens[i]);
+                i += 1;
+            }
+        }
+    }
+
+    let parts = parse_pipe_args(&cleaned_tokens.join(" "));
+    if parts.len() < 3 {
+        return None;
+    }
+
+    Some(ParsedPollSpec {
+        title: parts[0].clone(),
+        choices: parts[1..].to_vec(),
+        duration_secs: duration_secs.unwrap_or(60).clamp(15, 1800),
+        channel_points_per_vote,
+    })
+}
+
 fn parse_poll_flag_args(input: &str) -> Option<ParsedPollSpec> {
     let tokens = split_quoted_args(input);
     if tokens.is_empty() {
@@ -6529,7 +7572,7 @@ fn parse_poll_flag_args(input: &str) -> Option<ParsedPollSpec> {
     let mut i = 0usize;
     while i < tokens.len() {
         match tokens[i].as_str() {
-            "--title" => {
+            "--title" | "-t" => {
                 let value = tokens.get(i + 1)?.trim();
                 if value.is_empty() {
                     return None;
@@ -6537,7 +7580,7 @@ fn parse_poll_flag_args(input: &str) -> Option<ParsedPollSpec> {
                 title = Some(value.to_owned());
                 i += 2;
             }
-            "--choice" => {
+            "--choice" | "-c" => {
                 let value = tokens.get(i + 1)?.trim();
                 if value.is_empty() {
                     return None;
@@ -6545,7 +7588,7 @@ fn parse_poll_flag_args(input: &str) -> Option<ParsedPollSpec> {
                 choices.push(value.to_owned());
                 i += 2;
             }
-            "--duration" => {
+            "--duration" | "-d" => {
                 let value = tokens.get(i + 1)?;
                 duration_secs = parse_poll_duration_token(value);
                 if duration_secs.is_none() {
@@ -6553,10 +7596,9 @@ fn parse_poll_flag_args(input: &str) -> Option<ParsedPollSpec> {
                 }
                 i += 2;
             }
-            "--points" => {
+            "--points" | "-p" => {
                 let value = tokens.get(i + 1)?;
-                let parsed = value.parse::<u32>().ok().filter(|v| *v > 0)?;
-                channel_points_per_vote = Some(parsed);
+                channel_points_per_vote = Some(parse_poll_points_token(value)?);
                 i += 2;
             }
             _ => return None,
@@ -6586,9 +7628,9 @@ fn extract_duration_flag(input: &str) -> (String, Option<u32>) {
     let tokens: Vec<&str> = input.split_whitespace().collect();
     let mut i = 0usize;
     while i < tokens.len() {
-        if tokens[i] == "--duration" {
+        if matches!(tokens[i], "--duration" | "-d") {
             if let Some(next) = tokens.get(i + 1) {
-                if let Ok(v) = next.parse::<u32>() {
+                if let Some(v) = parse_poll_duration_token(next) {
                     duration = Some(v);
                     i += 2;
                     continue;
@@ -6600,29 +7642,6 @@ fn extract_duration_flag(input: &str) -> (String, Option<u32>) {
     }
 
     (cleaned_tokens.join(" "), duration)
-}
-
-fn extract_points_flag(input: &str) -> (String, Option<u32>) {
-    let mut cleaned_tokens: Vec<&str> = Vec::new();
-    let mut points: Option<u32> = None;
-
-    let tokens: Vec<&str> = input.split_whitespace().collect();
-    let mut i = 0usize;
-    while i < tokens.len() {
-        if tokens[i] == "--points" {
-            if let Some(next) = tokens.get(i + 1) {
-                if let Ok(v) = next.parse::<u32>() {
-                    points = Some(v.max(1));
-                    i += 2;
-                    continue;
-                }
-            }
-        }
-        cleaned_tokens.push(tokens[i]);
-        i += 1;
-    }
-
-    (cleaned_tokens.join(" "), points)
 }
 
 fn parse_twitch_channel_login_arg(raw: &str) -> Option<String> {
@@ -6756,6 +7775,33 @@ fn build_emote_lookup(catalog: &[EmoteCatalogEntry]) -> HashMap<&str, &EmoteCata
         map.insert(&e.code, e);
     }
     map
+}
+
+fn tokenize_whisper_text(
+    text: &str,
+    twitch_emotes: &[TwitchEmotePos],
+    emote_map: &HashMap<&str, &EmoteCatalogEntry>,
+) -> Vec<Span> {
+    crust_core::format::tokenize(text, false, twitch_emotes, &|code| {
+        emote_map.get(code).map(|e| {
+            (
+                e.code.clone(),
+                e.code.clone(),
+                e.url.clone(),
+                e.provider.clone(),
+                None,
+            )
+        })
+    })
+    .into_vec()
+}
+
+fn whisper_fit_size(w: u32, h: u32, target_h: f32) -> egui::Vec2 {
+    if h == 0 || w == 0 {
+        return egui::vec2(target_h, target_h);
+    }
+    let scale = target_h / h as f32;
+    egui::vec2((w as f32 * scale).max(6.0), target_h)
 }
 
 #[cfg(test)]
@@ -6978,6 +8024,37 @@ mod tests {
     }
 
     #[test]
+    fn slash_poll_short_flags_map_to_create_poll() {
+        let channel = ChannelId::new("somechannel");
+        let parsed = parse_slash_command(
+            "/poll -t \"Best snack\" -c Chips -c Popcorn -d 90s -p 25",
+            &channel,
+            None,
+            None,
+            true,
+            0,
+            true,
+            true,
+        );
+
+        match parsed {
+            Some(AppCommand::CreatePoll {
+                title,
+                choices,
+                duration_secs,
+                channel_points_per_vote,
+                ..
+            }) => {
+                assert_eq!(title, "Best snack");
+                assert_eq!(choices, vec!["Chips".to_owned(), "Popcorn".to_owned()]);
+                assert_eq!(duration_secs, 90);
+                assert_eq!(channel_points_per_vote, Some(25));
+            }
+            other => panic!("expected CreatePoll, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn slash_unbanrequests_maps_to_fetch_command() {
         let channel = ChannelId::new("somechannel");
         let parsed = parse_slash_command(
@@ -7053,6 +8130,28 @@ mod tests {
                 assert_eq!(text, "/vote 2");
             }
             other => panic!("expected SendMessage for /vote, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_vote_rejects_non_numeric_choice() {
+        let channel = ChannelId::new("somechannel");
+        let parsed = parse_slash_command(
+            "/vote winner",
+            &channel,
+            None,
+            None,
+            false,
+            0,
+            true,
+            true,
+        );
+
+        match parsed {
+            Some(AppCommand::InjectLocalMessage { text, .. }) => {
+                assert_eq!(text, "Usage: /vote <choice number>");
+            }
+            other => panic!("expected usage local message for /vote, got {other:?}"),
         }
     }
 
@@ -7168,6 +8267,51 @@ mod tests {
                 assert_eq!(text, "/unban troublemaker");
             }
             other => panic!("expected SendMessage forwarding to /unban, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_whisper_maps_to_send_whisper_command() {
+        let channel = ChannelId::new("somechannel");
+        let parsed = parse_slash_command(
+            "/w @TargetUser hello there",
+            &channel,
+            None,
+            None,
+            true,
+            0,
+            true,
+            true,
+        );
+
+        match parsed {
+            Some(AppCommand::SendWhisper { target_login, text }) => {
+                assert_eq!(target_login, "targetuser");
+                assert_eq!(text, "hello there");
+            }
+            other => panic!("expected SendWhisper command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_whisper_requires_target_and_message() {
+        let channel = ChannelId::new("somechannel");
+        let parsed = parse_slash_command(
+            "/whisper targetonly",
+            &channel,
+            None,
+            None,
+            true,
+            0,
+            true,
+            true,
+        );
+
+        match parsed {
+            Some(AppCommand::InjectLocalMessage { text, .. }) => {
+                assert_eq!(text, "Usage: /w <user> <message>");
+            }
+            other => panic!("expected usage local message for /whisper, got {other:?}"),
         }
     }
 }

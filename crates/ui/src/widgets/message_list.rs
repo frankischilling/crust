@@ -1274,6 +1274,59 @@ impl<'a> MessageList<'a> {
             }
         }
 
+        if let Some(reward_id) = msg
+            .flags
+            .custom_reward_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            ui.separator();
+            ui.label(RichText::new("Channel points").small().color(t::text_muted()));
+            if ui.button("Copy custom reward ID").clicked() {
+                ui.ctx().copy_text(reward_id.to_owned());
+                ui.close_menu();
+            }
+        }
+
+        if let MsgKind::ChannelPointsReward {
+            reward_title,
+            reward_id,
+            redemption_id,
+            ..
+        } = &msg.msg_kind
+        {
+            ui.separator();
+            ui.label(RichText::new("Redemption details").small().color(t::text_muted()));
+
+            if ui.button("Copy reward title").clicked() {
+                ui.ctx().copy_text(reward_title.clone());
+                ui.close_menu();
+            }
+
+            if let Some(reward_id) = reward_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                if ui.button("Copy reward ID").clicked() {
+                    ui.ctx().copy_text(reward_id.to_owned());
+                    ui.close_menu();
+                }
+            }
+
+            if let Some(redemption_id) = redemption_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                if ui.button("Copy redemption ID").clicked() {
+                    ui.ctx().copy_text(redemption_id.to_owned());
+                    ui.close_menu();
+                }
+            }
+        }
+
         if self.can_moderate && msg.channel.is_twitch() {
             ui.separator();
             ui.label(RichText::new("Mod actions").small().color(t::text_muted()));
@@ -1404,6 +1457,17 @@ impl<'a> MessageList<'a> {
                         url: format!(
                             "https://logs.ivr.fi/?channel={channel_login}&username={}",
                             msg.sender.login
+                        ),
+                    });
+                    ui.close_menu();
+                }
+
+                if matches!(msg.msg_kind, MsgKind::ChannelPointsReward { .. })
+                    && ui.button("Open reward queue").clicked()
+                {
+                    let _ = self.cmd_tx.try_send(AppCommand::OpenUrl {
+                        url: format!(
+                            "https://www.twitch.tv/popout/{channel_login}/reward-queue"
                         ),
                     });
                     ui.close_menu();
@@ -1992,6 +2056,34 @@ impl<'a> MessageList<'a> {
                             ui.add(Label::new(RichText::new(":").color(t::separator())));
                         }
 
+                        if let Some(reward_id) = msg
+                            .flags
+                            .custom_reward_id
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        {
+                            let chip_bg = Color32::from_rgba_unmultiplied(120, 85, 195, 52);
+                            let chip_stroke = Color32::from_rgba_unmultiplied(160, 130, 235, 200);
+                            let chip = egui::Frame::new()
+                                .fill(chip_bg)
+                                .stroke(egui::Stroke::new(1.0, chip_stroke))
+                                .corner_radius(egui::CornerRadius::same(3))
+                                .inner_margin(egui::Margin::symmetric(5, 1))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new("POINTS")
+                                            .font(t::tiny())
+                                            .color(Color32::from_rgb(228, 217, 255))
+                                            .strong(),
+                                    );
+                                })
+                                .response;
+                            chip.on_hover_text(format!(
+                                "Sent via channel points reward\nReward ID: {reward_id}"
+                            ));
+                        }
+
                         // Message spans carry their own whitespace from the
                         // tokenizer, so keep inter-widget spacing at zero to
                         // avoid rendering words with visually doubled spaces.
@@ -2173,31 +2265,14 @@ impl<'a> MessageList<'a> {
                 user_login,
                 reward_title,
                 cost,
-                reward_id,
-                redemption_id,
-                user_input,
                 status,
+                ..
             } => {
-                let mut text = format!("🎟  {user_login} redeemed '{reward_title}' ({cost} points)");
-                if let Some(input) = user_input.as_deref().filter(|s| !s.trim().is_empty()) {
-                    text.push_str(&format!(": {input}"));
-                }
-                if let Some(status) = status.as_deref().filter(|s| !s.trim().is_empty()) {
-                    text.push_str(&format!(" [{status}]"));
-                } else {
-                    text.push_str(" [UNFULFILLED]");
-                }
-                if reward_id.is_none() || redemption_id.is_none() {
-                    text.push_str(" [id-missing]");
-                }
-                let accent = match status.as_deref() {
-                    Some(s) if s.eq_ignore_ascii_case("fulfilled") => t::green(),
-                    Some(s)
-                        if s.eq_ignore_ascii_case("canceled")
-                            || s.eq_ignore_ascii_case("cancelled") => t::red(),
-                    _ => Color32::from_rgb(120, 85, 195),
-                };
-                (accent, Some(text))
+                let (status_label, _) = redemption_status_presentation(status.as_deref());
+                let text = format!(
+                    "🎟  {user_login} redeemed '{reward_title}' ({cost} points) [{status_label}]"
+                );
+                (redemption_accent(status.as_deref()), Some(text))
             }
             _ => (Color32::from_rgb(100, 100, 120), Some(msg.raw_text.clone())),
         };
@@ -2227,90 +2302,175 @@ impl<'a> MessageList<'a> {
                     if msg.flags.is_history {
                         ui.set_opacity(opacity);
                     }
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        // Coloured left stripe
-                        let (rect, _) =
-                            ui.allocate_exact_size(egui::vec2(3.0, 14.0), egui::Sense::hover());
-                        ui.painter().rect_filled(rect, 1.0, accent);
+                    if let MsgKind::ChannelPointsReward {
+                        user_login,
+                        reward_title,
+                        cost,
+                        reward_id,
+                        redemption_id,
+                        user_input,
+                        status,
+                    } = &msg.msg_kind
+                    {
+                        let (status_label, status_color) =
+                            redemption_status_presentation(status.as_deref());
 
-                        if self.show_timestamps {
-                            // Timestamp
-                            let ts = format_message_timestamp(
-                                &msg.timestamp,
-                                self.show_timestamp_seconds,
-                                self.use_24h_timestamps,
-                            );
-                            ui.add(Label::new(
-                                RichText::new(ts).color(t::timestamp()).font(t::small()),
-                            ));
-                        }
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                let (rect, _) = ui
+                                    .allocate_exact_size(egui::vec2(3.0, 14.0), egui::Sense::hover());
+                                ui.painter().rect_filled(rect, 1.0, accent);
 
-                        // Message text
-                        let rich = if is_irc_motd_line(&text) {
-                            RichText::new(text).color(accent).font(t::small())
-                        } else {
-                            RichText::new(text).italics().color(accent).font(t::small())
-                        };
-                        ui.add(Label::new(rich).wrap());
+                                if self.show_timestamps {
+                                    let ts = format_message_timestamp(
+                                        &msg.timestamp,
+                                        self.show_timestamp_seconds,
+                                        self.use_24h_timestamps,
+                                    );
+                                    ui.add(Label::new(
+                                        RichText::new(ts).color(t::timestamp()).font(t::small()),
+                                    ));
+                                }
 
-                        if self.can_moderate {
-                            if let MsgKind::ChannelPointsReward {
-                                reward_id,
-                                redemption_id,
-                                status,
-                                user_login,
-                                reward_title,
-                                ..
-                            } = &msg.msg_kind
-                            {
-                                let can_update = Self::redemption_can_update(
-                                    reward_id.as_deref(),
-                                    redemption_id.as_deref(),
-                                    status.as_deref(),
+                                ui.add(
+                                    Label::new(
+                                        RichText::new(format!(
+                                            "🎟 {user_login} redeemed '{reward_title}'"
+                                        ))
+                                        .color(accent)
+                                        .font(t::small()),
+                                    )
+                                    .wrap(),
                                 );
-                                if can_update {
-                                    ui.add_space(4.0);
-                                    if ui.small_button("Approve").clicked() {
-                                        let _ = self.cmd_tx.try_send(
-                                            AppCommand::UpdateRewardRedemptionStatus {
-                                                channel: self.channel.clone(),
-                                                reward_id: reward_id
-                                                    .as_ref()
-                                                    .cloned()
-                                                    .unwrap_or_default(),
-                                                redemption_id: redemption_id
-                                                    .as_ref()
-                                                    .cloned()
-                                                    .unwrap_or_default(),
-                                                status: "FULFILLED".to_owned(),
-                                                user_login: user_login.clone(),
-                                                reward_title: reward_title.clone(),
-                                            },
+
+                                let cost_chip = format!("{cost} pts");
+                                let cost_response = egui::Frame::new()
+                                    .fill(Color32::from_rgba_unmultiplied(120, 85, 195, 48))
+                                    .corner_radius(egui::CornerRadius::same(3))
+                                    .inner_margin(egui::Margin::symmetric(4, 1))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            RichText::new(cost_chip)
+                                                .font(t::tiny())
+                                                .color(Color32::from_rgb(226, 214, 255))
+                                                .strong(),
                                         );
-                                    }
-                                    if ui.small_button("Reject").clicked() {
-                                        let _ = self.cmd_tx.try_send(
-                                            AppCommand::UpdateRewardRedemptionStatus {
-                                                channel: self.channel.clone(),
-                                                reward_id: reward_id
-                                                    .as_ref()
-                                                    .cloned()
-                                                    .unwrap_or_default(),
-                                                redemption_id: redemption_id
-                                                    .as_ref()
-                                                    .cloned()
-                                                    .unwrap_or_default(),
-                                                status: "CANCELED".to_owned(),
-                                                user_login: user_login.clone(),
-                                                reward_title: reward_title.clone(),
-                                            },
+                                    })
+                                    .response;
+                                cost_response.on_hover_text("Channel points cost");
+
+                                egui::Frame::new()
+                                    .fill(Color32::from_rgba_unmultiplied(
+                                        status_color.r(),
+                                        status_color.g(),
+                                        status_color.b(),
+                                        50,
+                                    ))
+                                    .corner_radius(egui::CornerRadius::same(3))
+                                    .inner_margin(egui::Margin::symmetric(4, 1))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            RichText::new(status_label.as_ref())
+                                                .font(t::tiny())
+                                                .color(status_color)
+                                                .strong(),
                                         );
+                                    });
+
+                                if self.can_moderate {
+                                    let can_update = Self::redemption_can_update(
+                                        reward_id.as_deref(),
+                                        redemption_id.as_deref(),
+                                        status.as_deref(),
+                                    );
+                                    if can_update {
+                                        ui.add_space(4.0);
+                                        if ui.small_button("Approve").clicked() {
+                                            let _ = self.cmd_tx.try_send(
+                                                AppCommand::UpdateRewardRedemptionStatus {
+                                                    channel: self.channel.clone(),
+                                                    reward_id: reward_id
+                                                        .as_ref()
+                                                        .cloned()
+                                                        .unwrap_or_default(),
+                                                    redemption_id: redemption_id
+                                                        .as_ref()
+                                                        .cloned()
+                                                        .unwrap_or_default(),
+                                                    status: "FULFILLED".to_owned(),
+                                                    user_login: user_login.clone(),
+                                                    reward_title: reward_title.clone(),
+                                                },
+                                            );
+                                        }
+                                        if ui.small_button("Reject").clicked() {
+                                            let _ = self.cmd_tx.try_send(
+                                                AppCommand::UpdateRewardRedemptionStatus {
+                                                    channel: self.channel.clone(),
+                                                    reward_id: reward_id
+                                                        .as_ref()
+                                                        .cloned()
+                                                        .unwrap_or_default(),
+                                                    redemption_id: redemption_id
+                                                        .as_ref()
+                                                        .cloned()
+                                                        .unwrap_or_default(),
+                                                    status: "CANCELED".to_owned(),
+                                                    user_login: user_login.clone(),
+                                                    reward_title: reward_title.clone(),
+                                                },
+                                            );
+                                        }
                                     }
                                 }
+                            });
+
+                            if let Some(input) = user_input
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                            {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(10.0);
+                                    ui.label(
+                                        RichText::new(format!("Message: {input}"))
+                                            .font(t::small())
+                                            .color(t::text_muted())
+                                            .italics(),
+                                    );
+                                });
                             }
-                        }
-                    });
+                        });
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            // Coloured left stripe
+                            let (rect, _) = ui
+                                .allocate_exact_size(egui::vec2(3.0, 14.0), egui::Sense::hover());
+                            ui.painter().rect_filled(rect, 1.0, accent);
+
+                            if self.show_timestamps {
+                                // Timestamp
+                                let ts = format_message_timestamp(
+                                    &msg.timestamp,
+                                    self.show_timestamp_seconds,
+                                    self.use_24h_timestamps,
+                                );
+                                ui.add(Label::new(
+                                    RichText::new(ts).color(t::timestamp()).font(t::small()),
+                                ));
+                            }
+
+                            // Message text
+                            let rich = if is_irc_motd_line(&text) {
+                                RichText::new(text).color(accent).font(t::small())
+                            } else {
+                                RichText::new(text).italics().color(accent).font(t::small())
+                            };
+                            ui.add(Label::new(rich).wrap());
+                        });
+                    }
                 });
         }); // end push_id
     }
@@ -3864,31 +4024,74 @@ fn site_badge_colors(site: &str) -> (Color32, Color32) {
 
 /// Return `(label_text, stripe_color)` for messages with a chat notification.
 /// Returns `None` for ordinary messages.
+fn redemption_status_presentation(status: Option<&str>) -> (Cow<'static, str>, Color32) {
+    let normalized = status
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("UNFULFILLED");
+
+    if normalized.eq_ignore_ascii_case("fulfilled") {
+        return (Cow::Borrowed("FULFILLED"), t::green());
+    }
+    if normalized.eq_ignore_ascii_case("canceled")
+        || normalized.eq_ignore_ascii_case("cancelled")
+    {
+        return (Cow::Borrowed("CANCELED"), t::red());
+    }
+    if normalized.eq_ignore_ascii_case("unfulfilled") {
+        return (Cow::Borrowed("UNFULFILLED"), Color32::from_rgb(185, 140, 38));
+    }
+
+    (
+        Cow::Owned(normalized.to_ascii_uppercase()),
+        Color32::from_rgb(120, 85, 195),
+    )
+}
+
+fn redemption_accent(status: Option<&str>) -> Color32 {
+    let (_, color) = redemption_status_presentation(status);
+    color
+}
+
 fn notification_label(
     flags: &MessageFlags,
     kind: &MsgKind,
     keyword_highlight: bool,
     keyword_highlight_color: Option<Color32>,
 ) -> Option<(&'static str, Color32)> {
-    if flags.is_highlighted {
-        Some(("Highlighted Message", t::twitch_purple()))
-    } else if keyword_highlight {
+    if keyword_highlight {
         Some((
             "Keyword Highlight",
             keyword_highlight_color.unwrap_or_else(t::twitch_purple),
         ))
     } else if flags.is_mention {
         Some(("Mention", Color32::from_rgb(210, 140, 40)))
+    } else if let MsgKind::ChannelPointsReward { status, .. } = kind {
+        let label = match status
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("UNFULFILLED")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "fulfilled" => "Points Reward Fulfilled",
+            "canceled" | "cancelled" => "Points Reward Rejected",
+            _ => "Points Redemption",
+        };
+        Some((label, redemption_accent(status.as_deref())))
+    } else if flags.custom_reward_id.is_some() && flags.is_highlighted {
+        Some(("Points Highlight", Color32::from_rgb(120, 85, 195)))
+    } else if flags.custom_reward_id.is_some() {
+        Some(("Points Reward Message", Color32::from_rgb(100, 65, 165)))
+    } else if flags.is_highlighted {
+        Some(("Highlighted Message", t::twitch_purple()))
     } else if flags.is_pinned {
         Some(("Pinned Message", t::gold()))
     } else if matches!(kind, MsgKind::Bits { .. }) {
         Some(("Bits Cheer", t::bits_orange()))
     } else if flags.is_first_msg {
         Some(("First Message", t::green()))
-    } else if flags.custom_reward_id.is_some()
-        || matches!(kind, MsgKind::ChannelPointsReward { .. })
-    {
-        Some(("Channel Points Reward", Color32::from_rgb(100, 65, 165)))
     } else {
         None
     }
@@ -3904,8 +4107,6 @@ fn message_row_background(
     if highlight_alpha > 0.0 {
         let a = (50.0 * highlight_alpha) as u8;
         Color32::from_rgba_unmultiplied(100, 140, 255, a)
-    } else if flags.is_highlighted {
-        Color32::from_rgba_unmultiplied(145, 70, 255, 22)
     } else if keyword_highlight {
         if let Some(color) = keyword_highlight_color {
             Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 18)
@@ -3914,6 +4115,14 @@ fn message_row_background(
         }
     } else if flags.is_mention {
         Color32::from_rgba_unmultiplied(210, 140, 40, 24)
+    } else if let MsgKind::ChannelPointsReward { status, .. } = kind {
+        let accent = redemption_accent(status.as_deref());
+        Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 16)
+    } else if flags.custom_reward_id.is_some() {
+        let alpha = if flags.is_highlighted { 24 } else { 16 };
+        Color32::from_rgba_unmultiplied(100, 65, 165, alpha)
+    } else if flags.is_highlighted {
+        Color32::from_rgba_unmultiplied(145, 70, 255, 22)
     } else if flags.is_pinned {
         let gold = t::gold();
         Color32::from_rgba_unmultiplied(gold.r(), gold.g(), gold.b(), 26)
@@ -3924,10 +4133,6 @@ fn message_row_background(
         Color32::from_rgba_unmultiplied(180, 30, 30, 12)
     } else if matches!(kind, MsgKind::Bits { .. }) {
         Color32::from_rgba_unmultiplied(255, 175, 30, 14)
-    } else if flags.custom_reward_id.is_some()
-        || matches!(kind, MsgKind::ChannelPointsReward { .. })
-    {
-        Color32::from_rgba_unmultiplied(100, 65, 165, 16)
     } else {
         Color32::TRANSPARENT
     }
@@ -3943,12 +4148,16 @@ fn message_left_accent_color(
         Some(t::raid_cyan())
     } else if flags.is_mention {
         Some(t::accent())
-    } else if flags.is_highlighted {
-        Some(Color32::from_rgb(255, 210, 30))
     } else if keyword_highlight {
         Some(keyword_highlight_color.unwrap_or_else(t::twitch_purple))
-    } else if matches!(kind, MsgKind::ChannelPointsReward { .. }) {
+    } else if let MsgKind::ChannelPointsReward { status, .. } = kind {
+        Some(redemption_accent(status.as_deref()))
+    } else if flags.custom_reward_id.is_some() && flags.is_highlighted {
+        Some(Color32::from_rgb(165, 125, 235))
+    } else if flags.custom_reward_id.is_some() {
         Some(Color32::from_rgb(120, 85, 195))
+    } else if flags.is_highlighted {
+        Some(Color32::from_rgb(255, 210, 30))
     } else if flags.is_pinned {
         Some(t::gold())
     } else if flags.is_first_msg {
@@ -4047,6 +4256,47 @@ mod tests {
         assert_eq!(
             notification_label(&flags, &MsgKind::Chat, false, None),
             Some(("Pinned Message", t::gold()))
+        );
+    }
+
+    #[test]
+    fn custom_reward_highlight_prefers_points_label_and_accent() {
+        let flags = MessageFlags {
+            is_highlighted: true,
+            custom_reward_id: Some("reward-123".to_owned()),
+            ..MessageFlags::default()
+        };
+
+        assert_eq!(
+            notification_label(&flags, &MsgKind::Chat, false, None),
+            Some(("Points Highlight", Color32::from_rgb(120, 85, 195)))
+        );
+        assert_eq!(
+            message_left_accent_color(&flags, &MsgKind::Chat, false, None),
+            Some(Color32::from_rgb(165, 125, 235))
+        );
+    }
+
+    #[test]
+    fn channel_points_reward_status_label_reflects_terminal_state() {
+        let flags = MessageFlags::default();
+        let kind = MsgKind::ChannelPointsReward {
+            user_login: "viewer".to_owned(),
+            reward_title: "Hydrate".to_owned(),
+            cost: 250,
+            reward_id: Some("reward-id".to_owned()),
+            redemption_id: Some("redeem-id".to_owned()),
+            user_input: None,
+            status: Some("FULFILLED".to_owned()),
+        };
+
+        assert_eq!(
+            notification_label(&flags, &kind, false, None),
+            Some(("Points Reward Fulfilled", t::green()))
+        );
+        assert_eq!(
+            message_left_accent_color(&flags, &kind, false, None),
+            Some(t::green())
         );
     }
 

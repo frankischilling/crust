@@ -1,9 +1,10 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::highlight::HighlightRule;
 use crate::model::{
     Badge, ChannelId, ChatMessage, EmoteCatalogEntry, ModActionPreset, ReplyInfo,
-    SenderNamePaint, SystemNotice, UserProfile,
+    SenderNamePaint, SystemNotice, TwitchEmotePos, UserProfile,
 };
 
 /// A single chat log entry from the IVR logs API.
@@ -84,6 +85,15 @@ pub enum AppCommand {
         #[serde(default)]
         reply: Option<ReplyInfo>,
     },
+    /// Send a Twitch whisper via Helix (`POST /helix/whispers`).
+    SendWhisper {
+        /// Target Twitch login (lowercase, no leading `@`).
+        target_login: String,
+        /// Whisper body text.
+        text: String,
+    },
+    /// Request a Twitch stream status snapshot by login name.
+    FetchStreamStatus { login: String },
     /// Request a Twitch user profile lookup by login name.
     FetchUserProfile { login: String },
     /// Timeout a user in a channel via the Twitch Helix API.
@@ -350,6 +360,25 @@ pub enum AppEvent {
         channel: ChannelId,
         message: ChatMessage,
     },
+    /// Incoming Twitch whisper delivered out-of-band from channel chat.
+    WhisperReceived {
+        /// Login of the whisper sender.
+        from_login: String,
+        /// Display name of the whisper sender.
+        from_display_name: String,
+        /// Whisper target login (usually the authenticated user for incoming whispers).
+        target_login: String,
+        /// Whisper body text.
+        text: String,
+        /// Twitch native emote ranges parsed from IRC tags.
+        twitch_emotes: Vec<TwitchEmotePos>,
+        /// True when the local user sent the whisper (server echo).
+        is_self: bool,
+        /// Whisper timestamp from IRC tags when available.
+        timestamp: DateTime<Utc>,
+        /// True when this whisper is replayed from local history.
+        is_history: bool,
+    },
     MessageDeleted {
         channel: ChannelId,
         server_id: String,
@@ -394,6 +423,12 @@ pub enum AppEvent {
         login: String,
         /// `true` when stream is live, `false` when offline.
         is_live: bool,
+        /// Optional stream title when known.
+        title: Option<String>,
+        /// Optional game/category name when known.
+        game: Option<String>,
+        /// Optional viewer count when known.
+        viewers: Option<u64>,
     },
     /// A user profile lookup finished without data (network/API/user not found).
     UserProfileUnavailable {

@@ -9,7 +9,7 @@ use tracing::{debug, error, info, warn};
 
 use crust_core::model::{
     Badge, ChannelId, ChatMessage, MessageFlags, MessageId, MsgKind, ReplyInfo, Sender,
-    SystemNotice, UserId,
+    SystemNotice, TwitchEmotePos, UserId,
 };
 
 use crate::{
@@ -31,6 +31,16 @@ pub enum TwitchEvent {
         attempt: u32,
     },
     ChatMessage(ChatMessage),
+    /// Incoming or echoed whisper message (WHISPER).
+    Whisper {
+        from_login: String,
+        from_display_name: String,
+        target_login: String,
+        text: String,
+        twitch_emotes: Vec<TwitchEmotePos>,
+        is_self: bool,
+        timestamp: chrono::DateTime<Utc>,
+    },
     MessageDeleted {
         channel: ChannelId,
         server_id: String,
@@ -469,6 +479,22 @@ impl TwitchSession {
                     self.emit(TwitchEvent::ChatMessage(cm)).await;
                 }
             }
+            "WHISPER" => {
+                if let Some((from_login, from_display_name, target_login, text, twitch_emotes, is_self, timestamp)) =
+                    self.parse_whisper(msg)
+                {
+                    self.emit(TwitchEvent::Whisper {
+                        from_login,
+                        from_display_name,
+                        target_login,
+                        text,
+                        twitch_emotes,
+                        is_self,
+                        timestamp,
+                    })
+                    .await;
+                }
+            }
             "CLEARMSG" => {
                 if let (Some(ch_raw), Some(target_id)) =
                     (msg.params.first(), msg.tags.get("target-msg-id"))
@@ -808,6 +834,71 @@ impl TwitchSession {
             reply,
             msg_kind,
         })
+    }
+
+    /// Parse WHISPER into a lightweight payload for UI whisper management.
+    fn parse_whisper(
+        &self,
+        msg: &IrcMessage,
+    ) -> Option<(
+        String,
+        String,
+        String,
+        String,
+        Vec<TwitchEmotePos>,
+        bool,
+        chrono::DateTime<Utc>,
+    )> {
+        let target_login = msg
+            .params
+            .first()?
+            .trim()
+            .trim_start_matches('#')
+            .trim_start_matches('@')
+            .to_ascii_lowercase();
+        if target_login.is_empty() {
+            return None;
+        }
+
+        let raw_text = msg.trailing()?.to_owned();
+        let text = if raw_text.starts_with("\x01ACTION ") && raw_text.ends_with('\x01') {
+            raw_text[8..raw_text.len() - 1].to_owned()
+        } else {
+            raw_text
+        };
+
+        let from_login = msg.nick().unwrap_or("").trim().to_ascii_lowercase();
+        if from_login.is_empty() {
+            return None;
+        }
+
+        let from_display_name = msg
+            .tags
+            .get("display-name")
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(from_login.as_str())
+            .to_owned();
+
+        let twitch_emotes =
+            crust_core::format::parse_twitch_emotes_tag(msg.tags.get("emotes").unwrap_or(""));
+
+        let is_self = self.is_own_nick(msg);
+        let timestamp = msg
+            .tags
+            .get("tmi-sent-ts")
+            .and_then(|s| s.parse::<i64>().ok())
+            .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
+            .unwrap_or_else(Utc::now);
+
+        Some((
+            from_login,
+            from_display_name,
+            target_login,
+            text,
+            twitch_emotes,
+            is_self,
+            timestamp,
+        ))
     }
 }
 

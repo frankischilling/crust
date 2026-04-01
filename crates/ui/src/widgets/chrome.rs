@@ -9,6 +9,7 @@ pub enum ChromeIcon {
     Tabs,
     Settings,
     Analytics,
+    Whisper,
     Irc,
     Perf,
     Menu,
@@ -178,6 +179,32 @@ fn paint_icon(ui: &Ui, rect: egui::Rect, icon: ChromeIcon, state: IconButtonStat
                 );
                 painter.rect_filled(bar, CornerRadius::same(1), stroke_color);
             }
+        }
+        ChromeIcon::Whisper => {
+            let bubble = egui::Rect::from_min_max(
+                egui::pos2(rect.left() + 1.5, rect.top() + 2.0),
+                egui::pos2(rect.right() - 1.5, rect.bottom() - 4.0),
+            );
+            painter.rect_stroke(
+                bubble,
+                CornerRadius::same(3),
+                stroke,
+                egui::StrokeKind::Outside,
+            );
+            let tail_top = egui::pos2(bubble.left() + 5.0, bubble.bottom());
+            painter.line_segment(
+                [tail_top, tail_top + egui::vec2(-2.5, 3.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [tail_top + egui::vec2(-2.5, 3.0), tail_top + egui::vec2(1.5, 2.0)],
+                stroke,
+            );
+            let y = bubble.center().y;
+            painter.line_segment(
+                [egui::pos2(bubble.left() + 3.0, y), egui::pos2(bubble.right() - 3.0, y)],
+                stroke,
+            );
         }
         ChromeIcon::Irc => {
             painter.rect_stroke(rect, CornerRadius::same(3), stroke, egui::StrokeKind::Outside);

@@ -15,6 +15,8 @@ use crate::seventv::SevenTvCosmeticUpdate;
 use super::badges::{resolve_badge_url, BadgeMap};
 use super::emote_loading::prefetch_emote_images;
 
+const WHISPER_HISTORY_CHANNEL_PREFIX: &str = "whisper:";
+
 /// Load locally persisted chat history from SQLite and replay it as
 /// `AppEvent::HistoryLoaded` for the channel.
 pub(crate) async fn load_local_recent_messages(
@@ -121,6 +123,101 @@ pub(crate) async fn load_local_older_messages(
     let _ = evt_tx
         .send(AppEvent::HistoryLoaded { channel, messages })
         .await;
+}
+
+/// Load locally persisted whispers from SQLite and replay them as
+/// `AppEvent::WhisperReceived` with `is_history=true`.
+pub(crate) async fn load_local_recent_whispers(
+    log_store: LogStore,
+    self_login: Option<String>,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let channels = tokio::task::spawn_blocking({
+        let store = log_store.clone();
+        move || store.recent_channels_with_prefix(WHISPER_HISTORY_CHANNEL_PREFIX, 250)
+    })
+    .await;
+
+    let whisper_channels = match channels {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(e)) => {
+            warn!("whisper-history: failed to list whisper channels: {e}");
+            return;
+        }
+        Err(e) => {
+            warn!("whisper-history: channel-list task failed: {e}");
+            return;
+        }
+    };
+
+    if whisper_channels.is_empty() {
+        return;
+    }
+
+    let self_login = self_login
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_default();
+
+    for channel in whisper_channels {
+        let Some(partner_login) = channel
+            .strip_prefix(WHISPER_HISTORY_CHANNEL_PREFIX)
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .filter(|v| !v.is_empty())
+        else {
+            continue;
+        };
+
+        let rows = tokio::task::spawn_blocking({
+            let store = log_store.clone();
+            let channel_id = ChannelId(channel.clone());
+            move || store.recent_messages(&channel_id, 250)
+        })
+        .await;
+
+        let messages = match rows {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                warn!(
+                    "whisper-history: failed loading channel {}: {e}",
+                    channel
+                );
+                continue;
+            }
+            Err(e) => {
+                warn!(
+                    "whisper-history: load task failed for channel {}: {e}",
+                    channel
+                );
+                continue;
+            }
+        };
+
+        for msg in messages {
+            let from_login = msg.sender.login.trim().to_ascii_lowercase();
+            if from_login.is_empty() {
+                continue;
+            }
+            let target_login = if msg.flags.is_self {
+                partner_login.clone()
+            } else {
+                self_login.clone()
+            };
+            let _ = evt_tx
+                .send(AppEvent::WhisperReceived {
+                    from_login,
+                    from_display_name: msg.sender.display_name,
+                    target_login,
+                    text: msg.raw_text,
+                    twitch_emotes: msg.twitch_emotes,
+                    is_self: msg.flags.is_self,
+                    timestamp: msg.timestamp,
+                    is_history: true,
+                })
+                .await;
+        }
+    }
 }
 
 /// Fetch recent messages for a channel and send `AppEvent::HistoryLoaded`.

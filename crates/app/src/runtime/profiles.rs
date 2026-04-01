@@ -3,7 +3,7 @@ use crust_core::{
     model::{ChannelId, UserProfile},
 };
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::runtime::assets::fetch_and_decode_raw;
 
@@ -14,10 +14,75 @@ fn non_empty_opt(input: Option<String>) -> Option<String> {
     })
 }
 
+/// Fetch a fresh Twitch live viewer count via public GQL.
+///
+/// IVR can lag for hot channels, so this gives us a closer-to-live count
+/// without requiring user OAuth.
+async fn fetch_twitch_live_viewer_count_gql(login: &str) -> Option<u64> {
+    #[derive(serde::Deserialize)]
+    struct GqlResponse {
+        data: Option<GqlData>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct GqlData {
+        user: Option<GqlUser>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct GqlUser {
+        stream: Option<GqlStream>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct GqlStream {
+        #[serde(rename = "viewersCount")]
+        viewers_count: Option<u64>,
+    }
+
+    let login = login.trim().to_ascii_lowercase();
+    if login.is_empty() {
+        return None;
+    }
+
+    let payload = serde_json::json!({
+        "query": "query($login:String!){user(login:$login){stream{viewersCount}}}",
+        "variables": { "login": login },
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    let resp = client
+        .post("https://gql.twitch.tv/gql")
+        .header("Client-ID", "kimne78kx3ncx6brgo4mv6wki5h1ko")
+        .header(reqwest::header::CACHE_CONTROL, "no-cache")
+        .header(reqwest::header::PRAGMA, "no-cache")
+        .json(&payload)
+        .send()
+        .await
+        .ok()?;
+
+    if !resp.status().is_success() {
+        return None;
+    }
+
+    let parsed: GqlResponse = resp.json().await.ok()?;
+    parsed
+        .data?
+        .user?
+        .stream?
+        .viewers_count
+}
+
 /// Fetch a user profile appropriate for the channel platform.
 pub(crate) async fn fetch_user_profile_for_channel(
     login: &str,
     channel: &ChannelId,
+    oauth_token: Option<&str>,
+    client_id: Option<&str>,
     evt_tx: mpsc::Sender<AppEvent>,
 ) {
     if channel.is_kick() {
@@ -29,14 +94,261 @@ pub(crate) async fn fetch_user_profile_for_channel(
             })
             .await;
     } else {
-        fetch_twitch_user_profile(login, evt_tx).await;
+        fetch_twitch_user_profile(login, oauth_token, client_id, evt_tx).await;
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TwitchStreamSnapshot {
+    is_live: bool,
+    title: Option<String>,
+    game: Option<String>,
+    viewers: Option<u64>,
+}
+
+/// Fetch a Twitch stream snapshot via Helix streams endpoint.
+///
+/// Returns `Some` for both live and offline channels when the request itself
+/// succeeds. Returns `None` only when Helix could not be queried.
+async fn fetch_twitch_stream_snapshot_helix(
+    login: &str,
+    oauth_token: Option<&str>,
+    client_id: Option<&str>,
+) -> Option<TwitchStreamSnapshot> {
+    #[derive(serde::Deserialize)]
+    struct HelixStreamItem {
+        title: String,
+        #[serde(rename = "game_name")]
+        game_name: String,
+        #[serde(rename = "viewer_count")]
+        viewer_count: u64,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct HelixStreamsResponse {
+        data: Vec<HelixStreamItem>,
+    }
+
+    let token = oauth_token.map(str::trim).filter(|s| !s.is_empty());
+    let Some(token) = token else {
+        warn!("stream-status helix unavailable: missing oauth token");
+        return None;
+    };
+
+    let client_id = client_id.map(str::trim).filter(|s| !s.is_empty());
+    let Some(client_id) = client_id else {
+        warn!("stream-status helix unavailable: missing client id");
+        return None;
+    };
+
+    let login = login.trim().to_ascii_lowercase();
+    if login.is_empty() {
+        return None;
+    }
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    if bare.trim().is_empty() {
+        return None;
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    let resp = client
+        .get("https://api.twitch.tv/helix/streams")
+        .query(&[("user_login", login.as_str())])
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", client_id)
+        .header(reqwest::header::CACHE_CONTROL, "no-cache")
+        .header(reqwest::header::PRAGMA, "no-cache")
+        .send()
+        .await;
+
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("stream-status helix request failed for {login}: {e}");
+            return None;
+        }
+    };
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        warn!("stream-status helix HTTP {status} for {login}: {body}");
+        return None;
+    }
+
+    let parsed: HelixStreamsResponse = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("stream-status helix decode failed for {login}: {e}");
+            return None;
+        }
+    };
+    let snapshot = match parsed.data.into_iter().next() {
+        Some(item) => TwitchStreamSnapshot {
+            is_live: true,
+            title: non_empty_opt(Some(item.title)),
+            game: non_empty_opt(Some(item.game_name)),
+            viewers: Some(item.viewer_count),
+        },
+        None => TwitchStreamSnapshot {
+            is_live: false,
+            title: None,
+            game: None,
+            viewers: None,
+        },
+    };
+
+    Some(snapshot)
+}
+
+/// Fetch a Twitch stream snapshot via IVR user endpoint.
+///
+/// Returns `Some` for both live and offline channels when IVR returns a user.
+/// Returns `None` for network/protocol failures.
+async fn fetch_twitch_stream_snapshot_ivr(login: &str) -> Option<TwitchStreamSnapshot> {
+    #[derive(serde::Deserialize)]
+    struct IvrStreamGame {
+        #[serde(rename = "displayName", default)]
+        display_name: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct IvrStream {
+        #[serde(default)]
+        title: String,
+        game: Option<IvrStreamGame>,
+        #[serde(rename = "viewersCount", default)]
+        viewers_count: u64,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct IvrUser {
+        stream: Option<IvrStream>,
+    }
+
+    let login = login.trim().to_ascii_lowercase();
+    if login.is_empty() {
+        return None;
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    let resp = client
+        .get(format!("https://api.ivr.fi/v2/twitch/user?login={login}"))
+        .send()
+        .await
+        .ok()?;
+
+    if !resp.status().is_success() {
+        return None;
+    }
+
+    let users: Vec<IvrUser> = resp.json().await.ok()?;
+    let user = users.into_iter().next()?;
+
+    let snapshot = match user.stream {
+        Some(stream) => TwitchStreamSnapshot {
+            is_live: true,
+            title: non_empty_opt(Some(stream.title)),
+            game: non_empty_opt(stream.game.map(|g| g.display_name)),
+            viewers: Some(stream.viewers_count),
+        },
+        None => TwitchStreamSnapshot {
+            is_live: false,
+            title: None,
+            game: None,
+            viewers: None,
+        },
+    };
+
+    Some(snapshot)
+}
+
+/// Fetch Twitch stream status for periodic channel refresh.
+///
+/// Uses Helix streams as the primary source and falls back to IVR when Helix
+/// is unavailable. Emits `StreamStatusUpdated` on success.
+pub(crate) async fn fetch_twitch_stream_status(
+    login: &str,
+    oauth_token: Option<&str>,
+    client_id: Option<&str>,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let login = login.trim().to_ascii_lowercase();
+    if login.is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::UserProfileUnavailable {
+                login: login.to_owned(),
+            })
+            .await;
+        return;
+    }
+
+    debug!("stream-status refresh requested for {login}");
+
+    let mut source = "helix";
+    let mut snapshot = fetch_twitch_stream_snapshot_helix(&login, oauth_token, client_id).await;
+    if snapshot.is_none() {
+        source = "ivr";
+        snapshot = fetch_twitch_stream_snapshot_ivr(&login).await;
+    }
+
+    if let Some(mut snapshot) = snapshot {
+        if snapshot.is_live {
+            if let Some(gql_viewers) = fetch_twitch_live_viewer_count_gql(&login).await {
+                if snapshot.viewers != Some(gql_viewers) {
+                    debug!(
+                        "stream-status viewer override from gql for {login}: {:?} -> {}",
+                        snapshot.viewers,
+                        gql_viewers
+                    );
+                }
+                snapshot.viewers = Some(gql_viewers);
+                source = "gql";
+            }
+        }
+
+        debug!(
+            "stream-status refresh result for {login}: source={source}, live={}, viewers={:?}",
+            snapshot.is_live,
+            snapshot.viewers
+        );
+        let _ = evt_tx
+            .send(AppEvent::StreamStatusUpdated {
+                login,
+                is_live: snapshot.is_live,
+                title: snapshot.title,
+                game: snapshot.game,
+                viewers: snapshot.viewers,
+            })
+            .await;
+    } else {
+        warn!("stream-status refresh failed for {login}");
+        let _ = evt_tx
+            .send(AppEvent::UserProfileUnavailable {
+                login: login.to_owned(),
+            })
+            .await;
     }
 }
 
 /// Fetch a Twitch user profile from the IVR API (no auth required) and send
 /// `AppEvent::UserProfileLoaded`. Also pre-fetches avatar bytes so the popup
 /// can show the real avatar immediately.
-pub(crate) async fn fetch_twitch_user_profile(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
+pub(crate) async fn fetch_twitch_user_profile(
+    login: &str,
+    oauth_token: Option<&str>,
+    client_id: Option<&str>,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
     #[derive(serde::Deserialize)]
     struct IvrRoles {
         #[serde(rename = "isPartner", default)]
@@ -118,24 +430,41 @@ pub(crate) async fn fetch_twitch_user_profile(login: &str, evt_tx: mpsc::Sender<
         ban_status: Option<IvrBanStatus>,
     }
 
-    let url = format!("https://api.ivr.fi/v2/twitch/user?login={login}");
-    let client = reqwest::Client::new();
+    let requested_login = login.trim().to_ascii_lowercase();
+    if requested_login.is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::UserProfileUnavailable {
+                login: login.to_owned(),
+            })
+            .await;
+        return;
+    }
+
+    let url = format!("https://api.ivr.fi/v2/twitch/user?login={requested_login}");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let resp = match client.get(&url).send().await {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
-            warn!("IVR user fetch returned HTTP {} for {login}", r.status());
+            warn!(
+                "IVR user fetch returned HTTP {} for {}",
+                r.status(),
+                requested_login
+            );
             let _ = evt_tx
                 .send(AppEvent::UserProfileUnavailable {
-                    login: login.to_owned(),
+                    login: requested_login.clone(),
                 })
                 .await;
             return;
         }
         Err(e) => {
-            warn!("IVR user fetch failed for {login}: {e}");
+            warn!("IVR user fetch failed for {}: {e}", requested_login);
             let _ = evt_tx
                 .send(AppEvent::UserProfileUnavailable {
-                    login: login.to_owned(),
+                    login: requested_login.clone(),
                 })
                 .await;
             return;
@@ -145,10 +474,10 @@ pub(crate) async fn fetch_twitch_user_profile(login: &str, evt_tx: mpsc::Sender<
     let users: Vec<IvrUser> = match resp.json().await {
         Ok(u) => u,
         Err(e) => {
-            warn!("IVR user response parse failed for {login}: {e}");
+            warn!("IVR user response parse failed for {}: {e}", requested_login);
             let _ = evt_tx
                 .send(AppEvent::UserProfileUnavailable {
-                    login: login.to_owned(),
+                    login: requested_login.clone(),
                 })
                 .await;
             return;
@@ -156,10 +485,10 @@ pub(crate) async fn fetch_twitch_user_profile(login: &str, evt_tx: mpsc::Sender<
     };
 
     let Some(user) = users.into_iter().next() else {
-        warn!("IVR returned no user for {login}");
+        warn!("IVR returned no user for {}", requested_login);
         let _ = evt_tx
             .send(AppEvent::UserProfileUnavailable {
-                login: login.to_owned(),
+                login: requested_login.clone(),
             })
             .await;
         return;
@@ -167,28 +496,72 @@ pub(crate) async fn fetch_twitch_user_profile(login: &str, evt_tx: mpsc::Sender<
 
     let avatar_url = user.logo.clone();
 
-    let is_live = user.stream.is_some();
-    let stream_title = user
+    let mut is_live = user.stream.is_some();
+    let mut stream_title = user
         .stream
         .as_ref()
         .map(|s| s.title.clone())
         .filter(|s| !s.is_empty());
-    let stream_game = user
+    let mut stream_game = user
         .stream
         .as_ref()
         .and_then(|s| s.game.as_ref())
         .map(|g| g.display_name.clone())
         .filter(|s| !s.is_empty());
-    let stream_viewers = user.stream.as_ref().map(|s| s.viewers_count);
+    let mut stream_viewers = user.stream.as_ref().map(|s| s.viewers_count);
     let stream_started = user.stream.as_ref().and_then(|s| s.started_at.clone());
     let last_broadcast_at =
         stream_started.or_else(|| user.last_broadcast.and_then(|b| b.started_at));
     let is_banned = user.roles.as_ref().map_or(false, |r| r.is_banned) || user.ban_status.is_some();
     let ban_reason = user.ban_status.and_then(|b| b.reason);
 
+    let snapshot_login = if user.login.trim().is_empty() {
+        requested_login.as_str()
+    } else {
+        user.login.as_str()
+    };
+
+    if let Some(snapshot) =
+        fetch_twitch_stream_snapshot_helix(snapshot_login, oauth_token, client_id).await
+    {
+        is_live = snapshot.is_live;
+        stream_title = snapshot.title.or(stream_title);
+        stream_game = snapshot.game.or(stream_game);
+        stream_viewers = snapshot.viewers.or(stream_viewers);
+    }
+
+    if is_live {
+        let gql_login = if user.login.trim().is_empty() {
+            requested_login.as_str()
+        } else {
+            user.login.as_str()
+        };
+        if let Some(fresh_viewers) = fetch_twitch_live_viewer_count_gql(gql_login).await {
+            if stream_viewers != Some(fresh_viewers) {
+                debug!(
+                    "profile viewer override from gql for {}: {:?} -> {}",
+                    gql_login,
+                    stream_viewers,
+                    fresh_viewers
+                );
+            }
+            stream_viewers = Some(fresh_viewers);
+        }
+    }
+
+    let profile_login = user
+        .login
+        .trim()
+        .to_ascii_lowercase();
+    let profile_login = if profile_login.is_empty() {
+        requested_login.clone()
+    } else {
+        profile_login
+    };
+
     let profile = UserProfile {
         id: user.id,
-        login: user.login,
+        login: profile_login,
         display_name: user.display_name,
         description: user.description,
         created_at: user.created_at,
@@ -208,6 +581,8 @@ pub(crate) async fn fetch_twitch_user_profile(login: &str, evt_tx: mpsc::Sender<
         ban_reason,
     };
 
+    let _ = evt_tx.send(AppEvent::UserProfileLoaded { profile }).await;
+
     // Pre-fetch avatar bytes so egui can display them right away.
     if let Some(ref logo) = avatar_url {
         if let Ok((w, h, raw)) = fetch_and_decode_raw(logo).await {
@@ -221,8 +596,6 @@ pub(crate) async fn fetch_twitch_user_profile(login: &str, evt_tx: mpsc::Sender<
                 .await;
         }
     }
-
-    let _ = evt_tx.send(AppEvent::UserProfileLoaded { profile }).await;
 }
 
 /// Fetch external chat logs from the IVR logs API (logs.ivr.fi).
