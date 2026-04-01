@@ -1370,17 +1370,6 @@ fn small_action_btn(ui: &mut egui::Ui, label: &str) -> bool {
     .clicked()
 }
 
-/// Render a small timeout-preset button; returns true if clicked.
-fn timeout_btn(ui: &mut egui::Ui, label: &str) -> bool {
-    ui.add(
-        egui::Button::new(RichText::new(label).small())
-            .fill(t::bg_raised())
-            .stroke(egui::Stroke::new(1.0, t::border_subtle()))
-            .min_size(egui::vec2(36.0, 20.0)),
-    )
-    .clicked()
-}
-
 /// Convert the reason buffer to `Option<String>` (None if empty).
 fn reason_opt(buf: &str) -> Option<String> {
     let s = buf.trim();

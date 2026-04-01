@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use egui::{CentralPanel, Color32, Context, Frame, Margin, RichText, SidePanel, TopBottomPanel};
@@ -54,8 +54,14 @@ const STREAM_REFRESH_SCAN_INTERVAL: std::time::Duration = std::time::Duration::f
 const STREAM_REFRESH_ACTIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
 const STREAM_REFRESH_BACKGROUND_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(60);
+const STREAM_NOTIFICATION_STARTUP_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(8);
 const AUTH_REFRESH_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 const AUTH_REFRESH_INFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const EVENT_TOAST_MAX_ACTIVE: usize = 5;
+const EVENT_TOAST_QUEUE_MAX: usize = 24;
+const EVENT_TOAST_STAGGER: std::time::Duration = std::time::Duration::from_millis(650);
+const EVENT_TOAST_TTL_SECS: f32 = 5.0;
 const NARROW_WINDOW_THRESHOLD: f32 = 520.0;
 const VERY_NARROW_WINDOW_THRESHOLD: f32 = 320.0;
 const REGULAR_MIN_CENTRAL_WIDTH: f32 = 250.0;
@@ -646,6 +652,12 @@ pub struct CrustApp {
     stream_tracker: StreamStatusTracker,
     /// Short-lived pop-in banners for Sub / Raid / Bits events (cap 5).
     event_toasts: Vec<EventToast>,
+    /// Backlog of toasts waiting for paced rendering.
+    event_toast_queue: VecDeque<EventToast>,
+    /// Last time a toast was emitted from the queue.
+    last_event_toast_emit: Option<std::time::Instant>,
+    /// Suppress stream live/offline toasts during startup sync.
+    suppress_stream_toasts_until: std::time::Instant,
     /// Settings dialog visibility.
     settings_open: bool,
     /// Current section selected in the settings page.
@@ -847,6 +859,10 @@ impl CrustApp {
             live_map_cache: HashMap::new(),
             stream_tracker: StreamStatusTracker::default(),
             event_toasts: Vec::new(),
+            event_toast_queue: VecDeque::new(),
+            last_event_toast_emit: None,
+            suppress_stream_toasts_until: std::time::Instant::now()
+                + STREAM_NOTIFICATION_STARTUP_GRACE,
             settings_open: false,
             settings_section: SettingsSection::default(),
             kick_beta_enabled: false,
@@ -1181,15 +1197,43 @@ exit 1
     }
 
     fn push_event_toast(&mut self, text: String, hue: Color32, confetti: bool) {
-        if self.event_toasts.len() >= 5 {
-            self.event_toasts.remove(0);
-        }
-        self.event_toasts.push(EventToast {
+        self.enqueue_event_toast(EventToast {
             text,
             hue,
             confetti,
             born: std::time::Instant::now(),
         });
+    }
+
+    fn enqueue_event_toast(&mut self, toast: EventToast) {
+        if self.event_toast_queue.len() >= EVENT_TOAST_QUEUE_MAX {
+            self.event_toast_queue.pop_front();
+        }
+        self.event_toast_queue.push_back(toast);
+        self.flush_event_toast_queue();
+    }
+
+    fn flush_event_toast_queue(&mut self) {
+        let now = std::time::Instant::now();
+        let can_emit = self
+            .last_event_toast_emit
+            .map(|last| now.duration_since(last) >= EVENT_TOAST_STAGGER)
+            .unwrap_or(true);
+
+        if !can_emit {
+            return;
+        }
+
+        let Some(mut toast) = self.event_toast_queue.pop_front() else {
+            return;
+        };
+
+        toast.born = now;
+        if self.event_toasts.len() >= EVENT_TOAST_MAX_ACTIVE {
+            self.event_toasts.remove(0);
+        }
+        self.event_toasts.push(toast);
+        self.last_event_toast_emit = Some(now);
     }
 
     fn handle_stream_status_transition(
@@ -1221,8 +1265,14 @@ exit 1
             return;
         };
 
+        let suppress_stream_toasts = self.loading_screen.is_active()
+            || std::time::Instant::now() < self.suppress_stream_toasts_until;
+
         match update {
             StreamStatusUpdate::Live(payload) => {
+                if suppress_stream_toasts {
+                    return;
+                }
                 let mut text = format!("{} is live", payload.display_name);
                 if let Some(stream_title) = payload.title.as_deref().filter(|s| !s.is_empty()) {
                     text = format!("{} is live: {}", payload.display_name, stream_title);
@@ -1233,6 +1283,9 @@ exit 1
                 }
             }
             StreamStatusUpdate::Offline(payload) => {
+                if suppress_stream_toasts {
+                    return;
+                }
                 self.push_event_toast(format!("{} went offline", payload.channel_name), t::text_muted(), false);
             }
         }
@@ -1507,79 +1560,74 @@ exit 1
                     .unwrap_or((false, false, false));
 
                 // Generate a short-lived event toast for high-visibility events.
-                if self.event_toasts.len() < 5 {
-                    // Only pop banners for the channel the user is watching.
-                    let maybe_toast: Option<EventToast> = if !is_active {
-                        None
-                    } else {
-                        match &message.msg_kind {
-                            MsgKind::Sub {
-                                display_name,
-                                months,
-                                is_gift,
-                                plan,
-                                ..
-                            } => {
-                                let gifted_to_me = *is_gift && message.flags.is_mention;
-                                let text = if gifted_to_me {
-                                    format!("🎉🎊  You received a gifted {} sub!", plan)
-                                } else if *is_gift {
-                                    format!("🎁  {} received a gifted {} sub!", display_name, plan)
-                                } else if *months <= 1 {
-                                    format!("⭐  {} just subscribed with {}!", display_name, plan)
+                // Only pop banners for the channel the user is watching.
+                let maybe_toast: Option<EventToast> = if !is_active {
+                    None
+                } else {
+                    match &message.msg_kind {
+                        MsgKind::Sub {
+                            display_name,
+                            months,
+                            is_gift,
+                            plan,
+                            ..
+                        } => {
+                            let gifted_to_me = *is_gift && message.flags.is_mention;
+                            let text = if gifted_to_me {
+                                format!("🎉🎊  You received a gifted {} sub!", plan)
+                            } else if *is_gift {
+                                format!("🎁  {} received a gifted {} sub!", display_name, plan)
+                            } else if *months <= 1 {
+                                format!("⭐  {} just subscribed with {}!", display_name, plan)
+                            } else {
+                                format!("⭐  {} resubscribed x{}!", display_name, months)
+                            };
+                            Some(EventToast {
+                                text,
+                                hue: if gifted_to_me {
+                                    t::raid_cyan()
                                 } else {
-                                    format!("⭐  {} resubscribed x{}!", display_name, months)
-                                };
-                                Some(EventToast {
-                                    text,
-                                    hue: if gifted_to_me {
-                                        t::raid_cyan()
-                                    } else {
-                                        t::gold()
-                                    },
-                                    confetti: gifted_to_me,
-                                    born: std::time::Instant::now(),
-                                })
-                            }
-                            MsgKind::Raid {
-                                display_name,
-                                viewer_count,
-                            } => Some(EventToast {
-                                text: format!(
-                                    "🚀  {} is raiding with {} viewers!",
-                                    display_name, viewer_count
-                                ),
-                                hue: t::raid_cyan(),
-                                confetti: false,
+                                    t::gold()
+                                },
+                                confetti: gifted_to_me,
                                 born: std::time::Instant::now(),
-                            }),
-                            MsgKind::Bits { amount } if *amount >= 100 => Some(EventToast {
-                                text: format!(
-                                    "💎  {} cheered {} bits!",
-                                    message.sender.display_name, amount
-                                ),
-                                hue: t::bits_orange(),
-                                confetti: false,
-                                born: std::time::Instant::now(),
-                            }),
-                            _ if message.flags.is_pinned => Some(EventToast {
-                                text: format!(
-                                    "📌  {} sent a pinned message",
-                                    message.sender.display_name
-                                ),
-                                hue: t::gold(),
-                                confetti: false,
-                                born: std::time::Instant::now(),
-                            }),
-                            _ => None,
+                            })
                         }
-                    };
-                    if let Some(toast) = maybe_toast {
-                        if self.event_toasts.len() >= 5 {
-                            self.event_toasts.remove(0);
-                        }
-                        self.event_toasts.push(toast);
+                        MsgKind::Raid {
+                            display_name,
+                            viewer_count,
+                        } => Some(EventToast {
+                            text: format!(
+                                "🚀  {} is raiding with {} viewers!",
+                                display_name, viewer_count
+                            ),
+                            hue: t::raid_cyan(),
+                            confetti: false,
+                            born: std::time::Instant::now(),
+                        }),
+                        MsgKind::Bits { amount } if *amount >= 100 => Some(EventToast {
+                            text: format!(
+                                "💎  {} cheered {} bits!",
+                                message.sender.display_name, amount
+                            ),
+                            hue: t::bits_orange(),
+                            confetti: false,
+                            born: std::time::Instant::now(),
+                        }),
+                        _ if message.flags.is_pinned => Some(EventToast {
+                            text: format!(
+                                "📌  {} sent a pinned message",
+                                message.sender.display_name
+                            ),
+                            hue: t::gold(),
+                            confetti: false,
+                            born: std::time::Instant::now(),
+                        }),
+                        _ => None,
                     }
+                };
+                if let Some(toast) = maybe_toast {
+                    self.enqueue_event_toast(toast);
                 }
 
                 let mut rebuilt_chatters: Option<Vec<String>> = None;
@@ -2277,17 +2325,13 @@ exit 1
             AppEvent::UnbanRequestResolved {
                 channel,
                 request_id,
-                status,
+                status: _,
             } => {
                 if let Some(requests) = self.unban_requests.get_mut(&channel) {
                     requests.retain(|request| request.request_id != request_id);
                 }
                 self.unban_resolution_drafts
                     .remove(&Self::unban_draft_key(&channel, &request_id));
-                self.send_cmd(AppCommand::InjectLocalMessage {
-                    channel,
-                    text: format!("[Unban Requests] {request_id} resolved with status {status}."),
-                });
             }
             AppEvent::OpenModerationTools { channel } => {
                 if let Some(channel) = channel {
@@ -3043,7 +3087,7 @@ impl eframe::App for CrustApp {
             };
             let appearance_before = self.appearance_snapshot();
             let stats = SettingsStats {
-                highlights_count: self.highlights.len(),
+                highlights_count: self.settings_highlight_rules.len(),
                 ignores_count: self.ignores.len(),
                 auto_join_count: self.auto_join_channels.len(),
             };
@@ -5104,8 +5148,9 @@ impl eframe::App for CrustApp {
         // -- Event toast overlay ---------------------------------------------
         // Expire toasts older than 5 s, then render remaining ones as stacked
         // floating banners anchored to the top-right of the screen.
+        self.flush_event_toast_queue();
         self.event_toasts
-            .retain(|t| t.born.elapsed().as_secs_f32() < 5.0);
+            .retain(|t| t.born.elapsed().as_secs_f32() < EVENT_TOAST_TTL_SECS);
         for (i, toast) in self.event_toasts.iter().enumerate() {
             let age = toast.born.elapsed().as_secs_f32();
             let opacity = if age < 0.25 {
@@ -5190,7 +5235,7 @@ impl eframe::App for CrustApp {
                 });
         }
         // Keep animating while toasts are live.
-        if !self.event_toasts.is_empty() {
+        if !self.event_toasts.is_empty() || !self.event_toast_queue.is_empty() {
             ctx.request_repaint_after(std::time::Duration::from_millis(30));
         }
 

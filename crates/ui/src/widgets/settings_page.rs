@@ -315,10 +315,9 @@ fn render_settings_content(
                     });
                     ui.checkbox(&mut state.sidebar_visible, "Show sidebar in sidebar mode");
                     ui.checkbox(&mut state.analytics_visible, "Show analytics panel");
-                    ui.add_enabled_ui(state.irc_beta_enabled, |ui| {
+                    if state.irc_beta_enabled {
                         ui.checkbox(&mut state.irc_status_visible, "Show IRC status panel");
-                    });
-                    if !state.irc_beta_enabled {
+                    } else {
                         ui.label(
                             RichText::new("Enable IRC beta to use the IRC diagnostics panel.")
                                 .font(t::tiny())
@@ -528,10 +527,11 @@ fn render_settings_content(
                     state.highlight_rule_bufs.truncate(state.highlight_rules.len());
 
                     let mut delete_idx: Option<usize> = None;
+                    let action_btn_size = egui::vec2(26.0, 22.0);
 
                     egui::Grid::new("highlight_rules_grid")
                         .num_columns(7)
-                        .spacing(egui::vec2(4.0, 4.0))
+                        .spacing(egui::vec2(8.0, 6.0))
                         .show(ui, |ui| {
                             // Header row
                             ui.label(RichText::new("On").font(t::tiny()).color(t::text_muted()));
@@ -574,7 +574,7 @@ fn render_settings_content(
                                         egui::Button::new(
                                             RichText::new("Re").font(t::tiny()).color(re_col),
                                         )
-                                        .min_size(egui::vec2(24.0, 20.0)),
+                                        .min_size(action_btn_size),
                                     )
                                     .clicked()
                                 {
@@ -592,7 +592,7 @@ fn render_settings_content(
                                         egui::Button::new(
                                             RichText::new("Aa").font(t::tiny()).color(aa_col),
                                         )
-                                        .min_size(egui::vec2(24.0, 20.0)),
+                                        .min_size(action_btn_size),
                                     )
                                     .clicked()
                                 {
@@ -610,7 +610,7 @@ fn render_settings_content(
                                         egui::Button::new(
                                             RichText::new("⚠").font(t::tiny()).color(alert_col),
                                         )
-                                        .min_size(egui::vec2(24.0, 20.0)),
+                                        .min_size(action_btn_size),
                                     )
                                     .on_hover_text("Show visual alert/flash on match")
                                     .clicked()
@@ -629,7 +629,7 @@ fn render_settings_content(
                                         egui::Button::new(
                                             RichText::new("🔊").font(t::tiny()).color(sound_col),
                                         )
-                                        .min_size(egui::vec2(24.0, 20.0)),
+                                        .min_size(action_btn_size),
                                     )
                                     .on_hover_text("Play sound notification on match")
                                     .clicked()
@@ -645,7 +645,7 @@ fn render_settings_content(
                                                 Color32::from_rgb(220, 80, 80),
                                             ),
                                         )
-                                        .min_size(egui::vec2(20.0, 20.0)),
+                                        .min_size(action_btn_size),
                                     )
                                     .clicked()
                                 {
@@ -666,6 +666,40 @@ fn render_settings_content(
                         state.highlight_rule_bufs.push(String::new());
                         state.highlight_rules.push(new_rule);
                     }
+
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("Keyword Highlights (Legacy)")
+                            .font(t::small())
+                            .strong()
+                            .color(t::text_primary()),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "Used for compatibility with older highlight lists. One per line or comma-separated.",
+                        )
+                        .font(t::tiny())
+                        .color(t::text_muted()),
+                    );
+                    ui.add(
+                        egui::TextEdit::multiline(&mut state.highlights_buf)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(if ultra_compact {
+                                3
+                            } else if compact {
+                                4
+                            } else {
+                                5
+                            }),
+                    );
+                    ui.label(
+                        RichText::new(format!(
+                            "{} keyword highlight(s)",
+                            parse_settings_lines(&state.highlights_buf, false).len()
+                        ))
+                        .font(t::tiny())
+                        .color(t::text_muted()),
+                    );
 
                     ui.add_space(8.0);
                     ui.separator();
@@ -898,44 +932,52 @@ fn render_settings_content(
                     ui.checkbox(&mut state.kick_beta_enabled, "Kick compatibility (beta)");
                     ui.checkbox(&mut state.irc_beta_enabled, "IRC chat compatibility (beta)");
                     ui.add_space(8.0);
-                    ui.label(
-                        RichText::new("IRC NickServ Auto-Identify")
-                            .font(t::small())
-                            .strong()
-                            .color(t::text_primary()),
-                    );
-                    if compact {
-                        ui.label("Username:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut state.irc_nickserv_user)
-                                .desired_width(f32::INFINITY),
+                    if state.irc_beta_enabled {
+                        ui.label(
+                            RichText::new("IRC NickServ Auto-Identify")
+                                .font(t::small())
+                                .strong()
+                                .color(t::text_primary()),
                         );
-                        ui.label("Password:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut state.irc_nickserv_pass)
-                                .desired_width(f32::INFINITY)
-                                .password(true),
-                        );
-                    } else {
-                        egui::Grid::new("settings_irc_auth_grid")
-                            .num_columns(2)
-                            .spacing(egui::vec2(8.0, 6.0))
-                            .show(ui, |ui| {
-                                ui.label("Username:");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut state.irc_nickserv_user)
-                                        .desired_width(f32::INFINITY),
-                                );
-                                ui.end_row();
+                        if compact {
+                            ui.label("Username:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut state.irc_nickserv_user)
+                                    .desired_width(f32::INFINITY),
+                            );
+                            ui.label("Password:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut state.irc_nickserv_pass)
+                                    .desired_width(f32::INFINITY)
+                                    .password(true),
+                            );
+                        } else {
+                            egui::Grid::new("settings_irc_auth_grid")
+                                .num_columns(2)
+                                .spacing(egui::vec2(8.0, 6.0))
+                                .show(ui, |ui| {
+                                    ui.label("Username:");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut state.irc_nickserv_user)
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                    ui.end_row();
 
-                                ui.label("Password:");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut state.irc_nickserv_pass)
-                                        .desired_width(f32::INFINITY)
-                                        .password(true),
-                                );
-                                ui.end_row();
-                            });
+                                    ui.label("Password:");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut state.irc_nickserv_pass)
+                                            .desired_width(f32::INFINITY)
+                                            .password(true),
+                                    );
+                                    ui.end_row();
+                                });
+                        }
+                    } else {
+                        ui.label(
+                            RichText::new("Enable IRC beta to configure NickServ auto-identify.")
+                                .font(t::tiny())
+                                .color(t::text_muted()),
+                        );
                     }
                     ui.add_space(8.0);
                     ui.label(

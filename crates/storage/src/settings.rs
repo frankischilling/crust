@@ -138,6 +138,7 @@ pub struct AppSettings {
     // ── Highlight rules (chatterino-style per-rule config) ──────────────
     /// Structured highlight rules (replaces the flat `highlights` string list).
     /// When empty on load and `highlights` is non-empty, a migration populates it.
+    #[serde(default)]
     pub highlight_rules: Vec<HighlightRule>,
     /// Structured filter records for hiding messages.
     #[serde(default)]
@@ -505,6 +506,21 @@ split_header_show_viewer_count = false
         assert!(!cfg.split_header_show_title);
         assert!(cfg.split_header_show_game);
         assert!(!cfg.split_header_show_viewer_count);
+    }
+
+    #[test]
+    fn legacy_config_without_highlight_rules_parses() {
+        let cfg: AppSettings = toml::from_str(
+            r#"
+theme = "dark"
+font_size = 13.0
+"#,
+        )
+        .expect("legacy config should parse without highlight_rules");
+
+        assert!(cfg.highlight_rules.is_empty());
+        assert!(cfg.filter_records.is_empty());
+        assert!(cfg.mod_action_presets.is_empty());
     }
 
     #[test]

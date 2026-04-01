@@ -723,7 +723,7 @@ impl TwitchSession {
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
         let user_id = tags.get("user-id").unwrap_or("").to_owned();
-        let server_id = tags.get("id").map(str::to_owned);
+        let server_id = extract_server_message_id(tags);
 
         let badges: Vec<Badge> = tags
             .get("badges")
@@ -840,7 +840,7 @@ pub fn parse_privmsg_irc(
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
     let user_id = tags.get("user-id").unwrap_or("").to_owned();
-    let server_id = tags.get("id").map(str::to_owned);
+    let server_id = extract_server_message_id(tags);
 
     let badges: Vec<Badge> = tags
         .get("badges")
@@ -945,6 +945,17 @@ fn is_pinned_chat_message(tags: &crate::irc::types::IrcTags) -> bool {
                     .any(|part| part.to_ascii_lowercase().contains("pinned-chat"))
             })
             .unwrap_or(false)
+}
+
+fn extract_server_message_id(tags: &crate::irc::types::IrcTags) -> Option<String> {
+    ["id", "source-id"]
+        .into_iter()
+        .find_map(|key| {
+            tags.get(key)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })
 }
 
 /// Decode a Twitch sub-plan code to a human-readable tier name.
