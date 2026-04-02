@@ -2,6 +2,11 @@
 name = "crust-kick"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Kick chat session integration for crust"
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 tokio = { workspace = true }
@@ -14,4 +19,4 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 smallvec = { workspace = true }
-crust-core = { path = "../core" }
+crust-core = { path = "../core", version = "0.1.0" }

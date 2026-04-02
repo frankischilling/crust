@@ -14,7 +14,10 @@ members = [
 version = "0.1.0"
 edition = "2021"
 authors = ["crust contributors"]
-license = "MIT"
+license = "GPL-3.0-only"
+repository = "https://github.com/frankischilling/crust"
+homepage = "https://github.com/frankischilling/crust"
+readme = "README.md"
 
 [workspace.dependencies]
 # async runtime

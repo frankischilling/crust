@@ -2,6 +2,11 @@
 name = "crust-storage"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Settings, token, and chat log storage for crust"
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 serde = { workspace = true }
@@ -13,5 +18,5 @@ keyring = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 chrono = { workspace = true }
-crust-core = { path = "../core" }
+crust-core = { path = "../core", version = "0.1.0" }
 rusqlite = { workspace = true }
