@@ -299,7 +299,9 @@ fn show_message_search_contents(
                 }
             }
             if ui
-                .add(Button::new(RichText::new("Load older logs").font(t::small())))
+                .add(Button::new(
+                    RichText::new("Load older logs").font(t::small()),
+                ))
                 .on_hover_text("Load older local SQLite logs before the oldest visible message")
                 .clicked()
             {

@@ -48,11 +48,8 @@ pub fn show_split_header(
         let accent = t::accent();
         let top_line =
             egui::Rect::from_min_size(hdr_rect.left_top(), egui::vec2(hdr_rect.width(), 2.0));
-        ui.painter().rect_filled(
-            top_line,
-            egui::CornerRadius::ZERO,
-            t::alpha(accent, 180),
-        );
+        ui.painter()
+            .rect_filled(top_line, egui::CornerRadius::ZERO, t::alpha(accent, 180));
     }
 
     let mut result = SplitHeaderResult::default();

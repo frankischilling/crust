@@ -1,5 +1,5 @@
-use crust_core::model::ChannelId;
 use crate::theme as t;
+use crust_core::model::ChannelId;
 
 /// Simple popup for joining a channel by name.
 ///
@@ -95,11 +95,7 @@ impl JoinDialog {
 
                 if let Some(err) = &self.error {
                     ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new(err)
-                            .small()
-                            .color(t::red()),
-                    );
+                    ui.label(egui::RichText::new(err).small().color(t::red()));
                 }
             });
 

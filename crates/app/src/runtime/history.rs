@@ -53,9 +53,8 @@ pub(crate) async fn load_local_recent_messages(
     }
 
     for msg in &mut messages {
-        msg.id = MessageId(
-            crate::HISTORY_MSG_ID.fetch_sub(1, std::sync::atomic::Ordering::Relaxed),
-        );
+        msg.id =
+            MessageId(crate::HISTORY_MSG_ID.fetch_sub(1, std::sync::atomic::Ordering::Relaxed));
         msg.flags.is_history = true;
         msg.channel = channel.clone();
     }
@@ -108,9 +107,8 @@ pub(crate) async fn load_local_older_messages(
     }
 
     for msg in &mut messages {
-        msg.id = MessageId(
-            crate::HISTORY_MSG_ID.fetch_sub(1, std::sync::atomic::Ordering::Relaxed),
-        );
+        msg.id =
+            MessageId(crate::HISTORY_MSG_ID.fetch_sub(1, std::sync::atomic::Ordering::Relaxed));
         msg.flags.is_history = true;
         msg.channel = channel.clone();
     }
@@ -179,10 +177,7 @@ pub(crate) async fn load_local_recent_whispers(
         let messages = match rows {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => {
-                warn!(
-                    "whisper-history: failed loading channel {}: {e}",
-                    channel
-                );
+                warn!("whisper-history: failed loading channel {}: {e}", channel);
                 continue;
             }
             Err(e) => {

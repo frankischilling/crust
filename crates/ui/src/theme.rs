@@ -474,7 +474,10 @@ pub fn split_success_bg() -> Color32 {
 /// Split-view helper label color.
 #[inline]
 pub fn split_success_text() -> Color32 {
-    alpha(green().gamma_multiply(1.6), if is_light() { 210 } else { 190 })
+    alpha(
+        green().gamma_multiply(1.6),
+        if is_light() { 210 } else { 190 },
+    )
 }
 
 /// Whisper thread selected row background.

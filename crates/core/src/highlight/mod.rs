@@ -272,7 +272,8 @@ fn match_text_expression(pattern: &str, text: &str, case_sensitive: bool, is_reg
     } else if pattern.is_ascii() && text.is_ascii() {
         contains_ascii_case_insensitive(text, pattern)
     } else {
-        text.to_lowercase().contains(pattern.to_lowercase().as_str())
+        text.to_lowercase()
+            .contains(pattern.to_lowercase().as_str())
     }
 }
 
@@ -302,7 +303,10 @@ pub fn compile_rules(rules: &[HighlightRule]) -> Vec<HighlightMatch> {
             } else {
                 CompiledMatcher::Substring(rule.pattern.clone())
             };
-            Some(HighlightMatch { rule: rule.clone(), matcher })
+            Some(HighlightMatch {
+                rule: rule.clone(),
+                matcher,
+            })
         })
         .collect()
 }
@@ -515,14 +519,8 @@ mod tests {
     fn context_channel_and_content_rule_matches() {
         let rule = make_rule("channel=somechan hello");
         let compiled = compile_rules(&[rule]);
-        let matched = first_match_context(
-            &compiled,
-            "say hello",
-            "alice",
-            "Alice",
-            "somechan",
-            false,
-        );
+        let matched =
+            first_match_context(&compiled, "say hello", "alice", "Alice", "somechan", false);
         assert!(matched.is_some());
     }
 

@@ -328,7 +328,11 @@ impl AnalyticsPanel {
 
         // Header
         ui.horizontal(|ui| {
-            chrome::dialog_header(ui, "Analytics", Some("Recent message, chatter, and activity stats."));
+            chrome::dialog_header(
+                ui,
+                "Analytics",
+                Some("Recent message, chatter, and activity stats."),
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 let save_btn = ui

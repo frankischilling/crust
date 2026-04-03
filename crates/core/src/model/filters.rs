@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize};
 use crate::model::ChannelId;
 use regex::RegexBuilder;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FilterScope {
@@ -49,7 +49,9 @@ pub struct FilterRecord {
     pub filter_sender: bool,
 }
 
-fn bool_true() -> bool { true }
+fn bool_true() -> bool {
+    true
+}
 
 impl FilterRecord {
     pub fn new(name: impl Into<String>, pattern: impl Into<String>, scope: FilterScope) -> Self {
@@ -113,7 +115,7 @@ pub fn compile_filters(records: &[FilterRecord]) -> Vec<CompiledFilter> {
 
             let mut builder = regex::RegexBuilder::new(&pattern);
             builder.case_insensitive(!r.case_sensitive);
-            
+
             match builder.build() {
                 Ok(re) => Some(CompiledFilter {
                     name: r.name.clone(),
@@ -197,10 +199,14 @@ mod tests {
     fn check_filters_respects_channel_scope() {
         let channel_a = ChannelId("123".to_owned());
         let channel_b = ChannelId("456".to_owned());
-        
-        let records = vec![FilterRecord::new("test", "banned", FilterScope::Channel(channel_a.clone()))];
+
+        let records = vec![FilterRecord::new(
+            "test",
+            "banned",
+            FilterScope::Channel(channel_a.clone()),
+        )];
         let compiled = compile_filters(&records);
-        
+
         assert!(check_filters(&compiled, Some(&channel_a), "banned word", "user").is_some());
         assert!(check_filters(&compiled, Some(&channel_b), "banned word", "user").is_none());
     }
@@ -209,13 +215,13 @@ mod tests {
     fn filter_sender_checks_username_instead_of_message() {
         let mut filter = FilterRecord::new("block_user", "trolluser", FilterScope::Global);
         filter.filter_sender = true;
-        
+
         let records = vec![filter];
         let compiled = compile_filters(&records);
-        
+
         let result = check_filters(&compiled, None, "innocent message", "trolluser");
         assert_eq!(result, Some(FilterAction::Hide));
-        
+
         let result2 = check_filters(&compiled, None, "message from trolluser", "gooduser");
         assert_eq!(result2, None);
     }

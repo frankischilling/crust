@@ -40,19 +40,21 @@ impl ModActionPreset {
     /// Parse the action type from the command template.
     pub fn action_type(&self) -> ModActionType {
         let cmd = self.command_template.trim();
-        
+
         if cmd.starts_with("/ban ") || cmd.starts_with(".ban ") || cmd.starts_with("!ban ") {
             return ModActionType::Ban;
         }
-        
+
         if cmd.starts_with("/delete ") || cmd.starts_with(".delete ") {
             return ModActionType::Delete;
         }
-        
+
         if let Some(duration) = parse_timeout_duration(cmd) {
-            return ModActionType::Timeout { duration_seconds: duration };
+            return ModActionType::Timeout {
+                duration_seconds: duration,
+            };
         }
-        
+
         ModActionType::Custom
     }
 
@@ -119,7 +121,7 @@ fn parse_timeout_duration(cmd: &str) -> Option<u32> {
     }
 
     let duration_str = parts[2];
-    
+
     if let Ok(seconds) = duration_str.parse::<u32>() {
         return Some(seconds);
     }
@@ -184,10 +186,7 @@ mod tests {
             command_template: "/timeout {user} 600 in {channel}".to_owned(),
             icon_url: None,
         };
-        assert_eq!(
-            preset.expand("xqc", "forsen"),
-            "/timeout xqc 600 in forsen"
-        );
+        assert_eq!(preset.expand("xqc", "forsen"), "/timeout xqc 600 in forsen");
     }
 
     #[test]

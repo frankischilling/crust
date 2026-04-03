@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use crust_core::plugin_command_infos;
+
 /// Metadata for one built-in slash command.
 #[derive(Clone, Copy)]
 pub struct SlashCommandInfo {
@@ -13,12 +15,38 @@ pub struct SlashCommandInfo {
     pub aliases: &'static [&'static str],
 }
 
+/// Owned slash-command suggestion used by autocomplete.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlashCommandSuggestion {
+    pub name: String,
+    pub usage: String,
+    pub summary: String,
+    pub aliases: Vec<String>,
+}
+
+impl From<&SlashCommandInfo> for SlashCommandSuggestion {
+    fn from(value: &SlashCommandInfo) -> Self {
+        Self {
+            name: value.name.to_owned(),
+            usage: value.usage.to_owned(),
+            summary: value.summary.to_owned(),
+            aliases: value.aliases.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+}
+
 const BUILTIN_SLASH_COMMANDS: &[SlashCommandInfo] = &[
     SlashCommandInfo {
         name: "help",
         usage: "/help",
         summary: "Show command reference and slash-autocomplete tips.",
         aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "reloadplugins",
+        usage: "/reloadplugins",
+        summary: "Reload Crust Lua plugins from disk.",
+        aliases: &["pluginsreload"],
     },
     SlashCommandInfo {
         name: "clearmessages",
@@ -539,6 +567,14 @@ Built-in commands:\n",
         out.push_str(&format!("  {:<24} {}\n", cmd.usage, cmd.summary));
     }
 
+    let plugin_commands = plugin_command_infos();
+    if !plugin_commands.is_empty() {
+        out.push_str("\nPlugin commands:\n");
+        for cmd in &plugin_commands {
+            out.push_str(&format!("  {:<24} {}\n", cmd.usage, cmd.summary));
+        }
+    }
+
     out.push_str(
         "\nAliases:\n\
   /whisper is the same as /w\n\
@@ -602,7 +638,7 @@ pub fn replace_slash_token(buf: &mut String, command: &str) {
 }
 
 /// Find command suggestions for a slash query.
-pub fn slash_command_matches(query: &str, limit: usize) -> Vec<&'static SlashCommandInfo> {
+pub fn slash_command_matches(query: &str, limit: usize) -> Vec<SlashCommandSuggestion> {
     let usage_counts: HashMap<String, u32> = HashMap::new();
     slash_command_matches_ranked(query, limit, &usage_counts)
 }
@@ -612,10 +648,17 @@ pub fn slash_command_matches_ranked(
     query: &str,
     limit: usize,
     usage_counts: &HashMap<String, u32>,
-) -> Vec<&'static SlashCommandInfo> {
+) -> Vec<SlashCommandSuggestion> {
     let q = query.to_ascii_lowercase();
-    let mut matches: Vec<(&SlashCommandInfo, u8)> = built_in_commands()
+    let mut matches: Vec<(SlashCommandSuggestion, u8)> = built_in_commands()
         .iter()
+        .map(SlashCommandSuggestion::from)
+        .chain(plugin_command_infos().into_iter().map(|cmd| SlashCommandSuggestion {
+            name: cmd.name,
+            usage: cmd.usage,
+            summary: cmd.summary,
+            aliases: cmd.aliases,
+        }))
         .filter_map(|cmd| {
             if q.is_empty() {
                 return Some((cmd, 1));
@@ -670,12 +713,12 @@ pub fn slash_command_matches_ranked(
     matches.into_iter().map(|(cmd, _)| cmd).collect()
 }
 
-fn usage_weight(cmd: &SlashCommandInfo, usage_counts: &HashMap<String, u32>) -> u32 {
+fn usage_weight(cmd: &SlashCommandSuggestion, usage_counts: &HashMap<String, u32>) -> u32 {
     let mut out = usage_counts
         .get(&cmd.name.to_ascii_lowercase())
         .copied()
         .unwrap_or(0);
-    for alias in cmd.aliases {
+    for alias in &cmd.aliases {
         out = out.saturating_add(
             usage_counts
                 .get(&alias.to_ascii_lowercase())

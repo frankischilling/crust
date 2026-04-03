@@ -1185,8 +1185,9 @@ impl<'a> MessageList<'a> {
                 return None;
             }
 
-            let delta_ms = (candidate.timestamp.timestamp_millis() - msg.timestamp.timestamp_millis())
-                .unsigned_abs();
+            let delta_ms = (candidate.timestamp.timestamp_millis()
+                - msg.timestamp.timestamp_millis())
+            .unsigned_abs();
             if delta_ms > 10_000 {
                 return None;
             }
@@ -1274,7 +1275,11 @@ impl<'a> MessageList<'a> {
             .filter(|s| !s.is_empty())
         {
             ui.separator();
-            ui.label(RichText::new("Channel points").small().color(t::text_muted()));
+            ui.label(
+                RichText::new("Channel points")
+                    .small()
+                    .color(t::text_muted()),
+            );
             if ui.button("Copy custom reward ID").clicked() {
                 ui.ctx().copy_text(reward_id.to_owned());
                 ui.close_menu();
@@ -1289,7 +1294,11 @@ impl<'a> MessageList<'a> {
         } = &msg.msg_kind
         {
             ui.separator();
-            ui.label(RichText::new("Redemption details").small().color(t::text_muted()));
+            ui.label(
+                RichText::new("Redemption details")
+                    .small()
+                    .color(t::text_muted()),
+            );
 
             if ui.button("Copy reward title").clicked() {
                 ui.ctx().copy_text(reward_title.clone());
@@ -1343,11 +1352,7 @@ impl<'a> MessageList<'a> {
 
             if can_user_action {
                 ui.menu_button("Timeouts", |ui| {
-                    for (label, seconds) in [
-                        ("1m", 60u32),
-                        ("10m", 10 * 60),
-                        ("1h", 60 * 60),
-                    ] {
+                    for (label, seconds) in [("1m", 60u32), ("10m", 10 * 60), ("1h", 60 * 60)] {
                         if ui.button(format!("Timeout {label}")).clicked() {
                             let _ = self.cmd_tx.try_send(AppCommand::TimeoutUser {
                                 channel: self.channel.clone(),
@@ -1361,11 +1366,49 @@ impl<'a> MessageList<'a> {
                     }
                 });
 
+                ui.menu_button("Low trust", |ui| {
+                    if ui.button("Monitor").clicked() {
+                        let _ = self.cmd_tx.try_send(AppCommand::SetSuspiciousUser {
+                            channel: self.channel.clone(),
+                            login: msg.sender.login.clone(),
+                            user_id: target_user_id.to_owned(),
+                            restricted: false,
+                        });
+                        ui.close_menu();
+                    }
+                    if ui.button("Restrict").clicked() {
+                        let _ = self.cmd_tx.try_send(AppCommand::SetSuspiciousUser {
+                            channel: self.channel.clone(),
+                            login: msg.sender.login.clone(),
+                            user_id: target_user_id.to_owned(),
+                            restricted: true,
+                        });
+                        ui.close_menu();
+                    }
+                    if ui.button("Unmonitor").clicked() {
+                        let _ = self.cmd_tx.try_send(AppCommand::ClearSuspiciousUser {
+                            channel: self.channel.clone(),
+                            login: msg.sender.login.clone(),
+                            user_id: target_user_id.to_owned(),
+                        });
+                        ui.close_menu();
+                    }
+                    if ui.button("Unrestrict").clicked() {
+                        let _ = self.cmd_tx.try_send(AppCommand::ClearSuspiciousUser {
+                            channel: self.channel.clone(),
+                            login: msg.sender.login.clone(),
+                            user_id: target_user_id.to_owned(),
+                        });
+                        ui.close_menu();
+                    }
+                });
+
                 if !self.mod_action_presets.is_empty() {
                     ui.menu_button("Presets", |ui| {
                         for preset in self.mod_action_presets {
                             if ui.button(&preset.label).clicked() {
-                                let command = preset.expand(&msg.sender.login, self.channel.display_name());
+                                let command =
+                                    preset.expand(&msg.sender.login, self.channel.display_name());
                                 let _ = self.cmd_tx.try_send(AppCommand::SendMessage {
                                     channel: self.channel.clone(),
                                     text: command,
@@ -1393,6 +1436,14 @@ impl<'a> MessageList<'a> {
                         channel: self.channel.clone(),
                         login: msg.sender.login.clone(),
                         user_id: target_user_id.to_owned(),
+                    });
+                    ui.close_menu();
+                }
+
+                if ui.button("Hide user's messages locally").clicked() {
+                    let _ = self.cmd_tx.try_send(AppCommand::ClearUserMessagesLocally {
+                        channel: self.channel.clone(),
+                        login: msg.sender.login.clone(),
                     });
                     ui.close_menu();
                 }
@@ -1458,9 +1509,7 @@ impl<'a> MessageList<'a> {
                     && ui.button("Open reward queue").clicked()
                 {
                     let _ = self.cmd_tx.try_send(AppCommand::OpenUrl {
-                        url: format!(
-                            "https://www.twitch.tv/popout/{channel_login}/reward-queue"
-                        ),
+                        url: format!("https://www.twitch.tv/popout/{channel_login}/reward-queue"),
                     });
                     ui.close_menu();
                 }
@@ -1487,26 +1536,30 @@ impl<'a> MessageList<'a> {
 
                 if can_update {
                     if ui.button("Mark fulfilled").clicked() {
-                        let _ = self.cmd_tx.try_send(AppCommand::UpdateRewardRedemptionStatus {
-                            channel: self.channel.clone(),
-                            reward_id: reward_id.clone().unwrap_or_default(),
-                            redemption_id: redemption_id.clone().unwrap_or_default(),
-                            status: "FULFILLED".to_owned(),
-                            user_login: user_login.clone(),
-                            reward_title: reward_title.clone(),
-                        });
+                        let _ = self
+                            .cmd_tx
+                            .try_send(AppCommand::UpdateRewardRedemptionStatus {
+                                channel: self.channel.clone(),
+                                reward_id: reward_id.clone().unwrap_or_default(),
+                                redemption_id: redemption_id.clone().unwrap_or_default(),
+                                status: "FULFILLED".to_owned(),
+                                user_login: user_login.clone(),
+                                reward_title: reward_title.clone(),
+                            });
                         ui.close_menu();
                     }
 
                     if ui.button("Reject redemption").clicked() {
-                        let _ = self.cmd_tx.try_send(AppCommand::UpdateRewardRedemptionStatus {
-                            channel: self.channel.clone(),
-                            reward_id: reward_id.clone().unwrap_or_default(),
-                            redemption_id: redemption_id.clone().unwrap_or_default(),
-                            status: "CANCELED".to_owned(),
-                            user_login: user_login.clone(),
-                            reward_title: reward_title.clone(),
-                        });
+                        let _ = self
+                            .cmd_tx
+                            .try_send(AppCommand::UpdateRewardRedemptionStatus {
+                                channel: self.channel.clone(),
+                                reward_id: reward_id.clone().unwrap_or_default(),
+                                redemption_id: redemption_id.clone().unwrap_or_default(),
+                                status: "CANCELED".to_owned(),
+                                user_login: user_login.clone(),
+                                reward_title: reward_title.clone(),
+                            });
                         ui.close_menu();
                     }
                 } else {
@@ -1686,14 +1739,11 @@ impl<'a> MessageList<'a> {
                 )
             };
             let painter = ui.painter().with_clip_rect(panel_rect);
-            painter.rect_filled(
-                paused_rect,
-                6.0,
-                t::alpha(Color32::BLACK, 160),
-            );
+            painter.rect_filled(paused_rect, 6.0, t::alpha(Color32::BLACK, 160));
             let max_chars = (((paused_rect.width() - 16.0) / 6.8).floor() as usize).max(4);
             let text = if raw_text.chars().count() > max_chars {
-                let mut trimmed: String = raw_text.chars().take(max_chars.saturating_sub(1)).collect();
+                let mut trimmed: String =
+                    raw_text.chars().take(max_chars.saturating_sub(1)).collect();
                 trimmed.push('…');
                 trimmed
             } else {
@@ -1764,8 +1814,19 @@ impl<'a> MessageList<'a> {
         // Dispatch non-chat (and non-bits) events to the compact system-event renderer.
         match &msg.msg_kind {
             MsgKind::Chat | MsgKind::Bits { .. } => {}
+            MsgKind::SuspiciousUserMessage => {
+                self.render_suspicious_user_message(
+                    ui,
+                    msg,
+                    dimmed,
+                    rctx,
+                    static_frames,
+                    user_color_cache,
+                );
+                return;
+            }
             _ => {
-                self.render_system_event(ui, msg);
+                self.render_system_event(ui, msg, static_frames);
                 return;
             }
         }
@@ -1860,8 +1921,7 @@ impl<'a> MessageList<'a> {
                         // Accent left stripe
                         let (stripe, _) =
                             ui.allocate_exact_size(egui::vec2(2.0, 12.0), egui::Sense::hover());
-                        ui.painter()
-                            .rect_filled(stripe, 0.0, t::accent());
+                        ui.painter().rect_filled(stripe, 0.0, t::accent());
                         let body = if rep.parent_msg_body.chars().count() > 80 {
                             // Find the byte offset of the 80th char boundary.
                             let cut = rep
@@ -1908,14 +1968,12 @@ impl<'a> MessageList<'a> {
                 // ── Notification banner (pinned / first / highlighted / rewards) ──
                 // Rendered inside the Frame so the background fill covers
                 // the banner as well, and the interaction rect is contiguous.
-                if let Some((label, stripe_color)) =
-                    notification_label(
-                        &msg.flags,
-                        &msg.msg_kind,
-                        keyword_highlight,
-                        keyword_highlight_color,
-                    )
-                {
+                if let Some((label, stripe_color)) = notification_label(
+                    &msg.flags,
+                    &msg.msg_kind,
+                    keyword_highlight,
+                    keyword_highlight_color,
+                ) {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         // Colored left stripe
@@ -2146,14 +2204,12 @@ impl<'a> MessageList<'a> {
 
             // Left accent strip for mentions and highlights - a vivid 3 px bar on
             // the left edge of the row so the eye finds them instantly in fast chat.
-            if let Some(bar_col) =
-                message_left_accent_color(
-                    &msg.flags,
-                    &msg.msg_kind,
-                    keyword_highlight,
-                    keyword_highlight_color,
-                )
-            {
+            if let Some(bar_col) = message_left_accent_color(
+                &msg.flags,
+                &msg.msg_kind,
+                keyword_highlight,
+                keyword_highlight_color,
+            ) {
                 let r = msg_frame_resp.rect;
                 let strip = egui::Rect::from_min_size(r.left_top(), egui::vec2(3.0, r.height()));
                 ui.painter().rect_filled(strip, 0.0, bar_col);
@@ -2176,14 +2232,93 @@ impl<'a> MessageList<'a> {
             self.channel.display_name(),
             msg.flags.is_mention,
         )
-            .map(|(color, _show_in_mentions, _has_alert, _has_sound)| KeywordHighlightMatch {
+        .map(
+            |(color, _show_in_mentions, _has_alert, _has_sound)| KeywordHighlightMatch {
                 color: color.map(|[r, g, b]| Color32::from_rgb(r, g, b)),
-            })
+            },
+        )
     }
 
     /// Render a compact system-event row (mod action, sub alert, raid, notice).
     /// These rows are centered italic lines with a colored left stripe and icon.
-    fn render_system_event(&self, ui: &mut Ui, msg: &ChatMessage) {
+    fn render_system_event(
+        &self,
+        ui: &mut Ui,
+        msg: &ChatMessage,
+        static_frames: &mut HashMap<String, StaticFrameCacheEntry>,
+    ) {
+        let automod_row = msg.sender.login.eq_ignore_ascii_case("automod")
+            && msg.raw_text.starts_with("AutoMod:");
+        let suspicious_header =
+            msg.sender.login.is_empty() && msg.raw_text.starts_with("Suspicious User:");
+
+        if automod_row || suspicious_header {
+            let accent = t::red();
+            let title = if suspicious_header {
+                "Suspicious User:"
+            } else {
+                "AutoMod:"
+            };
+            let body = msg
+                .raw_text
+                .strip_prefix(title)
+                .unwrap_or(&msg.raw_text)
+                .trim_start();
+
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(3.0, 14.0), egui::Sense::hover());
+                ui.painter().rect_filled(rect, 1.0, accent);
+
+                for badge in &msg.sender.badges {
+                    let tooltip_label = pretty_badge_name(&badge.name, &badge.version);
+                    if let Some(url) = &badge.url {
+                        if let Some(&(w, h, ref raw)) = self.emote_bytes.get(url.as_str()) {
+                            let size = fit_size(w, h, BADGE_SIZE);
+                            let tooltip_size = fit_size(w, h, TOOLTIP_BADGE_SIZE);
+                            let url_key = super::bytes_uri(url, raw);
+                            self.show_image(
+                                ui,
+                                &url_key,
+                                raw,
+                                size,
+                                Some(url.as_str()),
+                                static_frames,
+                            )
+                            .on_hover_ui_at_pointer(|ui| {
+                                ui.set_max_width(200.0);
+                                ui.vertical_centered(|ui| {
+                                    ui.add(
+                                        egui::Image::from_bytes(
+                                            url_key.clone(),
+                                            egui::load::Bytes::Shared(raw.clone()),
+                                        )
+                                        .fit_to_exact_size(tooltip_size),
+                                    );
+                                    ui.add_space(4.0);
+                                    ui.label(RichText::new(&tooltip_label).strong());
+                                });
+                            });
+                            continue;
+                        }
+                    }
+                    render_badge_fallback(ui, &badge.name, &badge.version, &tooltip_label);
+                }
+
+                ui.add(Label::new(
+                    RichText::new(title).font(t::small()).color(accent).strong(),
+                ));
+                if !body.is_empty() {
+                    ui.add(Label::new(
+                        RichText::new(body)
+                            .font(t::small())
+                            .color(t::text_primary()),
+                    ));
+                }
+            });
+            return;
+        }
+
         let (accent, label_override): (Color32, Option<String>) = match &msg.msg_kind {
             MsgKind::Sub {
                 display_name,
@@ -2297,8 +2432,10 @@ impl<'a> MessageList<'a> {
                         ui.vertical(|ui| {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 6.0;
-                                let (rect, _) = ui
-                                    .allocate_exact_size(egui::vec2(3.0, 14.0), egui::Sense::hover());
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(3.0, 14.0),
+                                    egui::Sense::hover(),
+                                );
                                 ui.painter().rect_filled(rect, 1.0, accent);
 
                                 if self.show_timestamps {
@@ -2420,8 +2557,8 @@ impl<'a> MessageList<'a> {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
                             // Coloured left stripe
-                            let (rect, _) = ui
-                                .allocate_exact_size(egui::vec2(3.0, 14.0), egui::Sense::hover());
+                            let (rect, _) =
+                                ui.allocate_exact_size(egui::vec2(3.0, 14.0), egui::Sense::hover());
                             ui.painter().rect_filled(rect, 1.0, accent);
 
                             if self.show_timestamps {
@@ -2525,7 +2662,11 @@ impl<'a> MessageList<'a> {
                                 );
                                 ui.add_space(4.0);
                                 ui.label(RichText::new(code.as_str()).strong());
-                                ui.label(RichText::new(provider_label(provider)).small().color(t::text_secondary()));
+                                ui.label(
+                                    RichText::new(provider_label(provider))
+                                        .small()
+                                        .color(t::text_secondary()),
+                                );
                             });
                         })
                         .context_menu(|ui| {
@@ -2560,9 +2701,7 @@ impl<'a> MessageList<'a> {
                                 ui.add_space(4.0);
                                 ui.label(RichText::new(text.as_str()).strong());
                                 ui.label(
-                                    RichText::new("Twemoji")
-                                        .small()
-                                        .color(t::text_secondary()),
+                                    RichText::new("Twemoji").small().color(t::text_secondary()),
                                 );
                             });
                         })
@@ -2684,12 +2823,12 @@ impl<'a> MessageList<'a> {
                                     && p.description.is_none()
                                     && p.thumbnail_url.is_none()
                                 {
-                        ui.label(
-                            RichText::new("No preview available")
-                                .small()
-                                .italics()
-                                .color(t::text_secondary()),
-                        );
+                                    ui.label(
+                                        RichText::new("No preview available")
+                                            .small()
+                                            .italics()
+                                            .color(t::text_secondary()),
+                                    );
                                 }
                                 // Domain footer
                                 let host = url_hostname(url);
@@ -2705,6 +2844,250 @@ impl<'a> MessageList<'a> {
                 render_badge_fallback(ui, name, "1", &tooltip);
             }
         }
+    }
+
+    fn render_suspicious_user_message(
+        &self,
+        ui: &mut Ui,
+        msg: &ChatMessage,
+        dimmed: bool,
+        rctx: &RenderCtx,
+        static_frames: &mut HashMap<String, StaticFrameCacheEntry>,
+        user_color_cache: &mut HashMap<String, Color32>,
+    ) {
+        let reply_key = rctx.reply_key;
+        let highlight_alpha: f32 = match (&rctx.highlight_server_id, msg.server_id.as_deref()) {
+            (Some(hl_id), Some(msg_id)) if hl_id == msg_id => rctx.highlight_alpha,
+            _ => 0.0,
+        };
+        let keyword_highlight_match = self.message_keyword_highlight(msg);
+        let keyword_highlight = keyword_highlight_match.is_some();
+        let keyword_highlight_color = keyword_highlight_match.and_then(|m| m.color);
+        let bg = message_row_background(
+            &msg.flags,
+            &msg.msg_kind,
+            highlight_alpha,
+            keyword_highlight,
+            keyword_highlight_color,
+        );
+
+        ui.push_id(msg.id.0, |ui| {
+            let mut prepared = egui::Frame::new()
+                .fill(bg)
+                .inner_margin(egui::Margin::symmetric(ROW_PAD_X as i8, ROW_PAD_Y as i8))
+                .begin(ui);
+
+            let bg_click_id = Id::new("msg_bg_click").with(msg.id.0);
+            {
+                let ui = &mut prepared.content_ui;
+                let placeholder_rect =
+                    egui::Rect::from_min_size(ui.max_rect().left_top(), egui::Vec2::ZERO);
+                ui.interact(placeholder_rect, bg_click_id, egui::Sense::click());
+                ui.style_mut().interaction.selectable_labels = false;
+
+                if dimmed {
+                    ui.set_opacity(if msg.flags.is_history { 0.35 } else { 0.45 });
+                }
+                if msg.flags.is_history {
+                    ui.set_opacity(if dimmed { 0.35 } else { 0.55 });
+                }
+
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), EMOTE_SIZE),
+                    egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
+                    |ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(3.0, 1.0);
+
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(3.0, 14.0), egui::Sense::hover());
+                        ui.painter().rect_filled(rect, 1.0, t::red());
+
+                        let channel_name = format!("#{}", msg.channel.display_name());
+                        ui.add(Label::new(
+                            RichText::new(channel_name)
+                                .color(t::text_secondary())
+                                .font(t::small()),
+                        ));
+
+                        if self.show_timestamps {
+                            let ts = format_message_timestamp(
+                                &msg.timestamp,
+                                self.show_timestamp_seconds,
+                                self.use_24h_timestamps,
+                            );
+                            ui.add(Label::new(
+                                RichText::new(ts).color(t::timestamp()).font(t::small()),
+                            ));
+                            ui.add(Label::new(
+                                RichText::new("·").color(t::separator()).font(t::small()),
+                            ));
+                        }
+
+                        if self.can_moderate && msg.channel.is_twitch() {
+                            let presets = if self.mod_action_presets.is_empty() {
+                                crust_core::model::mod_actions::ModActionPreset::defaults()
+                            } else {
+                                self.mod_action_presets.to_vec()
+                            };
+                            let channel_name = msg.channel.display_name().to_ascii_lowercase();
+                            let target_login = msg.sender.login.clone();
+                            let mut command_to_send: Option<String> = None;
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
+                                for preset in presets {
+                                    let (glyph, fg_color, bg_color, stroke_color) = match preset
+                                        .action_type()
+                                    {
+                                        crust_core::model::mod_actions::ModActionType::Ban => (
+                                            "⛔",
+                                            t::red(),
+                                            t::alpha(t::red(), 12),
+                                            t::alpha(t::red(), 95),
+                                        ),
+                                        crust_core::model::mod_actions::ModActionType::Timeout { .. } => (
+                                            "⏱",
+                                            t::yellow(),
+                                            t::alpha(t::yellow(), 12),
+                                            t::alpha(t::yellow(), 90),
+                                        ),
+                                        crust_core::model::mod_actions::ModActionType::Delete => (
+                                            "🗑",
+                                            t::text_secondary(),
+                                            t::alpha(t::text_secondary(), 12),
+                                            t::alpha(t::text_secondary(), 80),
+                                        ),
+                                        crust_core::model::mod_actions::ModActionType::Custom => (
+                                            "⚙",
+                                            t::accent(),
+                                            t::alpha(t::accent(), 12),
+                                            t::alpha(t::accent(), 90),
+                                        ),
+                                    };
+                                    let response = egui::Frame::new()
+                                        .fill(bg_color)
+                                        .stroke(egui::Stroke::new(1.0, stroke_color))
+                                        .corner_radius(egui::CornerRadius::same(2))
+                                        .inner_margin(egui::Margin::symmetric(1, 0))
+                                        .show(ui, |ui| {
+                                            ui.add_sized(
+                                                [16.0, 16.0],
+                                                Label::new(
+                                                    RichText::new(glyph)
+                                                        .font(t::small())
+                                                        .color(fg_color)
+                                                        .strong(),
+                                                )
+                                                .sense(egui::Sense::click())
+                                                .wrap(),
+                                            )
+                                            .on_hover_text(format!(
+                                                "{}\n{}",
+                                                preset.display_label(),
+                                                preset.command_template
+                                            ))
+                                        })
+                                        .response;
+                                    if response.clicked() {
+                                        command_to_send =
+                                            Some(preset.expand(&target_login, &channel_name));
+                                    }
+                                }
+                            });
+                            if let Some(command) = command_to_send {
+                                let _ = self.cmd_tx.try_send(AppCommand::SendMessage {
+                                    channel: self.channel.clone(),
+                                    text: command,
+                                    reply_to_msg_id: None,
+                                    reply: None,
+                                });
+                            }
+                        }
+
+                        let name = if msg.flags.is_action {
+                            format!("* {}:", msg.sender.display_name)
+                        } else {
+                            format!("{}:", msg.sender.display_name)
+                        };
+                        let name_color = msg
+                            .sender
+                            .color
+                            .as_deref()
+                            .and_then(parse_hex_color)
+                            .unwrap_or_else(|| resolve_sender_color(msg, user_color_cache));
+                        let name_resp = show_sender_name(
+                            ui,
+                            msg.id.0,
+                            &name,
+                            name_color,
+                            msg.sender.name_paint.as_ref(),
+                            self.emote_bytes,
+                            self.cmd_tx,
+                        )
+                        .on_hover_ui(|ui| {
+                            ui.label(format!("@{}", msg.sender.login));
+                        });
+                        name_resp
+                            .context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
+                        if name_resp.clicked_by(egui::PointerButton::Primary) {
+                            let _ = self.cmd_tx.try_send(AppCommand::ShowUserCard {
+                                login: msg.sender.login.clone(),
+                                channel: self.channel.clone(),
+                            });
+                            let key = Id::new("ml_profile_req").with(self.channel.as_str());
+                            ui.ctx().data_mut(|d| {
+                                d.insert_temp(
+                                    key,
+                                    (msg.sender.login.clone(), msg.sender.badges.clone()),
+                                );
+                            });
+                        }
+                        if name_resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+
+                        ui.scope(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            if msg.flags.is_deleted {
+                                ui.add(
+                                    Label::new(
+                                        RichText::new(format!("✂ {}", msg.raw_text))
+                                            .strikethrough()
+                                            .italics()
+                                            .color(t::text_muted()),
+                                    )
+                                    .wrap(),
+                                );
+                            } else {
+                                for span in &msg.spans {
+                                    self.render_span(
+                                        ui,
+                                        span,
+                                        msg.flags.is_action,
+                                        msg,
+                                        reply_key,
+                                        static_frames,
+                                    );
+                                }
+                            }
+                        });
+                    },
+                );
+            }
+            let msg_frame_resp = prepared.end(ui);
+            let bg_click = ui.interact(msg_frame_resp.rect, bg_click_id, egui::Sense::click());
+            bg_click.context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
+
+            if let Some(bar_col) = message_left_accent_color(
+                &msg.flags,
+                &msg.msg_kind,
+                keyword_highlight,
+                keyword_highlight_color,
+            ) {
+                let r = msg_frame_resp.rect;
+                let strip = egui::Rect::from_min_size(r.left_top(), egui::vec2(3.0, r.height()));
+                ui.painter().rect_filled(strip, 0.0, bar_col);
+            }
+        });
     }
 
     /// Render an image from raw bytes, freezing animated sources to a cached static frame.
@@ -3790,10 +4173,7 @@ fn style_system_info_text(raw: &str) -> (Color32, String) {
     };
 
     match code {
-        "375" => (
-            t::link(),
-            format!("IRC MOTD: {}", payload.trim()),
-        ),
+        "375" => (t::link(), format!("IRC MOTD: {}", payload.trim())),
         "372" => (t::text_secondary(), format!("  {}", payload.trim())),
         "376" => (t::green(), "IRC MOTD complete".to_owned()),
         "001" => (t::green(), payload.trim().to_owned()),
@@ -3991,19 +4371,14 @@ fn redemption_status_presentation(status: Option<&str>) -> (Cow<'static, str>, C
     if normalized.eq_ignore_ascii_case("fulfilled") {
         return (Cow::Borrowed("FULFILLED"), t::green());
     }
-    if normalized.eq_ignore_ascii_case("canceled")
-        || normalized.eq_ignore_ascii_case("cancelled")
-    {
+    if normalized.eq_ignore_ascii_case("canceled") || normalized.eq_ignore_ascii_case("cancelled") {
         return (Cow::Borrowed("CANCELED"), t::red());
     }
     if normalized.eq_ignore_ascii_case("unfulfilled") {
         return (Cow::Borrowed("UNFULFILLED"), t::gold().gamma_multiply(0.85));
     }
 
-    (
-        Cow::Owned(normalized.to_ascii_uppercase()),
-        t::accent(),
-    )
+    (Cow::Owned(normalized.to_ascii_uppercase()), t::accent())
 }
 
 fn redemption_accent(status: Option<&str>) -> Color32 {
@@ -4050,6 +4425,8 @@ fn notification_label(
         Some(("Bits Cheer", t::bits_orange()))
     } else if flags.is_first_msg {
         Some(("First Message", t::green()))
+    } else if matches!(kind, MsgKind::SuspiciousUserMessage) {
+        Some(("Suspicious User", t::red()))
     } else {
         None
     }
@@ -4087,6 +4464,8 @@ fn message_row_background(
     } else if flags.is_first_msg {
         let fg = t::green();
         t::alpha(fg, 22)
+    } else if matches!(kind, MsgKind::SuspiciousUserMessage) {
+        t::alpha(t::red(), 12)
     } else if flags.is_deleted {
         t::alpha(t::red(), 12)
     } else if matches!(kind, MsgKind::Bits { .. }) {
@@ -4120,6 +4499,8 @@ fn message_left_accent_color(
         Some(t::gold())
     } else if flags.is_first_msg {
         Some(t::green())
+    } else if matches!(kind, MsgKind::SuspiciousUserMessage) {
+        Some(t::red())
     } else {
         None
     }
@@ -4257,8 +4638,6 @@ mod tests {
             Some(t::green())
         );
     }
-
-    
 
     #[test]
     fn keyword_highlight_uses_custom_color_when_present() {

@@ -34,7 +34,12 @@ impl NotificationController {
     }
 
     /// Add a channel to the watch list.
-    pub fn add_channel(&mut self, channel_name: String, platform: Platform, channel_id: Option<String>) {
+    pub fn add_channel(
+        &mut self,
+        channel_name: String,
+        platform: Platform,
+        channel_id: Option<String>,
+    ) {
         let key = (channel_name.to_lowercase(), platform);
         self.watched_channels.insert(
             key.clone(),
@@ -61,7 +66,12 @@ impl NotificationController {
 
     /// Update a channel's live status and return `Some(true)` if it just went live,
     /// `Some(false)` if it just went offline, or `None` if no transition occurred.
-    pub fn update_live_status(&mut self, channel_name: &str, platform: Platform, is_live: bool) -> Option<bool> {
+    pub fn update_live_status(
+        &mut self,
+        channel_name: &str,
+        platform: Platform,
+        is_live: bool,
+    ) -> Option<bool> {
         let key = (channel_name.to_lowercase(), platform);
         if let Some(watched) = self.watched_channels.get_mut(&key) {
             if watched.was_live != is_live {
@@ -148,7 +158,7 @@ mod tests {
     fn update_live_status_detects_transition_to_live() {
         let mut controller = NotificationController::new();
         controller.add_channel("xqc".to_owned(), Platform::Twitch, Some("123".to_owned()));
-        
+
         let transition = controller.update_live_status("xqc", Platform::Twitch, true);
         assert_eq!(transition, Some(true));
     }
@@ -158,7 +168,7 @@ mod tests {
         let mut controller = NotificationController::new();
         controller.add_channel("xqc".to_owned(), Platform::Twitch, Some("123".to_owned()));
         controller.update_live_status("xqc", Platform::Twitch, true);
-        
+
         let transition = controller.update_live_status("xqc", Platform::Twitch, true);
         assert_eq!(transition, None);
     }
@@ -167,9 +177,17 @@ mod tests {
     fn get_twitch_channel_ids_returns_all_ids() {
         let mut controller = NotificationController::new();
         controller.add_channel("xqc".to_owned(), Platform::Twitch, Some("123".to_owned()));
-        controller.add_channel("forsen".to_owned(), Platform::Twitch, Some("456".to_owned()));
-        controller.add_channel("kick_streamer".to_owned(), Platform::Kick, Some("789".to_owned()));
-        
+        controller.add_channel(
+            "forsen".to_owned(),
+            Platform::Twitch,
+            Some("456".to_owned()),
+        );
+        controller.add_channel(
+            "kick_streamer".to_owned(),
+            Platform::Kick,
+            Some("789".to_owned()),
+        );
+
         let ids = controller.get_twitch_channel_ids();
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&"123".to_owned()));
@@ -180,13 +198,17 @@ mod tests {
     fn export_and_import_preserves_watched_channels() {
         let mut controller = NotificationController::new();
         controller.add_channel("xqc".to_owned(), Platform::Twitch, Some("123".to_owned()));
-        controller.add_channel("forsen".to_owned(), Platform::Twitch, Some("456".to_owned()));
-        
+        controller.add_channel(
+            "forsen".to_owned(),
+            Platform::Twitch,
+            Some("456".to_owned()),
+        );
+
         let exported = controller.export_channels();
-        
+
         let mut new_controller = NotificationController::new();
         new_controller.import_channels(exported);
-        
+
         assert!(new_controller.is_watching("xqc", Platform::Twitch));
         assert!(new_controller.is_watching("forsen", Platform::Twitch));
     }

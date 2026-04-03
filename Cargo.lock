@@ -801,6 +801,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "cc",
  "chrono",
  "crust-core",
  "crust-emotes",
@@ -827,6 +828,7 @@ name = "crust-core"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "regex",
  "serde",
  "serde_json",
  "smallvec",
@@ -896,6 +898,7 @@ dependencies = [
  "crust-core",
  "futures-util",
  "native-tls",
+ "reqwest",
  "serde",
  "serde_json",
  "smallvec",

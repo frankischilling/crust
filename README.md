@@ -50,6 +50,7 @@ See:
 - Basic moderation: timeout, ban, unban
 - User profile popup with avatar, badges, account metadata, and recent messages
 - Link preview metadata fetch (Open Graph / Twitter card)
+- Lua plugins with slash-command registration and completion hooks, see [Crust plugin wiki](docs/HOME.md), [plugin API reference](docs/API.md), and [example plugins](plugins/)
 - Message input history (arrow-key recall)
 - Local settings persistence and optional keyring-backed token storage
 - Per-channel append-only chat logs

@@ -70,7 +70,12 @@ pub fn icon_button(
     };
     ui.painter()
         .rect(rect, t::RADIUS_SM, fill, stroke, egui::StrokeKind::Middle);
-    paint_icon(ui, rect.shrink(if state.compact { 4.0 } else { 4.5 }), icon, state);
+    paint_icon(
+        ui,
+        rect.shrink(if state.compact { 4.0 } else { 4.5 }),
+        icon,
+        state,
+    );
     resp.on_hover_text(tooltip)
 }
 
@@ -136,18 +141,32 @@ fn paint_icon(ui: &Ui, rect: egui::Rect, icon: ChromeIcon, state: IconButtonStat
     match icon {
         ChromeIcon::Join => {
             painter.line_segment(
-                [egui::pos2(rect.center().x, rect.top()), egui::pos2(rect.center().x, rect.bottom())],
+                [
+                    egui::pos2(rect.center().x, rect.top()),
+                    egui::pos2(rect.center().x, rect.bottom()),
+                ],
                 stroke,
             );
             painter.line_segment(
-                [egui::pos2(rect.left(), rect.center().y), egui::pos2(rect.right(), rect.center().y)],
+                [
+                    egui::pos2(rect.left(), rect.center().y),
+                    egui::pos2(rect.right(), rect.center().y),
+                ],
                 stroke,
             );
         }
         ChromeIcon::Sidebar => {
-            painter.rect_stroke(rect, CornerRadius::same(3), stroke, egui::StrokeKind::Outside);
+            painter.rect_stroke(
+                rect,
+                CornerRadius::same(3),
+                stroke,
+                egui::StrokeKind::Outside,
+            );
             let x = rect.left() + rect.width() * 0.34;
-            painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], stroke);
+            painter.line_segment(
+                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                stroke,
+            );
         }
         ChromeIcon::Tabs => {
             let h = rect.height() * 0.34;
@@ -164,8 +183,10 @@ fn paint_icon(ui: &Ui, rect: egui::Rect, icon: ChromeIcon, state: IconButtonStat
             painter.circle_stroke(rect.center(), rect.width() * 0.22, stroke);
             for idx in 0..8 {
                 let angle = idx as f32 * std::f32::consts::TAU / 8.0;
-                let inner = rect.center() + egui::vec2(angle.cos(), angle.sin()) * rect.width() * 0.28;
-                let outer = rect.center() + egui::vec2(angle.cos(), angle.sin()) * rect.width() * 0.42;
+                let inner =
+                    rect.center() + egui::vec2(angle.cos(), angle.sin()) * rect.width() * 0.28;
+                let outer =
+                    rect.center() + egui::vec2(angle.cos(), angle.sin()) * rect.width() * 0.42;
                 painter.line_segment([inner, outer], stroke);
             }
         }
@@ -192,22 +213,30 @@ fn paint_icon(ui: &Ui, rect: egui::Rect, icon: ChromeIcon, state: IconButtonStat
                 egui::StrokeKind::Outside,
             );
             let tail_top = egui::pos2(bubble.left() + 5.0, bubble.bottom());
+            painter.line_segment([tail_top, tail_top + egui::vec2(-2.5, 3.0)], stroke);
             painter.line_segment(
-                [tail_top, tail_top + egui::vec2(-2.5, 3.0)],
-                stroke,
-            );
-            painter.line_segment(
-                [tail_top + egui::vec2(-2.5, 3.0), tail_top + egui::vec2(1.5, 2.0)],
+                [
+                    tail_top + egui::vec2(-2.5, 3.0),
+                    tail_top + egui::vec2(1.5, 2.0),
+                ],
                 stroke,
             );
             let y = bubble.center().y;
             painter.line_segment(
-                [egui::pos2(bubble.left() + 3.0, y), egui::pos2(bubble.right() - 3.0, y)],
+                [
+                    egui::pos2(bubble.left() + 3.0, y),
+                    egui::pos2(bubble.right() - 3.0, y),
+                ],
                 stroke,
             );
         }
         ChromeIcon::Irc => {
-            painter.rect_stroke(rect, CornerRadius::same(3), stroke, egui::StrokeKind::Outside);
+            painter.rect_stroke(
+                rect,
+                CornerRadius::same(3),
+                stroke,
+                egui::StrokeKind::Outside,
+            );
             let left = rect.left() + 3.0;
             let cy = rect.center().y;
             painter.line_segment(
@@ -219,16 +248,28 @@ fn paint_icon(ui: &Ui, rect: egui::Rect, icon: ChromeIcon, state: IconButtonStat
                 stroke,
             );
             painter.line_segment(
-                [egui::pos2(left + 5.0, cy + 4.0), egui::pos2(left + 9.0, cy + 4.0)],
+                [
+                    egui::pos2(left + 5.0, cy + 4.0),
+                    egui::pos2(left + 9.0, cy + 4.0),
+                ],
                 stroke,
             );
         }
         ChromeIcon::Perf => {
             let p0 = egui::pos2(rect.left(), rect.center().y);
             let p1 = egui::pos2(rect.left() + rect.width() * 0.22, rect.center().y);
-            let p2 = egui::pos2(rect.left() + rect.width() * 0.38, rect.center().y - rect.height() * 0.24);
-            let p3 = egui::pos2(rect.left() + rect.width() * 0.52, rect.center().y + rect.height() * 0.18);
-            let p4 = egui::pos2(rect.left() + rect.width() * 0.68, rect.center().y - rect.height() * 0.34);
+            let p2 = egui::pos2(
+                rect.left() + rect.width() * 0.38,
+                rect.center().y - rect.height() * 0.24,
+            );
+            let p3 = egui::pos2(
+                rect.left() + rect.width() * 0.52,
+                rect.center().y + rect.height() * 0.18,
+            );
+            let p4 = egui::pos2(
+                rect.left() + rect.width() * 0.68,
+                rect.center().y - rect.height() * 0.34,
+            );
             let p5 = egui::pos2(rect.right(), rect.center().y - rect.height() * 0.05);
             painter.line_segment([p0, p1], stroke);
             painter.line_segment([p1, p2], stroke);
@@ -245,7 +286,10 @@ fn paint_icon(ui: &Ui, rect: egui::Rect, icon: ChromeIcon, state: IconButtonStat
             let c = rect.center() + egui::vec2(-1.0, -1.0);
             painter.circle_stroke(c, rect.width() * 0.22, stroke);
             painter.line_segment(
-                [c + egui::vec2(rect.width() * 0.15, rect.width() * 0.15), rect.right_bottom() - egui::vec2(1.5, 1.5)],
+                [
+                    c + egui::vec2(rect.width() * 0.15, rect.width() * 0.15),
+                    rect.right_bottom() - egui::vec2(1.5, 1.5),
+                ],
                 stroke,
             );
         }
@@ -261,7 +305,12 @@ fn paint_icon(ui: &Ui, rect: egui::Rect, icon: ChromeIcon, state: IconButtonStat
                 rect.center_bottom() - egui::vec2(0.0, rect.height() * 0.18),
                 egui::vec2(rect.width() * 0.62, rect.height() * 0.32),
             );
-            painter.rect_stroke(body, CornerRadius::same(3), stroke, egui::StrokeKind::Outside);
+            painter.rect_stroke(
+                body,
+                CornerRadius::same(3),
+                stroke,
+                egui::StrokeKind::Outside,
+            );
         }
     }
     let _ = Align2::CENTER_CENTER;

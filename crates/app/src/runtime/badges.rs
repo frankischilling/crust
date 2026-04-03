@@ -28,6 +28,30 @@ fn badge_cache_path() -> Option<PathBuf> {
     Some(dirs.cache_dir().join("badges").join("badge_map.json"))
 }
 
+fn parse_badges_on_large_stack<T>(name: &str, f: impl FnOnce() -> T + Send + 'static) -> Option<T>
+where
+    T: Send + 'static,
+{
+    let builder = std::thread::Builder::new()
+        .name(name.to_owned())
+        .stack_size(16 * 1024 * 1024);
+    let handle = match builder.spawn(f) {
+        Ok(handle) => handle,
+        Err(e) => {
+            warn!("Failed to spawn badge parsing thread {name}: {e}");
+            return None;
+        }
+    };
+
+    match handle.join() {
+        Ok(v) => Some(v),
+        Err(_) => {
+            warn!("Badge parsing thread {name} panicked");
+            None
+        }
+    }
+}
+
 pub(crate) fn load_badge_map_cache_into(map: &BadgeMap) -> usize {
     let Some(path) = badge_cache_path() else {
         return 0;
@@ -187,11 +211,15 @@ fn parse_ivr_badge_response(
         // Some badge datasets use base URLs that end in `/` and require a
         // scale suffix (`/1`, `/2`, `/3`). Use `/3` for sharper rendering.
         if url.contains("/badges/v1/") {
-            let trimmed = url.trim_end_matches('/');
-            let tail = trimmed.rsplit('/').next().unwrap_or("");
-            let has_explicit_scale = matches!(tail, "1" | "2" | "3" | "4");
-            if !has_explicit_scale {
-                return format!("{trimmed}/3");
+            // Avoid the more complex trim/search helpers here; this code runs
+            // during startup while badge caches are loaded.
+            if url.as_bytes().last() == Some(&b'/') {
+                let trimmed = &url[..url.len() - 1];
+                let tail = trimmed.rsplit('/').next().unwrap_or("");
+                let has_explicit_scale = matches!(tail, "1" | "2" | "3" | "4");
+                if !has_explicit_scale {
+                    return format!("{trimmed}/3");
+                }
             }
         }
 
@@ -439,22 +467,24 @@ async fn load_global_badges_v1_fallback(
     )
     .await
     {
-        let new_urls = {
-            let mut map = badge_map.write().unwrap();
+        let badge_map_for_parse = badge_map.clone();
+        let new_urls = parse_badges_on_large_stack("badge-global-v1-parse", move || {
+            let mut map = badge_map_for_parse.write().unwrap();
             let before: HashSet<String> = map.values().cloned().collect();
             parse_badges_v1_response(&text, "", &mut map);
             map.values()
                 .filter(|u| !before.contains(*u))
                 .cloned()
                 .collect::<Vec<_>>()
-        };
+        })
+        .unwrap_or_default();
         if !new_urls.is_empty() {
             info!(
                 "Loaded {} global badges via badges.twitch.tv fallback",
                 new_urls.len()
             );
             prefetch_badge_images(new_urls, cache, evt_tx);
-            persist_badge_map_cache(badge_map);
+            persist_badge_map_cache(&badge_map);
         }
     }
 }
@@ -485,22 +515,25 @@ async fn load_channel_badges_v1_fallback(
     )
     .await
     {
-        let new_urls = {
-            let mut map = badge_map.write().unwrap();
+        let channel = channel.to_owned();
+        let badge_map_for_parse = badge_map.clone();
+        let new_urls = parse_badges_on_large_stack("badge-channel-v1-parse", move || {
+            let mut map = badge_map_for_parse.write().unwrap();
             let before: HashSet<String> = map.values().cloned().collect();
-            parse_badges_v1_response(&text, channel, &mut map);
+            parse_badges_v1_response(&text, &channel, &mut map);
             map.values()
                 .filter(|u| !before.contains(*u))
                 .cloned()
                 .collect::<Vec<_>>()
-        };
+        })
+        .unwrap_or_default();
         if !new_urls.is_empty() {
             info!(
                 "Loaded {} channel badges for room {room_id} via badges.twitch.tv fallback",
                 new_urls.len()
             );
             prefetch_badge_images(new_urls, cache, evt_tx);
-            persist_badge_map_cache(badge_map);
+            persist_badge_map_cache(&badge_map);
         }
     }
 }
@@ -512,86 +545,35 @@ pub(crate) async fn load_global_badges(
     evt_tx: &mpsc::Sender<AppEvent>,
     oauth_token: Option<String>,
 ) {
-    // Seed global badges from Crust's bundled catalog first so badge
-    // images still work when live API calls fail.
-    let bundled_urls = {
-        let mut map = badge_map.write().unwrap();
+    let badge_map_for_parse = badge_map.clone();
+    let new_urls = parse_badges_on_large_stack("badge-global-bundled-parse", move || {
+        let mut map = badge_map_for_parse.write().unwrap();
         let before: HashSet<String> = map.values().cloned().collect();
         parse_ivr_badge_response(CRUST_TWITCH_BADGES_JSON, "", &mut map);
         map.values()
             .filter(|u| !before.contains(*u))
             .cloned()
             .collect::<Vec<_>>()
-    };
-    if !bundled_urls.is_empty() {
+    })
+    .unwrap_or_default();
+
+    if !new_urls.is_empty() {
         info!(
-            "Loaded {} global badges from bundled Crust dataset",
-            bundled_urls.len()
+            "Loaded {} global badges from bundled Twitch snapshot",
+            new_urls.len()
         );
-        prefetch_badge_images(bundled_urls, cache, evt_tx);
-        persist_badge_map_cache(badge_map);
-    }
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .user_agent("crust-badges/1.0")
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-    let helix_auth = helix_auth_from_token(oauth_token.as_deref()).await;
-    if let Some((ref client_id, ref token)) = helix_auth {
-        if let Some(text) = fetch_badge_payload_with_retries(
-            &client,
-            &["https://api.twitch.tv/helix/chat/badges/global"],
-            "Helix global badges",
-            Some((client_id.as_str(), token.as_str())),
-        )
-        .await
-        {
-            let new_urls = {
-                let mut map = badge_map.write().unwrap();
-                let before: HashSet<String> = map.values().cloned().collect();
-                parse_helix_badge_response(&text, "", &mut map);
-                let after_count = map.len();
-                let new: Vec<String> = map
-                    .values()
-                    .filter(|u| !before.contains(*u))
-                    .cloned()
-                    .collect();
-                info!("Loaded {} global badges via Helix", after_count - before.len());
-                new
-            };
-            prefetch_badge_images(new_urls, cache, evt_tx);
-            persist_badge_map_cache(badge_map);
-            return;
-        }
-    }
-
-    if let Some(text) = fetch_badge_payload_with_retries(
-        &client,
-        &["https://api.ivr.fi/v2/twitch/badges/global"],
-        "IVR global badges",
-        None,
-    )
-    .await
-    {
-        let new_urls = {
-            let mut map = badge_map.write().unwrap();
-            let before: HashSet<String> = map.values().cloned().collect();
-            parse_ivr_badge_response(&text, "", &mut map);
-            let after_count = map.len();
-            let new: Vec<String> = map
-                .values()
-                .filter(|u| !before.contains(*u))
-                .cloned()
-                .collect();
-            info!("Loaded {} global badges via IVR", after_count - before.len());
-            new
-        };
         prefetch_badge_images(new_urls, cache, evt_tx);
         persist_badge_map_cache(badge_map);
-    } else {
-        load_global_badges_v1_fallback(badge_map, cache, evt_tx).await;
     }
+
+    let badge_map_for_refresh = badge_map.clone();
+    let cache = cache.clone();
+    let evt_tx = evt_tx.clone();
+    tokio::spawn(async move {
+        load_global_badges_v1_fallback(&badge_map_for_refresh, &cache, &evt_tx).await;
+    });
+
+    let _ = oauth_token;
 }
 
 /// Load channel-specific Twitch badges.
@@ -619,23 +601,24 @@ pub(crate) async fn load_channel_badges(
         )
         .await
         {
-            let new_urls = {
-                let mut map = badge_map.write().unwrap();
+            let channel = channel.to_owned();
+            let badge_map_for_parse = badge_map.clone();
+            let new_urls = parse_badges_on_large_stack("badge-channel-helix-parse", move || {
+                let mut map = badge_map_for_parse.write().unwrap();
                 let before: HashSet<String> = map.values().cloned().collect();
-                parse_helix_badge_response(&text, channel, &mut map);
-                let new: Vec<String> = map
-                    .values()
+                parse_helix_badge_response(&text, &channel, &mut map);
+                map.values()
                     .filter(|u| !before.contains(*u))
                     .cloned()
-                    .collect();
-                info!(
-                    "Loaded {} channel badges for room {room_id} via Helix",
-                    new.len()
-                );
-                new
-            };
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+            info!(
+                "Loaded {} channel badges for room {room_id} via Helix",
+                new_urls.len()
+            );
             prefetch_badge_images(new_urls, cache, evt_tx);
-            persist_badge_map_cache(badge_map);
+            persist_badge_map_cache(&badge_map);
             return;
         }
     }
@@ -650,23 +633,24 @@ pub(crate) async fn load_channel_badges(
     )
     .await
     {
-        let new_urls = {
-            let mut map = badge_map.write().unwrap();
+        let channel = channel.to_owned();
+        let badge_map_for_parse = badge_map.clone();
+        let new_urls = parse_badges_on_large_stack("badge-channel-ivr-parse", move || {
+            let mut map = badge_map_for_parse.write().unwrap();
             let before: HashSet<String> = map.values().cloned().collect();
-            parse_ivr_badge_response(&text, channel, &mut map);
-            let new: Vec<String> = map
-                .values()
+            parse_ivr_badge_response(&text, &channel, &mut map);
+            map.values()
                 .filter(|u| !before.contains(*u))
                 .cloned()
-                .collect();
-            info!(
-                "Loaded {} channel badges for room {room_id} via IVR",
-                new.len()
-            );
-            new
-        };
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+        info!(
+            "Loaded {} channel badges for room {room_id} via IVR",
+            new_urls.len()
+        );
         prefetch_badge_images(new_urls, cache, evt_tx);
-        persist_badge_map_cache(badge_map);
+        persist_badge_map_cache(&badge_map);
     } else {
         load_channel_badges_v1_fallback(room_id, channel, badge_map, cache, evt_tx).await;
     }
@@ -714,9 +698,7 @@ async fn host_resolves(host: &str) -> bool {
 fn warn_badges_twitch_unresolved_once() {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        warn!(
-            "Skipping badges.twitch.tv fallback: host is not resolvable in this environment"
-        );
+        warn!("Skipping badges.twitch.tv fallback: host is not resolvable in this environment");
     }
 }
 

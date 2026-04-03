@@ -57,7 +57,12 @@ impl BadgeController {
 
     /// Look up a badge version for a given set_id and version_id.
     /// Checks channel-specific badges first, then falls back to global badges.
-    pub fn get_badge(&self, channel_id: Option<&str>, set_id: &str, version_id: &str) -> Option<&BadgeVersion> {
+    pub fn get_badge(
+        &self,
+        channel_id: Option<&str>,
+        set_id: &str,
+        version_id: &str,
+    ) -> Option<&BadgeVersion> {
         fn resolve_badge_version<'a>(
             set: &'a BadgeSet,
             version_id: &str,
@@ -166,7 +171,10 @@ mod tests {
     #[test]
     fn get_global_badge() {
         let mut controller = BadgeController::new();
-        controller.set_global_badges(vec![make_test_badge_set("moderator", vec![("1", "Moderator")])]);
+        controller.set_global_badges(vec![make_test_badge_set(
+            "moderator",
+            vec![("1", "Moderator")],
+        )]);
 
         let badge = controller.get_badge(None, "moderator", "1");
         assert!(badge.is_some());
@@ -179,7 +187,10 @@ mod tests {
         controller.set_global_badges(vec![make_test_badge_set("subscriber", vec![("0", "Sub")])]);
         controller.set_channel_badges(
             "123".to_owned(),
-            vec![make_test_badge_set("subscriber", vec![("12", "12-Month Sub")])],
+            vec![make_test_badge_set(
+                "subscriber",
+                vec![("12", "12-Month Sub")],
+            )],
         );
 
         let badge = controller.get_badge(Some("123"), "subscriber", "12");
@@ -223,31 +234,47 @@ mod tests {
     #[test]
     fn clear_removes_all_badges() {
         let mut controller = BadgeController::new();
-        controller.set_global_badges(vec![make_test_badge_set("moderator", vec![("1", "Moderator")])]);
+        controller.set_global_badges(vec![make_test_badge_set(
+            "moderator",
+            vec![("1", "Moderator")],
+        )]);
         controller.set_channel_badges(
             "123".to_owned(),
-            vec![make_test_badge_set("subscriber", vec![("12", "12-Month Sub")])],
+            vec![make_test_badge_set(
+                "subscriber",
+                vec![("12", "12-Month Sub")],
+            )],
         );
 
         controller.clear();
 
         assert!(controller.get_badge(None, "moderator", "1").is_none());
-        assert!(controller.get_badge(Some("123"), "subscriber", "12").is_none());
+        assert!(controller
+            .get_badge(Some("123"), "subscriber", "12")
+            .is_none());
     }
 
     #[test]
     fn clear_channel_removes_only_channel_badges() {
         let mut controller = BadgeController::new();
-        controller.set_global_badges(vec![make_test_badge_set("moderator", vec![("1", "Moderator")])]);
+        controller.set_global_badges(vec![make_test_badge_set(
+            "moderator",
+            vec![("1", "Moderator")],
+        )]);
         controller.set_channel_badges(
             "123".to_owned(),
-            vec![make_test_badge_set("subscriber", vec![("12", "12-Month Sub")])],
+            vec![make_test_badge_set(
+                "subscriber",
+                vec![("12", "12-Month Sub")],
+            )],
         );
 
         controller.clear_channel("123");
 
         assert!(controller.get_badge(None, "moderator", "1").is_some());
-        assert!(controller.get_badge(Some("123"), "subscriber", "12").is_none());
+        assert!(controller
+            .get_badge(Some("123"), "subscriber", "12")
+            .is_none());
     }
 
     #[test]

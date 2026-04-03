@@ -457,6 +457,58 @@ impl EmotePicker {
             return None;
         }
 
+        let (close_requested, next_tab, prev_tab, direct_tab) = ctx.input_mut(|i| {
+            let close_requested = i.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
+            let next_tab = i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab)
+                || i.consume_key(egui::Modifiers::CTRL, egui::Key::PageDown);
+            let prev_tab = i.consume_key(
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                egui::Key::Tab,
+            ) || i.consume_key(egui::Modifiers::CTRL, egui::Key::PageUp);
+            let direct_tab = [
+                egui::Key::Num1,
+                egui::Key::Num2,
+                egui::Key::Num3,
+                egui::Key::Num4,
+                egui::Key::Num5,
+            ]
+            .iter()
+            .position(|key| i.consume_key(egui::Modifiers::ALT | egui::Modifiers::CTRL, *key));
+            (close_requested, next_tab, prev_tab, direct_tab)
+        });
+
+        if close_requested {
+            self.open = false;
+            return None;
+        }
+
+        if let Some(idx) = direct_tab {
+            self.active_view = match idx {
+                0 => PickerView::All,
+                1 => PickerView::Favorites,
+                2 => PickerView::Recent,
+                3 => PickerView::Provider(0),
+                4 => PickerView::Provider(1),
+                _ => PickerView::All,
+            };
+        } else if next_tab {
+            self.active_view = match self.active_view {
+                PickerView::All => PickerView::Favorites,
+                PickerView::Favorites => PickerView::Recent,
+                PickerView::Recent => PickerView::Provider(0),
+                PickerView::Provider(i) if i + 1 < TABS.len() => PickerView::Provider(i + 1),
+                _ => PickerView::All,
+            };
+        } else if prev_tab {
+            self.active_view = match self.active_view {
+                PickerView::All => PickerView::Provider(TABS.len() - 1),
+                PickerView::Favorites => PickerView::All,
+                PickerView::Recent => PickerView::Favorites,
+                PickerView::Provider(0) => PickerView::Recent,
+                PickerView::Provider(i) => PickerView::Provider(i - 1),
+            };
+        }
+
         let mut picked: Option<String> = None;
         let mut picked_entry: Option<EmoteCatalogEntry> = None;
         let mut still_open = self.open;
@@ -534,7 +586,10 @@ impl EmotePicker {
                         let count = view.tabs[ti].indices.len();
                         let is_active = next_active_view == PickerView::Provider(ti);
                         let text = format!("{label} ({count})");
-                        if ui.selectable_label(is_active, RichText::new(text).small()).clicked() {
+                        if ui
+                            .selectable_label(is_active, RichText::new(text).small())
+                            .clicked()
+                        {
                             next_active_view = PickerView::Provider(ti);
                         }
                     }
@@ -605,7 +660,8 @@ impl EmotePicker {
                         let vis_bottom = clip.bottom() - base_y;
 
                         let first_row = (vis_top / ROW_H).floor().max(0.0) as usize;
-                        let last_row = ((vis_bottom / ROW_H).ceil().max(0.0) as usize).min(num_rows);
+                        let last_row =
+                            ((vis_bottom / ROW_H).ceil().max(0.0) as usize).min(num_rows);
 
                         let mut hovered_entry: Option<(usize, egui::Rect)> = None;
 
@@ -643,7 +699,8 @@ impl EmotePicker {
                                     .unwrap_or(false);
 
                                 if has_bytes {
-                                    let &(w, h, ref raw) = emote_bytes.get(entry.url.as_str()).unwrap();
+                                    let &(w, h, ref raw) =
+                                        emote_bytes.get(entry.url.as_str()).unwrap();
                                     let animated = is_likely_animated_url(&entry.url);
                                     // Keep 7TV animation hover-only to avoid repaint storms in dense lists.
                                     let animate_in_grid = animated
@@ -663,8 +720,10 @@ impl EmotePicker {
 
                                         if let Some(tex) = self.static_frames.get(&entry.url) {
                                             let size = fit_size(w, h, EMOTE_SIZE);
-                                            let image_rect =
-                                                egui::Rect::from_center_size(cell_rect.center(), size);
+                                            let image_rect = egui::Rect::from_center_size(
+                                                cell_rect.center(),
+                                                size,
+                                            );
                                             ui.painter().image(
                                                 tex.id(),
                                                 image_rect,
@@ -675,7 +734,11 @@ impl EmotePicker {
                                                 Color32::WHITE,
                                             );
                                         } else {
-                                            ui.painter().rect_filled(cell_rect, 3.0, t::tooltip_bg());
+                                            ui.painter().rect_filled(
+                                                cell_rect,
+                                                3.0,
+                                                t::tooltip_bg(),
+                                            );
                                         }
                                     } else {
                                         if animate_in_grid {
@@ -695,7 +758,11 @@ impl EmotePicker {
                                         );
                                     }
                                 } else {
-                                    ui.painter().rect_filled(cell_rect, 3.0, t::section_header_bg());
+                                    ui.painter().rect_filled(
+                                        cell_rect,
+                                        3.0,
+                                        t::section_header_bg(),
+                                    );
                                 }
 
                                 if self.favorite_urls.contains(entry.url.as_str()) {
@@ -714,7 +781,7 @@ impl EmotePicker {
                             }
                         }
 
-                        if let Some((cat_idx, rect)) = hovered_entry {
+                if let Some((cat_idx, rect)) = hovered_entry {
                             let entry = &view.combined[cat_idx];
                             let entry_url = entry.url.clone();
                             let click_resp =
@@ -745,7 +812,8 @@ impl EmotePicker {
                             );
 
                             click_resp.on_hover_ui(|ui| {
-                                if let Some(&(w, h, ref raw)) = emote_bytes.get(entry.url.as_str()) {
+                                if let Some(&(w, h, ref raw)) = emote_bytes.get(entry.url.as_str())
+                                {
                                     let size = fit_size(w, h, 48.0);
                                     ui.add(
                                         egui::Image::from_bytes(
@@ -761,7 +829,11 @@ impl EmotePicker {
                                     ""
                                 };
                                 ui.label(RichText::new(format!("{}{}", entry.code, fav)).strong());
-                                ui.label(RichText::new(format!("{}", entry.provider)).small().color(t::text_muted()));
+                                ui.label(
+                                    RichText::new(format!("{}", entry.provider))
+                                        .small()
+                                        .color(t::text_muted()),
+                                );
                             });
                         }
                     });
@@ -772,14 +844,37 @@ impl EmotePicker {
                 }
             });
 
-        if let Some(entry) = picked_entry.as_ref() {
-            self.note_pick(entry);
+        if picked.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+            let active_view = self.active_view;
+            let provider_boost = self.provider_boost.clone();
+            let first_idx = {
+                let provider_boost = provider_boost.as_deref();
+                self.display_indices_for(active_view, provider_boost)
+                    .first()
+                    .copied()
+            };
+            if let Some(idx) = first_idx {
+                if let Some(entry) = self
+                    .cache
+                    .as_ref()
+                    .and_then(|view| view.combined.get(idx))
+                    .cloned()
+                {
+                    picked = Some(entry.code.clone());
+                    picked_entry = Some(entry);
+                    self.open = false;
+                }
+            }
         }
 
         self.active_view = next_active_view;
         self.provider_boost = next_provider_boost;
         if let Some(url) = pending_favorite_toggle {
             self.toggle_favorite_url(&url);
+        }
+
+        if let Some(entry) = picked_entry.as_ref() {
+            self.note_pick(entry);
         }
 
         if let Some(resp) = &window_resp {

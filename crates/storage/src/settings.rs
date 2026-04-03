@@ -451,9 +451,9 @@ impl SettingsStore {
 
 #[cfg(test)]
 mod tests {
-    use super::AppSettings;
-    use super::AccountEntry;
     use super::remove_account_from_settings;
+    use super::AccountEntry;
+    use super::AppSettings;
 
     #[test]
     fn legacy_configs_pick_up_new_appearance_defaults() {
