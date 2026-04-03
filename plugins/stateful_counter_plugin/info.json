@@ -1,0 +1,9 @@
+{
+  "name": "Stateful Counter Plugin",
+  "description": "Persistent state and completion example.",
+  "authors": ["Crust"],
+  "version": "1.0.0",
+  "license": "MIT",
+  "permissions": [],
+  "entry": "init.lua"
+}

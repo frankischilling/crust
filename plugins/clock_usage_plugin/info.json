@@ -1,0 +1,9 @@
+{
+  "name": "Clock and Usage Plugin",
+  "description": "Shows date, time, timezone, session uptime, and overall runtime.",
+  "authors": ["Crust"],
+  "version": "1.0.0",
+  "license": "MIT",
+  "permissions": [],
+  "entry": "init.lua"
+}
