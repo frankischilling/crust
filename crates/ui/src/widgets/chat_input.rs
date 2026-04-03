@@ -1173,6 +1173,11 @@ impl<'a> ChatInput<'a> {
                     } else {
                         t::accent()
                     };
+                    let summary_col = if is_selected {
+                        t::text_secondary()
+                    } else {
+                        t::text_muted()
+                    };
                     ui.vertical(|ui| {
                         ui.label(
                             RichText::new(entry.usage)
@@ -1185,7 +1190,7 @@ impl<'a> ChatInput<'a> {
                             egui::Label::new(
                                 RichText::new(entry.summary)
                                     .font(t::small())
-                                    .color(t::text_muted()),
+                                    .color(summary_col),
                             )
                             .truncate(),
                         );

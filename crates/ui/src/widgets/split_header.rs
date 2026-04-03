@@ -1,5 +1,5 @@
 use crust_core::model::ChannelId;
-use egui::{Color32, RichText};
+use egui::RichText;
 
 use crate::theme as t;
 use crate::widgets::chrome::{self, ChromeIcon, IconButtonState};
@@ -51,7 +51,7 @@ pub fn show_split_header(
         ui.painter().rect_filled(
             top_line,
             egui::CornerRadius::ZERO,
-            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 180),
+            t::alpha(accent, 180),
         );
     }
 

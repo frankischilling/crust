@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use egui::{Color32, Context, Margin, RichText};
+use egui::{Context, Margin, RichText};
 
 use crust_core::highlight::HighlightRule;
 
@@ -477,7 +477,7 @@ fn render_settings_content(
                                 if ui
                                     .add(
                                         egui::Button::new(
-                                            RichText::new("❌").font(t::tiny()).color(Color32::from_rgb(220, 80, 80)),
+                                            RichText::new("❌").font(t::tiny()).color(t::red()),
                                         )
                                         .min_size(egui::vec2(24.0, 20.0)),
                                     )
@@ -565,7 +565,7 @@ fn render_settings_content(
 
                                 // Regex toggle ("Re")
                                 let re_col = if rule.is_regex {
-                                    Color32::from_rgb(120, 200, 255)
+                                    t::link()
                                 } else {
                                     t::text_muted()
                                 };
@@ -583,7 +583,7 @@ fn render_settings_content(
 
                                 // Case-sensitive toggle ("Aa")
                                 let aa_col = if rule.case_sensitive {
-                                    Color32::from_rgb(255, 200, 100)
+                                    t::yellow()
                                 } else {
                                     t::text_muted()
                                 };
@@ -601,7 +601,7 @@ fn render_settings_content(
 
                                 // Visual alert toggle
                                 let alert_col = if rule.has_alert {
-                                    Color32::from_rgb(255, 150, 80)
+                                    t::bits_orange()
                                 } else {
                                     t::text_muted()
                                 };
@@ -620,7 +620,7 @@ fn render_settings_content(
 
                                 // Sound notification toggle
                                 let sound_col = if rule.has_sound {
-                                    Color32::from_rgb(100, 255, 150)
+                                    t::green()
                                 } else {
                                     t::text_muted()
                                 };
@@ -642,7 +642,7 @@ fn render_settings_content(
                                     .add(
                                         egui::Button::new(
                                             RichText::new("🗑").font(t::tiny()).color(
-                                                Color32::from_rgb(220, 80, 80),
+                                                t::red(),
                                             ),
                                         )
                                         .min_size(action_btn_size),
@@ -798,7 +798,7 @@ fn render_settings_content(
 
                                 // Regex toggle ("Re")
                                 let re_col = if filter.is_regex {
-                                    Color32::from_rgb(120, 200, 255)
+                                    t::link()
                                 } else {
                                     t::text_muted()
                                 };
@@ -816,7 +816,7 @@ fn render_settings_content(
 
                                 // Filter sender toggle
                                 let user_col = if filter.filter_sender {
-                                    Color32::from_rgb(255, 180, 100)
+                                    t::bits_orange()
                                 } else {
                                     t::text_muted()
                                 };
@@ -840,8 +840,8 @@ fn render_settings_content(
                                     FilterAction::Dim => "🔅",
                                 };
                                 let action_col = match filter.action {
-                                    FilterAction::Hide => Color32::from_rgb(220, 80, 80),
-                                    FilterAction::Dim => Color32::from_rgb(150, 150, 150),
+                                    FilterAction::Hide => t::red(),
+                                    FilterAction::Dim => t::text_secondary(),
                                 };
                                 if ui
                                     .add(
@@ -864,7 +864,7 @@ fn render_settings_content(
                                     .add(
                                         egui::Button::new(
                                             RichText::new("🗑").font(t::tiny()).color(
-                                                Color32::from_rgb(220, 80, 80),
+                                                t::red(),
                                             ),
                                         )
                                         .min_size(egui::vec2(20.0, 20.0)),

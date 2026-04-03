@@ -1,4 +1,4 @@
-use egui::{Context, RichText, Color32};
+use egui::{Context, RichText};
 use crate::theme as t;
 
 /// Account switcher widget state for displaying and switching between multiple saved accounts.
@@ -80,7 +80,7 @@ impl AccountSwitcherState {
                                     let username_text = if account.is_active {
                                         RichText::new(&account.username)
                                             .font(t::body())
-                                            .color(Color32::from_rgb(100, 200, 255))
+                                            .color(t::link())
                                             .strong()
                                     } else {
                                         RichText::new(&account.username).font(t::body())
@@ -100,9 +100,9 @@ impl AccountSwitcherState {
                                     // Token status indicator
                                     let token_indicator = if account.has_token { "🔑" } else { "⚠" };
                                     let token_color = if account.has_token {
-                                        Color32::from_rgb(100, 255, 100)
+                                        t::green()
                                     } else {
-                                        Color32::from_rgb(255, 150, 80)
+                                        t::bits_orange()
                                     };
                                     ui.label(
                                         RichText::new(token_indicator)
@@ -121,7 +121,7 @@ impl AccountSwitcherState {
                                             .button(
                                                 RichText::new("🗑")
                                                     .font(t::tiny())
-                                                    .color(Color32::from_rgb(220, 80, 80)),
+                                                    .color(t::red()),
                                             )
                                             .on_hover_text("Remove account")
                                             .clicked()

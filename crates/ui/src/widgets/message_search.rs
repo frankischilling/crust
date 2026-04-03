@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 
 use egui::{
-    Align, Button, CentralPanel, Color32, Context, Frame, Grid, Id, Key, Layout, RichText, Stroke,
-    Ui, ViewportBuilder, ViewportClass, ViewportCommand, ViewportId,
+    Align, Button, CentralPanel, Context, Frame, Grid, Id, Key, Layout, RichText, Stroke, Ui,
+    ViewportBuilder, ViewportClass, ViewportCommand, ViewportId,
 };
 use regex::{Regex, RegexBuilder};
 
@@ -411,7 +411,7 @@ fn show_message_search_contents(
         ui.label(
             RichText::new(format!("Regex error: {err}"))
                 .font(t::small())
-                .color(Color32::from_rgb(220, 120, 120)),
+                .color(t::red()),
         );
     } else {
         ui.label(

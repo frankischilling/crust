@@ -1094,16 +1094,8 @@ impl<'a> MessageList<'a> {
             egui::vec2(ui.available_width(), COMPACT_BOUNDARY_HEIGHT),
             egui::Sense::hover(),
         );
-        let fill = if t::is_light() {
-            Color32::from_rgb(240, 242, 246)
-        } else {
-            Color32::from_rgb(34, 37, 45)
-        };
-        let stroke = if t::is_light() {
-            Color32::from_rgb(195, 201, 212)
-        } else {
-            Color32::from_rgb(76, 84, 99)
-        };
+        let fill = t::sparkline_bg();
+        let stroke = t::border_subtle();
         ui.painter()
             .rect_filled(rect, egui::CornerRadius::same(6), fill);
         ui.painter().rect_stroke(
@@ -1697,7 +1689,7 @@ impl<'a> MessageList<'a> {
             painter.rect_filled(
                 paused_rect,
                 6.0,
-                Color32::from_rgba_unmultiplied(0, 0, 0, 160),
+                t::alpha(Color32::BLACK, 160),
             );
             let max_chars = (((paused_rect.width() - 16.0) / 6.8).floor() as usize).max(4);
             let text = if raw_text.chars().count() > max_chars {
@@ -1712,7 +1704,7 @@ impl<'a> MessageList<'a> {
                 egui::Align2::CENTER_CENTER,
                 text,
                 egui::FontId::proportional(12.0),
-                Color32::from_rgb(220, 220, 220),
+                t::text_primary(),
             );
         }
 
@@ -1734,7 +1726,7 @@ impl<'a> MessageList<'a> {
                 egui::Align2::CENTER_CENTER,
                 "Resume scrolling",
                 egui::FontId::proportional(12.0),
-                Color32::WHITE,
+                t::text_on_accent(),
             );
 
             // Detect click on the painted rect
@@ -1869,7 +1861,7 @@ impl<'a> MessageList<'a> {
                         let (stripe, _) =
                             ui.allocate_exact_size(egui::vec2(2.0, 12.0), egui::Sense::hover());
                         ui.painter()
-                            .rect_filled(stripe, 0.0, Color32::from_rgb(100, 65, 190));
+                            .rect_filled(stripe, 0.0, t::accent());
                         let body = if rep.parent_msg_body.chars().count() > 80 {
                             // Find the byte offset of the 80th char boundary.
                             let cut = rep
@@ -1882,11 +1874,7 @@ impl<'a> MessageList<'a> {
                         } else {
                             rep.parent_msg_body.clone()
                         };
-                        let reply_color = if t::is_light() {
-                            Color32::from_rgb(90, 90, 115)
-                        } else {
-                            Color32::from_rgb(130, 130, 155)
-                        };
+                        let reply_color = t::text_secondary();
                         let h = ui.add(
                             Label::new(
                                 RichText::new(format!("↩ @{}: {}", rep.parent_display_name, body))
@@ -2063,8 +2051,8 @@ impl<'a> MessageList<'a> {
                             .map(str::trim)
                             .filter(|s| !s.is_empty())
                         {
-                            let chip_bg = Color32::from_rgba_unmultiplied(120, 85, 195, 52);
-                            let chip_stroke = Color32::from_rgba_unmultiplied(160, 130, 235, 200);
+                            let chip_bg = t::alpha(t::accent(), 52);
+                            let chip_stroke = t::alpha(t::accent_dim(), 200);
                             let chip = egui::Frame::new()
                                 .fill(chip_bg)
                                 .stroke(egui::Stroke::new(1.0, chip_stroke))
@@ -2074,7 +2062,7 @@ impl<'a> MessageList<'a> {
                                     ui.label(
                                         RichText::new("POINTS")
                                             .font(t::tiny())
-                                            .color(Color32::from_rgb(228, 217, 255))
+                                            .color(t::text_on_accent())
                                             .strong(),
                                     );
                                 })
@@ -2241,7 +2229,7 @@ impl<'a> MessageList<'a> {
                     format!("{}h {}m", seconds / 3600, (seconds % 3600) / 60)
                 };
                 (
-                    Color32::from_rgb(220, 160, 50),
+                    t::yellow(),
                     Some(format!("⏱  {login} was timed out for {dur}.")),
                 )
             }
@@ -2250,11 +2238,7 @@ impl<'a> MessageList<'a> {
                 Some(format!("🚫  {login} was permanently banned.")),
             ),
             MsgKind::ChatCleared => (
-                if t::is_light() {
-                    Color32::from_rgb(100, 90, 120)
-                } else {
-                    Color32::from_rgb(130, 120, 150)
-                },
+                t::text_secondary(),
                 Some("🗑  Chat was cleared by a moderator.".to_owned()),
             ),
             MsgKind::SystemInfo => {
@@ -2274,7 +2258,7 @@ impl<'a> MessageList<'a> {
                 );
                 (redemption_accent(status.as_deref()), Some(text))
             }
-            _ => (Color32::from_rgb(100, 100, 120), Some(msg.raw_text.clone())),
+            _ => (t::text_secondary(), Some(msg.raw_text.clone())),
         };
 
         let text = label_override.unwrap_or_else(|| msg.raw_text.clone());
@@ -2288,12 +2272,7 @@ impl<'a> MessageList<'a> {
         // system event in the loaded history.
         ui.push_id(msg.id.0, |ui| {
             egui::Frame::new()
-                .fill(Color32::from_rgba_unmultiplied(
-                    accent.r(),
-                    accent.g(),
-                    accent.b(),
-                    10,
-                ))
+                .fill(t::alpha(accent, 10))
                 .inner_margin(egui::Margin::symmetric(
                     ROW_PAD_X as i8,
                     ROW_PAD_Y as i8 + 1,
@@ -2346,14 +2325,14 @@ impl<'a> MessageList<'a> {
 
                                 let cost_chip = format!("{cost} pts");
                                 let cost_response = egui::Frame::new()
-                                    .fill(Color32::from_rgba_unmultiplied(120, 85, 195, 48))
+                                    .fill(t::alpha(t::accent(), 48))
                                     .corner_radius(egui::CornerRadius::same(3))
                                     .inner_margin(egui::Margin::symmetric(4, 1))
                                     .show(ui, |ui| {
                                         ui.label(
                                             RichText::new(cost_chip)
                                                 .font(t::tiny())
-                                                .color(Color32::from_rgb(226, 214, 255))
+                                                .color(t::text_on_accent())
                                                 .strong(),
                                         );
                                     })
@@ -2361,12 +2340,7 @@ impl<'a> MessageList<'a> {
                                 cost_response.on_hover_text("Channel points cost");
 
                                 egui::Frame::new()
-                                    .fill(Color32::from_rgba_unmultiplied(
-                                        status_color.r(),
-                                        status_color.g(),
-                                        status_color.b(),
-                                        50,
-                                    ))
+                                    .fill(t::alpha(status_color, 50))
                                     .corner_radius(egui::CornerRadius::same(3))
                                     .inner_margin(egui::Margin::symmetric(4, 1))
                                     .show(ui, |ui| {
@@ -2484,11 +2458,7 @@ impl<'a> MessageList<'a> {
         reply_key: Id,
         static_frames: &mut HashMap<String, StaticFrameCacheEntry>,
     ) {
-        let action_color = if t::is_light() {
-            Color32::from_rgb(80, 80, 110)
-        } else {
-            Color32::from_rgb(180, 180, 210)
-        };
+        let action_color = t::text_secondary();
         match span {
             Span::Text { text, .. } => {
                 let cleaned = strip_invisible_chars(text);
@@ -2555,11 +2525,7 @@ impl<'a> MessageList<'a> {
                                 );
                                 ui.add_space(4.0);
                                 ui.label(RichText::new(code.as_str()).strong());
-                                ui.label(
-                                    RichText::new(provider_label(provider))
-                                        .small()
-                                        .color(Color32::GRAY),
-                                );
+                                ui.label(RichText::new(provider_label(provider)).small().color(t::text_secondary()));
                             });
                         })
                         .context_menu(|ui| {
@@ -2571,7 +2537,7 @@ impl<'a> MessageList<'a> {
                         RichText::new(code)
                             .italics()
                             .font(t::small())
-                            .color(Color32::from_rgb(110, 150, 110)),
+                            .color(t::green()),
                     ));
                 }
             }
@@ -2596,7 +2562,7 @@ impl<'a> MessageList<'a> {
                                 ui.label(
                                     RichText::new("Twemoji")
                                         .small()
-                                        .color(Color32::from_rgb(100, 100, 100)),
+                                        .color(t::text_secondary()),
                                 );
                             });
                         })
@@ -2651,7 +2617,7 @@ impl<'a> MessageList<'a> {
                                     RichText::new("Loading preview…")
                                         .small()
                                         .italics()
-                                        .color(Color32::GRAY),
+                                        .color(t::text_secondary()),
                                 );
                             }
                             Some(p) => {
@@ -2718,12 +2684,12 @@ impl<'a> MessageList<'a> {
                                     && p.description.is_none()
                                     && p.thumbnail_url.is_none()
                                 {
-                                    ui.label(
-                                        RichText::new("No preview available")
-                                            .small()
-                                            .italics()
-                                            .color(Color32::GRAY),
-                                    );
+                        ui.label(
+                            RichText::new("No preview available")
+                                .small()
+                                .italics()
+                                .color(t::text_secondary()),
+                        );
                                 }
                                 // Domain footer
                                 let host = url_hostname(url);
@@ -2785,7 +2751,7 @@ impl<'a> MessageList<'a> {
                         tex.id(),
                         rect,
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        Color32::WHITE,
+                        t::text_on_accent(),
                     );
                     return resp;
                 }
@@ -3820,30 +3786,22 @@ fn badge_chip_colors(name: &str) -> (Color32, Color32) {
 fn style_system_info_text(raw: &str) -> (Color32, String) {
     let s = raw.trim();
     let Some((code, payload)) = parse_bracket_numeric_prefix(s) else {
-        return (Color32::from_rgb(120, 125, 145), s.to_owned());
+        return (t::text_secondary(), s.to_owned());
     };
 
     match code {
         "375" => (
-            Color32::from_rgb(130, 165, 220),
+            t::link(),
             format!("IRC MOTD: {}", payload.trim()),
         ),
-        "372" => (
-            Color32::from_rgb(145, 150, 170),
-            format!("  {}", payload.trim()),
-        ),
-        "376" => (
-            Color32::from_rgb(120, 175, 135),
-            "IRC MOTD complete".to_owned(),
-        ),
-        "001" => (Color32::from_rgb(120, 195, 145), payload.trim().to_owned()),
-        "002" | "003" | "004" | "005" => {
-            (Color32::from_rgb(125, 165, 210), payload.trim().to_owned())
-        }
+        "372" => (t::text_secondary(), format!("  {}", payload.trim())),
+        "376" => (t::green(), "IRC MOTD complete".to_owned()),
+        "001" => (t::green(), payload.trim().to_owned()),
+        "002" | "003" | "004" | "005" => (t::link(), payload.trim().to_owned()),
         "251" | "252" | "253" | "254" | "255" | "265" | "266" | "250" => {
-            (Color32::from_rgb(140, 155, 175), payload.trim().to_owned())
+            (t::text_secondary(), payload.trim().to_owned())
         }
-        _ => (Color32::from_rgb(120, 125, 145), s.to_owned()),
+        _ => (t::text_secondary(), s.to_owned()),
     }
 }
 
@@ -4039,12 +3997,12 @@ fn redemption_status_presentation(status: Option<&str>) -> (Cow<'static, str>, C
         return (Cow::Borrowed("CANCELED"), t::red());
     }
     if normalized.eq_ignore_ascii_case("unfulfilled") {
-        return (Cow::Borrowed("UNFULFILLED"), Color32::from_rgb(185, 140, 38));
+        return (Cow::Borrowed("UNFULFILLED"), t::gold().gamma_multiply(0.85));
     }
 
     (
         Cow::Owned(normalized.to_ascii_uppercase()),
-        Color32::from_rgb(120, 85, 195),
+        t::accent(),
     )
 }
 
@@ -4065,7 +4023,7 @@ fn notification_label(
             keyword_highlight_color.unwrap_or_else(t::twitch_purple),
         ))
     } else if flags.is_mention {
-        Some(("Mention", Color32::from_rgb(210, 140, 40)))
+        Some(("Mention", t::bits_orange()))
     } else if let MsgKind::ChannelPointsReward { status, .. } = kind {
         let label = match status
             .as_deref()
@@ -4081,9 +4039,9 @@ fn notification_label(
         };
         Some((label, redemption_accent(status.as_deref())))
     } else if flags.custom_reward_id.is_some() && flags.is_highlighted {
-        Some(("Points Highlight", Color32::from_rgb(120, 85, 195)))
+        Some(("Points Highlight", t::accent()))
     } else if flags.custom_reward_id.is_some() {
-        Some(("Points Reward Message", Color32::from_rgb(100, 65, 165)))
+        Some(("Points Reward Message", t::accent_dim()))
     } else if flags.is_highlighted {
         Some(("Highlighted Message", t::twitch_purple()))
     } else if flags.is_pinned {
@@ -4106,33 +4064,33 @@ fn message_row_background(
 ) -> Color32 {
     if highlight_alpha > 0.0 {
         let a = (50.0 * highlight_alpha) as u8;
-        Color32::from_rgba_unmultiplied(100, 140, 255, a)
+        t::alpha(t::link(), a)
     } else if keyword_highlight {
         if let Some(color) = keyword_highlight_color {
-            Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 18)
+            t::alpha(color, 18)
         } else {
-            Color32::from_rgba_unmultiplied(145, 70, 255, 18)
+            t::alpha(t::accent(), 18)
         }
     } else if flags.is_mention {
-        Color32::from_rgba_unmultiplied(210, 140, 40, 24)
+        t::alpha(t::bits_orange(), 24)
     } else if let MsgKind::ChannelPointsReward { status, .. } = kind {
         let accent = redemption_accent(status.as_deref());
-        Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 16)
+        t::alpha(accent, 16)
     } else if flags.custom_reward_id.is_some() {
         let alpha = if flags.is_highlighted { 24 } else { 16 };
-        Color32::from_rgba_unmultiplied(100, 65, 165, alpha)
+        t::alpha(t::accent_dim(), alpha)
     } else if flags.is_highlighted {
-        Color32::from_rgba_unmultiplied(145, 70, 255, 22)
+        t::alpha(t::accent(), 22)
     } else if flags.is_pinned {
         let gold = t::gold();
-        Color32::from_rgba_unmultiplied(gold.r(), gold.g(), gold.b(), 26)
+        t::alpha(gold, 26)
     } else if flags.is_first_msg {
         let fg = t::green();
-        Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 22)
+        t::alpha(fg, 22)
     } else if flags.is_deleted {
-        Color32::from_rgba_unmultiplied(180, 30, 30, 12)
+        t::alpha(t::red(), 12)
     } else if matches!(kind, MsgKind::Bits { .. }) {
-        Color32::from_rgba_unmultiplied(255, 175, 30, 14)
+        t::alpha(t::bits_orange(), 14)
     } else {
         Color32::TRANSPARENT
     }
@@ -4153,11 +4111,11 @@ fn message_left_accent_color(
     } else if let MsgKind::ChannelPointsReward { status, .. } = kind {
         Some(redemption_accent(status.as_deref()))
     } else if flags.custom_reward_id.is_some() && flags.is_highlighted {
-        Some(Color32::from_rgb(165, 125, 235))
+        Some(t::accent_dim())
     } else if flags.custom_reward_id.is_some() {
-        Some(Color32::from_rgb(120, 85, 195))
+        Some(t::accent())
     } else if flags.is_highlighted {
-        Some(Color32::from_rgb(255, 210, 30))
+        Some(t::gold())
     } else if flags.is_pinned {
         Some(t::gold())
     } else if flags.is_first_msg {
@@ -4269,11 +4227,11 @@ mod tests {
 
         assert_eq!(
             notification_label(&flags, &MsgKind::Chat, false, None),
-            Some(("Points Highlight", Color32::from_rgb(120, 85, 195)))
+            Some(("Points Highlight", t::accent()))
         );
         assert_eq!(
             message_left_accent_color(&flags, &MsgKind::Chat, false, None),
-            Some(Color32::from_rgb(165, 125, 235))
+            Some(t::accent_dim())
         );
     }
 
@@ -4305,7 +4263,7 @@ mod tests {
     #[test]
     fn keyword_highlight_uses_custom_color_when_present() {
         let flags = MessageFlags::default();
-        let custom = Color32::from_rgb(12, 180, 120);
+        let custom = t::green().gamma_multiply(0.9);
         assert_eq!(
             message_left_accent_color(&flags, &MsgKind::Chat, true, Some(custom)),
             Some(custom)
@@ -4316,7 +4274,7 @@ mod tests {
         );
         assert_eq!(
             message_row_background(&flags, &MsgKind::Chat, 0.0, true, Some(custom)),
-            Color32::from_rgba_unmultiplied(12, 180, 120, 18)
+            t::alpha(custom, 18)
         );
     }
 

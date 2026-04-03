@@ -217,7 +217,7 @@ impl<'a> ChannelList<'a> {
                     }
 
                     let frame_bg = if is_dragging_this {
-                        Color32::from_rgba_unmultiplied(100, 70, 180, 50)
+                        t::alpha(t::accent(), 50)
                     } else if is_active {
                         t::active_channel_bg()
                     } else {
@@ -242,9 +242,9 @@ impl<'a> ChannelList<'a> {
                                             egui::Sense::hover(),
                                         );
                                         let dot_col = if is_live {
-                                            Color32::from_rgb(220, 65, 65)
+                                            t::red()
                                         } else {
-                                            Color32::from_rgba_unmultiplied(90, 90, 110, 70)
+                                            t::alpha(t::text_secondary(), 70)
                                         };
                                         ui.painter().circle_filled(
                                             dot_rect.center(),
@@ -261,7 +261,7 @@ impl<'a> ChannelList<'a> {
                                         RichText::new("K")
                                             .font(t::small())
                                             .strong()
-                                            .color(Color32::from_rgb(83, 252, 24)),
+                                            .color(t::kick_green()),
                                     );
                                 } else if ch.is_irc() {
                                     ui.label(
@@ -396,10 +396,9 @@ impl<'a> ChannelList<'a> {
                         // Slight rotation via skewed rounded rect
                         let fill = if is_outside {
                             // Green-ish tint for "will split"
-                            Color32::from_rgba_unmultiplied(60, 140, 90, 210)
+                            t::split_success_bg()
                         } else {
-                            let a = t::accent();
-                            Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 210)
+                            t::alpha(t::accent(), 210)
                         };
                         painter.rect_filled(ghost_rect, egui::CornerRadius::same(6), fill);
                         painter.text(
@@ -407,7 +406,7 @@ impl<'a> ChannelList<'a> {
                             egui::Align2::CENTER_CENTER,
                             &label_text,
                             t::small(),
-                            Color32::WHITE,
+                            t::text_on_accent(),
                         );
 
                         // Sub-label when outside sidebar
@@ -419,7 +418,7 @@ impl<'a> ChannelList<'a> {
                                 egui::Align2::CENTER_TOP,
                                 "Split view",
                                 t::small(),
-                                Color32::from_rgba_unmultiplied(200, 255, 200, 180),
+                                t::split_success_text(),
                             );
                         }
                     }

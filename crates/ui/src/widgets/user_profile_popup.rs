@@ -305,13 +305,13 @@ impl UserProfilePopup {
                     ));
                     if profile.is_live {
                         egui::Frame::new()
-                            .fill(Color32::from_rgba_unmultiplied(200, 40, 40, 200))
+                            .fill(t::danger_strong_bg())
                             .corner_radius(t::RADIUS_SM)
                             .inner_margin(egui::Margin::symmetric(5, 2))
                             .show(ui, |ui| {
                                 ui.add(egui::Label::new(
                                     RichText::new("● LIVE")
-                                        .color(Color32::WHITE)
+                                        .color(t::text_on_accent())
                                         .size(10.0)
                                         .strong(),
                                 ));
@@ -319,13 +319,13 @@ impl UserProfilePopup {
                     }
                     if profile.is_banned {
                         egui::Frame::new()
-                            .fill(Color32::from_rgba_unmultiplied(200, 30, 30, 160))
+                            .fill(t::danger_strong_bg().gamma_multiply(0.9))
                             .corner_radius(t::RADIUS_SM)
                             .inner_margin(egui::Margin::symmetric(5, 2))
                             .show(ui, |ui| {
                                 ui.add(egui::Label::new(
                                     RichText::new("BANNED")
-                                        .color(Color32::WHITE)
+                                        .color(t::text_on_accent())
                                         .size(10.0)
                                         .strong(),
                                 ));
@@ -352,7 +352,7 @@ impl UserProfilePopup {
                     if let Some(ref hex) = profile.chat_color {
                         if let Some(c) = parse_hex_color(hex) {
                             egui::Frame::new()
-                                .fill(Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 35))
+                                .fill(t::alpha(c, 35))
                                 .corner_radius(t::RADIUS_SM)
                                 .inner_margin(egui::Margin::symmetric(5, 2))
                                 .stroke(egui::Stroke::new(1.0, c))
@@ -451,11 +451,11 @@ impl UserProfilePopup {
 
         ui.add_space(6.0);
         egui::Frame::new()
-            .fill(Color32::from_rgba_unmultiplied(200, 40, 40, 18))
+            .fill(t::danger_soft_bg())
             .corner_radius(t::RADIUS)
             .stroke(egui::Stroke::new(
                 1.0,
-                Color32::from_rgba_unmultiplied(200, 60, 60, 80),
+                t::alpha(t::red(), 80),
             ))
             .inner_margin(egui::Margin::symmetric(8, 6))
             .show(ui, |ui| {
@@ -556,11 +556,7 @@ impl UserProfilePopup {
     fn render_logs_tab(&self, ui: &mut egui::Ui) {
         let log_count = self.logs.len();
         egui::Frame::new()
-            .fill(if t::is_light() {
-                Color32::from_rgba_unmultiplied(0, 0, 0, 20)
-            } else {
-                Color32::from_rgba_unmultiplied(0, 0, 0, 60)
-            })
+            .fill(t::scrim_bg())
             .corner_radius(t::RADIUS_SM)
             .inner_margin(egui::Margin::symmetric(6, 4))
             .show(ui, |ui| {
@@ -600,7 +596,7 @@ impl UserProfilePopup {
 
                     egui::Frame::new()
                         .fill(if is_deleted {
-                            Color32::from_rgba_unmultiplied(150, 30, 30, 20)
+                            t::alpha(t::red(), 20)
                         } else {
                             Color32::TRANSPARENT
                         })
@@ -617,7 +613,7 @@ impl UserProfilePopup {
                                 let msg_color = if is_deleted {
                                     t::text_muted()
                                 } else if is_action {
-                                    Color32::from_rgba_unmultiplied(200, 200, 255, 230)
+                                    t::alpha(t::mention(), 230)
                                 } else {
                                     t::text_primary()
                                 };
@@ -638,11 +634,7 @@ impl UserProfilePopup {
     fn render_mod_logs_tab(&self, ui: &mut egui::Ui) {
         let log_count = self.mod_logs.len();
         egui::Frame::new()
-            .fill(if t::is_light() {
-                Color32::from_rgba_unmultiplied(0, 0, 0, 20)
-            } else {
-                Color32::from_rgba_unmultiplied(0, 0, 0, 60)
-            })
+            .fill(t::scrim_bg())
             .corner_radius(t::RADIUS_SM)
             .inner_margin(egui::Margin::symmetric(6, 4))
             .show(ui, |ui| {
@@ -680,7 +672,7 @@ impl UserProfilePopup {
                 for msg in &self.mod_logs {
                     let time_str = msg.timestamp.format("%H:%M:%S").to_string();
                     egui::Frame::new()
-                        .fill(Color32::from_rgba_unmultiplied(180, 120, 20, 18))
+                        .fill(t::warning_soft_bg())
                         .inner_margin(egui::Margin::symmetric(4, 2))
                         .show(ui, |ui| {
                             ui.horizontal_wrapped(|ui| {
@@ -814,7 +806,7 @@ impl UserProfilePopup {
         if profile.is_banned {
             ui.add_space(5.0);
             egui::Frame::new()
-                .fill(Color32::from_rgba_unmultiplied(200, 30, 30, 25))
+                .fill(t::danger_soft_bg())
                 .corner_radius(t::RADIUS_SM)
                 .inner_margin(egui::Margin::symmetric(8, 5))
                 .show(ui, |ui| {
@@ -921,9 +913,9 @@ impl UserProfilePopup {
                 egui::Button::new(
                     RichText::new("Untimeout / Unban")
                         .small()
-                        .color(Color32::WHITE),
+                        .color(t::text_on_accent()),
                 )
-                .fill(Color32::from_rgba_unmultiplied(40, 180, 90, 200))
+                .fill(t::success_strong_bg())
                 .min_size(egui::vec2(160.0, 24.0)),
             )
             .clicked()
@@ -978,9 +970,9 @@ impl UserProfilePopup {
                     egui::Button::new(
                         RichText::new("Confirm ban")
                             .small()
-                            .color(Color32::WHITE),
+                            .color(t::text_on_accent()),
                     )
-                    .fill(Color32::from_rgba_unmultiplied(200, 30, 30, 230))
+                    .fill(t::danger_strong_bg())
                     .min_size(egui::vec2(120.0, 24.0)),
                 );
                 let cancel = ui.add(
@@ -1002,8 +994,10 @@ impl UserProfilePopup {
             });
         } else if ui
             .add(
-                egui::Button::new(RichText::new("Ban user").small().color(Color32::WHITE))
-                    .fill(Color32::from_rgba_unmultiplied(180, 40, 40, 180))
+                egui::Button::new(
+                    RichText::new("Ban user").small().color(t::text_on_accent()),
+                )
+                    .fill(t::danger_strong_bg().gamma_multiply(0.9))
                     .min_size(egui::vec2(100.0, 24.0)),
             )
             .clicked()
@@ -1074,7 +1068,7 @@ impl UserProfilePopup {
         if let Some(ref err) = self.ivr_logs_error {
             ui.add_space(4.0);
             egui::Frame::new()
-                .fill(Color32::from_rgba_unmultiplied(200, 30, 30, 25))
+                .fill(t::danger_soft_bg())
                 .corner_radius(t::RADIUS_SM)
                 .inner_margin(egui::Margin::symmetric(8, 5))
                 .show(ui, |ui| {
@@ -1101,11 +1095,7 @@ impl UserProfilePopup {
 
         let log_count = self.ivr_logs.len();
         egui::Frame::new()
-            .fill(if t::is_light() {
-                Color32::from_rgba_unmultiplied(0, 0, 0, 20)
-            } else {
-                Color32::from_rgba_unmultiplied(0, 0, 0, 60)
-            })
+            .fill(t::scrim_bg())
             .corner_radius(t::RADIUS_SM)
             .inner_margin(egui::Margin::symmetric(6, 4))
             .show(ui, |ui| {
@@ -1146,7 +1136,7 @@ impl UserProfilePopup {
 
                     egui::Frame::new()
                         .fill(if is_timeout {
-                            Color32::from_rgba_unmultiplied(150, 30, 30, 20)
+                            t::alpha(t::red(), 20)
                         } else {
                             Color32::TRANSPARENT
                         })
@@ -1310,12 +1300,7 @@ fn fmt_ivr_timestamp(ts: &str) -> String {
 /// Render a small inline role pill using egui Frame.
 fn role_pill(ui: &mut egui::Ui, text: &str, color: Color32) {
     egui::Frame::new()
-        .fill(Color32::from_rgba_unmultiplied(
-            color.r(),
-            color.g(),
-            color.b(),
-            40,
-        ))
+        .fill(t::alpha(color, 40))
         .corner_radius(t::RADIUS_SM)
         .inner_margin(egui::Margin::symmetric(5, 2))
         .show(ui, |ui| {
@@ -1328,15 +1313,9 @@ fn role_pill(ui: &mut egui::Ui, text: &str, color: Color32) {
 /// Render a small text badge pill (fallback when image is unavailable).
 fn badge_text_pill(ui: &mut egui::Ui, name: &str) {
     let (fill, text_col) = if t::is_light() {
-        (
-            Color32::from_rgba_unmultiplied(80, 80, 100, 50),
-            Color32::from_rgb(50, 50, 65),
-        )
+        (t::pill_bg(), t::text_secondary())
     } else {
-        (
-            Color32::from_rgba_unmultiplied(80, 80, 100, 140),
-            Color32::from_rgb(210, 210, 220),
-        )
+        (t::pill_bg(), t::text_primary())
     };
     egui::Frame::new()
         .fill(fill)

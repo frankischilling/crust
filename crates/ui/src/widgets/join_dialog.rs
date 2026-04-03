@@ -1,4 +1,5 @@
 use crust_core::model::ChannelId;
+use crate::theme as t;
 
 /// Simple popup for joining a channel by name.
 ///
@@ -97,7 +98,7 @@ impl JoinDialog {
                     ui.label(
                         egui::RichText::new(err)
                             .small()
-                            .color(egui::Color32::from_rgb(220, 110, 110)),
+                            .color(t::red()),
                     );
                 }
             });

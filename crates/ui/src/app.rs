@@ -838,7 +838,7 @@ fn apply_theme_visuals(ctx: &egui::Context) {
 
     vis.widgets.active.weak_bg_fill = t::accent_dim();
     vis.widgets.active.bg_fill = t::accent_dim();
-    vis.widgets.active.fg_stroke = egui::Stroke::new(1.0, Color32::WHITE);
+    vis.widgets.active.fg_stroke = egui::Stroke::new(1.0, t::text_on_accent());
     vis.widgets.active.bg_stroke = egui::Stroke::new(1.0, t::accent());
     vis.widgets.active.corner_radius = t::RADIUS;
 
@@ -1604,11 +1604,7 @@ exit 1
         let title_chars = ((pane_width / 9.0) as usize).clamp(12, 26);
         let preview_chars = ((pane_width / 6.0) as usize).clamp(20, 60);
         let row_height = if compact_layout { 56.0 } else { 64.0 };
-        let selected_fill = if t::is_light() {
-            Color32::from_rgb(225, 218, 246)
-        } else {
-            Color32::from_rgb(49, 39, 73)
-        };
+        let selected_fill = t::whisper_selected_bg();
         let idle_fill = if t::is_light() {
             t::bg_dialog()
         } else {
@@ -1706,7 +1702,7 @@ exit 1
                                                 ui,
                                                 compact_badge_count(unread).to_string(),
                                                 t::gold(),
-                                                Color32::from_rgba_unmultiplied(170, 120, 20, 50),
+                                                t::warning_soft_bg(),
                                             );
                                         }
                                     },
@@ -1747,37 +1743,13 @@ exit 1
             .get(current_thread)
             .cloned()
             .unwrap_or_default();
-        let self_fill = if t::is_light() {
-            Color32::from_rgb(227, 219, 248)
-        } else {
-            Color32::from_rgb(63, 49, 96)
-        };
-        let self_stroke = if t::is_light() {
-            Color32::from_rgb(153, 128, 214)
-        } else {
-            Color32::from_rgb(120, 98, 182)
-        };
-        let self_text = if t::is_light() {
-            Color32::from_rgb(31, 24, 52)
-        } else {
-            Color32::from_rgb(242, 236, 255)
-        };
-        let self_meta = if t::is_light() {
-            Color32::from_rgb(92, 74, 142)
-        } else {
-            Color32::from_rgb(186, 168, 232)
-        };
+        let self_fill = t::whisper_self_fill();
+        let self_stroke = t::whisper_self_stroke();
+        let self_text = t::whisper_self_text();
+        let self_meta = t::whisper_self_meta();
 
-        let other_fill = if t::is_light() {
-            Color32::from_rgb(245, 246, 252)
-        } else {
-            Color32::from_rgb(34, 36, 48)
-        };
-        let other_stroke = if t::is_light() {
-            Color32::from_rgb(203, 206, 224)
-        } else {
-            Color32::from_rgb(62, 66, 88)
-        };
+        let other_fill = t::whisper_other_fill();
+        let other_stroke = t::whisper_other_stroke();
         let other_text = t::text_primary();
         let other_meta = t::text_secondary();
 
@@ -4231,7 +4203,7 @@ impl eframe::App for CrustApp {
                                         ui.label(
                                             RichText::new(format!(" AutoMod: {reason} "))
                                                 .font(t::small())
-                                                .color(Color32::WHITE)
+                                                .color(t::text_on_accent())
                                                 .background_color(t::red()),
                                         );
                                     }
@@ -4942,9 +4914,7 @@ impl eframe::App for CrustApp {
                                                             ui,
                                                             compact_badge_count(mentions),
                                                             t::yellow(),
-                                                            Color32::from_rgba_unmultiplied(
-                                                                200, 160, 20, 36,
-                                                            ),
+                                                            t::warning_soft_bg(),
                                                         );
                                                     } else if unread > 0 {
                                                         channel_tab_badge(
@@ -5013,17 +4983,9 @@ impl eframe::App for CrustApp {
                                                 );
                                                 let painter = ui.ctx().layer_painter(layer_id);
                                                 let fill = if is_outside {
-                                                    Color32::from_rgba_unmultiplied(
-                                                        60, 140, 90, 210,
-                                                    )
+                                                    t::split_success_bg()
                                                 } else {
-                                                    let ac = t::accent();
-                                                    Color32::from_rgba_unmultiplied(
-                                                        ac.r(),
-                                                        ac.g(),
-                                                        ac.b(),
-                                                        200,
-                                                    )
+                                                    t::alpha(t::accent(), 200)
                                                 };
                                                 painter.rect_filled(
                                                     ghost_rect,
@@ -5035,7 +4997,7 @@ impl eframe::App for CrustApp {
                                                     egui::Align2::CENTER_CENTER,
                                                     ch.display_name(),
                                                     t::small(),
-                                                    Color32::WHITE,
+                                                    t::text_on_accent(),
                                                 );
                                                 if is_outside {
                                                     painter.text(
@@ -5046,9 +5008,7 @@ impl eframe::App for CrustApp {
                                                         egui::Align2::CENTER_TOP,
                                                         "Split view",
                                                         t::small(),
-                                                        Color32::from_rgba_unmultiplied(
-                                                            200, 255, 200, 180,
-                                                        ),
+                                                        t::split_success_text(),
                                                     );
                                                 }
                                             }
@@ -5306,7 +5266,7 @@ impl eframe::App for CrustApp {
                                 ui.painter().rect_filled(
                                     highlight_rect,
                                     egui::CornerRadius::ZERO,
-                                    Color32::from_rgba_unmultiplied(ac.r(), ac.g(), ac.b(), highlight_alpha),
+                                    t::alpha(ac, highlight_alpha),
                                 );
                             }
                             if sep_resp.dragged() {
@@ -6094,10 +6054,10 @@ impl eframe::App for CrustApp {
                     ui.painter().rect(
                         zone_rect,
                         egui::CornerRadius::same(8),
-                        Color32::from_rgba_unmultiplied(ac.r(), ac.g(), ac.b(), alpha),
+                        t::alpha(ac, alpha),
                         egui::Stroke::new(
                             2.0,
-                            Color32::from_rgba_unmultiplied(ac.r(), ac.g(), ac.b(), border_alpha),
+                            t::alpha(ac, border_alpha),
                         ),
                         egui::epaint::StrokeKind::Outside,
                     );
@@ -6107,12 +6067,7 @@ impl eframe::App for CrustApp {
                         egui::Align2::CENTER_CENTER,
                         "Drop to split",
                         t::heading(),
-                        Color32::from_rgba_unmultiplied(
-                            255,
-                            255,
-                            255,
-                            (120.0 + pulse * 100.0) as u8,
-                        ),
+                        t::alpha(t::text_on_accent(), (120.0 + pulse * 100.0) as u8),
                     );
                 });
             ctx.request_repaint();
@@ -6147,20 +6102,10 @@ impl eframe::App for CrustApp {
                 .order(egui::Order::Foreground)
                 .interactable(false)
                 .show(ctx, |ui| {
-                    let border_col = Color32::from_rgba_unmultiplied(
-                        toast.hue.r(),
-                        toast.hue.g(),
-                        toast.hue.b(),
-                        (160.0 * opacity) as u8,
-                    );
+                    let border_col = t::alpha(toast.hue, (160.0 * opacity) as u8);
                     let fill_col = {
                         let o = t::overlay_fill();
-                        Color32::from_rgba_unmultiplied(
-                            o.r(),
-                            o.g(),
-                            o.b(),
-                            (225.0 * opacity) as u8,
-                        )
+                        t::alpha(o, (225.0 * opacity) as u8)
                     };
                     let frame_resp = egui::Frame::new()
                         .fill(fill_col)
@@ -6172,7 +6117,7 @@ impl eframe::App for CrustApp {
                             ui.label(
                                 RichText::new(&toast.text)
                                     .font(t::body())
-                                    .color(Color32::WHITE),
+                                    .color(t::text_on_accent()),
                             );
                         });
 
@@ -6192,12 +6137,7 @@ impl eframe::App for CrustApp {
                                 2 => t::accent(),
                                 _ => t::bits_orange(),
                             };
-                            let col = Color32::from_rgba_unmultiplied(
-                                c.r(),
-                                c.g(),
-                                c.b(),
-                                (180.0 * opacity) as u8,
-                            );
+                            let col = t::alpha(c, (180.0 * opacity) as u8);
                             painter.circle_filled(
                                 egui::pos2(x, y),
                                 1.6 + (n % 3) as f32 * 0.45,

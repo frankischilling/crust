@@ -344,7 +344,7 @@ fn draw_account_row(
                 ui.label(
                     RichText::new("★ Auto-login")
                         .font(egui::FontId::proportional(10.0))
-                        .color(egui::Color32::from_rgb(220, 180, 50)),
+                        .color(t::gold()),
                 );
             }
         });
@@ -393,7 +393,7 @@ fn draw_account_row(
             // Default-account star toggle (rendered last = leftmost in RTL)
             let star = if is_default { "★" } else { "☆" };
             let star_color = if is_default {
-                egui::Color32::from_rgb(220, 180, 50)
+                t::gold()
             } else {
                 t::text_muted()
             };

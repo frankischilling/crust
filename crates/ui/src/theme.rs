@@ -123,6 +123,15 @@ pub fn text_muted() -> Color32 {
         Color32::from_rgb(72, 72, 90)
     }
 }
+/// High-contrast text for colored pills/buttons.
+#[inline]
+pub fn text_on_accent() -> Color32 {
+    if is_light() {
+        Color32::from_rgb(255, 255, 255)
+    } else {
+        Color32::from_rgb(246, 244, 255)
+    }
+}
 
 /// Twitch-ish purple accent – buttons, highlights, username.
 #[inline]
@@ -259,6 +268,22 @@ pub fn raid_cyan() -> Color32 {
 #[inline]
 pub fn bits_orange() -> Color32 {
     Color32::from_rgb(255, 160, 50)
+}
+
+/// Kick platform green.
+#[inline]
+pub fn kick_green() -> Color32 {
+    if is_light() {
+        Color32::from_rgb(56, 182, 36)
+    } else {
+        Color32::from_rgb(83, 252, 24)
+    }
+}
+
+/// Apply alpha to an RGB color while preserving channels.
+#[inline]
+pub fn alpha(color: Color32, a: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), a)
 }
 
 // Stroke styles
@@ -403,6 +428,134 @@ pub fn info_bg() -> Color32 {
         Color32::from_rgba_premultiplied(90, 130, 220, 24)
     } else {
         Color32::from_rgba_premultiplied(85, 115, 210, 48)
+    }
+}
+
+/// Subtle red-tinted background for destructive notices.
+#[inline]
+pub fn danger_soft_bg() -> Color32 {
+    alpha(red(), if is_light() { 24 } else { 36 })
+}
+
+/// Strong destructive fill for critical action buttons.
+#[inline]
+pub fn danger_strong_bg() -> Color32 {
+    alpha(red(), if is_light() { 208 } else { 224 })
+}
+
+/// Soft amber background for warnings/highlights.
+#[inline]
+pub fn warning_soft_bg() -> Color32 {
+    alpha(yellow(), if is_light() { 28 } else { 44 })
+}
+
+/// Strong success fill for positive action buttons.
+#[inline]
+pub fn success_strong_bg() -> Color32 {
+    alpha(green(), if is_light() { 198 } else { 212 })
+}
+
+/// Neutral dark scrim used behind dense log rows/cards.
+#[inline]
+pub fn scrim_bg() -> Color32 {
+    if is_light() {
+        Color32::from_rgba_unmultiplied(0, 0, 0, 20)
+    } else {
+        Color32::from_rgba_unmultiplied(0, 0, 0, 60)
+    }
+}
+
+/// Drag ghost tint when dropping to split view.
+#[inline]
+pub fn split_success_bg() -> Color32 {
+    alpha(green(), if is_light() { 210 } else { 220 })
+}
+
+/// Split-view helper label color.
+#[inline]
+pub fn split_success_text() -> Color32 {
+    alpha(green().gamma_multiply(1.6), if is_light() { 210 } else { 190 })
+}
+
+/// Whisper thread selected row background.
+#[inline]
+pub fn whisper_selected_bg() -> Color32 {
+    if is_light() {
+        Color32::from_rgb(225, 218, 246)
+    } else {
+        Color32::from_rgb(49, 39, 73)
+    }
+}
+
+/// Outgoing whisper bubble colors.
+#[inline]
+pub fn whisper_self_fill() -> Color32 {
+    if is_light() {
+        Color32::from_rgb(227, 219, 248)
+    } else {
+        Color32::from_rgb(63, 49, 96)
+    }
+}
+#[inline]
+pub fn whisper_self_stroke() -> Color32 {
+    if is_light() {
+        Color32::from_rgb(153, 128, 214)
+    } else {
+        Color32::from_rgb(120, 98, 182)
+    }
+}
+#[inline]
+pub fn whisper_self_text() -> Color32 {
+    if is_light() {
+        Color32::from_rgb(31, 24, 52)
+    } else {
+        Color32::from_rgb(242, 236, 255)
+    }
+}
+#[inline]
+pub fn whisper_self_meta() -> Color32 {
+    if is_light() {
+        Color32::from_rgb(92, 74, 142)
+    } else {
+        Color32::from_rgb(186, 168, 232)
+    }
+}
+
+/// Incoming whisper bubble colors.
+#[inline]
+pub fn whisper_other_fill() -> Color32 {
+    if is_light() {
+        Color32::from_rgb(245, 246, 252)
+    } else {
+        Color32::from_rgb(34, 36, 48)
+    }
+}
+#[inline]
+pub fn whisper_other_stroke() -> Color32 {
+    if is_light() {
+        Color32::from_rgb(203, 206, 224)
+    } else {
+        Color32::from_rgb(62, 66, 88)
+    }
+}
+
+/// Background for perf sparklines.
+#[inline]
+pub fn sparkline_bg() -> Color32 {
+    if is_light() {
+        Color32::from_rgb(240, 243, 247)
+    } else {
+        Color32::from_rgb(28, 31, 38)
+    }
+}
+
+/// Accent line color in perf sparkline.
+#[inline]
+pub fn sparkline_stroke() -> Color32 {
+    if is_light() {
+        Color32::from_rgb(50, 150, 98)
+    } else {
+        Color32::from_rgb(90, 200, 140)
     }
 }
 

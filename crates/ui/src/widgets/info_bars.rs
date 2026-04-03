@@ -140,9 +140,9 @@ pub fn show_channel_info_bars(
                                 let status_text = if s.is_live { "LIVE" } else { "OFFLINE" };
                                 let status_col = if s.is_live { t::red() } else { t::text_muted() };
                                 let status_bg = if s.is_live {
-                                    Color32::from_rgba_unmultiplied(200, 45, 45, 30)
+                                    t::danger_soft_bg()
                                 } else {
-                                    Color32::from_rgba_unmultiplied(120, 120, 120, 20)
+                                    t::alpha(t::text_muted(), 20)
                                 };
 
                                 egui::Frame::new()
@@ -342,7 +342,7 @@ pub fn show_channel_info_bars(
                 .exact_height(24.0)
                 .frame(
                     Frame::new()
-                        .fill(Color32::from_rgba_unmultiplied(255, 215, 0, 18))
+                        .fill(t::warning_soft_bg())
                         .inner_margin(egui::Margin::symmetric(8, 3))
                         .stroke(egui::Stroke::new(1.0, t::gold().gamma_multiply(0.45))),
                 )
@@ -379,12 +379,7 @@ pub fn show_channel_info_bars(
 /// Render a tiny colored pill label (used for room-state modes in the stream bar).
 fn room_state_pill(ui: &mut egui::Ui, text: &str, color: Color32) {
     egui::Frame::new()
-        .fill(Color32::from_rgba_unmultiplied(
-            color.r(),
-            color.g(),
-            color.b(),
-            20,
-        ))
+        .fill(t::alpha(color, 20))
         .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.4)))
         .corner_radius(t::RADIUS_SM)
         .inner_margin(egui::Margin::symmetric(5, 0))

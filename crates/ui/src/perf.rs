@@ -10,6 +10,7 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
+use crate::theme as t;
 use crate::widgets::message_list::MessageListPerfStats;
 use egui::{Color32, Context, RichText, Window};
 
@@ -131,7 +132,7 @@ impl PerfOverlay {
                     .spacing([16.0, 4.0])
                     .show(ui, |ui| {
                         // FPS
-                        ui.label(RichText::new("FPS").color(Color32::GRAY));
+                        ui.label(RichText::new("FPS").color(t::text_muted()));
                         ui.label(
                             RichText::new(format!("{fps:.1}"))
                                 .color(fps_color(fps))
@@ -140,25 +141,25 @@ impl PerfOverlay {
                         ui.end_row();
 
                         // Frame time
-                        ui.label(RichText::new("Frame (avg)").color(Color32::GRAY));
+                        ui.label(RichText::new("Frame (avg)").color(t::text_muted()));
                         ui.label(format!("{avg_ms:.2} ms"));
                         ui.end_row();
 
-                        ui.label(RichText::new("Frame (worst)").color(Color32::GRAY));
+                        ui.label(RichText::new("Frame (worst)").color(t::text_muted()));
                         ui.label(RichText::new(format!("{worst_ms:.2} ms")).color(
                             if worst_ms > 33.0 {
-                                Color32::YELLOW
+                                t::yellow()
                             } else {
-                                Color32::WHITE
+                                t::text_primary()
                             },
                         ));
                         ui.end_row();
 
-                        ui.label(RichText::new("Frame (best)").color(Color32::GRAY));
+                        ui.label(RichText::new("Frame (best)").color(t::text_muted()));
                         ui.label(format!("{best_ms:.2} ms"));
                         ui.end_row();
 
-                        ui.label(RichText::new("FPS trend").color(Color32::GRAY));
+                        ui.label(RichText::new("FPS trend").color(t::text_muted()));
                         draw_sparkline(ui, &self.fps_timeline, 180.0, 36.0);
                         ui.end_row();
 
@@ -167,26 +168,26 @@ impl PerfOverlay {
                         ui.end_row();
 
                         // Events
-                        ui.label(RichText::new("Events/frame").color(Color32::GRAY));
+                        ui.label(RichText::new("Events/frame").color(t::text_muted()));
                         ui.label(format!("{avg_events:.2}"));
                         ui.end_row();
 
-                        ui.label(RichText::new("Events total").color(Color32::GRAY));
+                        ui.label(RichText::new("Events total").color(t::text_muted()));
                         ui.label(format!("{}", self.total_events));
                         ui.end_row();
 
-                        ui.label(RichText::new("Frames total").color(Color32::GRAY));
+                        ui.label(RichText::new("Frames total").color(t::text_muted()));
                         ui.label(format!("{}", self.total_frames));
                         ui.end_row();
 
                         // Repaint efficiency
-                        ui.label(RichText::new("Repaint efficiency").color(Color32::GRAY));
+                        ui.label(RichText::new("Repaint efficiency").color(t::text_muted()));
                         ui.label(
                             RichText::new(format!("{repaint_pct:.1}% event-driven")).color(
                                 if repaint_pct < 5.0 {
-                                    Color32::GREEN // mostly idle - good
+                                    t::green() // mostly idle - good
                                 } else {
-                                    Color32::WHITE
+                                    t::text_primary()
                                 },
                             ),
                         );
@@ -197,11 +198,11 @@ impl PerfOverlay {
                         ui.end_row();
 
                         // Emote cache
-                        ui.label(RichText::new("Emotes cached").color(Color32::GRAY));
+                        ui.label(RichText::new("Emotes cached").color(t::text_muted()));
                         ui.label(format!("{}", self.emote_count));
                         ui.end_row();
 
-                        ui.label(RichText::new("Emote RAM ~").color(Color32::GRAY));
+                        ui.label(RichText::new("Emote RAM ~").color(t::text_muted()));
                         let (val, unit) = human_bytes(self.emote_ram_kb * 1024);
                         ui.label(format!("{val:.1} {unit}"));
                         ui.end_row();
@@ -210,27 +211,27 @@ impl PerfOverlay {
                         ui.separator();
                         ui.end_row();
 
-                        ui.label(RichText::new("Rows retained").color(Color32::GRAY));
+                        ui.label(RichText::new("Rows retained").color(t::text_muted()));
                         ui.label(format!("{}", self.chat_stats.retained_rows));
                         ui.end_row();
 
-                        ui.label(RichText::new("Rows active").color(Color32::GRAY));
+                        ui.label(RichText::new("Rows active").color(t::text_muted()));
                         ui.label(format!("{}", self.chat_stats.active_rows));
                         ui.end_row();
 
-                        ui.label(RichText::new("Rows rendered").color(Color32::GRAY));
+                        ui.label(RichText::new("Rows rendered").color(t::text_muted()));
                         ui.label(format!("{}", self.chat_stats.rendered_rows));
                         ui.end_row();
 
-                        ui.label(RichText::new("Rows hidden").color(Color32::GRAY));
+                        ui.label(RichText::new("Rows hidden").color(t::text_muted()));
                         ui.label(format!("{}", self.chat_stats.boundary_hidden_rows));
                         ui.end_row();
 
-                        ui.label(RichText::new("Prefix rebuilds").color(Color32::GRAY));
+                        ui.label(RichText::new("Prefix rebuilds").color(t::text_muted()));
                         ui.label(format!("{}", self.chat_stats.prefix_rebuilds));
                         ui.end_row();
 
-                        ui.label(RichText::new("Height misses").color(Color32::GRAY));
+                        ui.label(RichText::new("Height misses").color(t::text_muted()));
                         ui.label(format!("{}", self.chat_stats.height_cache_misses));
                         ui.end_row();
                     });
@@ -263,11 +264,11 @@ fn avg_u32(buf: &VecDeque<u32>) -> f32 {
 
 fn fps_color(fps: f32) -> Color32 {
     if fps >= 55.0 {
-        Color32::GREEN
+        t::green()
     } else if fps >= 30.0 {
-        Color32::YELLOW
+        t::yellow()
     } else {
-        Color32::RED
+        t::red()
     }
 }
 
@@ -291,11 +292,7 @@ fn sparkline_points(samples: &VecDeque<f32>, width: f32, height: f32) -> Vec<egu
 
 fn draw_sparkline(ui: &mut egui::Ui, samples: &VecDeque<f32>, width: f32, height: f32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
-    let bg = if ui.visuals().dark_mode {
-        Color32::from_rgb(28, 31, 38)
-    } else {
-        Color32::from_rgb(240, 243, 247)
-    };
+    let bg = t::sparkline_bg();
     ui.painter()
         .rect_filled(rect, egui::CornerRadius::same(4), bg);
     let points = sparkline_points(samples, rect.width(), rect.height())
@@ -305,7 +302,7 @@ fn draw_sparkline(ui: &mut egui::Ui, samples: &VecDeque<f32>, width: f32, height
     if points.len() >= 2 {
         ui.painter().add(egui::Shape::line(
             points,
-            egui::Stroke::new(1.5, Color32::from_rgb(90, 200, 140)),
+            egui::Stroke::new(1.5, t::sparkline_stroke()),
         ));
     }
 }

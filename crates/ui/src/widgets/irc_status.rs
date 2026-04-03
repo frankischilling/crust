@@ -1315,11 +1315,11 @@ impl IrcStatusPanel {
             .show(ui, |ui| {
                 for line in server.event_log.iter().rev().take(220) {
                     let color = if line.contains("[error]") {
-                        Color32::from_rgb(240, 130, 130)
+                        t::red().gamma_multiply(1.15)
                     } else if line.contains("[conn]") {
                         t::accent()
                     } else if line.contains("[auth]") {
-                        Color32::from_rgb(215, 190, 120)
+                        t::yellow()
                     } else {
                         t::text_secondary()
                     };
