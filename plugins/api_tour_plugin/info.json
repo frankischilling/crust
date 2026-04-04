@@ -1,0 +1,9 @@
+{
+  "name": "API Tour Plugin",
+  "description": "Shows account info, channel info, messages, timers, and settings-aware formatting.",
+  "authors": ["Crust"],
+  "version": "1.0.0",
+  "license": "MIT",
+  "permissions": [],
+  "entry": "init.lua"
+}

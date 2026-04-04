@@ -1,0 +1,9 @@
+{
+  "name": "Loader Progress Demo Plugin",
+  "description": "Low-level image and emote loader event example.",
+  "authors": ["Crust"],
+  "version": "1.0.0",
+  "license": "MIT",
+  "permissions": [],
+  "entry": "init.lua"
+}

@@ -1,0 +1,9 @@
+{
+  "name": "UI Settings Demo",
+  "description": "Declarative plugin settings-page example for the Lua UI API.",
+  "authors": ["Crust"],
+  "version": "1.0.0",
+  "license": "MIT",
+  "permissions": [],
+  "entry": "init.lua"
+}

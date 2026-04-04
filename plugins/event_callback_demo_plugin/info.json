@@ -1,0 +1,9 @@
+{
+  "name": "Event Callback Demo Plugin",
+  "description": "Focused example of callback registration and fetch-result events.",
+  "authors": ["Crust"],
+  "version": "1.0.0",
+  "license": "MIT",
+  "permissions": [],
+  "entry": "init.lua"
+}

@@ -1,0 +1,9 @@
+{
+  "name": "Channel Toolbox Plugin",
+  "description": "Channel lookup and message manipulation example.",
+  "authors": ["Crust"],
+  "version": "1.0.0",
+  "license": "MIT",
+  "permissions": [],
+  "entry": "init.lua"
+}

@@ -1,0 +1,9 @@
+{
+  "name": "Timer Plugin",
+  "description": "Delayed local message example.",
+  "authors": ["Crust"],
+  "version": "1.0.0",
+  "license": "MIT",
+  "permissions": [],
+  "entry": "init.lua"
+}
