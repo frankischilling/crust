@@ -235,24 +235,24 @@ impl<'a> ChannelList<'a> {
                                 // Live-status indicator dot.
                                 if self.show_live_indicator {
                                     if let Some(live_map) = self.live_channels {
-                                    if let Some(&is_live) = live_map.get(ch.display_name()) {
-                                        let dot_r = 3.5_f32;
-                                        let (dot_rect, _) = ui.allocate_exact_size(
-                                            egui::vec2(dot_r * 2.0 + 2.0, dot_r * 2.0),
-                                            egui::Sense::hover(),
-                                        );
-                                        let dot_col = if is_live {
-                                            t::red()
-                                        } else {
-                                            t::alpha(t::text_secondary(), 70)
-                                        };
-                                        ui.painter().circle_filled(
-                                            dot_rect.center(),
-                                            dot_r,
-                                            dot_col,
-                                        );
+                                        if let Some(&is_live) = live_map.get(ch.display_name()) {
+                                            let dot_r = 3.5_f32;
+                                            let (dot_rect, _) = ui.allocate_exact_size(
+                                                egui::vec2(dot_r * 2.0 + 2.0, dot_r * 2.0),
+                                                egui::Sense::hover(),
+                                            );
+                                            let dot_col = if is_live {
+                                                t::red()
+                                            } else {
+                                                t::alpha(t::text_secondary(), 70)
+                                            };
+                                            ui.painter().circle_filled(
+                                                dot_rect.center(),
+                                                dot_r,
+                                                dot_col,
+                                            );
+                                        }
                                     }
-                                }
                                 }
 
                                 // Platform badge for non-Twitch channels
@@ -282,7 +282,7 @@ impl<'a> ChannelList<'a> {
                                 let name_text = if unread_mentions > 0 {
                                     RichText::new(format!("{prefix}{display}"))
                                         .font(t::body())
-                                        .color(t::yellow())
+                                        .color(t::text_primary())
                                         .strong()
                                 } else if unread_count > 0 {
                                     RichText::new(format!("{prefix}{display}"))
@@ -313,18 +313,24 @@ impl<'a> ChannelList<'a> {
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
                                         if unread_mentions > 0 {
-                                            // Mentions / highlights badge - amber
+                                            // Mentions / highlights badge - semantic warning pill.
                                             let label = if unread_mentions > 99 {
                                                 "99+".to_owned()
                                             } else {
                                                 format!("{unread_mentions}")
                                             };
-                                            ui.label(
-                                                RichText::new(label)
-                                                    .font(t::small())
-                                                    .strong()
-                                                    .color(t::yellow()),
-                                            );
+                                            egui::Frame::new()
+                                                .fill(t::mention_pill_bg())
+                                                .corner_radius(t::RADIUS_SM)
+                                                .inner_margin(egui::Margin::symmetric(5, 0))
+                                                .show(ui, |ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(label)
+                                                            .font(t::tiny())
+                                                            .strong()
+                                                            .color(t::text_primary()),
+                                                    );
+                                                });
                                         } else if unread_count > 0 {
                                             // Plain unreads badge - muted
                                             let label = if unread_count > 99 {

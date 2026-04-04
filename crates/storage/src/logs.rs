@@ -187,7 +187,9 @@ impl LogStore {
              ORDER BY MAX(ts_ms) DESC
              LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![like_pattern, safe_limit], |row| row.get::<_, String>(0))?;
+        let rows = stmt.query_map(params![like_pattern, safe_limit], |row| {
+            row.get::<_, String>(0)
+        })?;
 
         let mut out = Vec::new();
         for row in rows {

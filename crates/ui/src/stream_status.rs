@@ -1,4 +1,6 @@
-use crust_core::notifications::{NotificationController, LiveNotification, OfflineNotification, Platform, WatchedChannel};
+use crust_core::notifications::{
+    LiveNotification, NotificationController, OfflineNotification, Platform, WatchedChannel,
+};
 
 /// Stream status tracker that manages live/offline transitions and fires notifications.
 #[derive(Debug, Clone)]
@@ -14,8 +16,14 @@ impl StreamStatusTracker {
     }
 
     /// Add a channel to watch for live status.
-    pub fn watch_channel(&mut self, channel_name: String, platform: Platform, channel_id: Option<String>) {
-        self.controller.add_channel(channel_name, platform, channel_id);
+    pub fn watch_channel(
+        &mut self,
+        channel_name: String,
+        platform: Platform,
+        channel_id: Option<String>,
+    ) {
+        self.controller
+            .add_channel(channel_name, platform, channel_id);
     }
 
     /// Remove a channel from the watch list.
@@ -38,7 +46,10 @@ impl StreamStatusTracker {
         game: Option<String>,
         viewer_count: Option<u32>,
     ) -> Option<StreamStatusUpdate> {
-        if let Some(went_live) = self.controller.update_live_status(channel_name, platform, is_live) {
+        if let Some(went_live) = self
+            .controller
+            .update_live_status(channel_name, platform, is_live)
+        {
             if went_live {
                 return Some(StreamStatusUpdate::Live(LiveNotification {
                     channel_id: String::new(),
@@ -151,8 +162,16 @@ mod tests {
     fn get_twitch_channel_ids() {
         let mut tracker = StreamStatusTracker::new();
         tracker.watch_channel("xqc".to_owned(), Platform::Twitch, Some("123".to_owned()));
-        tracker.watch_channel("forsen".to_owned(), Platform::Twitch, Some("456".to_owned()));
-        tracker.watch_channel("kick_user".to_owned(), Platform::Kick, Some("789".to_owned()));
+        tracker.watch_channel(
+            "forsen".to_owned(),
+            Platform::Twitch,
+            Some("456".to_owned()),
+        );
+        tracker.watch_channel(
+            "kick_user".to_owned(),
+            Platform::Kick,
+            Some("789".to_owned()),
+        );
 
         let ids = tracker.get_twitch_channel_ids();
         assert_eq!(ids.len(), 2);
@@ -164,7 +183,11 @@ mod tests {
     fn export_and_import_channels() {
         let mut tracker = StreamStatusTracker::new();
         tracker.watch_channel("xqc".to_owned(), Platform::Twitch, Some("123".to_owned()));
-        tracker.watch_channel("forsen".to_owned(), Platform::Twitch, Some("456".to_owned()));
+        tracker.watch_channel(
+            "forsen".to_owned(),
+            Platform::Twitch,
+            Some("456".to_owned()),
+        );
 
         let exported = tracker.export_channels();
 

@@ -480,8 +480,15 @@ impl TwitchSession {
                 }
             }
             "WHISPER" => {
-                if let Some((from_login, from_display_name, target_login, text, twitch_emotes, is_self, timestamp)) =
-                    self.parse_whisper(msg)
+                if let Some((
+                    from_login,
+                    from_display_name,
+                    target_login,
+                    text,
+                    twitch_emotes,
+                    is_self,
+                    timestamp,
+                )) = self.parse_whisper(msg)
                 {
                     self.emit(TwitchEvent::Whisper {
                         from_login,
@@ -1039,14 +1046,12 @@ fn is_pinned_chat_message(tags: &crate::irc::types::IrcTags) -> bool {
 }
 
 fn extract_server_message_id(tags: &crate::irc::types::IrcTags) -> Option<String> {
-    ["id", "source-id"]
-        .into_iter()
-        .find_map(|key| {
-            tags.get(key)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-        })
+    ["id", "source-id"].into_iter().find_map(|key| {
+        tags.get(key)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    })
 }
 
 /// Decode a Twitch sub-plan code to a human-readable tier name.

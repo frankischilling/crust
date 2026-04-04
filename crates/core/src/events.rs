@@ -1,11 +1,14 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::highlight::HighlightRule;
 use crate::model::{
-    Badge, ChannelId, ChatMessage, EmoteCatalogEntry, ModActionPreset, ReplyInfo,
-    SenderNamePaint, SystemNotice, TwitchEmotePos, UserProfile,
+    Badge, ChannelId, ChatMessage, EmoteCatalogEntry, ModActionPreset, ReplyInfo, SenderNamePaint,
+    SystemNotice, TwitchEmotePos, UserProfile,
 };
+use crate::plugins::{PluginUiSurfaceKind, PluginUiValue};
 
 /// A single chat log entry from the IVR logs API.
 #[derive(Debug, Clone)]
@@ -117,6 +120,26 @@ pub enum AppCommand {
         login: String,
         user_id: String,
     },
+    /// Warn a user in a channel via the Twitch Helix API.
+    WarnUser {
+        channel: ChannelId,
+        login: String,
+        user_id: String,
+        reason: String,
+    },
+    /// Mark a user as monitored/restricted suspicious via the Twitch Helix API.
+    SetSuspiciousUser {
+        channel: ChannelId,
+        login: String,
+        user_id: String,
+        restricted: bool,
+    },
+    /// Remove a user from suspicious-user treatment via the Twitch Helix API.
+    ClearSuspiciousUser {
+        channel: ChannelId,
+        login: String,
+        user_id: String,
+    },
     /// Approve or deny a held AutoMod message via Twitch Helix.
     ResolveAutoModMessage {
         channel: ChannelId,
@@ -126,9 +149,7 @@ pub enum AppCommand {
         action: String,
     },
     /// Fetch pending unban requests for a channel via Twitch Helix.
-    FetchUnbanRequests {
-        channel: ChannelId,
-    },
+    FetchUnbanRequests { channel: ChannelId },
     /// Approve or deny a pending unban request via Twitch Helix.
     ResolveUnbanRequest {
         channel: ChannelId,
@@ -159,6 +180,21 @@ pub enum AppCommand {
     InjectLocalMessage { channel: ChannelId, text: String },
     /// Opens the user-card popup for the given login in a channel.
     ShowUserCard { login: String, channel: ChannelId },
+    /// Execute a command registered by a plugin.
+    RunPluginCommand {
+        channel: ChannelId,
+        command: String,
+        words: Vec<String>,
+        #[serde(default)]
+        reply_to_msg_id: Option<String>,
+        #[serde(default)]
+        reply: Option<ReplyInfo>,
+        raw_text: String,
+    },
+    /// Reload all plugins from disk.
+    ReloadPlugins,
+    /// Run a delayed Lua callback on the main app thread.
+    RunPluginCallback { vm_key: usize, callback_ref: i32 },
     /// Fetch Open-Graph / Twitter-Card metadata for a URL to show a hover preview.
     FetchLinkPreview { url: String },
     /// Add a new account by validating and saving the given OAuth token.
@@ -274,10 +310,7 @@ pub enum AppCommand {
     },
     /// End or cancel the active Twitch poll via Helix (`PATCH /helix/polls`).
     /// `status` should be `ARCHIVED` (normal end) or `TERMINATED` (cancel).
-    EndPoll {
-        channel: ChannelId,
-        status: String,
-    },
+    EndPoll { channel: ChannelId, status: String },
     /// Create a Twitch prediction via Helix (`POST /helix/predictions`).
     CreatePrediction {
         channel: ChannelId,
@@ -286,18 +319,14 @@ pub enum AppCommand {
         duration_secs: u32,
     },
     /// Lock the active Twitch prediction via Helix (`PATCH /helix/predictions`, status=LOCKED).
-    LockPrediction {
-        channel: ChannelId,
-    },
+    LockPrediction { channel: ChannelId },
     /// Resolve the active Twitch prediction with a 1-based outcome index.
     ResolvePrediction {
         channel: ChannelId,
         winning_outcome_index: usize,
     },
     /// Cancel the active Twitch prediction via Helix (`PATCH /helix/predictions`, status=CANCELED).
-    CancelPrediction {
-        channel: ChannelId,
-    },
+    CancelPrediction { channel: ChannelId },
     /// Start a Twitch commercial via Helix (`POST /helix/channels/commercial`).
     StartCommercial {
         channel: ChannelId,
@@ -325,10 +354,14 @@ pub enum AppCommand {
         /// Server-assigned message ID (from `ChatMessage::server_id`).
         message_id: String,
     },
+    /// Hide all visible messages from a user locally in the current channel.
+    ClearUserMessagesLocally { channel: ChannelId, login: String },
     /// Persist an updated ordered list of highlight rules.
     SetHighlightRules { rules: Vec<HighlightRule> },
     /// Persist an updated ordered list of filter records.
-    SetFilterRecords { records: Vec<crate::model::FilterRecord> },
+    SetFilterRecords {
+        records: Vec<crate::model::FilterRecord>,
+    },
     /// Persist an updated ordered list of moderation action presets.
     SetModActionPresets { presets: Vec<ModActionPreset> },
     /// Refresh authentication after a 401 — re-validate the stored token.
@@ -595,6 +628,11 @@ pub enum AppEvent {
         message_id: String,
         action: Option<String>,
     },
+    /// Hide all visible messages from a user in a channel locally.
+    ClearUserMessagesLocally {
+        channel: ChannelId,
+        login: String,
+    },
     /// Unban requests snapshot loaded for a channel.
     UnbanRequestsLoaded {
         channel: ChannelId,
@@ -621,13 +659,52 @@ pub enum AppEvent {
         channel: Option<ChannelId>,
     },
     /// Updated highlight rules list (sent after persistence).
-    HighlightRulesUpdated { rules: Vec<HighlightRule> },
+    HighlightRulesUpdated {
+        rules: Vec<HighlightRule>,
+    },
     /// Updated filter records list.
-    FilterRecordsUpdated { records: Vec<crate::model::FilterRecord> },
+    FilterRecordsUpdated {
+        records: Vec<crate::model::FilterRecord>,
+    },
     /// Updated moderation action preset list.
-    ModActionPresetsUpdated { presets: Vec<ModActionPreset> },
+    ModActionPresetsUpdated {
+        presets: Vec<ModActionPreset>,
+    },
     /// Auth has expired; prompt user to re-authenticate.
     AuthExpired,
+    /// A plugin-owned UI widget emitted an action event.
+    PluginUiAction {
+        plugin_name: String,
+        surface_kind: PluginUiSurfaceKind,
+        surface_id: String,
+        widget_id: String,
+        action: Option<String>,
+        value: Option<PluginUiValue>,
+        form_values: BTreeMap<String, PluginUiValue>,
+    },
+    /// A plugin-owned UI input changed.
+    PluginUiChange {
+        plugin_name: String,
+        surface_kind: PluginUiSurfaceKind,
+        surface_id: String,
+        widget_id: String,
+        value: PluginUiValue,
+        form_values: BTreeMap<String, PluginUiValue>,
+    },
+    /// A plugin-owned UI form or button requested submission.
+    PluginUiSubmit {
+        plugin_name: String,
+        surface_kind: PluginUiSurfaceKind,
+        surface_id: String,
+        widget_id: Option<String>,
+        action: Option<String>,
+        form_values: BTreeMap<String, PluginUiValue>,
+    },
+    /// A plugin-owned floating window was closed by the user.
+    PluginUiWindowClosed {
+        plugin_name: String,
+        window_id: String,
+    },
 }
 
 // ConnectionState: connection status enumeration

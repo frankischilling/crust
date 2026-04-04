@@ -49,6 +49,21 @@ pub enum EventSubNoticeKind {
         from_login: String,
         viewers: u32,
     },
+    ChannelChatUserMessageHold {
+        message_id: String,
+        user_id: String,
+        user_login: String,
+        user_name: String,
+        text: String,
+    },
+    ChannelChatUserMessageUpdate {
+        message_id: String,
+        user_id: String,
+        user_login: String,
+        user_name: String,
+        text: String,
+        status: String,
+    },
     ChannelPointsRedemption {
         user_login: String,
         reward_title: String,
@@ -101,6 +116,35 @@ pub enum EventSubNoticeKind {
     ChannelUnban {
         user_login: String,
     },
+    SuspiciousUserMessage {
+        user_id: String,
+        user_login: String,
+        user_name: String,
+        low_trust_status: String,
+        ban_evasion_evaluation: Option<String>,
+        shared_ban_channel_ids: Vec<String>,
+        types: Vec<String>,
+        text: String,
+    },
+    SuspiciousUserUpdate {
+        user_id: String,
+        user_login: String,
+        user_name: String,
+        moderator_user_id: String,
+        moderator_login: String,
+        moderator_name: String,
+        low_trust_status: String,
+    },
+    UserWhisperMessage {
+        from_user_id: String,
+        from_user_login: String,
+        from_user_name: String,
+        to_user_id: String,
+        to_user_login: String,
+        to_user_name: String,
+        whisper_id: String,
+        text: String,
+    },
     ModerationAction {
         moderator_login: String,
         action: String,
@@ -123,12 +167,8 @@ pub struct EventSubNotice {
 
 #[derive(Debug, Clone)]
 pub enum EventSubEvent {
-    Connected {
-        resumed: bool,
-    },
-    Reconnecting {
-        attempt: u32,
-    },
+    Connected { resumed: bool },
+    Reconnecting { attempt: u32 },
     BackfillRequested,
     Notice(EventSubNotice),
     Error(String),
@@ -179,7 +219,10 @@ impl LruCache {
 }
 
 impl EventSubSession {
-    pub fn new(event_tx: mpsc::Sender<EventSubEvent>, cmd_rx: mpsc::Receiver<EventSubCommand>) -> Self {
+    pub fn new(
+        event_tx: mpsc::Sender<EventSubEvent>,
+        cmd_rx: mpsc::Receiver<EventSubCommand>,
+    ) -> Self {
         Self {
             event_tx,
             cmd_rx,
@@ -218,8 +261,10 @@ impl EventSubSession {
                     }
                 }
                 Err(e) => {
-                    self.emit(EventSubEvent::Error(format!("EventSub connection error: {e}")))
-                        .await;
+                    self.emit(EventSubEvent::Error(format!(
+                        "EventSub connection error: {e}"
+                    )))
+                    .await;
                 }
             }
 
@@ -364,7 +409,7 @@ impl EventSubSession {
                                         .and_then(|m| m.get("subscription_type"))
                                         .and_then(Value::as_str)
                                         .unwrap_or("");
-                                    
+
                                     let event_id = parsed
                                         .get("metadata")
                                         .and_then(|m| m.get("message_id"))
@@ -439,8 +484,7 @@ impl EventSubSession {
                 Ok(r) if r.status() == StatusCode::CONFLICT => {
                     debug!(
                         "EventSub already subscribed (conflict): {} for {}",
-                        spec.kind,
-                        broadcaster_id
+                        spec.kind, broadcaster_id
                     );
                 }
                 Ok(r) => {
@@ -448,18 +492,13 @@ impl EventSubSession {
                     let body = r.text().await.unwrap_or_default();
                     warn!(
                         "EventSub subscribe failed {} for {}: HTTP {} - {}",
-                        spec.kind,
-                        broadcaster_id,
-                        status,
-                        body
+                        spec.kind, broadcaster_id, status, body
                     );
                 }
                 Err(e) => {
                     warn!(
                         "EventSub subscribe request failed {} for {}: {}",
-                        spec.kind,
-                        broadcaster_id,
-                        e
+                        spec.kind, broadcaster_id, e
                     );
                 }
             }
@@ -508,6 +547,22 @@ fn subscription_specs(broadcaster_id: &str, moderator_user_id: &str) -> Vec<Subs
             kind: "channel.subscription.gift",
             version: "1",
             condition: json!({"broadcaster_user_id": bid}),
+        },
+        SubscriptionSpec {
+            kind: "channel.chat.user_message_hold",
+            version: "1",
+            condition: json!({
+                "broadcaster_user_id": bid,
+                "user_id": mid,
+            }),
+        },
+        SubscriptionSpec {
+            kind: "channel.chat.user_message_update",
+            version: "1",
+            condition: json!({
+                "broadcaster_user_id": bid,
+                "user_id": mid,
+            }),
         },
         SubscriptionSpec {
             kind: "channel.raid",
@@ -627,6 +682,29 @@ fn subscription_specs(broadcaster_id: &str, moderator_user_id: &str) -> Vec<Subs
                 "moderator_user_id": mid,
             }),
         });
+        out.push(SubscriptionSpec {
+            kind: "channel.suspicious_user.message",
+            version: "1",
+            condition: json!({
+                "broadcaster_user_id": bid,
+                "moderator_user_id": mid,
+            }),
+        });
+        out.push(SubscriptionSpec {
+            kind: "channel.suspicious_user.update",
+            version: "1",
+            condition: json!({
+                "broadcaster_user_id": bid,
+                "moderator_user_id": mid,
+            }),
+        });
+        out.push(SubscriptionSpec {
+            kind: "user.whisper.message",
+            version: "1",
+            condition: json!({
+                "user_id": mid,
+            }),
+        });
     }
 
     out
@@ -665,7 +743,11 @@ fn parse_notice(root: &Value, sub_type: &str) -> Option<EventSubNotice> {
     let broadcaster_login = event
         .get("broadcaster_user_login")
         .and_then(Value::as_str)
-        .or_else(|| event.get("to_broadcaster_user_login").and_then(Value::as_str))
+        .or_else(|| {
+            event
+                .get("to_broadcaster_user_login")
+                .and_then(Value::as_str)
+        })
         .map(str::to_owned);
 
     let kind = match sub_type {
@@ -725,6 +807,68 @@ fn parse_notice(root: &Value, sub_type: &str) -> Option<EventSubNotice> {
                 .and_then(|v| u32::try_from(v).ok())
                 .unwrap_or(0),
         },
+        "channel.chat.user_message_hold" => EventSubNoticeKind::ChannelChatUserMessageHold {
+            message_id: pick_non_empty(
+                event.get("message_id").and_then(Value::as_str),
+                event.get("id").and_then(Value::as_str),
+                "",
+            )
+            .to_owned(),
+            user_id: pick_non_empty(event.get("user_id").and_then(Value::as_str), Some(""), "")
+                .to_owned(),
+            user_login: pick_non_empty(
+                event.get("user_login").and_then(Value::as_str),
+                event.get("user_name").and_then(Value::as_str),
+                "unknown",
+            )
+            .to_owned(),
+            user_name: pick_non_empty(
+                event.get("user_name").and_then(Value::as_str),
+                event.get("user_login").and_then(Value::as_str),
+                "unknown",
+            )
+            .to_owned(),
+            text: event
+                .get("message")
+                .and_then(|m| m.get("text"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+        },
+        "channel.chat.user_message_update" => EventSubNoticeKind::ChannelChatUserMessageUpdate {
+            message_id: pick_non_empty(
+                event.get("message_id").and_then(Value::as_str),
+                event.get("id").and_then(Value::as_str),
+                "",
+            )
+            .to_owned(),
+            user_id: pick_non_empty(event.get("user_id").and_then(Value::as_str), Some(""), "")
+                .to_owned(),
+            user_login: pick_non_empty(
+                event.get("user_login").and_then(Value::as_str),
+                event.get("user_name").and_then(Value::as_str),
+                "unknown",
+            )
+            .to_owned(),
+            user_name: pick_non_empty(
+                event.get("user_name").and_then(Value::as_str),
+                event.get("user_login").and_then(Value::as_str),
+                "unknown",
+            )
+            .to_owned(),
+            text: event
+                .get("message")
+                .and_then(|m| m.get("text"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            status: pick_non_empty(
+                event.get("status").and_then(Value::as_str),
+                Some(""),
+                "unknown",
+            )
+            .to_owned(),
+        },
         "channel.channel_points_custom_reward_redemption.add"
         | "channel.channel_points_custom_reward_redemption.update" => {
             let reward = event.get("reward");
@@ -783,7 +927,10 @@ fn parse_notice(root: &Value, sub_type: &str) -> Option<EventSubNotice> {
                     .unwrap_or("Untitled poll")
                     .to_owned(),
                 phase,
-                status: event.get("status").and_then(Value::as_str).map(str::to_owned),
+                status: event
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 details: summarize_poll_details(event),
             }
         }
@@ -803,7 +950,10 @@ fn parse_notice(root: &Value, sub_type: &str) -> Option<EventSubNotice> {
                     .unwrap_or("Untitled prediction")
                     .to_owned(),
                 phase,
-                status: event.get("status").and_then(Value::as_str).map(str::to_owned),
+                status: event
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 details: summarize_prediction_details(event),
             }
         }
@@ -829,7 +979,9 @@ fn parse_notice(root: &Value, sub_type: &str) -> Option<EventSubNotice> {
                 .to_owned(),
                 sender_user_id: pick_non_empty(
                     event.get("user_id").and_then(Value::as_str),
-                    sender.and_then(|s| s.get("user_id")).and_then(Value::as_str),
+                    sender
+                        .and_then(|s| s.get("user_id"))
+                        .and_then(Value::as_str),
                     "",
                 )
                 .to_owned(),
@@ -933,6 +1085,153 @@ fn parse_notice(root: &Value, sub_type: &str) -> Option<EventSubNotice> {
                 "unknown",
             )
             .to_owned(),
+        },
+        "channel.suspicious_user.message" => EventSubNoticeKind::SuspiciousUserMessage {
+            user_id: pick_non_empty(event.get("user_id").and_then(Value::as_str), Some(""), "")
+                .to_owned(),
+            user_login: pick_non_empty(
+                event.get("user_login").and_then(Value::as_str),
+                event.get("user_name").and_then(Value::as_str),
+                "unknown",
+            )
+            .to_owned(),
+            user_name: pick_non_empty(
+                event.get("user_name").and_then(Value::as_str),
+                event.get("user_login").and_then(Value::as_str),
+                "unknown",
+            )
+            .to_owned(),
+            low_trust_status: pick_non_empty(
+                event.get("low_trust_status").and_then(Value::as_str),
+                Some(""),
+                "none",
+            )
+            .to_owned(),
+            ban_evasion_evaluation: pick_optional_non_empty(
+                event.get("ban_evasion_evaluation").and_then(Value::as_str),
+                event.get("banEvasionEvaluation").and_then(Value::as_str),
+            )
+            .map(str::to_owned),
+            shared_ban_channel_ids: event
+                .get("shared_ban_channel_ids")
+                .and_then(Value::as_array)
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(Value::as_str)
+                        .filter(|s| !s.trim().is_empty())
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+            types: event
+                .get("types")
+                .and_then(Value::as_array)
+                .map(|types| {
+                    types
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .filter(|s| !s.trim().is_empty())
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+            text: event
+                .get("message")
+                .and_then(|m| m.get("text"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+        },
+        "channel.suspicious_user.update" => EventSubNoticeKind::SuspiciousUserUpdate {
+            user_id: pick_non_empty(event.get("user_id").and_then(Value::as_str), Some(""), "")
+                .to_owned(),
+            user_login: pick_non_empty(
+                event.get("user_login").and_then(Value::as_str),
+                event.get("user_name").and_then(Value::as_str),
+                "unknown",
+            )
+            .to_owned(),
+            user_name: pick_non_empty(
+                event.get("user_name").and_then(Value::as_str),
+                event.get("user_login").and_then(Value::as_str),
+                "unknown",
+            )
+            .to_owned(),
+            moderator_user_id: pick_non_empty(
+                event.get("moderator_user_id").and_then(Value::as_str),
+                Some(""),
+                "",
+            )
+            .to_owned(),
+            moderator_login: pick_non_empty(
+                event.get("moderator_user_login").and_then(Value::as_str),
+                event.get("moderator_user_name").and_then(Value::as_str),
+                "unknown",
+            )
+            .to_owned(),
+            moderator_name: pick_non_empty(
+                event.get("moderator_user_name").and_then(Value::as_str),
+                event.get("moderator_user_login").and_then(Value::as_str),
+                "unknown",
+            )
+            .to_owned(),
+            low_trust_status: pick_non_empty(
+                event.get("low_trust_status").and_then(Value::as_str),
+                Some(""),
+                "none",
+            )
+            .to_owned(),
+        },
+        "user.whisper.message" => EventSubNoticeKind::UserWhisperMessage {
+            from_user_id: pick_non_empty(
+                event.get("from_user_id").and_then(Value::as_str),
+                Some(""),
+                "",
+            )
+            .to_owned(),
+            from_user_login: pick_non_empty(
+                event.get("from_user_login").and_then(Value::as_str),
+                event.get("from_user_name").and_then(Value::as_str),
+                "unknown",
+            )
+            .to_owned(),
+            from_user_name: pick_non_empty(
+                event.get("from_user_name").and_then(Value::as_str),
+                event.get("from_user_login").and_then(Value::as_str),
+                "unknown",
+            )
+            .to_owned(),
+            to_user_id: pick_non_empty(
+                event.get("to_user_id").and_then(Value::as_str),
+                Some(""),
+                "",
+            )
+            .to_owned(),
+            to_user_login: pick_non_empty(
+                event.get("to_user_login").and_then(Value::as_str),
+                event.get("to_user_name").and_then(Value::as_str),
+                "unknown",
+            )
+            .to_owned(),
+            to_user_name: pick_non_empty(
+                event.get("to_user_name").and_then(Value::as_str),
+                event.get("to_user_login").and_then(Value::as_str),
+                "unknown",
+            )
+            .to_owned(),
+            whisper_id: pick_non_empty(
+                event.get("whisper_id").and_then(Value::as_str),
+                event.get("id").and_then(Value::as_str),
+                "",
+            )
+            .to_owned(),
+            text: event
+                .get("whisper")
+                .and_then(|m| m.get("text"))
+                .and_then(Value::as_str)
+                .or_else(|| event.get("text").and_then(Value::as_str))
+                .unwrap_or("")
+                .to_owned(),
         },
         "channel.moderate" => {
             let action = parse_moderation_action(event);
@@ -1222,7 +1521,12 @@ fn summarize_prediction_details(event: &Value) -> Option<String> {
             let users = outcome.get("users").and_then(Value::as_u64).unwrap_or(0);
             let is_winner = winning_id
                 .as_deref()
-                .and_then(|wid| outcome.get("id").and_then(Value::as_str).map(|id| id == wid))
+                .and_then(|wid| {
+                    outcome
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(|id| id == wid)
+                })
                 .unwrap_or(false);
             Some((title, points, users, is_winner))
         })
@@ -1244,9 +1548,17 @@ fn summarize_prediction_details(event: &Value) -> Option<String> {
             let winner = if is_winner { " [winner]" } else { "" };
             if total_points > 0 {
                 let pct = ((points as f64 / total_points as f64) * 100.0).round() as u64;
-                format!("{title} {pct}% ({} pts, {} users){winner}", compact_u64(points), users)
+                format!(
+                    "{title} {pct}% ({} pts, {} users){winner}",
+                    compact_u64(points),
+                    users
+                )
             } else {
-                format!("{title} ({} pts, {} users){winner}", compact_u64(points), users)
+                format!(
+                    "{title} ({} pts, {} users){winner}",
+                    compact_u64(points),
+                    users
+                )
             }
         })
         .collect::<Vec<_>>()
@@ -1284,6 +1596,10 @@ mod tests {
         assert!(kinds.contains(&"channel.ban"));
         assert!(kinds.contains(&"channel.unban"));
         assert!(kinds.contains(&"channel.moderate"));
+        assert!(kinds.contains(&"channel.chat.user_message_hold"));
+        assert!(kinds.contains(&"channel.chat.user_message_update"));
+        assert!(kinds.contains(&"channel.suspicious_user.message"));
+        assert!(kinds.contains(&"channel.suspicious_user.update"));
     }
 
     #[test]
@@ -1435,6 +1751,84 @@ mod tests {
     }
 
     #[test]
+    fn parse_channel_chat_user_message_update_extracts_status() {
+        let payload = json!({
+            "payload": {
+                "event": {
+                    "broadcaster_user_id": "123",
+                    "broadcaster_user_login": "streamer",
+                    "user_id": "456",
+                    "user_login": "viewer",
+                    "user_name": "Viewer",
+                    "message_id": "msg-1",
+                    "status": "approved",
+                    "message": {
+                        "text": "hello"
+                    }
+                }
+            }
+        });
+
+        let notice = parse_notice(&payload, "channel.chat.user_message_update")
+            .expect("channel.chat.user_message_update parsed");
+        match notice.kind {
+            EventSubNoticeKind::ChannelChatUserMessageUpdate {
+                message_id,
+                user_login,
+                status,
+                ..
+            } => {
+                assert_eq!(message_id, "msg-1");
+                assert_eq!(user_login, "viewer");
+                assert_eq!(status, "approved");
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_suspicious_user_message_extracts_details() {
+        let payload = json!({
+            "payload": {
+                "event": {
+                    "broadcaster_user_id": "123",
+                    "broadcaster_user_login": "streamer",
+                    "user_id": "456",
+                    "user_login": "viewer",
+                    "user_name": "Viewer",
+                    "low_trust_status": "restricted",
+                    "ban_evasion_evaluation": "likely",
+                    "shared_ban_channel_ids": ["1", "2"],
+                    "types": ["ban_evader_detector"],
+                    "message": {
+                        "text": "hello"
+                    }
+                }
+            }
+        });
+
+        let notice = parse_notice(&payload, "channel.suspicious_user.message")
+            .expect("channel.suspicious_user.message parsed");
+        match notice.kind {
+            EventSubNoticeKind::SuspiciousUserMessage {
+                low_trust_status,
+                ban_evasion_evaluation,
+                shared_ban_channel_ids,
+                types,
+                text,
+                ..
+            } => {
+                assert_eq!(low_trust_status, "restricted");
+                assert_eq!(ban_evasion_evaluation.as_deref(), Some("likely"));
+                assert_eq!(shared_ban_channel_ids, vec!["1".to_owned(), "2".to_owned()]);
+                assert_eq!(types, vec!["ban_evader_detector".to_owned()]);
+                assert_eq!(text, "hello");
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_channel_moderate_timeout_extracts_duration_action() {
         let payload = json!({
             "payload": {
@@ -1503,7 +1897,8 @@ mod tests {
             }
         });
 
-        let notice = parse_notice(&payload, "channel.poll.progress").expect("channel.poll.progress parsed");
+        let notice =
+            parse_notice(&payload, "channel.poll.progress").expect("channel.poll.progress parsed");
         match notice.kind {
             EventSubNoticeKind::PollLifecycle { details, .. } => {
                 let details = details.expect("poll details");

@@ -70,11 +70,7 @@ async fn fetch_twitch_live_viewer_count_gql(login: &str) -> Option<u64> {
     }
 
     let parsed: GqlResponse = resp.json().await.ok()?;
-    parsed
-        .data?
-        .user?
-        .stream?
-        .viewers_count
+    parsed.data?.user?.stream?.viewers_count
 }
 
 /// Fetch a user profile appropriate for the channel platform.
@@ -307,8 +303,7 @@ pub(crate) async fn fetch_twitch_stream_status(
                 if snapshot.viewers != Some(gql_viewers) {
                     debug!(
                         "stream-status viewer override from gql for {login}: {:?} -> {}",
-                        snapshot.viewers,
-                        gql_viewers
+                        snapshot.viewers, gql_viewers
                     );
                 }
                 snapshot.viewers = Some(gql_viewers);
@@ -318,8 +313,7 @@ pub(crate) async fn fetch_twitch_stream_status(
 
         debug!(
             "stream-status refresh result for {login}: source={source}, live={}, viewers={:?}",
-            snapshot.is_live,
-            snapshot.viewers
+            snapshot.is_live, snapshot.viewers
         );
         let _ = evt_tx
             .send(AppEvent::StreamStatusUpdated {
@@ -474,7 +468,10 @@ pub(crate) async fn fetch_twitch_user_profile(
     let users: Vec<IvrUser> = match resp.json().await {
         Ok(u) => u,
         Err(e) => {
-            warn!("IVR user response parse failed for {}: {e}", requested_login);
+            warn!(
+                "IVR user response parse failed for {}: {e}",
+                requested_login
+            );
             let _ = evt_tx
                 .send(AppEvent::UserProfileUnavailable {
                     login: requested_login.clone(),
@@ -540,19 +537,14 @@ pub(crate) async fn fetch_twitch_user_profile(
             if stream_viewers != Some(fresh_viewers) {
                 debug!(
                     "profile viewer override from gql for {}: {:?} -> {}",
-                    gql_login,
-                    stream_viewers,
-                    fresh_viewers
+                    gql_login, stream_viewers, fresh_viewers
                 );
             }
             stream_viewers = Some(fresh_viewers);
         }
     }
 
-    let profile_login = user
-        .login
-        .trim()
-        .to_ascii_lowercase();
+    let profile_login = user.login.trim().to_ascii_lowercase();
     let profile_login = if profile_login.is_empty() {
         requested_login.clone()
     } else {

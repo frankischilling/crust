@@ -3,11 +3,16 @@ use std::collections::HashSet;
 use egui::{Context, Margin, RichText};
 
 use crust_core::highlight::HighlightRule;
+use crust_core::plugins::{PluginUiHostSlot, PluginUiSnapshot};
+use crust_core::PluginStatus;
 
 use crate::app::{ChannelLayout, TabVisualStyle};
 use crate::theme as t;
 
-use super::chrome;
+use super::{
+    chrome,
+    plugin_ui::{has_host_panels_for_slot, render_host_panels_for_slot, PluginUiSessionState},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsSection {
@@ -44,7 +49,7 @@ impl SettingsSection {
             Self::Highlights => "Highlight rules and ignored users",
             Self::Filters => "Message filtering and moderation",
             Self::Channels => "Auto-join channel management",
-            Self::Integrations => "Kick/IRC beta and NickServ",
+            Self::Integrations => "Plugins, Kick/IRC beta, and NickServ",
         }
     }
 }
@@ -92,6 +97,9 @@ pub struct SettingsPageState {
     pub filter_records: Vec<crust_core::model::filters::FilterRecord>,
     pub filter_record_bufs: Vec<String>,
     pub mod_action_presets: Vec<crust_core::model::mod_actions::ModActionPreset>,
+    pub plugin_statuses: Vec<PluginStatus>,
+    pub plugin_ui: PluginUiSnapshot,
+    pub plugin_reload_requested: bool,
     /// Desktop notification toggle.
     pub desktop_notifications_enabled: bool,
 }
@@ -127,6 +135,94 @@ fn settings_sections() -> [SettingsSection; 6] {
         SettingsSection::Channels,
         SettingsSection::Integrations,
     ]
+}
+
+fn plugin_status_counts(statuses: &[PluginStatus]) -> (usize, usize) {
+    let loaded = statuses.iter().filter(|status| status.loaded).count();
+    let failed = statuses.len().saturating_sub(loaded);
+    (loaded, failed)
+}
+
+fn render_plugin_manifest_line(ui: &mut egui::Ui, label: &str, value: &str) {
+    if value.trim().is_empty() {
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            RichText::new(label)
+                .font(t::tiny())
+                .strong()
+                .color(t::text_muted()),
+        );
+        ui.label(
+            RichText::new(value)
+                .font(t::tiny())
+                .color(t::text_secondary()),
+        );
+    });
+}
+
+fn render_plugin_status_card(ui: &mut egui::Ui, status: &PluginStatus, compact: bool) {
+    let frame = egui::Frame::new()
+        .fill(t::bg_surface())
+        .stroke(egui::Stroke::new(1.0, t::border_subtle()))
+        .inner_margin(Margin::same(if compact { 8 } else { 10 }));
+
+    frame.show(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(&status.manifest.name)
+                    .font(t::body())
+                    .strong()
+                    .color(t::text_primary()),
+            );
+            let state_text = if status.loaded { "Loaded" } else { "Failed" };
+            let state_color = if status.loaded { t::green() } else { t::red() };
+            ui.label(
+                RichText::new(state_text)
+                    .font(t::tiny())
+                    .strong()
+                    .color(state_color),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "{} command{}",
+                    status.command_count,
+                    if status.command_count == 1 { "" } else { "s" }
+                ))
+                .font(t::tiny())
+                .color(t::text_muted()),
+            );
+        });
+
+        if !status.manifest.version.trim().is_empty() {
+            ui.label(
+                RichText::new(format!("Version {}", status.manifest.version))
+                    .font(t::tiny())
+                    .color(t::text_muted()),
+            );
+        }
+        render_plugin_manifest_line(ui, "Authors:", &status.manifest.authors.join(", "));
+        render_plugin_manifest_line(ui, "Homepage:", &status.manifest.homepage);
+        render_plugin_manifest_line(ui, "Tags:", &status.manifest.tags.join(", "));
+        render_plugin_manifest_line(ui, "Entry:", &status.manifest.entry);
+        render_plugin_manifest_line(ui, "Permissions:", &status.manifest.permissions.join(", "));
+        if !status.manifest.description.trim().is_empty() {
+            ui.label(
+                RichText::new(&status.manifest.description)
+                    .font(t::tiny())
+                    .color(t::text_secondary()),
+            );
+        }
+        if let Some(error) = status.error.as_ref().filter(|err| !err.trim().is_empty()) {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!("Error: {error}"))
+                    .font(t::tiny())
+                    .color(t::red()),
+            );
+        }
+    });
 }
 
 fn render_sections_nav(
@@ -247,6 +343,7 @@ fn render_settings_content(
     ui: &mut egui::Ui,
     settings_section: SettingsSection,
     state: &mut SettingsPageState,
+    plugin_ui_session: &mut PluginUiSessionState,
     compact: bool,
     ultra_compact: bool,
 ) {
@@ -351,6 +448,18 @@ fn render_settings_content(
                         &mut state.split_header_show_game,
                         "Show split-header game",
                     );
+                    if has_host_panels_for_slot(
+                        &state.plugin_ui,
+                        PluginUiHostSlot::SettingsAppearance,
+                    ) {
+                        ui.add_space(10.0);
+                        render_host_panels_for_slot(
+                            ui,
+                            &state.plugin_ui,
+                            plugin_ui_session,
+                            PluginUiHostSlot::SettingsAppearance,
+                        );
+                    }
                 }
                 SettingsSection::Chat => {
                     ui.checkbox(&mut state.show_timestamps, "Show message timestamps");
@@ -436,7 +545,7 @@ fn render_settings_content(
                             "Animate only while window is focused"
                         },
                     );
-                    
+
                     ui.add_space(8.0);
                     ui.label(
                         RichText::new("Moderation Action Presets")
@@ -499,6 +608,15 @@ fn render_settings_content(
                             icon_url: None,
                         });
                     }
+                    if has_host_panels_for_slot(&state.plugin_ui, PluginUiHostSlot::SettingsChat) {
+                        ui.add_space(10.0);
+                        render_host_panels_for_slot(
+                            ui,
+                            &state.plugin_ui,
+                            plugin_ui_session,
+                            PluginUiHostSlot::SettingsChat,
+                        );
+                    }
                 }
                 SettingsSection::Highlights => {
                     // ── Highlight rules table ─────────────────────────────
@@ -527,10 +645,13 @@ fn render_settings_content(
                     state.highlight_rule_bufs.truncate(state.highlight_rules.len());
 
                     let mut delete_idx: Option<usize> = None;
+                    let mut move_up_idx: Option<usize> = None;
+                    let mut move_down_idx: Option<usize> = None;
+                    let mut duplicate_idx: Option<usize> = None;
                     let action_btn_size = egui::vec2(26.0, 22.0);
 
                     egui::Grid::new("highlight_rules_grid")
-                        .num_columns(7)
+                        .num_columns(10)
                         .spacing(egui::vec2(8.0, 6.0))
                         .show(ui, |ui| {
                             // Header row
@@ -541,6 +662,9 @@ fn render_settings_content(
                             ui.label(RichText::new("Aa").font(t::tiny()).color(t::text_muted()));
                             ui.label(RichText::new("Alert").font(t::tiny()).color(t::text_muted()));
                             ui.label(RichText::new("Sound").font(t::tiny()).color(t::text_muted()));
+                            ui.label(RichText::new("").font(t::tiny()));
+                            ui.label(RichText::new("").font(t::tiny()));
+                            ui.label(RichText::new("").font(t::tiny()));
                             ui.label(RichText::new("").font(t::tiny()));
                             ui.end_row();
 
@@ -652,10 +776,69 @@ fn render_settings_content(
                                     delete_idx = Some(i);
                                 }
 
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("↑").font(t::tiny()).color(t::text_secondary()),
+                                        )
+                                        .min_size(action_btn_size),
+                                    )
+                                    .on_hover_text("Move rule up")
+                                    .clicked()
+                                {
+                                    move_up_idx = Some(i);
+                                }
+
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("↓").font(t::tiny()).color(t::text_secondary()),
+                                        )
+                                        .min_size(action_btn_size),
+                                    )
+                                    .on_hover_text("Move rule down")
+                                    .clicked()
+                                {
+                                    move_down_idx = Some(i);
+                                }
+
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("⎘").font(t::tiny()).color(t::text_secondary()),
+                                        )
+                                        .min_size(action_btn_size),
+                                    )
+                                    .on_hover_text("Duplicate rule")
+                                    .clicked()
+                                {
+                                    duplicate_idx = Some(i);
+                                }
+
                                 ui.end_row();
                             }
                         });
 
+                    if let Some(idx) = duplicate_idx {
+                        let clone = state.highlight_rules.get(idx).cloned();
+                        if let Some(rule) = clone {
+                            let buf = state.highlight_rule_bufs.get(idx).cloned().unwrap_or_default();
+                            state.highlight_rules.insert(idx + 1, rule);
+                            state.highlight_rule_bufs.insert(idx + 1, buf);
+                        }
+                    }
+                    if let Some(idx) = move_up_idx {
+                        if idx > 0 {
+                            state.highlight_rules.swap(idx, idx - 1);
+                            state.highlight_rule_bufs.swap(idx, idx - 1);
+                        }
+                    }
+                    if let Some(idx) = move_down_idx {
+                        if idx + 1 < state.highlight_rules.len() {
+                            state.highlight_rules.swap(idx, idx + 1);
+                            state.highlight_rule_bufs.swap(idx, idx + 1);
+                        }
+                    }
                     if let Some(idx) = delete_idx {
                         state.highlight_rules.remove(idx);
                         state.highlight_rule_bufs.remove(idx);
@@ -759,9 +942,12 @@ fn render_settings_content(
                     state.filter_record_bufs.truncate(state.filter_records.len());
 
                     let mut filter_delete_idx: Option<usize> = None;
+                    let mut filter_move_up_idx: Option<usize> = None;
+                    let mut filter_move_down_idx: Option<usize> = None;
+                    let mut filter_duplicate_idx: Option<usize> = None;
 
                     egui::Grid::new("filter_records_grid")
-                        .num_columns(7)
+                        .num_columns(10)
                         .spacing(egui::vec2(4.0, 4.0))
                         .show(ui, |ui| {
                             // Header row
@@ -771,6 +957,9 @@ fn render_settings_content(
                             ui.label(RichText::new("Re").font(t::tiny()).color(t::text_muted()).strong());
                             ui.label(RichText::new("User").font(t::tiny()).color(t::text_muted()));
                             ui.label(RichText::new("Act").font(t::tiny()).color(t::text_muted()));
+                            ui.label(RichText::new("").font(t::tiny()));
+                            ui.label(RichText::new("").font(t::tiny()));
+                            ui.label(RichText::new("").font(t::tiny()));
                             ui.label(RichText::new("").font(t::tiny()));
                             ui.end_row();
 
@@ -874,10 +1063,69 @@ fn render_settings_content(
                                     filter_delete_idx = Some(i);
                                 }
 
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("↑").font(t::tiny()).color(t::text_secondary()),
+                                        )
+                                        .min_size(egui::vec2(20.0, 20.0)),
+                                    )
+                                    .on_hover_text("Move filter up")
+                                    .clicked()
+                                {
+                                    filter_move_up_idx = Some(i);
+                                }
+
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("↓").font(t::tiny()).color(t::text_secondary()),
+                                        )
+                                        .min_size(egui::vec2(20.0, 20.0)),
+                                    )
+                                    .on_hover_text("Move filter down")
+                                    .clicked()
+                                {
+                                    filter_move_down_idx = Some(i);
+                                }
+
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("⎘").font(t::tiny()).color(t::text_secondary()),
+                                        )
+                                        .min_size(egui::vec2(20.0, 20.0)),
+                                    )
+                                    .on_hover_text("Duplicate filter")
+                                    .clicked()
+                                {
+                                    filter_duplicate_idx = Some(i);
+                                }
+
                                 ui.end_row();
                             }
                         });
 
+                    if let Some(idx) = filter_duplicate_idx {
+                        let clone = state.filter_records.get(idx).cloned();
+                        if let Some(filter) = clone {
+                            let buf = state.filter_record_bufs.get(idx).cloned().unwrap_or_default();
+                            state.filter_records.insert(idx + 1, filter);
+                            state.filter_record_bufs.insert(idx + 1, buf);
+                        }
+                    }
+                    if let Some(idx) = filter_move_up_idx {
+                        if idx > 0 {
+                            state.filter_records.swap(idx, idx - 1);
+                            state.filter_record_bufs.swap(idx, idx - 1);
+                        }
+                    }
+                    if let Some(idx) = filter_move_down_idx {
+                        if idx + 1 < state.filter_records.len() {
+                            state.filter_records.swap(idx, idx + 1);
+                            state.filter_record_bufs.swap(idx, idx + 1);
+                        }
+                    }
                     if let Some(idx) = filter_delete_idx {
                         state.filter_records.remove(idx);
                         state.filter_record_bufs.remove(idx);
@@ -931,6 +1179,64 @@ fn render_settings_content(
                 SettingsSection::Integrations => {
                     ui.checkbox(&mut state.kick_beta_enabled, "Kick compatibility (beta)");
                     ui.checkbox(&mut state.irc_beta_enabled, "IRC chat compatibility (beta)");
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("Lua Plugins")
+                            .font(t::small())
+                            .strong()
+                            .color(t::text_primary()),
+                    );
+                    let (loaded_count, failed_count) = plugin_status_counts(&state.plugin_statuses);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Reload plugins").clicked() {
+                            state.plugin_reload_requested = true;
+                        }
+                        ui.label(
+                            RichText::new(format!(
+                                "{} loaded, {} failed",
+                                loaded_count, failed_count
+                            ))
+                            .font(t::tiny())
+                            .color(t::text_muted()),
+                        );
+                    });
+                    if state.plugin_statuses.is_empty() {
+                        ui.label(
+                            RichText::new("No plugins found in the Crust plugin directory.")
+                                .font(t::tiny())
+                                .color(t::text_muted()),
+                        );
+                    } else {
+                        ui.add_space(4.0);
+                        egui::ScrollArea::vertical()
+                            .max_height(if compact { 220.0 } else { 280.0 })
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = 8.0;
+                                for status in &state.plugin_statuses {
+                                    render_plugin_status_card(ui, status, compact);
+                                }
+                            });
+                    }
+                    if !state.plugin_ui.settings_pages.is_empty() {
+                        super::plugin_ui::render_plugin_settings_hub(
+                            ui,
+                            &state.plugin_ui,
+                            plugin_ui_session,
+                        );
+                    }
+                    if has_host_panels_for_slot(
+                        &state.plugin_ui,
+                        PluginUiHostSlot::SettingsIntegrations,
+                    ) {
+                        ui.add_space(10.0);
+                        render_host_panels_for_slot(
+                            ui,
+                            &state.plugin_ui,
+                            plugin_ui_session,
+                            PluginUiHostSlot::SettingsIntegrations,
+                        );
+                    }
                     ui.add_space(8.0);
                     if state.irc_beta_enabled {
                         ui.label(
@@ -995,6 +1301,7 @@ pub fn show_settings_page(
     settings_open: &mut bool,
     settings_section: &mut SettingsSection,
     state: &mut SettingsPageState,
+    plugin_ui_session: &mut PluginUiSessionState,
     stats: SettingsStats,
 ) {
     let settings_default_pos = egui::pos2(
@@ -1033,6 +1340,7 @@ pub fn show_settings_page(
                             ui,
                             *settings_section,
                             state,
+                            plugin_ui_session,
                             true,
                             ultra_compact_layout,
                         );
@@ -1047,7 +1355,14 @@ pub fn show_settings_page(
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(content, |ui| {
-                            render_settings_content(ui, *settings_section, state, false, false);
+                            render_settings_content(
+                                ui,
+                                *settings_section,
+                                state,
+                                plugin_ui_session,
+                                false,
+                                false,
+                            );
                         });
                 });
             }

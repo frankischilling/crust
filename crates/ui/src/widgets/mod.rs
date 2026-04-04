@@ -12,6 +12,7 @@ pub mod loading_screen;
 pub mod login_dialog;
 pub mod message_list;
 pub mod message_search;
+pub mod plugin_ui;
 pub mod settings_page;
 pub mod split_header;
 pub mod user_profile_popup;

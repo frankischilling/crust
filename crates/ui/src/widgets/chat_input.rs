@@ -5,7 +5,7 @@ use egui::{Color32, Id, Key, LayerId, Order, Pos2, RichText, Stroke, Ui, Vec2};
 use image::DynamicImage;
 
 use crate::commands::{
-    extract_slash_query, replace_slash_token, slash_command_matches_ranked, SlashCommandInfo,
+    extract_slash_query, replace_slash_token, slash_command_matches_ranked, SlashCommandSuggestion,
 };
 use crate::theme as t;
 use crust_core::model::{ChannelId, EmoteCatalogEntry, ReplyInfo, IRC_SERVER_CONTROL_CHANNEL};
@@ -748,10 +748,7 @@ impl<'a> ChatInput<'a> {
                             ui.close_menu();
                         }
 
-                        if ui
-                            .button(RichText::new("Paste").font(t::small()))
-                            .clicked()
-                        {
+                        if ui.button(RichText::new("Paste").font(t::small())).clicked() {
                             context_paste_input = true;
                             ui.close_menu();
                         }
@@ -1104,7 +1101,7 @@ impl<'a> ChatInput<'a> {
         &self,
         ui: &mut Ui,
         text_resp: &egui::Response,
-        matches: &[&SlashCommandInfo],
+        matches: &[SlashCommandSuggestion],
         selected: i32,
     ) -> Option<String> {
         if matches.is_empty() {
@@ -1180,7 +1177,7 @@ impl<'a> ChatInput<'a> {
                     };
                     ui.vertical(|ui| {
                         ui.label(
-                            RichText::new(entry.usage)
+                            RichText::new(entry.usage.clone())
                                 .font(t::small())
                                 .color(cmd_col)
                                 .strong(),
@@ -1188,7 +1185,7 @@ impl<'a> ChatInput<'a> {
                         ui.add_sized(
                             [ui.available_width(), 14.0],
                             egui::Label::new(
-                                RichText::new(entry.summary)
+                                RichText::new(entry.summary.clone())
                                     .font(t::small())
                                     .color(summary_col),
                             )
@@ -1417,7 +1414,7 @@ fn find_autocomplete_matches<'a>(
 fn find_slash_matches(
     buf: &str,
     usage_counts: &HashMap<String, u32>,
-) -> Vec<&'static SlashCommandInfo> {
+) -> Vec<SlashCommandSuggestion> {
     let Some(query) = extract_slash_query(buf) else {
         return Vec::new();
     };
@@ -1614,9 +1611,10 @@ fn move_cursor_to_end(ctx: &egui::Context, id: egui::Id, char_pos: usize) {
 fn select_all_text(ctx: &egui::Context, id: egui::Id, total_chars: usize) {
     use egui::text::{CCursor, CCursorRange};
     if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
-        state
-            .cursor
-            .set_char_range(Some(CCursorRange::two(CCursor::new(0), CCursor::new(total_chars))));
+        state.cursor.set_char_range(Some(CCursorRange::two(
+            CCursor::new(0),
+            CCursor::new(total_chars),
+        )));
         egui::TextEdit::store_state(ctx, id, state);
     }
 }

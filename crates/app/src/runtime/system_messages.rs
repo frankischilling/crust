@@ -48,6 +48,43 @@ pub(crate) fn make_system_message(
     timestamp: DateTime<Utc>,
     kind: MsgKind,
 ) -> ChatMessage {
+    make_custom_message(
+        id,
+        channel,
+        text,
+        timestamp,
+        Sender {
+            user_id: UserId(String::new()),
+            login: String::new(),
+            display_name: String::new(),
+            color: None,
+            name_paint: None,
+            badges: Vec::new(),
+        },
+        MessageFlags {
+            is_action: false,
+            is_highlighted: false,
+            is_deleted: false,
+            is_first_msg: false,
+            is_pinned: false,
+            is_self: false,
+            is_mention: false,
+            custom_reward_id: None,
+            is_history: false,
+        },
+        kind,
+    )
+}
+
+pub(crate) fn make_custom_message(
+    id: u64,
+    channel: ChannelId,
+    text: String,
+    timestamp: DateTime<Utc>,
+    sender: Sender,
+    flags: MessageFlags,
+    kind: MsgKind,
+) -> ChatMessage {
     use smallvec::smallvec;
 
     let spans = smallvec![crust_core::model::Span::Text {
@@ -59,28 +96,11 @@ pub(crate) fn make_system_message(
         server_id: None,
         timestamp,
         channel,
-        sender: Sender {
-            user_id: UserId(String::new()),
-            login: String::new(),
-            display_name: String::new(),
-            color: None,
-            name_paint: None,
-            badges: Vec::new(),
-        },
+        sender,
         raw_text: text,
         spans,
         twitch_emotes: Vec::new(),
-        flags: MessageFlags {
-            is_action: false,
-            is_highlighted: false,
-            is_deleted: false,
-            is_first_msg: false,
-            is_pinned: false,
-            is_self: false,
-            is_mention: false,
-            custom_reward_id: None,
-            is_history: false,
-        },
+        flags,
         reply: None,
         msg_kind: kind,
     }

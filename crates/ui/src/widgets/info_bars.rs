@@ -2,9 +2,14 @@ use std::collections::HashMap;
 
 use egui::{Color32, Context, Frame, RichText, TopBottomPanel};
 
+use crust_core::plugins::{PluginUiHostSlot, PluginUiSnapshot};
 use crust_core::AppState;
 
 use crate::theme as t;
+
+use super::plugin_ui::{
+    has_host_panels_for_slot, render_host_panels_for_slot, PluginUiSessionState,
+};
 
 /// Stream status snapshot for one channel, populated via FetchUserProfile.
 #[derive(Clone)]
@@ -19,13 +24,14 @@ pub fn show_channel_info_bars(
     ctx: &Context,
     state: &AppState,
     stream_statuses: &HashMap<String, StreamStatusInfo>,
+    plugin_ui: &PluginUiSnapshot,
+    plugin_ui_session: &mut PluginUiSessionState,
 ) {
     // Shows live/offline status, viewer count and stream title for the
     // currently active channel. Hidden when no channel is active.
     if let Some(active_ch) = state.active_channel.as_ref() {
         if !active_ch.is_twitch() {
             TopBottomPanel::top("stream_info_bar")
-                .exact_height(28.0)
                 .frame(
                     Frame::new()
                         .fill(t::bg_surface())
@@ -74,6 +80,15 @@ pub fn show_channel_info_bars(
                             );
                         }
                     });
+                    if has_host_panels_for_slot(plugin_ui, PluginUiHostSlot::ChannelHeader) {
+                        ui.add_space(6.0);
+                        render_host_panels_for_slot(
+                            ui,
+                            plugin_ui,
+                            plugin_ui_session,
+                            PluginUiHostSlot::ChannelHeader,
+                        );
+                    }
                 });
         } else {
             let login = active_ch.display_name().to_ascii_lowercase();
@@ -86,7 +101,6 @@ pub fn show_channel_info_bars(
                 t::bg_surface()
             };
             TopBottomPanel::top("stream_info_bar")
-                .exact_height(28.0)
                 .frame(
                     Frame::new()
                         .fill(bar_fill)
@@ -265,6 +279,15 @@ pub fn show_channel_info_bars(
                             }
                         }
                     });
+                    if has_host_panels_for_slot(plugin_ui, PluginUiHostSlot::ChannelHeader) {
+                        ui.add_space(6.0);
+                        render_host_panels_for_slot(
+                            ui,
+                            plugin_ui,
+                            plugin_ui_session,
+                            PluginUiHostSlot::ChannelHeader,
+                        );
+                    }
                 });
 
             // Room state pills (sub-only, slow, emote-only, etc.)

@@ -33,13 +33,53 @@ pub enum PopupAction {
         login: String,
         user_id: String,
     },
+    Warn {
+        channel: ChannelId,
+        login: String,
+        user_id: String,
+        reason: String,
+    },
+    Monitor {
+        channel: ChannelId,
+        login: String,
+        user_id: String,
+    },
+    Restrict {
+        channel: ChannelId,
+        login: String,
+        user_id: String,
+    },
+    Unmonitor {
+        channel: ChannelId,
+        login: String,
+        user_id: String,
+    },
+    Unrestrict {
+        channel: ChannelId,
+        login: String,
+        user_id: String,
+    },
+    ClearUserMessagesLocally {
+        channel: ChannelId,
+        login: String,
+    },
     /// Request IVR chat logs for the displayed user.
-    FetchIvrLogs { channel: String, username: String },
+    FetchIvrLogs {
+        channel: String,
+        username: String,
+    },
     /// Open a URL in the system browser.
-    OpenUrl { url: String },
-    OpenModerationTools { channel: ChannelId },
+    OpenUrl {
+        url: String,
+    },
+    OpenModerationTools {
+        channel: ChannelId,
+    },
     /// Execute an arbitrary chat command (e.g. from a mod action preset).
-    ExecuteCommand { channel: ChannelId, command: String },
+    ExecuteCommand {
+        channel: ChannelId,
+        command: String,
+    },
 }
 
 // ─── Tab state ────────────────────────────────────────────────────────────────
@@ -378,8 +418,8 @@ impl UserProfilePopup {
                                 if let Some((_, _, ref raw)) = emote_bytes.get(url.as_str()) {
                                     let uri = super::bytes_uri(url, raw.as_ref());
                                     const BS: f32 = 18.0;
-                                    let (brect, _) =
-                                        ui.allocate_exact_size(Vec2::splat(BS), egui::Sense::hover());
+                                    let (brect, _) = ui
+                                        .allocate_exact_size(Vec2::splat(BS), egui::Sense::hover());
                                     ui.put(
                                         brect,
                                         egui::Image::from_bytes(
@@ -453,10 +493,7 @@ impl UserProfilePopup {
         egui::Frame::new()
             .fill(t::danger_soft_bg())
             .corner_radius(t::RADIUS)
-            .stroke(egui::Stroke::new(
-                1.0,
-                t::alpha(t::red(), 80),
-            ))
+            .stroke(egui::Stroke::new(1.0, t::alpha(t::red(), 80)))
             .inner_margin(egui::Margin::symmetric(8, 6))
             .show(ui, |ui| {
                 if let Some(ref title) = profile.stream_title {
@@ -500,7 +537,12 @@ impl UserProfilePopup {
             });
     }
 
-    fn render_tab_bar(&mut self, ui: &mut egui::Ui, profile: &UserProfile, actions: &mut Vec<PopupAction>) {
+    fn render_tab_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        profile: &UserProfile,
+        actions: &mut Vec<PopupAction>,
+    ) {
         let mut tabs: Vec<(&str, ProfileTab)> = vec![("Profile", ProfileTab::Profile)];
         tabs.push(("Logs", ProfileTab::Logs));
         if self.is_mod {
@@ -584,7 +626,11 @@ impl UserProfilePopup {
                 if self.logs.is_empty() {
                     ui.add_space(8.0);
                     ui.centered_and_justified(|ui| {
-                        ui.label(RichText::new("No recent messages.").color(t::text_muted()).small());
+                        ui.label(
+                            RichText::new("No recent messages.")
+                                .color(t::text_muted())
+                                .small(),
+                        );
                     });
                 }
                 for msg in &self.logs {
@@ -709,12 +755,9 @@ impl UserProfilePopup {
                     ui.horizontal(|ui| {
                         ui.set_width(ui.available_width());
                         ui.label(RichText::new(label).color(t::text_secondary()).small());
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.label(RichText::new(value).color(t::text_primary()).small());
-                            },
-                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(RichText::new(value).color(t::text_primary()).small());
+                        });
                     });
                     ui.add_space(2.0);
                 };
@@ -790,7 +833,12 @@ impl UserProfilePopup {
                 .corner_radius(t::RADIUS_SM)
                 .inner_margin(egui::Margin::symmetric(8, 6))
                 .show(ui, |ui| {
-                    ui.label(RichText::new("Bio").small().strong().color(t::text_secondary()));
+                    ui.label(
+                        RichText::new("Bio")
+                            .small()
+                            .strong()
+                            .color(t::text_secondary()),
+                    );
                     ui.add_space(2.0);
                     ui.add(
                         egui::Label::new(
@@ -810,7 +858,10 @@ impl UserProfilePopup {
                 .corner_radius(t::RADIUS_SM)
                 .inner_margin(egui::Margin::symmetric(8, 5))
                 .show(ui, |ui| {
-                    let reason = profile.ban_reason.as_deref().unwrap_or("No reason provided");
+                    let reason = profile
+                        .ban_reason
+                        .as_deref()
+                        .unwrap_or("No reason provided");
                     ui.add(
                         egui::Label::new(
                             RichText::new(format!("⚠ Suspended: {reason}"))
@@ -854,7 +905,7 @@ impl UserProfilePopup {
 
         section_label(ui, "Quick Actions");
         ui.add_space(3.0);
-        
+
         let default_presets = crust_core::model::mod_actions::ModActionPreset::defaults();
         let active_presets = if presets.is_empty() {
             default_presets.as_slice()
@@ -927,6 +978,20 @@ impl UserProfilePopup {
             });
         }
 
+        ui.add_space(6.0);
+        section_label(ui, "Local cleanup");
+        ui.add_space(3.0);
+        if ui
+            .button("Hide this user's messages locally")
+            .on_hover_text("Removes visible messages from this user in the current channel only.")
+            .clicked()
+        {
+            actions.push(PopupAction::ClearUserMessagesLocally {
+                channel: channel.clone(),
+                login: login.clone(),
+            });
+        }
+
         let channel_login = channel.display_name().to_ascii_lowercase();
         if !channel_login.is_empty() {
             ui.add_space(8.0);
@@ -959,6 +1024,54 @@ impl UserProfilePopup {
                 }
             });
         }
+
+        ui.add_space(8.0);
+        section_label(ui, "Low trust");
+        ui.add_space(3.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+            let can_warn = !self.mod_reason.trim().is_empty();
+            if ui
+                .add_enabled(can_warn, egui::Button::new("Warn"))
+                .clicked()
+            {
+                let reason = self.mod_reason.trim().to_owned();
+                actions.push(PopupAction::Warn {
+                    channel: channel.clone(),
+                    login: login.clone(),
+                    user_id: user_id.clone(),
+                    reason,
+                });
+            }
+            if ui.button("Monitor").clicked() {
+                actions.push(PopupAction::Monitor {
+                    channel: channel.clone(),
+                    login: login.clone(),
+                    user_id: user_id.clone(),
+                });
+            }
+            if ui.button("Restrict").clicked() {
+                actions.push(PopupAction::Restrict {
+                    channel: channel.clone(),
+                    login: login.clone(),
+                    user_id: user_id.clone(),
+                });
+            }
+            if ui.button("Unmonitor").clicked() {
+                actions.push(PopupAction::Unmonitor {
+                    channel: channel.clone(),
+                    login: login.clone(),
+                    user_id: user_id.clone(),
+                });
+            }
+            if ui.button("Unrestrict").clicked() {
+                actions.push(PopupAction::Unrestrict {
+                    channel: channel.clone(),
+                    login: login.clone(),
+                    user_id: user_id.clone(),
+                });
+            }
+        });
 
         ui.add_space(8.0);
         section_label(ui, "Permanent ban");
@@ -994,9 +1107,7 @@ impl UserProfilePopup {
             });
         } else if ui
             .add(
-                egui::Button::new(
-                    RichText::new("Ban user").small().color(t::text_on_accent()),
-                )
+                egui::Button::new(RichText::new("Ban user").small().color(t::text_on_accent()))
                     .fill(t::danger_strong_bg().gamma_multiply(0.9))
                     .min_size(egui::vec2(100.0, 24.0)),
             )
@@ -1021,13 +1132,9 @@ impl UserProfilePopup {
         ui.horizontal(|ui| {
             if ui
                 .add(
-                    egui::Button::new(
-                        RichText::new("Open in Browser")
-                            .small()
-                            .color(t::accent()),
-                    )
-                    .fill(t::bg_raised())
-                    .min_size(egui::vec2(130.0, 22.0)),
+                    egui::Button::new(RichText::new("Open in Browser").small().color(t::accent()))
+                        .fill(t::bg_raised())
+                        .min_size(egui::vec2(130.0, 22.0)),
                 )
                 .clicked()
             {
@@ -1150,7 +1257,11 @@ impl UserProfilePopup {
                                         .small()
                                         .monospace(),
                                 ));
-                                let msg_color = if is_timeout { t::red() } else { t::text_primary() };
+                                let msg_color = if is_timeout {
+                                    t::red()
+                                } else {
+                                    t::text_primary()
+                                };
                                 let rich = RichText::new(&entry.text).color(msg_color).small();
                                 let rich = if is_timeout { rich.italics() } else { rich };
                                 ui.add(egui::Label::new(rich).wrap());
@@ -1176,14 +1287,19 @@ impl UserProfilePopup {
                         format!("https://twitch.tv/{}", profile.login),
                     )
                 };
-            ui.hyperlink_to(RichText::new(primary_label).small().color(t::accent()), primary_url);
+            ui.hyperlink_to(
+                RichText::new(primary_label).small().color(t::accent()),
+                primary_url,
+            );
             let logs_url = format!(
                 "https://logs.ivr.fi/?channel={}&username={}",
                 self.channel.as_ref().map(|c| c.as_str()).unwrap_or(""),
                 profile.login,
             );
             ui.hyperlink_to(
-                RichText::new("Lookup logs").small().color(t::text_secondary()),
+                RichText::new("Lookup logs")
+                    .small()
+                    .color(t::text_secondary()),
                 logs_url,
             );
         });
@@ -1270,7 +1386,16 @@ impl UserProfilePopup {
         let has_mod_action = actions.iter().any(|a| {
             matches!(
                 a,
-                PopupAction::Timeout { .. } | PopupAction::Ban { .. } | PopupAction::Unban { .. } | PopupAction::ExecuteCommand { .. }
+                PopupAction::Timeout { .. }
+                    | PopupAction::Ban { .. }
+                    | PopupAction::Unban { .. }
+                    | PopupAction::Warn { .. }
+                    | PopupAction::Monitor { .. }
+                    | PopupAction::Restrict { .. }
+                    | PopupAction::Unmonitor { .. }
+                    | PopupAction::Unrestrict { .. }
+                    | PopupAction::ClearUserMessagesLocally { .. }
+                    | PopupAction::ExecuteCommand { .. }
             )
         });
         if has_mod_action {

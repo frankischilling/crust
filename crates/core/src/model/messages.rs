@@ -82,6 +82,8 @@ pub enum MsgKind {
         user_input: Option<String>,
         status: Option<String>,
     },
+    /// Suspicious-user body message (EventSub low-trust chat line).
+    SuspiciousUserMessage,
     /// Message containing a bits cheermote donation.
     Bits { amount: u32 },
 }

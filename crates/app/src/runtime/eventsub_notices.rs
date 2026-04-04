@@ -45,6 +45,25 @@ pub(crate) fn format_eventsub_notice_text(kind: &EventSubNoticeKind) -> String {
         } => {
             format!("Incoming raid from {from_login} with {viewers} viewers.")
         }
+        EventSubNoticeKind::ChannelChatUserMessageHold { text, .. } => {
+            if text.trim().is_empty() {
+                "AutoMod is checking your message.".to_owned()
+            } else {
+                "AutoMod: Hey! Your message is being checked by mods and has not been sent."
+                    .to_owned()
+            }
+        }
+        EventSubNoticeKind::ChannelChatUserMessageUpdate { status, .. } => {
+            match status.trim().to_ascii_lowercase().as_str() {
+                "approved" => "AutoMod: Mods have accepted your message.".to_owned(),
+                "denied" => "AutoMod: Mods have denied your message.".to_owned(),
+                "invalid" => "AutoMod: Your message was lost in the void.".to_owned(),
+                other if !other.is_empty() => {
+                    format!("AutoMod: Message update resolved as {other}.")
+                }
+                _ => "AutoMod: Message update resolved.".to_owned(),
+            }
+        }
         EventSubNoticeKind::ChannelPointsRedemption {
             user_login,
             reward_title,
@@ -129,9 +148,7 @@ pub(crate) fn format_eventsub_notice_text(kind: &EventSubNoticeKind) -> String {
             }
         }
         EventSubNoticeKind::UnbanRequestCreate {
-            user_login,
-            text,
-            ..
+            user_login, text, ..
         } => {
             if let Some(text) = text.as_deref().filter(|s| !s.trim().is_empty()) {
                 format!("Unban request from {user_login}: {text}")
@@ -151,12 +168,12 @@ pub(crate) fn format_eventsub_notice_text(kind: &EventSubNoticeKind) -> String {
             reason,
             ends_at,
         } => {
-            let mut out =
-                if let Some(ends_at) = ends_at.as_deref().filter(|s| !s.trim().is_empty()) {
-                    format!("{user_login} was timed out until {ends_at}.")
-                } else {
-                    format!("{user_login} was banned.")
-                };
+            let mut out = if let Some(ends_at) = ends_at.as_deref().filter(|s| !s.trim().is_empty())
+            {
+                format!("{user_login} was timed out until {ends_at}.")
+            } else {
+                format!("{user_login} was banned.")
+            };
             if let Some(reason) = reason.as_deref().filter(|s| !s.trim().is_empty()) {
                 out.push_str(&format!(" Reason: {reason}"));
             }
@@ -165,6 +182,70 @@ pub(crate) fn format_eventsub_notice_text(kind: &EventSubNoticeKind) -> String {
         EventSubNoticeKind::ChannelUnban { user_login } => {
             format!("{user_login} was unbanned.")
         }
+        EventSubNoticeKind::SuspiciousUserMessage {
+            low_trust_status,
+            ban_evasion_evaluation,
+            shared_ban_channel_ids,
+            types,
+            ..
+        } => {
+            if low_trust_status.trim().eq_ignore_ascii_case("none")
+                || low_trust_status.trim().eq_ignore_ascii_case("monitored")
+            {
+                String::new()
+            } else {
+                let mut out = String::from("Suspicious User: Restricted");
+                let mut details = Vec::new();
+                if types
+                    .iter()
+                    .any(|ty| ty.eq_ignore_ascii_case("ban_evader_detector"))
+                {
+                    let evader = match ban_evasion_evaluation
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim()
+                        .to_ascii_lowercase()
+                        .as_str()
+                    {
+                        "likely" => "likely",
+                        _ => "possible",
+                    };
+                    details.push(format!("Detected as {evader} ban evader"));
+                }
+                if !shared_ban_channel_ids.is_empty() {
+                    details.push(format!(
+                        "Banned in {} shared channels",
+                        shared_ban_channel_ids.len()
+                    ));
+                }
+                if !details.is_empty() {
+                    out.push_str(". ");
+                    out.push_str(&details.join(". "));
+                }
+                out
+            }
+        }
+        EventSubNoticeKind::SuspiciousUserUpdate {
+            user_name,
+            moderator_name,
+            low_trust_status,
+            ..
+        } => match low_trust_status.trim().to_ascii_lowercase().as_str() {
+            "restricted" => {
+                format!("{moderator_name} added {user_name} as a restricted suspicious chatter.")
+            }
+            "monitored" => {
+                format!("{moderator_name} added {user_name} as a monitored suspicious chatter.")
+            }
+            "none" => {
+                format!("{moderator_name} removed {user_name} from the suspicious user list.")
+            }
+            other => {
+                format!(
+                    "{moderator_name} updated suspicious user status for {user_name} to {other}."
+                )
+            }
+        },
         EventSubNoticeKind::ModerationAction {
             moderator_login,
             action,
@@ -172,11 +253,7 @@ pub(crate) fn format_eventsub_notice_text(kind: &EventSubNoticeKind) -> String {
             target_message_id: _,
             source_channel_login,
         } => {
-            let action_label = action
-                .replace('_', " ")
-                .replace('.', " ")
-                .trim()
-                .to_owned();
+            let action_label = action.replace('_', " ").replace('.', " ").trim().to_owned();
             let source_suffix = source_channel_login
                 .as_deref()
                 .map(str::trim)
@@ -191,6 +268,18 @@ pub(crate) fn format_eventsub_notice_text(kind: &EventSubNoticeKind) -> String {
         }
         EventSubNoticeKind::StreamOnline => "Stream is now live.".to_owned(),
         EventSubNoticeKind::StreamOffline => "Stream is now offline.".to_owned(),
+        EventSubNoticeKind::UserWhisperMessage {
+            from_user_name,
+            to_user_name,
+            text,
+            ..
+        } => {
+            if text.trim().is_empty() {
+                format!("Whisper from {from_user_name} to {to_user_name}.")
+            } else {
+                format!("Whisper from {from_user_name} to {to_user_name}: {text}")
+            }
+        }
     }
 }
 
@@ -263,7 +352,15 @@ pub(crate) fn should_emit_eventsub_notice_message(kind: &EventSubNoticeKind) -> 
     !matches!(
         kind,
         // IRC moderation events already emit equivalent ban/unban lines.
-        EventSubNoticeKind::ChannelBan { .. } | EventSubNoticeKind::ChannelUnban { .. }
+        EventSubNoticeKind::ChannelBan { .. }
+            | EventSubNoticeKind::ChannelUnban { .. }
+            | EventSubNoticeKind::AutoModMessageHold { .. }
+            | EventSubNoticeKind::AutoModMessageUpdate { .. }
+            | EventSubNoticeKind::ChannelChatUserMessageHold { .. }
+            | EventSubNoticeKind::ChannelChatUserMessageUpdate { .. }
+            | EventSubNoticeKind::SuspiciousUserMessage { .. }
+            | EventSubNoticeKind::SuspiciousUserUpdate { .. }
+            | EventSubNoticeKind::UserWhisperMessage { .. }
     )
 }
 
@@ -318,7 +415,13 @@ fn parse_timeout_seconds(ends_at: Option<&str>) -> Option<u32> {
 
 pub(crate) fn room_state_update_from_moderation_action(
     action: &str,
-) -> Option<(Option<bool>, Option<i32>, Option<u32>, Option<bool>, Option<bool>)> {
+) -> Option<(
+    Option<bool>,
+    Option<i32>,
+    Option<u32>,
+    Option<bool>,
+    Option<bool>,
+)> {
     let normalized = action.trim().to_ascii_lowercase();
     if normalized.is_empty() {
         return None;

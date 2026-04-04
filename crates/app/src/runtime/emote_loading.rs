@@ -25,49 +25,16 @@ pub(crate) async fn load_global_emotes(
 ) {
     info!("Loading global emotes...");
 
-    let bttv = BttvProvider::new();
-    let ffz = FfzProvider::new();
-    let stv = SevenTvProvider::new();
     let twg = TwitchGlobalProvider::new();
 
-    let (b, f, s, t) = tokio::join!(
-        bttv.load_global(),
-        ffz.load_global(),
-        stv.load_global(),
-        twg.load_global(),
-    );
+    let t = twg.load_global().await;
+    let total = t.len();
+    info!("Loaded {total} global emotes (Twitch={})", t.len());
 
-    let total = b.len() + f.len() + s.len() + t.len();
-    info!(
-        "Loaded {total} global emotes (BTTV={}, FFZ={}, 7TV={}, Twitch={})",
-        b.len(),
-        f.len(),
-        s.len(),
-        t.len(),
-    );
+    let new_urls: Vec<String> = t.iter().map(|e| e.url_1x.clone()).collect();
 
-    // Collect URLs of the newly-loaded emotes for prefetching.
-    let new_urls: Vec<String> = f
-        .iter()
-        .chain(b.iter())
-        .chain(s.iter())
-        .chain(t.iter())
-        .map(|e| e.url_1x.clone())
-        .collect();
-
-    // Insert each provider under its own compound key so duplicates across
-    // providers are preserved in the catalog.
     {
         let mut idx = index.write().unwrap();
-        for e in f {
-            idx.insert(crate::emote_key(&e.provider, &e.code), e);
-        }
-        for e in b {
-            idx.insert(crate::emote_key(&e.provider, &e.code), e);
-        }
-        for e in s {
-            idx.insert(crate::emote_key(&e.provider, &e.code), e);
-        }
         for e in t {
             idx.insert(crate::emote_key(&e.provider, &e.code), e);
         }

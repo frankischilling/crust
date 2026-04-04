@@ -13,13 +13,10 @@ use crust_core::events::{
     AppCommand, AppEvent, AutoModQueueItem, ConnectionState, UnbanRequestItem,
 };
 use crust_core::model::{
-    Badge, ChannelId, ChatMessage, MessageFlags, MessageId, MsgKind, Sender, TwitchEmotePos,
-    UserId,
+    Badge, ChannelId, ChatMessage, MessageFlags, MessageId, MsgKind, Sender, TwitchEmotePos, UserId,
 };
-use crust_emotes::{
-    cache::EmoteCache,
-    providers::EmoteInfo,
-};
+use crust_core::plugins::{plugin_host, set_plugin_host, PluginCommandInvocation};
+use crust_emotes::{cache::EmoteCache, providers::EmoteInfo};
 use crust_kick::session::{KickEvent, KickSession, KickSessionCommand};
 use crust_storage::{AppSettings, LogStore, SettingsStore};
 use crust_twitch::session::generic_irc::{
@@ -38,32 +35,31 @@ use seventv::{
 
 use runtime::assets::fetch_emote_image;
 use runtime::badges::{
-    load_badge_map_cache_into, load_channel_badges, load_global_badges, resolve_badge_url,
-    BadgeMap,
+    load_badge_map_cache_into, load_channel_badges, load_global_badges, resolve_badge_url, BadgeMap,
 };
 use runtime::emote_loading::{
     load_channel_emotes, load_global_emotes, load_kick_channel_emotes, load_personal_7tv_emotes,
 };
+#[cfg(test)]
+use runtime::eventsub_notices::format_eventsub_notice_text;
 use runtime::eventsub_notices::{
     eventsub_notice_to_message, moderation_action_effect_from_notice,
     room_state_update_from_moderation_action, should_drop_duplicate_eventsub_notice,
-    should_emit_eventsub_notice_message, stream_status_is_live_from_notice,
-    ModerationActionEffect,
+    should_emit_eventsub_notice_message, stream_status_is_live_from_notice, ModerationActionEffect,
 };
-#[cfg(test)]
-use runtime::eventsub_notices::format_eventsub_notice_text;
 use runtime::history::{
     load_local_older_messages, load_local_recent_messages, load_local_recent_whispers,
     load_recent_messages,
 };
 use runtime::link_preview::fetch_link_preview;
+use runtime::plugins::init_plugins;
 use runtime::profiles::{
     fetch_ivr_logs, fetch_self_avatar, fetch_twitch_stream_status, fetch_twitch_user_profile,
     fetch_user_profile_for_channel,
 };
 use runtime::system_messages::{
     build_sub_text, extract_irc_msg_echo, format_timeout_text, is_twitch_pinned_notice,
-    make_system_message,
+    make_custom_message, make_system_message,
 };
 
 mod runtime;
@@ -212,7 +208,10 @@ fn main() -> Result<()> {
     let badge_map: BadgeMap = Arc::new(RwLock::new(std::collections::HashMap::new()));
     let loaded_cached_badges = load_badge_map_cache_into(&badge_map);
     if loaded_cached_badges > 0 {
-        info!("Loaded {} badge mappings from local cache", loaded_cached_badges);
+        info!(
+            "Loaded {} badge mappings from local cache",
+            loaded_cached_badges
+        );
     }
 
     // Settings / token storage
@@ -225,8 +224,19 @@ fn main() -> Result<()> {
     let kick_runtime_enabled = initial_settings.enable_kick_beta;
     let irc_runtime_enabled = initial_settings.enable_irc_beta;
 
+    // Lua/CupidScript plugin host.
+    let _plugin_host = init_plugins(cmd_tx.clone(), initial_settings.use_24h_timestamps);
+    let _ = set_plugin_host(_plugin_host.clone());
+
     // Apply persisted theme before UI renders.
     crust_ui::theme::apply_from_str(&initial_settings.theme);
+
+    // Raise worker stack size before any tokio threads are created.
+    // Some startup paths in OpenSSL/reqwest are deep enough to overflow the
+    // default worker stack on this build when they run on background threads.
+    if std::env::var_os("RUST_MIN_STACK").is_none() {
+        std::env::set_var("RUST_MIN_STACK", "33554432");
+    }
 
     // Determine which account to auto-login as on startup:
     // prefer the explicitly pinned default_account, fall back to the last
@@ -253,6 +263,9 @@ fn main() -> Result<()> {
 
     rt.spawn(async move {
         while let Some(evt) = evt_bridge_rx.recv().await {
+            if let Some(host) = plugin_host() {
+                host.dispatch_event(&evt);
+            }
             if ui_evt_tx.send(evt).await.is_ok() {
                 request_ui_repaint();
             }
@@ -287,27 +300,21 @@ fn main() -> Result<()> {
         session.run()
     });
 
-    // Load global emotes in background
-    rt.spawn({
+    // Run the initial catalog bootstrap on the main thread instead of a
+    // worker thread. The provider constructors and TLS setup involved here
+    // can consume a lot of stack on some libc/OpenSSL combinations.
+    {
         let idx = emote_index.clone();
         let cache = emote_cache.clone();
         let etx = evt_tx.clone();
         let gc = global_emote_codes.clone();
-        async move {
-            load_global_emotes(&idx, &cache, &etx, &gc).await;
-        }
-    });
-
-    // Load global badges in background
-    rt.spawn({
         let bm = badge_map.clone();
-        let etx = evt_tx.clone();
-        let cache = emote_cache.clone();
         let token = saved_token.clone();
-        async move {
+        rt.block_on(async move {
+            load_global_emotes(&idx, &cache, &etx, &gc).await;
             load_global_badges(&bm, &cache, &etx, token).await;
-        }
-    });
+        });
+    }
 
     // Spawn the reducer (bridges twitch/kick events → tokenized AppEvents for UI)
     rt.spawn({
@@ -1741,6 +1748,33 @@ async fn reducer_loop(
                             });
 
                         if let Some(channel) = channel {
+                            let mut next_message_id = || {
+                                let id = local_msg_id;
+                                local_msg_id += 1;
+                                id
+                            };
+                            let make_sender = |user_id: &str,
+                                               login: &str,
+                                               display_name: &str| Sender {
+                                user_id: UserId(user_id.to_owned()),
+                                login: login.to_owned(),
+                                display_name: display_name.to_owned(),
+                                color: None,
+                                name_paint: None,
+                                badges: Vec::new(),
+                            };
+                            let make_automod_sender = || Sender {
+                                user_id: UserId(String::new()),
+                                login: "automod".to_owned(),
+                                display_name: "AutoMod".to_owned(),
+                                color: None,
+                                name_paint: None,
+                                badges: vec![Badge {
+                                    name: "twitchbot".to_owned(),
+                                    version: "1".to_owned(),
+                                    url: None,
+                                }],
+                            };
                             match &notice.kind {
                                 EventSubNoticeKind::AutoModMessageHold {
                                     message_id,
@@ -1763,17 +1797,92 @@ async fn reducer_loop(
                                             })
                                             .await;
                                     }
+
+                                    let msg = make_custom_message(
+                                        next_message_id(),
+                                        channel.clone(),
+                                        "AutoMod: Held a message for review.".to_owned(),
+                                        Utc::now(),
+                                        make_automod_sender(),
+                                        MessageFlags::default(),
+                                        MsgKind::SystemInfo,
+                                    );
+                                    let _ = evt_tx
+                                        .send(AppEvent::MessageReceived {
+                                            channel: channel.clone(),
+                                            message: msg,
+                                        })
+                                        .await;
                                 }
                                 EventSubNoticeKind::AutoModMessageUpdate {
                                     message_id,
-                                    status,
+                                    ..
                                 } => {
                                     if !message_id.trim().is_empty() {
                                         let _ = evt_tx
                                             .send(AppEvent::AutoModQueueRemove {
                                                 channel: channel.clone(),
                                                 message_id: message_id.clone(),
-                                                action: Some(status.clone()),
+                                                action: None,
+                                            })
+                                            .await;
+                                    }
+                                }
+                                EventSubNoticeKind::ChannelChatUserMessageHold {
+                                    message_id,
+                                    user_id: _,
+                                    user_login: _,
+                                    user_name: _,
+                                    ..
+                                } => {
+                                    if !message_id.trim().is_empty() {
+                                    let msg = make_custom_message(
+                                        next_message_id(),
+                                        channel.clone(),
+                                        "AutoMod: Hey! Your message is being checked by mods and has not been sent.".to_owned(),
+                                        Utc::now(),
+                                        make_automod_sender(),
+                                        MessageFlags::default(),
+                                        MsgKind::SystemInfo,
+                                    );
+                                        let _ = evt_tx
+                                            .send(AppEvent::MessageReceived {
+                                                channel: channel.clone(),
+                                                message: msg,
+                                            })
+                                            .await;
+                                    }
+                                }
+                                EventSubNoticeKind::ChannelChatUserMessageUpdate {
+                                    message_id,
+                                    user_id: _,
+                                    user_login: _,
+                                    user_name: _,
+                                    status,
+                                    ..
+                                } => {
+                                    if !message_id.trim().is_empty() {
+                                        let message_text = match status.trim().to_ascii_lowercase().as_str()
+                                        {
+                                            "approved" => "AutoMod: Mods have accepted your message.",
+                                            "denied" => "AutoMod: Mods have denied your message.",
+                                            "invalid" => "AutoMod: Your message was lost in the void.",
+                                            _ => "AutoMod: Message update resolved.",
+                                        }
+                                        .to_owned();
+                                        let msg = make_custom_message(
+                                            next_message_id(),
+                                            channel.clone(),
+                                            message_text,
+                                            Utc::now(),
+                                            make_automod_sender(),
+                                            MessageFlags::default(),
+                                            MsgKind::SystemInfo,
+                                        );
+                                        let _ = evt_tx
+                                            .send(AppEvent::MessageReceived {
+                                                channel: channel.clone(),
+                                                message: msg,
                                             })
                                             .await;
                                     }
@@ -1824,6 +1933,174 @@ async fn reducer_loop(
                                             })
                                             .await;
                                     }
+                                }
+                                EventSubNoticeKind::SuspiciousUserMessage {
+                                    user_login,
+                                    user_name,
+                                    low_trust_status,
+                                    ban_evasion_evaluation,
+                                    shared_ban_channel_ids,
+                                    types,
+                                    text,
+                                    ..
+                                } => {
+                                    if low_trust_status.trim().eq_ignore_ascii_case("restricted") {
+                                        let mut details = Vec::new();
+                                        if types.iter().any(|ty| ty.eq_ignore_ascii_case("ban_evader_detector")) {
+                                            let evader = match ban_evasion_evaluation
+                                                .as_deref()
+                                                .unwrap_or("")
+                                                .trim()
+                                                .to_ascii_lowercase()
+                                                .as_str()
+                                            {
+                                                "likely" => "likely",
+                                                _ => "possible",
+                                            };
+                                            details.push(format!("Detected as {evader} ban evader"));
+                                        }
+                                        if !shared_ban_channel_ids.is_empty() {
+                                            details.push(format!(
+                                                "Banned in {} shared channels",
+                                                shared_ban_channel_ids.len()
+                                            ));
+                                        }
+
+                                        let header_text = if details.is_empty() {
+                                            "Suspicious User: Restricted".to_owned()
+                                        } else {
+                                            format!(
+                                                "Suspicious User: Restricted. {}",
+                                                details.join(". ")
+                                            )
+                                        };
+                                        let header = make_custom_message(
+                                            next_message_id(),
+                                            channel.clone(),
+                                            header_text,
+                                            Utc::now(),
+                                            make_sender("", "", ""),
+                                            MessageFlags::default(),
+                                            MsgKind::SystemInfo,
+                                        );
+                                        let _ = evt_tx
+                                            .send(AppEvent::MessageReceived {
+                                                channel: channel.clone(),
+                                                message: header,
+                                            })
+                                            .await;
+
+                                        let body_text = if text.trim().is_empty() {
+                                            "[message hidden]".to_owned()
+                                        } else {
+                                            text.clone()
+                                        };
+                                        let body = make_custom_message(
+                                            next_message_id(),
+                                            channel.clone(),
+                                            body_text,
+                                            Utc::now(),
+                                            make_sender("", user_login, user_name),
+                                            MessageFlags::default(),
+                                            MsgKind::SuspiciousUserMessage,
+                                        );
+                                        let _ = evt_tx
+                                            .send(AppEvent::MessageReceived {
+                                                channel: channel.clone(),
+                                                message: body,
+                                            })
+                                            .await;
+                                    }
+                                }
+                                EventSubNoticeKind::SuspiciousUserUpdate {
+                                    moderator_user_id,
+                                    moderator_login,
+                                    moderator_name,
+                                    user_name,
+                                    low_trust_status,
+                                    ..
+                                } => {
+                                    let action_text = match low_trust_status
+                                        .trim()
+                                        .to_ascii_lowercase()
+                                        .as_str()
+                                    {
+                                        "restricted" => format!(
+                                            "{moderator_name} added {user_name} as a restricted suspicious chatter."
+                                        ),
+                                        "monitored" => format!(
+                                            "{moderator_name} added {user_name} as a monitored suspicious chatter."
+                                        ),
+                                        "none" => format!(
+                                            "{moderator_name} removed {user_name} from the suspicious user list."
+                                        ),
+                                        other => format!(
+                                            "{moderator_name} updated suspicious user status for {user_name} to {other}."
+                                        ),
+                                    };
+                                    let msg = make_custom_message(
+                                        next_message_id(),
+                                        channel.clone(),
+                                        action_text,
+                                        Utc::now(),
+                                        make_sender(moderator_user_id, moderator_login, moderator_name),
+                                        MessageFlags::default(),
+                                        MsgKind::SystemInfo,
+                                    );
+                                    let _ = evt_tx
+                                        .send(AppEvent::MessageReceived {
+                                            channel: channel.clone(),
+                                            message: msg,
+                                        })
+                                        .await;
+                                }
+                                EventSubNoticeKind::UserWhisperMessage {
+                                    from_user_login,
+                                    from_user_name,
+                                    to_user_login,
+                                    to_user_name: _,
+                                    text,
+                                    ..
+                                } => {
+                                    let local_login = auth_username
+                                        .as_deref()
+                                        .map(str::trim)
+                                        .filter(|s| !s.is_empty())
+                                        .map(str::to_ascii_lowercase);
+                                    let is_self = local_login
+                                        .as_deref()
+                                        .map(|login| login.eq_ignore_ascii_case(from_user_login))
+                                        .unwrap_or(false);
+                                    if !is_self && settings.local_log_indexing_enabled {
+                                        if let Some(store) = chat_logs.as_ref() {
+                                            if let Err(e) = persist_whisper_message(
+                                                store,
+                                                local_login.as_deref(),
+                                                from_user_login,
+                                                from_user_name,
+                                                to_user_login,
+                                                text,
+                                                &[],
+                                                false,
+                                                Utc::now(),
+                                            ) {
+                                                warn!("whisper-history: failed to persist EventSub whisper: {e}");
+                                            }
+                                        }
+                                    }
+
+                                    let _ = evt_tx
+                                        .send(AppEvent::WhisperReceived {
+                                            from_login: from_user_login.clone(),
+                                            from_display_name: from_user_name.clone(),
+                                            target_login: to_user_login.clone(),
+                                            text: text.clone(),
+                                            twitch_emotes: Vec::new(),
+                                            is_self,
+                                            timestamp: Utc::now(),
+                                            is_history: false,
+                                        })
+                                        .await;
                                 }
                                 EventSubNoticeKind::ModerationAction {
                                     action,
@@ -2565,6 +2842,9 @@ async fn reducer_loop(
                                 warn!("Failed to save general settings: {e}");
                             }
                         }
+                        if let Some(host) = plugin_host() {
+                            host.set_use_24h_timestamps(settings.use_24h_timestamps);
+                        }
 
                         let _ = evt_tx
                             .send(AppEvent::GeneralSettingsUpdated {
@@ -3268,6 +3548,11 @@ async fn reducer_loop(
                             ).await;
                         });
                     }
+                    AppCommand::ClearUserMessagesLocally { channel, login } => {
+                        let _ = evt_tx
+                            .send(AppEvent::ClearUserMessagesLocally { channel, login })
+                            .await;
+                    }
                     AppCommand::BanUser { channel, login, user_id, reason } => {
                         if let Some(remaining) = moderation_command_remaining_cooldown(
                             &mut moderation_cmd_cooldowns,
@@ -3332,6 +3617,82 @@ async fn reducer_loop(
                                 broadcaster_id.as_deref(), moderator_id.as_deref(),
                                 &user_id, &login, &ch_name, evt_tx2,
                             ).await;
+                        });
+                    }
+                    AppCommand::WarnUser {
+                        channel,
+                        login,
+                        user_id: _,
+                        reason,
+                    } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let moderator_id = auth_user_id.clone();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        let ch_name = channel.clone();
+                        tokio::spawn(async move {
+                            helix_warn_user(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                moderator_id.as_deref(),
+                                &login,
+                                &reason,
+                                &ch_name,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::SetSuspiciousUser {
+                        channel,
+                        login,
+                        user_id: _,
+                        restricted,
+                    } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let moderator_id = auth_user_id.clone();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        let ch_name = channel.clone();
+                        tokio::spawn(async move {
+                            helix_set_suspicious_user(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                moderator_id.as_deref(),
+                                &login,
+                                restricted,
+                                &ch_name,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::ClearSuspiciousUser {
+                        channel,
+                        login,
+                        user_id: _,
+                    } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let moderator_id = auth_user_id.clone();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        let ch_name = channel.clone();
+                        tokio::spawn(async move {
+                            helix_clear_suspicious_user(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                moderator_id.as_deref(),
+                                &login,
+                                &ch_name,
+                                evt_tx2,
+                            )
+                            .await;
                         });
                     }
                     AppCommand::ResolveAutoModMessage {
@@ -3653,6 +4014,40 @@ async fn reducer_loop(
                         // Platform-agnostic browser open via xdg-open / open / start.
                         open_url_in_browser(&url);
                     }
+                    AppCommand::ReloadPlugins => {
+                        if let Some(host) = plugin_host() {
+                            host.reload();
+                            local_msg_id += 1;
+                            let msg = make_system_message(
+                                local_msg_id,
+                                ChannelId::new("system"),
+                                "Plugins reloaded.".to_owned(),
+                                Utc::now(),
+                                MsgKind::SystemInfo,
+                            );
+                            let _ = evt_tx
+                                .send(AppEvent::MessageReceived {
+                                    channel: ChannelId::new("system"),
+                                    message: msg,
+                                })
+                                .await;
+                        } else {
+                            let _ = evt_tx
+                                .send(AppEvent::Error {
+                                    context: "Plugins".into(),
+                                    message: "Plugin host is unavailable.".into(),
+                                })
+                                .await;
+                        }
+                    }
+                    AppCommand::RunPluginCallback {
+                        vm_key,
+                        callback_ref,
+                    } => {
+                        if let Some(host) = plugin_host() {
+                            host.run_plugin_callback(vm_key, callback_ref);
+                        }
+                    }
                     AppCommand::InjectLocalMessage { channel, text } => {
                         local_msg_id += 1;
                         let msg = make_system_message(
@@ -3678,6 +4073,32 @@ async fn reducer_loop(
                             )
                             .await;
                         });
+                    }
+                    AppCommand::RunPluginCommand {
+                        channel,
+                        command,
+                        words,
+                        reply_to_msg_id,
+                        reply,
+                        raw_text,
+                    } => {
+                        if let Some(host) = plugin_host() {
+                            host.execute_command(PluginCommandInvocation {
+                                command,
+                                channel,
+                                words,
+                                reply_to_msg_id,
+                                reply,
+                                raw_text,
+                            });
+                        } else {
+                            let _ = evt_tx
+                                .send(AppEvent::Error {
+                                    context: "Plugins".into(),
+                                    message: "Plugin host is unavailable.".into(),
+                                })
+                                .await;
+                        }
                     }
                     AppCommand::FetchIvrLogs { channel, username } => {
                         let etx = evt_tx.clone();
@@ -4111,12 +4532,7 @@ async fn helix_delete_message(
 
     if status.is_success() {
         info!("Moderation: deleted message in #{channel}");
-        emit_helix_system_info(
-            evt_tx,
-            channel,
-            "Moderation: message deleted.".into(),
-        )
-        .await;
+        emit_helix_system_info(evt_tx, channel, "Moderation: message deleted.".into()).await;
         return;
     } else {
         let body_text = resp.text().await.unwrap_or_default();
@@ -4333,6 +4749,327 @@ async fn helix_unban_user(
     }
 }
 
+async fn helix_warn_user(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    moderator_id: Option<&str>,
+    target_login: &str,
+    reason: &str,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (Some(cid), Some(bid), Some(mid)) = (client_id, broadcaster_id, moderator_id) else {
+        warn!("helix_warn_user: missing credentials");
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Moderation".into(),
+                message: "Cannot warn: missing Twitch credentials. Reconnect and try again.".into(),
+            })
+            .await;
+        return;
+    };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    if bare.trim().is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Moderation".into(),
+                message: "You must be logged in to warn a user.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let target_login = target_login
+        .trim()
+        .trim_start_matches('@')
+        .to_ascii_lowercase();
+    let reason = reason.trim();
+    if target_login.is_empty() || reason.is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Moderation".into(),
+                message: "Cannot warn: target login and reason are required.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let target_user_id = match helix_user_id_by_login(bare, cid, &target_login).await {
+        Ok(id) => id,
+        Err(msg) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Moderation".into(),
+                    message: msg,
+                })
+                .await;
+            return;
+        }
+    };
+
+    let client = reqwest::Client::new();
+    let url = format!(
+        "https://api.twitch.tv/helix/moderation/warnings?broadcaster_id={bid}&moderator_id={mid}"
+    );
+    let resp = match client
+        .post(&url)
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .json(&serde_json::json!({
+            "data": {
+                "reason": reason,
+                "user_id": target_user_id,
+            }
+        }))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("helix_warn_user: request failed: {e}");
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Moderation".into(),
+                    message: format!("Warn request failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let status = resp.status();
+    if status.is_success() {
+        info!("Moderation: warned {target_login} in #{channel}");
+        return;
+    }
+
+    let body_text = resp.text().await.unwrap_or_default();
+    warn!("helix_warn_user: HTTP {status} - {body_text}");
+    let helix_msg = helix_error_message(status, &body_text);
+    let _ = evt_tx
+        .send(AppEvent::Error {
+            context: "Moderation".into(),
+            message: format!("Could not warn {target_login}: {helix_msg}"),
+        })
+        .await;
+}
+
+async fn helix_set_suspicious_user(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    moderator_id: Option<&str>,
+    target_login: &str,
+    restricted: bool,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (Some(cid), Some(bid), Some(mid)) = (client_id, broadcaster_id, moderator_id) else {
+        warn!("helix_set_suspicious_user: missing credentials");
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Moderation".into(),
+                message:
+                    "Cannot update low-trust status: missing Twitch credentials. Reconnect and try again."
+                        .into(),
+            })
+            .await;
+        return;
+    };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    if bare.trim().is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Moderation".into(),
+                message: "You must be logged in to update low-trust status.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let target_login = target_login
+        .trim()
+        .trim_start_matches('@')
+        .to_ascii_lowercase();
+    if target_login.is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Moderation".into(),
+                message: "Cannot update low-trust status: missing target login.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let target_user_id = match helix_user_id_by_login(bare, cid, &target_login).await {
+        Ok(id) => id,
+        Err(msg) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Moderation".into(),
+                    message: msg,
+                })
+                .await;
+            return;
+        }
+    };
+
+    let client = reqwest::Client::new();
+    let url = format!(
+        "https://api.twitch.tv/helix/moderation/suspicious_users?broadcaster_id={bid}&moderator_id={mid}"
+    );
+    let resp = match client
+        .post(&url)
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .json(&serde_json::json!({
+            "user_id": target_user_id,
+            "status": if restricted { "RESTRICTED" } else { "ACTIVE_MONITORING" },
+        }))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("helix_set_suspicious_user: request failed: {e}");
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Moderation".into(),
+                    message: format!("Low-trust update failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let status = resp.status();
+    if status.is_success() {
+        info!(
+            "Moderation: set suspicious user {target_login} ({}) in #{channel}",
+            if restricted {
+                "restricted"
+            } else {
+                "monitored"
+            }
+        );
+        return;
+    }
+
+    let body_text = resp.text().await.unwrap_or_default();
+    warn!("helix_set_suspicious_user: HTTP {status} - {body_text}");
+    let helix_msg = helix_error_message(status, &body_text);
+    let _ = evt_tx
+        .send(AppEvent::Error {
+            context: "Moderation".into(),
+            message: format!("Could not update low-trust status for {target_login}: {helix_msg}"),
+        })
+        .await;
+}
+
+async fn helix_clear_suspicious_user(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    moderator_id: Option<&str>,
+    target_login: &str,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (Some(cid), Some(bid), Some(mid)) = (client_id, broadcaster_id, moderator_id) else {
+        warn!("helix_clear_suspicious_user: missing credentials");
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Moderation".into(),
+                message:
+                    "Cannot clear low-trust status: missing Twitch credentials. Reconnect and try again."
+                        .into(),
+            })
+            .await;
+        return;
+    };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    if bare.trim().is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Moderation".into(),
+                message: "You must be logged in to clear low-trust status.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let target_login = target_login
+        .trim()
+        .trim_start_matches('@')
+        .to_ascii_lowercase();
+    if target_login.is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Moderation".into(),
+                message: "Cannot clear low-trust status: missing target login.".into(),
+            })
+            .await;
+        return;
+    }
+
+    let target_user_id = match helix_user_id_by_login(bare, cid, &target_login).await {
+        Ok(id) => id,
+        Err(msg) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Moderation".into(),
+                    message: msg,
+                })
+                .await;
+            return;
+        }
+    };
+
+    let client = reqwest::Client::new();
+    let url = format!(
+        "https://api.twitch.tv/helix/moderation/suspicious_users?broadcaster_id={bid}&moderator_id={mid}&user_id={target_user_id}"
+    );
+    let resp = match client
+        .delete(&url)
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("helix_clear_suspicious_user: request failed: {e}");
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Moderation".into(),
+                    message: format!("Low-trust removal failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let status = resp.status();
+    if status.is_success() || status.as_u16() == 204 {
+        info!("Moderation: cleared suspicious user {target_login} in #{channel}");
+        return;
+    }
+
+    let body_text = resp.text().await.unwrap_or_default();
+    warn!("helix_clear_suspicious_user: HTTP {status} - {body_text}");
+    let helix_msg = helix_error_message(status, &body_text);
+    let _ = evt_tx
+        .send(AppEvent::Error {
+            context: "Moderation".into(),
+            message: format!("Could not clear low-trust status for {target_login}: {helix_msg}"),
+        })
+        .await;
+}
+
 /// Resolve a held AutoMod message via
 /// `POST /helix/moderation/automod/message`.
 async fn helix_resolve_automod_message(
@@ -4407,10 +5144,7 @@ async fn helix_resolve_automod_message(
         .post(url)
         .header("Authorization", format!("Bearer {bare}"))
         .header("Client-Id", cid)
-        .query(&[
-            ("broadcaster_id", bid),
-            ("moderator_id", mid),
-        ])
+        .query(&[("broadcaster_id", bid), ("moderator_id", mid)])
         .json(&AutoModResolveBody {
             user_id,
             msg_id,
@@ -4660,9 +5394,7 @@ async fn helix_resolve_unban_request(
         resolution_text: Option<&'a str>,
     }
 
-    let trimmed_resolution = resolution_text
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let trimmed_resolution = resolution_text.map(str::trim).filter(|s| !s.is_empty());
 
     let req = ResolveUnbanBody {
         unban_request_id: request_id,
@@ -4675,10 +5407,7 @@ async fn helix_resolve_unban_request(
         .patch("https://api.twitch.tv/helix/moderation/unban_requests")
         .header("Authorization", format!("Bearer {bare}"))
         .header("Client-Id", cid)
-        .query(&[
-            ("broadcaster_id", bid),
-            ("moderator_id", mid),
-        ])
+        .query(&[("broadcaster_id", bid), ("moderator_id", mid)])
         .json(&req)
         .send()
         .await
@@ -4841,11 +5570,7 @@ async fn emit_helix_system_info(evt_tx: mpsc::Sender<AppEvent>, channel: &Channe
 fn helix_error_message(status: reqwest::StatusCode, body_text: &str) -> String {
     serde_json::from_str::<serde_json::Value>(body_text)
         .ok()
-        .and_then(|v| {
-            v.get("message")
-                .and_then(|m| m.as_str())
-                .map(str::to_owned)
-        })
+        .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_owned))
         .unwrap_or_else(|| format!("HTTP {status}"))
 }
 
@@ -4988,10 +5713,7 @@ fn persist_whisper_message(
             .or_else(|| from_login.clone())
             .or(local_login)
     } else {
-        from_login
-            .clone()
-            .or(target_login.clone())
-            .or(local_login)
+        from_login.clone().or(target_login.clone()).or(local_login)
     };
     let Some(partner_login) = partner_login else {
         return Ok(());
@@ -5170,9 +5892,7 @@ async fn helix_send_whisper(
         let _ = evt_tx
             .send(AppEvent::Error {
                 context: "Whisper".into(),
-                message: format!(
-                    "Whisper too long (>{TWITCH_MAX_MESSAGE_CHARS} characters)."
-                ),
+                message: format!("Whisper too long (>{TWITCH_MAX_MESSAGE_CHARS} characters)."),
             })
             .await;
         return;
@@ -5201,7 +5921,10 @@ async fn helix_send_whisper(
         .post("https://api.twitch.tv/helix/whispers")
         .header("Authorization", format!("Bearer {bare}"))
         .header("Client-Id", cid)
-        .query(&[("from_user_id", sender_id), ("to_user_id", to_user_id.as_str())])
+        .query(&[
+            ("from_user_id", sender_id),
+            ("to_user_id", to_user_id.as_str()),
+        ])
         .json(&WhisperBody {
             message: trimmed_text,
         })
@@ -5247,9 +5970,7 @@ async fn helix_send_whisper(
 
     let mut msg = helix_error_message(status, &body_text);
     if body_text.contains("MISSING_REQUIRED_SCOPE")
-        || msg
-            .to_ascii_lowercase()
-            .contains("missing required scope")
+        || msg.to_ascii_lowercase().contains("missing required scope")
     {
         msg.push_str(" Re-login with a token that includes user:manage:whispers.");
     }
@@ -5321,7 +6042,12 @@ async fn helix_send_announcement(
         .map(str::trim)
         .filter(|c| !c.is_empty())
         .map(str::to_ascii_lowercase)
-        .filter(|c| matches!(c.as_str(), "primary" | "blue" | "green" | "orange" | "purple"));
+        .filter(|c| {
+            matches!(
+                c.as_str(),
+                "primary" | "blue" | "green" | "orange" | "purple"
+            )
+        });
 
     #[derive(serde::Serialize)]
     struct AnnouncementBody<'a> {
@@ -5418,7 +6144,10 @@ async fn helix_send_shoutout(
         return;
     }
 
-    let login = target_login.trim().trim_start_matches('@').to_ascii_lowercase();
+    let login = target_login
+        .trim()
+        .trim_start_matches('@')
+        .to_ascii_lowercase();
     if login.is_empty() {
         let _ = evt_tx
             .send(AppEvent::Error {
@@ -5478,8 +6207,7 @@ async fn helix_send_shoutout(
     let status = resp.status();
     let body_text = resp.text().await.unwrap_or_default();
     if status.is_success() {
-        emit_helix_system_info(evt_tx, channel, format!("Sent shoutout to {login}."))
-            .await;
+        emit_helix_system_info(evt_tx, channel, format!("Sent shoutout to {login}.")).await;
         return;
     }
 
@@ -5585,10 +6313,7 @@ async fn helix_start_commercial(
         let info = serde_json::from_str::<CommercialResponse>(&body_text)
             .ok()
             .and_then(|payload| payload.data.into_iter().next());
-        let confirmed_len = info
-            .as_ref()
-            .and_then(|d| d.length)
-            .unwrap_or(length_secs);
+        let confirmed_len = info.as_ref().and_then(|d| d.length).unwrap_or(length_secs);
         let server_msg = info
             .as_ref()
             .and_then(|d| d.message.as_deref())
@@ -5868,9 +6593,7 @@ async fn helix_find_active_poll(
         data: Vec<PollItem>,
     }
 
-    let url = format!(
-        "https://api.twitch.tv/helix/polls?broadcaster_id={broadcaster_id}&first=20"
-    );
+    let url = format!("https://api.twitch.tv/helix/polls?broadcaster_id={broadcaster_id}&first=20");
     let client = reqwest::Client::new();
     let resp = client
         .get(url)
@@ -5985,8 +6708,7 @@ async fn helix_end_poll(
         } else {
             "Ended"
         };
-        emit_helix_system_info(evt_tx, channel, format!("{verb} poll: {poll_title}"))
-            .await;
+        emit_helix_system_info(evt_tx, channel, format!("{verb} poll: {poll_title}")).await;
         return;
     }
 
@@ -6036,9 +6758,8 @@ async fn helix_find_manageable_prediction(
         data: Vec<PredictionItem>,
     }
 
-    let url = format!(
-        "https://api.twitch.tv/helix/predictions?broadcaster_id={broadcaster_id}&first=20"
-    );
+    let url =
+        format!("https://api.twitch.tv/helix/predictions?broadcaster_id={broadcaster_id}&first=20");
     let client = reqwest::Client::new();
     let resp = client
         .get(url)
@@ -6237,10 +6958,7 @@ async fn helix_patch_prediction_status(
         let _ = evt_tx
             .send(AppEvent::Error {
                 context: "Prediction".into(),
-                message: format!(
-                    "Prediction is {} and cannot be locked.",
-                    prediction.status
-                ),
+                message: format!("Prediction is {} and cannot be locked.", prediction.status),
             })
             .await;
         return;
@@ -6314,7 +7032,10 @@ async fn helix_patch_prediction_status(
                 .as_ref()
                 .map(|(_, title)| title.as_str())
                 .unwrap_or("<unknown>");
-            format!("Resolved prediction: {} (winner: {})", prediction.title, winner)
+            format!(
+                "Resolved prediction: {} (winner: {})",
+                prediction.title, winner
+            )
         } else {
             format!("Updated prediction: {}", prediction.title)
         };
@@ -6468,7 +7189,9 @@ async fn validate_token(token: &str) -> Result<ValidateInfo, ValidateError> {
 }
 
 fn token_has_scope(scopes: &[String], required: &str) -> bool {
-    scopes.iter().any(|scope| scope.eq_ignore_ascii_case(required))
+    scopes
+        .iter()
+        .any(|scope| scope.eq_ignore_ascii_case(required))
 }
 
 async fn warn_missing_whisper_scope(evt_tx: &mpsc::Sender<AppEvent>, scopes: &[String]) {
@@ -6700,15 +7423,13 @@ mod tests {
 
     use super::{
         format_eventsub_notice_text, moderation_action_effect_from_notice,
-        moderation_command_remaining_cooldown,
-        parse_twitch_pinned_snapshot_json,
+        moderation_command_remaining_cooldown, parse_twitch_pinned_snapshot_json,
         should_drop_duplicate_eventsub_notice, should_emit_eventsub_notice_message,
-        stream_status_is_live_from_notice,
-        ModerationActionEffect, MODERATION_CMD_COOLDOWN,
-        APP_INITIAL_INNER_SIZE, APP_MIN_INNER_SIZE,
+        stream_status_is_live_from_notice, ModerationActionEffect, APP_INITIAL_INNER_SIZE,
+        APP_MIN_INNER_SIZE, MODERATION_CMD_COOLDOWN,
     };
-    use crust_core::model::ChannelId;
     use crate::runtime::system_messages::is_twitch_pinned_notice;
+    use crust_core::model::ChannelId;
     use crust_twitch::eventsub::EventSubNoticeKind;
 
     #[test]
@@ -6824,10 +7545,7 @@ mod tests {
         let now = Instant::now();
 
         assert!(!should_drop_duplicate_eventsub_notice(
-            &mut seen,
-            "evt-123",
-            now,
-            &mut gc_at,
+            &mut seen, "evt-123", now, &mut gc_at,
         ));
         assert!(should_drop_duplicate_eventsub_notice(
             &mut seen,
@@ -6844,10 +7562,7 @@ mod tests {
         let now = Instant::now();
 
         assert!(!should_drop_duplicate_eventsub_notice(
-            &mut seen,
-            "evt-123",
-            now,
-            &mut gc_at,
+            &mut seen, "evt-123", now, &mut gc_at,
         ));
         assert!(!should_drop_duplicate_eventsub_notice(
             &mut seen,
@@ -6959,5 +7674,3 @@ mod tests {
         );
     }
 }
-
-

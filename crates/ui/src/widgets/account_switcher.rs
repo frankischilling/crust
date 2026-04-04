@@ -1,5 +1,5 @@
-use egui::{Context, RichText};
 use crate::theme as t;
+use egui::{Context, RichText};
 
 /// Account switcher widget state for displaying and switching between multiple saved accounts.
 #[derive(Clone, Debug, Default)]
@@ -98,7 +98,8 @@ impl AccountSwitcherState {
                                     }
 
                                     // Token status indicator
-                                    let token_indicator = if account.has_token { "🔑" } else { "⚠" };
+                                    let token_indicator =
+                                        if account.has_token { "🔑" } else { "⚠" };
                                     let token_color = if account.has_token {
                                         t::green()
                                     } else {
@@ -109,19 +110,19 @@ impl AccountSwitcherState {
                                             .font(t::small())
                                             .color(token_color),
                                     )
-                                    .on_hover_text(if account.has_token {
-                                        "Token saved"
-                                    } else {
-                                        "No token - login required"
-                                    });
+                                    .on_hover_text(
+                                        if account.has_token {
+                                            "Token saved"
+                                        } else {
+                                            "No token - login required"
+                                        },
+                                    );
 
                                     // Remove button
                                     if !account.is_active {
                                         if ui
                                             .button(
-                                                RichText::new("🗑")
-                                                    .font(t::tiny())
-                                                    .color(t::red()),
+                                                RichText::new("🗑").font(t::tiny()).color(t::red()),
                                             )
                                             .on_hover_text("Remove account")
                                             .clicked()

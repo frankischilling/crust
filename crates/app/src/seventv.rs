@@ -484,10 +484,13 @@ pub(crate) async fn load_7tv_user_style_for_twitch(
                         });
                     }
                     if out.color.is_none() {
-                        out.color = user2
-                            .style
-                            .as_ref()
-                            .and_then(|s| if s.color == 0 { None } else { Some(s.color) });
+                        out.color = user2.style.as_ref().and_then(|s| {
+                            if s.color == 0 {
+                                None
+                            } else {
+                                Some(s.color)
+                            }
+                        });
                     }
                     out.badge_id = user2
                         .style

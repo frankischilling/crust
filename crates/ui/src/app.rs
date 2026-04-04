@@ -10,15 +10,15 @@ use tracing::warn;
 
 use crust_core::{
     events::{
-        AppCommand, AppEvent, AutoModQueueItem, ConnectionState, LinkPreview,
-        UnbanRequestItem,
+        AppCommand, AppEvent, AutoModQueueItem, ConnectionState, LinkPreview, UnbanRequestItem,
     },
     model::{
-        ChannelId, ChannelState, EmoteCatalogEntry, MsgKind, ReplyInfo, Span,
-        TwitchEmotePos,
+        ChannelId, ChannelState, EmoteCatalogEntry, MsgKind, ReplyInfo, Span, TwitchEmotePos,
         IRC_SERVER_CONTROL_CHANNEL,
     },
-    AppState,
+    plugin_command_infos, plugin_host,
+    plugins::PluginUiHostSlot,
+    AppState, PluginAuthSnapshot, PluginChannelSnapshot,
 };
 
 use crate::commands::render_help_message;
@@ -43,6 +43,10 @@ use crate::widgets::{
         should_use_search_window, show_message_search_inline, show_message_search_window,
         MessageSearchState,
     },
+    plugin_ui::{
+        has_host_panels_for_slot, render_host_panels_for_slot, show_plugin_windows,
+        PluginUiSessionState,
+    },
     settings_page::{
         parse_settings_lines, show_settings_page, SettingsPageState, SettingsSection, SettingsStats,
     },
@@ -55,8 +59,7 @@ use crate::widgets::{
 const REPAINT_ANIM_MS: u64 = 33;
 const REPAINT_HOUSEKEEPING_MS: u64 = 2_000;
 const STREAM_REFRESH_SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-const STREAM_REFRESH_ACTIVE_LIVE_INTERVAL: std::time::Duration =
-    std::time::Duration::from_secs(8);
+const STREAM_REFRESH_ACTIVE_LIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(8);
 const STREAM_REFRESH_ACTIVE_OFFLINE_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(30);
 const STREAM_REFRESH_ACTIVE_UNKNOWN_INTERVAL: std::time::Duration =
@@ -67,10 +70,8 @@ const STREAM_REFRESH_BACKGROUND_OFFLINE_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(120);
 const STREAM_REFRESH_BACKGROUND_UNKNOWN_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(60);
-const STREAM_REFRESH_INFLIGHT_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(25);
-const STREAM_NOTIFICATION_STARTUP_GRACE: std::time::Duration =
-    std::time::Duration::from_secs(8);
+const STREAM_REFRESH_INFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+const STREAM_NOTIFICATION_STARTUP_GRACE: std::time::Duration = std::time::Duration::from_secs(8);
 const AUTH_REFRESH_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 const AUTH_REFRESH_INFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const EVENT_TOAST_MAX_ACTIVE: usize = 5;
@@ -270,6 +271,48 @@ impl SplitPanes {
             self.clamp_focus();
         }
     }
+
+    fn move_focused(&mut self, delta: isize) {
+        if self.panes.len() < 2 || self.focused >= self.panes.len() {
+            return;
+        }
+        let new_idx = self.focused as isize + delta;
+        if new_idx < 0 || new_idx >= self.panes.len() as isize {
+            return;
+        }
+        let idx = self.focused;
+        let other = new_idx as usize;
+        self.panes.swap(idx, other);
+        self.focused = other;
+    }
+
+    fn focus_first(&mut self) {
+        if !self.panes.is_empty() {
+            self.focused = 0;
+        }
+    }
+
+    fn focus_last(&mut self) {
+        if !self.panes.is_empty() {
+            self.focused = self.panes.len() - 1;
+        }
+    }
+
+    fn focus_next(&mut self) {
+        if !self.panes.is_empty() {
+            self.focused = (self.focused + 1) % self.panes.len();
+        }
+    }
+
+    fn focus_prev(&mut self) {
+        if !self.panes.is_empty() {
+            self.focused = if self.focused == 0 {
+                self.panes.len() - 1
+            } else {
+                self.focused - 1
+            };
+        }
+    }
 }
 
 /// Controls where the channel list is rendered.
@@ -463,7 +506,8 @@ fn estimate_toolbar_required_width(visibility: &ToolbarVisibility) -> f32 {
     };
     width += 8.0 + account_width;
 
-    if !visibility.compact_controls || visibility.show_emote_count || visibility.show_overflow_menu {
+    if !visibility.compact_controls || visibility.show_emote_count || visibility.show_overflow_menu
+    {
         width += TOOLBAR_SEPARATOR_W;
     }
 
@@ -720,6 +764,8 @@ pub struct CrustApp {
     settings_open: bool,
     /// Current section selected in the settings page.
     settings_section: SettingsSection,
+    /// Host-managed plugin UI form/session state for retained plugin surfaces.
+    plugin_ui_session: PluginUiSessionState,
     /// Persisted Kick compatibility (beta) toggle.
     kick_beta_enabled: bool,
     /// Persisted IRC compatibility (beta) toggle.
@@ -760,13 +806,13 @@ pub struct CrustApp {
     /// Settings dialog state for highlight rules
     settings_highlight_rules: Vec<crust_core::highlight::HighlightRule>,
     settings_highlight_rule_bufs: Vec<String>,
-    
+
     /// Compiled filter records for hiding messages.
     filter_records: Vec<crust_core::model::filters::CompiledFilter>,
     /// Settings dialog state for filter records.
     settings_filter_records: Vec<crust_core::model::filters::FilterRecord>,
     settings_filter_record_bufs: Vec<String>,
-    
+
     /// User-defined moderation action presets
     mod_action_presets: Vec<crust_core::model::mod_actions::ModActionPreset>,
     settings_mod_action_presets: Vec<crust_core::model::mod_actions::ModActionPreset>,
@@ -930,6 +976,7 @@ impl CrustApp {
                 + STREAM_NOTIFICATION_STARTUP_GRACE,
             settings_open: false,
             settings_section: SettingsSection::default(),
+            plugin_ui_session: PluginUiSessionState::default(),
             kick_beta_enabled: false,
             irc_beta_enabled: false,
             irc_nickserv_user: String::new(),
@@ -1028,10 +1075,7 @@ impl CrustApp {
         login: &str,
         is_active_channel: bool,
     ) -> std::time::Duration {
-        let live_state = self
-            .stream_statuses
-            .get(login)
-            .map(|status| status.is_live);
+        let live_state = self.stream_statuses.get(login).map(|status| status.is_live);
 
         match (is_active_channel, live_state) {
             (true, Some(true)) => STREAM_REFRESH_ACTIVE_LIVE_INTERVAL,
@@ -1225,7 +1269,11 @@ exit 1
                             break;
                         }
                         Ok(status) => {
-                            last_error = Some(format!("{} (exit code {:?})", shell.display(), status.code()));
+                            last_error = Some(format!(
+                                "{} (exit code {:?})",
+                                shell.display(),
+                                status.code()
+                            ));
                         }
                         Err(error) => {
                             last_error = Some(format!("{} ({error})", shell.display()));
@@ -1374,7 +1422,11 @@ exit 1
                 if suppress_stream_toasts {
                     return;
                 }
-                self.push_event_toast(format!("{} went offline", payload.channel_name), t::text_muted(), false);
+                self.push_event_toast(
+                    format!("{} went offline", payload.channel_name),
+                    t::text_muted(),
+                    false,
+                );
             }
         }
     }
@@ -1461,7 +1513,12 @@ exit 1
         }
     }
 
-    fn render_whisper_line_body(&mut self, ui: &mut egui::Ui, line: &WhisperLine, text_color: Color32) {
+    fn render_whisper_line_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        line: &WhisperLine,
+        text_color: Color32,
+    ) {
         if line.text.trim().is_empty() {
             ui.label(
                 RichText::new("(empty whisper)")
@@ -1660,18 +1717,17 @@ exit 1
                         .show(ui, |ui| {
                             ui.set_min_height(row_height);
                             ui.horizontal(|ui| {
-                                let title =
-                                    truncate_with_ellipsis(&format!("@{display_name}"), title_chars);
-                                ui.label(
-                                    RichText::new(title)
-                                        .font(t::small())
-                                        .strong()
-                                        .color(if is_selected {
-                                            t::text_primary()
-                                        } else {
-                                            t::text_primary()
-                                        }),
+                                let title = truncate_with_ellipsis(
+                                    &format!("@{display_name}"),
+                                    title_chars,
                                 );
+                                ui.label(RichText::new(title).font(t::small()).strong().color(
+                                    if is_selected {
+                                        t::text_primary()
+                                    } else {
+                                        t::text_primary()
+                                    },
+                                ));
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
@@ -1770,20 +1826,17 @@ exit 1
                             .font(t::tiny())
                             .color(t::text_secondary()),
                     );
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            if ui.button(RichText::new("Reply").font(t::small())).clicked() {
-                                *compose_thread = Some(current_thread.to_owned());
-                            }
-                            if ui
-                                .button(RichText::new("Mark read").font(t::small()))
-                                .clicked()
-                            {
-                                *mark_read_thread = Some(current_thread.to_owned());
-                            }
-                        },
-                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button(RichText::new("Reply").font(t::small())).clicked() {
+                            *compose_thread = Some(current_thread.to_owned());
+                        }
+                        if ui
+                            .button(RichText::new("Mark read").font(t::small()))
+                            .clicked()
+                        {
+                            *mark_read_thread = Some(current_thread.to_owned());
+                        }
+                    });
                 });
             });
 
@@ -2145,6 +2198,15 @@ exit 1
             AppEvent::ChannelJoined { channel } => {
                 self.state.join_channel(channel.clone());
                 self.sorted_chatters.entry(channel.clone()).or_default();
+                if let Some(host) = plugin_host() {
+                    host.update_channel_snapshot(
+                        channel.clone(),
+                        PluginChannelSnapshot {
+                            is_joined: true,
+                            ..Default::default()
+                        },
+                    );
+                }
                 // Kick off an immediate stream-status fetch for the new channel (Twitch only).
                 if channel.is_twitch() {
                     let login = channel.display_name().to_ascii_lowercase();
@@ -2166,10 +2228,8 @@ exit 1
                     .retain(|k, _| !k.starts_with(&prefix));
                 if channel.is_twitch() {
                     let login = channel.display_name().to_ascii_lowercase();
-                    self.stream_tracker.unwatch_channel(
-                        &login,
-                        crust_core::notifications::Platform::Twitch,
-                    );
+                    self.stream_tracker
+                        .unwatch_channel(&login, crust_core::notifications::Platform::Twitch);
                     self.stream_statuses.remove(&login);
                     self.live_map_cache.remove(&login);
                     self.stream_status_fetched.remove(&login);
@@ -2182,6 +2242,15 @@ exit 1
                     .unwrap_or(false)
                 {
                     self.pending_reply = None;
+                }
+                if let Some(host) = plugin_host() {
+                    host.update_channel_snapshot(
+                        channel.clone(),
+                        PluginChannelSnapshot {
+                            is_joined: false,
+                            ..Default::default()
+                        },
+                    );
                 }
             }
             AppEvent::ChannelRedirected {
@@ -2234,10 +2303,7 @@ exit 1
                             .as_deref()
                             .map(str::trim)
                             .filter(|s| !s.is_empty());
-                        let st = status
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty());
+                        let st = status.as_deref().map(str::trim).filter(|s| !s.is_empty());
                         let is_terminal = st
                             .map(|s| {
                                 s.eq_ignore_ascii_case("fulfilled")
@@ -2661,6 +2727,14 @@ exit 1
                 self.state.auth.logged_in = true;
                 self.state.auth.username = Some(username);
                 self.state.auth.user_id = Some(user_id);
+                if let Some(host) = plugin_host() {
+                    host.update_auth_snapshot(PluginAuthSnapshot {
+                        logged_in: true,
+                        username: self.state.auth.username.clone(),
+                        user_id: self.state.auth.user_id.clone(),
+                        display_name: self.state.auth.username.clone(),
+                    });
+                }
             }
             AppEvent::LoggedOut => {
                 self.auth_refresh_inflight = false;
@@ -2675,6 +2749,9 @@ exit 1
                 self.whisper_unread.clear();
                 self.active_whisper_login = None;
                 self.whisper_pending_images.clear();
+                if let Some(host) = plugin_host() {
+                    host.update_auth_snapshot(PluginAuthSnapshot::default());
+                }
             }
             AppEvent::Error { context, message } => {
                 tracing::error!("[{context}] {message}");
@@ -2793,34 +2870,32 @@ exit 1
                     self.user_profile_popup.set_mod_logs(mod_logs);
 
                     // Build shared-channel context from all locally-known tabs.
-                    let mut shared_channels: Vec<String> = self
-                        .state
-                        .channels
-                        .iter()
-                        .filter_map(|(cid, state)| {
-                            let seen_in_chatters = state
-                                .chatters
-                                .iter()
-                                .any(|name| name.eq_ignore_ascii_case(&profile.login));
-                            let seen_in_messages = state
-                                .messages
-                                .iter()
-                                .rev()
-                                .take(400)
-                                .any(|m| m.sender.login.eq_ignore_ascii_case(&profile.login));
-                            if !(seen_in_chatters || seen_in_messages) {
-                                return None;
-                            }
-                            let label = if cid.is_kick() {
-                                format!("kick:{}", cid.display_name())
-                            } else if cid.is_irc() {
-                                format!("irc:{}", cid.display_name())
-                            } else {
-                                format!("#{}", cid.display_name())
-                            };
-                            Some(label)
-                        })
-                        .collect();
+                    let mut shared_channels: Vec<String> =
+                        self.state
+                            .channels
+                            .iter()
+                            .filter_map(|(cid, state)| {
+                                let seen_in_chatters = state
+                                    .chatters
+                                    .iter()
+                                    .any(|name| name.eq_ignore_ascii_case(&profile.login));
+                                let seen_in_messages =
+                                    state.messages.iter().rev().take(400).any(|m| {
+                                        m.sender.login.eq_ignore_ascii_case(&profile.login)
+                                    });
+                                if !(seen_in_chatters || seen_in_messages) {
+                                    return None;
+                                }
+                                let label = if cid.is_kick() {
+                                    format!("kick:{}", cid.display_name())
+                                } else if cid.is_irc() {
+                                    format!("irc:{}", cid.display_name())
+                                } else {
+                                    format!("#{}", cid.display_name())
+                                };
+                                Some(label)
+                            })
+                            .collect();
                     shared_channels.sort_by_key(|name| name.to_ascii_lowercase());
                     shared_channels.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
                     self.user_profile_popup.set_shared_channels(shared_channels);
@@ -2846,15 +2921,15 @@ exit 1
             } => {
                 let login = login.to_ascii_lowercase();
                 let (title, game, viewers) = {
-                    let entry = self
-                        .stream_statuses
-                        .entry(login.clone())
-                        .or_insert(StreamStatusInfo {
-                            is_live,
-                            title: None,
-                            game: None,
-                            viewers: None,
-                        });
+                    let entry =
+                        self.stream_statuses
+                            .entry(login.clone())
+                            .or_insert(StreamStatusInfo {
+                                is_live,
+                                title: None,
+                                game: None,
+                                viewers: None,
+                            });
                     entry.is_live = is_live;
                     if !is_live {
                         entry.title = None;
@@ -2879,14 +2954,7 @@ exit 1
                 self.stream_status_fetched
                     .insert(login.clone(), std::time::Instant::now());
 
-                self.handle_stream_status_transition(
-                    ctx,
-                    &login,
-                    is_live,
-                    title,
-                    game,
-                    viewers,
-                );
+                self.handle_stream_status_transition(ctx, &login, is_live, title, game, viewers);
             }
             AppEvent::UserProfileUnavailable { login } => {
                 let login_lc = login.to_ascii_lowercase();
@@ -2912,11 +2980,28 @@ exit 1
                     ch.delete_messages_from(&login);
                 }
             }
+            AppEvent::ClearUserMessagesLocally { channel, login } => {
+                if let Some(ch) = self.state.channels.get_mut(&channel) {
+                    ch.delete_messages_from(&login);
+                }
+            }
             AppEvent::UserStateUpdated {
                 channel, is_mod, ..
             } => {
                 if let Some(ch) = self.state.channels.get_mut(&channel) {
                     ch.is_mod = is_mod;
+                }
+                if let Some(host) = plugin_host() {
+                    let mut snapshot = PluginChannelSnapshot::default();
+                    snapshot.is_mod = is_mod;
+                    snapshot.is_broadcaster = self
+                        .state
+                        .auth
+                        .username
+                        .as_deref()
+                        .map(|u| u.eq_ignore_ascii_case(channel.display_name()))
+                        .unwrap_or(false);
+                    host.update_channel_snapshot(channel.clone(), snapshot);
                 }
             }
             AppEvent::ChannelMessagesCleared { channel } => {
@@ -3056,18 +3141,14 @@ exit 1
                 // Keep the settings page state in sync so re-opening the
                 // dialog shows the current rules without lag.
                 self.settings_highlight_rules = rules.clone();
-                self.settings_highlight_rule_bufs = rules
-                    .iter()
-                    .map(|r| r.pattern.clone())
-                    .collect();
+                self.settings_highlight_rule_bufs =
+                    rules.iter().map(|r| r.pattern.clone()).collect();
             }
             AppEvent::FilterRecordsUpdated { records } => {
                 self.filter_records = crust_core::model::filters::compile_filters(&records);
                 self.settings_filter_records = records.clone();
-                self.settings_filter_record_bufs = records
-                    .iter()
-                    .map(|r| r.pattern.clone())
-                    .collect();
+                self.settings_filter_record_bufs =
+                    records.iter().map(|r| r.pattern.clone()).collect();
             }
             AppEvent::ModActionPresetsUpdated { presets } => {
                 self.mod_action_presets = presets.clone();
@@ -3091,7 +3172,8 @@ exit 1
                             .active_channel
                             .clone()
                             .unwrap_or_else(|| ChannelId::new("system")),
-                        text: "\u{26a0}\u{fe0f} Twitch auth check failed. Trying token refresh...".into(),
+                        text: "\u{26a0}\u{fe0f} Twitch auth check failed. Trying token refresh..."
+                            .into(),
                     });
                 } else {
                     self.auth_refresh_inflight = false;
@@ -3167,8 +3249,10 @@ exit 1
             AppEvent::UnbanRequestsLoaded { channel, requests } => {
                 let mut requests = requests;
                 Self::normalize_unban_requests(&mut requests);
-                let keep_ids: HashSet<String> =
-                    requests.iter().map(|item| item.request_id.clone()).collect();
+                let keep_ids: HashSet<String> = requests
+                    .iter()
+                    .map(|item| item.request_id.clone())
+                    .collect();
                 let prefix = format!("{}::", channel.as_str());
                 self.unban_resolution_drafts.retain(|k, _| {
                     if !k.starts_with(&prefix) {
@@ -3282,6 +3366,13 @@ exit 1
                     }
                 }
             }
+            AppEvent::PluginUiAction { .. }
+            | AppEvent::PluginUiChange { .. }
+            | AppEvent::PluginUiSubmit { .. }
+            | AppEvent::PluginUiWindowClosed { .. } => {
+                // Plugin UI interaction events are routed directly back into the
+                // plugin host; the main app state does not reduce them.
+            }
         }
     }
 
@@ -3389,12 +3480,14 @@ exit 1
                 }
             } else {
                 let btn_h = t::BAR_H;
-                let name_galley =
-                    ui.painter()
-                        .layout_no_wrap(display_name.clone(), t::small(), t::text_primary());
+                let name_galley = ui.painter().layout_no_wrap(
+                    display_name.clone(),
+                    t::small(),
+                    t::text_primary(),
+                );
                 let pill_w = (btn_h + 6.0 + name_galley.size().x + 10.0).clamp(btn_h + 28.0, 230.0);
-                let (rect, resp) = ui
-                    .allocate_exact_size(egui::vec2(pill_w, btn_h), egui::Sense::click());
+                let (rect, resp) =
+                    ui.allocate_exact_size(egui::vec2(pill_w, btn_h), egui::Sense::click());
                 resp.clone().on_hover_text("Account");
 
                 if ui.is_rect_visible(rect) {
@@ -3445,7 +3538,8 @@ exit 1
                         let av_size = avatar_r * 2.0;
                         let av_rect =
                             egui::Rect::from_center_size(avatar_c, egui::vec2(av_size, av_size));
-                        ui.painter().circle_filled(avatar_c, avatar_r, t::bg_raised());
+                        ui.painter()
+                            .circle_filled(avatar_c, avatar_r, t::bg_raised());
                         if let Some(tex) = self.static_avatar_texture_for(ui, &logo, &raw) {
                             ui.put(
                                 av_rect,
@@ -3462,7 +3556,8 @@ exit 1
                             );
                         }
                     } else {
-                        ui.painter().circle_filled(avatar_c, avatar_r, t::accent_dim());
+                        ui.painter()
+                            .circle_filled(avatar_c, avatar_r, t::accent_dim());
                         ui.painter().text(
                             avatar_c,
                             egui::Align2::CENTER_CENTER,
@@ -3633,7 +3728,19 @@ exit 1
     }
 
     fn handle_channel_shortcuts(&mut self, ctx: &Context) {
-        let (next, prev, direct_idx) = ctx.input_mut(|i| {
+        let (
+            next,
+            prev,
+            direct_idx,
+            move_left,
+            move_right,
+            first,
+            last,
+            split_prev,
+            split_next,
+            split_move_left,
+            split_move_right,
+        ) = ctx.input_mut(|i| {
             let ctrl_shift = egui::Modifiers {
                 ctrl: true,
                 shift: true,
@@ -3645,6 +3752,32 @@ exit 1
             let prev = i.consume_key(ctrl_shift, egui::Key::Tab)
                 || i.consume_key(egui::Modifiers::CTRL, egui::Key::PageUp)
                 || i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowLeft);
+            let move_left = i.consume_key(
+                egui::Modifiers::ALT | egui::Modifiers::SHIFT,
+                egui::Key::ArrowLeft,
+            );
+            let move_right = i.consume_key(
+                egui::Modifiers::ALT | egui::Modifiers::SHIFT,
+                egui::Key::ArrowRight,
+            );
+            let first = i.consume_key(egui::Modifiers::CTRL, egui::Key::Home);
+            let last = i.consume_key(egui::Modifiers::CTRL, egui::Key::End);
+            let split_prev = i.consume_key(
+                egui::Modifiers::CTRL | egui::Modifiers::ALT,
+                egui::Key::PageUp,
+            );
+            let split_next = i.consume_key(
+                egui::Modifiers::CTRL | egui::Modifiers::ALT,
+                egui::Key::PageDown,
+            );
+            let split_move_left = i.consume_key(
+                egui::Modifiers::CTRL | egui::Modifiers::ALT | egui::Modifiers::SHIFT,
+                egui::Key::ArrowLeft,
+            );
+            let split_move_right = i.consume_key(
+                egui::Modifiers::CTRL | egui::Modifiers::ALT | egui::Modifiers::SHIFT,
+                egui::Key::ArrowRight,
+            );
             let direct_idx = [
                 egui::Key::Num1,
                 egui::Key::Num2,
@@ -3658,12 +3791,114 @@ exit 1
             ]
             .iter()
             .position(|key| i.consume_key(egui::Modifiers::CTRL, *key));
-            (next, prev, direct_idx)
+            (
+                next,
+                prev,
+                direct_idx,
+                move_left,
+                move_right,
+                first,
+                last,
+                split_prev,
+                split_next,
+                split_move_left,
+                split_move_right,
+            )
         });
 
         if let Some(idx) = direct_idx {
             if let Some(target) = self.state.channel_order.get(idx).cloned() {
                 self.activate_channel(target);
+            }
+            return;
+        }
+
+        let split_mode = self.split_panes.panes.len() > 1;
+
+        if move_left {
+            if split_mode {
+                self.split_panes.move_focused(-1);
+                if let Some(ch) = self.split_panes.focused_channel().cloned() {
+                    self.state.active_channel = Some(ch);
+                }
+            } else if let Some(active) = self.state.active_channel.clone() {
+                if let Some(idx) = self.state.channel_order.iter().position(|ch| ch == &active) {
+                    if idx > 0 {
+                        self.state.channel_order.swap(idx, idx - 1);
+                    }
+                }
+            }
+        }
+        if move_right {
+            if split_mode {
+                self.split_panes.move_focused(1);
+                if let Some(ch) = self.split_panes.focused_channel().cloned() {
+                    self.state.active_channel = Some(ch);
+                }
+            } else if let Some(active) = self.state.active_channel.clone() {
+                if let Some(idx) = self.state.channel_order.iter().position(|ch| ch == &active) {
+                    if idx + 1 < self.state.channel_order.len() {
+                        self.state.channel_order.swap(idx, idx + 1);
+                    }
+                }
+            }
+        }
+        if first {
+            if split_mode {
+                self.split_panes.focus_first();
+                if let Some(ch) = self.split_panes.focused_channel().cloned() {
+                    self.state.active_channel = Some(ch);
+                }
+            } else if let Some(target) = self.state.channel_order.first().cloned() {
+                self.activate_channel(target);
+            }
+            return;
+        }
+        if last {
+            if split_mode {
+                self.split_panes.focus_last();
+                if let Some(ch) = self.split_panes.focused_channel().cloned() {
+                    self.state.active_channel = Some(ch);
+                }
+            } else if let Some(target) = self.state.channel_order.last().cloned() {
+                self.activate_channel(target);
+            }
+            return;
+        }
+
+        if split_prev {
+            if split_mode {
+                self.split_panes.focus_prev();
+                if let Some(ch) = self.split_panes.focused_channel().cloned() {
+                    self.state.active_channel = Some(ch);
+                }
+            }
+            return;
+        }
+        if split_next {
+            if split_mode {
+                self.split_panes.focus_next();
+                if let Some(ch) = self.split_panes.focused_channel().cloned() {
+                    self.state.active_channel = Some(ch);
+                }
+            }
+            return;
+        }
+        if split_move_left {
+            if split_mode {
+                self.split_panes.move_focused(-1);
+                if let Some(ch) = self.split_panes.focused_channel().cloned() {
+                    self.state.active_channel = Some(ch);
+                }
+            }
+            return;
+        }
+        if split_move_right {
+            if split_mode {
+                self.split_panes.move_focused(1);
+                if let Some(ch) = self.split_panes.focused_channel().cloned() {
+                    self.state.active_channel = Some(ch);
+                }
             }
             return;
         }
@@ -3830,10 +4065,12 @@ impl eframe::App for CrustApp {
         }
 
         // Render profile popup and dispatch any actions.
-        for action in self
-            .user_profile_popup
-            .show(ctx, &self.emote_bytes, &self.stv_avatars, &self.mod_action_presets)
-        {
+        for action in self.user_profile_popup.show(
+            ctx,
+            &self.emote_bytes,
+            &self.stv_avatars,
+            &self.mod_action_presets,
+        ) {
             match action {
                 PopupAction::Timeout {
                     channel,
@@ -3873,6 +4110,68 @@ impl eframe::App for CrustApp {
                         login,
                         user_id,
                     });
+                }
+                PopupAction::Warn {
+                    channel,
+                    login,
+                    user_id,
+                    reason,
+                } => {
+                    self.send_cmd(AppCommand::WarnUser {
+                        channel,
+                        login,
+                        user_id,
+                        reason,
+                    });
+                }
+                PopupAction::Monitor {
+                    channel,
+                    login,
+                    user_id,
+                } => {
+                    self.send_cmd(AppCommand::SetSuspiciousUser {
+                        channel,
+                        login,
+                        user_id,
+                        restricted: false,
+                    });
+                }
+                PopupAction::Restrict {
+                    channel,
+                    login,
+                    user_id,
+                } => {
+                    self.send_cmd(AppCommand::SetSuspiciousUser {
+                        channel,
+                        login,
+                        user_id,
+                        restricted: true,
+                    });
+                }
+                PopupAction::Unmonitor {
+                    channel,
+                    login,
+                    user_id,
+                } => {
+                    self.send_cmd(AppCommand::ClearSuspiciousUser {
+                        channel,
+                        login,
+                        user_id,
+                    });
+                }
+                PopupAction::Unrestrict {
+                    channel,
+                    login,
+                    user_id,
+                } => {
+                    self.send_cmd(AppCommand::ClearSuspiciousUser {
+                        channel,
+                        login,
+                        user_id,
+                    });
+                }
+                PopupAction::ClearUserMessagesLocally { channel, login } => {
+                    self.send_cmd(AppCommand::ClearUserMessagesLocally { channel, login });
                 }
                 PopupAction::FetchIvrLogs { channel, username } => {
                     self.user_profile_popup.set_ivr_logs_loading();
@@ -3935,6 +4234,15 @@ impl eframe::App for CrustApp {
             }
         }
 
+        let plugin_ui_snapshot = plugin_host()
+            .map(|host| {
+                host.set_current_channel(self.active_search_target());
+                host.plugin_ui_snapshot()
+            })
+            .unwrap_or_default();
+        self.plugin_ui_session
+            .prune_missing_surfaces(&plugin_ui_snapshot);
+
         if self.settings_open {
             let mut settings_open = self.settings_open;
             let mut settings_section = self.settings_section;
@@ -3972,6 +4280,11 @@ impl eframe::App for CrustApp {
                 filter_records: self.settings_filter_records.clone(),
                 filter_record_bufs: self.settings_filter_record_bufs.clone(),
                 mod_action_presets: self.settings_mod_action_presets.clone(),
+                plugin_ui: plugin_ui_snapshot.clone(),
+                plugin_statuses: plugin_host()
+                    .map(|host| host.plugin_statuses())
+                    .unwrap_or_default(),
+                plugin_reload_requested: false,
             };
             let appearance_before = self.appearance_snapshot();
             let stats = SettingsStats {
@@ -3985,8 +4298,13 @@ impl eframe::App for CrustApp {
                 &mut settings_open,
                 &mut settings_section,
                 &mut state,
+                &mut self.plugin_ui_session,
                 stats,
             );
+
+            if state.plugin_reload_requested {
+                self.send_cmd(AppCommand::ReloadPlugins);
+            }
 
             self.settings_open = settings_open;
             self.settings_section = settings_section;
@@ -4134,7 +4452,9 @@ impl eframe::App for CrustApp {
             let mut window_open = self.mod_tools_open;
             let mut refresh_channel: Option<ChannelId> = None;
             let mut automod_actions: Vec<(String, String, String)> = Vec::new();
+            let mut automod_bulk_action: Option<String> = None;
             let mut unban_actions: Vec<(String, bool, Option<String>)> = Vec::new();
+            let mut unban_bulk_action: Option<bool> = None;
 
             egui::Window::new("Moderation Tools")
                 .open(&mut window_open)
@@ -4173,6 +4493,23 @@ impl eframe::App for CrustApp {
                         .get(&channel)
                         .cloned()
                         .unwrap_or_default();
+                    if !queue_items.is_empty() {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(RichText::new("Allow all").font(t::small()).color(t::green()))
+                                .clicked()
+                            {
+                                automod_bulk_action = Some("ALLOW".to_owned());
+                            }
+                            if ui
+                                .button(RichText::new("Deny all").font(t::small()).color(t::red()))
+                                .clicked()
+                            {
+                                automod_bulk_action = Some("DENY".to_owned());
+                            }
+                        });
+                        ui.add_space(4.0);
+                    }
                     if queue_items.is_empty() {
                         ui.label(
                             RichText::new("No held AutoMod messages.")
@@ -4258,6 +4595,23 @@ impl eframe::App for CrustApp {
                         .get(&channel)
                         .cloned()
                         .unwrap_or_default();
+                    if !requests.is_empty() {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(RichText::new("Approve all").font(t::small()).color(t::green()))
+                                .clicked()
+                            {
+                                unban_bulk_action = Some(true);
+                            }
+                            if ui
+                                .button(RichText::new("Deny all").font(t::small()).color(t::red()))
+                                .clicked()
+                            {
+                                unban_bulk_action = Some(false);
+                            }
+                        });
+                        ui.add_space(4.0);
+                    }
                     if requests.is_empty() {
                         ui.label(
                             RichText::new("No pending unban requests loaded.")
@@ -4356,6 +4710,41 @@ impl eframe::App for CrustApp {
                 self.send_cmd(AppCommand::FetchUnbanRequests { channel });
             }
             if let Some(channel) = moderation_channel {
+                if let Some(action) = automod_bulk_action {
+                    for item in self
+                        .automod_queue
+                        .get(&channel)
+                        .cloned()
+                        .unwrap_or_default()
+                    {
+                        automod_actions.push((
+                            item.message_id,
+                            item.sender_user_id,
+                            action.clone(),
+                        ));
+                    }
+                }
+                if let Some(approve) = unban_bulk_action {
+                    for request in self
+                        .unban_requests
+                        .get(&channel)
+                        .cloned()
+                        .unwrap_or_default()
+                    {
+                        let key = Self::unban_draft_key(&channel, &request.request_id);
+                        let draft = self.unban_resolution_drafts.entry(key).or_default();
+                        let resolution = draft.trim();
+                        unban_actions.push((
+                            request.request_id,
+                            approve,
+                            if resolution.is_empty() {
+                                None
+                            } else {
+                                Some(resolution.to_owned())
+                            },
+                        ));
+                    }
+                }
                 for (message_id, sender_user_id, action) in automod_actions {
                     self.send_cmd(AppCommand::ResolveAutoModMessage {
                         channel: channel.clone(),
@@ -4374,6 +4763,8 @@ impl eframe::App for CrustApp {
                 }
             }
         }
+
+        show_plugin_windows(ctx, &plugin_ui_snapshot, &mut self.plugin_ui_session);
 
         self.show_whispers_window(ctx);
 
@@ -4415,395 +4806,424 @@ impl eframe::App for CrustApp {
                     row_size,
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
-                    ui.spacing_mut().item_spacing = if visibility.compact_controls {
-                        egui::vec2(4.0, 0.0)
-                    } else {
-                        egui::vec2(8.0, 0.0)
-                    };
+                        ui.spacing_mut().item_spacing = if visibility.compact_controls {
+                            egui::vec2(4.0, 0.0)
+                        } else {
+                            egui::vec2(8.0, 0.0)
+                        };
 
-                    if visibility.show_logo {
-                        let logo_font = egui::FontId::proportional(15.0);
-                        ui.label(
-                            RichText::new("crust")
-                                .font(logo_font)
-                                .strong()
-                                .color(t::accent()),
-                        );
-                    }
-
-                    chrome::toolbar_group_frame().show(ui, |ui| {
-                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
-                            let dot_r = 4.0_f32;
-                            let (dot_rect, _) = ui.allocate_exact_size(
-                                egui::vec2(dot_r * 2.0 + 2.0, dot_r * 2.0),
-                                egui::Sense::hover(),
+                        if visibility.show_logo {
+                            let logo_font = egui::FontId::proportional(15.0);
+                            ui.label(
+                                RichText::new("crust")
+                                    .font(logo_font)
+                                    .strong()
+                                    .color(t::accent()),
                             );
-                            ui.painter()
-                                .circle_filled(dot_rect.center(), dot_r, dot_color);
-                            if visibility.show_connection_label {
-                                ui.label(
-                                    RichText::new(conn_label)
-                                        .font(t::small())
-                                        .color(t::text_secondary()),
-                                );
-                            }
-                            if visibility.show_join_button
-                                && chrome::icon_button(
-                                    ui,
-                                    ChromeIcon::Join,
-                                    "Join a channel",
-                                    IconButtonState {
-                                        compact: visibility.compact_controls,
-                                        ..Default::default()
-                                    },
-                                )
-                                .clicked()
-                            {
-                                self.join_dialog.toggle();
-                            }
-                            if visibility.show_join_button && visibility.show_join_text {
-                                ui.label(
-                                    RichText::new("Join")
-                                        .font(t::small())
-                                        .color(t::text_secondary()),
-                                );
-                            }
-                        });
-                    });
+                        }
 
-                    if visibility.show_sidebar_actions {
                         chrome::toolbar_group_frame().show(ui, |ui| {
                             ui.with_layout(
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
-                                ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
-                                if chrome::icon_button(
-                                    ui,
-                                    ChromeIcon::Sidebar,
-                                    if sidebar_open {
-                                        "Hide channel sidebar"
-                                    } else {
-                                        "Show channel sidebar"
-                                    },
-                                    IconButtonState {
-                                        selected: sidebar_open,
-                                        compact: visibility.compact_controls,
-                                        ..Default::default()
-                                    },
-                                )
-                                .clicked()
-                                {
-                                    match self.channel_layout {
-                                        ChannelLayout::TopTabs => {
-                                            self.channel_layout = ChannelLayout::Sidebar;
-                                            self.sidebar_visible = true;
-                                        }
-                                        ChannelLayout::Sidebar => {
-                                            self.sidebar_visible = !self.sidebar_visible;
-                                        }
+                                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+                                    let dot_r = 4.0_f32;
+                                    let (dot_rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(dot_r * 2.0 + 2.0, dot_r * 2.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter()
+                                        .circle_filled(dot_rect.center(), dot_r, dot_color);
+                                    if visibility.show_connection_label {
+                                        ui.label(
+                                            RichText::new(conn_label)
+                                                .font(t::small())
+                                                .color(t::text_secondary()),
+                                        );
                                     }
-                                }
-                                if chrome::icon_button(
-                                    ui,
-                                    ChromeIcon::Tabs,
-                                    if effective_channel_layout == ChannelLayout::Sidebar {
-                                        "Move channels to top tabs"
-                                    } else {
-                                        "Move channels to the sidebar"
-                                    },
-                                    IconButtonState {
-                                        selected: effective_channel_layout == ChannelLayout::TopTabs,
-                                        compact: visibility.compact_controls,
-                                        ..Default::default()
-                                    },
-                                )
-                                .clicked()
-                                {
-                                    if self.channel_layout == ChannelLayout::Sidebar {
-                                        self.channel_layout = ChannelLayout::TopTabs;
-                                    } else {
-                                        self.channel_layout = ChannelLayout::Sidebar;
-                                        self.sidebar_visible = true;
+                                    if visibility.show_join_button
+                                        && chrome::icon_button(
+                                            ui,
+                                            ChromeIcon::Join,
+                                            "Join a channel",
+                                            IconButtonState {
+                                                compact: visibility.compact_controls,
+                                                ..Default::default()
+                                            },
+                                        )
+                                        .clicked()
+                                    {
+                                        self.join_dialog.toggle();
                                     }
-                                }
+                                    if visibility.show_join_button && visibility.show_join_text {
+                                        ui.label(
+                                            RichText::new("Join")
+                                                .font(t::small())
+                                                .color(t::text_secondary()),
+                                        );
+                                    }
                                 },
                             );
                         });
-                    }
 
-                    // Right-side items
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.spacing_mut().item_spacing = if visibility.compact_controls {
-                            egui::vec2(3.0, 0.0)
-                        } else {
-                            t::TOOLBAR_SPACING
-                        };
-
-                        self.show_topbar_account_button(
-                            ui,
-                            compact_account,
-                            visibility.ultra_compact_account,
-                        );
-                        if !visibility.compact_controls
-                            || visibility.show_emote_count
-                            || visibility.show_overflow_menu
-                        {
-                            ui.separator();
+                        if visibility.show_sidebar_actions {
+                            chrome::toolbar_group_frame().show(ui, |ui| {
+                                ui.with_layout(
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                                        if chrome::icon_button(
+                                            ui,
+                                            ChromeIcon::Sidebar,
+                                            if sidebar_open {
+                                                "Hide channel sidebar"
+                                            } else {
+                                                "Show channel sidebar"
+                                            },
+                                            IconButtonState {
+                                                selected: sidebar_open,
+                                                compact: visibility.compact_controls,
+                                                ..Default::default()
+                                            },
+                                        )
+                                        .clicked()
+                                        {
+                                            match self.channel_layout {
+                                                ChannelLayout::TopTabs => {
+                                                    self.channel_layout = ChannelLayout::Sidebar;
+                                                    self.sidebar_visible = true;
+                                                }
+                                                ChannelLayout::Sidebar => {
+                                                    self.sidebar_visible = !self.sidebar_visible;
+                                                }
+                                            }
+                                        }
+                                        if chrome::icon_button(
+                                            ui,
+                                            ChromeIcon::Tabs,
+                                            if effective_channel_layout == ChannelLayout::Sidebar {
+                                                "Move channels to top tabs"
+                                            } else {
+                                                "Move channels to the sidebar"
+                                            },
+                                            IconButtonState {
+                                                selected: effective_channel_layout
+                                                    == ChannelLayout::TopTabs,
+                                                compact: visibility.compact_controls,
+                                                ..Default::default()
+                                            },
+                                        )
+                                        .clicked()
+                                        {
+                                            if self.channel_layout == ChannelLayout::Sidebar {
+                                                self.channel_layout = ChannelLayout::TopTabs;
+                                            } else {
+                                                self.channel_layout = ChannelLayout::Sidebar;
+                                                self.sidebar_visible = true;
+                                            }
+                                        }
+                                    },
+                                );
+                            });
                         }
 
-                        if visibility.show_overflow_menu {
-                            ui.menu_button(RichText::new("⋯").font(t::small()), |ui| {
-                                if visibility.show_join_in_overflow
-                                    && ui
-                                        .button(RichText::new("Join channel").font(t::small()))
-                                        .clicked()
-                                {
-                                    self.join_dialog.toggle();
-                                    ui.close_menu();
-                                }
+                        // Right-side items
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing = if visibility.compact_controls {
+                                egui::vec2(3.0, 0.0)
+                            } else {
+                                t::TOOLBAR_SPACING
+                            };
 
-                                if ui
-                                    .button(RichText::new("Settings").font(t::small()))
-                                    .clicked()
-                                {
-                                    self.settings_open = true;
-                                    ui.close_menu();
-                                }
-
-                                if moderation_available
-                                    && ui
-                                        .button(RichText::new("Moderation tools").font(t::small()))
-                                        .clicked()
-                                {
-                                    self.mod_tools_open = true;
-                                    if let Some(channel) = moderation_channel_toolbar.clone() {
-                                        self.send_cmd(AppCommand::FetchUnbanRequests { channel });
-                                    }
-                                    ui.close_menu();
-                                }
-
+                            self.show_topbar_account_button(
+                                ui,
+                                compact_account,
+                                visibility.ultra_compact_account,
+                            );
+                            if !visibility.compact_controls
+                                || visibility.show_emote_count
+                                || visibility.show_overflow_menu
+                            {
                                 ui.separator();
+                            }
 
-                                let sidebar_open = self.channel_layout == ChannelLayout::Sidebar
-                                    && self.sidebar_visible;
-                                let sidebar_label = if sidebar_open {
-                                    "Hide sidebar"
-                                } else {
-                                    "Show sidebar"
-                                };
-                                if ui
-                                    .button(RichText::new(sidebar_label).font(t::small()))
-                                    .clicked()
-                                {
-                                    match self.channel_layout {
-                                        ChannelLayout::TopTabs => {
-                                            self.channel_layout = ChannelLayout::Sidebar;
-                                            self.sidebar_visible = true;
-                                        }
-                                        ChannelLayout::Sidebar => {
-                                            self.sidebar_visible = !self.sidebar_visible;
-                                        }
+                            if visibility.show_overflow_menu {
+                                ui.menu_button(RichText::new("⋯").font(t::small()), |ui| {
+                                    if visibility.show_join_in_overflow
+                                        && ui
+                                            .button(RichText::new("Join channel").font(t::small()))
+                                            .clicked()
+                                    {
+                                        self.join_dialog.toggle();
+                                        ui.close_menu();
                                     }
-                                    ui.close_menu();
-                                }
 
-                                let mode_label = if self.channel_layout == ChannelLayout::Sidebar {
-                                    "Use top tabs"
-                                } else {
-                                    "Use sidebar"
-                                };
-                                if ui
-                                    .button(RichText::new(mode_label).font(t::small()))
-                                    .clicked()
-                                {
-                                    if self.channel_layout == ChannelLayout::Sidebar {
-                                        self.channel_layout = ChannelLayout::TopTabs;
-                                    } else {
-                                        self.channel_layout = ChannelLayout::Sidebar;
-                                        self.sidebar_visible = true;
-                                    }
-                                    ui.close_menu();
-                                }
-
-                                ui.separator();
-
-                                if visibility.show_perf_in_overflow
-                                    && ui
-                                        .button(RichText::new("Perf overlay").font(t::small()))
-                                        .clicked()
-                                {
-                                    self.perf.visible = !self.perf.visible;
-                                    ui.close_menu();
-                                }
-
-                                if visibility.show_stats_in_overflow
-                                    && ui
-                                        .button(RichText::new("Analytics").font(t::small()))
-                                        .clicked()
-                                {
-                                    self.analytics_visible = !self.analytics_visible;
-                                    ui.close_menu();
-                                }
-
-                                if visibility.show_whispers_in_overflow {
-                                    let whispers_label = if whisper_unread_total > 0 {
-                                        format!("Whispers ({whisper_unread_total})")
-                                    } else {
-                                        "Whispers".to_owned()
-                                    };
                                     if ui
-                                        .button(RichText::new(whispers_label).font(t::small()))
+                                        .button(RichText::new("Settings").font(t::small()))
                                         .clicked()
                                     {
-                                        self.whispers_visible = !self.whispers_visible;
-                                        if self.whispers_visible {
-                                            if let Some(active) = self
-                                                .active_whisper_login
-                                                .clone()
-                                                .or_else(|| self.whisper_order.first().cloned())
-                                            {
-                                                self.active_whisper_login = Some(active.clone());
-                                                self.mark_whisper_thread_read(&active);
+                                        self.settings_open = true;
+                                        ui.close_menu();
+                                    }
+
+                                    if moderation_available
+                                        && ui
+                                            .button(
+                                                RichText::new("Moderation tools").font(t::small()),
+                                            )
+                                            .clicked()
+                                    {
+                                        self.mod_tools_open = true;
+                                        if let Some(channel) = moderation_channel_toolbar.clone() {
+                                            self.send_cmd(AppCommand::FetchUnbanRequests {
+                                                channel,
+                                            });
+                                        }
+                                        ui.close_menu();
+                                    }
+
+                                    ui.separator();
+
+                                    let sidebar_open = self.channel_layout
+                                        == ChannelLayout::Sidebar
+                                        && self.sidebar_visible;
+                                    let sidebar_label = if sidebar_open {
+                                        "Hide sidebar"
+                                    } else {
+                                        "Show sidebar"
+                                    };
+                                    if ui
+                                        .button(RichText::new(sidebar_label).font(t::small()))
+                                        .clicked()
+                                    {
+                                        match self.channel_layout {
+                                            ChannelLayout::TopTabs => {
+                                                self.channel_layout = ChannelLayout::Sidebar;
+                                                self.sidebar_visible = true;
+                                            }
+                                            ChannelLayout::Sidebar => {
+                                                self.sidebar_visible = !self.sidebar_visible;
                                             }
                                         }
                                         ui.close_menu();
                                     }
-                                }
 
-                                if visibility.show_irc_in_overflow
-                                    && ui.button(RichText::new("IRC status").font(t::small())).clicked()
-                                {
-                                    self.irc_status_visible = !self.irc_status_visible;
-                                    ui.close_menu();
+                                    let mode_label =
+                                        if self.channel_layout == ChannelLayout::Sidebar {
+                                            "Use top tabs"
+                                        } else {
+                                            "Use sidebar"
+                                        };
+                                    if ui
+                                        .button(RichText::new(mode_label).font(t::small()))
+                                        .clicked()
+                                    {
+                                        if self.channel_layout == ChannelLayout::Sidebar {
+                                            self.channel_layout = ChannelLayout::TopTabs;
+                                        } else {
+                                            self.channel_layout = ChannelLayout::Sidebar;
+                                            self.sidebar_visible = true;
+                                        }
+                                        ui.close_menu();
+                                    }
+
+                                    ui.separator();
+
+                                    if visibility.show_perf_in_overflow
+                                        && ui
+                                            .button(RichText::new("Perf overlay").font(t::small()))
+                                            .clicked()
+                                    {
+                                        self.perf.visible = !self.perf.visible;
+                                        ui.close_menu();
+                                    }
+
+                                    if visibility.show_stats_in_overflow
+                                        && ui
+                                            .button(RichText::new("Analytics").font(t::small()))
+                                            .clicked()
+                                    {
+                                        self.analytics_visible = !self.analytics_visible;
+                                        ui.close_menu();
+                                    }
+
+                                    if visibility.show_whispers_in_overflow {
+                                        let whispers_label = if whisper_unread_total > 0 {
+                                            format!("Whispers ({whisper_unread_total})")
+                                        } else {
+                                            "Whispers".to_owned()
+                                        };
+                                        if ui
+                                            .button(RichText::new(whispers_label).font(t::small()))
+                                            .clicked()
+                                        {
+                                            self.whispers_visible = !self.whispers_visible;
+                                            if self.whispers_visible {
+                                                if let Some(active) = self
+                                                    .active_whisper_login
+                                                    .clone()
+                                                    .or_else(|| self.whisper_order.first().cloned())
+                                                {
+                                                    self.active_whisper_login =
+                                                        Some(active.clone());
+                                                    self.mark_whisper_thread_read(&active);
+                                                }
+                                            }
+                                            ui.close_menu();
+                                        }
+                                    }
+
+                                    if visibility.show_irc_in_overflow
+                                        && ui
+                                            .button(RichText::new("IRC status").font(t::small()))
+                                            .clicked()
+                                    {
+                                        self.irc_status_visible = !self.irc_status_visible;
+                                        ui.close_menu();
+                                    }
+                                });
+                                if bar_width > 520.0 {
+                                    ui.separator();
                                 }
-                            });
-                            if bar_width > 520.0 {
+                            }
+
+                            if visibility.show_emote_count {
+                                ui.label(
+                                    RichText::new(format!("{} emotes", self.emote_bytes.len()))
+                                        .font(t::small())
+                                        .color(t::text_muted()),
+                                );
                                 ui.separator();
                             }
-                        }
 
-                        if visibility.show_emote_count {
-                            ui.label(
-                                RichText::new(format!("{} emotes", self.emote_bytes.len()))
-                                    .font(t::small())
-                                    .color(t::text_muted()),
-                            );
-                            ui.separator();
-                        }
-
-                        chrome::toolbar_group_frame().show(ui, |ui| {
-                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
-                                let mod_button = ui.add_enabled(
-                                    moderation_available,
-                                    egui::Button::new(RichText::new("Mod").font(t::tiny())),
-                                );
-                                if mod_button.clicked() {
-                                    self.mod_tools_open = !self.mod_tools_open;
-                                    if self.mod_tools_open {
-                                        if let Some(channel) = moderation_channel_toolbar.clone() {
-                                            self.send_cmd(AppCommand::FetchUnbanRequests { channel });
-                                        }
-                                    }
-                                }
-                                if chrome::icon_button(
-                                        ui,
-                                        ChromeIcon::Settings,
-                                        "Open application settings",
-                                        IconButtonState {
-                                            compact: visibility.compact_controls,
-                                            ..Default::default()
-                                        },
-                                    )
-                                    .clicked()
-                                {
-                                    self.settings_open = true;
-                                }
-                                if visibility.show_perf_toggle
-                                    && chrome::icon_button(
-                                        ui,
-                                        ChromeIcon::Perf,
-                                        "Toggle performance overlay",
-                                        IconButtonState {
-                                            selected: self.perf.visible,
-                                            compact: visibility.compact_controls,
-                                            ..Default::default()
-                                        },
-                                    )
-                                    .clicked()
-                                {
-                                    self.perf.visible = !self.perf.visible;
-                                }
-                                if visibility.show_stats_toggle
-                                    && chrome::icon_button(
-                                        ui,
-                                        ChromeIcon::Analytics,
-                                        "Toggle chatter analytics",
-                                        IconButtonState {
-                                            selected: self.analytics_visible,
-                                            compact: visibility.compact_controls,
-                                            ..Default::default()
-                                        },
-                                    )
-                                    .clicked()
-                                {
-                                    self.analytics_visible = !self.analytics_visible;
-                                }
-                                if visibility.show_whispers_toggle {
-                                    let tooltip = if whisper_unread_total > 0 {
-                                        format!("Open whispers ({whisper_unread_total} unread)")
-                                    } else {
-                                        "Open whispers".to_owned()
-                                    };
-                                    if chrome::icon_button(
-                                        ui,
-                                        ChromeIcon::Whisper,
-                                        &tooltip,
-                                        IconButtonState {
-                                            selected: self.whispers_visible,
-                                            compact: visibility.compact_controls,
-                                            ..Default::default()
-                                        },
-                                    )
-                                    .clicked()
-                                    {
-                                        self.whispers_visible = !self.whispers_visible;
-                                        if self.whispers_visible {
-                                            if let Some(active) = self
-                                                .active_whisper_login
-                                                .clone()
-                                                .or_else(|| self.whisper_order.first().cloned())
-                                            {
-                                                self.active_whisper_login = Some(active.clone());
-                                                self.mark_whisper_thread_read(&active);
+                            chrome::toolbar_group_frame().show(ui, |ui| {
+                                ui.with_layout(
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                                        let mod_button = ui.add_enabled(
+                                            moderation_available,
+                                            egui::Button::new(RichText::new("Mod").font(t::tiny())),
+                                        );
+                                        if mod_button.clicked() {
+                                            self.mod_tools_open = !self.mod_tools_open;
+                                            if self.mod_tools_open {
+                                                if let Some(channel) =
+                                                    moderation_channel_toolbar.clone()
+                                                {
+                                                    self.send_cmd(AppCommand::FetchUnbanRequests {
+                                                        channel,
+                                                    });
+                                                }
                                             }
                                         }
-                                    }
-                                }
-                                if visibility.show_irc_toggle
-                                    && chrome::icon_button(
-                                        ui,
-                                        ChromeIcon::Irc,
-                                        "Toggle IRC status window",
-                                        IconButtonState {
-                                            selected: self.irc_status_visible,
-                                            compact: visibility.compact_controls,
-                                            ..Default::default()
-                                        },
-                                    )
-                                    .clicked()
-                                {
-                                    self.irc_status_visible = !self.irc_status_visible;
-                                }
+                                        if chrome::icon_button(
+                                            ui,
+                                            ChromeIcon::Settings,
+                                            "Open application settings",
+                                            IconButtonState {
+                                                compact: visibility.compact_controls,
+                                                ..Default::default()
+                                            },
+                                        )
+                                        .clicked()
+                                        {
+                                            self.settings_open = true;
+                                        }
+                                        if visibility.show_perf_toggle
+                                            && chrome::icon_button(
+                                                ui,
+                                                ChromeIcon::Perf,
+                                                "Toggle performance overlay",
+                                                IconButtonState {
+                                                    selected: self.perf.visible,
+                                                    compact: visibility.compact_controls,
+                                                    ..Default::default()
+                                                },
+                                            )
+                                            .clicked()
+                                        {
+                                            self.perf.visible = !self.perf.visible;
+                                        }
+                                        if visibility.show_stats_toggle
+                                            && chrome::icon_button(
+                                                ui,
+                                                ChromeIcon::Analytics,
+                                                "Toggle chatter analytics",
+                                                IconButtonState {
+                                                    selected: self.analytics_visible,
+                                                    compact: visibility.compact_controls,
+                                                    ..Default::default()
+                                                },
+                                            )
+                                            .clicked()
+                                        {
+                                            self.analytics_visible = !self.analytics_visible;
+                                        }
+                                        if visibility.show_whispers_toggle {
+                                            let tooltip = if whisper_unread_total > 0 {
+                                                format!(
+                                                    "Open whispers ({whisper_unread_total} unread)"
+                                                )
+                                            } else {
+                                                "Open whispers".to_owned()
+                                            };
+                                            if chrome::icon_button(
+                                                ui,
+                                                ChromeIcon::Whisper,
+                                                &tooltip,
+                                                IconButtonState {
+                                                    selected: self.whispers_visible,
+                                                    compact: visibility.compact_controls,
+                                                    ..Default::default()
+                                                },
+                                            )
+                                            .clicked()
+                                            {
+                                                self.whispers_visible = !self.whispers_visible;
+                                                if self.whispers_visible {
+                                                    if let Some(active) =
+                                                        self.active_whisper_login.clone().or_else(
+                                                            || self.whisper_order.first().cloned(),
+                                                        )
+                                                    {
+                                                        self.active_whisper_login =
+                                                            Some(active.clone());
+                                                        self.mark_whisper_thread_read(&active);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if visibility.show_irc_toggle
+                                            && chrome::icon_button(
+                                                ui,
+                                                ChromeIcon::Irc,
+                                                "Toggle IRC status window",
+                                                IconButtonState {
+                                                    selected: self.irc_status_visible,
+                                                    compact: visibility.compact_controls,
+                                                    ..Default::default()
+                                                },
+                                            )
+                                            .clicked()
+                                        {
+                                            self.irc_status_visible = !self.irc_status_visible;
+                                        }
+                                    },
+                                );
                             });
                         });
-                    });
-                },
-            );
+                    },
+                );
             });
 
-        show_channel_info_bars(ctx, &self.state, &self.stream_statuses);
+        show_channel_info_bars(
+            ctx,
+            &self.state,
+            &self.stream_statuses,
+            &plugin_ui_snapshot,
+            &mut self.plugin_ui_session,
+        );
 
         // -- Channel list: left sidebar OR top tab strip ----------------------
         // Accumulate actions outside the panel closure so we can call &mut self
@@ -4855,8 +5275,8 @@ impl eframe::App for CrustApp {
                                             && self
                                                 .live_map_cache
                                                 .get(&display.to_ascii_lowercase())
-                                            .copied()
-                                            .unwrap_or(false);
+                                                .copied()
+                                                .unwrap_or(false);
 
                                         let (fg, bg) = if is_active {
                                             (t::text_primary(), t::tab_selected_bg())
@@ -4913,8 +5333,8 @@ impl eframe::App for CrustApp {
                                                         channel_tab_badge(
                                                             ui,
                                                             compact_badge_count(mentions),
-                                                            t::yellow(),
-                                                            t::warning_soft_bg(),
+                                                            t::text_primary(),
+                                                            t::mention_pill_bg(),
                                                         );
                                                     } else if unread > 0 {
                                                         channel_tab_badge(
@@ -5106,6 +5526,18 @@ impl eframe::App for CrustApp {
                             .stroke(egui::Stroke::new(1.0, t::border_subtle())),
                     )
                     .show(ctx, |ui| {
+                        if has_host_panels_for_slot(
+                            &plugin_ui_snapshot,
+                            PluginUiHostSlot::SidebarTop,
+                        ) {
+                            render_host_panels_for_slot(
+                                ui,
+                                &plugin_ui_snapshot,
+                                &mut self.plugin_ui_session,
+                                PluginUiHostSlot::SidebarTop,
+                            );
+                            ui.add_space(8.0);
+                        }
                         ui.label(
                             RichText::new("CHANNELS")
                                 .font(t::heading())
@@ -6055,10 +6487,7 @@ impl eframe::App for CrustApp {
                         zone_rect,
                         egui::CornerRadius::same(8),
                         t::alpha(ac, alpha),
-                        egui::Stroke::new(
-                            2.0,
-                            t::alpha(ac, border_alpha),
-                        ),
+                        egui::Stroke::new(2.0, t::alpha(ac, border_alpha)),
                         egui::epaint::StrokeKind::Outside,
                     );
                     // Center label.
@@ -6079,6 +6508,7 @@ impl eframe::App for CrustApp {
         self.flush_event_toast_queue();
         self.event_toasts
             .retain(|t| t.born.elapsed().as_secs_f32() < EVENT_TOAST_TTL_SECS);
+        let mut toast_y = 58.0;
         for (i, toast) in self.event_toasts.iter().enumerate() {
             let age = toast.born.elapsed().as_secs_f32();
             let opacity = if age < 0.25 {
@@ -6097,11 +6527,12 @@ impl eframe::App for CrustApp {
             egui::Area::new(egui::Id::new("event_toast").with(i))
                 .anchor(
                     egui::Align2::RIGHT_TOP,
-                    egui::vec2(-14.0 - slide_x, 58.0 + i as f32 * 50.0),
+                    egui::vec2(-14.0 - slide_x, toast_y),
                 )
                 .order(egui::Order::Foreground)
                 .interactable(false)
                 .show(ctx, |ui| {
+                    ui.set_max_width(360.0);
                     let border_col = t::alpha(toast.hue, (160.0 * opacity) as u8);
                     let fill_col = {
                         let o = t::overlay_fill();
@@ -6145,6 +6576,8 @@ impl eframe::App for CrustApp {
                             );
                         }
                     }
+
+                    toast_y += frame_resp.response.rect.height() + 8.0;
                 });
         }
         // Keep animating while toasts are live.
@@ -6460,6 +6893,8 @@ fn parse_slash_command(
             channel: channel.clone(),
         }),
 
+        "reloadplugins" | "pluginsreload" => Some(AppCommand::ReloadPlugins),
+
         "chatters" => {
             let msg = format!("There are {} chatters currently connected.", chatters_count);
             Some(AppCommand::InjectLocalMessage {
@@ -6479,8 +6914,7 @@ fn parse_slash_command(
             if !is_mod {
                 return Some(AppCommand::InjectLocalMessage {
                     channel: channel.clone(),
-                    text: "Poll commands require moderator or broadcaster permissions."
-                        .to_owned(),
+                    text: "Poll commands require moderator or broadcaster permissions.".to_owned(),
                 });
             }
 
@@ -6528,8 +6962,7 @@ fn parse_slash_command(
             if !is_mod {
                 return Some(AppCommand::InjectLocalMessage {
                     channel: channel.clone(),
-                    text: "Poll commands require moderator or broadcaster permissions."
-                        .to_owned(),
+                    text: "Poll commands require moderator or broadcaster permissions.".to_owned(),
                 });
             }
             Some(AppCommand::EndPoll {
@@ -6548,8 +6981,7 @@ fn parse_slash_command(
             if !is_mod {
                 return Some(AppCommand::InjectLocalMessage {
                     channel: channel.clone(),
-                    text: "Poll commands require moderator or broadcaster permissions."
-                        .to_owned(),
+                    text: "Poll commands require moderator or broadcaster permissions.".to_owned(),
                 });
             }
             Some(AppCommand::EndPoll {
@@ -6573,11 +7005,7 @@ fn parse_slash_command(
                 });
             }
 
-            let Some(choice_number) = rest
-                .trim()
-                .parse::<u32>()
-                .ok()
-                .filter(|choice| *choice > 0)
+            let Some(choice_number) = rest.trim().parse::<u32>().ok().filter(|choice| *choice > 0)
             else {
                 return Some(AppCommand::InjectLocalMessage {
                     channel: channel.clone(),
@@ -6819,8 +7247,7 @@ fn parse_slash_command(
                 });
             }
 
-            let usage =
-                "Usage: /announce <message> [--color primary|blue|green|orange|purple]";
+            let usage = "Usage: /announce <message> [--color primary|blue|green|orange|purple]";
             let (message, color) = extract_color_flag(rest);
             let message = message.trim();
             if message.is_empty() {
@@ -7252,6 +7679,99 @@ fn parse_slash_command(
         // Mod-only shorthand helpers (validated client-side)
         // NOTE: the actual enforcement is server-side; we just show a
         // usage hint so non-mods don't waste a round-trip.
+        "warn" => {
+            if !is_mod {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Warn commands require moderator or broadcaster permissions.".to_owned(),
+                });
+            }
+            let (target, reason) = rest
+                .split_once(char::is_whitespace)
+                .map(|(user, reason)| (user.trim(), reason.trim()))
+                .unwrap_or((rest.trim(), ""));
+            if target.is_empty() || reason.is_empty() {
+                Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Usage: /warn <user> <reason>".to_owned(),
+                })
+            } else {
+                Some(AppCommand::WarnUser {
+                    channel: channel.clone(),
+                    login: target.trim_start_matches('@').to_ascii_lowercase(),
+                    user_id: String::new(),
+                    reason: reason.to_owned(),
+                })
+            }
+        }
+        "monitor" => {
+            if !is_mod {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Low-trust commands require moderator or broadcaster permissions."
+                        .to_owned(),
+                });
+            }
+            let target = rest.trim();
+            if target.is_empty() {
+                Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Usage: /monitor <user>".to_owned(),
+                })
+            } else {
+                Some(AppCommand::SetSuspiciousUser {
+                    channel: channel.clone(),
+                    login: target.trim_start_matches('@').to_ascii_lowercase(),
+                    user_id: String::new(),
+                    restricted: false,
+                })
+            }
+        }
+        "restrict" => {
+            if !is_mod {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Low-trust commands require moderator or broadcaster permissions."
+                        .to_owned(),
+                });
+            }
+            let target = rest.trim();
+            if target.is_empty() {
+                Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Usage: /restrict <user>".to_owned(),
+                })
+            } else {
+                Some(AppCommand::SetSuspiciousUser {
+                    channel: channel.clone(),
+                    login: target.trim_start_matches('@').to_ascii_lowercase(),
+                    user_id: String::new(),
+                    restricted: true,
+                })
+            }
+        }
+        "unmonitor" | "unrestrict" => {
+            if !is_mod {
+                return Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: "Low-trust commands require moderator or broadcaster permissions."
+                        .to_owned(),
+                });
+            }
+            let target = rest.trim();
+            if target.is_empty() {
+                Some(AppCommand::InjectLocalMessage {
+                    channel: channel.clone(),
+                    text: format!("Usage: /{cmd} <user>"),
+                })
+            } else {
+                Some(AppCommand::ClearSuspiciousUser {
+                    channel: channel.clone(),
+                    login: target.trim_start_matches('@').to_ascii_lowercase(),
+                    user_id: String::new(),
+                })
+            }
+        }
         "banid" if !rest.is_empty() => {
             // /banid <userID>  →  forward as /ban to IRC (uses ID not name).
             let fwd = format!("/ban {rest}");
@@ -7317,12 +7837,33 @@ fn parse_slash_command(
             })
         }
 
-        // Everything else falls through to IRC
-        // Standard Twitch chat commands (/ban, /timeout, /unban, /slow,
-        // /subscribers, /emoteonly, /clear, /mod, /vip, /color, /delete,
-        // /raid, /host, /uniquechat, /block, /unblock,
-        // /r, etc.) are handled server-side.
-        _ => None,
+        _ => {
+            let plugin_commands = plugin_command_infos();
+            if let Some(info) = plugin_commands.iter().find(|info| {
+                info.name.eq_ignore_ascii_case(&cmd_lower)
+                    || info
+                        .aliases
+                        .iter()
+                        .any(|alias| alias.eq_ignore_ascii_case(&cmd_lower))
+            }) {
+                let words = split_quoted_args(text);
+                return Some(AppCommand::RunPluginCommand {
+                    channel: channel.clone(),
+                    command: info.name.clone(),
+                    words,
+                    reply_to_msg_id,
+                    reply,
+                    raw_text: text.to_owned(),
+                });
+            }
+
+            // Everything else falls through to IRC
+            // Standard Twitch chat commands (/ban, /timeout, /unban, /slow,
+            // /subscribers, /emoteonly, /clear, /mod, /vip, /color, /delete,
+            // /raid, /host, /uniquechat, /block, /unblock,
+            // /r, etc.) are handled server-side.
+            None
+        }
     }
 }
 
@@ -7331,8 +7872,10 @@ fn is_anonymous_local_command(cmd: &AppCommand) -> bool {
         cmd,
         AppCommand::InjectLocalMessage { .. }
             | AppCommand::ClearLocalMessages { .. }
+            | AppCommand::ReloadPlugins
             | AppCommand::OpenUrl { .. }
             | AppCommand::ShowUserCard { .. }
+            | AppCommand::RunPluginCommand { .. }
     )
 }
 
@@ -7626,7 +8169,10 @@ fn extract_color_flag(input: &str) -> (String, Option<String>) {
         if tokens[i] == "--color" {
             if let Some(next) = tokens.get(i + 1) {
                 let candidate = next.trim().to_ascii_lowercase();
-                if matches!(candidate.as_str(), "primary" | "blue" | "green" | "orange" | "purple") {
+                if matches!(
+                    candidate.as_str(),
+                    "primary" | "blue" | "green" | "orange" | "purple"
+                ) {
                     color = Some(candidate);
                     i += 2;
                     continue;
@@ -7747,12 +8293,11 @@ fn whisper_fit_size(w: u32, h: u32, target_h: f32) -> egui::Vec2 {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_slash_command, responsive_layout, top_tab_metrics, toolbar_visibility,
-        TabVisualStyle,
+        parse_slash_command, responsive_layout, toolbar_visibility, top_tab_metrics, TabVisualStyle,
     };
+    use crate::theme as t;
     use crust_core::events::AppCommand;
     use crust_core::model::ChannelId;
-    use crate::theme as t;
 
     #[test]
     fn responsive_layout_prefers_top_tabs_on_narrow_windows() {
@@ -7824,16 +8369,8 @@ mod tests {
     #[test]
     fn slash_commercial_rejects_invalid_duration_argument() {
         let channel = ChannelId::new("somechannel");
-        let parsed = parse_slash_command(
-            "/commercial 45",
-            &channel,
-            None,
-            None,
-            true,
-            0,
-            true,
-            true,
-        );
+        let parsed =
+            parse_slash_command("/commercial 45", &channel, None, None, true, 0, true, true);
 
         match parsed {
             Some(AppCommand::InjectLocalMessage { text, .. }) => {
@@ -7846,16 +8383,8 @@ mod tests {
     #[test]
     fn slash_commercial_accepts_supported_duration_argument() {
         let channel = ChannelId::new("somechannel");
-        let parsed = parse_slash_command(
-            "/commercial 90",
-            &channel,
-            None,
-            None,
-            true,
-            0,
-            true,
-            true,
-        );
+        let parsed =
+            parse_slash_command("/commercial 90", &channel, None, None, true, 0, true, true);
 
         match parsed {
             Some(AppCommand::StartCommercial { length_secs, .. }) => {
@@ -7997,16 +8526,8 @@ mod tests {
     #[test]
     fn slash_unbanrequests_maps_to_fetch_command() {
         let channel = ChannelId::new("somechannel");
-        let parsed = parse_slash_command(
-            "/unbanrequests",
-            &channel,
-            None,
-            None,
-            true,
-            0,
-            true,
-            true,
-        );
+        let parsed =
+            parse_slash_command("/unbanrequests", &channel, None, None, true, 0, true, true);
 
         match parsed {
             Some(AppCommand::FetchUnbanRequests { channel }) => {
@@ -8045,7 +8566,10 @@ mod tests {
 
         match parsed {
             Some(AppCommand::OpenUrl { url }) => {
-                assert_eq!(url, "https://www.twitch.tv/popout/targetchannel/reward-queue");
+                assert_eq!(
+                    url,
+                    "https://www.twitch.tv/popout/targetchannel/reward-queue"
+                );
             }
             other => panic!("expected OpenUrl for reward queue, got {other:?}"),
         }
@@ -8054,16 +8578,7 @@ mod tests {
     #[test]
     fn slash_vote_maps_to_send_message() {
         let channel = ChannelId::new("somechannel");
-        let parsed = parse_slash_command(
-            "/vote 2",
-            &channel,
-            None,
-            None,
-            false,
-            0,
-            true,
-            true,
-        );
+        let parsed = parse_slash_command("/vote 2", &channel, None, None, false, 0, true, true);
 
         match parsed {
             Some(AppCommand::SendMessage { text, .. }) => {
@@ -8076,16 +8591,8 @@ mod tests {
     #[test]
     fn slash_vote_rejects_non_numeric_choice() {
         let channel = ChannelId::new("somechannel");
-        let parsed = parse_slash_command(
-            "/vote winner",
-            &channel,
-            None,
-            None,
-            false,
-            0,
-            true,
-            true,
-        );
+        let parsed =
+            parse_slash_command("/vote winner", &channel, None, None, false, 0, true, true);
 
         match parsed {
             Some(AppCommand::InjectLocalMessage { text, .. }) => {
