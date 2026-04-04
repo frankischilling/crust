@@ -1,8 +1,20 @@
 # Lua API Reference
 
-This page documents the Crust-specific Lua host API.
+This is the exhaustive reference for the Lua API currently emitted and accepted
+by the Rust host. The pages are split by category for navigation, but the goal
+of this wiki is parity with the Lua surface that exists today.
 
-## Global Tables
+## Pages
+
+- [Core and callbacks](./API_Core)
+- [UI](./API_UI)
+- [Chat and channels](./API_Chat)
+- [Accounts and settings](./API_Accounts_Settings)
+- [Moderation and creator tools](./API_Moderation)
+- [Events](./API_Events)
+- [Examples](./Examples)
+
+## Global Tables And Namespaces
 
 ### `c2.LogLevel`
 
@@ -15,132 +27,71 @@ c2.LogLevel.Critical
 
 ### `c2.EventType`
 
+`c2.EventType` contains every event kind accepted by
+`c2.register_callback(event_type, handler)`.
+
+The current Lua bridge includes:
+
+- completion events
+- account and connection events
+- chat and channel events
+- fetch-result events
+- moderation and settings events
+- loader and emote/image events, including `ImagePrefetchQueued`
+
+The event surface now matches the user-facing `AppEvent` variants used by the
+runtime.
+
+The command surface also matches the non-internal `AppCommand` variants that
+the runtime exposes to plugins. Internal host plumbing, such as
+`RunPluginCommand` and `RunPluginCallback`, is intentionally not documented as
+public Lua API.
+
+The event reference also documents shared nested payload tables, optional-field
+omission rules, and concrete string/value domains already enforced by the Rust
+bridge.
+
+### `c2.ui`
+
+`c2.ui` is the declarative retained UI namespace for plugin-owned floating
+windows and plugin settings pages.
+
+See [API_UI.md](./API_UI).
+
+## API Conventions
+
+- All functions live under the global `c2` table.
+- Declarative UI helpers live under `c2.ui`.
+- Functions usually return `nil` unless the page says otherwise.
+- Read-only snapshots are plain Lua tables.
+- Async work is callback-driven: call a `c2.fetch_*` helper or trigger an app
+  action, then listen for the matching `c2.EventType.*` payload.
+- Every callback payload table includes a `type` field.
+
+## Common Patterns
+
+### Register a command
+
 ```lua
-c2.EventType.CompletionRequested
+c2.register_command("hello", function(ctx)
+  c2.add_system_message(ctx.channel, "Hello from Lua")
+end)
 ```
 
-## Logging And Commands
-
-### `c2.log(level, ...parts)`
-
-Write a message to the Crust log.
-
-### `c2.register_command(name, handler, meta?)`
-
-Register a slash command.
-
-Arguments:
-
-- `name`: command name, with or without the leading `/`
-- `handler`: Lua function called for the command
-- `meta`: optional table with:
-  - `usage`
-  - `summary`
-  - `aliases`
-
-Command context fields:
-
-- `command`
-- `raw_text`
-- `channel`
-- `channel_name`
-- `account`
-- `words`
-- `reply_to_msg_id`
-- `reply`
-
-Return values:
-
-- `nil` to do nothing
-- a string to post a local system message
-
-### `c2.register_callback(event_type, handler)`
-
-Register a callback for host-driven events.
-
-Currently supported event:
-
-- `c2.EventType.CompletionRequested`
-
-Completion event fields:
-
-- `query`
-- `full_text_content`
-- `cursor_position`
-- `is_first_word`
-- `channel`
-
-Completion result fields:
-
-- `values`
-- `hide_others`
-
-### `c2.later(callback, msec)`
-
-Run a callback later on the plugin VM.
-
-## Account And Channel
-
-### `c2.current_account()`
-
-Return the current Twitch account snapshot.
-
-### `c2.channel_by_name(name)`
-
-Return a channel info table for a channel name.
-
-### `c2.send_message(channel, text)`
-
-Send a chat message.
-
-`channel` may be:
-
-- a channel name string
-- a channel table from `c2.channel_by_name`
-
-### `c2.add_system_message(channel, text)`
-
-Inject a local system message into the visible channel feed.
-
-### `c2.clear_messages(channel)`
-
-Clear the visible message buffer for a channel.
-
-### `c2.open_url(url)`
-
-Open a URL in the system browser.
-
-## Paths And Time
-
-### `c2.plugin_dir()`
-
-Return the plugin installation directory.
-
-### `c2.plugin_data_dir()`
-
-Return the writable per-plugin data directory.
-
-Use this for persistent state, caches, and timestamps.
-
-### `c2.use_24h_timestamps()`
-
-Return `true` when Crust is configured to render timestamps in 24-hour time.
-
-### `c2.session_started_ms()`
-
-Return the current Crust session start time in Unix milliseconds.
-
-Use this to compute session uptime without relying on wall-clock persistence.
-
-## Example
+### Register a callback
 
 ```lua
-c2.log(c2.LogLevel.Info, "plugin loaded")
+c2.register_callback(c2.EventType.Authenticated, function(ev)
+  c2.log(c2.LogLevel.Info, "logged in as " .. tostring(ev.username or ""))
+end)
+```
 
-c2.register_command("hello", function(ctx)
-  c2.add_system_message(ctx.channel_name, "Hello from Lua")
-end, {
-  usage = "/hello",
-  summary = "Print a local message",
-})
+### Fetch something and wait for the event
+
+```lua
+c2.register_callback(c2.EventType.UserProfileLoaded, function(ev)
+  c2.log(c2.LogLevel.Info, "loaded profile for " .. tostring(ev.profile.login or ""))
+end)
+
+c2.fetch_user_profile("some_login")
 ```
