@@ -6545,25 +6545,10 @@ async fn helix_create_poll(
 
     let status = resp.status();
     if status.is_success() {
-        emit_helix_system_info(
-            evt_tx,
-            channel,
-            if let Some(points) = points_per_vote {
-                format!(
-                    "Started poll: {title} ({} choices, {}s, {} points/vote)",
-                    choices.len(),
-                    duration_secs,
-                    points
-                )
-            } else {
-                format!(
-                    "Started poll: {title} ({} choices, {}s)",
-                    choices.len(),
-                    duration_secs
-                )
-            },
-        )
-        .await;
+        let _ = points_per_vote;
+        let _ = choices;
+        let _ = duration_secs;
+        emit_helix_system_info(evt_tx, channel, format!("Created poll: '{title}'")).await;
         return;
     }
 
@@ -6575,6 +6560,60 @@ async fn helix_create_poll(
             message: format!("Could not create poll: {msg}"),
         })
         .await;
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct HelixPollChoiceSummary {
+    title: String,
+    #[serde(default)]
+    votes: u64,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct HelixPollSummary {
+    title: String,
+    #[serde(default)]
+    choices: Vec<HelixPollChoiceSummary>,
+}
+
+fn format_completed_poll_message(poll: &HelixPollSummary) -> String {
+    let total_votes: u64 = poll.choices.iter().map(|choice| choice.votes).sum();
+    if total_votes == 0 {
+        return format!("Poll ended with zero votes: '{}'", poll.title);
+    }
+
+    let Some(max_votes) = poll.choices.iter().map(|choice| choice.votes).max() else {
+        return format!("Poll ended with zero votes: '{}'", poll.title);
+    };
+
+    let winners: Vec<&HelixPollChoiceSummary> = poll
+        .choices
+        .iter()
+        .filter(|choice| choice.votes == max_votes)
+        .collect();
+    if winners.len() != 1 {
+        return format!("Poll ended in a draw: '{}'", poll.title);
+    }
+
+    let winner = winners[0];
+    let percent = 100.0 * winner.votes as f64 / total_votes as f64;
+    format!(
+        "Ended poll: '{}' - '{}' won with {} votes ({percent:.1}%)",
+        poll.title, winner.title, winner.votes
+    )
+}
+
+fn parse_ended_poll_summary(body: &str) -> Option<HelixPollSummary> {
+    #[derive(serde::Deserialize)]
+    struct PollSummaryResponse {
+        data: Vec<HelixPollSummary>,
+    }
+
+    serde_json::from_str::<PollSummaryResponse>(body)
+        .ok()?
+        .data
+        .into_iter()
+        .next()
 }
 
 async fn helix_find_active_poll(
@@ -6614,11 +6653,15 @@ async fn helix_find_active_poll(
 
     let parsed = serde_json::from_str::<PollList>(&body)
         .map_err(|e| format!("Failed to parse poll list: {e}"))?;
+    if parsed.data.is_empty() {
+        return Err("Failed to find any polls".to_owned());
+    }
+
     let active = parsed
         .data
         .into_iter()
         .find(|p| p.status.eq_ignore_ascii_case("ACTIVE"))
-        .ok_or_else(|| "No active poll found in this channel.".to_owned())?;
+        .ok_or_else(|| "Could not find an active poll".to_owned())?;
     Ok((active.id, active.title))
 }
 
@@ -6703,12 +6746,18 @@ async fn helix_end_poll(
 
     let http_status = resp.status();
     if http_status.is_success() {
-        let verb = if status.eq_ignore_ascii_case("TERMINATED") {
-            "Canceled"
+        let body_text = resp.text().await.unwrap_or_default();
+        let message = if status.eq_ignore_ascii_case("TERMINATED") {
+            let title = parse_ended_poll_summary(&body_text)
+                .map(|poll| poll.title)
+                .unwrap_or_else(|| poll_title.clone());
+            format!("Canceled poll: '{title}'")
+        } else if let Some(poll) = parse_ended_poll_summary(&body_text) {
+            format_completed_poll_message(&poll)
         } else {
-            "Ended"
+            format!("Ended poll: '{poll_title}'")
         };
-        emit_helix_system_info(evt_tx, channel, format!("{verb} poll: {poll_title}")).await;
+        emit_helix_system_info(evt_tx, channel, message).await;
         return;
     }
 
@@ -7422,11 +7471,12 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        format_eventsub_notice_text, moderation_action_effect_from_notice,
-        moderation_command_remaining_cooldown, parse_twitch_pinned_snapshot_json,
-        should_drop_duplicate_eventsub_notice, should_emit_eventsub_notice_message,
-        stream_status_is_live_from_notice, ModerationActionEffect, APP_INITIAL_INNER_SIZE,
-        APP_MIN_INNER_SIZE, MODERATION_CMD_COOLDOWN,
+        format_completed_poll_message, format_eventsub_notice_text,
+        moderation_action_effect_from_notice, moderation_command_remaining_cooldown,
+        parse_twitch_pinned_snapshot_json, should_drop_duplicate_eventsub_notice,
+        should_emit_eventsub_notice_message, stream_status_is_live_from_notice,
+        HelixPollChoiceSummary, HelixPollSummary, ModerationActionEffect,
+        APP_INITIAL_INNER_SIZE, APP_MIN_INNER_SIZE, MODERATION_CMD_COOLDOWN,
     };
     use crate::runtime::system_messages::is_twitch_pinned_notice;
     use crust_core::model::ChannelId;
@@ -7671,6 +7721,72 @@ mod tests {
                 now + Duration::from_millis(100),
             ),
             None
+        );
+    }
+
+    #[test]
+    fn completed_poll_message_reports_zero_votes() {
+        let poll = HelixPollSummary {
+            title: "Best snack".to_owned(),
+            choices: vec![
+                HelixPollChoiceSummary {
+                    title: "Chips".to_owned(),
+                    votes: 0,
+                },
+                HelixPollChoiceSummary {
+                    title: "Popcorn".to_owned(),
+                    votes: 0,
+                },
+            ],
+        };
+
+        assert_eq!(
+            format_completed_poll_message(&poll),
+            "Poll ended with zero votes: 'Best snack'"
+        );
+    }
+
+    #[test]
+    fn completed_poll_message_reports_draws() {
+        let poll = HelixPollSummary {
+            title: "Best snack".to_owned(),
+            choices: vec![
+                HelixPollChoiceSummary {
+                    title: "Chips".to_owned(),
+                    votes: 5,
+                },
+                HelixPollChoiceSummary {
+                    title: "Popcorn".to_owned(),
+                    votes: 5,
+                },
+            ],
+        };
+
+        assert_eq!(
+            format_completed_poll_message(&poll),
+            "Poll ended in a draw: 'Best snack'"
+        );
+    }
+
+    #[test]
+    fn completed_poll_message_reports_winner_like_chatterino() {
+        let poll = HelixPollSummary {
+            title: "Best snack".to_owned(),
+            choices: vec![
+                HelixPollChoiceSummary {
+                    title: "Chips".to_owned(),
+                    votes: 7,
+                },
+                HelixPollChoiceSummary {
+                    title: "Popcorn".to_owned(),
+                    votes: 3,
+                },
+            ],
+        };
+
+        assert_eq!(
+            format_completed_poll_message(&poll),
+            "Ended poll: 'Best snack' - 'Chips' won with 7 votes (70.0%)"
         );
     }
 }

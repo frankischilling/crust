@@ -62,8 +62,8 @@ const BUILTIN_SLASH_COMMANDS: &[SlashCommandInfo] = &[
     },
     SlashCommandInfo {
         name: "poll",
-        usage: "/poll <title> | <choice1> | <choice2> [--duration <15..1800>] OR /poll --title \"...\" --choice \"...\" --choice \"...\" [--duration 60|1m] [--points <n>]",
-        summary: "Create a Twitch poll (mod/broadcaster only).",
+        usage: "/poll --title \"<title>\" --choice \"<choice 1>\" --choice \"<choice 2>\" [--choice \"<choice 3>\"] [--duration <15..1800>|<60s|1m>] [--points <n>]",
+        summary: "Create a Twitch poll with Chatterino-style flags (mod/broadcaster only).",
         aliases: &[],
     },
     SlashCommandInfo {
@@ -76,12 +76,6 @@ const BUILTIN_SLASH_COMMANDS: &[SlashCommandInfo] = &[
         name: "cancelpoll",
         usage: "/cancelpoll",
         summary: "Cancel the active Twitch poll.",
-        aliases: &[],
-    },
-    SlashCommandInfo {
-        name: "vote",
-        usage: "/vote <choice number>",
-        summary: "Vote in the active Twitch poll.",
         aliases: &[],
     },
     SlashCommandInfo {
@@ -772,6 +766,18 @@ mod tests {
     fn slash_matches_include_commercial_command() {
         let matches = slash_command_matches("comm", usize::MAX);
         assert!(matches.iter().any(|c| c.name == "commercial"));
+    }
+
+    #[test]
+    fn slash_matches_do_not_advertise_vote_command() {
+        let matches = slash_command_matches("vote", usize::MAX);
+        assert!(!matches.iter().any(|c| c.name == "vote"));
+    }
+
+    #[test]
+    fn slash_matches_include_requests_command() {
+        let matches = slash_command_matches("request", usize::MAX);
+        assert!(matches.iter().any(|c| c.name == "requests"));
     }
 
     #[test]

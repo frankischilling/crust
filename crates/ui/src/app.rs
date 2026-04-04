@@ -6918,7 +6918,7 @@ fn parse_slash_command(
                 });
             }
 
-            let usage = "Usage: /poll <title> | <choice 1> | <choice 2> [| ...] [--duration <15..1800>] OR /poll --title \"<title>\" --choice \"<choice 1>\" --choice \"<choice 2>\" [--duration <15..1800>|<60s|1m>] [--points <n>]";
+            let usage = "Usage: /poll --title \"<title>\" --choice \"<choice 1>\" --choice \"<choice 2>\" [--choice \"<choice 3>\"] [--duration <15..1800>|<60s|1m>] [--points <n>]";
             if rest.is_empty() {
                 return Some(AppCommand::InjectLocalMessage {
                     channel: channel.clone(),
@@ -6926,7 +6926,7 @@ fn parse_slash_command(
                 });
             }
 
-            let parsed = parse_poll_flag_args(rest).or_else(|| parse_poll_pipe_args(rest));
+            let parsed = parse_poll_flag_args(rest);
 
             let Some(parsed) = parsed else {
                 return Some(AppCommand::InjectLocalMessage {
@@ -7013,11 +7013,11 @@ fn parse_slash_command(
                 });
             };
 
-            Some(AppCommand::SendMessage {
+            let _choice_number = choice_number;
+
+            Some(AppCommand::InjectLocalMessage {
                 channel: channel.clone(),
-                text: format!("/vote {choice_number}"),
-                reply_to_msg_id: None,
-                reply: None,
+                text: "Twitch poll voting is not available over IRC. Vote in the Twitch poll card instead.".to_owned(),
             })
         }
 
@@ -7999,48 +7999,6 @@ fn parse_poll_points_token(raw: &str) -> Option<u32> {
     raw.trim().parse::<u32>().ok().filter(|value| *value > 0)
 }
 
-fn parse_poll_pipe_args(input: &str) -> Option<ParsedPollSpec> {
-    let mut cleaned_tokens: Vec<&str> = Vec::new();
-    let mut duration_secs: Option<u32> = None;
-    let mut channel_points_per_vote: Option<u32> = None;
-
-    let tokens: Vec<&str> = input.split_whitespace().collect();
-    let mut i = 0usize;
-    while i < tokens.len() {
-        match tokens[i] {
-            "--duration" | "-d" => {
-                let value = tokens.get(i + 1)?;
-                duration_secs = parse_poll_duration_token(value);
-                if duration_secs.is_none() {
-                    return None;
-                }
-                i += 2;
-            }
-            "--points" | "-p" => {
-                let value = tokens.get(i + 1)?;
-                channel_points_per_vote = Some(parse_poll_points_token(value)?);
-                i += 2;
-            }
-            _ => {
-                cleaned_tokens.push(tokens[i]);
-                i += 1;
-            }
-        }
-    }
-
-    let parts = parse_pipe_args(&cleaned_tokens.join(" "));
-    if parts.len() < 3 {
-        return None;
-    }
-
-    Some(ParsedPollSpec {
-        title: parts[0].clone(),
-        choices: parts[1..].to_vec(),
-        duration_secs: duration_secs.unwrap_or(60).clamp(15, 1800),
-        channel_points_per_vote,
-    })
-}
-
 fn parse_poll_flag_args(input: &str) -> Option<ParsedPollSpec> {
     let tokens = split_quoted_args(input);
     if tokens.is_empty() {
@@ -8431,7 +8389,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_poll_pipe_syntax_supports_points_flag() {
+    fn slash_poll_pipe_syntax_is_rejected_in_favor_of_flag_syntax() {
         let channel = ChannelId::new("somechannel");
         let parsed = parse_slash_command(
             "/poll Best pet? | Cat | Dog --duration 90 --points 250",
@@ -8445,19 +8403,13 @@ mod tests {
         );
 
         match parsed {
-            Some(AppCommand::CreatePoll {
-                title,
-                choices,
-                duration_secs,
-                channel_points_per_vote,
-                ..
-            }) => {
-                assert_eq!(title, "Best pet?");
-                assert_eq!(choices, vec!["Cat".to_owned(), "Dog".to_owned()]);
-                assert_eq!(duration_secs, 90);
-                assert_eq!(channel_points_per_vote, Some(250));
+            Some(AppCommand::InjectLocalMessage { text, .. }) => {
+                assert_eq!(
+                    text,
+                    "Usage: /poll --title \"<title>\" --choice \"<choice 1>\" --choice \"<choice 2>\" [--choice \"<choice 3>\"] [--duration <15..1800>|<60s|1m>] [--points <n>]"
+                );
             }
-            other => panic!("expected CreatePoll, got {other:?}"),
+            other => panic!("expected usage local message for /poll, got {other:?}"),
         }
     }
 
@@ -8576,20 +8528,23 @@ mod tests {
     }
 
     #[test]
-    fn slash_vote_maps_to_send_message() {
+    fn slash_vote_is_not_advertised_but_still_explains_locally() {
         let channel = ChannelId::new("somechannel");
         let parsed = parse_slash_command("/vote 2", &channel, None, None, false, 0, true, true);
 
         match parsed {
-            Some(AppCommand::SendMessage { text, .. }) => {
-                assert_eq!(text, "/vote 2");
+            Some(AppCommand::InjectLocalMessage { text, .. }) => {
+                assert_eq!(
+                    text,
+                    "Twitch poll voting is not available over IRC. Vote in the Twitch poll card instead."
+                );
             }
-            other => panic!("expected SendMessage for /vote, got {other:?}"),
+            other => panic!("expected local explanation for /vote, got {other:?}"),
         }
     }
 
     #[test]
-    fn slash_vote_rejects_non_numeric_choice() {
+    fn slash_vote_hidden_guard_still_rejects_invalid_choice_numbers() {
         let channel = ChannelId::new("somechannel");
         let parsed =
             parse_slash_command("/vote winner", &channel, None, None, false, 0, true, true);
@@ -8598,7 +8553,7 @@ mod tests {
             Some(AppCommand::InjectLocalMessage { text, .. }) => {
                 assert_eq!(text, "Usage: /vote <choice number>");
             }
-            other => panic!("expected usage local message for /vote, got {other:?}"),
+            other => panic!("expected usage local message for hidden /vote guard, got {other:?}"),
         }
     }
 
