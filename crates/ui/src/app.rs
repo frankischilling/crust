@@ -16,8 +16,9 @@ use crust_core::{
         ChannelId, ChannelState, EmoteCatalogEntry, MsgKind, ReplyInfo, Span, TwitchEmotePos,
         IRC_SERVER_CONTROL_CHANNEL,
     },
-    plugin_command_infos, plugin_host, PluginAuthSnapshot, PluginChannelSnapshot,
-    AppState,
+    plugin_command_infos, plugin_host,
+    plugins::PluginUiHostSlot,
+    AppState, PluginAuthSnapshot, PluginChannelSnapshot,
 };
 
 use crate::commands::render_help_message;
@@ -41,6 +42,10 @@ use crate::widgets::{
     message_search::{
         should_use_search_window, show_message_search_inline, show_message_search_window,
         MessageSearchState,
+    },
+    plugin_ui::{
+        has_host_panels_for_slot, render_host_panels_for_slot, show_plugin_windows,
+        PluginUiSessionState,
     },
     settings_page::{
         parse_settings_lines, show_settings_page, SettingsPageState, SettingsSection, SettingsStats,
@@ -759,6 +764,8 @@ pub struct CrustApp {
     settings_open: bool,
     /// Current section selected in the settings page.
     settings_section: SettingsSection,
+    /// Host-managed plugin UI form/session state for retained plugin surfaces.
+    plugin_ui_session: PluginUiSessionState,
     /// Persisted Kick compatibility (beta) toggle.
     kick_beta_enabled: bool,
     /// Persisted IRC compatibility (beta) toggle.
@@ -969,6 +976,7 @@ impl CrustApp {
                 + STREAM_NOTIFICATION_STARTUP_GRACE,
             settings_open: false,
             settings_section: SettingsSection::default(),
+            plugin_ui_session: PluginUiSessionState::default(),
             kick_beta_enabled: false,
             irc_beta_enabled: false,
             irc_nickserv_user: String::new(),
@@ -3358,6 +3366,13 @@ exit 1
                     }
                 }
             }
+            AppEvent::PluginUiAction { .. }
+            | AppEvent::PluginUiChange { .. }
+            | AppEvent::PluginUiSubmit { .. }
+            | AppEvent::PluginUiWindowClosed { .. } => {
+                // Plugin UI interaction events are routed directly back into the
+                // plugin host; the main app state does not reduce them.
+            }
         }
     }
 
@@ -3713,8 +3728,19 @@ exit 1
     }
 
     fn handle_channel_shortcuts(&mut self, ctx: &Context) {
-        let (next, prev, direct_idx, move_left, move_right, first, last, split_prev, split_next,
-            split_move_left, split_move_right) = ctx.input_mut(|i| {
+        let (
+            next,
+            prev,
+            direct_idx,
+            move_left,
+            move_right,
+            first,
+            last,
+            split_prev,
+            split_next,
+            split_move_left,
+            split_move_right,
+        ) = ctx.input_mut(|i| {
             let ctrl_shift = egui::Modifiers {
                 ctrl: true,
                 shift: true,
@@ -4208,6 +4234,15 @@ impl eframe::App for CrustApp {
             }
         }
 
+        let plugin_ui_snapshot = plugin_host()
+            .map(|host| {
+                host.set_current_channel(self.active_search_target());
+                host.plugin_ui_snapshot()
+            })
+            .unwrap_or_default();
+        self.plugin_ui_session
+            .prune_missing_surfaces(&plugin_ui_snapshot);
+
         if self.settings_open {
             let mut settings_open = self.settings_open;
             let mut settings_section = self.settings_section;
@@ -4245,6 +4280,7 @@ impl eframe::App for CrustApp {
                 filter_records: self.settings_filter_records.clone(),
                 filter_record_bufs: self.settings_filter_record_bufs.clone(),
                 mod_action_presets: self.settings_mod_action_presets.clone(),
+                plugin_ui: plugin_ui_snapshot.clone(),
                 plugin_statuses: plugin_host()
                     .map(|host| host.plugin_statuses())
                     .unwrap_or_default(),
@@ -4262,6 +4298,7 @@ impl eframe::App for CrustApp {
                 &mut settings_open,
                 &mut settings_section,
                 &mut state,
+                &mut self.plugin_ui_session,
                 stats,
             );
 
@@ -4674,7 +4711,12 @@ impl eframe::App for CrustApp {
             }
             if let Some(channel) = moderation_channel {
                 if let Some(action) = automod_bulk_action {
-                    for item in self.automod_queue.get(&channel).cloned().unwrap_or_default() {
+                    for item in self
+                        .automod_queue
+                        .get(&channel)
+                        .cloned()
+                        .unwrap_or_default()
+                    {
                         automod_actions.push((
                             item.message_id,
                             item.sender_user_id,
@@ -4683,7 +4725,12 @@ impl eframe::App for CrustApp {
                     }
                 }
                 if let Some(approve) = unban_bulk_action {
-                    for request in self.unban_requests.get(&channel).cloned().unwrap_or_default() {
+                    for request in self
+                        .unban_requests
+                        .get(&channel)
+                        .cloned()
+                        .unwrap_or_default()
+                    {
                         let key = Self::unban_draft_key(&channel, &request.request_id);
                         let draft = self.unban_resolution_drafts.entry(key).or_default();
                         let resolution = draft.trim();
@@ -4716,6 +4763,8 @@ impl eframe::App for CrustApp {
                 }
             }
         }
+
+        show_plugin_windows(ctx, &plugin_ui_snapshot, &mut self.plugin_ui_session);
 
         self.show_whispers_window(ctx);
 
@@ -5168,7 +5217,13 @@ impl eframe::App for CrustApp {
                 );
             });
 
-        show_channel_info_bars(ctx, &self.state, &self.stream_statuses);
+        show_channel_info_bars(
+            ctx,
+            &self.state,
+            &self.stream_statuses,
+            &plugin_ui_snapshot,
+            &mut self.plugin_ui_session,
+        );
 
         // -- Channel list: left sidebar OR top tab strip ----------------------
         // Accumulate actions outside the panel closure so we can call &mut self
@@ -5471,6 +5526,18 @@ impl eframe::App for CrustApp {
                             .stroke(egui::Stroke::new(1.0, t::border_subtle())),
                     )
                     .show(ctx, |ui| {
+                        if has_host_panels_for_slot(
+                            &plugin_ui_snapshot,
+                            PluginUiHostSlot::SidebarTop,
+                        ) {
+                            render_host_panels_for_slot(
+                                ui,
+                                &plugin_ui_snapshot,
+                                &mut self.plugin_ui_session,
+                                PluginUiHostSlot::SidebarTop,
+                            );
+                            ui.add_space(8.0);
+                        }
                         ui.label(
                             RichText::new("CHANNELS")
                                 .font(t::heading())
@@ -6458,7 +6525,10 @@ impl eframe::App for CrustApp {
                 0.0
             };
             egui::Area::new(egui::Id::new("event_toast").with(i))
-                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-14.0 - slide_x, toast_y))
+                .anchor(
+                    egui::Align2::RIGHT_TOP,
+                    egui::vec2(-14.0 - slide_x, toast_y),
+                )
                 .order(egui::Order::Foreground)
                 .interactable(false)
                 .show(ctx, |ui| {
@@ -7613,8 +7683,7 @@ fn parse_slash_command(
             if !is_mod {
                 return Some(AppCommand::InjectLocalMessage {
                     channel: channel.clone(),
-                    text: "Warn commands require moderator or broadcaster permissions."
-                        .to_owned(),
+                    text: "Warn commands require moderator or broadcaster permissions.".to_owned(),
                 });
             }
             let (target, reason) = rest

@@ -4,6 +4,6 @@ pub(crate) mod emote_loading;
 pub(crate) mod eventsub_notices;
 pub(crate) mod history;
 pub(crate) mod link_preview;
-pub(crate) mod profiles;
 pub(crate) mod plugins;
+pub(crate) mod profiles;
 pub(crate) mod system_messages;

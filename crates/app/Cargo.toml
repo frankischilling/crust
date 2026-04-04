@@ -34,6 +34,7 @@ crust-kick = { path = "../kick", version = "0.1.0" }
 crust-emotes = { path = "../emotes", version = "0.1.0" }
 crust-storage = { path = "../storage", version = "0.1.0" }
 libc = { workspace = true }
+base64 = "0.22"
 
 # Force wayland-data-control feature onto arboard (transitive via egui-winit)
 arboard = { workspace = true }

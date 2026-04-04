@@ -1175,13 +1175,13 @@ impl<'a> ChatInput<'a> {
                     } else {
                         t::text_muted()
                     };
-                        ui.vertical(|ui| {
-                            ui.label(
-                                RichText::new(entry.usage.clone())
-                                    .font(t::small())
-                                    .color(cmd_col)
-                                    .strong(),
-                            );
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new(entry.usage.clone())
+                                .font(t::small())
+                                .color(cmd_col)
+                                .strong(),
+                        );
                         ui.add_sized(
                             [ui.available_width(), 14.0],
                             egui::Label::new(

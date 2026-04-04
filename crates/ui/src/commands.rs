@@ -653,12 +653,16 @@ pub fn slash_command_matches_ranked(
     let mut matches: Vec<(SlashCommandSuggestion, u8)> = built_in_commands()
         .iter()
         .map(SlashCommandSuggestion::from)
-        .chain(plugin_command_infos().into_iter().map(|cmd| SlashCommandSuggestion {
-            name: cmd.name,
-            usage: cmd.usage,
-            summary: cmd.summary,
-            aliases: cmd.aliases,
-        }))
+        .chain(
+            plugin_command_infos()
+                .into_iter()
+                .map(|cmd| SlashCommandSuggestion {
+                    name: cmd.name,
+                    usage: cmd.usage,
+                    summary: cmd.summary,
+                    aliases: cmd.aliases,
+                }),
+        )
         .filter_map(|cmd| {
             if q.is_empty() {
                 return Some((cmd, 1));
@@ -784,6 +788,6 @@ mod tests {
         usage.insert("help".to_owned(), 2);
 
         let ranked = slash_command_matches_ranked("", usize::MAX, &usage);
-        assert_eq!(ranked.first().map(|c| c.name), Some("shoutout"));
+        assert_eq!(ranked.first().map(|c| c.name.as_str()), Some("shoutout"));
     }
 }

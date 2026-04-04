@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -6,6 +8,7 @@ use crate::model::{
     Badge, ChannelId, ChatMessage, EmoteCatalogEntry, ModActionPreset, ReplyInfo, SenderNamePaint,
     SystemNotice, TwitchEmotePos, UserProfile,
 };
+use crate::plugins::{PluginUiSurfaceKind, PluginUiValue};
 
 /// A single chat log entry from the IVR logs API.
 #[derive(Debug, Clone)]
@@ -191,10 +194,7 @@ pub enum AppCommand {
     /// Reload all plugins from disk.
     ReloadPlugins,
     /// Run a delayed Lua callback on the main app thread.
-    RunPluginCallback {
-        vm_key: usize,
-        callback_ref: i32,
-    },
+    RunPluginCallback { vm_key: usize, callback_ref: i32 },
     /// Fetch Open-Graph / Twitter-Card metadata for a URL to show a hover preview.
     FetchLinkPreview { url: String },
     /// Add a new account by validating and saving the given OAuth token.
@@ -355,10 +355,7 @@ pub enum AppCommand {
         message_id: String,
     },
     /// Hide all visible messages from a user locally in the current channel.
-    ClearUserMessagesLocally {
-        channel: ChannelId,
-        login: String,
-    },
+    ClearUserMessagesLocally { channel: ChannelId, login: String },
     /// Persist an updated ordered list of highlight rules.
     SetHighlightRules { rules: Vec<HighlightRule> },
     /// Persist an updated ordered list of filter records.
@@ -675,6 +672,39 @@ pub enum AppEvent {
     },
     /// Auth has expired; prompt user to re-authenticate.
     AuthExpired,
+    /// A plugin-owned UI widget emitted an action event.
+    PluginUiAction {
+        plugin_name: String,
+        surface_kind: PluginUiSurfaceKind,
+        surface_id: String,
+        widget_id: String,
+        action: Option<String>,
+        value: Option<PluginUiValue>,
+        form_values: BTreeMap<String, PluginUiValue>,
+    },
+    /// A plugin-owned UI input changed.
+    PluginUiChange {
+        plugin_name: String,
+        surface_kind: PluginUiSurfaceKind,
+        surface_id: String,
+        widget_id: String,
+        value: PluginUiValue,
+        form_values: BTreeMap<String, PluginUiValue>,
+    },
+    /// A plugin-owned UI form or button requested submission.
+    PluginUiSubmit {
+        plugin_name: String,
+        surface_kind: PluginUiSurfaceKind,
+        surface_id: String,
+        widget_id: Option<String>,
+        action: Option<String>,
+        form_values: BTreeMap<String, PluginUiValue>,
+    },
+    /// A plugin-owned floating window was closed by the user.
+    PluginUiWindowClosed {
+        plugin_name: String,
+        window_id: String,
+    },
 }
 
 // ConnectionState: connection status enumeration

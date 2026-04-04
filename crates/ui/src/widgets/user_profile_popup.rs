@@ -1031,7 +1031,10 @@ impl UserProfilePopup {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
             let can_warn = !self.mod_reason.trim().is_empty();
-            if ui.add_enabled(can_warn, egui::Button::new("Warn")).clicked() {
+            if ui
+                .add_enabled(can_warn, egui::Button::new("Warn"))
+                .clicked()
+            {
                 let reason = self.mod_reason.trim().to_owned();
                 actions.push(PopupAction::Warn {
                     channel: channel.clone(),

@@ -52,11 +52,11 @@ use runtime::history::{
     load_recent_messages,
 };
 use runtime::link_preview::fetch_link_preview;
+use runtime::plugins::init_plugins;
 use runtime::profiles::{
     fetch_ivr_logs, fetch_self_avatar, fetch_twitch_stream_status, fetch_twitch_user_profile,
     fetch_user_profile_for_channel,
 };
-use runtime::plugins::init_plugins;
 use runtime::system_messages::{
     build_sub_text, extract_irc_msg_echo, format_timeout_text, is_twitch_pinned_notice,
     make_custom_message, make_system_message,
@@ -263,6 +263,9 @@ fn main() -> Result<()> {
 
     rt.spawn(async move {
         while let Some(evt) = evt_bridge_rx.recv().await {
+            if let Some(host) = plugin_host() {
+                host.dispatch_event(&evt);
+            }
             if ui_evt_tx.send(evt).await.is_ok() {
                 request_ui_repaint();
             }
@@ -4761,8 +4764,7 @@ async fn helix_warn_user(
         let _ = evt_tx
             .send(AppEvent::Error {
                 context: "Moderation".into(),
-                message: "Cannot warn: missing Twitch credentials. Reconnect and try again."
-                    .into(),
+                message: "Cannot warn: missing Twitch credentials. Reconnect and try again.".into(),
             })
             .await;
         return;
@@ -4779,7 +4781,10 @@ async fn helix_warn_user(
         return;
     }
 
-    let target_login = target_login.trim().trim_start_matches('@').to_ascii_lowercase();
+    let target_login = target_login
+        .trim()
+        .trim_start_matches('@')
+        .to_ascii_lowercase();
     let reason = reason.trim();
     if target_login.is_empty() || reason.is_empty() {
         let _ = evt_tx
@@ -4885,7 +4890,10 @@ async fn helix_set_suspicious_user(
         return;
     }
 
-    let target_login = target_login.trim().trim_start_matches('@').to_ascii_lowercase();
+    let target_login = target_login
+        .trim()
+        .trim_start_matches('@')
+        .to_ascii_lowercase();
     if target_login.is_empty() {
         let _ = evt_tx
             .send(AppEvent::Error {
@@ -4941,7 +4949,11 @@ async fn helix_set_suspicious_user(
     if status.is_success() {
         info!(
             "Moderation: set suspicious user {target_login} ({}) in #{channel}",
-            if restricted { "restricted" } else { "monitored" }
+            if restricted {
+                "restricted"
+            } else {
+                "monitored"
+            }
         );
         return;
     }
@@ -4990,7 +5002,10 @@ async fn helix_clear_suspicious_user(
         return;
     }
 
-    let target_login = target_login.trim().trim_start_matches('@').to_ascii_lowercase();
+    let target_login = target_login
+        .trim()
+        .trim_start_matches('@')
+        .to_ascii_lowercase();
     if target_login.is_empty() {
         let _ = evt_tx
             .send(AppEvent::Error {

@@ -781,7 +781,7 @@ impl EmotePicker {
                             }
                         }
 
-                if let Some((cat_idx, rect)) = hovered_entry {
+                        if let Some((cat_idx, rect)) = hovered_entry {
                             let entry = &view.combined[cat_idx];
                             let entry_url = entry.url.clone();
                             let click_resp =

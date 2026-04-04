@@ -3,12 +3,16 @@ use std::collections::HashSet;
 use egui::{Context, Margin, RichText};
 
 use crust_core::highlight::HighlightRule;
+use crust_core::plugins::{PluginUiHostSlot, PluginUiSnapshot};
 use crust_core::PluginStatus;
 
 use crate::app::{ChannelLayout, TabVisualStyle};
 use crate::theme as t;
 
-use super::chrome;
+use super::{
+    chrome,
+    plugin_ui::{has_host_panels_for_slot, render_host_panels_for_slot, PluginUiSessionState},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsSection {
@@ -94,6 +98,7 @@ pub struct SettingsPageState {
     pub filter_record_bufs: Vec<String>,
     pub mod_action_presets: Vec<crust_core::model::mod_actions::ModActionPreset>,
     pub plugin_statuses: Vec<PluginStatus>,
+    pub plugin_ui: PluginUiSnapshot,
     pub plugin_reload_requested: bool,
     /// Desktop notification toggle.
     pub desktop_notifications_enabled: bool,
@@ -149,7 +154,11 @@ fn render_plugin_manifest_line(ui: &mut egui::Ui, label: &str, value: &str) {
                 .strong()
                 .color(t::text_muted()),
         );
-        ui.label(RichText::new(value).font(t::tiny()).color(t::text_secondary()));
+        ui.label(
+            RichText::new(value)
+                .font(t::tiny())
+                .color(t::text_secondary()),
+        );
     });
 }
 
@@ -167,16 +176,8 @@ fn render_plugin_status_card(ui: &mut egui::Ui, status: &PluginStatus, compact: 
                     .strong()
                     .color(t::text_primary()),
             );
-            let state_text = if status.loaded {
-                "Loaded"
-            } else {
-                "Failed"
-            };
-            let state_color = if status.loaded {
-                t::green()
-            } else {
-                t::red()
-            };
+            let state_text = if status.loaded { "Loaded" } else { "Failed" };
+            let state_color = if status.loaded { t::green() } else { t::red() };
             ui.label(
                 RichText::new(state_text)
                     .font(t::tiny())
@@ -201,19 +202,11 @@ fn render_plugin_status_card(ui: &mut egui::Ui, status: &PluginStatus, compact: 
                     .color(t::text_muted()),
             );
         }
-        render_plugin_manifest_line(
-            ui,
-            "Authors:",
-            &status.manifest.authors.join(", "),
-        );
+        render_plugin_manifest_line(ui, "Authors:", &status.manifest.authors.join(", "));
         render_plugin_manifest_line(ui, "Homepage:", &status.manifest.homepage);
         render_plugin_manifest_line(ui, "Tags:", &status.manifest.tags.join(", "));
         render_plugin_manifest_line(ui, "Entry:", &status.manifest.entry);
-        render_plugin_manifest_line(
-            ui,
-            "Permissions:",
-            &status.manifest.permissions.join(", "),
-        );
+        render_plugin_manifest_line(ui, "Permissions:", &status.manifest.permissions.join(", "));
         if !status.manifest.description.trim().is_empty() {
             ui.label(
                 RichText::new(&status.manifest.description)
@@ -350,6 +343,7 @@ fn render_settings_content(
     ui: &mut egui::Ui,
     settings_section: SettingsSection,
     state: &mut SettingsPageState,
+    plugin_ui_session: &mut PluginUiSessionState,
     compact: bool,
     ultra_compact: bool,
 ) {
@@ -454,6 +448,18 @@ fn render_settings_content(
                         &mut state.split_header_show_game,
                         "Show split-header game",
                     );
+                    if has_host_panels_for_slot(
+                        &state.plugin_ui,
+                        PluginUiHostSlot::SettingsAppearance,
+                    ) {
+                        ui.add_space(10.0);
+                        render_host_panels_for_slot(
+                            ui,
+                            &state.plugin_ui,
+                            plugin_ui_session,
+                            PluginUiHostSlot::SettingsAppearance,
+                        );
+                    }
                 }
                 SettingsSection::Chat => {
                     ui.checkbox(&mut state.show_timestamps, "Show message timestamps");
@@ -539,7 +545,7 @@ fn render_settings_content(
                             "Animate only while window is focused"
                         },
                     );
-                    
+
                     ui.add_space(8.0);
                     ui.label(
                         RichText::new("Moderation Action Presets")
@@ -601,6 +607,15 @@ fn render_settings_content(
                             command_template: "".into(),
                             icon_url: None,
                         });
+                    }
+                    if has_host_panels_for_slot(&state.plugin_ui, PluginUiHostSlot::SettingsChat) {
+                        ui.add_space(10.0);
+                        render_host_panels_for_slot(
+                            ui,
+                            &state.plugin_ui,
+                            plugin_ui_session,
+                            PluginUiHostSlot::SettingsChat,
+                        );
                     }
                 }
                 SettingsSection::Highlights => {
@@ -1203,6 +1218,25 @@ fn render_settings_content(
                                 }
                             });
                     }
+                    if !state.plugin_ui.settings_pages.is_empty() {
+                        super::plugin_ui::render_plugin_settings_hub(
+                            ui,
+                            &state.plugin_ui,
+                            plugin_ui_session,
+                        );
+                    }
+                    if has_host_panels_for_slot(
+                        &state.plugin_ui,
+                        PluginUiHostSlot::SettingsIntegrations,
+                    ) {
+                        ui.add_space(10.0);
+                        render_host_panels_for_slot(
+                            ui,
+                            &state.plugin_ui,
+                            plugin_ui_session,
+                            PluginUiHostSlot::SettingsIntegrations,
+                        );
+                    }
                     ui.add_space(8.0);
                     if state.irc_beta_enabled {
                         ui.label(
@@ -1267,6 +1301,7 @@ pub fn show_settings_page(
     settings_open: &mut bool,
     settings_section: &mut SettingsSection,
     state: &mut SettingsPageState,
+    plugin_ui_session: &mut PluginUiSessionState,
     stats: SettingsStats,
 ) {
     let settings_default_pos = egui::pos2(
@@ -1305,6 +1340,7 @@ pub fn show_settings_page(
                             ui,
                             *settings_section,
                             state,
+                            plugin_ui_session,
                             true,
                             ultra_compact_layout,
                         );
@@ -1319,7 +1355,14 @@ pub fn show_settings_page(
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(content, |ui| {
-                            render_settings_content(ui, *settings_section, state, false, false);
+                            render_settings_content(
+                                ui,
+                                *settings_section,
+                                state,
+                                plugin_ui_session,
+                                false,
+                                false,
+                            );
                         });
                 });
             }
