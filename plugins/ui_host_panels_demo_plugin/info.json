@@ -1,0 +1,9 @@
+{
+  "name": "UI Host Panels Demo",
+  "description": "Demonstrates plugin-owned host panels in settings, the sidebar, and the active channel header.",
+  "authors": ["Crust"],
+  "version": "1.0.0",
+  "license": "MIT",
+  "permissions": [],
+  "entry": "init.lua"
+}

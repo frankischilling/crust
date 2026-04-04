@@ -1,8 +1,8 @@
 {
   "name": "Clock and Usage Plugin",
-  "description": "Shows date, time, timezone, session uptime, and overall runtime.",
+  "description": "Shows local time, session time, overall Crust time, and per-channel time in a retained UI window.",
   "authors": ["Crust"],
-  "version": "1.0.0",
+  "version": "2.0.0",
   "license": "MIT",
   "permissions": [],
   "entry": "init.lua"
