@@ -35,7 +35,12 @@ pub fn show_channel_info_bars(
                 .frame(
                     Frame::new()
                         .fill(t::bg_surface())
-                        .inner_margin(egui::Margin::symmetric(8, 4))
+                        .inner_margin(egui::Margin {
+                            left: 8,
+                            right: 8,
+                            top: 0,
+                            bottom: 2,
+                        })
                         .stroke(egui::Stroke::NONE),
                 )
                 .show(ctx, |ui| {
@@ -104,7 +109,12 @@ pub fn show_channel_info_bars(
                 .frame(
                     Frame::new()
                         .fill(bar_fill)
-                        .inner_margin(egui::Margin::symmetric(8, 4))
+                        .inner_margin(egui::Margin {
+                            left: 8,
+                            right: 8,
+                            top: 0,
+                            bottom: 2,
+                        })
                         .stroke(egui::Stroke::NONE),
                 )
                 .show(ctx, |ui| {

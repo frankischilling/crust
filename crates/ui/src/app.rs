@@ -82,9 +82,9 @@ const NARROW_WINDOW_THRESHOLD: f32 = 520.0;
 const VERY_NARROW_WINDOW_THRESHOLD: f32 = 320.0;
 const REGULAR_MIN_CENTRAL_WIDTH: f32 = 250.0;
 const NARROW_MIN_CENTRAL_WIDTH: f32 = 120.0;
-const REGULAR_STATUS_BAR_HEIGHT: f32 = 44.0;
-const NARROW_STATUS_BAR_HEIGHT: f32 = 36.0;
-const VERY_NARROW_STATUS_BAR_HEIGHT: f32 = 30.0;
+const REGULAR_STATUS_BAR_HEIGHT: f32 = 40.0;
+const NARROW_STATUS_BAR_HEIGHT: f32 = 40.0;
+const VERY_NARROW_STATUS_BAR_HEIGHT: f32 = 40.0;
 const ANALYTICS_DEFAULT_W: f32 = 220.0;
 const ANALYTICS_MIN_W: f32 = 180.0;
 const ANALYTICS_MAX_W: f32 = 340.0;
@@ -4790,7 +4790,12 @@ impl eframe::App for CrustApp {
             .frame(
                 Frame::new()
                     .fill(t::bg_surface())
-                    .inner_margin(Margin::symmetric(10, 4))
+                    .inner_margin(Margin {
+                        left: 10,
+                        right: 10,
+                        top: 4,
+                        bottom: 1,
+                    })
                     .stroke(egui::Stroke::new(1.0, t::border_subtle())),
             )
             .show(ctx, |ui| {
@@ -8263,14 +8268,14 @@ mod tests {
         assert!(layout.force_top_tabs);
         assert_eq!(layout.min_central_width, 120.0);
         assert_eq!(layout.sidebar_min_width, t::SIDEBAR_COMPACT_MIN_W);
-        assert_eq!(layout.status_bar_height, 36.0);
+        assert_eq!(layout.status_bar_height, 40.0);
     }
 
     #[test]
     fn responsive_layout_compacts_further_on_very_narrow_windows() {
         let layout = responsive_layout(280.0);
         assert!(layout.force_top_tabs);
-        assert_eq!(layout.status_bar_height, 30.0);
+        assert_eq!(layout.status_bar_height, 40.0);
         assert!(layout.analytics_default_width < 220.0);
     }
 
