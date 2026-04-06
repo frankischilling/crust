@@ -2,7 +2,7 @@
 
 A native Twitch chat client written in Rust.
 
-`crust` is a hobby project built as a multi-crate Rust workspace with an `egui` desktop UI, a Twitch IRC/WebSocket session layer, emote provider integrations, and local settings/log storage.
+`crust` is a hobby project built as a multi-crate Rust workspace with an `egui` desktop UI, a Twitch IRC/WebSocket session layer, emote provider integrations, Lua plugin support, and local settings/log storage.
 
 ## Screenshots
 
@@ -18,7 +18,15 @@ A native Twitch chat client written in Rust.
 
 ## Current status
 
-Active early-stage project. The app builds and runs, and core chat workflows are in place. APIs and internals may still change.
+Active early-stage hobby project with daily-use chat workflows in place. The app builds and runs, plugin APIs are available, and a Windows auto-updater is now implemented. APIs and internals may still evolve.
+
+Kick support is currently super cooked and munted (very incomplete / unstable).
+
+## Documentation
+
+- [Crust docs home](docs/HOME.md)
+- [Plugin API reference](docs/API.md)
+- [Release notes v0.4.2](docs/Release_v0.4.2.md)
 
 ## Reference baseline
 
@@ -37,6 +45,7 @@ See:
 - Twitch IRC over WebSocket - anonymous and authenticated modes
 - Multi-channel tabs - join, leave, reorder channels
 - Multi-account support - add, switch, remove, and set a default account
+- Windows auto-updater from GitHub Releases (stable-only checks, SHA256 verification, prompt-based install)
 - Message rendering:
   - Twitch native emotes
   - Third-party emotes: BTTV, FFZ, 7TV (global + channel + personal sets)
@@ -50,7 +59,7 @@ See:
 - Basic moderation: timeout, ban, unban
 - User profile popup with avatar, badges, account metadata, and recent messages
 - Link preview metadata fetch (Open Graph / Twitter card)
-- Lua plugins with slash-command registration and completion hooks, see [Crust plugin wiki](docs/HOME.md), [plugin API reference](docs/API.md), and [example plugins](plugins/)
+- Lua plugins with slash-command registration/completion hooks, retained UI surfaces, and host callbacks. See [Crust docs home](docs/HOME.md), [plugin API reference](docs/API.md), and [example plugins](plugins/)
 - Message input history (arrow-key recall)
 - Local settings persistence and optional keyring-backed token storage
 - Per-channel append-only chat logs
@@ -70,6 +79,7 @@ See:
 - Rust stable toolchain (edition 2021)
 - Cargo
 - Linux desktop dependencies for `eframe`/`winit` (X11 or Wayland)
+- Windows 10/11 for built-in auto-install updates
 
 ## Build and run
 
@@ -83,7 +93,7 @@ cargo run -p crust
 Release build:
 
 ```bash
-cargo run -p crust --release
+cargo build -p crust --release
 ```
 
 ### Windows release binary
@@ -97,7 +107,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_release.ps1
 Artifacts are produced at:
 
 - `target\\release\\crust.exe`
-- `dist\\windows\\crust-v0.1.0-windows-x64.zip`
+- `dist\\windows\\crust-v<version>-windows-x64.zip`
 
 ### Running on WSL
 
