@@ -135,7 +135,7 @@ pub struct AppSettings {
     /// Whether split headers show viewer counts when available.
     #[serde(default = "bool_true")]
     pub split_header_show_viewer_count: bool,
-    // ── Highlight rules (chatterino-style per-rule config) ──────────────
+    // -- Highlight rules (chatterino-style per-rule config) --------------
     /// Structured highlight rules (replaces the flat `highlights` string list).
     /// When empty on load and `highlights` is non-empty, a migration populates it.
     #[serde(default)]
@@ -143,20 +143,30 @@ pub struct AppSettings {
     /// Structured filter records for hiding messages.
     #[serde(default)]
     pub filter_records: Vec<crust_core::model::filters::FilterRecord>,
-    // ── Moderation action presets ────────────────────────────────────────
+    // -- Moderation action presets ----------------------------------------
     /// Saved moderation action presets shown in the user-card Moderation tab.
     /// When empty, the UI falls back to [`ModActionPreset::defaults()`].
     #[serde(default)]
     pub mod_action_presets: Vec<ModActionPreset>,
-    // ── Desktop notifications ────────────────────────────────────────────
+    // -- Desktop notifications --------------------------------------------
     /// Fire an OS desktop notification when a highlight rule with
     /// `show_in_mentions = true` matches an incoming message.
     #[serde(default)]
     pub desktop_notifications_enabled: bool,
-    // ── Watched channels for stream status notifications ────────────────────
+    // -- Watched channels for stream status notifications --------------------
     /// Channels being watched for live/offline notifications.
     #[serde(default)]
     pub watched_channels: Vec<crust_core::notifications::WatchedChannel>,
+    // -- Updater settings/state (Windows releases) ---------------------------
+    /// Whether startup/background update checks are enabled.
+    #[serde(default = "bool_true")]
+    pub update_checks_enabled: bool,
+    /// Last successful or attempted update check timestamp in UTC RFC3339.
+    #[serde(default)]
+    pub updater_last_checked_at: Option<String>,
+    /// Semver string that the user skipped (if any).
+    #[serde(default)]
+    pub updater_skipped_version: String,
 }
 
 fn default_theme() -> String {
@@ -226,6 +236,9 @@ impl Default for AppSettings {
             mod_action_presets: Vec::new(),
             desktop_notifications_enabled: false,
             watched_channels: Vec::new(),
+            update_checks_enabled: true,
+            updater_last_checked_at: None,
+            updater_skipped_version: String::new(),
         }
     }
 }

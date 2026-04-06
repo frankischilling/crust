@@ -383,7 +383,7 @@ impl<'a> ChannelList<'a> {
                     }
                 }
 
-                // ── Floating drag ghost ──────────────────────────
+                // -- Floating drag ghost --------------------------
                 // Rendered on a foreground layer, follows the cursor.
                 if let Some(ref ds) = drag {
                     if let Some(pos) = ui.ctx().pointer_latest_pos() {

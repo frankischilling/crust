@@ -102,6 +102,28 @@ pub struct SettingsPageState {
     pub plugin_reload_requested: bool,
     /// Desktop notification toggle.
     pub desktop_notifications_enabled: bool,
+    /// Enable startup/background update checks.
+    pub update_checks_enabled: bool,
+    /// Last updater check timestamp from settings.
+    pub updater_last_checked_at: Option<String>,
+    /// Version currently marked as skipped.
+    pub updater_skipped_version: String,
+    /// Latest available version from runtime, when known.
+    pub updater_available_version: Option<String>,
+    /// Latest available asset name from runtime, when known.
+    pub updater_available_asset: Option<String>,
+    /// Latest available release URL from runtime, when known.
+    pub updater_available_release_url: Option<String>,
+    /// True while install pipeline is running.
+    pub updater_install_inflight: bool,
+    /// Request a manual update check.
+    pub request_update_check_now: bool,
+    /// Request install/update staging and immediate restart.
+    pub request_update_install_now: bool,
+    /// Request skipping the currently available version.
+    pub request_skip_available_update: bool,
+    /// Request opening the available release page.
+    pub request_open_available_release: bool,
 }
 
 pub fn parse_settings_lines(input: &str, lowercase: bool) -> Vec<String> {
@@ -619,7 +641,7 @@ fn render_settings_content(
                     }
                 }
                 SettingsSection::Highlights => {
-                    // ── Highlight rules table ─────────────────────────────
+                    // -- Highlight rules table -----------------------------
                     ui.label(
                         RichText::new("Highlight Rules")
                             .font(t::small())
@@ -888,7 +910,7 @@ fn render_settings_content(
                     ui.separator();
                     ui.add_space(4.0);
 
-                    // ── Ignored users ─────────────────────────────────────
+                    // -- Ignored users -------------------------------------
                     ui.label(
                         RichText::new("Ignored usernames (one per line or comma-separated)")
                             .font(t::small())
@@ -916,7 +938,7 @@ fn render_settings_content(
                     ui.add_space(4.0);
                 }
                 SettingsSection::Filters => {
-                    // ── Filter Records table ──────────────────────────────
+                    // -- Filter Records table ------------------------------
                     ui.label(
                         RichText::new("Filter Records (Hide/Dim Messages)")
                             .font(t::small())
@@ -1291,6 +1313,99 @@ fn render_settings_content(
                             .font(t::small())
                             .color(t::text_muted()),
                     );
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("Updates")
+                            .font(t::small())
+                            .strong()
+                            .color(t::text_primary()),
+                    );
+                    ui.label(
+                        RichText::new(format!(
+                            "Current version: v{}",
+                            env!("CARGO_PKG_VERSION")
+                        ))
+                        .font(t::tiny())
+                        .color(t::text_muted()),
+                    );
+
+                    if !cfg!(target_os = "windows") {
+                        ui.label(
+                            RichText::new("Auto-update is currently only supported on Windows.")
+                                .font(t::tiny())
+                                .color(t::text_muted()),
+                        );
+                    } else {
+                        ui.checkbox(
+                            &mut state.update_checks_enabled,
+                            "Enable automatic update checks (startup + every 24h)",
+                        );
+
+                        if let Some(last_checked) = state.updater_last_checked_at.as_ref() {
+                            ui.label(
+                                RichText::new(format!("Last checked: {}", last_checked))
+                                    .font(t::tiny())
+                                    .color(t::text_muted()),
+                            );
+                        }
+
+                        if !state.updater_skipped_version.trim().is_empty() {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Skipped version: {}",
+                                    state.updater_skipped_version
+                                ))
+                                .font(t::tiny())
+                                .color(t::text_muted()),
+                            );
+                        }
+
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("Check now").clicked() {
+                                state.request_update_check_now = true;
+                            }
+
+                            if let Some(version) = state.updater_available_version.as_ref() {
+                                let install_label = if state.updater_install_inflight {
+                                    "Installing..."
+                                } else {
+                                    "Install update and restart"
+                                };
+                                if ui
+                                    .add_enabled(
+                                        !state.updater_install_inflight,
+                                        egui::Button::new(install_label),
+                                    )
+                                    .clicked()
+                                {
+                                    state.request_update_install_now = true;
+                                }
+
+                                if ui.button("Skip this version").clicked() {
+                                    state.request_skip_available_update = true;
+                                }
+
+                                if state.updater_available_release_url.is_some()
+                                    && ui.button("Open release page").clicked()
+                                {
+                                    state.request_open_available_release = true;
+                                }
+
+                                let mut details = format!("Update available: v{}", version);
+                                if let Some(asset) = state.updater_available_asset.as_ref() {
+                                    details.push_str(&format!(" ({})", asset));
+                                }
+                                ui.label(
+                                    RichText::new(details)
+                                        .font(t::tiny())
+                                        .color(t::text_secondary()),
+                                );
+                            }
+                        });
+                    }
                 }
             }
         });

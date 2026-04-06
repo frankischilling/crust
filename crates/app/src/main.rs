@@ -64,6 +64,7 @@ use runtime::system_messages::{
 
 mod runtime;
 mod seventv;
+mod updater;
 
 const CMD_CHANNEL_SIZE: usize = 512;
 const EVT_CHANNEL_SIZE: usize = 4096;
@@ -78,6 +79,9 @@ const TWITCH_WEB_CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
 const WHISPER_HISTORY_CHANNEL_PREFIX: &str = "whisper:";
 const APP_INITIAL_INNER_SIZE: [f32; 2] = [1100.0, 700.0];
 const APP_MIN_INNER_SIZE: [f32; 2] = [220.0, 200.0];
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const UPDATE_RESTART_EXIT_DELAY: Duration = Duration::from_millis(250);
 
 static UI_REPAINT_CTX: OnceLock<egui::Context> = OnceLock::new();
 
@@ -406,6 +410,49 @@ enum TokenValidationResult {
     },
 }
 
+#[derive(Debug, Clone, Copy)]
+enum UpdateCheckTrigger {
+    Startup,
+    Interval,
+    Manual,
+}
+
+struct UpdateCheckResult {
+    trigger: UpdateCheckTrigger,
+    result: Result<updater::UpdateCheckOutcome, String>,
+}
+
+struct UpdateInstallResult {
+    version: String,
+    restart_now: bool,
+    result: Result<(), String>,
+}
+
+fn spawn_update_check(trigger: UpdateCheckTrigger, tx: mpsc::Sender<UpdateCheckResult>) {
+    tokio::spawn(async move {
+        let result = updater::check_for_update(APP_VERSION).await;
+        let _ = tx.send(UpdateCheckResult { trigger, result }).await;
+    });
+}
+
+fn spawn_update_install(
+    update: updater::AvailableUpdate,
+    restart_now: bool,
+    tx: mpsc::Sender<UpdateInstallResult>,
+) {
+    tokio::spawn(async move {
+        let version = update.version.clone();
+        let result = updater::install_update(&update, std::process::id()).await;
+        let _ = tx
+            .send(UpdateInstallResult {
+                version,
+                restart_now,
+                result,
+            })
+            .await;
+    });
+}
+
 /// Central reducer: receives raw Twitch/Kick events + UI commands, tokenizes
 /// messages using the emote index, and forwards AppEvents to the UI.
 async fn reducer_loop(
@@ -557,6 +604,18 @@ async fn reducer_loop(
     // validate_token() never blocks the reducer loop.
     let (token_val_tx, mut token_val_rx) = mpsc::channel::<TokenValidationResult>(8);
 
+    // Internal channel for background GitHub release checks.
+    let (update_check_tx, mut update_check_rx) = mpsc::channel::<UpdateCheckResult>(4);
+    // Internal channel for update install pipeline.
+    let (update_install_tx, mut update_install_rx) = mpsc::channel::<UpdateInstallResult>(2);
+    let mut latest_available_update: Option<updater::AvailableUpdate> = None;
+    let mut update_check_inflight = false;
+    let mut update_install_inflight = false;
+    let mut update_check_interval = tokio::time::interval(UPDATE_CHECK_INTERVAL);
+    update_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Consume the immediate first tick so periodic checks happen 24h after startup.
+    update_check_interval.tick().await;
+
     /// Persist the current `joined_channels` set back to disk.
     fn save_channels(
         store: &Option<SettingsStore>,
@@ -693,6 +752,13 @@ async fn reducer_loop(
             split_header_show_viewer_count: settings.split_header_show_viewer_count,
         })
         .await;
+    let _ = evt_tx
+        .send(AppEvent::UpdaterSettingsUpdated {
+            update_checks_enabled: settings.update_checks_enabled,
+            last_checked_at: settings.updater_last_checked_at.clone(),
+            skipped_version: settings.updater_skipped_version.clone(),
+        })
+        .await;
 
     // Configure preferred IRC nickname (if set).
     if irc_runtime_enabled && irc_beta_enabled && !settings.irc_nick.trim().is_empty() {
@@ -745,8 +811,20 @@ async fn reducer_loop(
         }
     }
 
+    if settings.update_checks_enabled && updater::platform_supported() {
+        update_check_inflight = true;
+        spawn_update_check(UpdateCheckTrigger::Startup, update_check_tx.clone());
+    }
+
     loop {
         tokio::select! {
+            _ = update_check_interval.tick(), if settings.update_checks_enabled && updater::platform_supported() => {
+                if !update_check_inflight {
+                    update_check_inflight = true;
+                    spawn_update_check(UpdateCheckTrigger::Interval, update_check_tx.clone());
+                }
+            }
+
             // Twitch IRC event
             Some(tw_evt) = tw_rx.recv() => {
                 match tw_evt {
@@ -3092,6 +3170,103 @@ async fn reducer_loop(
                                 .await;
                         }
                     }
+                    AppCommand::CheckForUpdates { manual } => {
+                        if !updater::platform_supported() {
+                            if manual {
+                                let _ = evt_tx
+                                    .send(AppEvent::UpdateCheckFailed {
+                                        message: "Auto-update checks are only supported on Windows.".to_owned(),
+                                        manual,
+                                    })
+                                    .await;
+                            }
+                            continue;
+                        }
+                        if update_check_inflight {
+                            continue;
+                        }
+                        update_check_inflight = true;
+                        let trigger = if manual {
+                            UpdateCheckTrigger::Manual
+                        } else {
+                            UpdateCheckTrigger::Interval
+                        };
+                        spawn_update_check(trigger, update_check_tx.clone());
+                    }
+                    AppCommand::SetUpdateChecksEnabled { enabled } => {
+                        settings.update_checks_enabled = enabled;
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save updater settings: {e}");
+                            }
+                        }
+                        let _ = evt_tx
+                            .send(AppEvent::UpdaterSettingsUpdated {
+                                update_checks_enabled: settings.update_checks_enabled,
+                                last_checked_at: settings.updater_last_checked_at.clone(),
+                                skipped_version: settings.updater_skipped_version.clone(),
+                            })
+                            .await;
+                    }
+                    AppCommand::SkipUpdateVersion { version } => {
+                        settings.updater_skipped_version = version;
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save skipped updater version: {e}");
+                            }
+                        }
+                        if latest_available_update
+                            .as_ref()
+                            .map(|u| {
+                                u.version
+                                    .eq_ignore_ascii_case(settings.updater_skipped_version.as_str())
+                            })
+                            .unwrap_or(false)
+                        {
+                            latest_available_update = None;
+                        }
+                        let _ = evt_tx
+                            .send(AppEvent::UpdaterSettingsUpdated {
+                                update_checks_enabled: settings.update_checks_enabled,
+                                last_checked_at: settings.updater_last_checked_at.clone(),
+                                skipped_version: settings.updater_skipped_version.clone(),
+                            })
+                            .await;
+                    }
+                    AppCommand::InstallAvailableUpdate { restart_now } => {
+                        if !updater::platform_supported() {
+                            let _ = evt_tx
+                                .send(AppEvent::UpdateInstallFailed {
+                                    version: String::new(),
+                                    message:
+                                        "Auto-update install is only supported on Windows."
+                                            .to_owned(),
+                                })
+                                .await;
+                            continue;
+                        }
+                        if update_install_inflight {
+                            continue;
+                        }
+                        let Some(update) = latest_available_update.clone() else {
+                            let _ = evt_tx
+                                .send(AppEvent::UpdateInstallFailed {
+                                    version: String::new(),
+                                    message: "No pending update is available to install."
+                                        .to_owned(),
+                                })
+                                .await;
+                            continue;
+                        };
+
+                        update_install_inflight = true;
+                        let _ = evt_tx
+                            .send(AppEvent::UpdateInstallStarted {
+                                version: update.version.clone(),
+                            })
+                            .await;
+                        spawn_update_install(update, restart_now, update_install_tx.clone());
+                    }
                     AppCommand::SendMessage {
                         channel,
                         text,
@@ -4135,6 +4310,107 @@ async fn reducer_loop(
                             load_local_older_messages(channel, before_ts_ms, limit, store, etx)
                                 .await;
                         });
+                    }
+                }
+            }
+
+            Some(update_result) = update_check_rx.recv() => {
+                update_check_inflight = false;
+                settings.updater_last_checked_at = Some(Utc::now().to_rfc3339());
+                if let Some(store) = &settings_store {
+                    if let Err(e) = store.save(&settings) {
+                        warn!("Failed to save updater check timestamp: {e}");
+                    }
+                }
+                let _ = evt_tx
+                    .send(AppEvent::UpdaterSettingsUpdated {
+                        update_checks_enabled: settings.update_checks_enabled,
+                        last_checked_at: settings.updater_last_checked_at.clone(),
+                        skipped_version: settings.updater_skipped_version.clone(),
+                    })
+                    .await;
+
+                match update_result.result {
+                    Ok(updater::UpdateCheckOutcome::UpToDate { current_version }) => {
+                        latest_available_update = None;
+                        if matches!(update_result.trigger, UpdateCheckTrigger::Manual) {
+                            let _ = evt_tx
+                                .send(AppEvent::UpdateCheckUpToDate {
+                                    version: current_version,
+                                })
+                                .await;
+                        }
+                    }
+                    Ok(updater::UpdateCheckOutcome::UpdateAvailable(update)) => {
+                        if !settings.updater_skipped_version.is_empty()
+                            && settings
+                                .updater_skipped_version
+                                .eq_ignore_ascii_case(update.version.as_str())
+                            && !matches!(update_result.trigger, UpdateCheckTrigger::Manual)
+                        {
+                            continue;
+                        }
+
+                        latest_available_update = Some(update.clone());
+
+                        info!(
+                            "Update available: v{} [{}] ({})",
+                            update.version, update.tag_name, update.asset_name
+                        );
+                        debug!(
+                            "Update asset url={} sha256={} published_at={:?}",
+                            update.asset_download_url,
+                            update.asset_sha256,
+                            update.published_at
+                        );
+                        let _ = evt_tx
+                            .send(AppEvent::UpdateAvailable {
+                                version: update.version,
+                                release_url: update.release_url,
+                                asset_name: update.asset_name,
+                            })
+                            .await;
+                    }
+                    Err(message) => {
+                        if matches!(update_result.trigger, UpdateCheckTrigger::Manual) {
+                            let _ = evt_tx
+                                .send(AppEvent::UpdateCheckFailed {
+                                    message,
+                                    manual: true,
+                                })
+                                .await;
+                        } else {
+                            warn!("Background update check failed: {message}");
+                        }
+                    }
+                }
+            }
+
+            Some(update_install_result) = update_install_rx.recv() => {
+                update_install_inflight = false;
+                match update_install_result.result {
+                    Ok(()) => {
+                        let _ = evt_tx
+                            .send(AppEvent::UpdateInstallScheduled {
+                                version: update_install_result.version.clone(),
+                                restart_now: update_install_result.restart_now,
+                            })
+                            .await;
+                        latest_available_update = None;
+                        if update_install_result.restart_now {
+                            tokio::spawn(async move {
+                                tokio::time::sleep(UPDATE_RESTART_EXIT_DELAY).await;
+                                std::process::exit(0);
+                            });
+                        }
+                    }
+                    Err(message) => {
+                        let _ = evt_tx
+                            .send(AppEvent::UpdateInstallFailed {
+                                version: update_install_result.version,
+                                message,
+                            })
+                            .await;
                     }
                 }
             }

@@ -102,7 +102,7 @@ impl HighlightRule {
     }
 }
 
-// ── Compiled match helper ─────────────────────────────────────────────────────
+// -- Compiled match helper -----------------------------------------------------
 
 /// Pre-compiled form of a [`HighlightRule`] used for efficient per-message
 /// evaluation.  Build once via [`compile_rules`] and reuse across frames.
@@ -369,7 +369,7 @@ pub fn is_highlighted_rules(rules: &[HighlightRule], text: &str) -> bool {
     is_highlighted(&compiled, text)
 }
 
-// ── ASCII case-insensitive search ─────────────────────────────────────────────
+// -- ASCII case-insensitive search ---------------------------------------------
 
 fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
     let h = haystack.as_bytes();
@@ -399,7 +399,7 @@ fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
     false
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
+// -- Tests ---------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -409,7 +409,7 @@ mod tests {
         HighlightRule::new(pattern)
     }
 
-    // ── substring matching ──────────────────────────────────────────────────
+    // -- substring matching --------------------------------------------------
 
     #[test]
     fn case_insensitive_match() {
@@ -425,7 +425,7 @@ mod tests {
         assert!(!is_highlighted(&compiled, "hello world"));
     }
 
-    // ── regex matching ──────────────────────────────────────────────────────
+    // -- regex matching ------------------------------------------------------
 
     #[test]
     fn regex_rule_matches() {
@@ -450,7 +450,7 @@ mod tests {
         assert_eq!(compiled.len(), 0);
     }
 
-    // ── disabled rules ──────────────────────────────────────────────────────
+    // -- disabled rules ------------------------------------------------------
 
     #[test]
     fn disabled_rule_skipped() {
@@ -461,7 +461,7 @@ mod tests {
         assert_eq!(compiled.len(), 0);
     }
 
-    // ── color propagation ───────────────────────────────────────────────────
+    // -- color propagation ---------------------------------------------------
 
     #[test]
     fn color_returned_on_match() {
@@ -481,7 +481,7 @@ mod tests {
         assert_eq!(result, Some((None, true, false, false)));
     }
 
-    // ── case sensitivity ────────────────────────────────────────────────────
+    // -- case sensitivity ----------------------------------------------------
 
     #[test]
     fn case_sensitive_no_match() {

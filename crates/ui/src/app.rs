@@ -183,7 +183,7 @@ struct WhisperLine {
     is_self: bool,
 }
 
-// ── Split-pane state ─────────────────────────────────────────────────────
+// -- Split-pane state -----------------------------------------------------
 
 /// One pane in the split view.
 #[derive(Clone)]
@@ -818,6 +818,20 @@ pub struct CrustApp {
     settings_mod_action_presets: Vec<crust_core::model::mod_actions::ModActionPreset>,
 
     desktop_notifications_enabled: bool,
+    /// Enable startup/background update checks.
+    update_checks_enabled: bool,
+    /// Last successful/attempted updater check timestamp.
+    updater_last_checked_at: Option<String>,
+    /// Version currently skipped by user choice.
+    updater_skipped_version: String,
+    /// Latest available version from updater checks.
+    updater_available_version: Option<String>,
+    /// Latest available release asset label.
+    updater_available_asset: Option<String>,
+    /// Latest available release URL.
+    updater_available_release_url: Option<String>,
+    /// True while runtime is downloading/staging update install artifacts.
+    updater_install_inflight: bool,
     /// Ignored usernames from settings.
     ignores: Vec<String>,
     /// Fast lookup set for ignored usernames.
@@ -1003,6 +1017,13 @@ impl CrustApp {
             mod_action_presets: Vec::new(),
             settings_mod_action_presets: Vec::new(),
             desktop_notifications_enabled: false,
+            update_checks_enabled: true,
+            updater_last_checked_at: None,
+            updater_skipped_version: String::new(),
+            updater_available_version: None,
+            updater_available_asset: None,
+            updater_available_release_url: None,
+            updater_install_inflight: false,
             ignores: Vec::new(),
             ignores_set: HashSet::new(),
             auto_join_channels: Vec::new(),
@@ -2764,6 +2785,92 @@ exit 1
                     });
                 }
             }
+            AppEvent::UpdaterSettingsUpdated {
+                update_checks_enabled,
+                last_checked_at,
+                skipped_version,
+            } => {
+                self.update_checks_enabled = update_checks_enabled;
+                self.updater_last_checked_at = last_checked_at;
+                self.updater_skipped_version = skipped_version;
+            }
+            AppEvent::UpdateAvailable {
+                version,
+                release_url,
+                asset_name,
+            } => {
+                self.updater_available_version = Some(version.clone());
+                self.updater_available_asset = Some(asset_name.clone());
+                self.updater_available_release_url = Some(release_url.clone());
+                self.updater_install_inflight = false;
+                self.push_event_toast(
+                    format!("Update available: v{} ({})", version, asset_name),
+                    Color32::from_rgb(92, 180, 255),
+                    false,
+                );
+
+                if let Some(ch_id) = self.state.active_channel.clone() {
+                    self.send_cmd(AppCommand::InjectLocalMessage {
+                        channel: ch_id,
+                        text: format!(
+                            "A new Crust release is available (v{}). Open: {}",
+                            version, release_url
+                        ),
+                    });
+                }
+            }
+            AppEvent::UpdateCheckUpToDate { version } => {
+                self.updater_available_version = None;
+                self.updater_available_asset = None;
+                self.updater_available_release_url = None;
+                self.push_event_toast(
+                    format!("Crust is up to date (v{})", version),
+                    Color32::from_rgb(116, 193, 129),
+                    false,
+                );
+            }
+            AppEvent::UpdateCheckFailed { message, manual } => {
+                tracing::warn!("Update check failed: {message}");
+                if manual {
+                    self.push_event_toast(
+                        format!("Update check failed: {}", message),
+                        Color32::from_rgb(219, 116, 116),
+                        false,
+                    );
+                }
+            }
+            AppEvent::UpdateInstallStarted { version } => {
+                self.updater_install_inflight = true;
+                self.push_event_toast(
+                    format!("Preparing update v{}...", version),
+                    Color32::from_rgb(92, 180, 255),
+                    false,
+                );
+            }
+            AppEvent::UpdateInstallScheduled {
+                version,
+                restart_now,
+            } => {
+                self.updater_install_inflight = false;
+                self.updater_available_version = None;
+                self.updater_available_asset = None;
+                self.updater_available_release_url = None;
+                let msg = if restart_now {
+                    format!("Update v{} staged. Restarting to apply...", version)
+                } else {
+                    format!("Update v{} staged. Restart Crust to apply.", version)
+                };
+                self.push_event_toast(msg, Color32::from_rgb(116, 193, 129), false);
+            }
+            AppEvent::UpdateInstallFailed { version, message } => {
+                self.updater_install_inflight = false;
+                let text = if version.trim().is_empty() {
+                    format!("Update install failed: {}", message)
+                } else {
+                    format!("Update v{} failed: {}", version, message)
+                };
+                self.push_event_toast(text, Color32::from_rgb(219, 116, 116), false);
+            }
             AppEvent::HistoryLoaded { channel, messages } => {
                 if let Some(ch) = self.state.channels.get_mut(&channel) {
                     // Scroll to the seam between history and live chat so the
@@ -3155,7 +3262,7 @@ exit 1
                 self.settings_mod_action_presets = presets;
             }
             AppEvent::AuthExpired => {
-                warn!("Auth expired — checking refresh path");
+                warn!("Auth expired - checking refresh path");
                 let now = std::time::Instant::now();
                 let can_retry = self
                     .last_auth_refresh_attempt
@@ -4275,6 +4382,17 @@ impl eframe::App for CrustApp {
                 split_header_show_game: self.split_header_show_game,
                 split_header_show_viewer_count: self.split_header_show_viewer_count,
                 desktop_notifications_enabled: self.desktop_notifications_enabled,
+                update_checks_enabled: self.update_checks_enabled,
+                updater_last_checked_at: self.updater_last_checked_at.clone(),
+                updater_skipped_version: self.updater_skipped_version.clone(),
+                updater_available_version: self.updater_available_version.clone(),
+                updater_available_asset: self.updater_available_asset.clone(),
+                updater_available_release_url: self.updater_available_release_url.clone(),
+                updater_install_inflight: self.updater_install_inflight,
+                request_update_check_now: false,
+                request_update_install_now: false,
+                request_skip_available_update: false,
+                request_open_available_release: false,
                 highlight_rules: self.settings_highlight_rules.clone(),
                 highlight_rule_bufs: self.settings_highlight_rule_bufs.clone(),
                 filter_records: self.settings_filter_records.clone(),
@@ -4409,6 +4527,34 @@ impl eframe::App for CrustApp {
                 self.send_cmd(AppCommand::SetNotificationSettings {
                     desktop_notifications_enabled: self.desktop_notifications_enabled,
                 });
+            }
+            if state.update_checks_enabled != self.update_checks_enabled {
+                self.update_checks_enabled = state.update_checks_enabled;
+                self.send_cmd(AppCommand::SetUpdateChecksEnabled {
+                    enabled: self.update_checks_enabled,
+                });
+            }
+            if state.request_update_check_now {
+                self.send_cmd(AppCommand::CheckForUpdates { manual: true });
+            }
+            if state.request_update_install_now {
+                self.send_cmd(AppCommand::InstallAvailableUpdate { restart_now: true });
+            }
+            if state.request_skip_available_update {
+                if let Some(version) = self.updater_available_version.clone() {
+                    self.send_cmd(AppCommand::SkipUpdateVersion {
+                        version: version.clone(),
+                    });
+                    self.updater_skipped_version = version;
+                    self.updater_available_version = None;
+                    self.updater_available_asset = None;
+                    self.updater_available_release_url = None;
+                }
+            }
+            if state.request_open_available_release {
+                if let Some(url) = self.updater_available_release_url.clone() {
+                    self.send_cmd(AppCommand::OpenUrl { url });
+                }
             }
             if state.show_timestamps != self.show_timestamps
                 || state.show_timestamp_seconds != self.show_timestamp_seconds
@@ -5240,7 +5386,7 @@ impl eframe::App for CrustApp {
         let mut show_split_drop_zone = false;
 
         match effective_channel_layout {
-            // ── Top-tab strip ────────────────────────────────────────────────
+            // -- Top-tab strip ------------------------------------------------
             ChannelLayout::TopTabs => {
                 let tab_metrics = top_tab_metrics(window_width, self.tab_style);
                 TopBottomPanel::top("channel_tabs")
@@ -5512,7 +5658,7 @@ impl eframe::App for CrustApp {
                     });
             }
 
-            // ── Left sidebar (default) ────────────────────────────────────────
+            // -- Left sidebar (default) ----------------------------------------
             ChannelLayout::Sidebar if self.sidebar_visible => {
                 // Dynamically cap sidebar width so the central panel always gets
                 // at least some usable space - allows super-narrow layouts.
@@ -5659,7 +5805,7 @@ impl eframe::App for CrustApp {
         CentralPanel::default()
             .frame(Frame::new().fill(t::bg_base()).inner_margin(Margin::ZERO))
             .show(ctx, |ui| {
-                // ── Split-pane mode ──────────────────────────────────────
+                // -- Split-pane mode --------------------------------------
                 if self.split_panes.panes.len() > 1 {
                     let n = self.split_panes.panes.len();
                     let total = ui.available_rect_before_wrap();
@@ -5671,7 +5817,7 @@ impl eframe::App for CrustApp {
                     let mut close_pane: Option<usize> = None;
                     let mut close_other_panes: Option<usize> = None;
 
-                    // ── Draggable separators ─────────────────────
+                    // -- Draggable separators ---------------------
                     // Compute cumulative x positions first so we can
                     // place the separator hit-rects.
                     {
@@ -5786,7 +5932,7 @@ impl eframe::App for CrustApp {
                         pane_ui.set_clip_rect(pane_rect);
                         pane_ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
 
-                        // ── Pane header ────────────────────────────────────
+                        // -- Pane header ------------------------------------
                         let (unread_count, unread_mentions) = self
                             .state
                             .channels
@@ -5834,7 +5980,7 @@ impl eframe::App for CrustApp {
                             }
                         }
 
-                        // ── Pane chat input (bottom) ─────────────
+                        // -- Pane chat input (bottom) -------------
                         let input_h = t::BAR_H
                             + (t::INPUT_MARGIN.top + t::INPUT_MARGIN.bottom)
                                 as f32;
@@ -5989,7 +6135,7 @@ impl eframe::App for CrustApp {
                             }
                         }
 
-                        // ── Message list (remaining space) ───────
+                        // -- Message list (remaining space) -------
                         // Region between header bottom and input top.
                         let mut search_h = 0.0;
                         let content_top = pane_rect.top() + SPLIT_HEADER_HEIGHT + pane_inner_pad;
@@ -6162,7 +6308,7 @@ impl eframe::App for CrustApp {
                             pane.input_buf.push(' ');
                         }
                     }
-                // ── Classic single-channel mode ──────────────────────────
+                // -- Classic single-channel mode --------------------------
                 } else if let Some(active_ch) = self.state.active_channel.clone() {
                     let active_reply = self
                         .pending_reply

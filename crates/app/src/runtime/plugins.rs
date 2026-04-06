@@ -4716,6 +4716,13 @@ fn event_kind(event: &AppEvent) -> Option<PluginEventKind> {
         AppEvent::FilterRecordsUpdated { .. } => PluginEventKind::FilterRecordsUpdated,
         AppEvent::ModActionPresetsUpdated { .. } => PluginEventKind::ModActionPresetsUpdated,
         AppEvent::AuthExpired => PluginEventKind::AuthExpired,
+        AppEvent::UpdaterSettingsUpdated { .. }
+        | AppEvent::UpdateInstallStarted { .. }
+        | AppEvent::UpdateInstallScheduled { .. }
+        | AppEvent::UpdateInstallFailed { .. }
+        | AppEvent::UpdateAvailable { .. }
+        | AppEvent::UpdateCheckUpToDate { .. }
+        | AppEvent::UpdateCheckFailed { .. } => PluginEventKind::Error,
         AppEvent::SelfAvatarLoaded { .. } => PluginEventKind::SelfAvatarLoaded,
         AppEvent::LinkPreviewReady { .. } => PluginEventKind::LinkPreviewReady,
         AppEvent::SenderCosmeticsUpdated { .. } => PluginEventKind::SenderCosmeticsUpdated,
@@ -5354,6 +5361,47 @@ unsafe fn make_event_table(L: *mut lua_State, event: &AppEvent) -> c_int {
             if let Some(color) = color.as_ref() {
                 set_field_string(L, -1, "color", color);
             }
+        }
+        AppEvent::UpdateAvailable {
+            version,
+            release_url,
+            asset_name,
+        } => {
+            set_field_string(L, -1, "version", version);
+            set_field_string(L, -1, "release_url", release_url);
+            set_field_string(L, -1, "asset_name", asset_name);
+        }
+        AppEvent::UpdateCheckUpToDate { version } => {
+            set_field_string(L, -1, "version", version);
+        }
+        AppEvent::UpdateCheckFailed { message, manual } => {
+            set_field_string(L, -1, "message", message);
+            set_field_bool(L, -1, "manual", *manual);
+        }
+        AppEvent::UpdaterSettingsUpdated {
+            update_checks_enabled,
+            last_checked_at,
+            skipped_version,
+        } => {
+            set_field_bool(L, -1, "update_checks_enabled", *update_checks_enabled);
+            if let Some(last_checked_at) = last_checked_at.as_ref() {
+                set_field_string(L, -1, "last_checked_at", last_checked_at);
+            }
+            set_field_string(L, -1, "skipped_version", skipped_version);
+        }
+        AppEvent::UpdateInstallStarted { version } => {
+            set_field_string(L, -1, "version", version);
+        }
+        AppEvent::UpdateInstallScheduled {
+            version,
+            restart_now,
+        } => {
+            set_field_string(L, -1, "version", version);
+            set_field_bool(L, -1, "restart_now", *restart_now);
+        }
+        AppEvent::UpdateInstallFailed { version, message } => {
+            set_field_string(L, -1, "version", version);
+            set_field_string(L, -1, "message", message);
         }
     }
 

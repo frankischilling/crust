@@ -27,12 +27,15 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 smallvec = { workspace = true }
 directories = { workspace = true }
-crust-core = { path = "../core", version = "0.1.0" }
-crust-ui = { path = "../ui", version = "0.1.0" }
-crust-twitch = { path = "../twitch", version = "0.1.0" }
-crust-kick = { path = "../kick", version = "0.1.0" }
-crust-emotes = { path = "../emotes", version = "0.1.0" }
-crust-storage = { path = "../storage", version = "0.1.0" }
+semver = "1"
+sha2 = "0.10"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+crust-core = { path = "../core", version = "0.4.2" }
+crust-ui = { path = "../ui", version = "0.4.2" }
+crust-twitch = { path = "../twitch", version = "0.4.2" }
+crust-kick = { path = "../kick", version = "0.4.2" }
+crust-emotes = { path = "../emotes", version = "0.4.2" }
+crust-storage = { path = "../storage", version = "0.4.2" }
 libc = { workspace = true }
 base64 = "0.22"
 

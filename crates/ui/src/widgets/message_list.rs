@@ -37,14 +37,14 @@ pub struct MessageListPerfStats {
     pub height_cache_misses: usize,
 }
 
-// ── Zero-allocation visible-index abstraction ────────────────────────────
+// -- Zero-allocation visible-index abstraction ----------------------------
 // When no search filter is active, `VisibleIndices::All(n)` avoids
 // allocating a Vec<usize> with one entry per message every frame.
 
 enum VisibleIndices {
-    /// No filter — visible index `i` maps directly to message index `i`.
+    /// No filter - visible index `i` maps directly to message index `i`.
     All(usize),
-    /// Search filter active — sparse set of matching message indices.
+    /// Search filter active - sparse set of matching message indices.
     Filtered(Vec<usize>),
 }
 
@@ -621,7 +621,7 @@ impl<'a> MessageList<'a> {
             height_cache_misses: 0,
         };
 
-        // ── Pre-compute highlight state once per frame ───────────────────
+        // -- Pre-compute highlight state once per frame -------------------
         // Previously this was looked up via 2× data_mut calls inside every
         // render_message invocation.  Computing it once here avoids dozens
         // of redundant lock acquisitions per frame.
@@ -638,7 +638,7 @@ impl<'a> MessageList<'a> {
                     if elapsed < FLASH_SECS {
                         (Some(id), 1.0 - (elapsed / FLASH_SECS), true)
                     } else {
-                        // Flash complete — clean up temp data.
+                        // Flash complete - clean up temp data.
                         ui.ctx().data_mut(|d| {
                             d.remove::<String>(highlight_key);
                             d.remove::<f64>(highlight_time_key);
@@ -707,7 +707,7 @@ impl<'a> MessageList<'a> {
         }
 
         if n < VIRTUAL_THRESHOLD {
-            // ── Simple path: render every message, let egui handle layout ─
+            // -- Simple path: render every message, let egui handle layout -
             // We also measure row heights here so the cache is pre-populated
             // when the channel crosses VIRTUAL_THRESHOLD.
             let scroll_paused: bool = ui
@@ -833,7 +833,7 @@ impl<'a> MessageList<'a> {
         let boundary_h = hot_plan.boundary_height();
         let total_h = boundary_h + *prefix.last().unwrap_or(&0.0);
 
-        // ── Virtual-scrolling render pass ────────────────────────────────
+        // -- Virtual-scrolling render pass --------------------------------
         // show_viewport gives us the currently-visible rect in content-local
         // coordinates.  We allocate dead space for off-screen rows and only
         // call render_message for rows whose y-range overlaps the viewport.
@@ -1684,7 +1684,7 @@ impl<'a> MessageList<'a> {
             // User actively scrolled back down to the bottom.
             false
         } else if !was_paused {
-            // Was not paused — stay unpaused (stick-to-bottom is active).
+            // Was not paused - stay unpaused (stick-to-bottom is active).
             // Transient !at_bottom from content growth is fine; egui's
             // stick_to_bottom will catch up next frame.
             false
@@ -1834,7 +1834,7 @@ impl<'a> MessageList<'a> {
         let reply_key = rctx.reply_key;
         let scroll_to_key = rctx.scroll_to_key;
 
-        // ── Message background ──────────────────────────────────────────
+        // -- Message background ------------------------------------------
         // Use pre-computed highlight state from RenderCtx instead of per-
         // message data_mut lookups.
         let highlight_alpha: f32 = match (&rctx.highlight_server_id, msg.server_id.as_deref()) {
@@ -1875,7 +1875,7 @@ impl<'a> MessageList<'a> {
                 .fill(bg)
                 .inner_margin(egui::Margin::symmetric(ROW_PAD_X as i8, ROW_PAD_Y as i8))
                 .begin(ui);
-            // Register a background click sensor EARLY — before any inner widgets —
+            // Register a background click sensor EARLY - before any inner widgets -
             // so it gets the lowest idx_in_layer and thus the lowest hit-test
             // priority.  Inner widgets (reply header, username label, emotes, URLs)
             // are registered afterwards and therefore *win* the hit test when the
@@ -1892,8 +1892,8 @@ impl<'a> MessageList<'a> {
                 // second interact() (with the real frame rect) doesn't trigger
                 // egui's ID-clash warning.  The zero rect is fully contained
                 // within the final frame rect, so `check_for_id_clash` treats
-                // them as the same widget.  The key property we care about —
-                // low `idx_in_layer` for hit-test priority — is preserved
+                // them as the same widget.  The key property we care about -
+                // low `idx_in_layer` for hit-test priority - is preserved
                 // because the widget is still registered before inner widgets.
                 let placeholder_rect =
                     egui::Rect::from_min_size(ui.max_rect().left_top(), egui::Vec2::ZERO);
@@ -1965,7 +1965,7 @@ impl<'a> MessageList<'a> {
                         }
                     });
                 }
-                // ── Notification banner (pinned / first / highlighted / rewards) ──
+                // -- Notification banner (pinned / first / highlighted / rewards) --
                 // Rendered inside the Frame so the background fill covers
                 // the banner as well, and the interaction rect is contiguous.
                 if let Some((label, stripe_color)) = notification_label(
@@ -3234,7 +3234,7 @@ fn with_ellipsis(text: &str, cut: usize) -> String {
 /// joiners, direction overrides, and other control characters that most fonts
 /// cannot render.
 ///
-/// PERF: fast-path scan first — if no bytes need stripping, return a
+/// PERF: fast-path scan first - if no bytes need stripping, return a
 /// zero-allocation `Cow::Borrowed` pointing at the original string.
 fn strip_invisible_chars(s: &str) -> std::borrow::Cow<'_, str> {
     // Fast-path: scan for any character that might need stripping.

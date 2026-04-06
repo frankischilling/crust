@@ -6,7 +6,10 @@ fn main() {
         .join("lua");
 
     let mut build = cc::Build::new();
-    build.include(&root).std("c99").warnings(false);
+    build.include(&root).warnings(false);
+    if target_os != "windows" {
+        build.std("c99");
+    }
 
     match target_os.as_str() {
         "windows" => {

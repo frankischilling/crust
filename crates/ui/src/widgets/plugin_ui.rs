@@ -576,7 +576,7 @@ fn render_widget(
                     line.push_str(value);
                 }
                 if let Some(note) = item.note.as_deref() {
-                    line.push_str(" — ");
+                    line.push_str(" - ");
                     line.push_str(note);
                 }
                 ui.label(line);

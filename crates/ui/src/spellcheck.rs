@@ -22,7 +22,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
-// ── Lazy-initialised data ──────────────────────────────────────────────────
+// -- Lazy-initialised data --------------------------------------------------
 
 static SPELL: OnceLock<SpellData> = OnceLock::new();
 
@@ -41,7 +41,7 @@ fn data() -> &'static SpellData {
         let dict_src: &'static str = include_str!("words_alpha_filtered.txt");
         let freq_src: &'static str = include_str!("word_frequencies.txt");
 
-        // ── Word set + Soundex index ───────────────────────────────────
+        // -- Word set + Soundex index -----------------------------------
         let mut words: HashSet<&'static str> = HashSet::with_capacity(230_000);
         let mut soundex_groups: HashMap<[u8; 4], Vec<&'static str>> =
             HashMap::with_capacity(60_000);
@@ -55,7 +55,7 @@ fn data() -> &'static SpellData {
             soundex_groups.entry(code).or_default().push(w);
         }
 
-        // ── Frequency map ──────────────────────────────────────────────
+        // -- Frequency map ----------------------------------------------
         // Format: "word count" per line, most-common first.
         let mut freq_rank: HashMap<&'static str, u32> = HashMap::with_capacity(50_000);
         for (rank, line) in freq_src.lines().enumerate() {
@@ -76,7 +76,7 @@ fn data() -> &'static SpellData {
     })
 }
 
-// ── Public API ─────────────────────────────────────────────────────────────
+// -- Public API -------------------------------------------------------------
 
 /// Eagerly initialise the dictionary data structures.  Call this once at
 /// startup so the first right-click doesn't pay the parsing cost.
@@ -104,7 +104,7 @@ pub fn suggestions(word: &str, max: usize) -> Vec<String> {
     // Maps candidate → minimum edit distance found.
     let mut candidates: HashMap<String, u8> = HashMap::new();
 
-    // ── Edit-distance 1 ────────────────────────────────────────────────
+    // -- Edit-distance 1 ------------------------------------------------
     let edit1_list = edits1(&lower);
     for c in &edit1_list {
         if d.words.contains(c.as_str()) {
@@ -112,7 +112,7 @@ pub fn suggestions(word: &str, max: usize) -> Vec<String> {
         }
     }
 
-    // ── Edit-distance 2 (complete – no cap) ────────────────────────────
+    // -- Edit-distance 2 (complete – no cap) ----------------------------
     for e1 in &edit1_list {
         for c in edits1(e1) {
             if d.words.contains(c.as_str()) {
@@ -121,7 +121,7 @@ pub fn suggestions(word: &str, max: usize) -> Vec<String> {
         }
     }
 
-    // ── Soundex / phonetic matches ─────────────────────────────────────
+    // -- Soundex / phonetic matches -------------------------------------
     // Catches silent-letter errors (e.g. "fonetic" → "phonetic") that may
     // exceed edit-distance 2.
     let query_sx = soundex_code(&lower);
@@ -136,7 +136,7 @@ pub fn suggestions(word: &str, max: usize) -> Vec<String> {
         }
     }
 
-    // ── Score, sort, truncate ──────────────────────────────────────────
+    // -- Score, sort, truncate ------------------------------------------
     let mut scored: Vec<(String, f64)> = candidates
         .into_iter()
         .map(|(cand, dist)| {
@@ -190,7 +190,7 @@ pub fn word_at_cursor(buf: &str, char_pos: usize) -> (&str, usize, usize) {
     (&buf[byte_start..byte_end], byte_start, byte_end)
 }
 
-// ── Scoring ────────────────────────────────────────────────────────────────
+// -- Scoring ----------------------------------------------------------------
 
 /// Compute a single score for `candidate` (lower = better).
 fn score(query: &str, candidate: &str, edit_dist: u8, query_sx: &[u8; 4], d: &SpellData) -> f64 {
@@ -219,7 +219,7 @@ fn score(query: &str, candidate: &str, edit_dist: u8, query_sx: &[u8; 4], d: &Sp
     s
 }
 
-// ── Edit-distance machinery ────────────────────────────────────────────────
+// -- Edit-distance machinery ------------------------------------------------
 
 /// Generate all strings one edit (delete / transpose / replace / insert) away
 /// from `word`.  All results are lowercase ASCII.
@@ -290,7 +290,7 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[m]
 }
 
-// ── Soundex ────────────────────────────────────────────────────────────────
+// -- Soundex ----------------------------------------------------------------
 
 /// Compute the 4-character Soundex code for `word`.
 fn soundex_code(word: &str) -> [u8; 4] {
@@ -333,7 +333,7 @@ fn soundex_digit(c: u8) -> u8 {
     }
 }
 
-// ── Keyboard proximity ─────────────────────────────────────────────────────
+// -- Keyboard proximity -----------------------------------------------------
 
 /// Returns a bonus ∈ [0, 1] indicating how close the substitution errors
 /// are on a QWERTY keyboard.  1 = every differing character is an adjacent

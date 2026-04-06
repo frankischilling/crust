@@ -10,7 +10,7 @@ use crate::theme as t;
 
 use super::chrome;
 
-// ─── Public action returned from show() ──────────────────────────────────────
+// --- Public action returned from show() --------------------------------------
 
 /// Action emitted by the popup when a moderation button is pressed.
 #[derive(Debug, Clone)]
@@ -82,7 +82,7 @@ pub enum PopupAction {
     },
 }
 
-// ─── Tab state ────────────────────────────────────────────────────────────────
+// --- Tab state ----------------------------------------------------------------
 
 #[derive(Default, PartialEq, Eq, Clone, Copy)]
 enum ProfileTab {
@@ -94,7 +94,7 @@ enum ProfileTab {
     IvrLogs,
 }
 
-// ─── Struct ───────────────────────────────────────────────────────────────────
+// --- Struct -------------------------------------------------------------------
 
 /// Floating popup showing a Twitch user's profile.  Open it by calling
 /// [`UserProfilePopup::set_loading`]; it stays open until the user closes it.
@@ -1405,7 +1405,7 @@ impl UserProfilePopup {
     }
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// --- Helpers -----------------------------------------------------------------
 
 /// Format an IVR timestamp ("2026-03-05T09:35:03.061Z") to "YYYY-MM-DD HH:MM".
 fn fmt_ivr_timestamp(ts: &str) -> String {

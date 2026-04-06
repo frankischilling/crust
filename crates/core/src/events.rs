@@ -364,10 +364,24 @@ pub enum AppCommand {
     },
     /// Persist an updated ordered list of moderation action presets.
     SetModActionPresets { presets: Vec<ModActionPreset> },
-    /// Refresh authentication after a 401 — re-validate the stored token.
+    /// Refresh authentication after a 401 - re-validate the stored token.
     RefreshAuth,
     /// Persist desktop notification toggle.
     SetNotificationSettings { desktop_notifications_enabled: bool },
+    /// Trigger a GitHub releases update check.
+    CheckForUpdates {
+        /// True when initiated from explicit user action.
+        manual: bool,
+    },
+    /// Enable/disable automatic background update checks.
+    SetUpdateChecksEnabled { enabled: bool },
+    /// Persist the currently skipped update version.
+    SkipUpdateVersion { version: String },
+    /// Download, verify, stage, and schedule installation of the available update.
+    InstallAvailableUpdate {
+        /// If true, exit the app after scheduling installer so update applies immediately.
+        restart_now: bool,
+    },
 }
 
 // Events (runtime to UI): notifications sent from runtime to UI
@@ -672,6 +686,46 @@ pub enum AppEvent {
     },
     /// Auth has expired; prompt user to re-authenticate.
     AuthExpired,
+    /// Updater preference/state loaded or updated from settings.
+    UpdaterSettingsUpdated {
+        update_checks_enabled: bool,
+        last_checked_at: Option<String>,
+        skipped_version: String,
+    },
+    /// A newer app release is available on GitHub.
+    UpdateAvailable {
+        /// Newer semantic version string (without leading `v`).
+        version: String,
+        /// Human-facing GitHub release page URL.
+        release_url: String,
+        /// Selected Windows x64 zip asset name.
+        asset_name: String,
+    },
+    /// Update check completed with no newer release.
+    UpdateCheckUpToDate {
+        /// Current app version used for comparison.
+        version: String,
+    },
+    /// Update check failed (network/parse/integrity metadata issue).
+    UpdateCheckFailed {
+        message: String,
+        /// True when initiated from explicit user action.
+        manual: bool,
+    },
+    /// Update install pipeline started (download/verify/extract).
+    UpdateInstallStarted {
+        version: String,
+    },
+    /// Update installer has been staged and scheduled.
+    UpdateInstallScheduled {
+        version: String,
+        restart_now: bool,
+    },
+    /// Update install failed.
+    UpdateInstallFailed {
+        version: String,
+        message: String,
+    },
     /// A plugin-owned UI widget emitted an action event.
     PluginUiAction {
         plugin_name: String,
