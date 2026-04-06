@@ -28,12 +28,6 @@ Kick support is currently super cooked and munted (very incomplete / unstable).
 - [Plugin API reference](docs/API.md)
 - [Release notes v0.4.2](docs/Release_v0.4.2.md)
 
-## Reference baseline
-
-crust uses `chatterino2-master` as the default north-star baseline for feature behavior and bug-fix outcomes.
-
-When `chatterino2-master` and `chatterino7-chatterino7` differ, crust prefers `chatterino2-master`.
-
 See:
 
 - [docs/REFERENCE_POLICY.md](docs/REFERENCE_POLICY.md)
