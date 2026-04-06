@@ -26,6 +26,7 @@ Kick support is currently super cooked and munted (very incomplete / unstable).
 
 - [Crust docs home](docs/HOME.md)
 - [Plugin API reference](docs/API.md)
+- [Release notes v0.4.3](docs/Release_v0.4.3.md)
 - [Release notes v0.4.2](docs/Release_v0.4.2.md)
 
 See:
@@ -36,28 +37,175 @@ See:
 
 ## Features
 
-- Twitch IRC over WebSocket - anonymous and authenticated modes
-- Multi-channel tabs - join, leave, reorder channels
-- Multi-account support - add, switch, remove, and set a default account
-- Windows auto-updater from GitHub Releases (stable-only checks, SHA256 verification, prompt-based install)
-- Message rendering:
-  - Twitch native emotes
-  - Third-party emotes: BTTV, FFZ, 7TV (global + channel + personal sets)
-  - Animated emote support (GIF, WebP)
-  - Emoji tokenization via Twemoji URLs
-  - Badge rendering (global + channel badges via IVR)
-  - URL and @mention detection
-  - Highlighted and first-message indicators
-- Emote picker and `:` autocomplete with Tab completion
-- Reply flow (threaded replies)
-- Basic moderation: timeout, ban, unban
-- User profile popup with avatar, badges, account metadata, and recent messages
-- Link preview metadata fetch (Open Graph / Twitter card)
-- Lua plugins with slash-command registration/completion hooks, retained UI surfaces, and host callbacks. See [Crust docs home](docs/HOME.md), [plugin API reference](docs/API.md), and [example plugins](plugins/)
-- Message input history (arrow-key recall)
-- Local settings persistence and optional keyring-backed token storage
-- Per-channel append-only chat logs
-- Chat history on join (via recent-messages.robotty.de / IVR fallback)
+### Platforms and transports
+
+- Twitch chat via IRC over WebSocket (anonymous and authenticated modes)
+- Kick chat integration (beta / currently incomplete)
+- Generic IRC integration (beta), including IRC server tabs and keyed channel joins
+- IRC channel redirect handling (old channel target -> new channel target)
+
+### Channels, tabs, and navigation
+
+- Multi-channel management: join, leave, reorder, and close channels
+- Sidebar and top-tab channel layouts
+- Tab style controls (compact/normal), optional close buttons, and optional live indicators
+- Unread and mention counters for channels
+- Quick switch palette (Ctrl+K):
+  - mention-first ordering (mentions -> unread -> others)
+  - unified channel + whisper-thread list
+  - query aliases for platforms and whispers
+  - keyboard navigation and activation
+- Split-pane chat view (up to 4 panes):
+  - drag channel to split
+  - focused-pane tracking
+  - split header controls and per-pane search toggle
+  - split keyboard navigation and pane reordering shortcuts
+
+### Desktop UI shell
+
+- Join dialog and account/login switcher dialogs
+- User profile popup and dedicated moderation tools window
+- Whisper management window
+- Optional analytics side panel
+- Optional IRC status diagnostics panel
+- Optional performance overlay for chat rendering stats
+- Startup loading screen for initial prefetch visibility
+
+### Messages and rendering
+
+- Message types rendered in chat include:
+  - standard chat and actions
+  - subscriptions, raids, bits, channel points redemptions
+  - timeout/ban/clear notices and system notices
+  - first-message and pinned-message indicators
+- Inline reply/thread support with reply metadata
+- Rich span/token rendering:
+  - text
+  - emotes
+  - badges
+  - mentions
+  - URLs
+  - emoji
+- URL detection and Open Graph/Twitter card preview metadata
+- Message deletion and user-message clear handling in UI
+- Optional timestamp rendering (12h/24h, with/without seconds)
+- Optional long-message collapse with configurable line limits
+
+### Input and command UX
+
+- Message input history recall (arrow keys)
+- `:` emote autocomplete and Tab completion
+- Slash command handling for chat, moderation, and creator workflows
+- Command usage tracking for ranking/autocomplete improvements
+
+### Emotes, badges, and cosmetics
+
+- Emote providers:
+  - Twitch native
+  - BTTV
+  - FFZ
+  - 7TV
+  - Kick
+- Provider-aware emote resolution and rendering priority
+- Animated emote support (GIF/WebP)
+- Emoji tokenization/rendering via Twemoji URLs
+- Badge rendering from global/channel badge sources
+- 7TV sender cosmetics support (name paints/badge updates)
+- Emote picker features:
+  - favorites
+  - recents
+  - provider preference boost
+- Emote image caching in memory and on disk
+
+### Whispers
+
+- Twitch whisper receive/render path
+- Whisper thread list with recency ordering
+- Per-thread unread counts and mention counts
+- Whisper compose/open workflow from thread context
+- Whisper desktop notifications (when enabled)
+
+### Moderation and creator tools
+
+- Message-row right-click moderation quick actions:
+  - Quick Delete
+  - Quick Timeout 10m
+  - Quick Ban
+  - Quick Warn
+- Full moderation actions:
+  - timeout/ban/unban/warn
+  - delete message
+  - clear user messages locally
+  - suspicious-user monitor/restrict/clear
+  - AutoMod message approve/deny
+  - unban request fetch/resolve
+- Moderation presets for reusable actions
+- Moderation tools window and workflow links
+- Creator tools:
+  - polls (create/end/cancel)
+  - predictions (create/lock/resolve/cancel)
+  - commercials
+  - stream markers
+  - announcements
+  - shoutouts
+  - reward redemption status updates
+
+### Profiles, stream state, and notifications
+
+- User profile popup with account metadata, avatar/badges, and recent messages
+- Stream status fetch and live/offline updates
+- Stream watch/tracker behavior for channel presence indicators
+- Desktop notifications for mentions/highlights/whispers (configurable)
+- In-app event toast banners for high-visibility events
+
+### Accounts, auth, and settings
+
+- Multi-account support:
+  - add/switch/remove accounts
+  - set default startup account
+- Auth refresh flow for expired/invalid sessions
+- OS keyring-backed token storage with settings-file fallback
+- IRC identity settings (nick and NickServ credentials)
+- Settings persistence for:
+  - general behavior (timestamps, local log indexing, auto-join, ignores/highlights)
+  - appearance/layout
+  - chat UI behavior
+  - notification preferences
+  - emote picker preferences
+  - highlight rules
+  - filter records
+  - mod action presets
+  - beta feature flags
+
+### Search, history, and local data
+
+- Recent-message history load on join (recent-messages API with IVR fallback)
+- Per-channel local append-only log indexing (SQLite)
+- Older local history paging support
+- Per-channel message search/filter UI
+- Data directories via `directories::ProjectDirs` for config/cache/logs
+
+### Plugin platform (Lua)
+
+- Lua plugin runtime with plugin lifecycle management
+- Plugin command registration and execution
+- Event callback registration across account/chat/settings/moderation/UI events
+- Plugin UI surfaces:
+  - custom windows
+  - settings pages
+  - host-panel extensions
+- Host callback helpers for image fetch, profile fetch, link preview fetch, and IVR log fetch
+- Example plugin set in [plugins](plugins/)
+
+### Updater and release flow
+
+- Windows auto-updater via GitHub Releases:
+  - stable-only checks
+  - SHA256 verification
+  - staged install prompt flow
+  - version skip support
+- Background and manual update check flows
+- PowerShell launch fallback chain for installer reliability
 
 ## Workspace layout
 
