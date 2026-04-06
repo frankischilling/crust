@@ -30,12 +30,12 @@ directories = { workspace = true }
 semver = "1"
 sha2 = "0.10"
 zip = { version = "2", default-features = false, features = ["deflate"] }
-crust-core = { path = "../core", version = "0.4.3" }
-crust-ui = { path = "../ui", version = "0.4.3" }
-crust-twitch = { path = "../twitch", version = "0.4.3" }
-crust-kick = { path = "../kick", version = "0.4.3" }
-crust-emotes = { path = "../emotes", version = "0.4.3" }
-crust-storage = { path = "../storage", version = "0.4.3" }
+crust-core = { path = "../core", version = "0.4.4" }
+crust-ui = { path = "../ui", version = "0.4.4" }
+crust-twitch = { path = "../twitch", version = "0.4.4" }
+crust-kick = { path = "../kick", version = "0.4.4" }
+crust-emotes = { path = "../emotes", version = "0.4.4" }
+crust-storage = { path = "../storage", version = "0.4.4" }
 libc = { workspace = true }
 base64 = "0.22"
 
