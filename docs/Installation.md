@@ -14,10 +14,10 @@ Example layout:
 
 ```text
 plugins/
-└── my_plugin/
-    ├── info.json
-    ├── init.lua
-    └── data/
+└-- my_plugin/
+    ├-- info.json
+    ├-- init.lua
+    └-- data/
 ```
 
 Install the bundled examples:

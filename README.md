@@ -25,6 +25,7 @@ Kick support is currently super cooked and munted (very incomplete / unstable).
 ## Documentation
 
 - [Crust docs home](docs/HOME.md)
+- [Features and keybinds](docs/FEATURES_AND_KEYBINDS.md)
 - [Plugin API reference](docs/API.md)
 - [Release notes v0.4.3](docs/Release_v0.4.3.md)
 - [Release notes v0.4.2](docs/Release_v0.4.2.md)

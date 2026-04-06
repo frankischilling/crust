@@ -33,11 +33,11 @@ Directory layout:
 
 ```text
 plugins/
-└── example_plugin/
-    ├── info.json
-    ├── init.lua
-    ├── helper.lua
-    └── data/
+└-- example_plugin/
+    ├-- info.json
+    ├-- init.lua
+    ├-- helper.lua
+    └-- data/
 ```
 
 Lua module loading:

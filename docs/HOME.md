@@ -2,6 +2,9 @@
 
 Start here:
 
+- [Features And Keybinds](./FEATURES_AND_KEYBINDS)
+- [Release Notes v0.4.3](./Release_v0.4.3)
+- [Release Notes v0.4.2](./Release_v0.4.2)
 - [Plugin Installation](./Installation)
 - [Plugin Lifecycle](./Lifecycle)
 - [Plugin API Reference](./API)
