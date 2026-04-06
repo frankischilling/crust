@@ -352,7 +352,7 @@ fn main() -> Result<()> {
     // eframe / egui: UI framework initialization
     let native_opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Crust – Twitch, Kick & IRC Chat")
+            .with_title("Crust - Twitch, Kick & IRC Chat")
             .with_inner_size(APP_INITIAL_INNER_SIZE)
             .with_min_inner_size(APP_MIN_INNER_SIZE)
             .with_app_id("crust"),
@@ -369,7 +369,7 @@ fn main() -> Result<()> {
     );
 
     // winit on Wayland may exit with code 1 if the sctk-adwaita CSD
-    // portal query fails.  This is harmless – the user closed the window
+    // portal query fails.  This is harmless - the user closed the window
     // normally and the portal problem is cosmetic.  Treat it as success.
     match result {
         Ok(()) => {}

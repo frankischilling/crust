@@ -69,7 +69,7 @@ pub fn is_definitely_emoji(codepoints: &[u32]) -> bool {
     }
     let first = codepoints[0];
 
-    // SMP emoji (flag pairs, pictographs, etc.) – Twemoji covers these fully.
+    // SMP emoji (flag pairs, pictographs, etc.) - Twemoji covers these fully.
     // Regional indicators (0x1F1E0-0x1F1FF) are included here.
     if first >= 0x1F000 {
         return true;

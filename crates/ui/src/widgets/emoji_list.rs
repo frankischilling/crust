@@ -20,7 +20,7 @@ pub fn emoji_catalog_entries() -> Vec<EmoteCatalogEntry> {
         .collect()
 }
 
-/// `(emoji, name)` – ordered by category for a natural browsing experience.
+/// `(emoji, name)` - ordered by category for a natural browsing experience.
 pub const EMOJI_LIST: &[(&str, &str)] = &[
     // -- Smileys & Emotion -----------------------------------------------
     ("😀", "grinning face"),

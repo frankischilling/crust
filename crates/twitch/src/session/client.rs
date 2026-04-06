@@ -316,7 +316,7 @@ impl TwitchSession {
             send_raw!(format!("PASS {pass}"));
             send_raw!(format!("NICK {nick}"));
         } else {
-            // Anonymous login – no PASS needed
+            // Anonymous login - no PASS needed
             let nick = format!("justinfan{}", rand_number());
             send_raw!(format!("NICK {nick}"));
         }
@@ -734,7 +734,7 @@ impl TwitchSession {
         false
     }
 
-    /// Parse PRIVMSG into a ChatMessage (spans left empty – filled by reducer).
+    /// Parse PRIVMSG into a ChatMessage (spans left empty - filled by reducer).
     fn parse_privmsg(&mut self, msg: &IrcMessage) -> Option<ChatMessage> {
         let channel_raw = msg.params.first()?;
         let channel = ChannelId::new(channel_raw.as_str());
@@ -1133,6 +1133,6 @@ fn rand_number() -> u32 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_millis() as u32)
         .unwrap_or(12345);
-    // Simple LCG – doesn't need to be crypto
+    // Simple LCG - doesn't need to be crypto
     (seed.wrapping_mul(1103515245).wrapping_add(12345) >> 16) % 90000 + 10000
 }

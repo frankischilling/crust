@@ -1332,6 +1332,59 @@ impl<'a> MessageList<'a> {
             ui.separator();
             ui.label(RichText::new("Mod actions").small().color(t::text_muted()));
 
+            let target_user_id = msg.sender.user_id.0.trim();
+            let can_user_action = !target_user_id.is_empty() && !msg.sender.login.trim().is_empty();
+
+            ui.horizontal_wrapped(|ui| {
+                if let Some(server_id) = resolved_server_id.as_deref() {
+                    if ui.button("Quick: Delete").clicked() {
+                        let _ = self.cmd_tx.try_send(AppCommand::DeleteMessage {
+                            channel: msg.channel.clone(),
+                            message_id: server_id.to_owned(),
+                        });
+                        ui.close_menu();
+                    }
+                } else {
+                    ui.add_enabled(false, egui::Button::new("Quick: Delete"));
+                }
+
+                if can_user_action {
+                    if ui.button("Quick: Timeout 10m").clicked() {
+                        let _ = self.cmd_tx.try_send(AppCommand::TimeoutUser {
+                            channel: self.channel.clone(),
+                            login: msg.sender.login.clone(),
+                            user_id: target_user_id.to_owned(),
+                            seconds: 10 * 60,
+                            reason: None,
+                        });
+                        ui.close_menu();
+                    }
+                    if ui.button("Quick: Ban").clicked() {
+                        let _ = self.cmd_tx.try_send(AppCommand::BanUser {
+                            channel: self.channel.clone(),
+                            login: msg.sender.login.clone(),
+                            user_id: target_user_id.to_owned(),
+                            reason: None,
+                        });
+                        ui.close_menu();
+                    }
+                    if ui.button("Quick: Warn").clicked() {
+                        let _ = self.cmd_tx.try_send(AppCommand::WarnUser {
+                            channel: self.channel.clone(),
+                            login: msg.sender.login.clone(),
+                            user_id: target_user_id.to_owned(),
+                            reason: "Please review the channel rules.".to_owned(),
+                        });
+                        ui.close_menu();
+                    }
+                } else {
+                    ui.add_enabled(false, egui::Button::new("Quick: Timeout 10m"));
+                    ui.add_enabled(false, egui::Button::new("Quick: Ban"));
+                    ui.add_enabled(false, egui::Button::new("Quick: Warn"));
+                }
+            });
+            ui.separator();
+
             if let Some(server_id) = resolved_server_id.as_deref() {
                 if ui.button("Delete message").clicked() {
                     let _ = self.cmd_tx.try_send(AppCommand::SendMessage {
@@ -1346,9 +1399,6 @@ impl<'a> MessageList<'a> {
                 ui.add_enabled(false, egui::Button::new("Delete message"))
                     .on_hover_text("Cannot delete this message yet (missing message id)");
             }
-
-            let target_user_id = msg.sender.user_id.0.trim();
-            let can_user_action = !target_user_id.is_empty() && !msg.sender.login.trim().is_empty();
 
             if can_user_action {
                 ui.menu_button("Timeouts", |ui| {
@@ -3098,7 +3148,7 @@ impl<'a> MessageList<'a> {
     /// it is never selected by hit-test, `response.hovered()` is always false, and
     /// `on_hover_ui_at_pointer` never fires.  Using `Sense::click()` ensures the image
     /// enters the hovered set so tooltips work.  We never actually handle the click
-    /// on images – callers that want right-click menus chain `.context_menu()` themselves.
+    /// on images - callers that want right-click menus chain `.context_menu()` themselves.
     fn show_image(
         &self,
         ui: &mut Ui,

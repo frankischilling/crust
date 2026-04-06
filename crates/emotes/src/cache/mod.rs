@@ -243,7 +243,7 @@ impl EmoteCache {
         fetch_result
     }
 
-    /// Look up an emote by code – returns `(id, code, url, provider)` tuple
+    /// Look up an emote by code - returns `(id, code, url, provider)` tuple
     /// suitable for the tokenizer callback.
     pub fn lookup_for_tokenizer(&self, code: &str) -> Option<(String, String, String, String)> {
         let guard = self.inner.lock().unwrap();

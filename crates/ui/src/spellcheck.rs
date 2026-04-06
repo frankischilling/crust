@@ -1,19 +1,19 @@
 //! Comprehensive spell checker with frequency-weighted ranking, Soundex
 //! phonetic matching, and QWERTY keyboard-proximity scoring.
 //!
-//! **Dictionary** – dwyl/english-words (~220 K lowercase alpha words, embedded
+//! **Dictionary** - dwyl/english-words (~220 K lowercase alpha words, embedded
 //! at compile time via `include_str!`).
 //!
-//! **Frequency** – Top 50 K English words from the OpenSubtitles corpus
+//! **Frequency** - Top 50 K English words from the OpenSubtitles corpus
 //! (hermitdave/FrequencyWords).  Common words like "the" rank far above
 //! obscure entries.
 //!
-//! **Algorithm** – Norvig edit-distance 1 + 2 (complete – no arbitrary cap),
+//! **Algorithm** - Norvig edit-distance 1 + 2 (complete - no arbitrary cap),
 //! augmented by Soundex phonetic lookup to catch silent-letter and
 //! sound-alike errors that may exceed distance 2
 //! (e.g. "fonetic" → "phonetic").
 //!
-//! **Scoring** – candidates are ranked by a combined metric:
+//! **Scoring** - candidates are ranked by a combined metric:
 //!   1. Edit distance (primary)
 //!   2. Word frequency (strongly favours common words)
 //!   3. Soundex phonetic match (bonus for same-sounding words)
@@ -112,7 +112,7 @@ pub fn suggestions(word: &str, max: usize) -> Vec<String> {
         }
     }
 
-    // -- Edit-distance 2 (complete – no cap) ----------------------------
+    // -- Edit-distance 2 (complete - no cap) ----------------------------
     for e1 in &edit1_list {
         for c in edits1(e1) {
             if d.words.contains(c.as_str()) {
@@ -197,14 +197,14 @@ fn score(query: &str, candidate: &str, edit_dist: u8, query_sx: &[u8; 4], d: &Sp
     // Base: edit distance dominates.
     let mut s = edit_dist as f64 * 1000.0;
 
-    // Frequency bonus – common words get up to 500 pts off.
+    // Frequency bonus - common words get up to 500 pts off.
     // rank 0 → bonus 500, rank 50 000 → bonus 0, unknown → no bonus.
     if let Some(&rank) = d.freq_rank.get(candidate) {
         let bonus = 500.0 * (1.0 - (rank as f64 / 50_000.0).min(1.0));
         s -= bonus;
     }
 
-    // Phonetic bonus – same Soundex code as the query.
+    // Phonetic bonus - same Soundex code as the query.
     if soundex_code(candidate) == *query_sx {
         s -= 200.0;
     }
@@ -212,7 +212,7 @@ fn score(query: &str, candidate: &str, edit_dist: u8, query_sx: &[u8; 4], d: &Sp
     // Keyboard-proximity bonus for substitution-type typos.
     s -= keyboard_bonus(query, candidate) * 100.0;
 
-    // Length-similarity penalty – prefer same-length corrections.
+    // Length-similarity penalty - prefer same-length corrections.
     let len_diff = (query.len() as f64 - candidate.len() as f64).abs();
     s += len_diff * 30.0;
 

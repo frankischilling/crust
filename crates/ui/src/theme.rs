@@ -40,7 +40,7 @@ pub fn apply_from_str(s: &str) {
 // Palette colours - each function returns the dark or light variant.
 // ---------------------------------------------------------------------------
 
-/// Deepest background – window body, sidebar.
+/// Deepest background - window body, sidebar.
 #[inline]
 pub fn bg_base() -> Color32 {
     if is_light() {
@@ -49,7 +49,7 @@ pub fn bg_base() -> Color32 {
         Color32::from_rgb(13, 13, 18)
     }
 }
-/// Slightly elevated surface – top bar, input tray.
+/// Slightly elevated surface - top bar, input tray.
 #[inline]
 pub fn bg_surface() -> Color32 {
     if is_light() {
@@ -58,7 +58,7 @@ pub fn bg_surface() -> Color32 {
         Color32::from_rgb(20, 20, 28)
     }
 }
-/// Raised surface – popup backgrounds, autocomplete.
+/// Raised surface - popup backgrounds, autocomplete.
 #[inline]
 pub fn bg_raised() -> Color32 {
     if is_light() {
@@ -67,7 +67,7 @@ pub fn bg_raised() -> Color32 {
         Color32::from_rgb(28, 28, 40)
     }
 }
-/// Deeply elevated – dialog / window fill.
+/// Deeply elevated - dialog / window fill.
 #[inline]
 pub fn bg_dialog() -> Color32 {
     if is_light() {
@@ -105,7 +105,7 @@ pub fn text_primary() -> Color32 {
         Color32::from_rgb(225, 225, 235)
     }
 }
-/// Secondary text – timestamps, hints, labels.
+/// Secondary text - timestamps, hints, labels.
 #[inline]
 pub fn text_secondary() -> Color32 {
     if is_light() {
@@ -114,7 +114,7 @@ pub fn text_secondary() -> Color32 {
         Color32::from_rgb(130, 130, 148)
     }
 }
-/// Muted – very low-contrast information.
+/// Muted - very low-contrast information.
 #[inline]
 pub fn text_muted() -> Color32 {
     if is_light() {
@@ -133,7 +133,7 @@ pub fn text_on_accent() -> Color32 {
     }
 }
 
-/// Twitch-ish purple accent – buttons, highlights, username.
+/// Twitch-ish purple accent - buttons, highlights, username.
 #[inline]
 pub fn accent() -> Color32 {
     if is_light() {
@@ -142,7 +142,7 @@ pub fn accent() -> Color32 {
         Color32::from_rgb(145, 95, 255)
     }
 }
-/// Dim accent – active press, selection fill.
+/// Dim accent - active press, selection fill.
 #[inline]
 pub fn accent_dim() -> Color32 {
     if is_light() {
@@ -162,7 +162,7 @@ pub fn hover_bg() -> Color32 {
     }
 }
 
-/// Active channel row fill – translucent purple.
+/// Active channel row fill - translucent purple.
 #[inline]
 pub fn active_channel_bg() -> Color32 {
     if is_light() {

@@ -238,7 +238,7 @@ fn tokenize_with_emoji(word: &str, is_action: bool, out: &mut SmallVec<[Span; 8]
                 });
                 found_emoji = true;
             } else {
-                // Ambiguous BMP symbol (geometric shape, arrow, etc.) – plain text
+                // Ambiguous BMP symbol (geometric shape, arrow, etc.) - plain text
                 for cp in codepoints {
                     if let Some(ch) = char::from_u32(cp) {
                         text_buf.push(ch);

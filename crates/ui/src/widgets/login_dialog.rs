@@ -64,10 +64,10 @@ impl LoginDialog {
 
     /// Show the dialog.  Returns `Some(LoginAction)` when the user performs an action.
     ///
-    /// * `logged_in`   – whether a session is currently authenticated.
-    /// * `username`    – display name of the active user (legacy / fallback).
-    /// * `avatar_url`  – CDN URL for the active user's avatar image.
-    /// * `emote_bytes` – shared image cache (used to render the avatar).
+    /// * `logged_in`   - whether a session is currently authenticated.
+    /// * `username`    - display name of the active user (legacy / fallback).
+    /// * `avatar_url`  - CDN URL for the active user's avatar image.
+    /// * `emote_bytes` - shared image cache (used to render the avatar).
     pub fn show(
         &mut self,
         ctx: &egui::Context,

@@ -254,7 +254,7 @@ fn fmt_relative_secs(older: i64, newer: i64) -> String {
             format!("{}m ago", s / 60)
         }
     };
-    format!("{} – {}", f(older), f(newer.max(0)))
+    format!("{} - {}", f(older), f(newer.max(0)))
 }
 
 fn bucket_index_for(

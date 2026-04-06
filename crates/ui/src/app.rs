@@ -94,6 +94,7 @@ const ANALYTICS_COMPACT_MAX_W: f32 = 260.0;
 const LOCAL_HISTORY_SEARCH_PAGE: usize = 800;
 const MAX_WHISPERS_PER_THREAD: usize = 250;
 const WHISPER_EMOTE_SIZE: f32 = 20.0;
+const QUICK_SWITCH_MAX_ROWS: usize = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ResponsiveLayout {
@@ -190,7 +191,7 @@ struct WhisperLine {
 struct Pane {
     channel: ChannelId,
     input_buf: String,
-    /// Width fraction (0.0–1.0) of available space; all panes sum to ~1.0.
+    /// Width fraction (0.0-1.0) of available space; all panes sum to ~1.0.
     frac: f32,
 }
 
@@ -670,6 +671,29 @@ struct AppearanceSnapshot {
     split_header_show_viewer_count: bool,
 }
 
+#[derive(Default, Clone)]
+struct ChannelQuickSwitch {
+    open: bool,
+    query: String,
+    selected: usize,
+    focus_query: bool,
+}
+
+#[derive(Clone)]
+enum QuickSwitchEntry {
+    Channel(ChannelId),
+    WhisperThread { login: String },
+}
+
+#[derive(Clone)]
+struct QuickSwitchCandidate {
+    entry: QuickSwitchEntry,
+    label: String,
+    subtitle: Option<String>,
+    unread_count: u32,
+    unread_mentions: u32,
+}
+
 /// Upper bound for usernames tracked per channel for @autocomplete.
 /// Keeps long-running channels from turning per-frame work into O(hours).
 const MAX_TRACKED_CHATTERS: usize = 5_000;
@@ -683,6 +707,7 @@ pub struct CrustApp {
     emote_bytes: HashMap<String, (u32, u32, Arc<[u8]>)>,
     join_dialog: JoinDialog,
     login_dialog: LoginDialog,
+    quick_switch: ChannelQuickSwitch,
     emote_picker: EmotePicker,
     chat_input_buf: String,
     emote_catalog: Vec<EmoteCatalogEntry>,
@@ -728,6 +753,8 @@ pub struct CrustApp {
     whisper_order: Vec<String>,
     /// Per-thread unread whisper counts.
     whisper_unread: HashMap<String, u32>,
+    /// Per-thread unread whispers that mention the active account.
+    whisper_unread_mentions: HashMap<String, u32>,
     /// Currently selected whisper thread login.
     active_whisper_login: Option<String>,
     /// Deduplicates whisper emote/emoji image fetches while loading.
@@ -949,6 +976,7 @@ impl CrustApp {
             emote_bytes: HashMap::new(),
             join_dialog: JoinDialog::default(),
             login_dialog: LoginDialog::default(),
+            quick_switch: ChannelQuickSwitch::default(),
             emote_picker: EmotePicker::default(),
             chat_input_buf: String::new(),
             emote_catalog: Vec::new(),
@@ -973,6 +1001,7 @@ impl CrustApp {
             whisper_display_names: HashMap::new(),
             whisper_order: Vec::new(),
             whisper_unread: HashMap::new(),
+            whisper_unread_mentions: HashMap::new(),
             active_whisper_login: None,
             whisper_pending_images: HashSet::new(),
             loading_screen: LoadingScreen::default(),
@@ -1640,6 +1669,35 @@ exit 1
 
     fn mark_whisper_thread_read(&mut self, login: &str) {
         self.whisper_unread.remove(login);
+        self.whisper_unread_mentions.remove(login);
+    }
+
+    fn whisper_message_mentions_current_user(&self, spans: &[Span], text: &str) -> bool {
+        let Some(username) = self
+            .state
+            .auth
+            .username
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        else {
+            return false;
+        };
+
+        if spans.iter().any(|span| {
+            matches!(span, Span::Mention { login } if login.eq_ignore_ascii_case(username))
+        }) {
+            return true;
+        }
+
+        let needle = format!("@{}", username.to_ascii_lowercase());
+        text.to_ascii_lowercase().contains(&needle)
+    }
+
+    fn activate_whisper_thread(&mut self, login: &str) {
+        self.whispers_visible = true;
+        self.active_whisper_login = Some(login.to_owned());
+        self.mark_whisper_thread_read(login);
     }
 
     fn open_whisper_compose(&mut self, partner_login: &str) {
@@ -1696,6 +1754,8 @@ exit 1
                 for login in thread_order {
                     let is_selected = login == current_thread;
                     let unread = self.whisper_unread.get(login).copied().unwrap_or(0);
+                    let unread_mentions =
+                        self.whisper_unread_mentions.get(login).copied().unwrap_or(0);
                     let last_line = self
                         .whisper_threads
                         .get(login)
@@ -1774,7 +1834,14 @@ exit 1
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        if unread > 0 {
+                                        if unread_mentions > 0 {
+                                            chrome::pill(
+                                                ui,
+                                                compact_badge_count(unread_mentions).to_string(),
+                                                t::text_primary(),
+                                                t::mention_pill_bg(),
+                                            );
+                                        } else if unread > 0 {
                                             chrome::pill(
                                                 ui,
                                                 compact_badge_count(unread).to_string(),
@@ -2578,6 +2645,7 @@ exit 1
 
                 let text = text.to_owned();
                 let spans = self.tokenize_whisper_text(&text, &twitch_emotes);
+                let mentions_current_user = self.whisper_message_mentions_current_user(&spans, &text);
                 self.queue_whisper_span_images(&spans);
                 let notification_body_text = text.trim().to_owned();
 
@@ -2619,6 +2687,12 @@ exit 1
                         .whisper_unread
                         .entry(partner_login.clone())
                         .or_insert(0) += 1;
+                    if !is_self && mentions_current_user {
+                        *self
+                            .whisper_unread_mentions
+                            .entry(partner_login.clone())
+                            .or_insert(0) += 1;
+                    }
                     if self.desktop_notifications_enabled {
                         let title = Self::truncate_notification_text(
                             &format!("Whisper from {display_name}"),
@@ -2768,6 +2842,7 @@ exit 1
                 self.whisper_display_names.clear();
                 self.whisper_order.clear();
                 self.whisper_unread.clear();
+                self.whisper_unread_mentions.clear();
                 self.active_whisper_login = None;
                 self.whisper_pending_images.clear();
                 if let Some(host) = plugin_host() {
@@ -3742,6 +3817,293 @@ exit 1
         }
     }
 
+    fn open_channel_quick_switch(&mut self) {
+        self.quick_switch.open = true;
+        self.quick_switch.query.clear();
+        self.quick_switch.selected = 0;
+        self.quick_switch.focus_query = true;
+    }
+
+    fn close_channel_quick_switch(&mut self) {
+        self.quick_switch.open = false;
+        self.quick_switch.focus_query = false;
+    }
+
+    fn quick_switch_candidates(&self) -> Vec<QuickSwitchCandidate> {
+        let query = self.quick_switch.query.trim().to_ascii_lowercase();
+        let mut out: Vec<QuickSwitchCandidate> = Vec::new();
+
+        for channel in &self.state.channel_order {
+            if !channel_matches_query(channel, &query) {
+                continue;
+            }
+
+            let (unread_count, unread_mentions) = self
+                .state
+                .channels
+                .get(channel)
+                .map(|state| (state.unread_count, state.unread_mentions))
+                .unwrap_or((0, 0));
+            let prefix = if channel.is_kick() || channel.is_irc_server_tab() {
+                ""
+            } else {
+                "#"
+            };
+            let subtitle = if channel.is_kick() {
+                Some("Kick channel".to_owned())
+            } else if channel.is_irc() {
+                Some("IRC target".to_owned())
+            } else {
+                Some("Twitch channel".to_owned())
+            };
+
+            out.push(QuickSwitchCandidate {
+                entry: QuickSwitchEntry::Channel(channel.clone()),
+                label: format!("{prefix}{}", channel.display_name()),
+                subtitle,
+                unread_count,
+                unread_mentions,
+            });
+        }
+
+        for login in &self.whisper_order {
+            let display_name = self
+                .whisper_display_names
+                .get(login)
+                .filter(|name| !name.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| login.clone());
+            if !whisper_thread_matches_query(login, &display_name, &query) {
+                continue;
+            }
+
+            out.push(QuickSwitchCandidate {
+                entry: QuickSwitchEntry::WhisperThread {
+                    login: login.clone(),
+                },
+                label: format!("@{display_name}"),
+                subtitle: Some("Whisper thread".to_owned()),
+                unread_count: self.whisper_unread.get(login).copied().unwrap_or(0),
+                unread_mentions: self.whisper_unread_mentions.get(login).copied().unwrap_or(0),
+            });
+        }
+
+        // Prioritize mentions, then unread, then everything else.
+        out.sort_by_key(|candidate| {
+            quick_switch_priority_bucket(candidate.unread_mentions, candidate.unread_count)
+        });
+        out
+    }
+
+    fn activate_quick_switch_entry(&mut self, entry: QuickSwitchEntry) {
+        match entry {
+            QuickSwitchEntry::Channel(channel) => self.activate_channel(channel),
+            QuickSwitchEntry::WhisperThread { login } => self.activate_whisper_thread(&login),
+        }
+    }
+
+    /// Returns true when the quick-switch palette is open/consuming hotkeys.
+    fn handle_quick_switch_shortcuts(&mut self, ctx: &Context) -> bool {
+        let open_requested =
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::K));
+        if open_requested {
+            self.open_channel_quick_switch();
+            return true;
+        }
+
+        if !self.quick_switch.open {
+            return false;
+        }
+
+        let (close, up, down, submit) = ctx.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+            )
+        });
+
+        if close {
+            self.close_channel_quick_switch();
+            return true;
+        }
+
+        let candidates = self.quick_switch_candidates();
+        if candidates.is_empty() {
+            if submit {
+                self.close_channel_quick_switch();
+            }
+            return true;
+        }
+
+        self.quick_switch.selected = self.quick_switch.selected.min(candidates.len() - 1);
+        if up {
+            self.quick_switch.selected = if self.quick_switch.selected == 0 {
+                candidates.len() - 1
+            } else {
+                self.quick_switch.selected - 1
+            };
+        }
+        if down {
+            self.quick_switch.selected = (self.quick_switch.selected + 1) % candidates.len();
+        }
+        if submit {
+            let target = candidates[self.quick_switch.selected].entry.clone();
+            self.activate_quick_switch_entry(target);
+            self.close_channel_quick_switch();
+        }
+
+        true
+    }
+
+    fn show_channel_quick_switch(&mut self, ctx: &Context) {
+        if !self.quick_switch.open {
+            return;
+        }
+
+        let mut activate: Option<QuickSwitchEntry> = None;
+        let mut open = self.quick_switch.open;
+        egui::Window::new("Quick Switch")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, -36.0])
+            .show(ctx, |ui| {
+                ui.set_min_width(420.0);
+                ui.label(
+                    RichText::new("Find and switch channels or whisper threads")
+                        .font(t::small())
+                        .color(t::text_secondary()),
+                );
+
+                let input_resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.quick_switch.query)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Type channel/login (supports twitch:, kick:, irc://, whisper:)")
+                );
+                if self.quick_switch.focus_query {
+                    input_resp.request_focus();
+                    self.quick_switch.focus_query = false;
+                }
+
+                if input_resp.changed() {
+                    self.quick_switch.selected = 0;
+                }
+
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("Ctrl+K opens this palette, ↑/↓ navigates, Enter switches")
+                        .font(t::tiny())
+                        .color(t::text_muted()),
+                );
+                ui.add_space(6.0);
+
+                let candidates = self.quick_switch_candidates();
+                if candidates.is_empty() {
+                    ui.label(
+                        RichText::new("No channels match this query")
+                            .font(t::small())
+                            .color(t::text_muted()),
+                    );
+                    return;
+                }
+
+                self.quick_switch.selected = self.quick_switch.selected.min(candidates.len() - 1);
+                let visible_rows = candidates.len().min(QUICK_SWITCH_MAX_ROWS);
+
+                egui::ScrollArea::vertical()
+                    .max_height(visible_rows as f32 * 28.0 + 8.0)
+                    .show(ui, |ui| {
+                        for (idx, candidate) in candidates.iter().enumerate() {
+                            let is_selected = idx == self.quick_switch.selected;
+                            let unread_count = candidate.unread_count;
+                            let unread_mentions = candidate.unread_mentions;
+
+                            let (row_rect, row_resp) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), 24.0),
+                                egui::Sense::click(),
+                            );
+                            let row_fill = if is_selected {
+                                t::tab_selected_bg()
+                            } else if row_resp.hovered() {
+                                t::tab_hover_bg()
+                            } else {
+                                t::bg_surface()
+                            };
+                            ui.painter().rect(
+                                row_rect,
+                                t::RADIUS_SM,
+                                row_fill,
+                                egui::Stroke::new(1.0, t::border_subtle()),
+                                egui::StrokeKind::Middle,
+                            );
+
+                            let mut row_ui = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(row_rect.shrink2(egui::vec2(8.0, 3.0)))
+                                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                            );
+                            row_ui.label(
+                                RichText::new(&candidate.label)
+                                    .font(t::small())
+                                    .color(if is_selected {
+                                        t::text_primary()
+                                    } else {
+                                        t::text_secondary()
+                                    })
+                                    .strong(),
+                            );
+                            if let Some(subtitle) = candidate.subtitle.as_deref() {
+                                row_ui.add_space(6.0);
+                                row_ui.label(
+                                    RichText::new(subtitle)
+                                        .font(t::tiny())
+                                        .color(t::text_muted()),
+                                );
+                            }
+                            row_ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if unread_mentions > 0 {
+                                        channel_tab_badge(
+                                            ui,
+                                            compact_badge_count(unread_mentions),
+                                            t::text_primary(),
+                                            t::mention_pill_bg(),
+                                        );
+                                    } else if unread_count > 0 {
+                                        channel_tab_badge(
+                                            ui,
+                                            compact_badge_count(unread_count),
+                                            t::text_secondary(),
+                                            t::bg_raised(),
+                                        );
+                                    }
+                                },
+                            );
+
+                            if row_resp.hovered() {
+                                self.quick_switch.selected = idx;
+                            }
+                            if row_resp.clicked() {
+                                activate = Some(candidate.entry.clone());
+                            }
+                        }
+                    });
+            });
+
+        if !open {
+            self.close_channel_quick_switch();
+            return;
+        }
+
+        if let Some(entry) = activate {
+            self.activate_quick_switch_entry(entry);
+            self.close_channel_quick_switch();
+        }
+    }
+
     fn record_slash_usage_from_text(&mut self, text: &str) {
         let trimmed = text.trim_start();
         if !trimmed.starts_with('/') {
@@ -4041,8 +4403,11 @@ impl eframe::App for CrustApp {
             self.auth_refresh_inflight = false;
         }
 
-        self.handle_channel_shortcuts(ctx);
-        self.handle_search_shortcuts(ctx);
+        let quick_switch_consumed = self.handle_quick_switch_shortcuts(ctx);
+        if !quick_switch_consumed {
+            self.handle_channel_shortcuts(ctx);
+            self.handle_search_shortcuts(ctx);
+        }
 
         let events = self.drain_events(ctx);
         let had_events = events > 0;
@@ -4304,6 +4669,8 @@ impl eframe::App for CrustApp {
         }
 
         // -- Dialogs -----------------------------------------------------------
+        self.show_channel_quick_switch(ctx);
+
         if let Some(ch) = self
             .join_dialog
             .show(ctx, self.kick_beta_enabled, self.irc_beta_enabled)
@@ -5106,6 +5473,17 @@ impl eframe::App for CrustApp {
                                             .clicked()
                                     {
                                         self.join_dialog.toggle();
+                                        ui.close_menu();
+                                    }
+
+                                    if ui
+                                        .button(
+                                            RichText::new("Quick switch channel (Ctrl+K)")
+                                                .font(t::small()),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.open_channel_quick_switch();
                                         ui.close_menu();
                                     }
 
@@ -6777,6 +7155,81 @@ fn compact_badge_count(count: u32) -> String {
     }
 }
 
+fn quick_switch_priority_bucket(unread_mentions: u32, unread_count: u32) -> u8 {
+    if unread_mentions > 0 {
+        0
+    } else if unread_count > 0 {
+        1
+    } else {
+        2
+    }
+}
+
+fn filter_channels_for_query(channels: &[ChannelId], query: &str) -> Vec<ChannelId> {
+    let query = query.trim().to_ascii_lowercase();
+    channels
+        .iter()
+        .filter(|ch| channel_matches_query(ch, &query))
+        .cloned()
+        .collect()
+}
+
+fn channel_matches_query(channel: &ChannelId, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+
+    let display = channel.display_name().to_ascii_lowercase();
+    if display.contains(query) {
+        return true;
+    }
+
+    if channel.as_str().to_ascii_lowercase().contains(query) {
+        return true;
+    }
+
+    if channel.is_twitch() && format!("twitch:{display}").contains(query) {
+        return true;
+    }
+    if channel.is_kick() && format!("kick:{display}").contains(query) {
+        return true;
+    }
+    if channel.is_irc() {
+        if let Some(target) = channel.irc_target() {
+            let host = target.host.to_ascii_lowercase();
+            if host.contains(query) {
+                return true;
+            }
+            let scheme = if target.tls { "ircs" } else { "irc" };
+            let url_like = format!(
+                "{scheme}://{}:{}/{}",
+                host,
+                target.port,
+                target.channel.to_ascii_lowercase()
+            );
+            if url_like.contains(query) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn whisper_thread_matches_query(login: &str, display_name: &str, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+
+    let login = login.trim().to_ascii_lowercase();
+    let display_name = display_name.trim().to_ascii_lowercase();
+    login.contains(query)
+        || display_name.contains(query)
+        || format!("whisper:{login}").contains(query)
+        || format!("w:{login}").contains(query)
+        || format!("@{display_name}").contains(query)
+}
+
 fn truncate_with_ellipsis(input: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
@@ -8402,7 +8855,9 @@ fn whisper_fit_size(w: u32, h: u32, target_h: f32) -> egui::Vec2 {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_slash_command, responsive_layout, toolbar_visibility, top_tab_metrics, TabVisualStyle,
+        filter_channels_for_query, parse_slash_command, quick_switch_priority_bucket,
+        responsive_layout, toolbar_visibility, top_tab_metrics, whisper_thread_matches_query,
+        TabVisualStyle,
     };
     use crate::theme as t;
     use crust_core::events::AppCommand;
@@ -8473,6 +8928,41 @@ mod tests {
         assert!(visibility.show_irc_in_overflow);
         assert!(visibility.show_overflow_menu);
         assert!(!visibility.compact_controls);
+    }
+
+    #[test]
+    fn quick_switch_filter_matches_platform_prefixes_and_irc_hosts() {
+        let irc = ChannelId::irc("irc.libera.chat", 6697, true, "rust");
+        let channels = vec![ChannelId::new("forsen"), ChannelId::kick("xqc"), irc.clone()];
+
+        assert_eq!(
+            filter_channels_for_query(&channels, "twitch:for"),
+            vec![ChannelId::new("forsen")]
+        );
+        assert_eq!(
+            filter_channels_for_query(&channels, "kick:xq"),
+            vec![ChannelId::kick("xqc")]
+        );
+        assert_eq!(filter_channels_for_query(&channels, "libera"), vec![irc]);
+    }
+
+    #[test]
+    fn quick_switch_priority_orders_mentions_then_unread_then_other() {
+        let mut buckets = vec![(0_u32, 0_u32), (0_u32, 3_u32), (2_u32, 2_u32), (1_u32, 0_u32)];
+        buckets.sort_by_key(|(mentions, unread)| quick_switch_priority_bucket(*mentions, *unread));
+        assert_eq!(buckets, vec![(2, 2), (1, 0), (0, 3), (0, 0)]);
+    }
+
+    #[test]
+    fn whisper_query_matches_prefix_login_and_display_name() {
+        assert!(whisper_thread_matches_query("some_user", "Some User", "w:some"));
+        assert!(whisper_thread_matches_query(
+            "some_user",
+            "Some User",
+            "whisper:some"
+        ));
+        assert!(whisper_thread_matches_query("some_user", "Some User", "@some user"));
+        assert!(!whisper_thread_matches_query("some_user", "Some User", "notthere"));
     }
 
     #[test]
