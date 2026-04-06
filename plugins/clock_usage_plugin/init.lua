@@ -338,19 +338,28 @@ local function render_window()
   end
 end
 
-local function tick()
+local tick
+
+local function start_ticking()
+  if state.ticking then
+    return
+  end
+
+  state.ticking = true
+  c2.later(tick, tick_interval_ms)
+end
+
+tick = function()
   if not state.ticking then
     return
   end
+
   sample_usage()
   if state.window_open then
     render_window()
   end
-  if state.window_open then
-    c2.later(tick, tick_interval_ms)
-  else
-    state.ticking = false
-  end
+
+  c2.later(tick, tick_interval_ms)
 end
 
 c2.register_callback(c2.EventType.PluginUiAction, function(ev)
@@ -384,12 +393,9 @@ end)
 c2.register_command("crusttime", function(ctx)
   ensure_initialized()
   sample_usage()
+  start_ticking()
   state.window_open = true
   render_window()
-  if not state.ticking then
-    state.ticking = true
-    c2.later(tick, tick_interval_ms)
-  end
   c2.ui.open_window("clock_usage")
   return "Opened the Crust Clock window."
 end, {
@@ -397,5 +403,9 @@ end, {
   summary = "Open the Crust Clock window",
   aliases = { "usageclock", "clockui" },
 })
+
+-- Track usage in the background immediately when the plugin is loaded.
+ensure_initialized()
+start_ticking()
 
 c2.log(c2.LogLevel.Info, "Crust Clock Plugin loaded")
