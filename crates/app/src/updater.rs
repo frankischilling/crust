@@ -63,7 +63,10 @@ pub fn platform_supported() -> bool {
 
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
 pub async fn install_update(_update: &AvailableUpdate, _current_pid: u32) -> Result<(), String> {
-    Err("auto-update install is only supported on Windows and Debian Linux".to_owned())
+    Err(
+        "auto-update install is only supported on Windows and Debian-based Linux distributions"
+            .to_owned(),
+    )
 }
 
 #[cfg(target_os = "windows")]
@@ -75,7 +78,10 @@ pub async fn install_update(update: &AvailableUpdate, current_pid: u32) -> Resul
 #[cfg(target_os = "linux")]
 pub async fn install_update(update: &AvailableUpdate, _current_pid: u32) -> Result<(), String> {
     if !is_debian_like_linux() {
-        return Err("auto-update install is only supported on Debian Linux systems".to_owned());
+        return Err(
+            "auto-update install is only supported on Debian-based Linux distributions"
+                .to_owned(),
+        );
     }
 
     let staged = stage_debian_update(update).await?;
@@ -129,7 +135,10 @@ pub async fn check_for_update(current_version: &str) -> Result<UpdateCheckOutcom
 #[cfg(target_os = "linux")]
 pub async fn check_for_update(current_version: &str) -> Result<UpdateCheckOutcome, String> {
     if !is_debian_like_linux() {
-        return Err("auto-update checks are only supported on Debian Linux systems".to_owned());
+        return Err(
+            "auto-update checks are only supported on Debian-based Linux distributions"
+                .to_owned(),
+        );
     }
 
     let current = normalize_version(current_version)?;
@@ -575,6 +584,12 @@ fn is_debian_like_linux() -> bool {
         Err(_) => return false,
     };
 
+    let (id, id_like) = parse_os_release_id_fields(&content);
+    is_debian_family_distro(&id, &id_like)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_os_release_id_fields(content: &str) -> (String, String) {
     let mut id = String::new();
     let mut id_like = String::new();
 
@@ -588,10 +603,42 @@ fn is_debian_like_linux() -> bool {
         }
     }
 
+    (id, id_like)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn is_debian_family_distro(id: &str, id_like: &str) -> bool {
+    const KNOWN_DEBIAN_DERIVATIVE_IDS: &[&str] = &[
+        "debian",
+        "ubuntu",
+        "linuxmint",
+        "pop",
+        "kali",
+        "raspbian",
+        "neon",
+        "elementary",
+        "zorin",
+        "mx",
+        "deepin",
+        "devuan",
+        "parrot",
+        "pureos",
+        "peppermint",
+    ];
+
     let matches = |value: &str| {
         value
-            .split_ascii_whitespace()
-            .any(|token| token == "debian" || token == "ubuntu")
+            .split(|ch: char| ch.is_ascii_whitespace() || ch == ',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(|token| token.trim_matches('"').to_ascii_lowercase())
+            .any(|token| {
+                token == "debian"
+                    || token == "ubuntu"
+                    || KNOWN_DEBIAN_DERIVATIVE_IDS
+                        .iter()
+                        .any(|known| *known == token)
+            })
     };
 
     matches(&id) || matches(&id_like)
@@ -708,6 +755,38 @@ mod tests {
             "amd64"
         ));
         assert!(!is_debian_arch_asset_name("source.zip", "amd64"));
+    }
+
+    #[test]
+    fn debian_family_detection_accepts_derivative_ids() {
+        assert!(is_debian_family_distro("linuxmint", ""));
+        assert!(is_debian_family_distro("kali", ""));
+        assert!(is_debian_family_distro("pop", ""));
+    }
+
+    #[test]
+    fn debian_family_detection_accepts_id_like_tokens() {
+        assert!(is_debian_family_distro("zorin", "ubuntu debian"));
+        assert!(is_debian_family_distro("some-distro", "debian"));
+        assert!(is_debian_family_distro("some-distro", "ubuntu,debian"));
+    }
+
+    #[test]
+    fn debian_family_detection_rejects_non_debian_distros() {
+        assert!(!is_debian_family_distro("fedora", "rhel"));
+        assert!(!is_debian_family_distro("arch", ""));
+    }
+
+    #[test]
+    fn os_release_parser_reads_id_fields() {
+        let payload = r#"
+NAME="Ubuntu"
+ID=ubuntu
+ID_LIKE="debian"
+"#;
+        let (id, id_like) = parse_os_release_id_fields(payload);
+        assert_eq!(id, "ubuntu");
+        assert_eq!(id_like, "debian");
     }
 
     #[test]

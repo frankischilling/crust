@@ -1332,9 +1332,11 @@ fn render_settings_content(
                         .color(t::text_muted()),
                     );
 
-                    if !cfg!(target_os = "windows") {
+                    if !(cfg!(target_os = "windows") || cfg!(target_os = "linux")) {
                         ui.label(
-                            RichText::new("Auto-update is currently only supported on Windows.")
+                            RichText::new(
+                                "Auto-update is currently only supported on Windows and Debian-based Linux distributions.",
+                            )
                                 .font(t::tiny())
                                 .color(t::text_muted()),
                         );

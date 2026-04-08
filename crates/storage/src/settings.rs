@@ -157,7 +157,7 @@ pub struct AppSettings {
     /// Channels being watched for live/offline notifications.
     #[serde(default)]
     pub watched_channels: Vec<crust_core::notifications::WatchedChannel>,
-    // -- Updater settings/state (Windows releases) ---------------------------
+    // -- Updater settings/state (Windows + Debian-based Linux releases) ------
     /// Whether startup/background update checks are enabled.
     #[serde(default = "bool_true")]
     pub update_checks_enabled: bool,
