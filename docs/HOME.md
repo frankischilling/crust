@@ -2,9 +2,11 @@
 
 Start here:
 
+- [Release Notes v0.4.6](./releases/Release_v0.4.6)
 - [Features And Keybinds](./FEATURES_AND_KEYBINDS)
-- [Release Notes v0.4.3](./Release_v0.4.3)
-- [Release Notes v0.4.2](./Release_v0.4.2)
+- [Release Notes v0.4.5](./releases/Release_v0.4.5)
+- [Release Notes v0.4.3](./releases/Release_v0.4.3)
+- [Release Notes v0.4.2](./releases/Release_v0.4.2)
 - [Plugin Installation](./Installation)
 - [Plugin Lifecycle](./Lifecycle)
 - [Plugin API Reference](./API)
