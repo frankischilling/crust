@@ -3,7 +3,7 @@ use serde::Deserialize;
 
 #[cfg(target_os = "windows")]
 use std::ffi::OsStr;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 use std::path::{Path, PathBuf};
 
 const RELEASE_API_URL: &str = "https://api.github.com/repos/frankischilling/crust/releases/latest";
@@ -47,12 +47,23 @@ struct GithubReleaseAsset {
 }
 
 pub fn platform_supported() -> bool {
-    cfg!(target_os = "windows")
+    #[cfg(target_os = "windows")]
+    {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return is_debian_like_linux();
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        false
+    }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 pub async fn install_update(_update: &AvailableUpdate, _current_pid: u32) -> Result<(), String> {
-    Err("auto-update install is only supported on Windows".to_owned())
+    Err("auto-update install is only supported on Windows and Debian Linux".to_owned())
 }
 
 #[cfg(target_os = "windows")]
@@ -61,7 +72,17 @@ pub async fn install_update(update: &AvailableUpdate, current_pid: u32) -> Resul
     launch_installer(&staged, current_pid)
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+pub async fn install_update(update: &AvailableUpdate, _current_pid: u32) -> Result<(), String> {
+    if !is_debian_like_linux() {
+        return Err("auto-update install is only supported on Debian Linux systems".to_owned());
+    }
+
+    let staged = stage_debian_update(update).await?;
+    launch_debian_installer(&staged)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 pub async fn check_for_update(current_version: &str) -> Result<UpdateCheckOutcome, String> {
     let current = normalize_version(current_version)?;
     Ok(UpdateCheckOutcome::UpToDate {
@@ -71,33 +92,8 @@ pub async fn check_for_update(current_version: &str) -> Result<UpdateCheckOutcom
 
 #[cfg(target_os = "windows")]
 pub async fn check_for_update(current_version: &str) -> Result<UpdateCheckOutcome, String> {
-    use std::time::Duration;
-
     let current = normalize_version(current_version)?;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("failed to build update HTTP client: {e}"))?;
-
-    let response = client
-        .get(RELEASE_API_URL)
-        .header(reqwest::header::USER_AGENT, format!("crust/{}", env!("CARGO_PKG_VERSION")))
-        .header(reqwest::header::ACCEPT, GITHUB_ACCEPT_HEADER)
-        .send()
-        .await
-        .map_err(|e| format!("failed to query GitHub releases: {e}"))?;
-
-    if !response.status().is_success() {
-        return Err(format!(
-            "GitHub releases API returned {}",
-            response.status()
-        ));
-    }
-
-    let release: GithubRelease = response
-        .json()
-        .await
-        .map_err(|e| format!("failed to parse GitHub release payload: {e}"))?;
+    let release = fetch_latest_release().await?;
 
     if release.draft {
         return Err("latest release is a draft".to_owned());
@@ -130,12 +126,84 @@ pub async fn check_for_update(current_version: &str) -> Result<UpdateCheckOutcom
     }))
 }
 
+#[cfg(target_os = "linux")]
+pub async fn check_for_update(current_version: &str) -> Result<UpdateCheckOutcome, String> {
+    if !is_debian_like_linux() {
+        return Err("auto-update checks are only supported on Debian Linux systems".to_owned());
+    }
+
+    let current = normalize_version(current_version)?;
+    let release = fetch_latest_release().await?;
+
+    if release.draft {
+        return Err("latest release is a draft".to_owned());
+    }
+    if release.prerelease {
+        return Err("latest release is a prerelease".to_owned());
+    }
+
+    let latest = normalize_version(&release.tag_name)?;
+    if latest <= current {
+        return Ok(UpdateCheckOutcome::UpToDate {
+            current_version: current.to_string(),
+        });
+    }
+
+    let asset = select_debian_asset(&release.assets)
+        .ok_or_else(|| "no Debian .deb asset found for this Linux architecture".to_owned())?;
+
+    let sha256 = parse_sha256_digest(asset.digest.as_deref())
+        .ok_or_else(|| "latest release asset is missing a valid sha256 digest".to_owned())?;
+
+    Ok(UpdateCheckOutcome::UpdateAvailable(AvailableUpdate {
+        version: latest.to_string(),
+        tag_name: release.tag_name,
+        release_url: release.html_url,
+        asset_name: asset.name.clone(),
+        asset_download_url: asset.browser_download_url.clone(),
+        asset_sha256: sha256.to_owned(),
+        published_at: release.published_at,
+    }))
+}
+
+async fn fetch_latest_release() -> Result<GithubRelease, String> {
+    use std::time::Duration;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("failed to build update HTTP client: {e}"))?;
+
+    let response = client
+        .get(RELEASE_API_URL)
+        .header(reqwest::header::USER_AGENT, format!("crust/{}", env!("CARGO_PKG_VERSION")))
+        .header(reqwest::header::ACCEPT, GITHUB_ACCEPT_HEADER)
+        .send()
+        .await
+        .map_err(|e| format!("failed to query GitHub releases: {e}"))?;
+
+    if !response.status().is_success() {
+        return Err(format!("GitHub releases API returned {}", response.status()));
+    }
+
+    response
+        .json()
+        .await
+        .map_err(|e| format!("failed to parse GitHub release payload: {e}"))
+}
+
 #[cfg(target_os = "windows")]
 #[derive(Debug, Clone)]
 struct StagedUpdate {
     target_exe: PathBuf,
     staged_exe: PathBuf,
     installer_script: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+struct StagedDebianUpdate {
+    package_path: PathBuf,
 }
 
 #[cfg(target_os = "windows")]
@@ -170,7 +238,25 @@ async fn stage_update(update: &AvailableUpdate) -> Result<StagedUpdate, String> 
     })
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(target_os = "linux")]
+async fn stage_debian_update(update: &AvailableUpdate) -> Result<StagedDebianUpdate, String> {
+    let stage_dir = make_stage_dir(&update.version).await?;
+    let package_path = stage_dir.join("release.deb");
+
+    download_asset(update, &package_path).await?;
+
+    let actual_sha = sha256_hex(&package_path).await?;
+    if !actual_sha.eq_ignore_ascii_case(update.asset_sha256.as_str()) {
+        return Err(format!(
+            "sha256 mismatch for downloaded update (expected {}, got {})",
+            update.asset_sha256, actual_sha
+        ));
+    }
+
+    Ok(StagedDebianUpdate { package_path })
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 async fn make_stage_dir(version: &str) -> Result<PathBuf, String> {
     let project_dirs = directories::ProjectDirs::from("dev", "crust", "crust")
         .ok_or_else(|| "failed to resolve platform update directory".to_owned())?;
@@ -200,7 +286,7 @@ async fn make_stage_dir(version: &str) -> Result<PathBuf, String> {
     Ok(stage_dir)
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 async fn download_asset(update: &AvailableUpdate, archive_path: &Path) -> Result<(), String> {
     use tokio::io::AsyncWriteExt;
 
@@ -247,7 +333,7 @@ async fn download_asset(update: &AvailableUpdate, archive_path: &Path) -> Result
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 async fn sha256_hex(path: &Path) -> Result<String, String> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
@@ -451,6 +537,66 @@ fn powershell_candidates() -> Vec<String> {
     candidates
 }
 
+#[cfg(target_os = "linux")]
+fn launch_debian_installer(staged: &StagedDebianUpdate) -> Result<(), String> {
+    let package = staged.package_path.as_os_str();
+
+    let xdg_result = std::process::Command::new("xdg-open").arg(package).spawn();
+    match xdg_result {
+        Ok(_) => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(format!(
+                "failed to launch Debian installer via 'xdg-open': {err}"
+            ))
+        }
+    }
+
+    let gio_result = std::process::Command::new("gio")
+        .arg("open")
+        .arg(package)
+        .spawn();
+    match gio_result {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(
+            "failed to launch Debian installer: no desktop opener found (tried: xdg-open, gio open)"
+                .to_owned(),
+        ),
+        Err(err) => Err(format!(
+            "failed to launch Debian installer via 'gio open': {err}"
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn is_debian_like_linux() -> bool {
+    let content = match std::fs::read_to_string("/etc/os-release") {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+
+    let mut id = String::new();
+    let mut id_like = String::new();
+
+    for line in content.lines() {
+        if let Some(value) = line.strip_prefix("ID=") {
+            id = value.trim().trim_matches('"').to_ascii_lowercase();
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("ID_LIKE=") {
+            id_like = value.trim().trim_matches('"').to_ascii_lowercase();
+        }
+    }
+
+    let matches = |value: &str| {
+        value
+            .split_ascii_whitespace()
+            .any(|token| token == "debian" || token == "ubuntu")
+    };
+
+    matches(&id) || matches(&id_like)
+}
+
 fn normalize_version(raw: &str) -> Result<Version, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -463,6 +609,7 @@ fn normalize_version(raw: &str) -> Result<Version, String> {
     Version::parse(normalized).map_err(|e| format!("invalid semantic version '{raw}': {e}"))
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn select_windows_asset(assets: &[GithubReleaseAsset]) -> Option<&GithubReleaseAsset> {
     assets
         .iter()
@@ -470,9 +617,38 @@ fn select_windows_asset(assets: &[GithubReleaseAsset]) -> Option<&GithubReleaseA
         .min_by_key(|asset| asset.name.to_ascii_lowercase())
 }
 
+fn select_debian_asset(assets: &[GithubReleaseAsset]) -> Option<&GithubReleaseAsset> {
+    let arch_candidates = debian_arch_candidates();
+    assets
+        .iter()
+        .filter(|asset| {
+            arch_candidates
+                .iter()
+                .any(|arch| is_debian_arch_asset_name(&asset.name, arch))
+        })
+        .min_by_key(|asset| asset.name.to_ascii_lowercase())
+}
+
+#[cfg(any(target_os = "windows", test))]
 fn is_windows_x64_zip_asset_name(asset_name: &str) -> bool {
     let name = asset_name.to_ascii_lowercase();
     name.ends_with(".zip") && name.contains("windows") && name.contains("x64")
+}
+
+fn is_debian_arch_asset_name(asset_name: &str, arch: &str) -> bool {
+    let name = asset_name.to_ascii_lowercase();
+    let arch = arch.to_ascii_lowercase();
+    name.ends_with(&format!("-debian-{arch}.deb"))
+}
+
+fn debian_arch_candidates() -> &'static [&'static str] {
+    match std::env::consts::ARCH {
+        "x86_64" => &["amd64", "x86_64"],
+        "aarch64" => &["arm64", "aarch64"],
+        "arm" => &["armhf", "arm"],
+        "x86" => &["i386", "x86"],
+        _ => &[std::env::consts::ARCH],
+    }
 }
 
 fn parse_sha256_digest(digest: Option<&str>) -> Option<&str> {
@@ -515,6 +691,23 @@ mod tests {
         assert!(is_windows_x64_zip_asset_name("CRUST-V0.3.0-WINDOWS-X64.ZIP"));
         assert!(!is_windows_x64_zip_asset_name("crust-v0.3.0-linux-x64.tar.gz"));
         assert!(!is_windows_x64_zip_asset_name("source.zip"));
+    }
+
+    #[test]
+    fn debian_asset_detection_matches_expected_pattern() {
+        assert!(is_debian_arch_asset_name(
+            "crust-v0.4.3-debian-amd64.deb",
+            "amd64"
+        ));
+        assert!(is_debian_arch_asset_name(
+            "CRUST-V0.4.3-DEBIAN-ARM64.DEB",
+            "arm64"
+        ));
+        assert!(!is_debian_arch_asset_name(
+            "crust-v0.4.3-linux-amd64.tar.gz",
+            "amd64"
+        ));
+        assert!(!is_debian_arch_asset_name("source.zip", "amd64"));
     }
 
     #[test]

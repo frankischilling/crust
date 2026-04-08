@@ -3175,7 +3175,8 @@ async fn reducer_loop(
                             if manual {
                                 let _ = evt_tx
                                     .send(AppEvent::UpdateCheckFailed {
-                                        message: "Auto-update checks are only supported on Windows.".to_owned(),
+                                        message: "Auto-update checks are only supported on Windows and Debian Linux."
+                                            .to_owned(),
                                         manual,
                                     })
                                     .await;
@@ -3239,7 +3240,7 @@ async fn reducer_loop(
                                 .send(AppEvent::UpdateInstallFailed {
                                     version: String::new(),
                                     message:
-                                        "Auto-update install is only supported on Windows."
+                                        "Auto-update install is only supported on Windows and Debian Linux."
                                             .to_owned(),
                                 })
                                 .await;

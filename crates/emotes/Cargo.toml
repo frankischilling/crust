@@ -20,4 +20,4 @@ tracing = { workspace = true }
 directories = { workspace = true }
 bytes = { workspace = true }
 async-trait = "0.1"
-crust-core = { path = "../core", version = "0.4.4" }
+crust-core = { path = "../core", version = "0.4.5" }
