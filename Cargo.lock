@@ -806,7 +806,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "crust"
-version = "0.4.3"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "arboard",
@@ -838,7 +838,7 @@ dependencies = [
 
 [[package]]
 name = "crust-core"
-version = "0.4.3"
+version = "0.4.5"
 dependencies = [
  "chrono",
  "regex",
@@ -852,7 +852,7 @@ dependencies = [
 
 [[package]]
 name = "crust-emotes"
-version = "0.4.3"
+version = "0.4.5"
 dependencies = [
  "async-trait",
  "bytes",
@@ -870,7 +870,7 @@ dependencies = [
 
 [[package]]
 name = "crust-kick"
-version = "0.4.3"
+version = "0.4.5"
 dependencies = [
  "chrono",
  "crust-core",
@@ -887,7 +887,7 @@ dependencies = [
 
 [[package]]
 name = "crust-storage"
-version = "0.4.3"
+version = "0.4.5"
 dependencies = [
  "chrono",
  "crust-core",
@@ -904,7 +904,7 @@ dependencies = [
 
 [[package]]
 name = "crust-twitch"
-version = "0.4.3"
+version = "0.4.5"
 dependencies = [
  "bytes",
  "chrono",
@@ -924,7 +924,7 @@ dependencies = [
 
 [[package]]
 name = "crust-ui"
-version = "0.4.3"
+version = "0.4.5"
 dependencies = [
  "chrono",
  "crust-core",

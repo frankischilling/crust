@@ -18,7 +18,7 @@ A native Twitch chat client written in Rust.
 
 ## Current status
 
-Active early-stage hobby project with daily-use chat workflows in place. The app builds and runs, plugin APIs are available, and a Windows auto-updater is now implemented. APIs and internals may still evolve.
+Active early-stage hobby project with daily-use chat workflows in place. The app builds and runs, plugin APIs are available, and built-in auto-updater support is now implemented for Windows and Debian Linux systems. APIs and internals may still evolve.
 
 Kick support is currently super cooked and munted (very incomplete / unstable).
 
@@ -27,6 +27,7 @@ Kick support is currently super cooked and munted (very incomplete / unstable).
 - [Crust docs home](docs/HOME.md)
 - [Features and keybinds](docs/FEATURES_AND_KEYBINDS.md)
 - [Plugin API reference](docs/API.md)
+- [Release notes v0.4.5](docs/Release_v0.4.5.md)
 - [Release notes v0.4.3](docs/Release_v0.4.3.md)
 - [Release notes v0.4.2](docs/Release_v0.4.2.md)
 
@@ -200,7 +201,7 @@ See:
 
 ### Updater and release flow
 
-- Windows auto-updater via GitHub Releases:
+- Windows and Debian Linux auto-updater via GitHub Releases:
   - stable-only checks
   - SHA256 verification
   - staged install prompt flow
@@ -222,7 +223,7 @@ See:
 - Rust stable toolchain (edition 2021)
 - Cargo
 - Linux desktop dependencies for `eframe`/`winit` (X11 or Wayland)
-- Windows 10/11 for built-in auto-install updates
+- Windows 10/11 or Debian-based Linux for built-in auto-install updates
 
 ## Build and run
 
@@ -251,6 +252,20 @@ Artifacts are produced at:
 
 - `target\\release\\crust.exe`
 - `dist\\windows\\crust-v<version>-windows-x64.zip`
+
+### Debian release package
+
+Build and package a Debian release `.deb` from Linux:
+
+```bash
+bash ./scripts/build_debian_release.sh
+```
+
+Artifacts are produced at:
+
+- `target/release/crust`
+- `dist/debian/crust-v<version>-debian-<arch>.deb`
+- `dist/debian/crust-v<version>-debian-<arch>.deb.sha256`
 
 ### Running on WSL
 
