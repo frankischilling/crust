@@ -22,6 +22,14 @@ const IMAGES_DONE_PCT: f32 = 0.95;
 /// we don't dismiss the loading screen before any channel data has loaded.
 const MIN_LOADING_GRACE: Duration = Duration::from_secs(2);
 
+/// When startup settings include Twitch auto-join channels, wait up to this
+/// long for join events before allowing completion without them.
+const STARTUP_JOIN_DISCOVERY_GRACE: Duration = Duration::from_secs(12);
+
+/// After this long from join, treat missing history/emote events as settled
+/// so startup doesn't hang forever on channels that never produce ROOMSTATE.
+const CHANNEL_DATA_SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// How long to keep the overlay visible after "ready" before fading out.
 const FADE_DURATION: Duration = Duration::from_millis(700);
 const LOADING_LOG_ROWS: usize = 10;
@@ -40,6 +48,9 @@ pub enum LoadEvent {
     },
     ChannelJoined {
         channel: String,
+    },
+    StartupChannelsConfigured {
+        channels: Vec<String>,
     },
     CatalogLoaded {
         count: usize,
@@ -84,6 +95,8 @@ pub struct LoadingScreen {
     // Progress counters
     authenticated_user: Option<String>,
     channels_joined: Vec<String>,
+    channel_joined_at: std::collections::HashMap<String, Instant>,
+    configured_startup_twitch_channels: HashSet<String>,
     channels_with_history: HashSet<String>,
     channels_with_emotes: HashSet<String>,
     catalog_count: usize,
@@ -111,6 +124,8 @@ impl Default for LoadingScreen {
             auth_optional: false,
             authenticated_user: None,
             channels_joined: Vec::new(),
+            channel_joined_at: std::collections::HashMap::new(),
+            configured_startup_twitch_channels: HashSet::new(),
             channels_with_history: HashSet::new(),
             channels_with_emotes: HashSet::new(),
             catalog_count: 0,
@@ -155,11 +170,22 @@ impl LoadingScreen {
                 self.enter_loading();
             }
             LoadEvent::ChannelJoined { channel } => {
+                let channel = normalize_channel_key(&channel);
                 self.maybe_enter_anonymous_loading();
                 self.push_log(format!("Joined #{channel}"), t::text_primary());
                 if !self.channels_joined.contains(&channel) {
-                    self.channels_joined.push(channel);
+                    self.channels_joined.push(channel.clone());
                 }
+                self.channel_joined_at
+                    .entry(channel.clone())
+                    .or_insert_with(Instant::now);
+                self.check_done();
+            }
+            LoadEvent::StartupChannelsConfigured { channels } => {
+                self.configured_startup_twitch_channels = channels
+                    .into_iter()
+                    .filter_map(|raw| normalize_blocking_twitch_startup_channel(&raw))
+                    .collect();
                 self.check_done();
             }
             LoadEvent::CatalogLoaded { count } => {
@@ -170,6 +196,7 @@ impl LoadingScreen {
                 self.check_done();
             }
             LoadEvent::HistoryLoaded { channel, count } => {
+                let channel = normalize_channel_key(&channel);
                 self.maybe_enter_anonymous_loading();
                 self.push_log(
                     format!("#{channel}: {count} history messages"),
@@ -180,7 +207,12 @@ impl LoadingScreen {
             }
             LoadEvent::EmoteImageReady => {
                 self.maybe_enter_anonymous_loading();
-                self.images_loaded += 1;
+                // Not all EmoteImageReady events come from prefetch queues
+                // (avatars/link previews/plugins can emit them too). Clamp to
+                // the queued total so counters don't run past expected.
+                if self.images_loaded < self.images_expected {
+                    self.images_loaded += 1;
+                }
                 // Re-check done on every image arrival.
                 self.check_done();
             }
@@ -190,6 +222,7 @@ impl LoadingScreen {
                 // Don't log - too noisy.
             }
             LoadEvent::ChannelEmotesLoaded { channel, count } => {
+                let channel = normalize_channel_key(&channel);
                 self.maybe_enter_anonymous_loading();
                 if count > 0 {
                     self.push_log(
@@ -430,7 +463,7 @@ impl LoadingScreen {
                                         };
                                         pills.push((
                                             format!(
-                                                "{} / {} images ({pct}%)",
+                                                "{} / {} images prefetched ({pct}%)",
                                                 self.images_loaded, self.images_expected
                                             ),
                                             c,
@@ -473,21 +506,28 @@ impl LoadingScreen {
                                         }
                                     });
 
+                                    let startup_prog = self.startup_progress();
+                                    ui.add_space(8.0);
+                                    let bar_w = ui.available_width().min(details_w);
+                                    ui.add(
+                                        egui::widgets::ProgressBar::new(startup_prog)
+                                            .fill(a(t::accent()))
+                                            .desired_width(bar_w)
+                                            .text(format!(
+                                                "Startup progress: {}%",
+                                                (startup_prog * 100.0).round() as usize
+                                            )),
+                                    );
+
                                     if self.images_expected > 0 {
-                                        let prog = (self.images_loaded as f32
-                                            / self.images_expected as f32)
-                                            .clamp(0.0, 1.0);
-                                        ui.add_space(8.0);
-                                        let bar_w = ui.available_width().min(details_w);
-                                        ui.add(
-                                            egui::widgets::ProgressBar::new(prog)
-                                                .fill(a(t::accent()))
-                                                .desired_width(bar_w)
-                                                .text(format!(
-                                                    "Image prefetch: {} / {}",
-                                                    self.images_loaded,
-                                                    self.images_expected
-                                                )),
+                                        ui.add_space(4.0);
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "Background image prefetch: {} / {}",
+                                                self.images_loaded, self.images_expected
+                                            ))
+                                            .font(t::tiny())
+                                            .color(a(t::text_muted())),
                                         );
                                     }
 
@@ -686,18 +726,26 @@ impl LoadingScreen {
                             );
                         }
 
+                        let startup_prog = self.startup_progress();
+                        ui.add_space(6.0);
+                        ui.add(
+                            egui::widgets::ProgressBar::new(startup_prog)
+                                .fill(a(t::accent()))
+                                .desired_width(ui.available_width())
+                                .text(format!(
+                                    "Startup: {}%",
+                                    (startup_prog * 100.0).round() as usize
+                                )),
+                        );
+
                         if self.images_expected > 0 {
-                            let prog = (self.images_loaded as f32 / self.images_expected as f32)
-                                .clamp(0.0, 1.0);
-                            ui.add_space(6.0);
-                            ui.add(
-                                egui::widgets::ProgressBar::new(prog)
-                                    .fill(a(t::accent()))
-                                    .desired_width(ui.available_width())
-                                    .text(format!(
-                                        "Images: {} / {}",
-                                        self.images_loaded, self.images_expected
-                                    )),
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Background images: {} / {}",
+                                    self.images_loaded, self.images_expected
+                                ))
+                                .font(t::tiny())
+                                .color(a(t::text_muted())),
                             );
                         }
 
@@ -804,21 +852,48 @@ impl LoadingScreen {
                 return;
             }
         }
-        let auth_ok = self.authenticated_user.is_some() || self.auth_optional;
-        let catalog_ok = self.catalog_loaded;
-        // Non-Twitch channels don't currently emit full history/emote-load
-        // signals. Don't block startup on those platform-specific side paths.
+
         let startup_channels: Vec<&String> = self
             .channels_joined
             .iter()
             .filter(|ch| is_blocking_twitch_startup_channel(ch))
             .collect();
-        let history_ok = startup_channels
+
+        let configured_startup_count = self.configured_startup_twitch_channels.len();
+        if configured_startup_count > 0 {
+            let joined_configured_count = startup_channels
+                .iter()
+                .filter(|ch| self.configured_startup_twitch_channels.contains(ch.as_str()))
+                .count();
+            if joined_configured_count < configured_startup_count {
+                if let Some(entered) = self.loading_entered_at {
+                    if entered.elapsed() < STARTUP_JOIN_DISCOVERY_GRACE {
+                        return;
+                    }
+                }
+            }
+        }
+
+        let auth_ok = self.authenticated_user.is_some() || self.auth_optional;
+        let catalog_ok = self.catalog_loaded;
+        // Non-Twitch channels don't currently emit full history/emote-load
+        // signals. Don't block startup on those platform-specific side paths.
+        let tracked_startup_channels: Vec<&String> = if self.configured_startup_twitch_channels
+            .is_empty()
+        {
+            startup_channels
+        } else {
+            startup_channels
+                .into_iter()
+                .filter(|ch| self.configured_startup_twitch_channels.contains(ch.as_str()))
+                .collect()
+        };
+        let history_ok = tracked_startup_channels
             .iter()
-            .all(|ch| self.channels_with_history.contains(*ch));
-        let emotes_ok = startup_channels
+            .all(|ch| self.channel_history_settled(ch));
+        let emotes_ok = tracked_startup_channels
             .iter()
-            .all(|ch| self.channels_with_emotes.contains(*ch));
+            .all(|ch| self.channel_emotes_settled(ch));
         // Images are prefetched in the background - don't block the loading
         // screen on them.  They'll fill in shortly after the overlay fades.
         if auth_ok && catalog_ok && history_ok && emotes_ok {
@@ -833,6 +908,90 @@ impl LoadingScreen {
         }
     }
 
+    fn startup_progress(&self) -> f32 {
+        if matches!(self.phase, Phase::Ready | Phase::Done) {
+            return 1.0;
+        }
+
+        let auth_ok = self.authenticated_user.is_some() || self.auth_optional;
+        let observed_blocking_channels: Vec<&String> = self
+            .channels_joined
+            .iter()
+            .filter(|ch| is_blocking_twitch_startup_channel(ch))
+            .collect();
+
+        let configured_count = self.configured_startup_twitch_channels.len();
+        let join_target = if configured_count > 0 {
+            configured_count
+        } else {
+            observed_blocking_channels.len()
+        };
+
+        let joined_count = if configured_count > 0 {
+            observed_blocking_channels
+                .iter()
+                .filter(|ch| self.configured_startup_twitch_channels.contains(ch.as_str()))
+                .count()
+        } else {
+            observed_blocking_channels.len()
+        };
+
+        let tracked_channels: Vec<&String> = if configured_count > 0 {
+            observed_blocking_channels
+                .into_iter()
+                .filter(|ch| self.configured_startup_twitch_channels.contains(ch.as_str()))
+                .collect()
+        } else {
+            observed_blocking_channels
+        };
+
+        let history_count = tracked_channels
+            .iter()
+            .filter(|ch| self.channel_history_settled(ch))
+            .count();
+        let emotes_count = tracked_channels
+            .iter()
+            .filter(|ch| self.channel_emotes_settled(ch))
+            .count();
+
+        let total_units = 2 + (join_target * 3);
+        let mut done_units = 0usize;
+        if auth_ok {
+            done_units += 1;
+        }
+        if self.catalog_loaded {
+            done_units += 1;
+        }
+        done_units += joined_count.min(join_target);
+        done_units += history_count.min(join_target);
+        done_units += emotes_count.min(join_target);
+
+        if total_units == 0 {
+            return 1.0;
+        }
+
+        let mut progress = (done_units as f32 / total_units as f32).clamp(0.0, 1.0);
+        if self.phase == Phase::Loading && progress >= 1.0 {
+            progress = 0.99;
+        }
+        progress
+    }
+
+    fn channel_history_settled(&self, channel: &str) -> bool {
+        self.channels_with_history.contains(channel) || self.channel_data_timed_out(channel)
+    }
+
+    fn channel_emotes_settled(&self, channel: &str) -> bool {
+        self.channels_with_emotes.contains(channel) || self.channel_data_timed_out(channel)
+    }
+
+    fn channel_data_timed_out(&self, channel: &str) -> bool {
+        self.channel_joined_at
+            .get(channel)
+            .map(|joined_at| joined_at.elapsed() >= CHANNEL_DATA_SETTLE_TIMEOUT)
+            .unwrap_or(false)
+    }
+
     fn mark_ready(&mut self) {
         if self.phase == Phase::Loading
             || self.phase == Phase::Connecting
@@ -844,16 +1003,29 @@ impl LoadingScreen {
     }
 }
 
-fn is_blocking_twitch_startup_channel(raw: &str) -> bool {
+fn normalize_channel_key(raw: &str) -> String {
+    raw.trim().trim_start_matches('#').to_ascii_lowercase()
+}
+
+fn normalize_blocking_twitch_startup_channel(raw: &str) -> Option<String> {
     if raw.starts_with("kick:") || raw.starts_with("irc:") {
-        return false;
+        return None;
     }
-    let login = raw.trim_start_matches('#');
+    let login = normalize_channel_key(raw);
     let len = login.len();
     if !(3..=25).contains(&len) {
-        return false;
+        return None;
     }
-    login
+    if login
         .bytes()
         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    {
+        Some(login)
+    } else {
+        None
+    }
+}
+
+fn is_blocking_twitch_startup_channel(raw: &str) -> bool {
+    normalize_blocking_twitch_startup_channel(raw).is_some()
 }

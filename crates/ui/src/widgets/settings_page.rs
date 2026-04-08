@@ -124,6 +124,8 @@ pub struct SettingsPageState {
     pub request_skip_available_update: bool,
     /// Request opening the available release page.
     pub request_open_available_release: bool,
+    /// Request simulating a gifted sub event toast/notification.
+    pub request_test_gifted_sub_alert: bool,
 }
 
 pub fn parse_settings_lines(input: &str, lowercase: bool) -> Vec<String> {
@@ -1368,6 +1370,10 @@ fn render_settings_content(
                         ui.horizontal_wrapped(|ui| {
                             if ui.button("Check now").clicked() {
                                 state.request_update_check_now = true;
+                            }
+
+                            if ui.button("Test gifted sub alert").clicked() {
+                                state.request_test_gifted_sub_alert = true;
                             }
 
                             if let Some(version) = state.updater_available_version.as_ref() {

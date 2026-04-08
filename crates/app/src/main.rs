@@ -262,6 +262,7 @@ fn main() -> Result<()> {
     // Build tokio runtime on background threads (eframe needs main thread)
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
+        .thread_stack_size(32 * 1024 * 1024)
         .enable_all()
         .build()?;
 

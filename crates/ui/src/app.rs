@@ -429,6 +429,8 @@ struct ToolbarVisibility {
     show_whispers_in_overflow: bool,
     show_irc_toggle: bool,
     show_irc_in_overflow: bool,
+    show_mod_button: bool,
+    show_mod_in_overflow: bool,
     show_emote_count: bool,
 }
 
@@ -442,6 +444,7 @@ const TOOLBAR_JOIN_LABEL_W: f32 = 32.0;
 const TOOLBAR_ACCOUNT_PILL_W: f32 = 118.0;
 const TOOLBAR_OVERFLOW_W: f32 = 30.0;
 const TOOLBAR_EMOTE_LABEL_W: f32 = 94.0;
+const TOOLBAR_MOD_BUTTON_W: f32 = 42.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ToolbarDegradeStep {
@@ -450,6 +453,7 @@ enum ToolbarDegradeStep {
     HideConnectionLabel,
     HideLogo,
     HideWhispersToggle,
+    HideModButton,
     HideIrcToggle,
     HideStatsToggle,
     HidePerfToggle,
@@ -536,6 +540,9 @@ fn estimate_toolbar_required_width(visibility: &ToolbarVisibility) -> f32 {
     if visibility.show_irc_toggle {
         icon_count += 1;
     }
+    if visibility.show_mod_button {
+        width += TOOLBAR_MOD_BUTTON_W + 4.0;
+    }
     width + estimate_toolbar_group_width(icon_count, 4.0, visibility.compact_controls)
 }
 
@@ -546,6 +553,7 @@ fn apply_toolbar_degrade_step(visibility: &mut ToolbarVisibility, step: ToolbarD
         ToolbarDegradeStep::HideConnectionLabel => visibility.show_connection_label = false,
         ToolbarDegradeStep::HideLogo => visibility.show_logo = false,
         ToolbarDegradeStep::HideWhispersToggle => visibility.show_whispers_toggle = false,
+        ToolbarDegradeStep::HideModButton => visibility.show_mod_button = false,
         ToolbarDegradeStep::HideIrcToggle => visibility.show_irc_toggle = false,
         ToolbarDegradeStep::HideStatsToggle => visibility.show_stats_toggle = false,
         ToolbarDegradeStep::HidePerfToggle => visibility.show_perf_toggle = false,
@@ -561,7 +569,11 @@ fn apply_toolbar_degrade_step(visibility: &mut ToolbarVisibility, step: ToolbarD
     }
 }
 
-fn finalize_toolbar_visibility(visibility: &mut ToolbarVisibility, irc_beta_enabled: bool) {
+fn finalize_toolbar_visibility(
+    visibility: &mut ToolbarVisibility,
+    irc_beta_enabled: bool,
+    moderation_available: bool,
+) {
     if !irc_beta_enabled {
         visibility.show_irc_toggle = false;
         visibility.show_irc_in_overflow = false;
@@ -572,6 +584,12 @@ fn finalize_toolbar_visibility(visibility: &mut ToolbarVisibility, irc_beta_enab
     visibility.show_perf_in_overflow = !visibility.show_perf_toggle;
     visibility.show_stats_in_overflow = !visibility.show_stats_toggle;
     visibility.show_whispers_in_overflow = !visibility.show_whispers_toggle;
+    if !moderation_available {
+        visibility.show_mod_button = false;
+        visibility.show_mod_in_overflow = false;
+    } else {
+        visibility.show_mod_in_overflow = !visibility.show_mod_button;
+    }
 
     if !visibility.show_join_button {
         visibility.show_join_text = false;
@@ -582,10 +600,15 @@ fn finalize_toolbar_visibility(visibility: &mut ToolbarVisibility, irc_beta_enab
         || visibility.show_perf_in_overflow
         || visibility.show_stats_in_overflow
         || visibility.show_whispers_in_overflow
-        || visibility.show_irc_in_overflow;
+        || visibility.show_irc_in_overflow
+        || visibility.show_mod_in_overflow;
 }
 
-fn toolbar_visibility(bar_width: f32, irc_beta_enabled: bool) -> ToolbarVisibility {
+fn toolbar_visibility(
+    bar_width: f32,
+    irc_beta_enabled: bool,
+    moderation_available: bool,
+) -> ToolbarVisibility {
     let mut visibility = ToolbarVisibility {
         compact_controls: false,
         compact_account: false,
@@ -605,15 +628,18 @@ fn toolbar_visibility(bar_width: f32, irc_beta_enabled: bool) -> ToolbarVisibili
         show_whispers_in_overflow: false,
         show_irc_toggle: irc_beta_enabled,
         show_irc_in_overflow: false,
+        show_mod_button: moderation_available,
+        show_mod_in_overflow: false,
         show_emote_count: true,
     };
 
-    const STEPS: [ToolbarDegradeStep; 13] = [
+    const STEPS: [ToolbarDegradeStep; 14] = [
         ToolbarDegradeStep::HideEmoteCount,
         ToolbarDegradeStep::HideJoinText,
         ToolbarDegradeStep::HideConnectionLabel,
         ToolbarDegradeStep::HideLogo,
         ToolbarDegradeStep::HideWhispersToggle,
+        ToolbarDegradeStep::HideModButton,
         ToolbarDegradeStep::HideIrcToggle,
         ToolbarDegradeStep::HideStatsToggle,
         ToolbarDegradeStep::HidePerfToggle,
@@ -621,18 +647,19 @@ fn toolbar_visibility(bar_width: f32, irc_beta_enabled: bool) -> ToolbarVisibili
         ToolbarDegradeStep::CompactControls,
         ToolbarDegradeStep::UltraCompactAccount,
         ToolbarDegradeStep::HideSidebarActions,
+        // keep join hidden as the final fallback
         ToolbarDegradeStep::HideJoinButton,
     ];
 
     for step in STEPS {
-        finalize_toolbar_visibility(&mut visibility, irc_beta_enabled);
+        finalize_toolbar_visibility(&mut visibility, irc_beta_enabled, moderation_available);
         if estimate_toolbar_required_width(&visibility) <= bar_width {
             break;
         }
         apply_toolbar_degrade_step(&mut visibility, step);
     }
 
-    finalize_toolbar_visibility(&mut visibility, irc_beta_enabled);
+    finalize_toolbar_visibility(&mut visibility, irc_beta_enabled, moderation_available);
 
     // Extreme fallback to keep controls coherent on tiny windows.
     if estimate_toolbar_required_width(&visibility) > bar_width {
@@ -647,11 +674,12 @@ fn toolbar_visibility(bar_width: f32, irc_beta_enabled: bool) -> ToolbarVisibili
         visibility.show_stats_toggle = false;
         visibility.show_whispers_toggle = false;
         visibility.show_irc_toggle = false;
+        visibility.show_mod_button = false;
         if bar_width < 300.0 {
             visibility.show_join_button = false;
             visibility.show_join_in_overflow = true;
         }
-        finalize_toolbar_visibility(&mut visibility, irc_beta_enabled);
+        finalize_toolbar_visibility(&mut visibility, irc_beta_enabled, moderation_available);
     }
 
     visibility
@@ -1389,6 +1417,23 @@ exit 1
             confetti,
             born: std::time::Instant::now(),
         });
+    }
+
+    fn trigger_test_gifted_sub_alert(&mut self, ctx: &Context) {
+        self.push_event_toast(
+            "🎉🎊  You received a gifted Tier 1 sub!".to_owned(),
+            t::raid_cyan(),
+            true,
+        );
+
+        if self.desktop_notifications_enabled {
+            self.request_user_attention(ctx, egui::UserAttentionType::Informational);
+            self.dispatch_desktop_notification(
+                "Crust Gifted Sub Test",
+                "Test alert: You received a gifted Tier 1 sub!",
+                true,
+            );
+        }
     }
 
     fn enqueue_event_toast(&mut self, toast: EventToast) {
@@ -2246,6 +2291,12 @@ exit 1
                 self.loading_screen.on_event(LoadEvent::Authenticated {
                     username: username.clone(),
                 })
+            }
+            AppEvent::GeneralSettingsUpdated { auto_join, .. } => {
+                self.loading_screen
+                    .on_event(LoadEvent::StartupChannelsConfigured {
+                        channels: auto_join.clone(),
+                    })
             }
             AppEvent::ChannelJoined { channel } => {
                 self.loading_screen.on_event(LoadEvent::ChannelJoined {
@@ -4760,6 +4811,7 @@ impl eframe::App for CrustApp {
                 request_update_install_now: false,
                 request_skip_available_update: false,
                 request_open_available_release: false,
+                request_test_gifted_sub_alert: false,
                 highlight_rules: self.settings_highlight_rules.clone(),
                 highlight_rule_bufs: self.settings_highlight_rule_bufs.clone(),
                 filter_records: self.settings_filter_records.clone(),
@@ -4922,6 +4974,9 @@ impl eframe::App for CrustApp {
                 if let Some(url) = self.updater_available_release_url.clone() {
                     self.send_cmd(AppCommand::OpenUrl { url });
                 }
+            }
+            if state.request_test_gifted_sub_alert {
+                self.trigger_test_gifted_sub_alert(ctx);
             }
             if state.show_timestamps != self.show_timestamps
                 || state.show_timestamp_seconds != self.show_timestamp_seconds
@@ -5313,7 +5368,8 @@ impl eframe::App for CrustApp {
             )
             .show(ctx, |ui| {
                 let bar_width = ui.available_width();
-                let visibility = toolbar_visibility(bar_width, self.irc_beta_enabled);
+                let visibility =
+                    toolbar_visibility(bar_width, self.irc_beta_enabled, moderation_available);
                 let compact_account = visibility.compact_account;
                 let sidebar_open =
                     self.channel_layout == ChannelLayout::Sidebar && self.sidebar_visible;
@@ -5495,7 +5551,8 @@ impl eframe::App for CrustApp {
                                         ui.close_menu();
                                     }
 
-                                    if moderation_available
+                                    if visibility.show_mod_in_overflow
+                                        && moderation_available
                                         && ui
                                             .button(
                                                 RichText::new("Moderation tools").font(t::small()),
@@ -5630,19 +5687,21 @@ impl eframe::App for CrustApp {
                                     egui::Layout::left_to_right(egui::Align::Center),
                                     |ui| {
                                         ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
-                                        let mod_button = ui.add_enabled(
-                                            moderation_available,
-                                            egui::Button::new(RichText::new("Mod").font(t::tiny())),
-                                        );
-                                        if mod_button.clicked() {
-                                            self.mod_tools_open = !self.mod_tools_open;
-                                            if self.mod_tools_open {
-                                                if let Some(channel) =
-                                                    moderation_channel_toolbar.clone()
-                                                {
-                                                    self.send_cmd(AppCommand::FetchUnbanRequests {
-                                                        channel,
-                                                    });
+                                        if visibility.show_mod_button {
+                                            let mod_button = ui.add_enabled(
+                                                moderation_available,
+                                                egui::Button::new(RichText::new("Mod").font(t::tiny())),
+                                            );
+                                            if mod_button.clicked() {
+                                                self.mod_tools_open = !self.mod_tools_open;
+                                                if self.mod_tools_open {
+                                                    if let Some(channel) =
+                                                        moderation_channel_toolbar.clone()
+                                                    {
+                                                        self.send_cmd(AppCommand::FetchUnbanRequests {
+                                                            channel,
+                                                        });
+                                                    }
                                                 }
                                             }
                                         }
@@ -7062,14 +7121,22 @@ impl eframe::App for CrustApp {
                 .interactable(false)
                 .show(ctx, |ui| {
                     ui.set_max_width(360.0);
-                    let border_col = t::alpha(toast.hue, (160.0 * opacity) as u8);
+                    let time = ctx.input(|input| input.time) as f32;
+                    let border_stroke = if toast.confetti {
+                        egui::Stroke::new(
+                            1.6,
+                            rainbow_color((time * 0.16 + age * 0.35).fract(), (200.0 * opacity) as u8),
+                        )
+                    } else {
+                        egui::Stroke::new(1.5, t::alpha(toast.hue, (160.0 * opacity) as u8))
+                    };
                     let fill_col = {
                         let o = t::overlay_fill();
                         t::alpha(o, (225.0 * opacity) as u8)
                     };
                     let frame_resp = egui::Frame::new()
                         .fill(fill_col)
-                        .stroke(egui::Stroke::new(1.5, border_col))
+                        .stroke(border_stroke)
                         .corner_radius(egui::CornerRadius::same(8))
                         .inner_margin(egui::Margin::symmetric(14, 8))
                         .show(ui, |ui| {
@@ -7084,20 +7151,15 @@ impl eframe::App for CrustApp {
                     if toast.confetti {
                         let rect = frame_resp.response.rect.expand(4.0);
                         let painter = ui.painter();
-                        for n in 0..14 {
+                        for n in 0..24 {
                             let seed = (n as f32) * 17.0 + (i as f32) * 5.0;
                             let base_x = rect.left() + ((seed * 0.37).fract() * rect.width());
                             let drop = ((seed * 0.11) + age * 0.85).fract();
                             let y = rect.top() - 3.0 + drop * (rect.height() + 10.0);
                             let drift = ((age * 5.2) + seed * 0.23).sin() * 3.2;
                             let x = (base_x + drift).clamp(rect.left(), rect.right());
-                            let c = match n % 4 {
-                                0 => t::raid_cyan(),
-                                1 => t::gold(),
-                                2 => t::accent(),
-                                _ => t::bits_orange(),
-                            };
-                            let col = t::alpha(c, (180.0 * opacity) as u8);
+                            let hue = ((n as f32 / 24.0) + time * 0.18 + age * 0.4).fract();
+                            let col = rainbow_color(hue, (190.0 * opacity) as u8);
                             painter.circle_filled(
                                 egui::pos2(x, y),
                                 1.6 + (n % 3) as f32 * 0.45,
@@ -7153,6 +7215,11 @@ fn compact_badge_count(count: u32) -> String {
     } else {
         count.to_string()
     }
+}
+
+fn rainbow_color(hue: f32, alpha: u8) -> Color32 {
+    let hsva = egui::ecolor::Hsva::new(hue.rem_euclid(1.0), 0.82, 1.0, alpha as f32 / 255.0);
+    Color32::from(hsva)
 }
 
 fn quick_switch_priority_bucket(unread_mentions: u32, unread_count: u32) -> u8 {
@@ -8899,17 +8966,17 @@ mod tests {
 
     #[test]
     fn toolbar_hides_irc_controls_when_irc_beta_is_disabled() {
-        let hidden = toolbar_visibility(900.0, false);
+        let hidden = toolbar_visibility(900.0, false, true);
         assert!(!hidden.show_irc_toggle);
         assert!(!hidden.show_irc_in_overflow);
 
-        let shown = toolbar_visibility(900.0, true);
+        let shown = toolbar_visibility(900.0, true, true);
         assert!(shown.show_irc_toggle);
     }
 
     #[test]
     fn toolbar_keeps_regular_icon_size_until_space_is_tight() {
-        let visibility = toolbar_visibility(520.0, true);
+        let visibility = toolbar_visibility(520.0, true, true);
         assert!(visibility.show_join_button);
         assert!(visibility.show_perf_toggle);
         assert!(visibility.show_stats_toggle);
@@ -8918,7 +8985,7 @@ mod tests {
 
     #[test]
     fn toolbar_hides_diagnostics_before_hiding_core_actions() {
-        let visibility = toolbar_visibility(350.0, true);
+        let visibility = toolbar_visibility(350.0, true, true);
         assert!(visibility.show_join_button);
         assert!(!visibility.show_perf_toggle);
         assert!(!visibility.show_stats_toggle);
