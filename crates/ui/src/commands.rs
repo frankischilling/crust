@@ -540,6 +540,48 @@ const BUILTIN_SLASH_COMMANDS: &[SlashCommandInfo] = &[
         summary: "Reply to your most recent whisper (server-side).",
         aliases: &[],
     },
+    SlashCommandInfo {
+        name: "logs",
+        usage: "/logs",
+        summary: "Open the Crust log/data folder in the system file manager.",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "shield",
+        usage: "/shield <on|off>",
+        summary: "Toggle Twitch Shield Mode for this channel (mod/broadcaster only).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "setgame",
+        usage: "/setgame <category>",
+        summary: "Update the Twitch stream category (broadcaster only).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "settitle",
+        usage: "/settitle <title>",
+        summary: "Update the Twitch stream title (broadcaster only).",
+        aliases: &[],
+    },
+    SlashCommandInfo {
+        name: "follow-age",
+        usage: "/follow-age [user]",
+        summary: "Report how long a user has followed this channel (defaults to you).",
+        aliases: &["followage"],
+    },
+    SlashCommandInfo {
+        name: "account-age",
+        usage: "/account-age [user]",
+        summary: "Report the Twitch account age for a user (defaults to you).",
+        aliases: &["accountage"],
+    },
+    SlashCommandInfo {
+        name: "live",
+        usage: "/live",
+        summary: "List currently live Twitch channels that crust is tracking.",
+        aliases: &[],
+    },
 ];
 
 /// Return all built-in commands.
@@ -644,7 +686,7 @@ pub fn slash_command_matches_ranked(
     usage_counts: &HashMap<String, u32>,
 ) -> Vec<SlashCommandSuggestion> {
     let q = query.to_ascii_lowercase();
-    let mut matches: Vec<(SlashCommandSuggestion, u8)> = built_in_commands()
+    let mut matches: Vec<(SlashCommandSuggestion, u8, String)> = built_in_commands()
         .iter()
         .map(SlashCommandSuggestion::from)
         .chain(
@@ -658,45 +700,51 @@ pub fn slash_command_matches_ranked(
                 }),
         )
         .filter_map(|cmd| {
-            if q.is_empty() {
-                return Some((cmd, 1));
-            }
-
+            // Compute the lowercase name once per cmd and reuse for all
+            // match tests + the final sort key.  Aliases use
+            // `eq_ignore_ascii_case` / substring tests that allocate
+            // only for the contains fallback (rare).
             let name = cmd.name.to_ascii_lowercase();
-            let aliases: Vec<String> = cmd
-                .aliases
-                .iter()
-                .map(|al| al.to_ascii_lowercase())
-                .collect();
 
-            let exact = name == q || aliases.iter().any(|al| al == &q);
+            if q.is_empty() {
+                return Some((cmd, 1, name));
+            }
+
+            let exact = name == q
+                || cmd.aliases.iter().any(|al| al.eq_ignore_ascii_case(&q));
             if exact {
-                return Some((cmd, 0));
+                return Some((cmd, 0, name));
             }
 
-            let prefix = name.starts_with(&q) || aliases.iter().any(|al| al.starts_with(&q));
+            let prefix = name.starts_with(&q)
+                || cmd
+                    .aliases
+                    .iter()
+                    .any(|al| starts_with_ignore_ascii_case(al, &q));
             if prefix {
-                return Some((cmd, 1));
+                return Some((cmd, 1, name));
             }
 
-            let contains = name.contains(&q) || aliases.iter().any(|al| al.contains(&q));
+            let contains = name.contains(&q)
+                || cmd
+                    .aliases
+                    .iter()
+                    .any(|al| contains_ignore_ascii_case(al, &q));
             if contains {
-                return Some((cmd, 2));
+                return Some((cmd, 2, name));
             }
 
-            let summary_contains = cmd.summary.to_ascii_lowercase().contains(&q)
-                || cmd.usage.to_ascii_lowercase().contains(&q);
+            let summary_contains = contains_ignore_ascii_case(&cmd.summary, &q)
+                || contains_ignore_ascii_case(&cmd.usage, &q);
             if summary_contains {
-                return Some((cmd, 3));
+                return Some((cmd, 3, name));
             }
 
             None
         })
         .collect();
 
-    matches.sort_by(|(a, a_rank), (b, b_rank)| {
-        let a_name = a.name.to_ascii_lowercase();
-        let b_name = b.name.to_ascii_lowercase();
+    matches.sort_by(|(a, a_rank, a_name), (b, b_rank, b_name)| {
         let a_usage = usage_weight(a, usage_counts);
         let b_usage = usage_weight(b, usage_counts);
 
@@ -704,11 +752,48 @@ pub fn slash_command_matches_ranked(
             .cmp(b_rank)
             .then_with(|| b_usage.cmp(&a_usage))
             .then_with(|| a_name.len().cmp(&b_name.len()))
-            .then_with(|| a_name.cmp(&b_name))
+            .then_with(|| a_name.cmp(b_name))
     });
 
     matches.truncate(limit);
-    matches.into_iter().map(|(cmd, _)| cmd).collect()
+    matches.into_iter().map(|(cmd, _, _)| cmd).collect()
+}
+
+fn starts_with_ignore_ascii_case(hay: &str, needle: &str) -> bool {
+    let h = hay.as_bytes();
+    let n = needle.as_bytes();
+    if h.len() < n.len() {
+        return false;
+    }
+    h[..n.len()]
+        .iter()
+        .zip(n.iter())
+        .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+fn contains_ignore_ascii_case(hay: &str, needle: &str) -> bool {
+    let n = needle.as_bytes();
+    if n.is_empty() {
+        return true;
+    }
+    let h = hay.as_bytes();
+    if n.len() > h.len() {
+        return false;
+    }
+    let first = n[0].to_ascii_lowercase();
+    let last_start = h.len() - n.len();
+    'outer: for start in 0..=last_start {
+        if h[start].to_ascii_lowercase() != first {
+            continue;
+        }
+        for i in 1..n.len() {
+            if !h[start + i].eq_ignore_ascii_case(&n[i]) {
+                continue 'outer;
+            }
+        }
+        return true;
+    }
+    false
 }
 
 fn usage_weight(cmd: &SlashCommandSuggestion, usage_counts: &HashMap<String, u32>) -> u32 {

@@ -4,7 +4,12 @@ use egui::RichText;
 use crate::theme as t;
 use crate::widgets::chrome::{self, ChromeIcon, IconButtonState};
 
-pub const SPLIT_HEADER_HEIGHT: f32 = 26.0;
+/// Height of the per-split header strip. Scales with chat font so text +
+/// icons don't clip at larger font sizes.
+#[inline]
+pub fn split_header_height() -> f32 {
+    26.0 * t::font_scale()
+}
 const HEADER_PAD_X: f32 = 6.0;
 const HEADER_CTRL_SIZE: f32 = 18.0;
 const HEADER_CTRL_GAP: f32 = 3.0;
@@ -31,7 +36,7 @@ pub fn show_split_header(
     let ultra_compact = pane_w < 165.0;
 
     let hdr_rect =
-        egui::Rect::from_min_size(pane_rect.min, egui::vec2(pane_w, SPLIT_HEADER_HEIGHT));
+        egui::Rect::from_min_size(pane_rect.min, egui::vec2(pane_w, split_header_height()));
     let hdr_fill = if is_focused {
         t::tab_selected_bg()
     } else {
@@ -203,7 +208,7 @@ pub fn show_split_header(
         title_resp.on_hover_text(meta_text);
     }
 
-    ui.allocate_space(egui::vec2(pane_w, SPLIT_HEADER_HEIGHT));
+    ui.allocate_space(egui::vec2(pane_w, split_header_height()));
     result
 }
 

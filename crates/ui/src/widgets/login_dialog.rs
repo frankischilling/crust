@@ -188,7 +188,7 @@ impl LoginDialog {
                             && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         if (ui
                             .add_sized(
-                                [84.0, t::BAR_H],
+                                [84.0, t::bar_h()],
                                 egui::Button::new(RichText::new("Add account").font(t::small())),
                             )
                             .clicked()
@@ -203,7 +203,7 @@ impl LoginDialog {
                         }
                         if ui
                             .add_sized(
-                                [52.0, t::BAR_H],
+                                [52.0, t::bar_h()],
                                 egui::Button::new(RichText::new("Cancel").font(t::small())),
                             )
                             .clicked()
@@ -218,7 +218,7 @@ impl LoginDialog {
                     ui.add_space(4.0);
                     if ui
                         .add_sized(
-                            [ui.available_width(), t::BAR_H],
+                            [ui.available_width(), t::bar_h()],
                             egui::Button::new(RichText::new("+ Add Account").font(t::small())),
                         )
                         .on_hover_text("Add another Twitch account")
@@ -237,7 +237,7 @@ impl LoginDialog {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                     if ui
                         .add_sized(
-                            [52.0, t::BAR_H],
+                            [52.0, t::bar_h()],
                             egui::Button::new(RichText::new("Close").font(t::small())),
                         )
                         .clicked()
@@ -354,7 +354,7 @@ fn draw_account_row(
             // Remove
             if ui
                 .add_sized(
-                    [56.0, t::BAR_H],
+                    [56.0, t::bar_h()],
                     egui::Button::new(RichText::new("Remove").font(t::small()).color(t::red()))
                         .fill(t::red().gamma_multiply(0.08))
                         .stroke(egui::Stroke::new(1.0, t::red().gamma_multiply(0.3))),
@@ -369,7 +369,7 @@ fn draw_account_row(
             if is_active {
                 if ui
                     .add_sized(
-                        [60.0, t::BAR_H],
+                        [60.0, t::bar_h()],
                         egui::Button::new(RichText::new("Sign out").font(t::small())),
                     )
                     .on_hover_text("Disconnect and resume as anonymous viewer")
@@ -380,7 +380,7 @@ fn draw_account_row(
                 }
             } else if ui
                 .add_sized(
-                    [52.0, t::BAR_H],
+                    [52.0, t::bar_h()],
                     egui::Button::new(RichText::new("Switch").font(t::small())),
                 )
                 .on_hover_text(format!("Switch active account to {acc_name}"))
@@ -404,7 +404,7 @@ fn draw_account_row(
             };
             let star_btn = ui
                 .add_sized(
-                    [t::BAR_H, t::BAR_H],
+                    [t::bar_h(), t::bar_h()],
                     egui::Button::new(RichText::new(star).color(star_color).font(t::small()))
                         .fill(egui::Color32::TRANSPARENT),
                 )

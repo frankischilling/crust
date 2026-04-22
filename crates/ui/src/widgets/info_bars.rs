@@ -317,7 +317,7 @@ pub fn show_channel_info_bars(
                 || live_viewers.is_some();
             if has_active_modes {
                 TopBottomPanel::top("room_state_bar")
-                    .exact_height(20.0)
+                    .exact_height((t::pills_font_size() + 10.0).max(20.0 * t::font_scale()))
                     .frame(
                         Frame::new()
                             .fill(t::bg_base())
@@ -372,7 +372,7 @@ pub fn show_channel_info_bars(
         });
         if let Some((sender, text)) = latest_pinned {
             TopBottomPanel::top("pinned_message_bar")
-                .exact_height(24.0)
+                .exact_height((24.0 * t::font_scale()).max(t::chat_font_size() + 8.0))
                 .frame(
                     Frame::new()
                         .fill(t::warning_soft_bg())
@@ -417,7 +417,7 @@ fn room_state_pill(ui: &mut egui::Ui, text: &str, color: Color32) {
         .corner_radius(t::RADIUS_SM)
         .inner_margin(egui::Margin::symmetric(5, 0))
         .show(ui, |ui| {
-            ui.label(RichText::new(text).font(t::tiny()).color(color).strong());
+            ui.label(RichText::new(text).font(t::pills_font()).color(color).strong());
         });
 }
 

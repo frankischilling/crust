@@ -52,8 +52,9 @@ impl<'a> ChannelList<'a> {
         };
 
         let drag_id = Id::new("channel_list_drag");
-        const ROW_H: f32 = 28.0;
-        const STRIDE: f32 = ROW_H + t::CHANNEL_ROW_GAP;
+        // Row height scales with chat font so channel labels don't clip.
+        let row_h: f32 = (t::chat_font_size() + 14.0).max(28.0);
+        let stride: f32 = row_h + t::CHANNEL_ROW_GAP;
         let n = self.channels.len();
 
         ScrollArea::vertical()
@@ -92,7 +93,7 @@ impl<'a> ChannelList<'a> {
                     // Allocate the full-width row rect.
                     let row_rect = {
                         let avail = ui.available_rect_before_wrap();
-                        egui::Rect::from_min_size(avail.min, egui::vec2(avail.width(), ROW_H))
+                        egui::Rect::from_min_size(avail.min, egui::vec2(avail.width(), row_h))
                     };
                     let row_resp =
                         ui.interact(row_rect, interact_id, egui::Sense::click_and_drag());
@@ -117,7 +118,7 @@ impl<'a> ChannelList<'a> {
                             let sidebar_rect = ui.max_rect();
                             let is_outside = pos.x > sidebar_rect.right() + 30.0;
                             let rel_y = pos.y - list_top;
-                            let new_insert = ((rel_y / STRIDE + 0.5) as usize).min(n);
+                            let new_insert = ((rel_y / stride + 0.5) as usize).min(n);
                             ui.data_mut(|d| {
                                 let mut ds: DragState = d.get_temp(drag_id).unwrap_or(DragState {
                                     dragging_idx: idx,
@@ -395,7 +396,7 @@ impl<'a> ChannelList<'a> {
                             egui::LayerId::new(egui::Order::Tooltip, Id::new("drag_ghost_layer"));
                         let ghost_rect = egui::Rect::from_min_size(
                             egui::pos2(pos.x + 12.0, pos.y - 14.0),
-                            egui::vec2(130.0, ROW_H),
+                            egui::vec2(130.0, row_h),
                         );
                         let painter = ui.ctx().layer_painter(layer_id);
 

@@ -42,9 +42,9 @@ pub fn icon_button(
     state: IconButtonState,
 ) -> Response {
     let size = if state.compact {
-        t::ICON_BTN_SM
+        t::icon_btn_sm()
     } else {
-        t::ICON_BTN
+        t::icon_btn()
     };
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), Sense::click());
     let hovered = resp.hovered();

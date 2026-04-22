@@ -214,26 +214,38 @@ impl<'a> ChatInput<'a> {
                     let is_twitch_channel = !self.channel.is_irc() && !self.channel.is_kick();
                     let show_counter = is_twitch_channel && !buf.is_empty();
                     let counter_reserve = if show_counter { 70.0 } else { 0.0 };
+                    let btn_square = (t::chat_font_size() + 16.0).max(t::bar_h());
+                    let send_btn_w = (58.0 * t::font_scale()).max(58.0);
                     let reserve = if show_send_btn && show_emote_btn {
-                        t::BAR_H + 58.0 + t::TOOLBAR_SPACING.x * 2.0 + counter_reserve
+                        btn_square + send_btn_w + t::TOOLBAR_SPACING.x * 2.0 + counter_reserve
                     } else if show_emote_btn {
-                        t::BAR_H + t::TOOLBAR_SPACING.x + counter_reserve
+                        btn_square + t::TOOLBAR_SPACING.x + counter_reserve
                     } else {
                         counter_reserve
                     };
+                    let hint_text = if self.logged_in {
+                        if let Some(name) = self.username.filter(|n| !n.trim().is_empty()) {
+                            format!("Send messages as {name}...")
+                        } else {
+                            "Send a message...".to_owned()
+                        }
+                    } else if let Some(name) = self.username.filter(|n| !n.trim().is_empty()) {
+                        format!("Send messages as {name} after login (/help for local commands)")
+                    } else {
+                        "Log in to send messages (/help for local commands)".to_owned()
+                    };
                     let text_width = (ui.available_width() - reserve).max(40.0);
+                    // Input box grows with chat font so text never clips.
+                    let input_h = (t::chat_font_size() + 16.0).max(t::bar_h());
                     let te_output = ui
-                        .allocate_ui(egui::vec2(text_width, t::BAR_H), |ui| {
+                        .allocate_ui(egui::vec2(text_width, input_h), |ui| {
                             egui::TextEdit::singleline(buf)
-                                .hint_text(if self.logged_in {
-                                    "Send a message..."
-                                } else {
-                                    "Type a local /command (example: /help)"
-                                })
+                                .hint_text(hint_text)
                                 .text_color(t::text_primary())
+                                .font(t::body())
                                 .margin(egui::Margin::symmetric(6, 6))
                                 .frame(true)
-                                .min_size(egui::vec2(text_width, t::BAR_H))
+                                .min_size(egui::vec2(text_width, input_h))
                                 // Prevent egui from cycling keyboard focus away on Tab;
                                 // we handle Tab ourselves for autocomplete.
                                 .lock_focus(true)
@@ -395,12 +407,26 @@ impl<'a> ChatInput<'a> {
                                             (false, word)
                                         };
                                     let wl = search_word.to_lowercase();
+                                    // Zero-alloc case-insensitive prefix test.
+                                    // Avoids `.to_lowercase()` per-entry allocations
+                                    // (1000+ per keystroke frame on large channels).
+                                    let starts_ci = |hay: &str| -> bool {
+                                        let h = hay.as_bytes();
+                                        let n = wl.as_bytes();
+                                        if h.len() < n.len() {
+                                            return false;
+                                        }
+                                        h[..n.len()]
+                                            .iter()
+                                            .zip(n.iter())
+                                            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+                                    };
 
                                     // Collect emote matches (only for non-mention words)
                                     let mut m: Vec<String> = if !is_mention {
                                         self.emote_catalog
                                             .iter()
-                                            .filter(|e| e.code.to_lowercase().starts_with(&wl))
+                                            .filter(|e| starts_ci(&e.code))
                                             .map(|e| e.code.clone())
                                             .collect()
                                     } else {
@@ -411,7 +437,7 @@ impl<'a> ChatInput<'a> {
                                     let user_matches: Vec<String> = self
                                         .chatters
                                         .iter()
-                                        .filter(|u| u.to_lowercase().starts_with(&wl))
+                                        .filter(|u| starts_ci(u))
                                         .map(|u| {
                                             if is_mention {
                                                 format!("@{u}")
@@ -565,11 +591,12 @@ impl<'a> ChatInput<'a> {
                     }
 
                     // Emote picker button - hidden at very narrow widths
+                    let btn_h = (t::chat_font_size() + 16.0).max(t::bar_h());
                     if show_emote_btn {
                         if ui
                             .add_sized(
-                                [t::BAR_H, t::BAR_H],
-                                egui::Button::new(RichText::new(":)").font(t::small())),
+                                [btn_h, btn_h],
+                                egui::Button::new(RichText::new(":)").font(t::body())),
                             )
                             .on_hover_text("Emote picker")
                             .clicked()
@@ -582,8 +609,8 @@ impl<'a> ChatInput<'a> {
                     if show_send_btn {
                         let send_btn = ui.add_enabled(
                             can_submit,
-                            egui::Button::new(RichText::new("Send").font(t::small()))
-                                .min_size(egui::vec2(58.0, t::BAR_H)),
+                            egui::Button::new(RichText::new("Send").font(t::body()))
+                                .min_size(egui::vec2((58.0 * t::font_scale()).max(58.0), btn_h)),
                         );
                         let send_btn = if twitch_over_limit && is_twitch_channel {
                             send_btn.on_hover_text("Twitch messages are limited to 500 characters")
@@ -930,9 +957,11 @@ impl<'a> ChatInput<'a> {
         let mut clicked_emote: Option<String> = None;
         let mut has_animated_preview = false;
         let static_id = text_resp.id.with("ac_static_frames");
+        // Use remove_temp (ownership transfer) to avoid cloning the texture
+        // handle map per-frame while autocomplete is open.
         let mut static_frames: HashMap<String, egui::TextureHandle> = ui
             .ctx()
-            .data_mut(|d| d.get_temp(static_id).unwrap_or_default());
+            .data_mut(|d| d.remove_temp(static_id).unwrap_or_default());
 
         egui::ScrollArea::vertical()
             .id_salt(text_resp.id.with("emote_ac_scroll"))

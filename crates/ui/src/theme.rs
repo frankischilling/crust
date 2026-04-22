@@ -3,7 +3,7 @@
 /// One place to change colours/metrics so every widget stays in sync.
 /// Colour functions read a global dark/light flag so the theme can be
 /// switched at runtime without restarting.
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use egui::{Color32, CornerRadius, FontId, Margin, Stroke, Vec2};
 
@@ -13,6 +13,190 @@ use egui::{Color32, CornerRadius, FontId, Margin, Stroke, Vec2};
 
 /// `false` = dark (default), `true` = light.
 static LIGHT_MODE: AtomicBool = AtomicBool::new(false);
+
+// ---------------------------------------------------------------------------
+// Global font sizing (chat body + UI scale)
+// ---------------------------------------------------------------------------
+
+/// Default chat body font size. `small/heading/tiny` are offsets from this.
+pub const DEFAULT_CHAT_FONT_SIZE: f32 = 13.5;
+/// Minimum permitted chat font size.
+pub const MIN_CHAT_FONT_SIZE: f32 = 8.0;
+/// Maximum permitted chat font size.
+pub const MAX_CHAT_FONT_SIZE: f32 = 32.0;
+/// Default UI scale ratio fed to `pixels_per_point`.
+pub const DEFAULT_UI_FONT_SIZE: f32 = 1.0;
+/// Minimum UI scale ratio. Below this, egui hit-targets shrink below usable size.
+pub const MIN_UI_FONT_SIZE: f32 = 0.75;
+/// Maximum UI scale ratio. Above this, fixed-width panels (sidebar, analytics)
+/// start clipping and buttons collide.
+pub const MAX_UI_FONT_SIZE: f32 = 1.75;
+
+/// Section font sizes. Storage persists the absolute pt value OR `0.0`
+/// which means "auto-follow chat font" (default).
+pub const DEFAULT_TOPBAR_FONT_SIZE: f32 = 0.0;
+pub const DEFAULT_TABS_FONT_SIZE: f32 = 0.0;
+pub const DEFAULT_TIMESTAMPS_FONT_SIZE: f32 = 0.0;
+pub const DEFAULT_PILLS_FONT_SIZE: f32 = 0.0;
+pub const MIN_SECTION_FONT_SIZE: f32 = 8.0;
+pub const MAX_SECTION_FONT_SIZE: f32 = 28.0;
+
+/// Minimum derived auto-follow section size (we never return values below this
+/// even if the chat font is tiny, so UI chrome stays legible).
+const AUTO_SECTION_FLOOR: f32 = 8.5;
+
+/// Compute the effective section size from a stored slot: `0` = auto.
+fn effective_section(slot: &AtomicU32, auto_offset: f32) -> f32 {
+    let bits = slot.load(Ordering::Relaxed);
+    if bits == 0 {
+        return (chat_font_size() - auto_offset).max(AUTO_SECTION_FLOOR);
+    }
+    let raw = f32::from_bits(bits);
+    if raw <= 0.0 || !raw.is_finite() {
+        (chat_font_size() - auto_offset).max(AUTO_SECTION_FLOOR)
+    } else {
+        raw
+    }
+}
+
+static CHAT_FONT_SIZE_BITS: AtomicU32 = AtomicU32::new(0);
+static UI_FONT_SIZE_BITS: AtomicU32 = AtomicU32::new(0);
+static TOPBAR_FONT_SIZE_BITS: AtomicU32 = AtomicU32::new(0);
+static TABS_FONT_SIZE_BITS: AtomicU32 = AtomicU32::new(0);
+static TIMESTAMPS_FONT_SIZE_BITS: AtomicU32 = AtomicU32::new(0);
+static PILLS_FONT_SIZE_BITS: AtomicU32 = AtomicU32::new(0);
+
+fn load_f32(slot: &AtomicU32, fallback: f32) -> f32 {
+    let bits = slot.load(Ordering::Relaxed);
+    if bits == 0 {
+        fallback
+    } else {
+        f32::from_bits(bits)
+    }
+}
+
+/// Current chat body font size in points (clamped to valid range).
+#[inline]
+pub fn chat_font_size() -> f32 {
+    load_f32(&CHAT_FONT_SIZE_BITS, DEFAULT_CHAT_FONT_SIZE)
+}
+
+/// Current UI scale ratio applied to egui `pixels_per_point`.
+#[inline]
+pub fn ui_font_size() -> f32 {
+    load_f32(&UI_FONT_SIZE_BITS, DEFAULT_UI_FONT_SIZE)
+}
+
+/// Persist a new chat font size (clamped). Returns the clamped value.
+pub fn set_chat_font_size(size: f32) -> f32 {
+    let clamped = size.clamp(MIN_CHAT_FONT_SIZE, MAX_CHAT_FONT_SIZE);
+    CHAT_FONT_SIZE_BITS.store(clamped.to_bits(), Ordering::Relaxed);
+    clamped
+}
+
+/// Persist a new UI scale ratio (clamped). Returns the clamped value.
+pub fn set_ui_font_size(ratio: f32) -> f32 {
+    let clamped = ratio.clamp(MIN_UI_FONT_SIZE, MAX_UI_FONT_SIZE);
+    UI_FONT_SIZE_BITS.store(clamped.to_bits(), Ordering::Relaxed);
+    clamped
+}
+
+/// Persist a raw slider value. `0.0` is kept as-is to mean "auto". Other
+/// values are clamped into the section range.
+fn set_section_font(slot: &AtomicU32, size: f32) -> f32 {
+    if size <= 0.0 || !size.is_finite() {
+        slot.store(0, Ordering::Relaxed);
+        return 0.0;
+    }
+    let clamped = size.clamp(MIN_SECTION_FONT_SIZE, MAX_SECTION_FONT_SIZE);
+    slot.store(clamped.to_bits(), Ordering::Relaxed);
+    clamped
+}
+
+/// Raw persisted section slider value (0.0 = auto).
+fn raw_section_font(slot: &AtomicU32) -> f32 {
+    let bits = slot.load(Ordering::Relaxed);
+    if bits == 0 {
+        0.0
+    } else {
+        f32::from_bits(bits)
+    }
+}
+
+/// Top chrome toolbar font size (effective pt).
+#[inline]
+pub fn topbar_font_size() -> f32 {
+    effective_section(&TOPBAR_FONT_SIZE_BITS, 1.0)
+}
+/// Raw slider value (0.0 = auto).
+#[inline]
+pub fn topbar_font_size_raw() -> f32 {
+    raw_section_font(&TOPBAR_FONT_SIZE_BITS)
+}
+#[inline]
+pub fn set_topbar_font_size(size: f32) -> f32 {
+    set_section_font(&TOPBAR_FONT_SIZE_BITS, size)
+}
+
+/// Channel tab chip font size (effective pt).
+#[inline]
+pub fn tabs_font_size() -> f32 {
+    effective_section(&TABS_FONT_SIZE_BITS, 1.0)
+}
+#[inline]
+pub fn tabs_font_size_raw() -> f32 {
+    raw_section_font(&TABS_FONT_SIZE_BITS)
+}
+#[inline]
+pub fn set_tabs_font_size(size: f32) -> f32 {
+    set_section_font(&TABS_FONT_SIZE_BITS, size)
+}
+
+/// Message timestamp font size (effective pt).
+#[inline]
+pub fn timestamps_font_size() -> f32 {
+    effective_section(&TIMESTAMPS_FONT_SIZE_BITS, 1.0)
+}
+#[inline]
+pub fn timestamps_font_size_raw() -> f32 {
+    raw_section_font(&TIMESTAMPS_FONT_SIZE_BITS)
+}
+#[inline]
+pub fn set_timestamps_font_size(size: f32) -> f32 {
+    set_section_font(&TIMESTAMPS_FONT_SIZE_BITS, size)
+}
+
+/// Room-state / viewer-count pill font size (effective pt).
+#[inline]
+pub fn pills_font_size() -> f32 {
+    effective_section(&PILLS_FONT_SIZE_BITS, 2.0)
+}
+#[inline]
+pub fn pills_font_size_raw() -> f32 {
+    raw_section_font(&PILLS_FONT_SIZE_BITS)
+}
+#[inline]
+pub fn set_pills_font_size(size: f32) -> f32 {
+    set_section_font(&PILLS_FONT_SIZE_BITS, size)
+}
+
+/// FontId helpers returning a proportional font at the section size.
+#[inline]
+pub fn topbar_font() -> FontId {
+    FontId::proportional(topbar_font_size())
+}
+#[inline]
+pub fn tabs_font() -> FontId {
+    FontId::proportional(tabs_font_size())
+}
+#[inline]
+pub fn timestamps_font() -> FontId {
+    FontId::proportional(timestamps_font_size())
+}
+#[inline]
+pub fn pills_font() -> FontId {
+    FontId::proportional(pills_font_size())
+}
 
 /// Switch to dark mode.
 pub fn set_dark() {
@@ -569,12 +753,28 @@ pub const RADIUS: CornerRadius = CornerRadius::same(5);
 /// Tighter radius for inline pills / badges.
 pub const RADIUS_SM: CornerRadius = CornerRadius::same(3);
 
-/// Standard toolbar row height.
-pub const BAR_H: f32 = 28.0;
+/// Ratio of the current chat font size to the default (used to scale
+/// bar/button heights so the layout keeps up with the font).
+#[inline]
+pub fn font_scale() -> f32 {
+    (chat_font_size() / DEFAULT_CHAT_FONT_SIZE).clamp(0.6, 2.4)
+}
+
+/// Standard toolbar row height. Grows with chat font so labels don't clip.
+#[inline]
+pub fn bar_h() -> f32 {
+    28.0 * font_scale()
+}
 /// Compact square icon button size.
-pub const ICON_BTN_SM: f32 = 18.0;
+#[inline]
+pub fn icon_btn_sm() -> f32 {
+    18.0 * font_scale()
+}
 /// Default square icon button size.
-pub const ICON_BTN: f32 = 24.0;
+#[inline]
+pub fn icon_btn() -> f32 {
+    24.0 * font_scale()
+}
 /// Dialog header padding.
 pub const DIALOG_MARGIN: Margin = Margin {
     left: 12,
@@ -642,20 +842,20 @@ pub const SECTION_GAP: f32 = 8.0;
 
 /// Body text - chat messages, general labels.
 pub fn body() -> FontId {
-    FontId::proportional(13.5)
+    FontId::proportional(chat_font_size())
 }
 
 /// Small label - timestamps, system messages, secondary info.
 pub fn small() -> FontId {
-    FontId::proportional(12.5)
+    FontId::proportional((chat_font_size() - 1.0).max(MIN_CHAT_FONT_SIZE))
 }
 
 /// Heading / section label (all-caps sidebar header etc).
 pub fn heading() -> FontId {
-    FontId::proportional(11.5)
+    FontId::proportional((chat_font_size() - 2.0).max(MIN_CHAT_FONT_SIZE))
 }
 
 /// Tiny label - badges, room-state pills, character count.
 pub fn tiny() -> FontId {
-    FontId::proportional(10.5)
+    FontId::proportional((chat_font_size() - 3.0).max(MIN_CHAT_FONT_SIZE))
 }

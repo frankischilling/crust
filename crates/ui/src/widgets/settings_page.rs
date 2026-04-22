@@ -20,7 +20,10 @@ pub enum SettingsSection {
     Chat,
     Highlights,
     Filters,
+    Nicknames,
+    Ignores,
     Channels,
+    StreamerMode,
     Integrations,
 }
 
@@ -37,7 +40,10 @@ impl SettingsSection {
             Self::Chat => "Chat",
             Self::Highlights => "Highlights",
             Self::Filters => "Filters",
+            Self::Nicknames => "Nicknames",
+            Self::Ignores => "Ignores",
             Self::Channels => "Channels",
+            Self::StreamerMode => "Streamer mode",
             Self::Integrations => "Integrations",
         }
     }
@@ -48,7 +54,10 @@ impl SettingsSection {
             Self::Chat => "Message rendering and input limits",
             Self::Highlights => "Highlight rules and ignored users",
             Self::Filters => "Message filtering and moderation",
+            Self::Nicknames => "Custom display names for other users",
+            Self::Ignores => "Blocked users and phrase filters",
             Self::Channels => "Auto-join channel management",
+            Self::StreamerMode => "Hide sensitive info while broadcasting",
             Self::Integrations => "Plugins, Kick/IRC beta, and NickServ",
         }
     }
@@ -80,6 +89,18 @@ pub struct SettingsPageState {
     pub ignores_buf: String,
     pub auto_join_buf: String,
     pub light_theme: bool,
+    /// Chat body font size in points.
+    pub chat_font_size: f32,
+    /// UI scale ratio fed to `pixels_per_point`.
+    pub ui_font_size: f32,
+    /// Top chrome toolbar label size (pt).
+    pub topbar_font_size: f32,
+    /// Channel tab chip label size (pt).
+    pub tabs_font_size: f32,
+    /// Message timestamp size (pt).
+    pub timestamps_font_size: f32,
+    /// Room-state pill size (pt).
+    pub pills_font_size: f32,
     pub channel_layout: ChannelLayout,
     pub sidebar_visible: bool,
     pub analytics_visible: bool,
@@ -97,6 +118,14 @@ pub struct SettingsPageState {
     pub filter_records: Vec<crust_core::model::filters::FilterRecord>,
     pub filter_record_bufs: Vec<String>,
     pub mod_action_presets: Vec<crust_core::model::mod_actions::ModActionPreset>,
+    /// Editable nickname aliases (mirrors AppSettings.nicknames).
+    pub nicknames: Vec<crust_core::model::Nickname>,
+    /// Editable ignored-user entries (mirrors AppSettings.ignored_users).
+    pub ignored_users: Vec<crust_core::ignores::IgnoredUser>,
+    /// Editable ignored-phrase entries (mirrors AppSettings.ignored_phrases).
+    pub ignored_phrases: Vec<crust_core::ignores::IgnoredPhrase>,
+    /// Opt-in fetch of pronouns from alejo.io on user profile popup.
+    pub show_pronouns_in_usercard: bool,
     pub plugin_statuses: Vec<PluginStatus>,
     pub plugin_ui: PluginUiSnapshot,
     pub plugin_reload_requested: bool,
@@ -126,6 +155,16 @@ pub struct SettingsPageState {
     pub request_open_available_release: bool,
     /// Request simulating a gifted sub event toast/notification.
     pub request_test_gifted_sub_alert: bool,
+    /// Streamer mode setting (`off`, `auto`, or `on`).
+    pub streamer_mode: String,
+    /// Hide link preview tooltips while streamer mode is active.
+    pub streamer_hide_link_previews: bool,
+    /// Hide viewer counts in split headers while streamer mode is active.
+    pub streamer_hide_viewer_counts: bool,
+    /// Suppress sound notifications while streamer mode is active.
+    pub streamer_suppress_sounds: bool,
+    /// True iff broadcasting software detection currently considers it active.
+    pub streamer_mode_active: bool,
 }
 
 pub fn parse_settings_lines(input: &str, lowercase: bool) -> Vec<String> {
@@ -150,13 +189,16 @@ pub fn parse_settings_lines(input: &str, lowercase: bool) -> Vec<String> {
     out
 }
 
-fn settings_sections() -> [SettingsSection; 6] {
+fn settings_sections() -> [SettingsSection; 9] {
     [
         SettingsSection::Appearance,
         SettingsSection::Chat,
         SettingsSection::Highlights,
         SettingsSection::Filters,
+        SettingsSection::Nicknames,
+        SettingsSection::Ignores,
         SettingsSection::Channels,
+        SettingsSection::StreamerMode,
         SettingsSection::Integrations,
     ]
 }
@@ -403,6 +445,92 @@ fn render_settings_content(
                         });
                     }
                     ui.checkbox(&mut state.always_on_top, "Always on top");
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("Font sizes")
+                            .font(t::small())
+                            .strong()
+                            .color(t::text_primary()),
+                    );
+                    if compact {
+                        ui.label("Chat text");
+                        ui.add(
+                            egui::Slider::new(
+                                &mut state.chat_font_size,
+                                t::MIN_CHAT_FONT_SIZE..=t::MAX_CHAT_FONT_SIZE,
+                            )
+                            .step_by(0.5)
+                            .suffix(" pt"),
+                        );
+                        ui.label("UI scale");
+                        ui.add(
+                            egui::Slider::new(
+                                &mut state.ui_font_size,
+                                t::MIN_UI_FONT_SIZE..=t::MAX_UI_FONT_SIZE,
+                            )
+                            .step_by(0.05)
+                            .suffix("x"),
+                        );
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.label("Chat text:");
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut state.chat_font_size,
+                                    t::MIN_CHAT_FONT_SIZE..=t::MAX_CHAT_FONT_SIZE,
+                                )
+                                .step_by(0.5)
+                                .suffix(" pt"),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("UI scale:");
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut state.ui_font_size,
+                                    t::MIN_UI_FONT_SIZE..=t::MAX_UI_FONT_SIZE,
+                                )
+                                .step_by(0.05)
+                                .suffix("x"),
+                            );
+                        });
+                    }
+                    ui.label(
+                        RichText::new("Tip: Ctrl+= / Ctrl+- / Ctrl+0 or Ctrl+scroll to zoom chat.")
+                            .font(t::tiny())
+                            .color(t::text_muted()),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("Section sizes (uncheck Auto to override)")
+                            .font(t::small())
+                            .strong()
+                            .color(t::text_secondary()),
+                    );
+                    let section_range = t::MIN_SECTION_FONT_SIZE..=t::MAX_SECTION_FONT_SIZE;
+                    let chat_font = state.chat_font_size;
+                    for (label, slot, auto_offset) in [
+                        ("Top bar", &mut state.topbar_font_size, 1.0_f32),
+                        ("Channel tabs", &mut state.tabs_font_size, 1.0),
+                        ("Timestamps", &mut state.timestamps_font_size, 1.0),
+                        ("Room-state pills", &mut state.pills_font_size, 2.0),
+                    ] {
+                        let auto_value = (chat_font - auto_offset).max(8.5);
+                        let mut is_auto = *slot <= 0.0;
+                        let mut override_val = if *slot > 0.0 { *slot } else { auto_value };
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{label}:"));
+                            ui.checkbox(&mut is_auto, "Auto");
+                            ui.add_enabled_ui(!is_auto, |ui| {
+                                ui.add(
+                                    egui::Slider::new(&mut override_val, section_range.clone())
+                                        .step_by(0.5)
+                                        .suffix(" pt"),
+                                );
+                            });
+                        });
+                        *slot = if is_auto { 0.0 } else { override_val };
+                    }
                     ui.add_space(6.0);
                     ui.label(
                         RichText::new("Layout")
@@ -1169,6 +1297,404 @@ fn render_settings_content(
                             .color(t::text_muted()),
                     );
                 }
+                SettingsSection::Nicknames => {
+                    ui.label(
+                        RichText::new("Nickname Aliases")
+                            .font(t::small())
+                            .strong()
+                            .color(t::text_primary()),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "Map a login to a custom display name.  Shown in chat, user cards, mention toasts.",
+                        )
+                        .font(t::tiny())
+                        .color(t::text_muted()),
+                    );
+                    ui.add_space(4.0);
+
+                    let mut delete_nick_idx: Option<usize> = None;
+                    let action_btn_size = egui::vec2(26.0, 22.0);
+
+                    egui::Grid::new("nicknames_grid")
+                        .num_columns(6)
+                        .spacing(egui::vec2(8.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("Login").font(t::tiny()).color(t::text_muted()));
+                            ui.label(RichText::new("Alias").font(t::tiny()).color(t::text_muted()));
+                            ui.label(RichText::new("Channel").font(t::tiny()).color(t::text_muted()));
+                            ui.label(RichText::new("Aa").font(t::tiny()).color(t::text_muted()));
+                            ui.label(RichText::new("@").font(t::tiny()).color(t::text_muted()));
+                            ui.label(RichText::new("").font(t::tiny()));
+                            ui.end_row();
+
+                            for (i, n) in state.nicknames.iter_mut().enumerate() {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut n.login)
+                                        .desired_width(if compact { 90.0 } else { 140.0 })
+                                        .hint_text("login"),
+                                );
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut n.nickname)
+                                        .desired_width(if compact { 90.0 } else { 140.0 })
+                                        .hint_text("Alias"),
+                                );
+                                let mut channel_buf = n.channel.clone().unwrap_or_default();
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(&mut channel_buf)
+                                        .desired_width(if compact { 80.0 } else { 120.0 })
+                                        .hint_text("all channels"),
+                                );
+                                if resp.changed() {
+                                    let trimmed = channel_buf.trim();
+                                    n.channel = if trimmed.is_empty() {
+                                        None
+                                    } else {
+                                        Some(trimmed.to_owned())
+                                    };
+                                }
+
+                                let aa_col = if n.case_sensitive {
+                                    t::yellow()
+                                } else {
+                                    t::text_muted()
+                                };
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("Aa").font(t::tiny()).color(aa_col),
+                                        )
+                                        .min_size(action_btn_size),
+                                    )
+                                    .on_hover_text("Case-sensitive login match")
+                                    .clicked()
+                                {
+                                    n.case_sensitive = !n.case_sensitive;
+                                }
+
+                                let mention_col = if n.replace_mentions {
+                                    t::link()
+                                } else {
+                                    t::text_muted()
+                                };
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("@").font(t::tiny()).color(mention_col),
+                                        )
+                                        .min_size(action_btn_size),
+                                    )
+                                    .on_hover_text("Treat alias as self-mention")
+                                    .clicked()
+                                {
+                                    n.replace_mentions = !n.replace_mentions;
+                                }
+
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("❌").font(t::tiny()).color(t::red()),
+                                        )
+                                        .min_size(action_btn_size),
+                                    )
+                                    .clicked()
+                                {
+                                    delete_nick_idx = Some(i);
+                                }
+                                ui.end_row();
+                            }
+                        });
+
+                    if let Some(i) = delete_nick_idx {
+                        state.nicknames.remove(i);
+                    }
+                    if ui.button("+ Add nickname").clicked() {
+                        state
+                            .nicknames
+                            .push(crust_core::model::Nickname::new("", ""));
+                    }
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(format!("{} nickname(s)", state.nicknames.len()))
+                            .font(t::tiny())
+                            .color(t::text_muted()),
+                    );
+                }
+                SettingsSection::Ignores => {
+                    ui.label(
+                        RichText::new("Ignored Users")
+                            .font(t::small())
+                            .strong()
+                            .color(t::text_primary()),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "Users listed here are suppressed in chat and never trigger mentions.",
+                        )
+                        .font(t::tiny())
+                        .color(t::text_muted()),
+                    );
+                    ui.add_space(4.0);
+
+                    let action_btn_size = egui::vec2(26.0, 22.0);
+                    let mut delete_user_idx: Option<usize> = None;
+
+                    egui::Grid::new("ignored_users_grid")
+                        .num_columns(5)
+                        .spacing(egui::vec2(8.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("On").font(t::tiny()).color(t::text_muted()));
+                            ui.label(RichText::new("Login / regex").font(t::tiny()).color(t::text_muted()));
+                            ui.label(RichText::new("Re").font(t::tiny()).color(t::text_muted()));
+                            ui.label(RichText::new("Aa").font(t::tiny()).color(t::text_muted()));
+                            ui.label(RichText::new("").font(t::tiny()));
+                            ui.end_row();
+
+                            for (i, u) in state.ignored_users.iter_mut().enumerate() {
+                                ui.checkbox(&mut u.enabled, "");
+                                let regex_ok = if u.is_regex {
+                                    let mut b = regex::RegexBuilder::new(&u.login);
+                                    b.case_insensitive(!u.case_sensitive);
+                                    b.build().is_ok()
+                                } else {
+                                    true
+                                };
+                                let text_color = if !regex_ok {
+                                    t::red()
+                                } else if u.enabled {
+                                    t::text_primary()
+                                } else {
+                                    t::text_muted()
+                                };
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut u.login)
+                                        .desired_width(if compact { 140.0 } else { 200.0 })
+                                        .text_color(text_color)
+                                        .hint_text("login or regex"),
+                                );
+                                let re_col = if u.is_regex { t::link() } else { t::text_muted() };
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("Re").font(t::tiny()).color(re_col),
+                                        )
+                                        .min_size(action_btn_size),
+                                    )
+                                    .clicked()
+                                {
+                                    u.is_regex = !u.is_regex;
+                                }
+                                let aa_col = if u.case_sensitive {
+                                    t::yellow()
+                                } else {
+                                    t::text_muted()
+                                };
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("Aa").font(t::tiny()).color(aa_col),
+                                        )
+                                        .min_size(action_btn_size),
+                                    )
+                                    .clicked()
+                                {
+                                    u.case_sensitive = !u.case_sensitive;
+                                }
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("❌").font(t::tiny()).color(t::red()),
+                                        )
+                                        .min_size(action_btn_size),
+                                    )
+                                    .clicked()
+                                {
+                                    delete_user_idx = Some(i);
+                                }
+                                ui.end_row();
+                            }
+                        });
+
+                    if let Some(i) = delete_user_idx {
+                        state.ignored_users.remove(i);
+                    }
+                    if ui.button("+ Add ignored user").clicked() {
+                        state
+                            .ignored_users
+                            .push(crust_core::ignores::IgnoredUser::new(""));
+                    }
+
+                    ui.add_space(12.0);
+                    ui.label(
+                        RichText::new("Ignored Phrases")
+                            .font(t::small())
+                            .strong()
+                            .color(t::text_primary()),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "Actions: Block drops the message. Replace rewrites matches. \
+                             Highlight-only tints without blocking. Mention-only fires notifications.",
+                        )
+                        .font(t::tiny())
+                        .color(t::text_muted()),
+                    );
+                    ui.add_space(4.0);
+
+                    let mut delete_phrase_idx: Option<usize> = None;
+
+                    egui::Grid::new("ignored_phrases_grid")
+                        .num_columns(7)
+                        .spacing(egui::vec2(8.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("On").font(t::tiny()).color(t::text_muted()));
+                            ui.label(RichText::new("Pattern").font(t::tiny()).color(t::text_muted()));
+                            ui.label(RichText::new("Re").font(t::tiny()).color(t::text_muted()));
+                            ui.label(RichText::new("Aa").font(t::tiny()).color(t::text_muted()));
+                            ui.label(RichText::new("Action").font(t::tiny()).color(t::text_muted()));
+                            ui.label(RichText::new("Replace").font(t::tiny()).color(t::text_muted()));
+                            ui.label(RichText::new("").font(t::tiny()));
+                            ui.end_row();
+
+                            for (i, p) in state.ignored_phrases.iter_mut().enumerate() {
+                                ui.checkbox(&mut p.enabled, "");
+                                let regex_ok = p.is_regex_valid();
+                                let text_color = if !regex_ok {
+                                    t::red()
+                                } else if p.enabled {
+                                    t::text_primary()
+                                } else {
+                                    t::text_muted()
+                                };
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut p.pattern)
+                                        .desired_width(if compact { 120.0 } else { 180.0 })
+                                        .text_color(text_color)
+                                        .hint_text("pattern"),
+                                );
+                                let re_col = if p.is_regex { t::link() } else { t::text_muted() };
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("Re").font(t::tiny()).color(re_col),
+                                        )
+                                        .min_size(action_btn_size),
+                                    )
+                                    .clicked()
+                                {
+                                    p.is_regex = !p.is_regex;
+                                }
+                                let aa_col = if p.case_sensitive {
+                                    t::yellow()
+                                } else {
+                                    t::text_muted()
+                                };
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("Aa").font(t::tiny()).color(aa_col),
+                                        )
+                                        .min_size(action_btn_size),
+                                    )
+                                    .clicked()
+                                {
+                                    p.case_sensitive = !p.case_sensitive;
+                                }
+
+                                egui::ComboBox::from_id_salt(("phrase_action", i))
+                                    .selected_text(match p.action {
+                                        crust_core::ignores::IgnoredPhraseAction::Block => "Block",
+                                        crust_core::ignores::IgnoredPhraseAction::Replace => "Replace",
+                                        crust_core::ignores::IgnoredPhraseAction::HighlightOnly => "Highlight only",
+                                        crust_core::ignores::IgnoredPhraseAction::MentionOnly => "Mention only",
+                                    })
+                                    .width(if compact { 90.0 } else { 120.0 })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut p.action,
+                                            crust_core::ignores::IgnoredPhraseAction::Block,
+                                            "Block",
+                                        );
+                                        ui.selectable_value(
+                                            &mut p.action,
+                                            crust_core::ignores::IgnoredPhraseAction::Replace,
+                                            "Replace",
+                                        );
+                                        ui.selectable_value(
+                                            &mut p.action,
+                                            crust_core::ignores::IgnoredPhraseAction::HighlightOnly,
+                                            "Highlight only",
+                                        );
+                                        ui.selectable_value(
+                                            &mut p.action,
+                                            crust_core::ignores::IgnoredPhraseAction::MentionOnly,
+                                            "Mention only",
+                                        );
+                                    });
+
+                                let replace_enabled = matches!(
+                                    p.action,
+                                    crust_core::ignores::IgnoredPhraseAction::Replace
+                                );
+                                ui.add_enabled_ui(replace_enabled, |ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut p.replace_with)
+                                            .desired_width(if compact { 60.0 } else { 80.0 })
+                                            .hint_text("***"),
+                                    );
+                                });
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("❌").font(t::tiny()).color(t::red()),
+                                        )
+                                        .min_size(action_btn_size),
+                                    )
+                                    .clicked()
+                                {
+                                    delete_phrase_idx = Some(i);
+                                }
+                                ui.end_row();
+                            }
+                        });
+
+                    if let Some(i) = delete_phrase_idx {
+                        state.ignored_phrases.remove(i);
+                    }
+                    if ui.button("+ Add ignored phrase").clicked() {
+                        state
+                            .ignored_phrases
+                            .push(crust_core::ignores::IgnoredPhrase::new(""));
+                    }
+
+                    let invalid_count = state
+                        .ignored_phrases
+                        .iter()
+                        .filter(|p| p.enabled && !p.is_regex_valid())
+                        .count()
+                        + state
+                            .ignored_users
+                            .iter()
+                            .filter(|u| {
+                                if !u.enabled || !u.is_regex {
+                                    return false;
+                                }
+                                let mut b = regex::RegexBuilder::new(&u.login);
+                                b.case_insensitive(!u.case_sensitive);
+                                b.build().is_err()
+                            })
+                            .count();
+                    if invalid_count > 0 {
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "⚠ {invalid_count} entry/entries have invalid regex (highlighted in red)."
+                            ))
+                            .font(t::tiny())
+                            .color(t::red()),
+                        );
+                    }
+                }
                 SettingsSection::Channels => {
                     ui.label(
                         RichText::new(
@@ -1200,9 +1726,76 @@ fn render_settings_content(
                         .color(t::text_muted()),
                     );
                 }
+                SettingsSection::StreamerMode => {
+                    ui.label(
+                        RichText::new(
+                            "Hide sensitive on-screen info while broadcasting software is running.",
+                        )
+                        .font(t::small())
+                        .color(t::text_secondary()),
+                    );
+                    ui.add_space(6.0);
+
+                    ui.label(RichText::new("Mode").strong());
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut state.streamer_mode, "off".to_owned(), "Off");
+                        ui.radio_value(
+                            &mut state.streamer_mode,
+                            "auto".to_owned(),
+                            "Auto (detect OBS / Streamlabs)",
+                        );
+                        ui.radio_value(&mut state.streamer_mode, "on".to_owned(), "Always on");
+                    });
+
+                    let active_label = if state.streamer_mode_active {
+                        "Status: ACTIVE"
+                    } else {
+                        "Status: inactive"
+                    };
+                    let active_color = if state.streamer_mode_active {
+                        t::accent()
+                    } else {
+                        t::text_muted()
+                    };
+                    ui.add_space(2.0);
+                    ui.label(RichText::new(active_label).font(t::small()).color(active_color));
+
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("When active").strong());
+                    ui.checkbox(
+                        &mut state.streamer_hide_link_previews,
+                        "Hide link previews",
+                    );
+                    ui.checkbox(
+                        &mut state.streamer_hide_viewer_counts,
+                        "Hide viewer counts in split headers",
+                    );
+                    ui.checkbox(
+                        &mut state.streamer_suppress_sounds,
+                        "Suppress sound notifications",
+                    );
+                }
                 SettingsSection::Integrations => {
                     ui.checkbox(&mut state.kick_beta_enabled, "Kick compatibility (beta)");
                     ui.checkbox(&mut state.irc_beta_enabled, "IRC chat compatibility (beta)");
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("User Cards")
+                            .font(t::small())
+                            .strong()
+                            .color(t::text_primary()),
+                    );
+                    ui.checkbox(
+                        &mut state.show_pronouns_in_usercard,
+                        "Fetch and show pronouns from alejo.io",
+                    );
+                    ui.label(
+                        RichText::new(
+                            "Opens a request to api.pronouns.alejo.io when you open a user card. Off by default.",
+                        )
+                        .font(t::tiny())
+                        .color(t::text_muted()),
+                    );
                     ui.add_space(8.0);
                     ui.label(
                         RichText::new("Lua Plugins")
@@ -1427,19 +2020,24 @@ pub fn show_settings_page(
     plugin_ui_session: &mut PluginUiSessionState,
     stats: SettingsStats,
 ) {
+    let screen = ctx.screen_rect();
     let settings_default_pos = egui::pos2(
-        (ctx.screen_rect().center().x - 380.0).max(8.0),
-        (ctx.screen_rect().center().y - 280.0).max(8.0),
+        (screen.center().x - 380.0).max(8.0),
+        (screen.center().y - 280.0).max(8.0),
     );
+    let min_w = 300.0_f32.min((screen.width() - 16.0).max(160.0));
+    let min_h = 280.0_f32.min((screen.height() - 16.0).max(160.0));
+    let default_w = 760.0_f32.min((screen.width() - 16.0).max(min_w));
+    let default_h = 560.0_f32.min((screen.height() - 16.0).max(min_h));
     egui::Window::new("Settings")
         .open(settings_open)
         .collapsible(false)
         .resizable(true)
         .order(egui::Order::Foreground)
         .default_pos(settings_default_pos)
-        .default_size(egui::vec2(760.0, 560.0))
+        .default_size(egui::vec2(default_w, default_h))
         .show(ctx, |ui| {
-            ui.set_min_size(egui::vec2(300.0, 280.0));
+            ui.set_min_size(egui::vec2(min_w, min_h));
             let compact_layout = ui.available_width() < 720.0;
             let ultra_compact_layout = ui.available_width() < 500.0;
             ui.vertical(|ui| {

@@ -134,6 +134,10 @@ pub struct UserProfilePopup {
     ivr_logs_requested: bool,
     /// Channels where this user appears in local state (chatters or recent messages).
     shared_channels: Vec<String>,
+    /// Pronouns resolved via alejo.io before the profile itself arrived.
+    /// Stored by lowercase login so `set_profile` can merge them in when the
+    /// profile finally loads.  `Some(None)` means "fetch confirmed unspecified".
+    pending_pronouns: std::collections::HashMap<String, Option<String>>,
 }
 
 impl UserProfilePopup {
@@ -202,11 +206,64 @@ impl UserProfilePopup {
     }
 
     /// Called when `AppEvent::UserProfileLoaded` arrives.
-    pub fn set_profile(&mut self, profile: UserProfile) {
+    pub fn set_profile(&mut self, mut profile: UserProfile) {
+        // If a UserPronounsLoaded event arrived *before* the profile did
+        // (alejo.io is usually faster than IVR/Helix), apply the stashed
+        // pronouns here so the usercard shows them on the first paint.
+        if profile.pronouns.is_none() {
+            let key = profile.login.to_ascii_lowercase();
+            if let Some(pending) = self.pending_pronouns.remove(&key) {
+                tracing::info!(
+                    "popup: merging pending pronouns for {key} -> {:?}",
+                    pending
+                );
+                profile.pronouns = pending;
+            } else {
+                tracing::info!(
+                    "popup: set_profile for {key}, no pending pronouns yet (pending keys: {:?})",
+                    self.pending_pronouns.keys().collect::<Vec<_>>()
+                );
+            }
+        }
         self.loading = false;
         self.open = true;
         self.profile = Some(profile);
     }
+
+    /// Called when `AppEvent::UserPronounsLoaded` arrives.  If the popup is
+    /// currently showing `login` and the profile has no pronouns yet, merge
+    /// them in so the row appears without waiting on a profile refetch.
+    /// If the profile hasn't loaded yet, stash the result so `set_profile`
+    /// can pick it up.
+    pub fn set_pronouns(&mut self, login: &str, pronouns: Option<String>) {
+        let key = login.to_ascii_lowercase();
+        match self.profile.as_mut() {
+            Some(profile) if profile.login.eq_ignore_ascii_case(login) => {
+                tracing::info!(
+                    "popup: set_pronouns live merge for {login} -> {:?} (prev={:?})",
+                    pronouns,
+                    profile.pronouns
+                );
+                if profile.pronouns.is_none() {
+                    profile.pronouns = pronouns;
+                }
+            }
+            Some(other) => {
+                tracing::info!(
+                    "popup: set_pronouns stashed for {key} (popup is showing {:?})",
+                    other.login
+                );
+                self.pending_pronouns.insert(key, pronouns);
+            }
+            None => {
+                tracing::info!(
+                    "popup: set_pronouns stashed for {key} (no profile loaded yet)"
+                );
+                self.pending_pronouns.insert(key, pronouns);
+            }
+        }
+    }
+
 
     /// Called when a profile request completes without data.
     pub fn set_unavailable(&mut self, login: &str) {

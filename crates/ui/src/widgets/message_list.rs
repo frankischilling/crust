@@ -9,8 +9,8 @@ use tokio::sync::mpsc;
 use crust_core::{
     events::{AppCommand, LinkPreview},
     model::{
-        filters::FilterAction, Badge, ChannelId, ChatMessage, MessageFlags, MsgKind, ReplyInfo,
-        SenderNamePaint, Span,
+        filters::FilterAction, Badge, ChannelId, ChatMessage, LowTrustStatus, MessageFlags,
+        MessageId, MsgKind, ReplyInfo, SenderNamePaint, Span,
     },
 };
 
@@ -121,8 +121,8 @@ const ROW_PAD_X: f32 = 6.0;
 const ROW_PAD_Y: f32 = 2.0;
 /// Fallback height for rows we have never rendered before.
 const EST_H: f32 = 26.0;
-const HOT_WINDOW_TRIGGER: usize = 600;
-const HOT_WINDOW_ROWS: usize = 400;
+const HOT_WINDOW_TRIGGER: usize = 200;
+const HOT_WINDOW_ROWS: usize = 300;
 const HOT_WINDOW_EXPAND_CHUNK: usize = 200;
 const HOT_WINDOW_EXPAND_THRESHOLD_PX: f32 = 24.0;
 const COMPACT_BOUNDARY_HEIGHT: f32 = 22.0;
@@ -303,12 +303,20 @@ pub struct MessageList<'a> {
     can_moderate: bool,
     /// Ignored usernames (lowercase) hidden from the message list.
     ignored_logins: &'a HashSet<String>,
+    /// Structured ignored-user matcher (regex/case-sensitive); hides on top of `ignored_logins`.
+    ignored_users: &'a crust_core::ignores::CompiledIgnoredUsers,
     /// Compiled highlight rules used for local keyword highlighting.
     highlight_rules: &'a [crust_core::highlight::HighlightMatch],
     /// Compiled filter records used for hiding messages.
     filter_records: &'a [crust_core::model::filters::CompiledFilter],
     /// Moderation action presets
     mod_action_presets: &'a [crust_core::model::mod_actions::ModActionPreset],
+    /// Per-user low-trust treatment for this channel, keyed by lowercased login.
+    low_trust_users: &'a HashMap<String, LowTrustStatus>,
+    /// When `Some`, scroll to the message with this id on this frame.
+    scroll_to: Option<MessageId>,
+    /// When true, link preview tooltips are suppressed (streamer mode).
+    hide_link_previews: bool,
 }
 
 impl<'a> MessageList<'a> {
@@ -340,9 +348,11 @@ impl<'a> MessageList<'a> {
         use_24h_timestamps: bool,
         can_moderate: bool,
         ignored_logins: &'a HashSet<String>,
+        ignored_users: &'a crust_core::ignores::CompiledIgnoredUsers,
         highlight_rules: &'a [crust_core::highlight::HighlightMatch],
         filter_records: &'a [crust_core::model::filters::CompiledFilter],
         mod_action_presets: &'a [crust_core::model::mod_actions::ModActionPreset],
+        low_trust_users: &'a HashMap<String, LowTrustStatus>,
     ) -> Self {
         Self {
             messages,
@@ -359,10 +369,26 @@ impl<'a> MessageList<'a> {
             use_24h_timestamps,
             can_moderate,
             ignored_logins,
+            ignored_users,
             highlight_rules,
             filter_records,
             mod_action_presets,
+            low_trust_users,
+            scroll_to: None,
+            hide_link_previews: false,
         }
+    }
+
+    /// Request scrolling to a specific message id on this frame.
+    pub fn with_scroll_to(mut self, id: Option<MessageId>) -> Self {
+        self.scroll_to = id;
+        self
+    }
+
+    /// Suppress link preview hover tooltips for this frame (streamer mode).
+    pub fn with_hide_link_previews(mut self, hide: bool) -> Self {
+        self.hide_link_previews = hide;
+        self
     }
 
     /// Render the message list with auto-scroll behaviour.
@@ -374,9 +400,13 @@ impl<'a> MessageList<'a> {
     pub fn show(&self, ui: &mut Ui) -> MessageListResult {
         let reply_key = Id::new("ml_reply_req").with(self.channel.as_str());
         let user_color_cache_key = Id::new("ml_user_color_cache").with(self.channel.as_str());
+        // PERF: remove_temp transfers ownership so we don't clone the entire
+        // HashMap every frame.  The cache is re-inserted at the end of show().
+        // On busy channels (1000+ distinct senders) this alone can save
+        // several hundred μs per frame.
         let mut user_color_cache: HashMap<String, Color32> = ui
             .ctx()
-            .data_mut(|d| d.get_temp(user_color_cache_key).unwrap_or_default());
+            .data_mut(|d| d.remove_temp(user_color_cache_key).unwrap_or_default());
         // We need the available rect before the scroll area consumes it
         let panel_rect = ui.available_rect_before_wrap();
         // Keep a small safety gap at the bottom so message pixels/emotes
@@ -389,11 +419,25 @@ impl<'a> MessageList<'a> {
         let is_visible_message = |msg: &ChatMessage| {
             if !self.ignored_logins.is_empty() {
                 let login = msg.sender.login.as_str();
-                if self.ignored_logins.contains(login)
-                    || self.ignored_logins.contains(&login.to_ascii_lowercase())
-                {
+                // ignored_logins is always lowercase (populated via
+                // parse_settings_lines with lowercase=true).  Skip the
+                // allocating `to_ascii_lowercase()` when the login already
+                // is lowercase, which is the overwhelmingly common case
+                // on Twitch/IRC.
+                let hit = if login.bytes().any(|b| b.is_ascii_uppercase()) {
+                    self.ignored_logins.contains(&login.to_ascii_lowercase())
+                } else {
+                    self.ignored_logins.contains(login)
+                };
+                if hit {
                     return false;
                 }
+            }
+
+            if !self.ignored_users.is_empty()
+                && self.ignored_users.is_ignored(&msg.sender.login)
+            {
+                return false;
             }
 
             if matches!(self.message_filter_action(msg), Some(FilterAction::Hide)) {
@@ -414,7 +458,9 @@ impl<'a> MessageList<'a> {
                     })
                     .collect(),
             ),
-            _ if self.ignored_logins.is_empty() => VisibleIndices::All(self.messages.len()),
+            _ if self.ignored_logins.is_empty() && self.ignored_users.is_empty() => {
+                VisibleIndices::All(self.messages.len())
+            }
             _ => VisibleIndices::Filtered(
                 self.messages
                     .iter()
@@ -558,6 +604,12 @@ impl<'a> MessageList<'a> {
                 ui.ctx().data_mut(|d| d.remove_temp(scroll_hint_key));
             let idx =
                 self.find_reply_target_index(&visible_indices, target.as_deref(), hint.as_ref());
+            // Also consider an externally-requested scroll_to (e.g. from global search).
+            let idx = idx.or_else(|| {
+                self.scroll_to.and_then(|target_id| {
+                    visible_indices.position(|msg_idx| self.messages[msg_idx].id == target_id)
+                })
+            });
             idx.map(|idx| {
                 // Store the target server_id + time for a brief highlight flash.
                 let now = ui.input(|i| i.time);
@@ -2057,12 +2109,12 @@ impl<'a> MessageList<'a> {
                                 self.use_24h_timestamps,
                             );
                             ui.add(Label::new(
-                                RichText::new(ts).color(t::timestamp()).font(t::small()),
+                                RichText::new(ts).color(t::timestamp()).font(t::timestamps_font()),
                             ));
 
                             // Separator dot between timestamp and badges/name
                             ui.add(Label::new(
-                                RichText::new("·").color(t::separator()).font(t::small()),
+                                RichText::new("·").color(t::separator()).font(t::timestamps_font()),
                             ));
                         }
 
@@ -2106,6 +2158,14 @@ impl<'a> MessageList<'a> {
                                 }
                             }
                             render_badge_fallback(ui, &badge.name, &badge.version, &tooltip_label);
+                        }
+
+                        if let Some(status) = self
+                            .low_trust_users
+                            .get(&msg.sender.login.to_ascii_lowercase())
+                            .copied()
+                        {
+                            render_low_trust_chip(ui, status);
                         }
 
                         // Sender name - clickable to open user profile card.
@@ -2495,7 +2555,7 @@ impl<'a> MessageList<'a> {
                                         self.use_24h_timestamps,
                                     );
                                     ui.add(Label::new(
-                                        RichText::new(ts).color(t::timestamp()).font(t::small()),
+                                        RichText::new(ts).color(t::timestamp()).font(t::timestamps_font()),
                                     ));
                                 }
 
@@ -2619,7 +2679,7 @@ impl<'a> MessageList<'a> {
                                     self.use_24h_timestamps,
                                 );
                                 ui.add(Label::new(
-                                    RichText::new(ts).color(t::timestamp()).font(t::small()),
+                                    RichText::new(ts).color(t::timestamp()).font(t::timestamps_font()),
                                 ));
                             }
 
@@ -2788,6 +2848,9 @@ impl<'a> MessageList<'a> {
                     let _ = cmd_tx.try_send(AppCommand::OpenUrl { url: url.clone() });
                 }
                 resp.context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
+                if self.hide_link_previews {
+                    return;
+                }
                 resp.on_hover_ui(|ui| {
                     // Fire preview fetch on first hover (idempotent in reducer).
                     let preview = link_previews.get(url.as_str());
@@ -2966,10 +3029,10 @@ impl<'a> MessageList<'a> {
                                 self.use_24h_timestamps,
                             );
                             ui.add(Label::new(
-                                RichText::new(ts).color(t::timestamp()).font(t::small()),
+                                RichText::new(ts).color(t::timestamp()).font(t::timestamps_font()),
                             ));
                             ui.add(Label::new(
-                                RichText::new("·").color(t::separator()).font(t::small()),
+                                RichText::new("·").color(t::separator()).font(t::timestamps_font()),
                             ));
                         }
 
@@ -3052,6 +3115,13 @@ impl<'a> MessageList<'a> {
                                 });
                             }
                         }
+
+                        let low_trust = self
+                            .low_trust_users
+                            .get(&msg.sender.login.to_ascii_lowercase())
+                            .copied()
+                            .unwrap_or(LowTrustStatus::Restricted);
+                        render_low_trust_chip(ui, low_trust);
 
                         let name = if msg.flags.is_action {
                             format!("* {}:", msg.sender.display_name)
@@ -4031,6 +4101,42 @@ fn pretty_badge_name(name: &str, version: &str) -> String {
     }
 
     label
+}
+
+fn render_low_trust_chip(ui: &mut Ui, status: LowTrustStatus) {
+    let (label, tooltip, bg, fg) = match status {
+        LowTrustStatus::Restricted => (
+            "RESTRICTED",
+            "Restricted suspicious user",
+            Color32::from_rgb(176, 42, 55),
+            Color32::from_rgb(255, 235, 238),
+        ),
+        LowTrustStatus::Monitored => (
+            "MONITORED",
+            "Monitored suspicious user",
+            Color32::from_rgb(155, 108, 20),
+            Color32::from_rgb(255, 243, 214),
+        ),
+    };
+    let stroke = if t::is_light() {
+        bg.gamma_multiply(0.72)
+    } else {
+        bg.gamma_multiply(1.25)
+    };
+    let response = egui::Frame::new()
+        .fill(bg)
+        .stroke(egui::Stroke::new(1.0, stroke))
+        .corner_radius(egui::CornerRadius::same(4))
+        .inner_margin(egui::Margin::symmetric(3, 1))
+        .show(ui, |ui| {
+            ui.add(Label::new(
+                RichText::new(label).font(t::tiny()).color(fg).strong(),
+            ));
+        })
+        .response;
+    response.on_hover_ui_at_pointer(|ui| {
+        ui.label(RichText::new(tooltip).strong());
+    });
 }
 
 fn render_badge_fallback(ui: &mut Ui, name: &str, version: &str, tooltip: &str) {

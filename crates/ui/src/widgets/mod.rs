@@ -5,6 +5,7 @@ pub mod chat_input;
 pub mod chrome;
 pub mod emoji_list;
 pub mod emote_picker;
+pub mod global_search;
 pub mod info_bars;
 pub mod irc_status;
 pub mod join_dialog;
