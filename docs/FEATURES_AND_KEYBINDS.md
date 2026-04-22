@@ -164,6 +164,8 @@ This is the built-in command surface in the UI parser. Unknown commands are pass
 - /chatters
 - /fakemsg <text>
 - /openurl <url>
+- /logs — open the Crust log/data folder in the system file manager
+- /live — list currently-live tracked Twitch channels
 
 ### Polls and predictions
 
@@ -183,6 +185,8 @@ This is the built-in command surface in the UI parser. Unknown commands are pass
 - /announce
 - /shoutout
 - /requests
+- /setgame <category> — update the Twitch stream category (broadcaster only)
+- /settitle <title> — update the Twitch stream title (broadcaster only)
 
 ### Moderation and safety
 
@@ -198,6 +202,7 @@ This is the built-in command surface in the UI parser. Unknown commands are pass
 - /unrestrict
 - /banid
 - /untimeout
+- /shield <on|off> — toggle Twitch Shield Mode (mod/broadcaster only)
 
 ### Chat and whisper helpers
 
@@ -212,6 +217,8 @@ This is the built-in command surface in the UI parser. Unknown commands are pass
 - /user
 - /usercard
 - /streamlink
+- /follow-age [user] — report how long a user has followed this channel (alias: /followage)
+- /account-age [user] — report the Twitch account age for a user (alias: /accountage)
 
 ### IRC-focused commands
 
