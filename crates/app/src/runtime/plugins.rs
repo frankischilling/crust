@@ -117,6 +117,8 @@ enum PluginEventKind {
     SlashUsageCountsUpdated,
     EmotePickerPreferencesUpdated,
     AppearanceSettingsUpdated,
+    FontSettingsUpdated,
+    RestoreLastActiveChannel,
     RoomStateUpdated,
     AutoModQueueAppend,
     AutoModQueueRemove,
@@ -128,12 +130,18 @@ enum PluginEventKind {
     HighlightRulesUpdated,
     FilterRecordsUpdated,
     ModActionPresetsUpdated,
+    NicknamesUpdated,
+    IgnoredUsersUpdated,
+    IgnoredPhrasesUpdated,
+    UserPronounsLoaded,
+    UsercardSettingsUpdated,
     SelfAvatarLoaded,
     LinkPreviewReady,
     SenderCosmeticsUpdated,
     IrcTopicChanged,
     AuthExpired,
     UserMessagesCleared,
+    LowTrustStatusUpdated,
     UserStateUpdated,
     ChannelMessagesCleared,
     ClearUserMessagesLocally,
@@ -1474,6 +1482,8 @@ fn event_kind_name(kind: PluginEventKind) -> &'static str {
         PluginEventKind::SlashUsageCountsUpdated => "SlashUsageCountsUpdated",
         PluginEventKind::EmotePickerPreferencesUpdated => "EmotePickerPreferencesUpdated",
         PluginEventKind::AppearanceSettingsUpdated => "AppearanceSettingsUpdated",
+        PluginEventKind::FontSettingsUpdated => "FontSettingsUpdated",
+        PluginEventKind::RestoreLastActiveChannel => "RestoreLastActiveChannel",
         PluginEventKind::RoomStateUpdated => "RoomStateUpdated",
         PluginEventKind::AutoModQueueAppend => "AutoModQueueAppend",
         PluginEventKind::AutoModQueueRemove => "AutoModQueueRemove",
@@ -1485,12 +1495,18 @@ fn event_kind_name(kind: PluginEventKind) -> &'static str {
         PluginEventKind::HighlightRulesUpdated => "HighlightRulesUpdated",
         PluginEventKind::FilterRecordsUpdated => "FilterRecordsUpdated",
         PluginEventKind::ModActionPresetsUpdated => "ModActionPresetsUpdated",
+        PluginEventKind::NicknamesUpdated => "NicknamesUpdated",
+        PluginEventKind::IgnoredUsersUpdated => "IgnoredUsersUpdated",
+        PluginEventKind::IgnoredPhrasesUpdated => "IgnoredPhrasesUpdated",
+        PluginEventKind::UserPronounsLoaded => "UserPronounsLoaded",
+        PluginEventKind::UsercardSettingsUpdated => "UsercardSettingsUpdated",
         PluginEventKind::SelfAvatarLoaded => "SelfAvatarLoaded",
         PluginEventKind::LinkPreviewReady => "LinkPreviewReady",
         PluginEventKind::SenderCosmeticsUpdated => "SenderCosmeticsUpdated",
         PluginEventKind::IrcTopicChanged => "IrcTopicChanged",
         PluginEventKind::AuthExpired => "AuthExpired",
         PluginEventKind::UserMessagesCleared => "UserMessagesCleared",
+        PluginEventKind::LowTrustStatusUpdated => "LowTrustStatusUpdated",
         PluginEventKind::UserStateUpdated => "UserStateUpdated",
         PluginEventKind::ChannelMessagesCleared => "ChannelMessagesCleared",
         PluginEventKind::ClearUserMessagesLocally => "ClearUserMessagesLocally",
@@ -1534,6 +1550,8 @@ fn push_event_type_table(L: *mut lua_State) {
             PluginEventKind::SlashUsageCountsUpdated,
             PluginEventKind::EmotePickerPreferencesUpdated,
             PluginEventKind::AppearanceSettingsUpdated,
+            PluginEventKind::FontSettingsUpdated,
+            PluginEventKind::RestoreLastActiveChannel,
             PluginEventKind::RoomStateUpdated,
             PluginEventKind::AutoModQueueAppend,
             PluginEventKind::AutoModQueueRemove,
@@ -1551,6 +1569,7 @@ fn push_event_type_table(L: *mut lua_State) {
             PluginEventKind::IrcTopicChanged,
             PluginEventKind::AuthExpired,
             PluginEventKind::UserMessagesCleared,
+            PluginEventKind::LowTrustStatusUpdated,
             PluginEventKind::UserStateUpdated,
             PluginEventKind::ChannelMessagesCleared,
             PluginEventKind::ClearUserMessagesLocally,
@@ -1559,6 +1578,11 @@ fn push_event_type_table(L: *mut lua_State) {
             PluginEventKind::PluginUiChange,
             PluginEventKind::PluginUiSubmit,
             PluginEventKind::PluginUiWindowClosed,
+            PluginEventKind::NicknamesUpdated,
+            PluginEventKind::IgnoredUsersUpdated,
+            PluginEventKind::IgnoredPhrasesUpdated,
+            PluginEventKind::UserPronounsLoaded,
+            PluginEventKind::UsercardSettingsUpdated,
         ];
         for (idx, kind) in kinds.into_iter().enumerate() {
             set_field_int(L, -1, event_kind_name(kind), idx as i64);
@@ -1623,6 +1647,14 @@ fn event_kind_from_value(L: *mut lua_State, idx: c_int) -> Option<PluginEventKin
                 50 => Some(PluginEventKind::PluginUiChange),
                 51 => Some(PluginEventKind::PluginUiSubmit),
                 52 => Some(PluginEventKind::PluginUiWindowClosed),
+                53 => Some(PluginEventKind::NicknamesUpdated),
+                54 => Some(PluginEventKind::IgnoredUsersUpdated),
+                55 => Some(PluginEventKind::IgnoredPhrasesUpdated),
+                56 => Some(PluginEventKind::UserPronounsLoaded),
+                57 => Some(PluginEventKind::UsercardSettingsUpdated),
+                58 => Some(PluginEventKind::FontSettingsUpdated),
+                59 => Some(PluginEventKind::RestoreLastActiveChannel),
+                60 => Some(PluginEventKind::LowTrustStatusUpdated),
                 _ => None,
             },
             LUA_TSTRING => {
@@ -1675,6 +1707,7 @@ fn event_kind_from_value(L: *mut lua_State, idx: c_int) -> Option<PluginEventKin
                     "irctopicchanged" => PluginEventKind::IrcTopicChanged,
                     "authexpired" => PluginEventKind::AuthExpired,
                     "usermessagescleared" => PluginEventKind::UserMessagesCleared,
+                    "lowtruststatusupdated" => PluginEventKind::LowTrustStatusUpdated,
                     "userstateupdated" => PluginEventKind::UserStateUpdated,
                     "channelmessagescleared" => PluginEventKind::ChannelMessagesCleared,
                     "clearusermessageslocally" => PluginEventKind::ClearUserMessagesLocally,
@@ -1683,6 +1716,13 @@ fn event_kind_from_value(L: *mut lua_State, idx: c_int) -> Option<PluginEventKin
                     "pluginuichange" => PluginEventKind::PluginUiChange,
                     "pluginuisubmit" => PluginEventKind::PluginUiSubmit,
                     "pluginuiwindowclosed" => PluginEventKind::PluginUiWindowClosed,
+                    "nicknamesupdated" => PluginEventKind::NicknamesUpdated,
+                    "ignoredusersupdated" => PluginEventKind::IgnoredUsersUpdated,
+                    "ignoredphrasesupdated" => PluginEventKind::IgnoredPhrasesUpdated,
+                    "userpronounsloaded" => PluginEventKind::UserPronounsLoaded,
+                    "usercardsettingsupdated" => PluginEventKind::UsercardSettingsUpdated,
+                    "fontsettingsupdated" => PluginEventKind::FontSettingsUpdated,
+                    "restorelastactivechannel" => PluginEventKind::RestoreLastActiveChannel,
                     _ => return None,
                 })
             }
@@ -3913,6 +3953,14 @@ fn set_field_bool(L: *mut lua_State, idx: c_int, key: &str, value: bool) {
     }
 }
 
+fn set_field_number(L: *mut lua_State, idx: c_int, key: &str, value: f64) {
+    unsafe {
+        let idx = lua_absindex(L, idx);
+        lua_pushnumber(L, value as lua_Number);
+        lua_setfield(L, idx, cstring(key).as_ptr());
+    }
+}
+
 fn set_list_string(L: *mut lua_State, idx: c_int, pos: lua_Integer, value: &str) {
     unsafe {
         let idx = lua_absindex(L, idx);
@@ -4704,6 +4752,8 @@ fn event_kind(event: &AppEvent) -> Option<PluginEventKind> {
             PluginEventKind::EmotePickerPreferencesUpdated
         }
         AppEvent::AppearanceSettingsUpdated { .. } => PluginEventKind::AppearanceSettingsUpdated,
+        AppEvent::FontSettingsUpdated { .. } => PluginEventKind::FontSettingsUpdated,
+        AppEvent::RestoreLastActiveChannel { .. } => PluginEventKind::RestoreLastActiveChannel,
         AppEvent::RoomStateUpdated { .. } => PluginEventKind::RoomStateUpdated,
         AppEvent::AutoModQueueAppend { .. } => PluginEventKind::AutoModQueueAppend,
         AppEvent::AutoModQueueRemove { .. } => PluginEventKind::AutoModQueueRemove,
@@ -4715,6 +4765,11 @@ fn event_kind(event: &AppEvent) -> Option<PluginEventKind> {
         AppEvent::HighlightRulesUpdated { .. } => PluginEventKind::HighlightRulesUpdated,
         AppEvent::FilterRecordsUpdated { .. } => PluginEventKind::FilterRecordsUpdated,
         AppEvent::ModActionPresetsUpdated { .. } => PluginEventKind::ModActionPresetsUpdated,
+        AppEvent::NicknamesUpdated { .. } => PluginEventKind::NicknamesUpdated,
+        AppEvent::IgnoredUsersUpdated { .. } => PluginEventKind::IgnoredUsersUpdated,
+        AppEvent::IgnoredPhrasesUpdated { .. } => PluginEventKind::IgnoredPhrasesUpdated,
+        AppEvent::UserPronounsLoaded { .. } => PluginEventKind::UserPronounsLoaded,
+        AppEvent::UsercardSettingsUpdated { .. } => PluginEventKind::UsercardSettingsUpdated,
         AppEvent::AuthExpired => PluginEventKind::AuthExpired,
         AppEvent::UpdaterSettingsUpdated { .. }
         | AppEvent::UpdateInstallStarted { .. }
@@ -4723,12 +4778,15 @@ fn event_kind(event: &AppEvent) -> Option<PluginEventKind> {
         | AppEvent::UpdateAvailable { .. }
         | AppEvent::UpdateCheckUpToDate { .. }
         | AppEvent::UpdateCheckFailed { .. } => PluginEventKind::Error,
+        AppEvent::StreamerModeSettingsUpdated { .. }
+        | AppEvent::StreamerModeActiveChanged { .. } => PluginEventKind::Error,
         AppEvent::SelfAvatarLoaded { .. } => PluginEventKind::SelfAvatarLoaded,
         AppEvent::LinkPreviewReady { .. } => PluginEventKind::LinkPreviewReady,
         AppEvent::SenderCosmeticsUpdated { .. } => PluginEventKind::SenderCosmeticsUpdated,
         AppEvent::IrcTopicChanged { .. } => PluginEventKind::IrcTopicChanged,
         AppEvent::UserStateUpdated { .. } => PluginEventKind::UserStateUpdated,
         AppEvent::UserMessagesCleared { .. } => PluginEventKind::UserMessagesCleared,
+        AppEvent::LowTrustStatusUpdated { .. } => PluginEventKind::LowTrustStatusUpdated,
         AppEvent::ChannelMessagesCleared { .. } => PluginEventKind::ChannelMessagesCleared,
         AppEvent::ClearUserMessagesLocally { .. } => PluginEventKind::ClearUserMessagesLocally,
         AppEvent::ImagePrefetchQueued { .. } => PluginEventKind::ImagePrefetchQueued,
@@ -4862,6 +4920,21 @@ unsafe fn make_event_table(L: *mut lua_State, event: &AppEvent) -> c_int {
             push_channel_table(L, channel);
             lua_setfield(L, -2, cstring("channel").as_ptr());
             set_field_string(L, -1, "login", login);
+        }
+        AppEvent::LowTrustStatusUpdated {
+            channel,
+            login,
+            status,
+        } => {
+            push_channel_table(L, channel);
+            lua_setfield(L, -2, cstring("channel").as_ptr());
+            set_field_string(L, -1, "login", login);
+            let s = match status {
+                Some(crust_core::model::LowTrustStatus::Monitored) => "monitored",
+                Some(crust_core::model::LowTrustStatus::Restricted) => "restricted",
+                None => "none",
+            };
+            set_field_string(L, -1, "status", s);
         }
         AppEvent::SystemNotice(notice) => {
             push_system_notice_table(L, notice);
@@ -5013,6 +5086,24 @@ unsafe fn make_event_table(L: *mut lua_State, event: &AppEvent) -> c_int {
             if let Some(provider_boost) = provider_boost.as_ref() {
                 set_field_string(L, -1, "provider_boost", provider_boost);
             }
+        }
+        AppEvent::FontSettingsUpdated {
+            chat_font_size,
+            ui_font_size,
+            topbar_font_size,
+            tabs_font_size,
+            timestamps_font_size,
+            pills_font_size,
+        } => {
+            set_field_number(L, -1, "chat_font_size", *chat_font_size as f64);
+            set_field_number(L, -1, "ui_font_size", *ui_font_size as f64);
+            set_field_number(L, -1, "topbar_font_size", *topbar_font_size as f64);
+            set_field_number(L, -1, "tabs_font_size", *tabs_font_size as f64);
+            set_field_number(L, -1, "timestamps_font_size", *timestamps_font_size as f64);
+            set_field_number(L, -1, "pills_font_size", *pills_font_size as f64);
+        }
+        AppEvent::RestoreLastActiveChannel { channel } => {
+            set_field_string(L, -1, "channel", channel);
         }
         AppEvent::AppearanceSettingsUpdated {
             channel_layout,
@@ -5195,6 +5286,62 @@ unsafe fn make_event_table(L: *mut lua_State, event: &AppEvent) -> c_int {
                 lua_seti(L, -2, (idx + 1) as lua_Integer);
             }
             lua_setfield(L, -2, cstring("presets").as_ptr());
+        }
+        AppEvent::NicknamesUpdated { nicknames } => {
+            lua_createtable(L, nicknames.len() as c_int, 0);
+            for (idx, n) in nicknames.iter().enumerate() {
+                lua_createtable(L, 0, 0);
+                set_field_string(L, -1, "login", &n.login);
+                set_field_string(L, -1, "nickname", &n.nickname);
+                set_field_bool(L, -1, "replace_mentions", n.replace_mentions);
+                set_field_bool(L, -1, "case_sensitive", n.case_sensitive);
+                if let Some(channel) = n.channel.as_ref() {
+                    set_field_string(L, -1, "channel", channel);
+                }
+                lua_seti(L, -2, (idx + 1) as lua_Integer);
+            }
+            lua_setfield(L, -2, cstring("nicknames").as_ptr());
+        }
+        AppEvent::IgnoredUsersUpdated { users } => {
+            lua_createtable(L, users.len() as c_int, 0);
+            for (idx, u) in users.iter().enumerate() {
+                lua_createtable(L, 0, 0);
+                set_field_string(L, -1, "login", &u.login);
+                set_field_bool(L, -1, "is_regex", u.is_regex);
+                set_field_bool(L, -1, "case_sensitive", u.case_sensitive);
+                set_field_bool(L, -1, "enabled", u.enabled);
+                lua_seti(L, -2, (idx + 1) as lua_Integer);
+            }
+            lua_setfield(L, -2, cstring("users").as_ptr());
+        }
+        AppEvent::IgnoredPhrasesUpdated { phrases } => {
+            lua_createtable(L, phrases.len() as c_int, 0);
+            for (idx, p) in phrases.iter().enumerate() {
+                lua_createtable(L, 0, 0);
+                set_field_string(L, -1, "pattern", &p.pattern);
+                set_field_bool(L, -1, "is_regex", p.is_regex);
+                set_field_bool(L, -1, "case_sensitive", p.case_sensitive);
+                set_field_bool(L, -1, "enabled", p.enabled);
+                set_field_string(L, -1, "replace_with", &p.replace_with);
+                let action = match p.action {
+                    crust_core::ignores::IgnoredPhraseAction::Block => "Block",
+                    crust_core::ignores::IgnoredPhraseAction::Replace => "Replace",
+                    crust_core::ignores::IgnoredPhraseAction::HighlightOnly => "HighlightOnly",
+                    crust_core::ignores::IgnoredPhraseAction::MentionOnly => "MentionOnly",
+                };
+                set_field_string(L, -1, "action", action);
+                lua_seti(L, -2, (idx + 1) as lua_Integer);
+            }
+            lua_setfield(L, -2, cstring("phrases").as_ptr());
+        }
+        AppEvent::UserPronounsLoaded { login, pronouns } => {
+            set_field_string(L, -1, "login", login);
+            if let Some(p) = pronouns.as_ref() {
+                set_field_string(L, -1, "pronouns", p);
+            }
+        }
+        AppEvent::UsercardSettingsUpdated { show_pronouns } => {
+            set_field_bool(L, -1, "show_pronouns", *show_pronouns);
         }
         AppEvent::SelfAvatarLoaded { avatar_url } => {
             set_field_string(L, -1, "avatar_url", avatar_url);
@@ -5402,6 +5549,20 @@ unsafe fn make_event_table(L: *mut lua_State, event: &AppEvent) -> c_int {
         AppEvent::UpdateInstallFailed { version, message } => {
             set_field_string(L, -1, "version", version);
             set_field_string(L, -1, "message", message);
+        }
+        AppEvent::StreamerModeSettingsUpdated {
+            mode,
+            hide_link_previews,
+            hide_viewer_counts,
+            suppress_sounds,
+        } => {
+            set_field_string(L, -1, "mode", mode);
+            set_field_bool(L, -1, "hide_link_previews", *hide_link_previews);
+            set_field_bool(L, -1, "hide_viewer_counts", *hide_viewer_counts);
+            set_field_bool(L, -1, "suppress_sounds", *suppress_sounds);
+        }
+        AppEvent::StreamerModeActiveChanged { active } => {
+            set_field_bool(L, -1, "active", *active);
         }
     }
 

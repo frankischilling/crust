@@ -1,5 +1,6 @@
 pub mod eventsub;
 pub mod irc;
+pub mod providers;
 pub mod session;
 
 pub use irc::parse_line;

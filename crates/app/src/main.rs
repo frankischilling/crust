@@ -64,9 +64,10 @@ use runtime::system_messages::{
 
 mod runtime;
 mod seventv;
+mod streamer_mode;
 mod updater;
 
-const CMD_CHANNEL_SIZE: usize = 512;
+const CMD_CHANNEL_SIZE: usize = 2048;
 const EVT_CHANNEL_SIZE: usize = 4096;
 const TWITCH_EVT_SIZE: usize = 4096;
 const KICK_EVT_SIZE: usize = 4096;
@@ -89,6 +90,43 @@ static UI_REPAINT_CTX: OnceLock<egui::Context> = OnceLock::new();
 fn request_ui_repaint() {
     if let Some(ctx) = UI_REPAINT_CTX.get() {
         ctx.request_repaint();
+    }
+}
+
+fn crust_icon_data() -> egui::IconData {
+    const SIZE: u32 = 64;
+    let mut rgba = vec![0_u8; (SIZE * SIZE * 4) as usize];
+    let center = (SIZE as f32 - 1.0) * 0.5;
+
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let dx = x as f32 - center;
+            let dy = y as f32 - center;
+            let dist = (dx * dx + dy * dy).sqrt();
+
+            let mut px = [0_u8, 0_u8, 0_u8, 0_u8];
+
+            // Dark circular backdrop.
+            if dist <= 30.0 {
+                px = [21, 30, 46, 255];
+            }
+
+            // Stylized "C" ring with a right-side gap.
+            let in_ring = (14.0..=26.0).contains(&dist);
+            let right_gap = dx > 9.0 && dy.abs() < 11.0;
+            if in_ring && !right_gap {
+                px = [138, 92, 255, 255];
+            }
+
+            let idx = ((y * SIZE + x) * 4) as usize;
+            rgba[idx..idx + 4].copy_from_slice(&px);
+        }
+    }
+
+    egui::IconData {
+        rgba,
+        width: SIZE,
+        height: SIZE,
     }
 }
 
@@ -234,6 +272,12 @@ fn main() -> Result<()> {
 
     // Apply persisted theme before UI renders.
     crust_ui::theme::apply_from_str(&initial_settings.theme);
+    crust_ui::theme::set_chat_font_size(initial_settings.font_size);
+    crust_ui::theme::set_ui_font_size(initial_settings.ui_font_size);
+    crust_ui::theme::set_topbar_font_size(initial_settings.topbar_font_size);
+    crust_ui::theme::set_tabs_font_size(initial_settings.tabs_font_size);
+    crust_ui::theme::set_timestamps_font_size(initial_settings.timestamps_font_size);
+    crust_ui::theme::set_pills_font_size(initial_settings.pills_font_size);
 
     // Raise worker stack size before any tokio threads are created.
     // Some startup paths in OpenSSL/reqwest are deep enough to overflow the
@@ -356,6 +400,7 @@ fn main() -> Result<()> {
             .with_title("Crust - Twitch, Kick & IRC Chat")
             .with_inner_size(APP_INITIAL_INNER_SIZE)
             .with_min_inner_size(APP_MIN_INNER_SIZE)
+            .with_icon(crust_icon_data())
             .with_app_id("crust"),
         ..Default::default()
     };
@@ -539,6 +584,13 @@ async fn reducer_loop(
         .as_ref()
         .map(|s| s.load())
         .unwrap_or_default();
+    // Compiled phrase / ignored-user matchers kept in sync with `settings`.
+    let mut compiled_ignored_phrases =
+        crust_core::ignores::CompiledIgnoredPhrases::new(&settings.ignored_phrases);
+    let mut compiled_ignored_users =
+        crust_core::ignores::CompiledIgnoredUsers::new(&settings.ignored_users);
+    // Shared alejo.io pronouns provider used by FetchUserPronouns dispatches.
+    let pronouns_provider = crust_twitch::providers::pronouns::PronounsProvider::new();
     let mut kick_beta_enabled = settings.enable_kick_beta;
     let mut irc_beta_enabled = settings.enable_irc_beta;
     fn parse_saved_channel(raw: &str) -> Option<ChannelId> {
@@ -754,12 +806,73 @@ async fn reducer_loop(
         })
         .await;
     let _ = evt_tx
+        .send(AppEvent::FontSettingsUpdated {
+            chat_font_size: settings.font_size,
+            ui_font_size: settings.ui_font_size,
+            topbar_font_size: settings.topbar_font_size,
+            tabs_font_size: settings.tabs_font_size,
+            timestamps_font_size: settings.timestamps_font_size,
+            pills_font_size: settings.pills_font_size,
+        })
+        .await;
+    if !settings.last_active_channel.is_empty() {
+        let _ = evt_tx
+            .send(AppEvent::RestoreLastActiveChannel {
+                channel: settings.last_active_channel.clone(),
+            })
+            .await;
+    }
+    let _ = evt_tx
         .send(AppEvent::UpdaterSettingsUpdated {
             update_checks_enabled: settings.update_checks_enabled,
             last_checked_at: settings.updater_last_checked_at.clone(),
             skipped_version: settings.updater_skipped_version.clone(),
         })
         .await;
+    let _ = evt_tx
+        .send(AppEvent::NicknamesUpdated {
+            nicknames: settings.nicknames.clone(),
+        })
+        .await;
+    let _ = evt_tx
+        .send(AppEvent::IgnoredUsersUpdated {
+            users: settings.ignored_users.clone(),
+        })
+        .await;
+    let _ = evt_tx
+        .send(AppEvent::IgnoredPhrasesUpdated {
+            phrases: settings.ignored_phrases.clone(),
+        })
+        .await;
+
+    let _ = evt_tx
+        .send(AppEvent::UsercardSettingsUpdated {
+            show_pronouns: settings.show_pronouns_in_usercard,
+        })
+        .await;
+
+    let _ = evt_tx
+        .send(AppEvent::StreamerModeSettingsUpdated {
+            mode: settings.streamer_mode.clone(),
+            hide_link_previews: settings.streamer_hide_link_previews,
+            hide_viewer_counts: settings.streamer_hide_viewer_counts,
+            suppress_sounds: settings.streamer_suppress_sounds,
+        })
+        .await;
+
+    let streamer_mode_setting_tx = streamer_mode::spawn_detector(
+        streamer_mode::StreamerModeSetting::from_str(&settings.streamer_mode),
+        evt_tx.clone(),
+    );
+
+    // Warm the alejo pronouns catalog if the usercard toggle is on so the
+    // first lookup resolves without paying the `/v1/pronouns` round-trip.
+    if settings.show_pronouns_in_usercard {
+        let provider = pronouns_provider.clone();
+        tokio::spawn(async move {
+            provider.load_catalog().await;
+        });
+    }
 
     // Configure preferred IRC nickname (if set).
     if irc_runtime_enabled && irc_beta_enabled && !settings.irc_nick.trim().is_empty() {
@@ -1060,6 +1173,32 @@ async fn reducer_loop(
                         }
                     }
                     TwitchEvent::ChatMessage(mut msg) => {
+                        // Drop messages from locally ignored users up front so
+                        // no highlight/mention side-effects fire for them.
+                        if compiled_ignored_users.is_ignored(&msg.sender.login) {
+                            continue;
+                        }
+                        // Apply ignored-phrase actions *before* tokenization so
+                        // that a Replace rule's output text goes through normal
+                        // emote/URL/mention detection.  A Block rule drops the
+                        // message without emitting it.
+                        let phrase_outcome = compiled_ignored_phrases.apply(&mut msg.raw_text);
+                        if phrase_outcome.blocked {
+                            continue;
+                        }
+                        if phrase_outcome.highlight_only {
+                            msg.flags.is_highlighted = true;
+                        }
+                        if phrase_outcome.mention_only {
+                            msg.flags.is_mention = true;
+                        }
+                        // Twitch emote positions referred to byte offsets in the
+                        // original text; after a replace rewrite those offsets
+                        // would be stale.  Clear them so the tokenizer doesn't
+                        // splice emotes at wrong indices.
+                        if phrase_outcome.replaced {
+                            msg.twitch_emotes.clear();
+                        }
                         // Hold read lock only during tokenization (no clone needed)
                         {
                             let emote_guard = emote_index.read().unwrap();
@@ -1090,6 +1229,14 @@ async fn reducer_loop(
                             }
                         }
 
+                        // Apply nickname alias to sender display name.
+                        crust_core::model::apply_nickname(
+                            &settings.nicknames,
+                            &msg.sender.login,
+                            &msg.channel.0,
+                            &mut msg.sender.display_name,
+                        );
+
                         // Mention / reply-to-me detection
                         if let Some(ref uname) = auth_username {
                             let uname_lower = uname.to_lowercase();
@@ -1105,7 +1252,29 @@ async fn reducer_loop(
                             let is_reply_to_me = msg.reply.as_ref()
                                 .map(|r| r.parent_user_login.to_lowercase() == uname_lower)
                                 .unwrap_or(false);
-                            msg.flags.is_mention = has_at_mention || has_bare_mention || is_reply_to_me;
+                            // Self-mention via nickname: if the logged-in user has a
+                            // nickname alias (replace_mentions=true), also match messages
+                            // that contain the alias as a bare or @-prefixed word.
+                            let has_nickname_mention = settings
+                                .nicknames
+                                .iter()
+                                .filter(|n| n.replace_mentions && n.matches_login(uname))
+                                .any(|n| {
+                                    let nick_lower = n.nickname.to_lowercase();
+                                    if nick_lower.is_empty() {
+                                        return false;
+                                    }
+                                    if text_lower.contains(&format!("@{nick_lower}")) {
+                                        return true;
+                                    }
+                                    text_lower
+                                        .split(|c: char| !c.is_alphanumeric() && c != '_')
+                                        .any(|w| w == nick_lower)
+                                });
+                            msg.flags.is_mention = has_at_mention
+                                || has_bare_mention
+                                || is_reply_to_me
+                                || has_nickname_mention;
                         }
 
                         // Apply cached 7TV cosmetics for Twitch users and
@@ -2023,7 +2192,27 @@ async fn reducer_loop(
                                     text,
                                     ..
                                 } => {
-                                    if low_trust_status.trim().eq_ignore_ascii_case("restricted") {
+                                    let status_norm =
+                                        low_trust_status.trim().to_ascii_lowercase();
+                                    let tracked_status = match status_norm.as_str() {
+                                        "restricted" => {
+                                            Some(crust_core::model::LowTrustStatus::Restricted)
+                                        }
+                                        "active_monitoring" | "monitored" => {
+                                            Some(crust_core::model::LowTrustStatus::Monitored)
+                                        }
+                                        _ => None,
+                                    };
+                                    if let Some(s) = tracked_status {
+                                        let _ = evt_tx
+                                            .send(AppEvent::LowTrustStatusUpdated {
+                                                channel: channel.clone(),
+                                                login: user_login.to_ascii_lowercase(),
+                                                status: Some(s),
+                                            })
+                                            .await;
+                                    }
+                                    if status_norm == "restricted" {
                                         let mut details = Vec::new();
                                         if types.iter().any(|ty| ty.eq_ignore_ascii_case("ban_evader_detector")) {
                                             let evader = match ban_evasion_evaluation
@@ -2095,15 +2284,33 @@ async fn reducer_loop(
                                     moderator_user_id,
                                     moderator_login,
                                     moderator_name,
+                                    user_login,
                                     user_name,
                                     low_trust_status,
                                     ..
                                 } => {
-                                    let action_text = match low_trust_status
-                                        .trim()
-                                        .to_ascii_lowercase()
-                                        .as_str()
-                                    {
+                                    let status_norm =
+                                        low_trust_status.trim().to_ascii_lowercase();
+                                    let tracked_status = match status_norm.as_str() {
+                                        "restricted" => {
+                                            Some(Some(crust_core::model::LowTrustStatus::Restricted))
+                                        }
+                                        "active_monitoring" | "monitored" => {
+                                            Some(Some(crust_core::model::LowTrustStatus::Monitored))
+                                        }
+                                        "none" => Some(None),
+                                        _ => None,
+                                    };
+                                    if let Some(s) = tracked_status {
+                                        let _ = evt_tx
+                                            .send(AppEvent::LowTrustStatusUpdated {
+                                                channel: channel.clone(),
+                                                login: user_login.to_ascii_lowercase(),
+                                                status: s,
+                                            })
+                                            .await;
+                                    }
+                                    let action_text = match status_norm.as_str() {
                                         "restricted" => format!(
                                             "{moderator_name} added {user_name} as a restricted suspicious chatter."
                                         ),
@@ -2836,6 +3043,67 @@ async fn reducer_loop(
                             }
                         }
                     }
+                    AppCommand::SetFontSizes {
+                        chat_font_size,
+                        ui_font_size,
+                        topbar_font_size,
+                        tabs_font_size,
+                        timestamps_font_size,
+                        pills_font_size,
+                    } => {
+                        let chat = if chat_font_size.is_finite() {
+                            chat_font_size.clamp(8.0, 32.0)
+                        } else {
+                            13.5
+                        };
+                        let ui = if ui_font_size.is_finite() {
+                            ui_font_size.clamp(0.75, 1.75)
+                        } else {
+                            1.0
+                        };
+                        let clamp_section = |v: f32| {
+                            if !v.is_finite() || v < 0.0 {
+                                0.0
+                            } else if v == 0.0 {
+                                0.0
+                            } else {
+                                v.clamp(8.0, 28.0)
+                            }
+                        };
+                        let topbar = clamp_section(topbar_font_size);
+                        let tabs = clamp_section(tabs_font_size);
+                        let timestamps = clamp_section(timestamps_font_size);
+                        let pills = clamp_section(pills_font_size);
+                        settings.font_size = chat;
+                        settings.ui_font_size = ui;
+                        settings.topbar_font_size = topbar;
+                        settings.tabs_font_size = tabs;
+                        settings.timestamps_font_size = timestamps;
+                        settings.pills_font_size = pills;
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save font size settings: {e}");
+                            }
+                        }
+                        let _ = evt_tx
+                            .send(AppEvent::FontSettingsUpdated {
+                                chat_font_size: chat,
+                                ui_font_size: ui,
+                                topbar_font_size: topbar,
+                                tabs_font_size: tabs,
+                                timestamps_font_size: timestamps,
+                                pills_font_size: pills,
+                            })
+                            .await;
+                    }
+                    AppCommand::SetLastActiveChannel { channel } => {
+                        settings.last_active_channel = channel;
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save last active channel: {e}");
+                            }
+                        }
+                    }
                     AppCommand::SetChatUiBehavior {
                         prevent_overlong_twitch_messages,
                         collapse_long_messages,
@@ -3133,6 +3401,43 @@ async fn reducer_loop(
                             .send(AppEvent::ModActionPresetsUpdated { presets })
                             .await;
                     }
+                    AppCommand::SetNicknames { nicknames } => {
+                        settings.nicknames = nicknames.clone();
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save nicknames: {e}");
+                            }
+                        }
+                        let _ = evt_tx
+                            .send(AppEvent::NicknamesUpdated { nicknames })
+                            .await;
+                    }
+                    AppCommand::SetIgnoredUsers { users } => {
+                        settings.ignored_users = users.clone();
+                        compiled_ignored_users =
+                            crust_core::ignores::CompiledIgnoredUsers::new(&users);
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save ignored users: {e}");
+                            }
+                        }
+                        let _ = evt_tx
+                            .send(AppEvent::IgnoredUsersUpdated { users })
+                            .await;
+                    }
+                    AppCommand::SetIgnoredPhrases { phrases } => {
+                        settings.ignored_phrases = phrases.clone();
+                        compiled_ignored_phrases =
+                            crust_core::ignores::CompiledIgnoredPhrases::new(&phrases);
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save ignored phrases: {e}");
+                            }
+                        }
+                        let _ = evt_tx
+                            .send(AppEvent::IgnoredPhrasesUpdated { phrases })
+                            .await;
+                    }
                     AppCommand::SetNotificationSettings {
                         desktop_notifications_enabled,
                     } => {
@@ -3268,6 +3573,37 @@ async fn reducer_loop(
                             })
                             .await;
                         spawn_update_install(update, restart_now, update_install_tx.clone());
+                    }
+                    AppCommand::SetStreamerModeSettings {
+                        mode,
+                        hide_link_previews,
+                        hide_viewer_counts,
+                        suppress_sounds,
+                    } => {
+                        let mode = if matches!(mode.as_str(), "off" | "auto" | "on") {
+                            mode
+                        } else {
+                            "off".to_owned()
+                        };
+                        settings.streamer_mode = mode.clone();
+                        settings.streamer_hide_link_previews = hide_link_previews;
+                        settings.streamer_hide_viewer_counts = hide_viewer_counts;
+                        settings.streamer_suppress_sounds = suppress_sounds;
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save streamer mode settings: {e}");
+                            }
+                        }
+                        let _ = streamer_mode_setting_tx
+                            .send(streamer_mode::StreamerModeSetting::from_str(&mode));
+                        let _ = evt_tx
+                            .send(AppEvent::StreamerModeSettingsUpdated {
+                                mode,
+                                hide_link_previews,
+                                hide_viewer_counts,
+                                suppress_sounds,
+                            })
+                            .await;
                     }
                     AppCommand::SendMessage {
                         channel,
@@ -3652,6 +3988,11 @@ async fn reducer_loop(
                         let etx = evt_tx.clone();
                         let token = settings.oauth_token.clone();
                         let client_id = helix_client_id.clone();
+                        let pronouns_login = if settings.show_pronouns_in_usercard {
+                            Some(login.clone())
+                        } else {
+                            None
+                        };
                         tokio::spawn(async move {
                             fetch_twitch_user_profile(
                                 &login,
@@ -3661,6 +4002,66 @@ async fn reducer_loop(
                             )
                             .await;
                         });
+                        // When the usercard pronouns toggle is on, kick off an
+                        // alejo.io lookup in parallel so the popup resolves
+                        // within a single round-trip.  Cached hits are instant.
+                        if let Some(login) = pronouns_login {
+                            info!("pronouns: fetching for {login} (toggle=on)");
+                            let etx = evt_tx.clone();
+                            let provider = pronouns_provider.clone();
+                            tokio::spawn(async move {
+                                let pronouns = provider.fetch_user(&login).await;
+                                info!(
+                                    "pronouns: dispatching UserPronounsLoaded for {login} -> {:?}",
+                                    pronouns
+                                );
+                                let _ = etx
+                                    .send(AppEvent::UserPronounsLoaded {
+                                        login,
+                                        pronouns,
+                                    })
+                                    .await;
+                            });
+                        } else {
+                            debug!(
+                                "pronouns: skipped for FetchUserProfile (toggle={})",
+                                settings.show_pronouns_in_usercard
+                            );
+                        }
+                    }
+                    AppCommand::FetchUserPronouns { login } => {
+                        if !settings.show_pronouns_in_usercard {
+                            continue;
+                        }
+                        let etx = evt_tx.clone();
+                        let provider = pronouns_provider.clone();
+                        tokio::spawn(async move {
+                            let pronouns = provider.fetch_user(&login).await;
+                            let _ = etx
+                                .send(AppEvent::UserPronounsLoaded { login, pronouns })
+                                .await;
+                        });
+                    }
+                    AppCommand::SetShowPronounsInUsercard { enabled } => {
+                        settings.show_pronouns_in_usercard = enabled;
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save pronouns toggle: {e}");
+                            }
+                        }
+                        // Warm the catalog on first opt-in so the next fetch
+                        // resolves in a single round-trip.
+                        if enabled {
+                            let provider = pronouns_provider.clone();
+                            tokio::spawn(async move {
+                                provider.load_catalog().await;
+                            });
+                        }
+                        let _ = evt_tx
+                            .send(AppEvent::UsercardSettingsUpdated {
+                                show_pronouns: enabled,
+                            })
+                            .await;
                     }
                     AppCommand::FetchStreamStatus { login } => {
                         let etx = evt_tx.clone();
@@ -4191,6 +4592,91 @@ async fn reducer_loop(
                         // Platform-agnostic browser open via xdg-open / open / start.
                         open_url_in_browser(&url);
                     }
+                    AppCommand::OpenLogsFolder => {
+                        if let Some(dir) = logs_folder_path() {
+                            open_path_in_file_manager(&dir);
+                        } else {
+                            let _ = evt_tx
+                                .send(AppEvent::Error {
+                                    context: "Logs".into(),
+                                    message: "Could not resolve the logs directory path.".into(),
+                                })
+                                .await;
+                        }
+                    }
+                    AppCommand::SetShieldMode { channel, active } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let moderator_id = auth_user_id.clone();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        tokio::spawn(async move {
+                            helix_set_shield_mode(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                moderator_id.as_deref(),
+                                active,
+                                &channel,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::UpdateChannelInfo {
+                        channel,
+                        title,
+                        game_name,
+                    } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        tokio::spawn(async move {
+                            helix_update_channel_info(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                title.as_deref(),
+                                game_name.as_deref(),
+                                &channel,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::FetchFollowAge { channel, user } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        tokio::spawn(async move {
+                            helix_fetch_follow_age(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                &user,
+                                &channel,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
+                    AppCommand::FetchAccountAge { channel, user } => {
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        tokio::spawn(async move {
+                            helix_fetch_account_age(
+                                &token,
+                                client_id.as_deref(),
+                                &user,
+                                &channel,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
                     AppCommand::ReloadPlugins => {
                         if let Some(host) = plugin_host() {
                             host.reload();
@@ -4240,6 +4726,29 @@ async fn reducer_loop(
                         let etx = evt_tx.clone();
                         let token = settings.oauth_token.clone();
                         let client_id = helix_client_id.clone();
+                        // Fire the pronouns lookup in parallel so the popup
+                        // resolves in a single round-trip.  Only for Twitch
+                        // users (alejo.io is Twitch-only).
+                        if settings.show_pronouns_in_usercard && channel.is_twitch() {
+                            info!("pronouns: fetching for {login} (ShowUserCard)");
+                            let etx_p = evt_tx.clone();
+                            let provider = pronouns_provider.clone();
+                            let pronoun_login = login.clone();
+                            tokio::spawn(async move {
+                                let pronouns = provider.fetch_user(&pronoun_login).await;
+                                info!(
+                                    "pronouns: dispatching UserPronounsLoaded for \
+                                     {pronoun_login} -> {:?}",
+                                    pronouns
+                                );
+                                let _ = etx_p
+                                    .send(AppEvent::UserPronounsLoaded {
+                                        login: pronoun_login,
+                                        pronouns,
+                                    })
+                                    .await;
+                            });
+                        }
                         tokio::spawn(async move {
                             fetch_user_profile_for_channel(
                                 &login,
@@ -7743,6 +8252,502 @@ fn open_url_in_browser(url: &str) {
     }
 }
 
+fn logs_folder_path() -> Option<std::path::PathBuf> {
+    directories::ProjectDirs::from("dev", "crust", "crust")
+        .map(|dirs| dirs.data_dir().join("logs"))
+}
+
+fn open_path_in_file_manager(path: &std::path::Path) {
+    let _ = std::fs::create_dir_all(path);
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(path).spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("explorer.exe").arg(path).spawn();
+    }
+}
+
+/// Call `PUT /helix/moderation/shield_mode` to enable or disable Shield Mode.
+async fn helix_set_shield_mode(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    moderator_id: Option<&str>,
+    active: bool,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (cid, bid, mid) =
+        match require_helix_moderation_context(client_id, broadcaster_id, moderator_id) {
+            Ok(v) => v,
+            Err(err) => {
+                let _ = evt_tx
+                    .send(AppEvent::Error {
+                        context: "Shield mode".into(),
+                        message: err,
+                    })
+                    .await;
+                return;
+            }
+        };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    let url = format!(
+        "https://api.twitch.tv/helix/moderation/shield_mode\
+         ?broadcaster_id={bid}&moderator_id={mid}"
+    );
+
+    #[derive(serde::Serialize)]
+    struct ShieldBody {
+        is_active: bool,
+    }
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .put(&url)
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .json(&ShieldBody { is_active: active })
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Shield mode".into(),
+                    message: format!("Shield mode request failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let status = resp.status();
+    if status.is_success() {
+        let verb = if active { "enabled" } else { "disabled" };
+        emit_helix_system_info(evt_tx, channel, format!("Shield mode {verb}.")).await;
+    } else {
+        let body = resp.text().await.unwrap_or_default();
+        let msg = helix_error_message(status, &body);
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Shield mode".into(),
+                message: format!("Could not update shield mode: {msg}"),
+            })
+            .await;
+    }
+}
+
+/// Resolve a game/category name to a Twitch game_id via `GET /helix/games?name=...`.
+async fn helix_game_id_by_name(
+    bare_token: &str,
+    client_id: &str,
+    name: &str,
+) -> Result<String, String> {
+    #[derive(serde::Deserialize)]
+    struct GameItem {
+        id: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct GamesResponse {
+        data: Vec<GameItem>,
+    }
+
+    let encoded = urlencode_query_value(name);
+    let url = format!("https://api.twitch.tv/helix/games?name={encoded}");
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {bare_token}"))
+        .header("Client-Id", client_id)
+        .send()
+        .await
+        .map_err(|e| format!("Game lookup failed: {e}"))?;
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "Game lookup failed: {}",
+            helix_error_message(status, &body)
+        ));
+    }
+
+    let parsed: GamesResponse = serde_json::from_str(&body)
+        .map_err(|e| format!("Failed to parse game lookup response: {e}"))?;
+    parsed
+        .data
+        .into_iter()
+        .next()
+        .map(|g| g.id)
+        .ok_or_else(|| format!("No Twitch category named '{name}' found."))
+}
+
+/// Call `PATCH /helix/channels` to update title and/or game.
+async fn helix_update_channel_info(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    title: Option<&str>,
+    game_name: Option<&str>,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (cid, bid) = match require_helix_context(client_id, broadcaster_id) {
+        Ok(v) => v,
+        Err(err) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Channel info".into(),
+                    message: err,
+                })
+                .await;
+            return;
+        }
+    };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+
+    let game_id = match game_name {
+        Some(name) => match helix_game_id_by_name(bare, cid, name).await {
+            Ok(id) => Some(id),
+            Err(err) => {
+                let _ = evt_tx
+                    .send(AppEvent::Error {
+                        context: "Channel info".into(),
+                        message: err,
+                    })
+                    .await;
+                return;
+            }
+        },
+        None => None,
+    };
+
+    #[derive(serde::Serialize)]
+    struct ChannelPatch<'a> {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        game_id: Option<&'a str>,
+    }
+
+    let body = ChannelPatch {
+        title,
+        game_id: game_id.as_deref(),
+    };
+
+    let url = format!("https://api.twitch.tv/helix/channels?broadcaster_id={bid}");
+    let client = reqwest::Client::new();
+    let resp = match client
+        .patch(&url)
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Channel info".into(),
+                    message: format!("Update request failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let status = resp.status();
+    if status.is_success() {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(t) = title {
+            parts.push(format!("title → \"{t}\""));
+        }
+        if let Some(g) = game_name {
+            parts.push(format!("category → \"{g}\""));
+        }
+        let summary = if parts.is_empty() {
+            "Channel info updated.".to_owned()
+        } else {
+            format!("Channel info updated: {}.", parts.join(", "))
+        };
+        emit_helix_system_info(evt_tx, channel, summary).await;
+    } else {
+        let body_text = resp.text().await.unwrap_or_default();
+        let msg = helix_error_message(status, &body_text);
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Channel info".into(),
+                message: format!("Could not update channel info: {msg}"),
+            })
+            .await;
+    }
+}
+
+/// Call `GET /helix/channels/followers` to report how long `user` has followed
+/// `channel`. Requires the `moderator:read:followers` scope for non-self lookups.
+async fn helix_fetch_follow_age(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    user_login: &str,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let (cid, bid) = match require_helix_context(client_id, broadcaster_id) {
+        Ok(v) => v,
+        Err(err) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Follow age".into(),
+                    message: err,
+                })
+                .await;
+            return;
+        }
+    };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    let user_id = match helix_user_id_by_login(bare, cid, user_login).await {
+        Ok(id) => id,
+        Err(err) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Follow age".into(),
+                    message: err,
+                })
+                .await;
+            return;
+        }
+    };
+
+    let url = format!(
+        "https://api.twitch.tv/helix/channels/followers?broadcaster_id={bid}&user_id={user_id}"
+    );
+
+    #[derive(serde::Deserialize)]
+    struct FollowerItem {
+        followed_at: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct FollowersResponse {
+        data: Vec<FollowerItem>,
+    }
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .get(&url)
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Follow age".into(),
+                    message: format!("Follow age request failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let msg = helix_error_message(status, &body);
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Follow age".into(),
+                message: format!("Could not fetch follow age: {msg}"),
+            })
+            .await;
+        return;
+    }
+
+    let parsed: FollowersResponse = match serde_json::from_str(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Follow age".into(),
+                    message: format!("Failed to parse follow age response: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let text = match parsed.data.into_iter().next() {
+        None => format!("{user_login} does not follow this channel."),
+        Some(item) => match chrono::DateTime::parse_from_rfc3339(&item.followed_at) {
+            Ok(dt) => format!(
+                "{user_login} has followed for {} (since {}).",
+                humanize_duration_since(dt.with_timezone(&Utc)),
+                dt.format("%Y-%m-%d")
+            ),
+            Err(_) => format!("{user_login} followed at {}", item.followed_at),
+        },
+    };
+    emit_helix_system_info(evt_tx, channel, text).await;
+}
+
+/// Call `GET /helix/users` to report the account age for `user_login`.
+async fn helix_fetch_account_age(
+    token: &str,
+    client_id: Option<&str>,
+    user_login: &str,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let cid = match client_id {
+        Some(c) => c,
+        None => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Account age".into(),
+                    message: "Missing Twitch Client-ID.".into(),
+                })
+                .await;
+            return;
+        }
+    };
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+
+    #[derive(serde::Deserialize)]
+    struct UserItem {
+        login: String,
+        display_name: String,
+        created_at: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct UsersResponse {
+        data: Vec<UserItem>,
+    }
+
+    let url = format!("https://api.twitch.tv/helix/users?login={user_login}");
+    let client = reqwest::Client::new();
+    let resp = match client
+        .get(&url)
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Account age".into(),
+                    message: format!("Account age request failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let msg = helix_error_message(status, &body);
+        let _ = evt_tx
+            .send(AppEvent::Error {
+                context: "Account age".into(),
+                message: format!("Could not fetch account age: {msg}"),
+            })
+            .await;
+        return;
+    }
+
+    let parsed: UsersResponse = match serde_json::from_str(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "Account age".into(),
+                    message: format!("Failed to parse user lookup response: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let text = match parsed.data.into_iter().next() {
+        None => format!("Twitch user '{user_login}' not found."),
+        Some(item) => {
+            let name = if item.display_name.is_empty() {
+                item.login
+            } else {
+                item.display_name
+            };
+            match chrono::DateTime::parse_from_rfc3339(&item.created_at) {
+                Ok(dt) => format!(
+                    "{name}'s account is {} old (created {}).",
+                    humanize_duration_since(dt.with_timezone(&Utc)),
+                    dt.format("%Y-%m-%d")
+                ),
+                Err(_) => format!("{name} created at {}", item.created_at),
+            }
+        }
+    };
+    emit_helix_system_info(evt_tx, channel, text).await;
+}
+
+fn humanize_duration_since(since: chrono::DateTime<Utc>) -> String {
+    let delta = Utc::now().signed_duration_since(since);
+    let total_secs = delta.num_seconds().max(0);
+    if total_secs < 60 {
+        return format!("{total_secs}s");
+    }
+    let days = total_secs / 86_400;
+    let years = days / 365;
+    let months = (days % 365) / 30;
+    let rem_days = (days % 365) % 30;
+    let mut parts: Vec<String> = Vec::new();
+    if years > 0 {
+        parts.push(format!("{years}y"));
+    }
+    if months > 0 {
+        parts.push(format!("{months}mo"));
+    }
+    if rem_days > 0 && years == 0 {
+        parts.push(format!("{rem_days}d"));
+    }
+    if parts.is_empty() {
+        let hours = total_secs / 3600;
+        if hours > 0 {
+            return format!("{hours}h");
+        }
+        let mins = total_secs / 60;
+        return format!("{mins}m");
+    }
+    parts.join(" ")
+}
+
+fn urlencode_query_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char);
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -7753,8 +8758,8 @@ mod tests {
         moderation_action_effect_from_notice, moderation_command_remaining_cooldown,
         parse_twitch_pinned_snapshot_json, should_drop_duplicate_eventsub_notice,
         should_emit_eventsub_notice_message, stream_status_is_live_from_notice,
-        HelixPollChoiceSummary, HelixPollSummary, ModerationActionEffect,
-        APP_INITIAL_INNER_SIZE, APP_MIN_INNER_SIZE, MODERATION_CMD_COOLDOWN,
+        HelixPollChoiceSummary, HelixPollSummary, ModerationActionEffect, APP_INITIAL_INNER_SIZE,
+        APP_MIN_INNER_SIZE, MODERATION_CMD_COOLDOWN,
     };
     use crate::runtime::system_messages::is_twitch_pinned_notice;
     use crust_core::model::ChannelId;

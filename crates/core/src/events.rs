@@ -176,6 +176,32 @@ pub enum AppCommand {
     ClearLocalMessages { channel: ChannelId },
     /// Opens a URL in the system default browser.
     OpenUrl { url: String },
+    /// Open the Crust log/data directory in the system file manager.
+    OpenLogsFolder,
+    /// Toggle Twitch Shield Mode on the given channel (mod/broadcaster only).
+    SetShieldMode {
+        channel: ChannelId,
+        active: bool,
+    },
+    /// Modify Twitch channel title and/or game (broadcaster scope required).
+    UpdateChannelInfo {
+        channel: ChannelId,
+        /// New broadcast title. `None` leaves it unchanged.
+        title: Option<String>,
+        /// New game/category name (resolved to `game_id` via Helix). `None` leaves it unchanged.
+        game_name: Option<String>,
+    },
+    /// Look up how long `user` has followed `channel`.
+    FetchFollowAge {
+        channel: ChannelId,
+        user: String,
+    },
+    /// Look up the account creation date for `user` and report its age.
+    FetchAccountAge {
+        /// Channel to inject the resulting local message into.
+        channel: ChannelId,
+        user: String,
+    },
     /// Injects a local informational message into a channel's feed (not sent to Twitch).
     InjectLocalMessage { channel: ChannelId, text: String },
     /// Opens the user-card popup for the given login in a channel.
@@ -221,6 +247,26 @@ pub enum AppCommand {
     SetAlwaysOnTop { enabled: bool },
     /// Switch UI theme ("dark" or "light") and persist to settings.
     SetTheme { theme: String },
+    /// Persist chat body font size, UI scale ratio, and per-section font sizes.
+    SetFontSizes {
+        /// Chat body font size in points.
+        chat_font_size: f32,
+        /// UI scale ratio applied to egui `pixels_per_point`.
+        ui_font_size: f32,
+        /// Top chrome toolbar label size (pt).
+        topbar_font_size: f32,
+        /// Channel tab chip label size (pt).
+        tabs_font_size: f32,
+        /// Message timestamp size (pt).
+        timestamps_font_size: f32,
+        /// Room-state / viewer-count pill size (pt).
+        pills_font_size: f32,
+    },
+    /// Persist the last-focused channel so it can be restored on next launch.
+    SetLastActiveChannel {
+        /// Serialised ChannelId (platform-prefixed key).
+        channel: String,
+    },
     /// Persist chat-input overflow behavior and long-message collapse settings.
     SetChatUiBehavior {
         /// `true` = Prevent mode (block typing past Twitch's limit).
@@ -364,6 +410,25 @@ pub enum AppCommand {
     },
     /// Persist an updated ordered list of moderation action presets.
     SetModActionPresets { presets: Vec<ModActionPreset> },
+    /// Persist an updated list of nickname aliases.
+    SetNicknames { nicknames: Vec<crate::model::Nickname> },
+    /// Persist an updated ignored-user list.
+    SetIgnoredUsers {
+        users: Vec<crate::ignores::IgnoredUser>,
+    },
+    /// Persist an updated ignored-phrase list.
+    SetIgnoredPhrases {
+        phrases: Vec<crate::ignores::IgnoredPhrase>,
+    },
+    /// Persist the "show pronouns in usercard" toggle.
+    SetShowPronounsInUsercard {
+        enabled: bool,
+    },
+    /// Request a pronouns fetch for a specific login.  No-op if the toggle is
+    /// off or the value is already cached.
+    FetchUserPronouns {
+        login: String,
+    },
     /// Refresh authentication after a 401 - re-validate the stored token.
     RefreshAuth,
     /// Persist desktop notification toggle.
@@ -381,6 +446,17 @@ pub enum AppCommand {
     InstallAvailableUpdate {
         /// If true, exit the app after scheduling installer so update applies immediately.
         restart_now: bool,
+    },
+    /// Persist streamer-mode preferences.
+    SetStreamerModeSettings {
+        /// `off`, `auto`, or `on`.
+        mode: String,
+        /// Hide link preview tooltips while active.
+        hide_link_previews: bool,
+        /// Hide viewer counts in split headers while active.
+        hide_viewer_counts: bool,
+        /// Suppress sound notifications while active.
+        suppress_sounds: bool,
     },
 }
 
@@ -486,6 +562,12 @@ pub enum AppEvent {
         channel: ChannelId,
         login: String,
     },
+    /// Low-trust treatment for a user changed. `status = None` means cleared.
+    LowTrustStatusUpdated {
+        channel: ChannelId,
+        login: String,
+        status: Option<crate::model::LowTrustStatus>,
+    },
     /// USERSTATE received - badges, color and mod status for the logged-in user.
     UserStateUpdated {
         channel: ChannelId,
@@ -581,6 +663,28 @@ pub enum AppEvent {
         favorites: Vec<String>,
         recent: Vec<String>,
         provider_boost: Option<String>,
+    },
+    /// Startup hint: the last-focused channel from the previous session.
+    /// UI activates this channel once it has been joined and is present in
+    /// `AppState.channels`.
+    RestoreLastActiveChannel {
+        /// Serialized ChannelId (platform-prefixed key).
+        channel: String,
+    },
+    /// Font sizing snapshot loaded/updated from persistent storage.
+    FontSettingsUpdated {
+        /// Chat body font size in points.
+        chat_font_size: f32,
+        /// UI scale ratio for egui `pixels_per_point`.
+        ui_font_size: f32,
+        /// Top chrome toolbar label size (pt).
+        topbar_font_size: f32,
+        /// Channel tab chip label size (pt).
+        tabs_font_size: f32,
+        /// Message timestamp size (pt).
+        timestamps_font_size: f32,
+        /// Room-state / viewer-count pill size (pt).
+        pills_font_size: f32,
     },
     /// Appearance and shell layout settings loaded/updated from storage.
     AppearanceSettingsUpdated {
@@ -684,6 +788,28 @@ pub enum AppEvent {
     ModActionPresetsUpdated {
         presets: Vec<ModActionPreset>,
     },
+    /// Updated nickname alias list.
+    NicknamesUpdated {
+        nicknames: Vec<crate::model::Nickname>,
+    },
+    /// Updated ignored-user list.
+    IgnoredUsersUpdated {
+        users: Vec<crate::ignores::IgnoredUser>,
+    },
+    /// Updated ignored-phrase list.
+    IgnoredPhrasesUpdated {
+        phrases: Vec<crate::ignores::IgnoredPhrase>,
+    },
+    /// Pronouns resolved for a user (from alejo.io).  `pronouns=None` means
+    /// the user has no pronouns set or a fetch miss.
+    UserPronounsLoaded {
+        login: String,
+        pronouns: Option<String>,
+    },
+    /// Usercard preferences loaded/updated (currently: show-pronouns toggle).
+    UsercardSettingsUpdated {
+        show_pronouns: bool,
+    },
     /// Auth has expired; prompt user to re-authenticate.
     AuthExpired,
     /// Updater preference/state loaded or updated from settings.
@@ -758,6 +884,17 @@ pub enum AppEvent {
     PluginUiWindowClosed {
         plugin_name: String,
         window_id: String,
+    },
+    /// Streamer-mode preferences loaded or updated from storage.
+    StreamerModeSettingsUpdated {
+        mode: String,
+        hide_link_previews: bool,
+        hide_viewer_counts: bool,
+        suppress_sounds: bool,
+    },
+    /// Effective streamer-mode active flag changed (driven by setting + detection).
+    StreamerModeActiveChanged {
+        active: bool,
     },
 }
 

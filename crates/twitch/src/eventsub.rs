@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -282,7 +282,7 @@ impl EventSubSession {
         let (ws, _) = connect_async(url)
             .await
             .map_err(|e| format!("connect failed: {e}"))?;
-        let (_sink, mut stream) = ws.split();
+        let (mut sink, mut stream) = ws.split();
 
         let mut session_id: Option<String> = None;
 
@@ -433,8 +433,30 @@ impl EventSubSession {
                                 }
                             }
                         }
+                        Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(payload))) => {
+                            if let Err(e) = sink
+                                .send(tokio_tungstenite::tungstenite::Message::Pong(payload))
+                                .await
+                            {
+                                return Err(format!("websocket pong failed: {e}"));
+                            }
+                        }
+                        Some(Ok(tokio_tungstenite::tungstenite::Message::Close(frame))) => {
+                            if let Some(frame) = frame {
+                                warn!(
+                                    "EventSub websocket closed by server: code={} reason={}",
+                                    frame.code, frame.reason
+                                );
+                            } else {
+                                warn!("EventSub websocket closed by server");
+                            }
+                            return Ok(EventSubConnectOutcome::Reconnect {
+                                reconnect_url: None,
+                                immediate: false,
+                            });
+                        }
                         Some(Ok(_)) => {
-                            // Ignore binary/ping/pong frames.
+                            // Ignore binary/pong frames.
                         }
                     }
                 }

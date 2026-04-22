@@ -26,8 +26,28 @@ pub struct AccountEntry {
 pub struct AppSettings {
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// Chat body font size in points (applied globally; small/heading/tiny derive as offsets).
     #[serde(default = "default_font_size")]
     pub font_size: f32,
+    /// UI scale ratio fed to egui `pixels_per_point` (1.0 = host DPI default).
+    #[serde(default = "default_ui_font_size")]
+    pub ui_font_size: f32,
+    /// Top chrome toolbar label size (pt).
+    #[serde(default = "default_topbar_font_size")]
+    pub topbar_font_size: f32,
+    /// Channel tab chip label size (pt).
+    #[serde(default = "default_tabs_font_size")]
+    pub tabs_font_size: f32,
+    /// Message timestamp size (pt).
+    #[serde(default = "default_timestamps_font_size")]
+    pub timestamps_font_size: f32,
+    /// Room-state / viewer-count pill label size (pt).
+    #[serde(default = "default_pills_font_size")]
+    pub pills_font_size: f32,
+    /// Last focused channel (restored on next launch). Stored as the
+    /// serialized ChannelId debug/serde string.
+    #[serde(default)]
+    pub last_active_channel: String,
     /// Username of the currently active account (mirrors `accounts[n].username`).
     #[serde(default)]
     pub username: String,
@@ -148,6 +168,19 @@ pub struct AppSettings {
     /// When empty, the UI falls back to [`ModActionPreset::defaults()`].
     #[serde(default)]
     pub mod_action_presets: Vec<ModActionPreset>,
+    /// User login → custom display name aliases.
+    #[serde(default)]
+    pub nicknames: Vec<crust_core::model::Nickname>,
+    /// Structured per-user ignore list (supports regex + case sensitivity).
+    #[serde(default)]
+    pub ignored_users: Vec<crust_core::ignores::IgnoredUser>,
+    /// Text-pattern ignore list with configurable actions (block/replace/highlight/mention).
+    #[serde(default)]
+    pub ignored_phrases: Vec<crust_core::ignores::IgnoredPhrase>,
+    /// Fetch + display pronouns from alejo.io on the user profile popup.
+    /// Off by default to respect privacy preferences.
+    #[serde(default)]
+    pub show_pronouns_in_usercard: bool,
     // -- Desktop notifications --------------------------------------------
     /// Fire an OS desktop notification when a highlight rule with
     /// `show_in_mentions = true` matches an incoming message.
@@ -167,13 +200,42 @@ pub struct AppSettings {
     /// Semver string that the user skipped (if any).
     #[serde(default)]
     pub updater_skipped_version: String,
+    // -- Streamer mode -----------------------------------------------------
+    /// Streamer mode setting: `off`, `auto`, or `on`.
+    /// `auto` enables only when broadcasting software (OBS / Streamlabs) is detected.
+    #[serde(default = "default_streamer_mode")]
+    pub streamer_mode: String,
+    /// Hide link preview tooltips while streamer mode is active.
+    #[serde(default = "bool_true")]
+    pub streamer_hide_link_previews: bool,
+    /// Hide viewer counts in split headers while streamer mode is active.
+    #[serde(default = "bool_true")]
+    pub streamer_hide_viewer_counts: bool,
+    /// Suppress sound notifications while streamer mode is active.
+    #[serde(default = "bool_true")]
+    pub streamer_suppress_sounds: bool,
 }
 
 fn default_theme() -> String {
     "dark".to_owned()
 }
 fn default_font_size() -> f32 {
-    13.0
+    13.5
+}
+fn default_ui_font_size() -> f32 {
+    1.0
+}
+fn default_topbar_font_size() -> f32 {
+    0.0
+}
+fn default_tabs_font_size() -> f32 {
+    0.0
+}
+fn default_timestamps_font_size() -> f32 {
+    0.0
+}
+fn default_pills_font_size() -> f32 {
+    0.0
 }
 fn bool_true() -> bool {
     true
@@ -190,12 +252,21 @@ fn default_channel_layout() -> String {
 fn default_tab_style() -> String {
     "compact".to_owned()
 }
+fn default_streamer_mode() -> String {
+    "off".to_owned()
+}
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
             theme: default_theme(),
             font_size: default_font_size(),
+            ui_font_size: default_ui_font_size(),
+            topbar_font_size: default_topbar_font_size(),
+            tabs_font_size: default_tabs_font_size(),
+            timestamps_font_size: default_timestamps_font_size(),
+            pills_font_size: default_pills_font_size(),
+            last_active_channel: String::new(),
             username: String::new(),
             auto_join: Vec::new(),
             highlights: Vec::new(),
@@ -234,11 +305,19 @@ impl Default for AppSettings {
             highlight_rules: Vec::new(),
             filter_records: Vec::new(),
             mod_action_presets: Vec::new(),
+            nicknames: Vec::new(),
+            ignored_users: Vec::new(),
+            ignored_phrases: Vec::new(),
+            show_pronouns_in_usercard: false,
             desktop_notifications_enabled: false,
             watched_channels: Vec::new(),
             update_checks_enabled: true,
             updater_last_checked_at: None,
             updater_skipped_version: String::new(),
+            streamer_mode: default_streamer_mode(),
+            streamer_hide_link_previews: true,
+            streamer_hide_viewer_counts: true,
+            streamer_suppress_sounds: true,
         }
     }
 }
@@ -304,11 +383,37 @@ impl SettingsStore {
                 if cfg.collapse_long_message_lines == 0 {
                     cfg.collapse_long_message_lines = default_collapse_long_message_lines();
                 }
+                if !cfg.font_size.is_finite() {
+                    cfg.font_size = default_font_size();
+                } else {
+                    cfg.font_size = cfg.font_size.clamp(8.0, 32.0);
+                }
+                if !cfg.ui_font_size.is_finite() {
+                    cfg.ui_font_size = default_ui_font_size();
+                } else {
+                    cfg.ui_font_size = cfg.ui_font_size.clamp(0.75, 1.75);
+                }
+                for slot in [
+                    &mut cfg.topbar_font_size,
+                    &mut cfg.tabs_font_size,
+                    &mut cfg.timestamps_font_size,
+                    &mut cfg.pills_font_size,
+                ] {
+                    // 0.0 = "auto-follow chat font"; otherwise clamp to section range.
+                    if !slot.is_finite() || *slot < 0.0 {
+                        *slot = 0.0;
+                    } else if *slot > 0.0 {
+                        *slot = slot.clamp(8.0, 28.0);
+                    }
+                }
                 if !matches!(cfg.channel_layout.as_str(), "sidebar" | "top_tabs") {
                     cfg.channel_layout = default_channel_layout();
                 }
                 if !matches!(cfg.tab_style.as_str(), "compact" | "normal") {
                     cfg.tab_style = default_tab_style();
+                }
+                if !matches!(cfg.streamer_mode.as_str(), "off" | "auto" | "on") {
+                    cfg.streamer_mode = default_streamer_mode();
                 }
                 // Migration: convert legacy plain-string highlights to structured rules.
                 if cfg.highlight_rules.is_empty() && !cfg.highlights.is_empty() {
@@ -317,6 +422,16 @@ impl SettingsStore {
                         .iter()
                         .filter(|s| !s.trim().is_empty())
                         .map(|kw| HighlightRule::new(kw.trim()))
+                        .collect();
+                }
+                // Migration: seed `ignored_users` from the legacy flat `ignores`
+                // string list on first load of the new structured config.
+                if cfg.ignored_users.is_empty() && !cfg.ignores.is_empty() {
+                    cfg.ignored_users = cfg
+                        .ignores
+                        .iter()
+                        .filter(|s| !s.trim().is_empty())
+                        .map(|login| crust_core::ignores::IgnoredUser::new(login.trim()))
                         .collect();
                 }
                 cfg

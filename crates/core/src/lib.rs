@@ -3,9 +3,11 @@ pub mod emoji;
 pub mod events;
 pub mod format;
 pub mod highlight;
+pub mod ignores;
 pub mod model;
 pub mod notifications;
 pub mod plugins;
+pub mod search;
 pub mod state;
 
 pub use badges::{BadgeController, BadgeSet, BadgeVersion};

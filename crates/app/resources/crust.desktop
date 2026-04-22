@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Crust
+Comment=Native Twitch, Kick and IRC chat client
+Exec=crust
+Icon=crust
+Terminal=false
+Categories=Network;Chat;
+StartupWMClass=crust
+StartupNotify=true

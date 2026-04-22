@@ -79,8 +79,7 @@ pub async fn install_update(update: &AvailableUpdate, current_pid: u32) -> Resul
 pub async fn install_update(update: &AvailableUpdate, _current_pid: u32) -> Result<(), String> {
     if !is_debian_like_linux() {
         return Err(
-            "auto-update install is only supported on Debian-based Linux distributions"
-                .to_owned(),
+            "auto-update install is only supported on Debian-based Linux distributions".to_owned(),
         );
     }
 
@@ -136,8 +135,7 @@ pub async fn check_for_update(current_version: &str) -> Result<UpdateCheckOutcom
 pub async fn check_for_update(current_version: &str) -> Result<UpdateCheckOutcome, String> {
     if !is_debian_like_linux() {
         return Err(
-            "auto-update checks are only supported on Debian-based Linux distributions"
-                .to_owned(),
+            "auto-update checks are only supported on Debian-based Linux distributions".to_owned(),
         );
     }
 
@@ -185,14 +183,20 @@ async fn fetch_latest_release() -> Result<GithubRelease, String> {
 
     let response = client
         .get(RELEASE_API_URL)
-        .header(reqwest::header::USER_AGENT, format!("crust/{}", env!("CARGO_PKG_VERSION")))
+        .header(
+            reqwest::header::USER_AGENT,
+            format!("crust/{}", env!("CARGO_PKG_VERSION")),
+        )
         .header(reqwest::header::ACCEPT, GITHUB_ACCEPT_HEADER)
         .send()
         .await
         .map_err(|e| format!("failed to query GitHub releases: {e}"))?;
 
     if !response.status().is_success() {
-        return Err(format!("GitHub releases API returned {}", response.status()));
+        return Err(format!(
+            "GitHub releases API returned {}",
+            response.status()
+        ));
     }
 
     response
@@ -734,9 +738,15 @@ mod tests {
 
     #[test]
     fn windows_asset_detection_is_case_insensitive() {
-        assert!(is_windows_x64_zip_asset_name("crust-v0.3.0-windows-x64.zip"));
-        assert!(is_windows_x64_zip_asset_name("CRUST-V0.3.0-WINDOWS-X64.ZIP"));
-        assert!(!is_windows_x64_zip_asset_name("crust-v0.3.0-linux-x64.tar.gz"));
+        assert!(is_windows_x64_zip_asset_name(
+            "crust-v0.3.0-windows-x64.zip"
+        ));
+        assert!(is_windows_x64_zip_asset_name(
+            "CRUST-V0.3.0-WINDOWS-X64.ZIP"
+        ));
+        assert!(!is_windows_x64_zip_asset_name(
+            "crust-v0.3.0-linux-x64.tar.gz"
+        ));
         assert!(!is_windows_x64_zip_asset_name("source.zip"));
     }
 
@@ -792,7 +802,10 @@ ID_LIKE="debian"
     #[test]
     fn digest_requires_sha256_prefix_and_hex() {
         let ok = format!("sha256:{}", "a".repeat(64));
-        assert_eq!(parse_sha256_digest(Some(ok.as_str())), Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert_eq!(
+            parse_sha256_digest(Some(ok.as_str())),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
         assert!(parse_sha256_digest(Some("SHA256:abc")).is_none());
         assert!(parse_sha256_digest(Some("sha1:abc")).is_none());
     }

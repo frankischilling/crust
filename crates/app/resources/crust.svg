@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Crust icon">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1c2a3d"/>
+      <stop offset="100%" stop-color="#0d1828"/>
+    </linearGradient>
+    <linearGradient id="ring" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#b48cff"/>
+      <stop offset="100%" stop-color="#7a4dff"/>
+    </linearGradient>
+    <mask id="gap">
+      <rect width="256" height="256" fill="white"/>
+      <rect x="150" y="94" width="82" height="68" rx="10" fill="black"/>
+    </mask>
+  </defs>
+
+  <circle cx="128" cy="128" r="120" fill="url(#bg)"/>
+  <circle cx="128" cy="128" r="78" fill="none" stroke="url(#ring)" stroke-width="42" mask="url(#gap)"/>
+</svg>

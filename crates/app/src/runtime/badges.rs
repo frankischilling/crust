@@ -489,6 +489,87 @@ async fn load_global_badges_v1_fallback(
     }
 }
 
+async fn load_global_badges_helix(
+    badge_map: &BadgeMap,
+    cache: &Option<EmoteCache>,
+    evt_tx: &mpsc::Sender<AppEvent>,
+    oauth_token: Option<&str>,
+) {
+    let Some((client_id, token)) = helix_auth_from_token(oauth_token).await else {
+        return;
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent("crust-badges/1.0")
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    if let Some(text) = fetch_badge_payload_with_retries(
+        &client,
+        &["https://api.twitch.tv/helix/chat/badges/global"],
+        "Helix global badges",
+        Some((client_id.as_str(), token.as_str())),
+    )
+    .await
+    {
+        let badge_map_for_parse = badge_map.clone();
+        let new_urls = parse_badges_on_large_stack("badge-global-helix-parse", move || {
+            let mut map = badge_map_for_parse.write().unwrap();
+            let before: HashSet<String> = map.values().cloned().collect();
+            parse_helix_badge_response(&text, "", &mut map);
+            map.values()
+                .filter(|u| !before.contains(*u))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+        if !new_urls.is_empty() {
+            info!("Loaded {} global badges via Helix", new_urls.len());
+            prefetch_badge_images(new_urls, cache, evt_tx);
+            persist_badge_map_cache(badge_map);
+        }
+    }
+}
+
+async fn load_global_badges_ivr_fallback(
+    badge_map: &BadgeMap,
+    cache: &Option<EmoteCache>,
+    evt_tx: &mpsc::Sender<AppEvent>,
+) {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent("crust-badges/1.0")
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    if let Some(text) = fetch_badge_payload_with_retries(
+        &client,
+        &["https://api.ivr.fi/v2/twitch/badges/global"],
+        "IVR global badges",
+        None,
+    )
+    .await
+    {
+        let badge_map_for_parse = badge_map.clone();
+        let new_urls = parse_badges_on_large_stack("badge-global-ivr-parse", move || {
+            let mut map = badge_map_for_parse.write().unwrap();
+            let before: HashSet<String> = map.values().cloned().collect();
+            parse_ivr_badge_response(&text, "", &mut map);
+            map.values()
+                .filter(|u| !before.contains(*u))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+        if !new_urls.is_empty() {
+            info!("Loaded {} global badges via IVR", new_urls.len());
+            prefetch_badge_images(new_urls, cache, evt_tx);
+            persist_badge_map_cache(badge_map);
+        }
+    }
+}
+
 async fn load_channel_badges_v1_fallback(
     room_id: &str,
     channel: &str,
@@ -569,11 +650,18 @@ pub(crate) async fn load_global_badges(
     let badge_map_for_refresh = badge_map.clone();
     let cache = cache.clone();
     let evt_tx = evt_tx.clone();
+    let oauth_token_for_refresh = oauth_token.clone();
     tokio::spawn(async move {
+        load_global_badges_helix(
+            &badge_map_for_refresh,
+            &cache,
+            &evt_tx,
+            oauth_token_for_refresh.as_deref(),
+        )
+        .await;
+        load_global_badges_ivr_fallback(&badge_map_for_refresh, &cache, &evt_tx).await;
         load_global_badges_v1_fallback(&badge_map_for_refresh, &cache, &evt_tx).await;
     });
-
-    let _ = oauth_token;
 }
 
 /// Load channel-specific Twitch badges.

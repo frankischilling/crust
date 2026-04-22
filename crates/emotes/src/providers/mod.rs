@@ -544,7 +544,9 @@ impl SevenTvProvider {
                 let base = format!("https:{}", data.host.url.trim_end_matches('/'));
                 let files = data.host.files;
 
-                let file_1x = choose_7tv_file_by_scale(&files, &[1])
+                // Prefer larger assets by default so 7TV emotes remain crisp
+                // even when rendered down in chat rows.
+                let file_1x = choose_7tv_file_by_scale(&files, &[4, 3, 2, 1])
                     .or_else(|| choose_7tv_smallest_file(&files))
                     .map(|f| format!("{base}/{}", f.name));
                 let file_2x = choose_7tv_file_by_scale(&files, &[2, 3, 4])
@@ -699,7 +701,7 @@ mod tests {
 
         assert_eq!(emotes.len(), 1);
         let e = &emotes[0];
-        assert_eq!(e.url_1x, "https://cdn.7tv.app/emote/abc/1x.webp");
+        assert_eq!(e.url_1x, "https://cdn.7tv.app/emote/abc/4x.webp");
         assert_eq!(
             e.url_2x.as_deref(),
             Some("https://cdn.7tv.app/emote/abc/2x.webp")
@@ -730,6 +732,7 @@ mod tests {
         }));
 
         assert_eq!(emotes.len(), 1);
+        assert_eq!(emotes[0].url_1x, "https://cdn.7tv.app/emote/def/3x.webp");
         assert_eq!(
             emotes[0].url_4x.as_deref(),
             Some("https://cdn.7tv.app/emote/def/3x.webp")

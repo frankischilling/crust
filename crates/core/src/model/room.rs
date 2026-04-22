@@ -12,6 +12,13 @@ pub struct RoomState {
 
 const MAX_MESSAGES: usize = 1500;
 
+/// Twitch low-trust / suspicious-user treatment for a single user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LowTrustStatus {
+    Monitored,
+    Restricted,
+}
+
 /// State and message buffer for a channel.
 #[derive(Debug)]
 pub struct ChannelState {
@@ -29,6 +36,10 @@ pub struct ChannelState {
     pub is_mod: bool,
     /// Channel topic (IRC only).
     pub topic: Option<String>,
+    /// Low-trust (suspicious-user) treatment keyed by lowercased login.
+    /// Populated from EventSub `channel.suspicious_user.*`; consumed by
+    /// the UI to render MONITORED / RESTRICTED chips on message rows.
+    pub low_trust_users: std::collections::HashMap<String, LowTrustStatus>,
 }
 
 impl ChannelState {
@@ -42,7 +53,33 @@ impl ChannelState {
             unread_mentions: 0,
             is_mod: false,
             topic: None,
+            low_trust_users: std::collections::HashMap::new(),
         }
+    }
+
+    /// Record a user's low-trust status (monitored/restricted).
+    pub fn set_low_trust(&mut self, login: &str, status: LowTrustStatus) {
+        let key = login.trim().to_ascii_lowercase();
+        if key.is_empty() {
+            return;
+        }
+        self.low_trust_users.insert(key, status);
+    }
+
+    /// Clear a user's low-trust status.
+    pub fn clear_low_trust(&mut self, login: &str) {
+        let key = login.trim().to_ascii_lowercase();
+        if key.is_empty() {
+            return;
+        }
+        self.low_trust_users.remove(&key);
+    }
+
+    /// Look up a user's current low-trust status, if any.
+    pub fn low_trust_status(&self, login: &str) -> Option<LowTrustStatus> {
+        self.low_trust_users
+            .get(&login.trim().to_ascii_lowercase())
+            .copied()
     }
 
     pub fn push_message(&mut self, msg: super::ChatMessage) {
