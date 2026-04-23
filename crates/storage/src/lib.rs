@@ -2,7 +2,9 @@ pub mod logs;
 pub mod settings;
 
 pub use logs::LogStore;
-pub use settings::{AccountEntry, AppSettings, SettingsStore};
+pub use settings::{
+    set_persist_hook, AccountEntry, AppSettings, SettingsPersistHook, SettingsStore,
+};
 
 use thiserror::Error;
 

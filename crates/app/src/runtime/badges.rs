@@ -786,7 +786,7 @@ async fn host_resolves(host: &str) -> bool {
 fn warn_badges_twitch_unresolved_once() {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        warn!("Skipping badges.twitch.tv fallback: host is not resolvable in this environment");
+        info!("Skipping badges.twitch.tv fallback: host is not resolvable in this environment");
     }
 }
 

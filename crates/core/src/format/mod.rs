@@ -154,10 +154,24 @@ fn tokenize_free_text<F>(
         // URL?
         if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
             let trail = &word[trimmed.len()..];
-            out.push(Span::Url {
-                text: trimmed.to_owned(),
-                url: trimmed.to_owned(),
-            });
+            // Channel-points rewards often ship only a link to a 7TV emote
+            // page (e.g. https://7tv.app/emotes/<id>). Render those as the
+            // actual emote image inline so the reward is visible, instead
+            // of a bare link that hides what was redeemed.
+            if let Some(id) = parse_seventv_emote_link(trimmed) {
+                out.push(Span::Emote {
+                    id: id.clone(),
+                    code: id.clone(),
+                    url: format!("https://cdn.7tv.app/emote/{id}/2x.webp"),
+                    url_hd: Some(format!("https://cdn.7tv.app/emote/{id}/4x.webp")),
+                    provider: "7tv".to_owned(),
+                });
+            } else {
+                out.push(Span::Url {
+                    text: trimmed.to_owned(),
+                    url: trimmed.to_owned(),
+                });
+            }
             if !trail.is_empty() {
                 out.push(Span::Text {
                     text: trail.to_owned(),
@@ -263,6 +277,25 @@ fn tokenize_with_emoji(word: &str, is_action: bool, out: &mut SmallVec<[Span; 8]
     }
 }
 
+/// Extract the emote id from a 7TV emote page URL
+/// (`https://7tv.app/emotes/<id>`). Returns `None` for anything else.
+/// Trailing `/`, query, or fragment is tolerated.
+fn parse_seventv_emote_link(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://7tv.app/emotes/")
+        .or_else(|| url.strip_prefix("http://7tv.app/emotes/"))
+        .or_else(|| url.strip_prefix("https://www.7tv.app/emotes/"))
+        .or_else(|| url.strip_prefix("http://www.7tv.app/emotes/"))?;
+    let id_end = rest
+        .find(|c: char| c == '/' || c == '?' || c == '#')
+        .unwrap_or(rest.len());
+    let id = &rest[..id_end];
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(id.to_owned())
+}
+
 /// Build Twitch-native emote CDN URL (2x).
 pub fn twitch_emote_url(id: &str) -> String {
     // Use `static` format to guarantee PNG responses and match the URLs
@@ -352,6 +385,48 @@ mod tests {
         assert_eq!(positions[0].id, "25");
         assert_eq!(positions[0].start, 0);
         assert_eq!(positions[0].end, 4);
+    }
+
+    #[test]
+    fn seventv_link_parse() {
+        assert_eq!(
+            parse_seventv_emote_link("https://7tv.app/emotes/01K2AN1RWND0043X61B48HNQFA"),
+            Some("01K2AN1RWND0043X61B48HNQFA".to_owned())
+        );
+        assert_eq!(
+            parse_seventv_emote_link("https://7tv.app/emotes/abc123/"),
+            Some("abc123".to_owned())
+        );
+        assert_eq!(
+            parse_seventv_emote_link("https://7tv.app/emotes/abc?ref=x"),
+            Some("abc".to_owned())
+        );
+        assert_eq!(parse_seventv_emote_link("https://7tv.app/emotes/"), None);
+        assert_eq!(parse_seventv_emote_link("https://example.com/x"), None);
+        assert_eq!(parse_seventv_emote_link("https://7tv.app/users/abc"), None);
+    }
+
+    #[test]
+    fn seventv_link_becomes_emote_span() {
+        let spans = tokenize(
+            "look https://7tv.app/emotes/01K2AN1RWND0043X61B48HNQFA nice",
+            false,
+            &[],
+            &|_| None,
+        );
+        let emote = spans.iter().find_map(|s| match s {
+            Span::Emote {
+                id, url, provider, ..
+            } if provider == "7tv" => Some((id.clone(), url.clone())),
+            _ => None,
+        });
+        assert_eq!(
+            emote,
+            Some((
+                "01K2AN1RWND0043X61B48HNQFA".to_owned(),
+                "https://cdn.7tv.app/emote/01K2AN1RWND0043X61B48HNQFA/2x.webp".to_owned()
+            ))
+        );
     }
 
     #[test]

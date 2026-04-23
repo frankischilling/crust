@@ -668,6 +668,7 @@ fn select_windows_asset(assets: &[GithubReleaseAsset]) -> Option<&GithubReleaseA
         .min_by_key(|asset| asset.name.to_ascii_lowercase())
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn select_debian_asset(assets: &[GithubReleaseAsset]) -> Option<&GithubReleaseAsset> {
     let arch_candidates = debian_arch_candidates();
     assets
@@ -686,12 +687,14 @@ fn is_windows_x64_zip_asset_name(asset_name: &str) -> bool {
     name.ends_with(".zip") && name.contains("windows") && name.contains("x64")
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn is_debian_arch_asset_name(asset_name: &str, arch: &str) -> bool {
     let name = asset_name.to_ascii_lowercase();
     let arch = arch.to_ascii_lowercase();
     name.ends_with(&format!("-debian-{arch}.deb"))
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn debian_arch_candidates() -> &'static [&'static str] {
     match std::env::consts::ARCH {
         "x86_64" => &["amd64", "x86_64"],

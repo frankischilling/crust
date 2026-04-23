@@ -37,6 +37,24 @@ pub(crate) async fn fetch_link_preview(
         }
     };
 
+    // Direct image URLs (image hosts, uploader output, hot-linked assets)
+    // don't serve OG tagsthey serve the image itself. Short-circuit by
+    // using the URL as its own thumbnail so the hover tooltip shows a real
+    // image preview instead of "Loading preview…" forever.
+    if is_direct_image_url(url) {
+        fetch_emote_image(url, cache, evt_tx).await;
+        let _ = evt_tx
+            .send(AppEvent::LinkPreviewReady {
+                url: url.to_owned(),
+                title: None,
+                description: None,
+                thumbnail_url: Some(url.to_owned()),
+                site_name: detect_site_name(url),
+            })
+            .await;
+        return;
+    }
+
     // YouTube serves proper OG tags but the oEmbed JSON API is faster,
     // more reliable, and doesn't require HTML parsing.
     if is_youtube_url(url) {
@@ -60,13 +78,28 @@ pub(crate) async fn fetch_link_preview(
         }
     };
 
-    // Only parse HTML
     let ct = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_lowercase();
+    // Direct-image fallback: URLs without a known image extension but
+    // served with an image content-type (CDN shorteners, redirects,
+    // /raw/... endpoints). Use the URL itself as the thumbnail.
+    if ct.starts_with("image/") {
+        fetch_emote_image(url, cache, evt_tx).await;
+        let _ = evt_tx
+            .send(AppEvent::LinkPreviewReady {
+                url: url.to_owned(),
+                title: None,
+                description: None,
+                thumbnail_url: Some(url.to_owned()),
+                site_name: detect_site_name(url),
+            })
+            .await;
+        return;
+    }
     if !ct.contains("html") {
         let _ = evt_tx.send(send_empty(url)).await;
         return;
@@ -110,6 +143,36 @@ pub(crate) async fn fetch_link_preview(
 fn is_youtube_url(url: &str) -> bool {
     let lower = url.to_lowercase();
     lower.contains("youtube.com/") || lower.contains("youtu.be/")
+}
+
+/// Return true when the URL's path looks like a direct image asset.
+/// Strips query + fragment so `?token=…` / `#anchor` don't break matching.
+fn is_direct_image_url(url: &str) -> bool {
+    let path = url
+        .split('#')
+        .next()
+        .and_then(|p| p.split('?').next())
+        .unwrap_or(url);
+    let lower = path.to_ascii_lowercase();
+    matches!(
+        lower.rsplit('.').next(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "avif")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_direct_image_url;
+
+    #[test]
+    fn direct_image_detection() {
+        assert!(is_direct_image_url("https://i.nuuls.com/5RpNP.png"));
+        assert!(is_direct_image_url("https://i.imgur.com/abc.JPG"));
+        assert!(is_direct_image_url("https://example.com/a/b/c.webp?v=2"));
+        assert!(is_direct_image_url("https://example.com/x.gif#t=5"));
+        assert!(!is_direct_image_url("https://example.com/page.html"));
+        assert!(!is_direct_image_url("https://youtube.com/watch?v=abc"));
+    }
 }
 
 /// Fetch YouTube video metadata via the public oEmbed JSON endpoint.

@@ -125,9 +125,7 @@ impl Predicate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{
-        ChannelId, ChatMessage, MessageFlags, MessageId, MsgKind, Sender, UserId,
-    };
+    use crate::model::{ChannelId, ChatMessage, MessageFlags, MessageId, MsgKind, Sender, UserId};
     use chrono::Utc;
     use smallvec::SmallVec;
 
@@ -268,8 +266,16 @@ mod tests {
         let ch = make_channel("foo");
         let mut m = make_msg("u", "U", "t");
         m.sender.badges = vec![
-            Badge { name: "moderator".into(), version: "1".into(), url: None },
-            Badge { name: "subscriber".into(), version: "12".into(), url: None },
+            Badge {
+                name: "moderator".into(),
+                version: "1".into(),
+                url: None,
+            },
+            Badge {
+                name: "subscriber".into(),
+                version: "12".into(),
+                url: None,
+            },
         ];
         assert!(Predicate::Badge(vec!["moderator".into()]).matches(&m, &ch));
         assert!(Predicate::Badge(vec!["MODERATOR".into()]).matches(&m, &ch));

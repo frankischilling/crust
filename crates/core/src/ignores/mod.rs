@@ -102,7 +102,10 @@ impl IgnoredPhrase {
 // -- Compiled matchers --------------------------------------------------------
 
 enum UserMatcher {
-    Exact { needle: String, case_sensitive: bool },
+    Exact {
+        needle: String,
+        case_sensitive: bool,
+    },
     Regex(regex::Regex),
 }
 
@@ -115,7 +118,10 @@ pub struct CompiledIgnoredUsers {
 impl CompiledIgnoredUsers {
     pub fn new(users: &[IgnoredUser]) -> Self {
         let mut matchers = Vec::with_capacity(users.len());
-        for u in users.iter().filter(|u| u.enabled && !u.login.trim().is_empty()) {
+        for u in users
+            .iter()
+            .filter(|u| u.enabled && !u.login.trim().is_empty())
+        {
             if u.is_regex {
                 let mut b = regex::RegexBuilder::new(&u.login);
                 b.case_insensitive(!u.case_sensitive);

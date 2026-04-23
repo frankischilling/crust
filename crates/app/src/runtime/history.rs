@@ -123,6 +123,45 @@ pub(crate) async fn load_local_older_messages(
         .await;
 }
 
+/// Load cross-channel mention-matching messages from SQLite and dispatch as
+/// a single `AppEvent::MentionsLoaded` event. Intended to run once on
+/// startup to backfill the Mentions pseudo-tab.
+pub(crate) async fn load_local_recent_mentions(
+    log_store: LogStore,
+    limit: usize,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let loaded = tokio::task::spawn_blocking(move || log_store.recent_mentions(limit)).await;
+
+    let mut messages = match loaded {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(e)) => {
+            warn!("mentions-history: local SQLite load failed: {e}");
+            return;
+        }
+        Err(e) => {
+            warn!("mentions-history: local SQLite task failed: {e}");
+            return;
+        }
+    };
+
+    if messages.is_empty() {
+        return;
+    }
+
+    for msg in &mut messages {
+        msg.id =
+            MessageId(crate::HISTORY_MSG_ID.fetch_sub(1, std::sync::atomic::Ordering::Relaxed));
+        msg.flags.is_history = true;
+    }
+
+    info!(
+        "mentions-history: loaded {} cross-channel mention rows",
+        messages.len()
+    );
+    let _ = evt_tx.send(AppEvent::MentionsLoaded { messages }).await;
+}
+
 /// Load locally persisted whispers from SQLite and replay them as
 /// `AppEvent::WhisperReceived` with `is_history=true`.
 pub(crate) async fn load_local_recent_whispers(

@@ -28,11 +28,7 @@ const BROADCASTING_BINARIES: &[&str] = &[
 ];
 
 #[cfg(not(windows))]
-const BROADCASTING_BINARIES: &[&str] = &[
-    "obs",
-    "Twitch Studio",
-    "Streamlabs Desktop",
-];
+const BROADCASTING_BINARIES: &[&str] = &["obs", "Twitch Studio", "Streamlabs Desktop"];
 
 /// Poll interval matches Chatterino (~20 seconds).
 const POLL_INTERVAL: Duration = Duration::from_secs(20);
@@ -217,9 +213,18 @@ mod tests {
 
     #[test]
     fn setting_from_str_handles_known_values() {
-        assert_eq!(StreamerModeSetting::from_str("off"), StreamerModeSetting::Off);
-        assert_eq!(StreamerModeSetting::from_str("auto"), StreamerModeSetting::Auto);
+        assert_eq!(
+            StreamerModeSetting::from_str("off"),
+            StreamerModeSetting::Off
+        );
+        assert_eq!(
+            StreamerModeSetting::from_str("auto"),
+            StreamerModeSetting::Auto
+        );
         assert_eq!(StreamerModeSetting::from_str("on"), StreamerModeSetting::On);
-        assert_eq!(StreamerModeSetting::from_str("garbage"), StreamerModeSetting::Off);
+        assert_eq!(
+            StreamerModeSetting::from_str("garbage"),
+            StreamerModeSetting::Off
+        );
     }
 }

@@ -197,11 +197,16 @@ impl ChannelState {
         false
     }
 
-    /// Prepend historical messages (e.g. from recent-messages API) to the
-    /// front of the buffer. Duplicates (matched by `server_id`) are skipped,
-    /// and the total remains bounded by `MAX_MESSAGES`.
+    /// Prepend historical messages (e.g. from recent-messages API or local
+    /// SQLite log) to the buffer. Duplicates (matched by `server_id`) are
+    /// skipped. After the merge the buffer is sorted by timestamp ascending
+    /// so two independent history sources (e.g. local DB + robotty) can
+    /// arrive in any order and still interleave chronologicallyavoiding
+    /// the bug where a later-arriving batch of newer messages ended up at
+    /// the very top of the chat. Live messages (pushed via `push_message`
+    /// with timestamps >= history) naturally sort to the end.
     pub fn prepend_history(&mut self, mut msgs: Vec<super::ChatMessage>) {
-        // Build a set of already-known server IDs to skip duplicates.
+        // Drop duplicates by server_id against what's already in the buffer.
         let existing_ids: std::collections::HashSet<&str> = self
             .messages
             .iter()
@@ -217,19 +222,23 @@ impl ChannelState {
             return;
         }
 
-        // Respect the ring-buffer cap: drop oldest history entries when
-        // the combined count would exceed MAX_MESSAGES.
-        let available = MAX_MESSAGES.saturating_sub(self.messages.len());
-        if msgs.len() > available {
-            msgs.drain(0..msgs.len() - available);
+        // Merge into a single Vec and sort chronologically (stable, so rows
+        // within the same millisecond keep their arrival order).
+        let total_cap = (msgs.len() + self.messages.len()).min(MAX_MESSAGES);
+        let mut merged: Vec<super::ChatMessage> =
+            Vec::with_capacity(msgs.len() + self.messages.len());
+        merged.extend(self.messages.drain(..));
+        merged.extend(msgs);
+        merged.sort_by_key(|m| m.timestamp);
+
+        // Enforce capdrop oldest.
+        if merged.len() > MAX_MESSAGES {
+            let excess = merged.len() - MAX_MESSAGES;
+            merged.drain(0..excess);
         }
 
-        // Build a new deque in one allocation: [history...] ++ [live...].
-        // This is faster than iterating msgs in reverse with push_front.
-        let total = msgs.len() + self.messages.len();
-        let mut new_deque = std::collections::VecDeque::with_capacity(total);
-        new_deque.extend(msgs);
-        new_deque.extend(self.messages.drain(..));
+        let mut new_deque = std::collections::VecDeque::with_capacity(total_cap);
+        new_deque.extend(merged);
         self.messages = new_deque;
     }
 }

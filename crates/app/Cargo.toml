@@ -30,17 +30,22 @@ directories = { workspace = true }
 semver = "1"
 sha2 = "0.10"
 zip = { version = "2", default-features = false, features = ["deflate"] }
-crust-core = { path = "../core", version = "0.4.9" }
-crust-ui = { path = "../ui", version = "0.4.9" }
-crust-twitch = { path = "../twitch", version = "0.4.9" }
-crust-kick = { path = "../kick", version = "0.4.9" }
-crust-emotes = { path = "../emotes", version = "0.4.9" }
-crust-storage = { path = "../storage", version = "0.4.9" }
+crust-core = { path = "../core", version = "0.5.0" }
+crust-ui = { path = "../ui", version = "0.5.0" }
+crust-twitch = { path = "../twitch", version = "0.5.0" }
+crust-kick = { path = "../kick", version = "0.5.0" }
+crust-emotes = { path = "../emotes", version = "0.5.0" }
+crust-storage = { path = "../storage", version = "0.5.0" }
+crust-uploader = { path = "../uploader", version = "0.5.0" }
 libc = { workspace = true }
 base64 = "0.22"
+futures-util = { workspace = true }
 
 # Force wayland-data-control feature onto arboard (transitive via egui-winit)
 arboard = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
 
 [build-dependencies]
 cc = { workspace = true }

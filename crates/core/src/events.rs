@@ -178,11 +178,31 @@ pub enum AppCommand {
     OpenUrl { url: String },
     /// Open the Crust log/data directory in the system file manager.
     OpenLogsFolder,
-    /// Toggle Twitch Shield Mode on the given channel (mod/broadcaster only).
-    SetShieldMode {
-        channel: ChannelId,
-        active: bool,
+    /// Launch `streamlink` for the given Twitch channel login using the
+    /// persisted external-tools settings.
+    OpenStreamlink { channel: String },
+    /// Launch the user's custom player template for the given Twitch channel.
+    OpenPlayer { channel: String },
+    /// Persist Streamlink / external-player configuration.
+    SetExternalToolsSettings {
+        /// Path to the `streamlink` binary (empty = use `PATH`).
+        streamlink_path: String,
+        /// Preferred Streamlink quality token (e.g. `best`, `720p60`).
+        streamlink_quality: String,
+        /// Extra args prepended to the Streamlink invocation.
+        streamlink_extra_args: String,
+        /// Custom player command template with `{channel}` / `{url}` /
+        /// `{quality}` / `{mpv}`.
+        player_template: String,
+        /// Path to the `mpv` binary (empty = use `PATH`).  Exposed via `{mpv}`
+        /// in `player_template`.
+        mpv_path: String,
+        /// Optional Twitch session `auth-token` cookie value.  When non-empty,
+        /// auto-injected as `--twitch-api-header "Authorization=OAuth <token>"`.
+        streamlink_session_token: String,
     },
+    /// Toggle Twitch Shield Mode on the given channel (mod/broadcaster only).
+    SetShieldMode { channel: ChannelId, active: bool },
     /// Modify Twitch channel title and/or game (broadcaster scope required).
     UpdateChannelInfo {
         channel: ChannelId,
@@ -192,10 +212,7 @@ pub enum AppCommand {
         game_name: Option<String>,
     },
     /// Look up how long `user` has followed `channel`.
-    FetchFollowAge {
-        channel: ChannelId,
-        user: String,
-    },
+    FetchFollowAge { channel: ChannelId, user: String },
     /// Look up the account creation date for `user` and report its age.
     FetchAccountAge {
         /// Channel to inject the resulting local message into.
@@ -266,6 +283,13 @@ pub enum AppCommand {
     SetLastActiveChannel {
         /// Serialised ChannelId (platform-prefixed key).
         channel: String,
+    },
+    /// Update the per-tab visibility rule for `channel`. Setting the rule
+    /// to [`crate::state::TabVisibilityRule::Always`] removes any prior
+    /// override. Persisted via `AppSettings::tab_visibility_rules`.
+    SetTabVisibilityRule {
+        channel: ChannelId,
+        rule: crate::state::TabVisibilityRule,
     },
     /// Persist chat-input overflow behavior and long-message collapse settings.
     SetChatUiBehavior {
@@ -411,7 +435,9 @@ pub enum AppCommand {
     /// Persist an updated ordered list of moderation action presets.
     SetModActionPresets { presets: Vec<ModActionPreset> },
     /// Persist an updated list of nickname aliases.
-    SetNicknames { nicknames: Vec<crate::model::Nickname> },
+    SetNicknames {
+        nicknames: Vec<crate::model::Nickname>,
+    },
     /// Persist an updated ignored-user list.
     SetIgnoredUsers {
         users: Vec<crate::ignores::IgnoredUser>,
@@ -420,15 +446,34 @@ pub enum AppCommand {
     SetIgnoredPhrases {
         phrases: Vec<crate::ignores::IgnoredPhrase>,
     },
-    /// Persist the "show pronouns in usercard" toggle.
-    SetShowPronounsInUsercard {
-        enabled: bool,
+    /// Persist an updated list of custom command aliases. Replaces the
+    /// entire set; send the full list every time the editor saves.
+    SetCommandAliases {
+        aliases: Vec<crate::commands::CommandAlias>,
     },
+    /// Persist an updated hotkey binding map. Each pair is
+    /// `(HotkeyAction::as_key(), KeyBinding)`. The entire set is replaced
+    /// on every write.
+    SetHotkeyBindings {
+        bindings: Vec<(String, crate::hotkeys::KeyBinding)>,
+    },
+    /// Append a word to the user's custom spellcheck dictionary.
+    /// Persisted via [`crate::events::AppEvent::SpellDictionaryUpdated`].
+    /// Duplicates and non-alphabetic input are rejected silently on the
+    /// storage side.
+    AddWordToDictionary { word: String },
+    /// Remove a word from the user's custom spellcheck dictionary.
+    RemoveWordFromDictionary { word: String },
+    /// Replace the user's custom spellcheck dictionary wholesale (used by
+    /// the settings editor when bulk-editing the list).
+    SetCustomSpellDictionary { words: Vec<String> },
+    /// Enable or disable chat-input spellchecking.
+    SetSpellcheckEnabled { enabled: bool },
+    /// Persist the "show pronouns in usercard" toggle.
+    SetShowPronounsInUsercard { enabled: bool },
     /// Request a pronouns fetch for a specific login.  No-op if the toggle is
     /// off or the value is already cached.
-    FetchUserPronouns {
-        login: String,
-    },
+    FetchUserPronouns { login: String },
     /// Refresh authentication after a 401 - re-validate the stored token.
     RefreshAuth,
     /// Persist desktop notification toggle.
@@ -447,6 +492,13 @@ pub enum AppCommand {
         /// If true, exit the app after scheduling installer so update applies immediately.
         restart_now: bool,
     },
+    /// Persist per-event sound notification settings (mention / whisper /
+    /// sub / raid / custom highlight).  The UI sends the full configured
+    /// set; missing keys fall back to [`crate::SoundEventSetting::default`]
+    /// on the receiving end.
+    SetSoundSettings {
+        events: Vec<(String, crate::sound::SoundEventSetting)>,
+    },
     /// Persist streamer-mode preferences.
     SetStreamerModeSettings {
         /// `off`, `auto`, or `on`.
@@ -458,6 +510,18 @@ pub enum AppCommand {
         /// Suppress sound notifications while active.
         suppress_sounds: bool,
     },
+    /// Upload an image to the configured host (Imgur / Nuuls / ShareX).
+    UploadImage {
+        channel: ChannelId,
+        /// Raw image bytes (already converted to a network format if needed).
+        bytes: Vec<u8>,
+        /// Extension without the dot: `"png"`, `"gif"`, `"jpeg"`.
+        format: String,
+        /// Original on-disk path if the image came from a file drop.
+        source_path: Option<String>,
+    },
+    /// Force the live-feed poll task to refresh immediately (bypass tick wait).
+    LiveFeedRefresh,
 }
 
 // Events (runtime to UI): notifications sent from runtime to UI
@@ -533,6 +597,11 @@ pub enum AppEvent {
     /// Should be prepended to the channel's message buffer.
     HistoryLoaded {
         channel: ChannelId,
+        messages: Vec<ChatMessage>,
+    },
+    /// Mention-matching messages replayed from the local SQLite log on
+    /// startup. Populates the cross-channel Mentions pseudo-tab buffer.
+    MentionsLoaded {
         messages: Vec<ChatMessage>,
     },
     /// Twitch user profile loaded from the IVR API.
@@ -654,6 +723,15 @@ pub enum AppEvent {
         /// Enable desktop notifications for highlight rules with `show_in_mentions`.
         desktop_notifications_enabled: bool,
     },
+    /// External-tool settings snapshot (Streamlink + custom player).
+    ExternalToolsSettingsUpdated {
+        streamlink_path: String,
+        streamlink_quality: String,
+        streamlink_extra_args: String,
+        player_template: String,
+        mpv_path: String,
+        streamlink_session_token: String,
+    },
     /// Slash command usage counts loaded/updated from persistent storage.
     SlashUsageCountsUpdated {
         usage_counts: Vec<(String, u32)>,
@@ -663,6 +741,18 @@ pub enum AppEvent {
         favorites: Vec<String>,
         recent: Vec<String>,
         provider_boost: Option<String>,
+    },
+    /// User-managed spellcheck state loaded/updated from persistent storage.
+    /// Emitted once at startup and after every `AddWordToDictionary`,
+    /// `RemoveWordFromDictionary`, `SetCustomSpellDictionary` or
+    /// `SetSpellcheckEnabled` command so the UI can refresh its in-memory
+    /// mirror.
+    SpellDictionaryUpdated {
+        /// Whether chat-input spellchecking should underline misspelled
+        /// words and surface suggestions.
+        enabled: bool,
+        /// Sorted list of user-added words (lowercase).
+        words: Vec<String>,
     },
     /// Startup hint: the last-focused channel from the previous session.
     /// UI activates this channel once it has been joined and is present in
@@ -685,6 +775,15 @@ pub enum AppEvent {
         timestamps_font_size: f32,
         /// Room-state / viewer-count pill size (pt).
         pills_font_size: f32,
+    },
+    /// Per-tab visibility rules loaded/updated from persistent storage.
+    /// Emitted at startup (initial snapshot) and after every successful
+    /// `SetTabVisibilityRule` write so the UI mirror stays consistent
+    /// with disk.
+    TabVisibilityRulesUpdated {
+        /// List of (channel-id, rule) pairs. Channels absent from the
+        /// list default to [`crate::state::TabVisibilityRule::Always`].
+        rules: Vec<(ChannelId, crate::state::TabVisibilityRule)>,
     },
     /// Appearance and shell layout settings loaded/updated from storage.
     AppearanceSettingsUpdated {
@@ -800,6 +899,16 @@ pub enum AppEvent {
     IgnoredPhrasesUpdated {
         phrases: Vec<crate::ignores::IgnoredPhrase>,
     },
+    /// Updated custom-command alias list.
+    CommandAliasesUpdated {
+        aliases: Vec<crate::commands::CommandAlias>,
+    },
+    /// Updated hotkey bindings. Emitted once on startup (from saved
+    /// settings, or defaults) and after every successful
+    /// [`AppCommand::SetHotkeyBindings`].
+    HotkeyBindingsUpdated {
+        bindings: Vec<(String, crate::hotkeys::KeyBinding)>,
+    },
     /// Pronouns resolved for a user (from alejo.io).  `pronouns=None` means
     /// the user has no pronouns set or a fetch miss.
     UserPronounsLoaded {
@@ -885,6 +994,14 @@ pub enum AppEvent {
         plugin_name: String,
         window_id: String,
     },
+    /// Per-event sound notification settings loaded or updated from
+    /// storage. Emitted once at startup (initial snapshot from
+    /// `AppSettings.sounds`) and after every successful
+    /// [`AppCommand::SetSoundSettings`] so the UI's
+    /// `SoundController` can refresh its in-memory copy.
+    SoundSettingsUpdated {
+        events: Vec<(String, crate::sound::SoundEventSetting)>,
+    },
     /// Streamer-mode preferences loaded or updated from storage.
     StreamerModeSettingsUpdated {
         mode: String,
@@ -895,6 +1012,33 @@ pub enum AppEvent {
     /// Effective streamer-mode active flag changed (driven by setting + detection).
     StreamerModeActiveChanged {
         active: bool,
+    },
+    /// An image upload started (show spinner / status banner).
+    UploadStarted {
+        channel: ChannelId,
+    },
+    /// An image upload finished. On success the URL is appended to the input
+    /// buffer of `channel`; on failure the error text is surfaced as a toast /
+    /// inline system notice.
+    UploadFinished {
+        channel: ChannelId,
+        result: Result<String, String>,
+    },
+    /// Latest list of currently-live followed channels, already sorted
+    /// desc by viewer_count. Replaces `AppState.live_channels` wholesale.
+    LiveFeedUpdated {
+        channels: Vec<crate::model::LiveChannelSnapshot>,
+    },
+    /// Live-feed poll task failed; previous snapshot is preserved.
+    LiveFeedError {
+        message: String,
+    },
+    /// Partial live-feed snapshot accompanied by an error. Applied atomically
+    /// so the UI doesn't flash through a "success cleared error" intermediate
+    /// state before the matching error arrives.
+    LiveFeedPartialUpdate {
+        channels: Vec<crate::model::LiveChannelSnapshot>,
+        error: String,
     },
 }
 
@@ -925,6 +1069,56 @@ impl std::fmt::Display for ConnectionState {
                 write!(f, "Reconnecting (attempt {attempt})…")
             }
             ConnectionState::Error(e) => write!(f, "Error: {e}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod live_feed_event_tests {
+    use super::*;
+    use crate::model::LiveChannelSnapshot;
+
+    #[test]
+    fn live_feed_refresh_command_is_unit_variant() {
+        // Construct it; pattern-match it; if the variant ever grows fields this
+        // test will force a deliberate update.
+        let cmd = AppCommand::LiveFeedRefresh;
+        match cmd {
+            AppCommand::LiveFeedRefresh => {}
+            _ => panic!("expected LiveFeedRefresh"),
+        }
+    }
+
+    #[test]
+    fn live_feed_updated_event_constructs_and_carries_channels() {
+        let snap = LiveChannelSnapshot {
+            user_id: "1".into(),
+            user_login: "a".into(),
+            user_name: "A".into(),
+            viewer_count: 42,
+            thumbnail_url: String::new(),
+            started_at: String::new(),
+        };
+        let evt = AppEvent::LiveFeedUpdated {
+            channels: vec![snap],
+        };
+        match evt {
+            AppEvent::LiveFeedUpdated { channels } => {
+                assert_eq!(channels.len(), 1);
+                assert_eq!(channels[0].viewer_count, 42);
+            }
+            _ => panic!("expected LiveFeedUpdated"),
+        }
+    }
+
+    #[test]
+    fn live_feed_error_event_carries_message() {
+        let evt = AppEvent::LiveFeedError {
+            message: "boom".into(),
+        };
+        match evt {
+            AppEvent::LiveFeedError { message } => assert_eq!(message, "boom"),
+            _ => panic!("expected LiveFeedError"),
         }
     }
 }

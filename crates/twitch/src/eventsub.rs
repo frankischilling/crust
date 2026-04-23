@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -20,10 +20,12 @@ pub enum EventSubCommand {
         token: String,
         client_id: String,
         user_id: String,
+        scopes: Vec<String>,
     },
     ClearAuth,
     WatchChannel {
         broadcaster_id: String,
+        can_moderate: bool,
     },
     UnwatchChannel {
         broadcaster_id: String,
@@ -179,13 +181,29 @@ struct EventSubAuth {
     token: String,
     client_id: String,
     user_id: String,
+    scopes: HashSet<String>,
+}
+
+impl EventSubAuth {
+    fn has_scope(&self, scope: &str) -> bool {
+        self.scopes.contains(&scope.to_ascii_lowercase())
+    }
+
+    fn has_any_scope(&self, scopes: &[&str]) -> bool {
+        scopes.iter().any(|scope| self.has_scope(scope))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct WatchedBroadcaster {
+    can_moderate: bool,
 }
 
 pub struct EventSubSession {
     event_tx: mpsc::Sender<EventSubEvent>,
     cmd_rx: mpsc::Receiver<EventSubCommand>,
     auth: Option<EventSubAuth>,
-    watched_broadcasters: HashSet<String>,
+    watched_broadcasters: HashMap<String, WatchedBroadcaster>,
     http: reqwest::Client,
     resumed_once: bool,
     /// Deduplication cache: tracks recent event IDs to prevent duplicate processing.
@@ -227,7 +245,7 @@ impl EventSubSession {
             event_tx,
             cmd_rx,
             auth: None,
-            watched_broadcasters: HashSet::new(),
+            watched_broadcasters: HashMap::new(),
             http: reqwest::Client::new(),
             resumed_once: false,
             seen_event_ids: LruCache::new(EVENT_DEDUP_CACHE_SIZE),
@@ -293,7 +311,7 @@ impl EventSubSession {
                         return Ok(EventSubConnectOutcome::Stop);
                     };
                     match cmd {
-                        EventSubCommand::SetAuth { token, client_id, user_id } => {
+                        EventSubCommand::SetAuth { token, client_id, user_id, scopes } => {
                             let bare = token.strip_prefix("oauth:").unwrap_or(&token).trim().to_owned();
                             if bare.is_empty() || client_id.trim().is_empty() || user_id.trim().is_empty() {
                                 self.auth = None;
@@ -303,22 +321,31 @@ impl EventSubSession {
                                 token: bare,
                                 client_id: client_id.trim().to_owned(),
                                 user_id: user_id.trim().to_owned(),
+                                scopes: scopes
+                                    .into_iter()
+                                    .map(|scope| scope.trim().to_ascii_lowercase())
+                                    .filter(|scope| !scope.is_empty())
+                                    .collect(),
                             });
                             if let Some(ref sid) = session_id {
+                                self.subscribe_user_topics(sid).await;
                                 self.subscribe_all(sid).await;
                             }
                         }
                         EventSubCommand::ClearAuth => {
                             self.auth = None;
                         }
-                        EventSubCommand::WatchChannel { broadcaster_id } => {
+                        EventSubCommand::WatchChannel { broadcaster_id, can_moderate } => {
                             let bid = broadcaster_id.trim();
                             if bid.is_empty() {
                                 continue;
                             }
-                            self.watched_broadcasters.insert(bid.to_owned());
+                            self.watched_broadcasters.insert(
+                                bid.to_owned(),
+                                WatchedBroadcaster { can_moderate },
+                            );
                             if let Some(ref sid) = session_id {
-                                self.subscribe_channel(sid, bid).await;
+                                self.subscribe_channel(sid, bid, can_moderate).await;
                             }
                         }
                         EventSubCommand::UnwatchChannel { broadcaster_id } => {
@@ -372,6 +399,7 @@ impl EventSubSession {
                                     }).await;
                                     self.emit(EventSubEvent::BackfillRequested).await;
                                     self.resumed_once = true;
+                                    self.subscribe_user_topics(&sid).await;
                                     self.subscribe_all(&sid).await;
                                 }
                                 "session_keepalive" => {
@@ -468,61 +496,120 @@ impl EventSubSession {
         if session_id.trim().is_empty() {
             return;
         }
-        for broadcaster_id in &self.watched_broadcasters {
-            self.subscribe_channel(session_id, broadcaster_id).await;
+        let Some(auth) = self.auth.as_ref() else {
+            return;
+        };
+        let estimated_total_cost: u32 = self
+            .watched_broadcasters
+            .iter()
+            .map(|(broadcaster_id, watched)| {
+                subscription_specs(broadcaster_id, auth, watched.can_moderate)
+                    .iter()
+                    .map(|spec| spec.estimated_cost)
+                    .sum::<u32>()
+            })
+            .sum();
+        debug!(
+            "EventSub plan estimated websocket cost {estimated_total_cost}/{EVENTSUB_MAX_ESTIMATED_COST} across {} watched broadcasters",
+            self.watched_broadcasters.len()
+        );
+        for (broadcaster_id, watched) in &self.watched_broadcasters {
+            self.subscribe_channel(session_id, broadcaster_id, watched.can_moderate)
+                .await;
         }
     }
 
-    async fn subscribe_channel(&self, session_id: &str, broadcaster_id: &str) {
+    async fn subscribe_channel(&self, session_id: &str, broadcaster_id: &str, can_moderate: bool) {
         let Some(auth) = self.auth.as_ref() else {
             return;
         };
 
-        let specs = subscription_specs(broadcaster_id, &auth.user_id);
+        let specs = subscription_specs(broadcaster_id, auth, can_moderate);
         for spec in specs {
-            let body = json!({
-                "type": spec.kind,
-                "version": spec.version,
-                "condition": spec.condition,
-                "transport": {
-                    "method": "websocket",
-                    "session_id": session_id,
-                }
-            });
-
-            let resp = self
-                .http
-                .post("https://api.twitch.tv/helix/eventsub/subscriptions")
-                .header("Authorization", format!("Bearer {}", auth.token))
-                .header("Client-Id", &auth.client_id)
-                .json(&body)
-                .send()
+            self.subscribe_spec(session_id, broadcaster_id, &spec, auth)
                 .await;
+        }
+    }
 
-            match resp {
-                Ok(r) if r.status().is_success() => {
-                    debug!("EventSub subscribed: {} for {}", spec.kind, broadcaster_id);
-                }
-                Ok(r) if r.status() == StatusCode::CONFLICT => {
+    async fn subscribe_user_topics(&self, session_id: &str) {
+        let Some(auth) = self.auth.as_ref() else {
+            return;
+        };
+
+        if !auth.has_any_scope(&["user:read:whispers", "user:manage:whispers"]) {
+            return;
+        }
+
+        let spec = SubscriptionSpec {
+            kind: "user.whisper.message",
+            version: "1",
+            condition: json!({
+                "user_id": auth.user_id,
+            }),
+            estimated_cost: 0,
+            priority: SubscriptionPriority::Critical,
+            fallback: None,
+        };
+        self.subscribe_spec(session_id, &auth.user_id, &spec, auth)
+            .await;
+    }
+
+    async fn subscribe_spec(
+        &self,
+        session_id: &str,
+        broadcaster_id: &str,
+        spec: &SubscriptionSpec,
+        auth: &EventSubAuth,
+    ) {
+        let body = json!({
+            "type": spec.kind,
+            "version": spec.version,
+            "condition": spec.condition,
+            "transport": {
+                "method": "websocket",
+                "session_id": session_id,
+            }
+        });
+
+        let resp = self
+            .http
+            .post("https://api.twitch.tv/helix/eventsub/subscriptions")
+            .header("Authorization", format!("Bearer {}", auth.token))
+            .header("Client-Id", &auth.client_id)
+            .json(&body)
+            .send()
+            .await;
+
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                debug!("EventSub subscribed: {} for {}", spec.kind, broadcaster_id);
+            }
+            Ok(r) if r.status() == StatusCode::CONFLICT => {
+                debug!(
+                    "EventSub already subscribed (conflict): {} for {}",
+                    spec.kind, broadcaster_id
+                );
+            }
+            Ok(r) => {
+                let status = r.status();
+                let body = r.text().await.unwrap_or_default();
+                if is_expected_authz_failure(status, &body) {
                     debug!(
-                        "EventSub already subscribed (conflict): {} for {}",
-                        spec.kind, broadcaster_id
+                        "EventSub subscription unavailable {} for {}: HTTP {} - {}",
+                        spec.kind, broadcaster_id, status, body
                     );
-                }
-                Ok(r) => {
-                    let status = r.status();
-                    let body = r.text().await.unwrap_or_default();
+                } else {
                     warn!(
                         "EventSub subscribe failed {} for {}: HTTP {} - {}",
                         spec.kind, broadcaster_id, status, body
                     );
                 }
-                Err(e) => {
-                    warn!(
-                        "EventSub subscribe request failed {} for {}: {}",
-                        spec.kind, broadcaster_id, e
-                    );
-                }
+            }
+            Err(e) => {
+                warn!(
+                    "EventSub subscribe request failed {} for {}: {}",
+                    spec.kind, broadcaster_id, e
+                );
             }
         }
     }
@@ -540,196 +627,399 @@ struct SubscriptionSpec {
     kind: &'static str,
     version: &'static str,
     condition: Value,
+    estimated_cost: u32,
+    priority: SubscriptionPriority,
+    fallback: Option<SubscriptionFallback>,
 }
 
-fn subscription_specs(broadcaster_id: &str, moderator_user_id: &str) -> Vec<SubscriptionSpec> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubscriptionPriority {
+    Critical,
+    Replaceable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubscriptionFallback {
+    StreamStatusPolling,
+    IrcUsernotice,
+}
+
+const EVENTSUB_MAX_ESTIMATED_COST: u32 = 10;
+
+fn is_expected_authz_failure(status: StatusCode, body: &str) -> bool {
+    status == StatusCode::FORBIDDEN
+        && body
+            .to_ascii_lowercase()
+            .contains("subscription missing proper authorization")
+}
+
+fn has_any_scope(auth: &EventSubAuth, scopes: &[&str]) -> bool {
+    auth.has_any_scope(scopes)
+}
+
+fn has_all_scope_groups(auth: &EventSubAuth, groups: &[&[&str]]) -> bool {
+    groups.iter().all(|group| has_any_scope(auth, group))
+}
+
+fn estimated_cross_channel_cost(is_broadcaster: bool) -> u32 {
+    if is_broadcaster {
+        0
+    } else {
+        1
+    }
+}
+
+fn should_subscribe_spec(spec: &SubscriptionSpec) -> bool {
+    match spec.priority {
+        SubscriptionPriority::Critical => true,
+        SubscriptionPriority::Replaceable => match spec.fallback {
+            // For joined channels, IRC USERNOTICE already carries raid notices.
+            Some(SubscriptionFallback::IrcUsernotice) => false,
+            // Cross-channel live state is already covered by profile refreshes and the live-feed poller.
+            Some(SubscriptionFallback::StreamStatusPolling) => spec.estimated_cost == 0,
+            None => spec.estimated_cost == 0,
+        },
+    }
+}
+
+fn subscription_specs(
+    broadcaster_id: &str,
+    auth: &EventSubAuth,
+    can_moderate: bool,
+) -> Vec<SubscriptionSpec> {
     let bid = broadcaster_id.trim();
-    let mid = moderator_user_id.trim();
     if bid.is_empty() {
         return Vec::new();
     }
+    let uid = auth.user_id.trim();
+    let is_broadcaster = bid == uid;
+    let can_moderate = can_moderate || is_broadcaster;
 
-    let mut out = vec![
+    let mut candidates = vec![
         SubscriptionSpec {
             kind: "stream.online",
             version: "1",
             condition: json!({"broadcaster_user_id": bid}),
+            estimated_cost: estimated_cross_channel_cost(is_broadcaster),
+            priority: SubscriptionPriority::Replaceable,
+            fallback: Some(SubscriptionFallback::StreamStatusPolling),
         },
         SubscriptionSpec {
             kind: "stream.offline",
             version: "1",
             condition: json!({"broadcaster_user_id": bid}),
-        },
-        SubscriptionSpec {
-            kind: "channel.subscribe",
-            version: "1",
-            condition: json!({"broadcaster_user_id": bid}),
-        },
-        SubscriptionSpec {
-            kind: "channel.subscription.gift",
-            version: "1",
-            condition: json!({"broadcaster_user_id": bid}),
-        },
-        SubscriptionSpec {
-            kind: "channel.chat.user_message_hold",
-            version: "1",
-            condition: json!({
-                "broadcaster_user_id": bid,
-                "user_id": mid,
-            }),
-        },
-        SubscriptionSpec {
-            kind: "channel.chat.user_message_update",
-            version: "1",
-            condition: json!({
-                "broadcaster_user_id": bid,
-                "user_id": mid,
-            }),
+            estimated_cost: estimated_cross_channel_cost(is_broadcaster),
+            priority: SubscriptionPriority::Replaceable,
+            fallback: Some(SubscriptionFallback::StreamStatusPolling),
         },
         SubscriptionSpec {
             kind: "channel.raid",
             version: "1",
             condition: json!({"to_broadcaster_user_id": bid}),
-        },
-        SubscriptionSpec {
-            kind: "channel.channel_points_custom_reward_redemption.add",
-            version: "1",
-            condition: json!({"broadcaster_user_id": bid}),
-        },
-        SubscriptionSpec {
-            kind: "channel.channel_points_custom_reward_redemption.update",
-            version: "1",
-            condition: json!({"broadcaster_user_id": bid}),
-        },
-        SubscriptionSpec {
-            kind: "channel.poll.begin",
-            version: "1",
-            condition: json!({"broadcaster_user_id": bid}),
-        },
-        SubscriptionSpec {
-            kind: "channel.poll.progress",
-            version: "1",
-            condition: json!({"broadcaster_user_id": bid}),
-        },
-        SubscriptionSpec {
-            kind: "channel.poll.end",
-            version: "1",
-            condition: json!({"broadcaster_user_id": bid}),
-        },
-        SubscriptionSpec {
-            kind: "channel.prediction.begin",
-            version: "1",
-            condition: json!({"broadcaster_user_id": bid}),
-        },
-        SubscriptionSpec {
-            kind: "channel.prediction.progress",
-            version: "1",
-            condition: json!({"broadcaster_user_id": bid}),
-        },
-        SubscriptionSpec {
-            kind: "channel.prediction.lock",
-            version: "1",
-            condition: json!({"broadcaster_user_id": bid}),
-        },
-        SubscriptionSpec {
-            kind: "channel.prediction.end",
-            version: "1",
-            condition: json!({"broadcaster_user_id": bid}),
+            estimated_cost: estimated_cross_channel_cost(is_broadcaster),
+            priority: SubscriptionPriority::Replaceable,
+            fallback: Some(SubscriptionFallback::IrcUsernotice),
         },
     ];
 
-    if !mid.is_empty() {
-        out.push(SubscriptionSpec {
+    if has_any_scope(auth, &["user:read:chat"]) {
+        candidates.push(SubscriptionSpec {
+            kind: "channel.chat.user_message_hold",
+            version: "1",
+            condition: json!({
+                "broadcaster_user_id": bid,
+                "user_id": uid,
+            }),
+            estimated_cost: 0,
+            priority: SubscriptionPriority::Critical,
+            fallback: None,
+        });
+        candidates.push(SubscriptionSpec {
+            kind: "channel.chat.user_message_update",
+            version: "1",
+            condition: json!({
+                "broadcaster_user_id": bid,
+                "user_id": uid,
+            }),
+            estimated_cost: 0,
+            priority: SubscriptionPriority::Critical,
+            fallback: None,
+        });
+    }
+
+    if is_broadcaster && has_any_scope(auth, &["channel:read:subscriptions"]) {
+        candidates.push(SubscriptionSpec {
+            kind: "channel.subscribe",
+            version: "1",
+            condition: json!({"broadcaster_user_id": bid}),
+            estimated_cost: 0,
+            priority: SubscriptionPriority::Critical,
+            fallback: None,
+        });
+        candidates.push(SubscriptionSpec {
+            kind: "channel.subscription.gift",
+            version: "1",
+            condition: json!({"broadcaster_user_id": bid}),
+            estimated_cost: 0,
+            priority: SubscriptionPriority::Critical,
+            fallback: None,
+        });
+    }
+
+    if is_broadcaster
+        && has_any_scope(
+            auth,
+            &["channel:read:redemptions", "channel:manage:redemptions"],
+        )
+    {
+        candidates.push(SubscriptionSpec {
+            kind: "channel.channel_points_custom_reward_redemption.add",
+            version: "1",
+            condition: json!({"broadcaster_user_id": bid}),
+            estimated_cost: 0,
+            priority: SubscriptionPriority::Critical,
+            fallback: None,
+        });
+        candidates.push(SubscriptionSpec {
+            kind: "channel.channel_points_custom_reward_redemption.update",
+            version: "1",
+            condition: json!({"broadcaster_user_id": bid}),
+            estimated_cost: 0,
+            priority: SubscriptionPriority::Critical,
+            fallback: None,
+        });
+    }
+
+    if is_broadcaster && has_any_scope(auth, &["channel:read:polls", "channel:manage:polls"]) {
+        candidates.push(SubscriptionSpec {
+            kind: "channel.poll.begin",
+            version: "1",
+            condition: json!({"broadcaster_user_id": bid}),
+            estimated_cost: 0,
+            priority: SubscriptionPriority::Critical,
+            fallback: None,
+        });
+        candidates.push(SubscriptionSpec {
+            kind: "channel.poll.progress",
+            version: "1",
+            condition: json!({"broadcaster_user_id": bid}),
+            estimated_cost: 0,
+            priority: SubscriptionPriority::Critical,
+            fallback: None,
+        });
+        candidates.push(SubscriptionSpec {
+            kind: "channel.poll.end",
+            version: "1",
+            condition: json!({"broadcaster_user_id": bid}),
+            estimated_cost: 0,
+            priority: SubscriptionPriority::Critical,
+            fallback: None,
+        });
+    }
+
+    if is_broadcaster
+        && has_any_scope(
+            auth,
+            &["channel:read:predictions", "channel:manage:predictions"],
+        )
+    {
+        candidates.push(SubscriptionSpec {
+            kind: "channel.prediction.begin",
+            version: "1",
+            condition: json!({"broadcaster_user_id": bid}),
+            estimated_cost: 0,
+            priority: SubscriptionPriority::Critical,
+            fallback: None,
+        });
+        candidates.push(SubscriptionSpec {
+            kind: "channel.prediction.progress",
+            version: "1",
+            condition: json!({"broadcaster_user_id": bid}),
+            estimated_cost: 0,
+            priority: SubscriptionPriority::Critical,
+            fallback: None,
+        });
+        candidates.push(SubscriptionSpec {
+            kind: "channel.prediction.lock",
+            version: "1",
+            condition: json!({"broadcaster_user_id": bid}),
+            estimated_cost: 0,
+            priority: SubscriptionPriority::Critical,
+            fallback: None,
+        });
+        candidates.push(SubscriptionSpec {
+            kind: "channel.prediction.end",
+            version: "1",
+            condition: json!({"broadcaster_user_id": bid}),
+            estimated_cost: 0,
+            priority: SubscriptionPriority::Critical,
+            fallback: None,
+        });
+    }
+
+    if can_moderate && has_any_scope(auth, &["moderator:read:followers"]) {
+        candidates.push(SubscriptionSpec {
             kind: "channel.follow",
             version: "2",
             condition: json!({
                 "broadcaster_user_id": bid,
-                "moderator_user_id": mid,
+                "moderator_user_id": uid,
             }),
+            estimated_cost: 0,
+            priority: SubscriptionPriority::Critical,
+            fallback: None,
         });
+    }
 
-        out.push(SubscriptionSpec {
+    if can_moderate && has_any_scope(auth, &["moderator:manage:automod"]) {
+        candidates.push(SubscriptionSpec {
             kind: "automod.message.hold",
             version: "2",
             condition: json!({
                 "broadcaster_user_id": bid,
-                "moderator_user_id": mid,
+                "moderator_user_id": uid,
             }),
+            estimated_cost: 0,
+            priority: SubscriptionPriority::Critical,
+            fallback: None,
         });
-        out.push(SubscriptionSpec {
+        candidates.push(SubscriptionSpec {
             kind: "automod.message.update",
             version: "1",
             condition: json!({
                 "broadcaster_user_id": bid,
-                "moderator_user_id": mid,
+                "moderator_user_id": uid,
             }),
+            estimated_cost: 0,
+            priority: SubscriptionPriority::Critical,
+            fallback: None,
         });
-        out.push(SubscriptionSpec {
+    }
+
+    if can_moderate
+        && has_any_scope(
+            auth,
+            &[
+                "moderator:read:unban_requests",
+                "moderator:manage:unban_requests",
+            ],
+        )
+    {
+        candidates.push(SubscriptionSpec {
             kind: "channel.unban_request.create",
             version: "1",
             condition: json!({
                 "broadcaster_user_id": bid,
-                "moderator_user_id": mid,
+                "moderator_user_id": uid,
             }),
+            estimated_cost: 0,
+            priority: SubscriptionPriority::Critical,
+            fallback: None,
         });
-        out.push(SubscriptionSpec {
+        candidates.push(SubscriptionSpec {
             kind: "channel.unban_request.resolve",
             version: "1",
             condition: json!({
                 "broadcaster_user_id": bid,
-                "moderator_user_id": mid,
+                "moderator_user_id": uid,
             }),
+            estimated_cost: 0,
+            priority: SubscriptionPriority::Critical,
+            fallback: None,
         });
-        out.push(SubscriptionSpec {
+    }
+
+    if can_moderate && has_any_scope(auth, &["channel:moderate"]) {
+        candidates.push(SubscriptionSpec {
             kind: "channel.ban",
             version: "1",
-            condition: json!({
-                "broadcaster_user_id": bid,
-                "moderator_user_id": mid,
-            }),
+            condition: json!({ "broadcaster_user_id": bid }),
+            estimated_cost: 0,
+            priority: SubscriptionPriority::Critical,
+            fallback: None,
         });
-        out.push(SubscriptionSpec {
+        candidates.push(SubscriptionSpec {
             kind: "channel.unban",
             version: "1",
-            condition: json!({
-                "broadcaster_user_id": bid,
-                "moderator_user_id": mid,
-            }),
+            condition: json!({ "broadcaster_user_id": bid }),
+            estimated_cost: 0,
+            priority: SubscriptionPriority::Critical,
+            fallback: None,
         });
-        out.push(SubscriptionSpec {
+    }
+
+    if can_moderate
+        && has_all_scope_groups(
+            auth,
+            &[
+                &[
+                    "moderator:read:blocked_terms",
+                    "moderator:manage:blocked_terms",
+                ],
+                &[
+                    "moderator:read:chat_settings",
+                    "moderator:manage:chat_settings",
+                ],
+                &[
+                    "moderator:read:unban_requests",
+                    "moderator:manage:unban_requests",
+                ],
+                &[
+                    "moderator:read:banned_users",
+                    "moderator:manage:banned_users",
+                ],
+                &[
+                    "moderator:read:chat_messages",
+                    "moderator:manage:chat_messages",
+                ],
+                &["moderator:read:warnings", "moderator:manage:warnings"],
+                &["moderator:read:moderators"],
+                &["moderator:read:vips"],
+            ],
+        )
+    {
+        candidates.push(SubscriptionSpec {
             kind: "channel.moderate",
             version: "2",
             condition: json!({
                 "broadcaster_user_id": bid,
-                "moderator_user_id": mid,
+                "moderator_user_id": uid,
             }),
+            estimated_cost: 0,
+            priority: SubscriptionPriority::Critical,
+            fallback: None,
         });
-        out.push(SubscriptionSpec {
+    }
+
+    if can_moderate && has_any_scope(auth, &["moderator:read:suspicious_users"]) {
+        candidates.push(SubscriptionSpec {
             kind: "channel.suspicious_user.message",
             version: "1",
             condition: json!({
                 "broadcaster_user_id": bid,
-                "moderator_user_id": mid,
+                "moderator_user_id": uid,
             }),
+            estimated_cost: 0,
+            priority: SubscriptionPriority::Critical,
+            fallback: None,
         });
-        out.push(SubscriptionSpec {
+        candidates.push(SubscriptionSpec {
             kind: "channel.suspicious_user.update",
             version: "1",
             condition: json!({
                 "broadcaster_user_id": bid,
-                "moderator_user_id": mid,
+                "moderator_user_id": uid,
             }),
-        });
-        out.push(SubscriptionSpec {
-            kind: "user.whisper.message",
-            version: "1",
-            condition: json!({
-                "user_id": mid,
-            }),
+            estimated_cost: 0,
+            priority: SubscriptionPriority::Critical,
+            fallback: None,
         });
     }
 
-    out
+    candidates
+        .into_iter()
+        .filter(should_subscribe_spec)
+        .collect()
 }
 
 fn parse_notice(root: &Value, sub_type: &str) -> Option<EventSubNotice> {
@@ -1607,11 +1897,37 @@ fn compact_u64(value: u64) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::{parse_notice, subscription_specs, EventSubNoticeKind};
+    use super::{parse_notice, subscription_specs, EventSubAuth, EventSubNoticeKind};
+
+    fn auth(user_id: &str, scopes: &[&str]) -> EventSubAuth {
+        EventSubAuth {
+            token: "token".to_owned(),
+            client_id: "client".to_owned(),
+            user_id: user_id.to_owned(),
+            scopes: scopes
+                .iter()
+                .map(|scope| scope.to_ascii_lowercase())
+                .collect(),
+        }
+    }
 
     #[test]
     fn moderator_scoped_subscriptions_include_ban_and_moderate_topics() {
-        let specs = subscription_specs("123", "456");
+        let scopes = [
+            "user:read:chat",
+            "channel:moderate",
+            "moderator:manage:automod",
+            "moderator:read:suspicious_users",
+            "moderator:read:blocked_terms",
+            "moderator:read:chat_settings",
+            "moderator:read:unban_requests",
+            "moderator:read:banned_users",
+            "moderator:read:chat_messages",
+            "moderator:read:warnings",
+            "moderator:read:moderators",
+            "moderator:read:vips",
+        ];
+        let specs = subscription_specs("123", &auth("456", &scopes), true);
         let mut kinds: Vec<&str> = specs.iter().map(|s| s.kind).collect();
         kinds.sort_unstable();
 
@@ -1622,6 +1938,74 @@ mod tests {
         assert!(kinds.contains(&"channel.chat.user_message_update"));
         assert!(kinds.contains(&"channel.suspicious_user.message"));
         assert!(kinds.contains(&"channel.suspicious_user.update"));
+    }
+
+    #[test]
+    fn non_moderator_channel_skips_moderation_topics() {
+        let specs = subscription_specs(
+            "123",
+            &auth(
+                "456",
+                &[
+                    "channel:moderate",
+                    "moderator:manage:automod",
+                    "moderator:read:suspicious_users",
+                ],
+            ),
+            false,
+        );
+        let kinds: Vec<&str> = specs.iter().map(|s| s.kind).collect();
+
+        assert!(!kinds.contains(&"channel.ban"));
+        assert!(!kinds.contains(&"automod.message.hold"));
+        assert!(!kinds.contains(&"channel.suspicious_user.message"));
+    }
+
+    #[test]
+    fn broadcaster_only_topics_are_limited_to_self_channel() {
+        let scopes = [
+            "channel:read:subscriptions",
+            "channel:read:redemptions",
+            "channel:read:polls",
+            "channel:read:predictions",
+        ];
+        let self_specs = subscription_specs("123", &auth("123", &scopes), false);
+        let other_specs = subscription_specs("999", &auth("123", &scopes), false);
+        let self_kinds: Vec<&str> = self_specs.iter().map(|s| s.kind).collect();
+        let other_kinds: Vec<&str> = other_specs.iter().map(|s| s.kind).collect();
+
+        assert!(self_kinds.contains(&"channel.subscribe"));
+        assert!(self_kinds.contains(&"channel.channel_points_custom_reward_redemption.add"));
+        assert!(self_kinds.contains(&"channel.poll.begin"));
+        assert!(self_kinds.contains(&"channel.prediction.begin"));
+        assert!(!other_kinds.contains(&"channel.subscribe"));
+        assert!(!other_kinds.contains(&"channel.channel_points_custom_reward_redemption.add"));
+        assert!(!other_kinds.contains(&"channel.poll.begin"));
+        assert!(!other_kinds.contains(&"channel.prediction.begin"));
+    }
+
+    #[test]
+    fn foreign_channel_uses_polling_and_irc_for_presence_and_raid() {
+        let specs = subscription_specs("999", &auth("123", &["user:read:chat"]), false);
+        let kinds: Vec<&str> = specs.iter().map(|s| s.kind).collect();
+        let estimated_cost: u32 = specs.iter().map(|s| s.estimated_cost).sum();
+
+        assert!(!kinds.contains(&"stream.online"));
+        assert!(!kinds.contains(&"stream.offline"));
+        assert!(!kinds.contains(&"channel.raid"));
+        assert!(kinds.contains(&"channel.chat.user_message_hold"));
+        assert!(kinds.contains(&"channel.chat.user_message_update"));
+        assert_eq!(estimated_cost, 0);
+    }
+
+    #[test]
+    fn self_channel_keeps_zero_cost_presence_topics() {
+        let specs = subscription_specs("123", &auth("123", &[]), false);
+        let kinds: Vec<&str> = specs.iter().map(|s| s.kind).collect();
+
+        assert!(kinds.contains(&"stream.online"));
+        assert!(kinds.contains(&"stream.offline"));
+        assert!(!kinds.contains(&"channel.raid"));
     }
 
     #[test]

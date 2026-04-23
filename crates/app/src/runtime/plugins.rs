@@ -339,9 +339,21 @@ impl LuaPluginHost {
     }
 
     pub fn plugin_root_dir() -> PathBuf {
-        ProjectDirs::from("dev", "crust", "crust")
-            .map(|dirs| dirs.data_dir().join("plugins"))
-            .unwrap_or_else(|| PathBuf::from("plugins"))
+        // Tests MUST NOT touch the user's real plugin directory; they
+        // write fixture plugins into this path and rely on best-effort
+        // cleanup via remove_dir_all. Any panic before cleanup would
+        // otherwise leave test fixtures in the production AppData dir
+        // and they would be loaded at next app launch.
+        #[cfg(test)]
+        {
+            return std::env::temp_dir().join("crust-test-plugins");
+        }
+        #[cfg(not(test))]
+        {
+            ProjectDirs::from("dev", "crust", "crust")
+                .map(|dirs| dirs.data_dir().join("plugins"))
+                .unwrap_or_else(|| PathBuf::from("plugins"))
+        }
     }
 
     fn send_command(&self, cmd: AppCommand) {
@@ -1146,6 +1158,25 @@ impl LuaPluginHost {
     fn set_plugin_window_spec(&self, plugin_idx: usize, spec: PluginUiWindowSpec) {
         if let Some(runtime) = self.runtime_by_index(plugin_idx) {
             let mut guard = runtime.lock().unwrap_or_else(|p| p.into_inner());
+            guard.windows.insert(spec.id.clone(), spec);
+        }
+    }
+
+    // Like set_plugin_window_spec but preserves the runtime-owned `open`
+    // state when the window already exists. Callers that tick content
+    // updates (e.g. clock plugin every second) otherwise race the async
+    // PluginUiWindowClosed event and silently reopen the window.
+    // Callers that want to force-open use c2.ui.open_window explicitly.
+    fn update_plugin_window_spec_preserving_open(
+        &self,
+        plugin_idx: usize,
+        mut spec: PluginUiWindowSpec,
+    ) {
+        if let Some(runtime) = self.runtime_by_index(plugin_idx) {
+            let mut guard = runtime.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(existing) = guard.windows.get(&spec.id) {
+                spec.open = existing.open;
+            }
             guard.windows.insert(spec.id.clone(), spec);
         }
     }
@@ -2177,7 +2208,7 @@ unsafe extern "C" fn native_ui_update_window(L: *mut lua_State) -> c_int {
         return 0;
     };
     if let Some(spec) = lua_table_ui_window_spec(L, 2, Some(&id)) {
-        host.set_plugin_window_spec(plugin_idx, spec);
+        host.update_plugin_window_spec_preserving_open(plugin_idx, spec);
     }
     0
 }
@@ -4779,7 +4810,13 @@ fn event_kind(event: &AppEvent) -> Option<PluginEventKind> {
         | AppEvent::UpdateCheckUpToDate { .. }
         | AppEvent::UpdateCheckFailed { .. } => PluginEventKind::Error,
         AppEvent::StreamerModeSettingsUpdated { .. }
-        | AppEvent::StreamerModeActiveChanged { .. } => PluginEventKind::Error,
+        | AppEvent::StreamerModeActiveChanged { .. }
+        | AppEvent::SoundSettingsUpdated { .. } => PluginEventKind::Error,
+        AppEvent::ExternalToolsSettingsUpdated { .. } => PluginEventKind::Error,
+        AppEvent::TabVisibilityRulesUpdated { .. } => PluginEventKind::Error,
+        // Alias edits are an internal UI concern; don't surface them to plugins.
+        AppEvent::CommandAliasesUpdated { .. } => return None,
+        AppEvent::UploadStarted { .. } | AppEvent::UploadFinished { .. } => PluginEventKind::Error,
         AppEvent::SelfAvatarLoaded { .. } => PluginEventKind::SelfAvatarLoaded,
         AppEvent::LinkPreviewReady { .. } => PluginEventKind::LinkPreviewReady,
         AppEvent::SenderCosmeticsUpdated { .. } => PluginEventKind::SenderCosmeticsUpdated,
@@ -4794,6 +4831,19 @@ fn event_kind(event: &AppEvent) -> Option<PluginEventKind> {
         AppEvent::PluginUiChange { .. } => PluginEventKind::PluginUiChange,
         AppEvent::PluginUiSubmit { .. } => PluginEventKind::PluginUiSubmit,
         AppEvent::PluginUiWindowClosed { .. } => PluginEventKind::PluginUiWindowClosed,
+        // Live-feed events are not exposed to plugins.
+        AppEvent::LiveFeedUpdated { .. }
+        | AppEvent::LiveFeedError { .. }
+        | AppEvent::LiveFeedPartialUpdate { .. } => return None,
+        // Mentions-tab restore is an internal UI-state event; not surfaced
+        // to plugins (individual mention messages already arrive via the
+        // normal MessageReceived dispatch path).
+        AppEvent::MentionsLoaded { .. } => return None,
+        // Hotkey binding changes are a pure UI/settings concern.
+        AppEvent::HotkeyBindingsUpdated { .. } => return None,
+        // Spell dictionary edits are a pure UI/settings concern - not
+        // surfaced to plugins.
+        AppEvent::SpellDictionaryUpdated { .. } => return None,
     })
 }
 
@@ -5564,6 +5614,44 @@ unsafe fn make_event_table(L: *mut lua_State, event: &AppEvent) -> c_int {
         AppEvent::StreamerModeActiveChanged { active } => {
             set_field_bool(L, -1, "active", *active);
         }
+        AppEvent::SoundSettingsUpdated { events: _ } => {
+            // Not yet surfaced to plugins with structured data; the
+            // default kind is `Error` so plugins that haven't opted in
+            // simply never see this event.
+        }
+        AppEvent::UploadStarted { .. } | AppEvent::UploadFinished { .. } => {
+            // Not yet surfaced to plugins.
+        }
+        AppEvent::ExternalToolsSettingsUpdated {
+            streamlink_path,
+            streamlink_quality,
+            streamlink_extra_args,
+            player_template,
+            mpv_path,
+            streamlink_session_token: _,
+        } => {
+            // Session token is user-private and intentionally not surfaced to
+            // plugins (keeps Twitch cookies out of the plugin event stream).
+            set_field_string(L, -1, "streamlink_path", streamlink_path);
+            set_field_string(L, -1, "streamlink_quality", streamlink_quality);
+            set_field_string(L, -1, "streamlink_extra_args", streamlink_extra_args);
+            set_field_string(L, -1, "player_template", player_template);
+            set_field_string(L, -1, "mpv_path", mpv_path);
+        }
+        // Live-feed events are not exposed to plugins.
+        AppEvent::LiveFeedUpdated { .. }
+        | AppEvent::LiveFeedError { .. }
+        | AppEvent::LiveFeedPartialUpdate { .. } => {}
+        // Mentions-tab restore event is not surfaced to plugins.
+        AppEvent::MentionsLoaded { .. } => {}
+        // Tab visibility rules are UI-only state; not exposed to plugins.
+        AppEvent::TabVisibilityRulesUpdated { .. } => {}
+        // Command alias edits are an internal UI concern; not surfaced to plugins.
+        AppEvent::CommandAliasesUpdated { .. } => {}
+        // Hotkey binding changes are UI/settings-only state.
+        AppEvent::HotkeyBindingsUpdated { .. } => {}
+        // Spell dictionary edits are UI/settings-only state.
+        AppEvent::SpellDictionaryUpdated { .. } => {}
     }
 
     lua_gettop(L)

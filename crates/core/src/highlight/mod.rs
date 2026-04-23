@@ -339,23 +339,48 @@ pub fn first_match_context<'a>(
     channel_login: &str,
     is_mention: bool,
 ) -> Option<(Option<HighlightColor>, bool, bool, bool)> {
-    for m in compiled {
-        if m.is_match_context(
-            text,
-            sender_login,
-            sender_display_name,
-            channel_login,
-            is_mention,
-        ) {
-            return Some((
-                m.rule.color,
-                m.rule.show_in_mentions,
-                m.rule.has_alert,
-                m.rule.has_sound,
-            ));
-        }
-    }
-    None
+    first_match_context_rule(
+        compiled,
+        text,
+        sender_login,
+        sender_display_name,
+        channel_login,
+        is_mention,
+    )
+    .map(|rule| {
+        (
+            rule.color,
+            rule.show_in_mentions,
+            rule.has_alert,
+            rule.has_sound,
+        )
+    })
+}
+
+/// Variant of [`first_match_context`] that returns the fully matched
+/// [`HighlightRule`] (borrowed) so callers that need the `sound_url`
+/// override or other per-rule metadata can read it without walking the
+/// compiled list again.
+pub fn first_match_context_rule<'a>(
+    compiled: &'a [HighlightMatch],
+    text: &str,
+    sender_login: &str,
+    sender_display_name: &str,
+    channel_login: &str,
+    is_mention: bool,
+) -> Option<&'a HighlightRule> {
+    compiled
+        .iter()
+        .find(|m| {
+            m.is_match_context(
+                text,
+                sender_login,
+                sender_display_name,
+                channel_login,
+                is_mention,
+            )
+        })
+        .map(|m| &m.rule)
 }
 
 /// Convenience: returns `true` if any compiled rule matches.

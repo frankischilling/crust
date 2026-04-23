@@ -207,7 +207,10 @@ impl PronounsProvider {
         for (id, raw) in obj.iter() {
             let subject = raw.get("subject").and_then(|v| v.as_str()).unwrap_or("");
             let object = raw.get("object").and_then(|v| v.as_str()).unwrap_or("");
-            let singular = raw.get("singular").and_then(|v| v.as_bool()).unwrap_or(false);
+            let singular = raw
+                .get("singular")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             if subject.is_empty() || object.is_empty() {
                 continue;
             }

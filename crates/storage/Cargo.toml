@@ -18,5 +18,6 @@ keyring = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 chrono = { workspace = true }
-crust-core = { path = "../core", version = "0.4.9" }
+crust-core = { path = "../core", version = "0.5.0" }
+crust-uploader = { path = "../uploader", version = "0.5.0" }
 rusqlite = { workspace = true }

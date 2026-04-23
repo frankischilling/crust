@@ -40,7 +40,7 @@ pub fn parse(input: &str) -> ParseOutcome {
                 match dispatch_tag(tag, val) {
                     Ok(Some(p)) => p,
                     Ok(None) => {
-                        // Unknown tag — whole match falls back to substring.
+                        // Unknown tagwhole match falls back to substring.
                         let raw = cap.get(0).unwrap().as_str();
                         Predicate::Substring(raw.to_string())
                     }
@@ -81,9 +81,9 @@ fn strip_quotes(v: &str) -> &str {
 
 /// Dispatches a single `name:value` tag.
 ///
-/// - `Ok(Some(p))` — tag recognised.
-/// - `Ok(None)`    — unknown tag (caller falls back to substring).
-/// - `Err(msg)`    — recognised tag but value invalid (e.g. bad regex).
+/// - `Ok(Some(p))`tag recognised.
+/// - `Ok(None)`   unknown tag (caller falls back to substring).
+/// - `Err(msg)`   recognised tag but value invalid (e.g. bad regex).
 fn dispatch_tag(name: &str, value: &str) -> Result<Option<Predicate>, String> {
     let name = name.to_lowercase();
     match name.as_str() {
@@ -194,7 +194,10 @@ mod tests {
         let Predicate::Author(names) = &out.predicates[0] else {
             panic!()
         };
-        assert_eq!(names, &vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(
+            names,
+            &vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
     }
 
     #[test]
@@ -205,7 +208,10 @@ mod tests {
 
     #[test]
     fn has_mention_and_emote_produce_respective_predicates() {
-        assert!(matches!(parse("has:mention").predicates[0], Predicate::Mention));
+        assert!(matches!(
+            parse("has:mention").predicates[0],
+            Predicate::Mention
+        ));
         assert!(matches!(parse("has:emote").predicates[0], Predicate::Emote));
     }
 
@@ -259,7 +265,11 @@ mod tests {
         };
         assert_eq!(
             names,
-            &vec!["moderator".to_string(), "subscriber".to_string(), "premium".to_string()]
+            &vec![
+                "moderator".to_string(),
+                "subscriber".to_string(),
+                "premium".to_string()
+            ]
         );
     }
 

@@ -132,6 +132,55 @@ impl LogStore {
         Ok(out)
     }
 
+    /// Load the most-recent cross-channel *mention-matching* messages, oldest
+    /// → newest. A message qualifies if its persisted JSON payload has any
+    /// of the "attention" flags set (`is_highlighted`, `is_mention`,
+    /// `is_first_msg`, `is_pinned`). Whispers are excluded (they have their
+    /// own dedicated UI feed via `whisper:` channel prefix).
+    ///
+    /// Uses SQLite LIKE patterns against the serialised JSON as a cheap
+    /// pre-filter, then validates by parsing the payload - this keeps the
+    /// scan bounded to a small slice of the full `chat_messages` table on
+    /// realistic datasets without needing a schema migration.
+    pub fn recent_mentions(&self, limit: usize) -> Result<Vec<ChatMessage>, StorageError> {
+        let safe_limit = limit.clamp(1, 5_000) as i64;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| StorageError::Io(std::io::Error::other("chat log DB mutex poisoned")))?;
+        // serde emits exactly these substrings for `true` bool fields.
+        let mut stmt = conn.prepare(
+            r#"SELECT payload_json
+             FROM chat_messages
+             WHERE channel NOT LIKE 'whisper:%'
+               AND (
+                 payload_json LIKE '%"is_highlighted":true%'
+                 OR payload_json LIKE '%"is_mention":true%'
+                 OR payload_json LIKE '%"is_first_msg":true%'
+                 OR payload_json LIKE '%"is_pinned":true%'
+               )
+             ORDER BY ts_ms DESC, id DESC
+             LIMIT ?1"#,
+        )?;
+        let rows = stmt.query_map(params![safe_limit], |row| row.get::<_, String>(0))?;
+
+        let mut out: Vec<ChatMessage> = Vec::new();
+        for row in rows {
+            let payload = row?;
+            if let Ok(msg) = serde_json::from_str::<ChatMessage>(&payload) {
+                // Double-check flags in-process in case the LIKE pre-filter
+                // false-positives (e.g. a user typed `"is_mention":true` in
+                // chat and it slipped through escaping).
+                let f = &msg.flags;
+                if f.is_highlighted || f.is_mention || f.is_first_msg || f.is_pinned {
+                    out.push(msg);
+                }
+            }
+        }
+        out.reverse(); // oldest → newest so callers can merge by timestamp.
+        Ok(out)
+    }
+
     /// Load older messages for a channel before `before_ts_ms`, oldest → newest.
     pub fn older_messages(
         &self,
@@ -349,6 +398,70 @@ mod tests {
             .expect("load older rows");
         assert_eq!(older.len(), 1);
         assert_eq!(older[0].raw_text, "one");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recent_mentions_filters_across_channels_and_ignores_whispers() {
+        let path = temp_db_path("logs-mentions");
+        let store = LogStore::with_db_path(path.clone()).expect("create store");
+
+        let mk = |id: u64, sec: i64, ch: ChannelId, flags: MessageFlags, txt: &str| ChatMessage {
+            id: MessageId(id),
+            server_id: Some(format!("srv-{id}")),
+            timestamp: Utc.timestamp_opt(1_700_000_000 + sec, 0).single().unwrap(),
+            channel: ch,
+            sender: Sender {
+                user_id: UserId("1".to_owned()),
+                login: "alice".to_owned(),
+                display_name: "Alice".to_owned(),
+                color: None,
+                name_paint: None,
+                badges: Vec::new(),
+            },
+            raw_text: txt.to_owned(),
+            spans: Default::default(),
+            twitch_emotes: Vec::new(),
+            flags,
+            reply: None,
+            msg_kind: MsgKind::Chat,
+        };
+
+        let hl = MessageFlags {
+            is_highlighted: true,
+            ..Default::default()
+        };
+        let mention = MessageFlags {
+            is_mention: true,
+            ..Default::default()
+        };
+        let plain = MessageFlags::default();
+
+        // Two different real channels + one whisper channel.
+        store
+            .append_message(&mk(1, 10, ChannelId::new("forsen"), plain.clone(), "plain"))
+            .expect("append plain");
+        store
+            .append_message(&mk(2, 20, ChannelId::new("forsen"), hl.clone(), "highlighted"))
+            .expect("append hl");
+        store
+            .append_message(&mk(3, 30, ChannelId::new("xqc"), mention.clone(), "mention"))
+            .expect("append mention");
+        // Whisper: must be excluded even if highlighted.
+        store
+            .append_message(&mk(
+                4,
+                40,
+                ChannelId::new("whisper:alice"),
+                hl,
+                "whisper-hl",
+            ))
+            .expect("append whisper");
+
+        let rows = store.recent_mentions(10).expect("load mentions");
+        let ids: Vec<_> = rows.iter().map(|m| m.raw_text.as_str()).collect();
+        assert_eq!(ids, vec!["highlighted", "mention"]);
 
         let _ = std::fs::remove_file(path);
     }

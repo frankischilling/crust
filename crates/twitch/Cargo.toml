@@ -16,10 +16,11 @@ native-tls = { workspace = true }
 futures-util = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
+async-trait = { workspace = true }
 smallvec = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }
-crust-core = { path = "../core", version = "0.4.9" }
+crust-core = { path = "../core", version = "0.5.0" }

@@ -27,6 +27,7 @@ use crust_twitch::{
     session::client::{SessionCommand, TwitchEvent, TwitchSession},
 };
 use crust_ui::CrustApp;
+use crust_uploader::{upload_image as uploader_upload, RawImage, UploaderConfig};
 use seventv::{
     apply_7tv_cosmetics_to_sender, load_7tv_cosmetics_catalog, load_7tv_user_style_for_twitch,
     resolve_7tv_user_style, SevenTvBadgeMeta, SevenTvCosmeticUpdate, SevenTvPaintMeta,
@@ -48,8 +49,8 @@ use runtime::eventsub_notices::{
     should_emit_eventsub_notice_message, stream_status_is_live_from_notice, ModerationActionEffect,
 };
 use runtime::history::{
-    load_local_older_messages, load_local_recent_messages, load_local_recent_whispers,
-    load_recent_messages,
+    load_local_older_messages, load_local_recent_mentions, load_local_recent_messages,
+    load_local_recent_whispers, load_recent_messages,
 };
 use runtime::link_preview::fetch_link_preview;
 use runtime::plugins::init_plugins;
@@ -62,6 +63,7 @@ use runtime::system_messages::{
     make_custom_message, make_system_message,
 };
 
+mod crash;
 mod runtime;
 mod seventv;
 mod streamer_mode;
@@ -204,12 +206,34 @@ fn main() -> Result<()> {
         }
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("crust=debug,warn")),
-        )
-        .init();
+    // Tracing: fmt layer to stderr + env filter + a crash-log layer
+    // that accumulates the last N events in memory.  The crash handler
+    // appends that tail to every report it writes so we always have
+    // application context for triage without needing persistent logs.
+    {
+        use tracing_subscriber::prelude::*;
+        let filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("crust=debug,warn"));
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer())
+            .with(crash::tracing_layer())
+            .init();
+    }
+
+    // Install the crash handler before any other subsystem so a panic
+    // in settings / storage / tokio bootstrap still leaves a recoverable
+    // report on disk.  Reports are scanned later, after `CrustApp::new`,
+    // and surfaced to the user via the crash viewer dialog.  This also
+    // drops a session sentinel that we delete on clean shutdown so
+    // abnormal exits (SIGKILL, native crashes, power loss) can still
+    // be detected by the next launch.
+    let crash_dir = crash::crashes_dir();
+    if let Some(ref dir) = crash_dir {
+        crash::install(dir.clone());
+    } else {
+        warn!("could not resolve crash report directory; panics will not be persisted");
+    }
 
     info!("Crust starting up");
 
@@ -235,6 +259,16 @@ fn main() -> Result<()> {
     // Twitch EventSub channels
     let (eventsub_evt_tx, eventsub_evt_rx) = mpsc::channel::<EventSubEvent>(EVENTSUB_EVT_SIZE);
     let (eventsub_cmd_tx, eventsub_cmd_rx) = mpsc::channel::<EventSubCommand>(128);
+
+    // Live-feed (followed-channels) runtime channels.
+    let (live_feed_cmd_tx, live_feed_cmd_rx) =
+        mpsc::channel::<runtime::live_feed::LiveFeedCommand>(64);
+    let (live_feed_evt_tx, live_feed_evt_rx) =
+        mpsc::channel::<runtime::live_feed::LiveFeedEvent>(64);
+
+    // AuthedHelix is the trait-object plumbed into the live-feed task; it
+    // is reconfigured on every login/logout via set_auth / clear_auth.
+    let authed_helix = std::sync::Arc::new(crust_twitch::helix::AuthedHelix::new());
 
     // Emote index shared between loaders and reducer
     let emote_index: EmoteIndex = Arc::new(RwLock::new(std::collections::HashMap::new()));
@@ -263,6 +297,17 @@ fn main() -> Result<()> {
         .as_ref()
         .map(|s| s.load())
         .unwrap_or_default();
+    // Register the loaded settings with the crash handler so any
+    // subsequent panic writes them alongside the backtrace.  We format
+    // via `Debug` (AppSettings contains no secrets) so the report is
+    // safe to share for triage.
+    crash::update_settings_snapshot(format!("{initial_settings:#?}"));
+    // Keep the snapshot live - every subsequent `SettingsStore::save`
+    // fires this hook so the most recent settings are always bundled
+    // into the next crash report, not just the startup copy.
+    crust_storage::set_persist_hook(Some(std::sync::Arc::new(|settings: &AppSettings| {
+        crash::update_settings_snapshot(format!("{settings:#?}"));
+    })));
     let kick_runtime_enabled = initial_settings.enable_kick_beta;
     let irc_runtime_enabled = initial_settings.enable_irc_beta;
 
@@ -349,6 +394,33 @@ fn main() -> Result<()> {
         session.run()
     });
 
+    // Spawn live-feed task (followed-channels live status).
+    {
+        let helix_for_live_feed: std::sync::Arc<dyn crust_twitch::helix::HelixApi> =
+            authed_helix.clone();
+        let _live_feed_handle = runtime::live_feed::spawn_on(
+            rt.handle(),
+            helix_for_live_feed,
+            live_feed_cmd_rx,
+            live_feed_evt_tx.clone(),
+        );
+    }
+
+    // Kick off a one-shot backfill of the cross-channel Mentions pseudo-tab
+    // from the local SQLite log. Gated on the same `local_log_indexing_enabled`
+    // setting as per-channel history restoration so users who have opted out
+    // of local indexing stay opted out here too.
+    if initial_settings.local_log_indexing_enabled {
+        if let Some(store) = chat_logs.clone() {
+            let etx = evt_tx.clone();
+            rt.spawn(async move {
+                // 500 rows is enough for several sessions of backlog without
+                // blowing RAM even if every historical row qualifies.
+                load_local_recent_mentions(store, 500, etx).await;
+            });
+        }
+    }
+
     // Run the initial catalog bootstrap on the main thread instead of a
     // worker thread. The provider constructors and TLS setup involved here
     // can consume a lot of stack on some libc/OpenSSL combinations.
@@ -377,11 +449,14 @@ fn main() -> Result<()> {
             kick_evt_rx,
             irc_evt_rx,
             eventsub_evt_rx,
+            live_feed_evt_rx,
             evt_tx,
             sess_cmd_tx,
             kick_cmd_tx,
             irc_cmd_tx,
             eventsub_cmd_tx,
+            live_feed_cmd_tx,
+            authed_helix,
             idx,
             cache,
             bm,
@@ -405,12 +480,29 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
+    // Scan the crash directory for reports left behind by a previous
+    // session. The viewer auto-opens on launch when at least one is
+    // found so the user can triage / dismiss them immediately.
+    let pending_crash_reports = crash_dir
+        .as_deref()
+        .map(crash::load_existing_reports)
+        .unwrap_or_default();
+    if !pending_crash_reports.is_empty() {
+        info!(
+            "Recovered {} crash report(s) from previous session",
+            pending_crash_reports.len()
+        );
+    }
+
     let result = eframe::run_native(
         "crust",
         native_opts,
         Box::new(move |cc| {
             let _ = UI_REPAINT_CTX.set(cc.egui_ctx.clone());
-            Ok(Box::new(CrustApp::new(cc, cmd_tx, evt_rx)))
+            let mut app = CrustApp::new(cc, cmd_tx, evt_rx);
+            app.set_pending_crash_reports(pending_crash_reports);
+            app.set_crash_pre_exit_hook(|| crash::clear_session_sentinel());
+            Ok(Box::new(app))
         }),
     );
 
@@ -425,12 +517,18 @@ fn main() -> Result<()> {
                 // Swallow the false-positive Wayland CSD error.
                 tracing::debug!("Ignoring benign winit exit: {msg}");
             } else {
+                // Don't clear the sentinel here - if eframe errored
+                // out uncleanly we'd like the next launch to surface
+                // that as an abnormal shutdown.
                 return Err(anyhow::anyhow!("eframe error: {e}"));
             }
         }
     }
 
     rt.shutdown_background();
+    // Clean-shutdown path: defuse the session sentinel so the next
+    // launch does not treat this run as an abnormal exit.
+    crash::clear_session_sentinel();
     Ok(())
 }
 
@@ -499,6 +597,43 @@ fn spawn_update_install(
     });
 }
 
+/// Watch an externally spawned child (Streamlink / custom player) and surface
+/// a nonzero exit as `AppEvent::Error` with the tail of captured stderr.
+///
+/// Runs on a detached tokio task so the reducer loop never blocks on child
+/// exit.  The actual wait happens on a blocking thread pool because
+/// [`std::process::Child::wait_with_output`] is synchronous.
+fn monitor_external_child(
+    child: std::process::Child,
+    context: &'static str,
+    label: String,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let label_for_log = label.clone();
+        let wait =
+            tokio::task::spawn_blocking(move || crust_ui::external::finalize_exit(child, &label))
+                .await;
+        match wait {
+            Ok(Ok(())) => {
+                tracing::info!("{context} ({label_for_log}) exited cleanly");
+            }
+            Ok(Err(msg)) => {
+                tracing::warn!("{context} failed: {msg}");
+                let _ = evt_tx
+                    .send(AppEvent::Error {
+                        context: context.into(),
+                        message: msg,
+                    })
+                    .await;
+            }
+            Err(join_err) => {
+                tracing::warn!("{context} monitor task panicked: {join_err}");
+            }
+        }
+    });
+}
+
 /// Central reducer: receives raw Twitch/Kick events + UI commands, tokenizes
 /// messages using the emote index, and forwards AppEvents to the UI.
 async fn reducer_loop(
@@ -507,11 +642,14 @@ async fn reducer_loop(
     mut kick_rx: mpsc::Receiver<KickEvent>,
     mut irc_rx: mpsc::Receiver<GenericIrcEvent>,
     mut eventsub_rx: mpsc::Receiver<EventSubEvent>,
+    mut live_feed_rx: mpsc::Receiver<runtime::live_feed::LiveFeedEvent>,
     evt_tx: mpsc::Sender<AppEvent>,
     sess_tx: mpsc::Sender<SessionCommand>,
     kick_tx: mpsc::Sender<KickSessionCommand>,
     irc_tx: mpsc::Sender<GenericIrcSessionCommand>,
     eventsub_tx: mpsc::Sender<EventSubCommand>,
+    live_feed_tx: mpsc::Sender<runtime::live_feed::LiveFeedCommand>,
+    authed_helix: std::sync::Arc<crust_twitch::helix::AuthedHelix>,
     emote_index: EmoteIndex,
     emote_cache: Option<EmoteCache>,
     badge_map: BadgeMap,
@@ -565,6 +703,7 @@ async fn reducer_loop(
     // Track authenticated user info for local echo messages
     let mut auth_username: Option<String> = None;
     let mut auth_user_id: Option<String> = None;
+    let mut auth_scopes: Vec<String> = Vec::new();
     let mut whisper_history_loaded_for: Option<String> = None;
     let mut local_msg_id: u64 = 1_000_000; // offset to avoid collisions with session IDs
                                            // Helix API credentials extracted from the validate response.
@@ -573,6 +712,7 @@ async fn reducer_loop(
     // Room-ids for every joined channel (broadcaster_id used by Helix API).
     let mut channel_room_ids: std::collections::HashMap<ChannelId, String> =
         std::collections::HashMap::new();
+    let mut channel_mod_status: HashMap<ChannelId, bool> = HashMap::new();
 
     // Per-channel cache of the logged-in user's badges + color (from USERSTATE).
     let mut self_badges: HashMap<ChannelId, Vec<Badge>> = HashMap::new();
@@ -792,6 +932,12 @@ async fn reducer_loop(
         })
         .await;
     let _ = evt_tx
+        .send(AppEvent::SpellDictionaryUpdated {
+            enabled: settings.spellcheck_enabled,
+            words: settings.custom_spell_dict.clone(),
+        })
+        .await;
+    let _ = evt_tx
         .send(AppEvent::AppearanceSettingsUpdated {
             channel_layout: settings.channel_layout.clone(),
             sidebar_visible: settings.sidebar_visible,
@@ -844,6 +990,49 @@ async fn reducer_loop(
             phrases: settings.ignored_phrases.clone(),
         })
         .await;
+    let _ = evt_tx
+        .send(AppEvent::CommandAliasesUpdated {
+            aliases: settings.command_aliases.clone(),
+        })
+        .await;
+    // Always emit a non-empty binding set: merge stored overrides with
+    // defaults so the UI has every action covered even on fresh installs
+    // or after an upgrade that added new actions.
+    let merged_hotkeys = crust_core::hotkeys::HotkeyBindings::from_pairs(
+        settings
+            .hotkey_bindings
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone())),
+    );
+    let _ = evt_tx
+        .send(AppEvent::HotkeyBindingsUpdated {
+            bindings: merged_hotkeys.to_pairs(),
+        })
+        .await;
+    let _ = evt_tx
+        .send(AppEvent::ExternalToolsSettingsUpdated {
+            streamlink_path: settings.external_tools.streamlink_path.clone(),
+            streamlink_quality: settings.external_tools.streamlink_quality.clone(),
+            streamlink_extra_args: settings.external_tools.streamlink_extra_args.clone(),
+            player_template: settings.external_tools.player_template.clone(),
+            mpv_path: settings.external_tools.mpv_path.clone(),
+            streamlink_session_token: settings.external_tools.streamlink_session_token.clone(),
+        })
+        .await;
+    let _ = evt_tx
+        .send(AppEvent::TabVisibilityRulesUpdated {
+            rules: settings
+                .tab_visibility_rules
+                .iter()
+                .map(|(id, key)| {
+                    (
+                        ChannelId(id.clone()),
+                        crust_core::state::TabVisibilityRule::from_key(key),
+                    )
+                })
+                .collect(),
+        })
+        .await;
 
     let _ = evt_tx
         .send(AppEvent::UsercardSettingsUpdated {
@@ -857,6 +1046,12 @@ async fn reducer_loop(
             hide_link_previews: settings.streamer_hide_link_previews,
             hide_viewer_counts: settings.streamer_hide_viewer_counts,
             suppress_sounds: settings.streamer_suppress_sounds,
+        })
+        .await;
+
+    let _ = evt_tx
+        .send(AppEvent::SoundSettingsUpdated {
+            events: settings.sounds.to_pairs(),
         })
         .await;
 
@@ -992,6 +1187,11 @@ async fn reducer_loop(
                         let _ = eventsub_tx
                             .send(EventSubCommand::WatchChannel {
                                 broadcaster_id: room_id.clone(),
+                                can_moderate: channel_mod_status
+                                    .get(&channel)
+                                    .copied()
+                                    .unwrap_or(false)
+                                    || auth_user_id.as_deref() == Some(room_id.as_str()),
                             })
                             .await;
 
@@ -1088,13 +1288,28 @@ async fn reducer_loop(
                             &settings,
                             helix_client_id.as_deref(),
                             Some(&user_id),
+                            &auth_scopes,
+                        )
+                        .await;
+                        sync_live_feed_auth(
+                            &live_feed_tx,
+                            &authed_helix,
+                            &settings,
+                            helix_client_id.as_deref(),
+                            Some(&user_id),
                         )
                         .await;
 
-                        for broadcaster_id in channel_room_ids.values() {
+                        for (channel, broadcaster_id) in &channel_room_ids {
                             let _ = eventsub_tx
                                 .send(EventSubCommand::WatchChannel {
                                     broadcaster_id: broadcaster_id.clone(),
+                                    can_moderate: channel_mod_status
+                                        .get(channel)
+                                        .copied()
+                                        .unwrap_or(false)
+                                        || auth_user_id.as_deref()
+                                            == Some(broadcaster_id.as_str()),
                                 })
                                 .await;
                         }
@@ -1507,6 +1722,17 @@ async fn reducer_loop(
                         }).await;
                     }
                     TwitchEvent::UserStateUpdated { channel, is_mod, mut badges, color } => {
+                        channel_mod_status.insert(channel.clone(), is_mod);
+                        if let Some(broadcaster_id) = channel_room_ids.get(&channel).cloned() {
+                            let _ = eventsub_tx
+                                .send(EventSubCommand::WatchChannel {
+                                    broadcaster_id: broadcaster_id.clone(),
+                                    can_moderate: is_mod
+                                        || auth_user_id.as_deref()
+                                            == Some(broadcaster_id.as_str()),
+                                })
+                                .await;
+                        }
                         // Resolve badge image URLs
                         {
                             let bm = badge_map.read().unwrap();
@@ -2757,6 +2983,7 @@ async fn reducer_loop(
                         }
                         let _ = evt_tx.send(AppEvent::ChannelParted { channel: channel.clone() }).await;
                         if let Some(broadcaster_id) = channel_room_ids.remove(&channel) {
+                            channel_mod_status.remove(&channel);
                             let _ = eventsub_tx
                                 .send(EventSubCommand::UnwatchChannel { broadcaster_id })
                                 .await;
@@ -2824,8 +3051,10 @@ async fn reducer_loop(
                         }
                         auth_username = None;
                         auth_user_id = None;
+                        auth_scopes.clear();
                         whisper_history_loaded_for = None;
                         let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
+                        clear_live_feed_auth(&live_feed_tx, &authed_helix).await;
                         let _ = sess_tx.send(SessionCommand::LogoutAndReconnect).await;
                         let _ = evt_tx.send(AppEvent::LoggedOut).await;
                         // Broadcast updated account list.
@@ -2865,6 +3094,7 @@ async fn reducer_loop(
                             whisper_history_loaded_for = None;
                             let _ = evt_tx.send(AppEvent::LoggedOut).await;
                             let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
+                            clear_live_feed_auth(&live_feed_tx, &authed_helix).await;
                             auth_in_progress = true;
                             let _ = sess_tx.send(SessionCommand::Authenticate {
                                 token,
@@ -2911,18 +3141,22 @@ async fn reducer_loop(
                                 } else {
                                     auth_username = None;
                                     auth_user_id = None;
+                                    auth_scopes.clear();
                                     whisper_history_loaded_for = None;
                                     settings.username = String::new();
                                     let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
+                                    clear_live_feed_auth(&live_feed_tx, &authed_helix).await;
                                     let _ = sess_tx.send(SessionCommand::LogoutAndReconnect).await;
                                     let _ = evt_tx.send(AppEvent::LoggedOut).await;
                                 }
                             } else {
                                 auth_username = None;
                                 auth_user_id = None;
+                                auth_scopes.clear();
                                 whisper_history_loaded_for = None;
                                 settings.username = String::new();
                                 let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
+                                clear_live_feed_auth(&live_feed_tx, &authed_helix).await;
                                 let _ = sess_tx.send(SessionCommand::LogoutAndReconnect).await;
                                 let _ = evt_tx.send(AppEvent::LoggedOut).await;
                             }
@@ -3103,6 +3337,35 @@ async fn reducer_loop(
                                 warn!("Failed to save last active channel: {e}");
                             }
                         }
+                    }
+                    AppCommand::SetTabVisibilityRule { channel, rule } => {
+                        use crust_core::state::TabVisibilityRule;
+                        let key = channel.as_str().to_owned();
+                        match rule {
+                            TabVisibilityRule::Always => {
+                                settings.tab_visibility_rules.remove(&key);
+                            }
+                            other => {
+                                settings
+                                    .tab_visibility_rules
+                                    .insert(key, other.as_key().to_owned());
+                            }
+                        }
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save tab visibility rules: {e}");
+                            }
+                        }
+                        let rules: Vec<(ChannelId, TabVisibilityRule)> = settings
+                            .tab_visibility_rules
+                            .iter()
+                            .map(|(id, key)| {
+                                (ChannelId(id.clone()), TabVisibilityRule::from_key(key))
+                            })
+                            .collect();
+                        let _ = evt_tx
+                            .send(AppEvent::TabVisibilityRulesUpdated { rules })
+                            .await;
                     }
                     AppCommand::SetChatUiBehavior {
                         prevent_overlong_twitch_messages,
@@ -3312,6 +3575,79 @@ async fn reducer_loop(
                             })
                             .await;
                     }
+                    AppCommand::AddWordToDictionary { word } => {
+                        let mut words = settings.custom_spell_dict.clone();
+                        words.push(word);
+                        let sanitized =
+                            crust_storage::settings::sanitize_custom_spell_dict(&words);
+                        if sanitized != settings.custom_spell_dict {
+                            settings.custom_spell_dict = sanitized.clone();
+                            if let Some(store) = &settings_store {
+                                if let Err(e) = store.save(&settings) {
+                                    warn!("Failed to save custom spell dictionary: {e}");
+                                }
+                            }
+                            let _ = evt_tx
+                                .send(AppEvent::SpellDictionaryUpdated {
+                                    enabled: settings.spellcheck_enabled,
+                                    words: sanitized,
+                                })
+                                .await;
+                        }
+                    }
+                    AppCommand::RemoveWordFromDictionary { word } => {
+                        let target = word.trim().to_ascii_lowercase();
+                        if !target.is_empty()
+                            && settings.custom_spell_dict.iter().any(|w| w == &target)
+                        {
+                            settings.custom_spell_dict.retain(|w| w != &target);
+                            if let Some(store) = &settings_store {
+                                if let Err(e) = store.save(&settings) {
+                                    warn!("Failed to save custom spell dictionary: {e}");
+                                }
+                            }
+                            let _ = evt_tx
+                                .send(AppEvent::SpellDictionaryUpdated {
+                                    enabled: settings.spellcheck_enabled,
+                                    words: settings.custom_spell_dict.clone(),
+                                })
+                                .await;
+                        }
+                    }
+                    AppCommand::SetCustomSpellDictionary { words } => {
+                        let sanitized =
+                            crust_storage::settings::sanitize_custom_spell_dict(&words);
+                        if sanitized != settings.custom_spell_dict {
+                            settings.custom_spell_dict = sanitized.clone();
+                            if let Some(store) = &settings_store {
+                                if let Err(e) = store.save(&settings) {
+                                    warn!("Failed to save custom spell dictionary: {e}");
+                                }
+                            }
+                            let _ = evt_tx
+                                .send(AppEvent::SpellDictionaryUpdated {
+                                    enabled: settings.spellcheck_enabled,
+                                    words: sanitized,
+                                })
+                                .await;
+                        }
+                    }
+                    AppCommand::SetSpellcheckEnabled { enabled } => {
+                        if settings.spellcheck_enabled != enabled {
+                            settings.spellcheck_enabled = enabled;
+                            if let Some(store) = &settings_store {
+                                if let Err(e) = store.save(&settings) {
+                                    warn!("Failed to save spellcheck toggle: {e}");
+                                }
+                            }
+                            let _ = evt_tx
+                                .send(AppEvent::SpellDictionaryUpdated {
+                                    enabled,
+                                    words: settings.custom_spell_dict.clone(),
+                                })
+                                .await;
+                        }
+                    }
                     AppCommand::SetAppearanceSettings {
                         channel_layout,
                         sidebar_visible,
@@ -3436,6 +3772,37 @@ async fn reducer_loop(
                         }
                         let _ = evt_tx
                             .send(AppEvent::IgnoredPhrasesUpdated { phrases })
+                            .await;
+                    }
+                    AppCommand::SetCommandAliases { aliases } => {
+                        settings.command_aliases = aliases.clone();
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save command aliases: {e}");
+                            }
+                        }
+                        let _ = evt_tx
+                            .send(AppEvent::CommandAliasesUpdated { aliases })
+                            .await;
+                    }
+                    AppCommand::SetHotkeyBindings { bindings } => {
+                        settings.hotkey_bindings = bindings
+                            .iter()
+                            .cloned()
+                            .collect::<std::collections::BTreeMap<_, _>>();
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save hotkey bindings: {e}");
+                            }
+                        }
+                        // Re-emit through the defaults-merger so the UI
+                        // never sees a partial set (e.g. after deleting a
+                        // row from settings.toml by hand).
+                        let merged = crust_core::hotkeys::HotkeyBindings::from_pairs(bindings);
+                        let _ = evt_tx
+                            .send(AppEvent::HotkeyBindingsUpdated {
+                                bindings: merged.to_pairs(),
+                            })
                             .await;
                     }
                     AppCommand::SetNotificationSettings {
@@ -3573,6 +3940,21 @@ async fn reducer_loop(
                             })
                             .await;
                         spawn_update_install(update, restart_now, update_install_tx.clone());
+                    }
+                    AppCommand::SetSoundSettings { events } => {
+                        let new_sounds =
+                            crust_core::sound::SoundSettings::from_pairs(events).normalised();
+                        settings.sounds = new_sounds.clone();
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save sound settings: {e}");
+                            }
+                        }
+                        let _ = evt_tx
+                            .send(AppEvent::SoundSettingsUpdated {
+                                events: new_sounds.to_pairs(),
+                            })
+                            .await;
                     }
                     AppCommand::SetStreamerModeSettings {
                         mode,
@@ -4604,6 +4986,105 @@ async fn reducer_loop(
                                 .await;
                         }
                     }
+                    AppCommand::OpenStreamlink { channel } => {
+                        let spawn_res = crust_ui::external::spawn_streamlink(
+                            &channel,
+                            &settings.external_tools.streamlink_path,
+                            &settings.external_tools.streamlink_quality,
+                            &settings.external_tools.streamlink_extra_args,
+                            &settings.external_tools.mpv_path,
+                            &settings.external_tools.streamlink_session_token,
+                        );
+                        match spawn_res {
+                            Ok(child) => {
+                                monitor_external_child(
+                                    child,
+                                    "Streamlink",
+                                    format!("streamlink for {channel}"),
+                                    evt_tx.clone(),
+                                );
+                            }
+                            Err(msg) => {
+                                let _ = evt_tx
+                                    .send(AppEvent::Error {
+                                        context: "Streamlink".into(),
+                                        message: msg,
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                    AppCommand::OpenPlayer { channel } => {
+                        let spawn_res = crust_ui::external::spawn_player(
+                            &channel,
+                            &settings.external_tools.player_template,
+                            &settings.external_tools.streamlink_quality,
+                            &settings.external_tools.mpv_path,
+                            &settings.external_tools.streamlink_path,
+                            &settings.external_tools.streamlink_session_token,
+                        );
+                        match spawn_res {
+                            Ok(child) => {
+                                monitor_external_child(
+                                    child,
+                                    "Player",
+                                    format!("player for {channel}"),
+                                    evt_tx.clone(),
+                                );
+                            }
+                            Err(msg) => {
+                                let _ = evt_tx
+                                    .send(AppEvent::Error {
+                                        context: "Player".into(),
+                                        message: msg,
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                    AppCommand::SetExternalToolsSettings {
+                        streamlink_path,
+                        streamlink_quality,
+                        streamlink_extra_args,
+                        player_template,
+                        mpv_path,
+                        streamlink_session_token,
+                    } => {
+                        settings.external_tools.streamlink_path = streamlink_path.trim().to_owned();
+                        let q = streamlink_quality.trim();
+                        settings.external_tools.streamlink_quality =
+                            if q.is_empty() { "best".to_owned() } else { q.to_owned() };
+                        settings.external_tools.streamlink_extra_args =
+                            streamlink_extra_args.trim().to_owned();
+                        settings.external_tools.player_template = player_template.trim().to_owned();
+                        settings.external_tools.mpv_path = mpv_path.trim().to_owned();
+                        settings.external_tools.streamlink_session_token =
+                            streamlink_session_token.trim().to_owned();
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save external-tools settings: {e}");
+                            }
+                        }
+                        let _ = evt_tx
+                            .send(AppEvent::ExternalToolsSettingsUpdated {
+                                streamlink_path: settings.external_tools.streamlink_path.clone(),
+                                streamlink_quality: settings
+                                    .external_tools
+                                    .streamlink_quality
+                                    .clone(),
+                                streamlink_extra_args: settings
+                                    .external_tools
+                                    .streamlink_extra_args
+                                    .clone(),
+                                player_template: settings.external_tools.player_template.clone(),
+                                mpv_path: settings.external_tools.mpv_path.clone(),
+                                streamlink_session_token: settings
+                                    .external_tools
+                                    .streamlink_session_token
+                                    .clone(),
+                            })
+                            .await;
+                    }
                     AppCommand::SetShieldMode { channel, active } => {
                         let broadcaster_id = channel_room_ids.get(&channel).cloned();
                         let moderator_id = auth_user_id.clone();
@@ -4722,6 +5203,55 @@ async fn reducer_loop(
                             message: msg,
                         }).await;
                     }
+                    AppCommand::UploadImage { channel, bytes, format, source_path } => {
+                        let cfg: UploaderConfig = settings.image_uploader.clone();
+                        let etx = evt_tx.clone();
+                        let ch = channel.clone();
+                        let ch_name = ch.display_name().to_owned();
+                        let log_dir = crust_uploader::default_log_dir();
+                        let _ = etx.send(AppEvent::UploadStarted { channel: ch.clone() }).await;
+                        let _ = etx.send(AppEvent::SystemNotice(crust_core::model::SystemNotice {
+                            channel: Some(ch.clone()),
+                            text: "Uploading image…".to_owned(),
+                            timestamp: Utc::now(),
+                        })).await;
+                        tokio::spawn(async move {
+                            let img = RawImage {
+                                bytes,
+                                format,
+                                path: source_path.as_deref().map(std::path::PathBuf::from),
+                            };
+                            match uploader_upload(&cfg, &img).await {
+                                Ok(resp) => {
+                                    if let Some(dir) = log_dir.as_deref() {
+                                        if let Err(e) = crust_uploader::append_log_entry(
+                                            dir,
+                                            &ch_name,
+                                            &resp.image_url,
+                                            resp.deletion_url.as_deref(),
+                                            img.path.as_deref(),
+                                        ) {
+                                            warn!("uploader: log write failed: {e}");
+                                        }
+                                    }
+                                    let _ = etx
+                                        .send(AppEvent::UploadFinished {
+                                            channel: ch,
+                                            result: Ok(resp.image_url),
+                                        })
+                                        .await;
+                                }
+                                Err(e) => {
+                                    let _ = etx
+                                        .send(AppEvent::UploadFinished {
+                                            channel: ch,
+                                            result: Err(e.to_string()),
+                                        })
+                                        .await;
+                                }
+                            }
+                        });
+                    }
                     AppCommand::ShowUserCard { login, channel } => {
                         let etx = evt_tx.clone();
                         let token = settings.oauth_token.clone();
@@ -4822,7 +5352,27 @@ async fn reducer_loop(
                                 .await;
                         });
                     }
+                    AppCommand::LiveFeedRefresh => {
+                        let _ = live_feed_tx
+                            .send(runtime::live_feed::LiveFeedCommand::ForceRefresh)
+                            .await;
+                    }
                 }
+            }
+
+            Some(e) = live_feed_rx.recv() => {
+                let app_evt = match e {
+                    runtime::live_feed::LiveFeedEvent::Snapshot(s) => {
+                        crust_core::events::AppEvent::LiveFeedUpdated { channels: s }
+                    }
+                    runtime::live_feed::LiveFeedEvent::PartialSnapshot { channels, error } => {
+                        crust_core::events::AppEvent::LiveFeedPartialUpdate { channels, error }
+                    }
+                    runtime::live_feed::LiveFeedEvent::Error(m) => {
+                        crust_core::events::AppEvent::LiveFeedError { message: m }
+                    }
+                };
+                let _ = evt_tx.send(app_evt).await;
             }
 
             Some(update_result) = update_check_rx.recv() => {
@@ -4933,6 +5483,7 @@ async fn reducer_loop(
                         match result {
                             Ok(info) => {
                                 warn_missing_whisper_scope(&evt_tx, &info.scopes).await;
+                                auth_scopes = info.scopes.clone();
                                 let login = info.login;
                                 info!("Saved token valid for user: {login}");
                                 if !info.client_id.is_empty() {
@@ -4949,6 +5500,15 @@ async fn reducer_loop(
                                     &settings,
                                     helix_client_id.as_deref(),
                                     auth_user_id.as_deref(),
+                                    &auth_scopes,
+                                )
+                                .await;
+                                sync_live_feed_auth(
+                                    &live_feed_tx,
+                                    &authed_helix,
+                                    &settings,
+                                    helix_client_id.as_deref(),
+                                    auth_user_id.as_deref(),
                                 )
                                 .await;
                                 // auth_in_progress was already set to true before spawn
@@ -4959,7 +5519,9 @@ async fn reducer_loop(
                             Err(ValidateError::Unauthorized) => {
                                 warn!("Saved token rejected by Twitch, clearing and starting anonymous");
                                 auth_in_progress = false;
+                                auth_scopes.clear();
                                 let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
+                                clear_live_feed_auth(&live_feed_tx, &authed_helix).await;
                                 if let Some(store) = &settings_store {
                                     let _ = store.delete_token();
                                 }
@@ -4968,7 +5530,9 @@ async fn reducer_loop(
                             Err(ValidateError::Transient(e)) => {
                                 warn!("Token validation failed ({e}), keeping token and starting anonymous");
                                 auth_in_progress = false;
+                                auth_scopes.clear();
                                 let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
+                                clear_live_feed_auth(&live_feed_tx, &authed_helix).await;
                                 let _ = evt_tx.send(AppEvent::LoggedOut).await;
                             }
                         }
@@ -4977,6 +5541,7 @@ async fn reducer_loop(
                         match result {
                             Ok(info) => {
                                 warn_missing_whisper_scope(&evt_tx, &info.scopes).await;
+                                auth_scopes = info.scopes.clone();
                                 let login = info.login;
                                 info!("Token valid for user: {login}");
                                 if !info.client_id.is_empty() {
@@ -5001,9 +5566,11 @@ async fn reducer_loop(
                                 if auth_username.is_some() {
                                     auth_username = None;
                                     auth_user_id = None;
+                                    auth_scopes.clear();
                                     let _ = evt_tx.send(AppEvent::LoggedOut).await;
                                 }
                                 let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
+                                clear_live_feed_auth(&live_feed_tx, &authed_helix).await;
                                 auth_in_progress = true;
                                 let _ = sess_tx.send(SessionCommand::Authenticate {
                                     token,
@@ -5030,6 +5597,7 @@ async fn reducer_loop(
                         match result {
                             Ok(info) => {
                                 warn_missing_whisper_scope(&evt_tx, &info.scopes).await;
+                                auth_scopes = info.scopes.clone();
                                 let login = info.login;
                                 info!("AddAccount: token valid for {login}");
                                 if !info.client_id.is_empty() {
@@ -5054,9 +5622,11 @@ async fn reducer_loop(
                                 if auth_username.is_some() {
                                     auth_username = None;
                                     auth_user_id = None;
+                                    auth_scopes.clear();
                                     let _ = evt_tx.send(AppEvent::LoggedOut).await;
                                 }
                                 let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
+                                clear_live_feed_auth(&live_feed_tx, &authed_helix).await;
                                 auth_in_progress = true;
                                 let _ = sess_tx.send(SessionCommand::Authenticate {
                                     token,
@@ -5083,6 +5653,7 @@ async fn reducer_loop(
                         match result {
                             Ok(info) => {
                                 warn_missing_whisper_scope(&evt_tx, &info.scopes).await;
+                                auth_scopes = info.scopes.clone();
                                 let login = info.login;
                                 let client_id = info.client_id;
 
@@ -5121,6 +5692,7 @@ async fn reducer_loop(
                                 }
                             }
                             Err(ValidateError::Unauthorized) => {
+                                auth_scopes.clear();
                                 let _ = evt_tx.send(AppEvent::AuthExpired).await;
                             }
                             Err(ValidateError::Transient(e)) => {
@@ -5143,6 +5715,7 @@ async fn sync_eventsub_auth(
     settings: &AppSettings,
     helix_client_id: Option<&str>,
     auth_user_id: Option<&str>,
+    auth_scopes: &[String],
 ) {
     let token = settings.oauth_token.trim();
     let cid = helix_client_id.unwrap_or("").trim();
@@ -5157,6 +5730,45 @@ async fn sync_eventsub_auth(
         .send(EventSubCommand::SetAuth {
             token: token.to_owned(),
             client_id: cid.to_owned(),
+            user_id: uid.to_owned(),
+            scopes: auth_scopes.to_vec(),
+        })
+        .await;
+}
+
+async fn clear_live_feed_auth(
+    live_feed_tx: &mpsc::Sender<runtime::live_feed::LiveFeedCommand>,
+    authed_helix: &std::sync::Arc<crust_twitch::helix::AuthedHelix>,
+) {
+    // Tell the task to idle before withdrawing credentials (see
+    // sync_live_feed_auth for the ordering rationale).
+    let _ = live_feed_tx
+        .send(runtime::live_feed::LiveFeedCommand::ClearAuth)
+        .await;
+    authed_helix.clear_auth().await;
+}
+
+async fn sync_live_feed_auth(
+    live_feed_tx: &mpsc::Sender<runtime::live_feed::LiveFeedCommand>,
+    authed_helix: &std::sync::Arc<crust_twitch::helix::AuthedHelix>,
+    settings: &AppSettings,
+    helix_client_id: Option<&str>,
+    auth_user_id: Option<&str>,
+) {
+    let token = settings.oauth_token.trim();
+    let cid = helix_client_id.unwrap_or("").trim();
+    let uid = auth_user_id.unwrap_or("").trim();
+
+    if token.is_empty() || cid.is_empty() || uid.is_empty() {
+        clear_live_feed_auth(live_feed_tx, authed_helix).await;
+        return;
+    }
+
+    authed_helix
+        .set_auth(token.to_owned(), cid.to_owned())
+        .await;
+    let _ = live_feed_tx
+        .send(runtime::live_feed::LiveFeedCommand::SetAuth {
             user_id: uid.to_owned(),
         })
         .await;
@@ -8253,8 +8865,7 @@ fn open_url_in_browser(url: &str) {
 }
 
 fn logs_folder_path() -> Option<std::path::PathBuf> {
-    directories::ProjectDirs::from("dev", "crust", "crust")
-        .map(|dirs| dirs.data_dir().join("logs"))
+    directories::ProjectDirs::from("dev", "crust", "crust").map(|dirs| dirs.data_dir().join("logs"))
 }
 
 fn open_path_in_file_manager(path: &std::path::Path) {

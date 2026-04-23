@@ -30,6 +30,20 @@ pub struct ChannelId(pub String);
 
 pub const IRC_SERVER_CONTROL_CHANNEL: &str = "__server__";
 
+/// Reserved `ChannelId` for the aggregated "Live" pseudo-tab.
+///
+/// Twitch logins cannot start with `_`, and the sentinel survives
+/// `ChannelId::new` (lowercase + strip leading `#`) unchanged, so it cannot
+/// collide with a real channel.
+pub const LIVE_FEED_CHANNEL: &str = "__live_feed__";
+
+/// Reserved `ChannelId` for the cross-channel "Mentions" pseudo-tab.
+///
+/// Same rationale as [`LIVE_FEED_CHANNEL`]: leading `_` means it cannot
+/// collide with any real Twitch login, and it round-trips through
+/// `ChannelId::new` unchanged.
+pub const MENTIONS_CHANNEL: &str = "__mentions__";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IrcTarget {
     pub host: String,
@@ -233,6 +247,9 @@ impl ChannelId {
         if !(3..=25).contains(&len) {
             return false;
         }
+        if login.starts_with('_') {
+            return false;
+        }
         login
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
@@ -255,6 +272,33 @@ impl ChannelId {
             .map(|t| t.channel == IRC_SERVER_CONTROL_CHANNEL)
             .unwrap_or(false)
     }
+
+    /// Sentinel ChannelId for the Live feed pseudo-tab.
+    pub fn live_feed() -> Self {
+        Self(LIVE_FEED_CHANNEL.to_owned())
+    }
+
+    /// True iff this id is the Live feed sentinel.
+    pub fn is_live_feed(&self) -> bool {
+        self.0 == LIVE_FEED_CHANNEL
+    }
+
+    /// Sentinel ChannelId for the cross-channel Mentions pseudo-tab.
+    pub fn mentions() -> Self {
+        Self(MENTIONS_CHANNEL.to_owned())
+    }
+
+    /// True iff this id is the Mentions sentinel.
+    pub fn is_mentions(&self) -> bool {
+        self.0 == MENTIONS_CHANNEL
+    }
+
+    /// True iff this id is any of the synthetic pseudo-tabs (Live / Mentions).
+    /// Useful for code paths that need to skip real-channel logic (joins,
+    /// persistence, chat input, etc.) for all virtual tabs at once.
+    pub fn is_virtual(&self) -> bool {
+        self.is_live_feed() || self.is_mentions()
+    }
 }
 
 impl std::fmt::Display for ChannelId {
@@ -270,3 +314,60 @@ pub struct UserId(pub String);
 /// Local monotonic message id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MessageId(pub u64);
+
+#[cfg(test)]
+mod live_feed_sentinel_tests {
+    use super::*;
+
+    #[test]
+    fn sentinel_constant_value() {
+        assert_eq!(LIVE_FEED_CHANNEL, "__live_feed__");
+    }
+
+    #[test]
+    fn sentinel_id_round_trips_through_new() {
+        // ChannelId::new lowercases + strips '#'. The sentinel survives both.
+        let id = ChannelId::new(LIVE_FEED_CHANNEL);
+        assert_eq!(id.0, LIVE_FEED_CHANNEL);
+    }
+
+    #[test]
+    fn live_feed_id_helper_returns_sentinel() {
+        assert_eq!(ChannelId::live_feed().0, LIVE_FEED_CHANNEL);
+    }
+
+    #[test]
+    fn is_live_feed_true_only_for_sentinel() {
+        assert!(ChannelId::live_feed().is_live_feed());
+        assert!(!ChannelId::new("forsen").is_live_feed());
+        assert!(!ChannelId::new("__server__").is_live_feed());
+    }
+
+    #[test]
+    fn live_feed_sentinel_is_not_a_valid_twitch_login() {
+        assert!(ChannelId::is_valid_twitch_login("forsen"));
+        assert!(!ChannelId::is_valid_twitch_login(LIVE_FEED_CHANNEL));
+        assert_eq!(ChannelId::parse_user_input(LIVE_FEED_CHANNEL), None);
+    }
+
+    #[test]
+    fn mentions_sentinel_round_trips_and_is_distinct_from_live_feed() {
+        let m = ChannelId::mentions();
+        assert_eq!(m.0, MENTIONS_CHANNEL);
+        assert!(m.is_mentions());
+        assert!(!m.is_live_feed());
+        assert!(m.is_virtual());
+        // Leading `_` blocks it from ever being parsed as a real login.
+        assert!(!ChannelId::is_valid_twitch_login(MENTIONS_CHANNEL));
+        assert_eq!(ChannelId::parse_user_input(MENTIONS_CHANNEL), None);
+        // And survives the same normalisation path as `new()`.
+        assert_eq!(ChannelId::new(MENTIONS_CHANNEL).0, MENTIONS_CHANNEL);
+    }
+
+    #[test]
+    fn mentions_and_live_feed_sentinels_do_not_collide() {
+        assert_ne!(ChannelId::mentions(), ChannelId::live_feed());
+        assert!(!ChannelId::mentions().is_live_feed());
+        assert!(!ChannelId::live_feed().is_mentions());
+    }
+}

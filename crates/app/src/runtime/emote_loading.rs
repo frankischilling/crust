@@ -117,7 +117,7 @@ pub(crate) async fn load_channel_emotes(
 
     let total = b.len() + f.len() + s.len();
     if total == 0 {
-        warn!("No channel emotes found for #{channel_name}");
+        info!("No channel emotes found for #{channel_name}");
         let _ = evt_tx
             .send(AppEvent::ChannelEmotesLoaded {
                 channel: ChannelId::new(channel_name),

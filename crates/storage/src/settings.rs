@@ -1,13 +1,47 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock, RwLock};
 
+use crust_core::commands::CommandAlias;
 use crust_core::highlight::HighlightRule;
+use crust_core::hotkeys::KeyBinding;
 use crust_core::model::ModActionPreset;
+use crust_uploader::UploaderConfig;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 
 use crate::StorageError;
+
+/// Callback invoked right after [`SettingsStore::save`] successfully
+/// writes the settings file. Used by the app-side crash handler to
+/// keep its snapshot current without wrapping every call site.
+pub type SettingsPersistHook = Arc<dyn Fn(&AppSettings) + Send + Sync>;
+
+static PERSIST_HOOK: OnceLock<RwLock<Option<SettingsPersistHook>>> = OnceLock::new();
+
+/// Install a global on-save hook.  Replaces any previously installed
+/// hook.  Pass `None` to clear.
+///
+/// Thread-safe and cheap; the hook is stored behind an `Arc` so
+/// invocation from [`SettingsStore::save`] doesn't have to clone the
+/// closure.
+pub fn set_persist_hook(hook: Option<SettingsPersistHook>) {
+    let slot = PERSIST_HOOK.get_or_init(|| RwLock::new(None));
+    if let Ok(mut g) = slot.write() {
+        *g = hook;
+    }
+}
+
+fn invoke_persist_hook(settings: &AppSettings) {
+    if let Some(lock) = PERSIST_HOOK.get() {
+        if let Ok(g) = lock.read() {
+            if let Some(hook) = g.as_ref() {
+                hook(settings);
+            }
+        }
+    }
+}
 
 // AccountEntry: one saved Twitch account
 
@@ -18,6 +52,56 @@ pub struct AccountEntry {
     /// OAuth token stored as fallback when the OS keyring is unavailable.
     #[serde(default)]
     pub oauth_token: String,
+}
+
+// ExternalToolsConfig: Streamlink + custom-player integration
+
+/// Config for external tool launches (Streamlink, custom player) from the
+/// channel context menu. Mirrors Chatterino's ExternalToolsPage fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExternalToolsConfig {
+    /// Absolute path to the `streamlink`/`streamlink.exe` binary.  Empty =
+    /// rely on `streamlink` being on `PATH`.
+    pub streamlink_path: String,
+    /// Preferred Streamlink quality token (`best`, `720p60`, ...).
+    pub streamlink_quality: String,
+    /// Extra CLI arguments prepended to the Streamlink invocation.
+    pub streamlink_extra_args: String,
+    /// Command template used by "Open in player".  Variables: `{channel}`,
+    /// `{url}`, `{quality}`, `{mpv}`.  Parsed with shell-style quoting.
+    /// `{mpv}` expands to `mpv_path` (or the literal `mpv` when unset, relying
+    /// on `PATH`)lets users point at a non-standard mpv install without
+    /// rewriting the whole command.
+    pub player_template: String,
+    /// Absolute path to the `mpv` binary (e.g.
+    /// `C:/Program Files/mpv/mpv.exe`, `/usr/bin/mpv`, `/opt/mpv/mpv`).
+    /// Empty = rely on `mpv` being on `PATH`.
+    pub mpv_path: String,
+    /// Optional Twitch session token (the `auth-token` cookie value from
+    /// twitch.tv in the browserDevTools → Application → Cookies → the
+    /// `auth-token` row).  When non-empty, Streamlink is launched with
+    /// `--twitch-api-header "Authorization=OAuth <token>"` so Turbo / sub
+    /// ad-skip applies and Twitch's HLS edge serves the authenticated
+    /// playlist.  The chat-IRC OAuth token does not work hereit's a
+    /// different scope and Twitch rejects it as `Unauthorized`.
+    pub streamlink_session_token: String,
+}
+
+impl Default for ExternalToolsConfig {
+    fn default() -> Self {
+        Self {
+            streamlink_path: String::new(),
+            streamlink_quality: "best".to_owned(),
+            streamlink_extra_args: String::new(),
+            // Default: pipe Streamlink into mpv.  `{streamlink}` / `{mpv}`
+            // expand from the configured paths so users can point at
+            // non-standard installs without rewriting the command.
+            player_template: "{streamlink} --player {mpv} twitch.tv/{channel} {quality}".to_owned(),
+            mpv_path: String::new(),
+            streamlink_session_token: String::new(),
+        }
+    }
 }
 
 // AppSettings: user configuration structure
@@ -214,6 +298,48 @@ pub struct AppSettings {
     /// Suppress sound notifications while streamer mode is active.
     #[serde(default = "bool_true")]
     pub streamer_suppress_sounds: bool,
+    // -- Sound events -------------------------------------------------------
+    /// Per-event audio ping configuration (mention / whisper / sub / raid /
+    /// custom highlight).  Stored under `[sounds]` in `settings.toml`.
+    #[serde(default)]
+    pub sounds: crust_core::sound::SoundSettings,
+    // -- Image uploader ----------------------------------------------------
+    /// Endpoint + JSON-path config for clipboard / drag-drop image uploads.
+    #[serde(default)]
+    pub image_uploader: UploaderConfig,
+    // -- External tools (Streamlink / custom player) -----------------------
+    /// Streamlink path, quality, extra args, and player template.
+    #[serde(default)]
+    pub external_tools: ExternalToolsConfig,
+    // -- Per-tab visibility rules ------------------------------------------
+    /// Per-channel tab visibility rules, keyed by the serialised
+    /// `ChannelId` string and mapped to a `TabVisibilityRule` key
+    /// (`always`, `hide_when_offline`). Mirrors Chatterino's per-tab
+    /// "hide when offline" / "hide muted" options.
+    #[serde(default)]
+    pub tab_visibility_rules: BTreeMap<String, String>,
+    // -- Custom command aliases -------------------------------------------
+    /// User-defined slash-command aliases. Each entry maps a trigger like
+    /// `hello` to an expansion body such as `/me says hi {1} {2+}`. See
+    /// `crust_core::commands::alias` for the variable grammar.
+    #[serde(default)]
+    pub command_aliases: Vec<CommandAlias>,
+    /// Customizable hotkey bindings keyed by
+    /// `HotkeyAction::as_key()` (e.g. `"open_quick_switcher"`).
+    /// Missing entries fall back to `HotkeyBindings::defaults()` so
+    /// upgrading the app doesn't wipe out bindings when new actions land.
+    #[serde(default)]
+    pub hotkey_bindings: BTreeMap<String, KeyBinding>,
+    // -- Spell check -------------------------------------------------------
+    /// Whether to underline misspelled words in the chat input and show
+    /// right-click suggestions. Mirrors Chatterino's input spellcheck toggle.
+    #[serde(default = "bool_true")]
+    pub spellcheck_enabled: bool,
+    /// User-managed custom dictionary - words added via the chat input's
+    /// right-click "Add to dictionary" are persisted here so they survive
+    /// relaunches. Stored lower-case, alphabetic only.
+    #[serde(default)]
+    pub custom_spell_dict: Vec<String>,
 }
 
 fn default_theme() -> String {
@@ -318,6 +444,14 @@ impl Default for AppSettings {
             streamer_hide_link_previews: true,
             streamer_hide_viewer_counts: true,
             streamer_suppress_sounds: true,
+            sounds: crust_core::sound::SoundSettings::with_defaults(),
+            image_uploader: UploaderConfig::default(),
+            external_tools: ExternalToolsConfig::default(),
+            tab_visibility_rules: BTreeMap::new(),
+            command_aliases: Vec::new(),
+            hotkey_bindings: BTreeMap::new(),
+            spellcheck_enabled: true,
+            custom_spell_dict: Vec::new(),
         }
     }
 }
@@ -333,6 +467,28 @@ fn account_keyring_key(username: &str) -> String {
 
 pub struct SettingsStore {
     config_path: PathBuf,
+}
+
+/// Normalise a custom spellcheck dictionary: trim, lowercase, drop anything
+/// non-alphabetic or longer than 64 chars, dedupe, and sort alphabetically.
+/// Capped at 10 000 entries to avoid runaway growth from pasted wordlists.
+pub fn sanitize_custom_spell_dict(words: &[String]) -> Vec<String> {
+    const MAX_WORDS: usize = 10_000;
+    let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for raw in words {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.len() > 64 {
+            continue;
+        }
+        if !trimmed.chars().all(|c| c.is_ascii_alphabetic()) {
+            continue;
+        }
+        set.insert(trimmed.to_ascii_lowercase());
+        if set.len() >= MAX_WORDS {
+            break;
+        }
+    }
+    set.into_iter().collect()
 }
 
 fn remove_account_from_settings(settings: &mut AppSettings, username: &str) {
@@ -434,6 +590,11 @@ impl SettingsStore {
                         .map(|login| crust_core::ignores::IgnoredUser::new(login.trim()))
                         .collect();
                 }
+                cfg.custom_spell_dict = sanitize_custom_spell_dict(&cfg.custom_spell_dict);
+                // Normalise sound settings: clamp volumes, trim paths, and
+                // back-fill any missing event keys so configs predating a
+                // new event type get sane defaults without a migration.
+                cfg.sounds = cfg.sounds.normalised();
                 cfg
             }
             Err(_) => AppSettings::default(),
@@ -444,10 +605,14 @@ impl SettingsStore {
         let s = toml::to_string_pretty(settings).map_err(|e| StorageError::Serde(e.to_string()))?;
         std::fs::write(&self.config_path, s)?;
         info!("Settings saved to {:?}", self.config_path);
+        // Notify the persist hook (e.g. crash handler snapshot) so it
+        // always reflects the latest on-disk state.  Any panic in the
+        // hook is irrelevant here because we've already persisted.
+        invoke_persist_hook(settings);
         Ok(())
     }
 
-    // --- Per-account token management ---
+    // Per-account token management
 
     /// Best-effort: write the token for `username` to the per-account keyring
     /// slot only - does NOT touch the settings file.  Use this after
@@ -522,7 +687,7 @@ impl SettingsStore {
         self.save(&settings)
     }
 
-    // --- Legacy single-account token management (kept for backward compatibility) ---
+    // Legacy single-account token management (kept for backward compatibility)
 
     // Token / keyring management
 
@@ -580,8 +745,50 @@ impl SettingsStore {
 #[cfg(test)]
 mod tests {
     use super::remove_account_from_settings;
+    use super::sanitize_custom_spell_dict;
     use super::AccountEntry;
     use super::AppSettings;
+
+    #[test]
+    fn sanitize_custom_spell_dict_drops_invalid_entries() {
+        let words: Vec<String> = [
+            "Kappa",          // normalised to lowercase
+            "kappa",          // duplicate
+            "  OMEGALUL  ",   // trimmed
+            "hello123",       // non-alpha
+            "",               // empty
+            "with space",     // non-alpha
+            "a".repeat(65).as_str(), // too long
+            "NotReal",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let got = sanitize_custom_spell_dict(&words);
+        assert_eq!(got, vec!["kappa", "notreal", "omegalul"]);
+    }
+
+    #[test]
+    fn spellcheck_defaults_enabled_with_empty_custom_dict() {
+        let cfg = AppSettings::default();
+        assert!(cfg.spellcheck_enabled);
+        assert!(cfg.custom_spell_dict.is_empty());
+    }
+
+    #[test]
+    fn spellcheck_settings_round_trip_from_toml() {
+        let cfg: AppSettings = toml::from_str(
+            r#"
+spellcheck_enabled = false
+custom_spell_dict = ["poggers", "Kappa", "bad word"]
+"#,
+        )
+        .expect("spellcheck config should parse");
+        assert!(!cfg.spellcheck_enabled);
+        // Raw deserialisation preserves the list as-given; the SettingsStore
+        // `load()` path is where `sanitize_custom_spell_dict` is applied.
+        assert_eq!(cfg.custom_spell_dict.len(), 3);
+    }
 
     #[test]
     fn legacy_configs_pick_up_new_appearance_defaults() {
@@ -697,6 +904,48 @@ font_size = 13.0
 
         assert_eq!(cfg.username, "beta");
         assert_eq!(cfg.oauth_token, "tok-b");
+    }
+
+    #[test]
+    fn external_tools_round_trip_from_toml() {
+        let cfg: AppSettings = toml::from_str(
+            r#"
+[external_tools]
+streamlink_path = "/usr/local/bin"
+streamlink_quality = "720p60"
+streamlink_extra_args = "--twitch-disable-ads"
+player_template = "{mpv} https://twitch.tv/{channel}"
+mpv_path = "/opt/mpv/mpv"
+"#,
+        )
+        .expect("external_tools config should parse");
+
+        assert_eq!(cfg.external_tools.streamlink_path, "/usr/local/bin");
+        assert_eq!(cfg.external_tools.streamlink_quality, "720p60");
+        assert_eq!(
+            cfg.external_tools.streamlink_extra_args,
+            "--twitch-disable-ads"
+        );
+        assert_eq!(
+            cfg.external_tools.player_template,
+            "{mpv} https://twitch.tv/{channel}"
+        );
+        assert_eq!(cfg.external_tools.mpv_path, "/opt/mpv/mpv");
+    }
+
+    #[test]
+    fn external_tools_defaults_when_missing() {
+        let cfg: AppSettings = toml::from_str(r#"theme = "dark""#)
+            .expect("legacy config should parse without external_tools");
+        assert!(cfg.external_tools.streamlink_path.is_empty());
+        assert_eq!(cfg.external_tools.streamlink_quality, "best");
+        assert!(cfg.external_tools.streamlink_extra_args.is_empty());
+        assert!(cfg
+            .external_tools
+            .player_template
+            .contains("{streamlink} --player {mpv}"));
+        assert!(cfg.external_tools.mpv_path.is_empty());
+        assert!(cfg.external_tools.streamlink_session_token.is_empty());
     }
 
     #[test]
