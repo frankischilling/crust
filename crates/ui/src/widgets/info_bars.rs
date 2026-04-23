@@ -30,6 +30,11 @@ pub fn show_channel_info_bars(
     // Shows live/offline status, viewer count and stream title for the
     // currently active channel. Hidden when no channel is active.
     if let Some(active_ch) = state.active_channel.as_ref() {
+        // The Live-feed pseudo-tab has its own header inside the widget;
+        // the normal channel info bar does not apply.
+        if active_ch.is_live_feed() {
+            return;
+        }
         if !active_ch.is_twitch() {
             TopBottomPanel::top("stream_info_bar")
                 .frame(
@@ -417,7 +422,12 @@ fn room_state_pill(ui: &mut egui::Ui, text: &str, color: Color32) {
         .corner_radius(t::RADIUS_SM)
         .inner_margin(egui::Margin::symmetric(5, 0))
         .show(ui, |ui| {
-            ui.label(RichText::new(text).font(t::pills_font()).color(color).strong());
+            ui.label(
+                RichText::new(text)
+                    .font(t::pills_font())
+                    .color(color)
+                    .strong(),
+            );
         });
 }
 

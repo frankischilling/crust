@@ -172,7 +172,7 @@ impl LoginDialog {
                     }
 
                     ui.label(
-                        RichText::new("Get a token at twitchtokengenerator.com  (chat:edit + chat:read; for whispers add user:manage:whispers; for polls/points also add channel:manage:polls and channel:manage:redemptions)")
+                        RichText::new("Get a token at twitchtokengenerator.com  (chat:edit + chat:read; for the Live feed add user:read:follows; for whispers add user:manage:whispers; for polls/points also add channel:manage:polls and channel:manage:redemptions)")
                             .font(t::small())
                             .color(t::text_muted()),
                     );

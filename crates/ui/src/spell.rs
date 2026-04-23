@@ -7,9 +7,7 @@
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 
-// ---------------------------------------------------------------------------
 // Dictionary
-// ---------------------------------------------------------------------------
 
 /// Base dictionary loaded once from the embedded word list.
 static BASE_DICT: OnceLock<HashSet<String>> = OnceLock::new();
@@ -51,9 +49,7 @@ fn in_dictionary(word: &str) -> bool {
     false
 }
 
-// ---------------------------------------------------------------------------
 // Public API
-// ---------------------------------------------------------------------------
 
 /// A word is "correct" if it is in the dictionary **or** is exempt from
 /// checking (very short, contains digits, looks like a URL / mention / emote).
@@ -126,9 +122,7 @@ pub fn suggest(word: &str, max: usize) -> Vec<String> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
 
 /// Levenshtein edit-distance between two ASCII-lowercase strings.
 fn levenshtein(a: &str, b: &str) -> usize {

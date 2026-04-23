@@ -10,7 +10,7 @@ use crate::theme as t;
 
 use super::chrome;
 
-// --- Public action returned from show() --------------------------------------
+// Public action returned from show()
 
 /// Action emitted by the popup when a moderation button is pressed.
 #[derive(Debug, Clone)]
@@ -82,7 +82,7 @@ pub enum PopupAction {
     },
 }
 
-// --- Tab state ----------------------------------------------------------------
+// Tab state
 
 #[derive(Default, PartialEq, Eq, Clone, Copy)]
 enum ProfileTab {
@@ -94,7 +94,7 @@ enum ProfileTab {
     IvrLogs,
 }
 
-// --- Struct -------------------------------------------------------------------
+// Struct
 
 /// Floating popup showing a Twitch user's profile.  Open it by calling
 /// [`UserProfilePopup::set_loading`]; it stays open until the user closes it.
@@ -213,10 +213,7 @@ impl UserProfilePopup {
         if profile.pronouns.is_none() {
             let key = profile.login.to_ascii_lowercase();
             if let Some(pending) = self.pending_pronouns.remove(&key) {
-                tracing::info!(
-                    "popup: merging pending pronouns for {key} -> {:?}",
-                    pending
-                );
+                tracing::info!("popup: merging pending pronouns for {key} -> {:?}", pending);
                 profile.pronouns = pending;
             } else {
                 tracing::info!(
@@ -256,14 +253,11 @@ impl UserProfilePopup {
                 self.pending_pronouns.insert(key, pronouns);
             }
             None => {
-                tracing::info!(
-                    "popup: set_pronouns stashed for {key} (no profile loaded yet)"
-                );
+                tracing::info!("popup: set_pronouns stashed for {key} (no profile loaded yet)");
                 self.pending_pronouns.insert(key, pronouns);
             }
         }
     }
-
 
     /// Called when a profile request completes without data.
     pub fn set_unavailable(&mut self, login: &str) {
@@ -1462,7 +1456,7 @@ impl UserProfilePopup {
     }
 }
 
-// --- Helpers -----------------------------------------------------------------
+// Helpers
 
 /// Format an IVR timestamp ("2026-03-05T09:35:03.061Z") to "YYYY-MM-DD HH:MM".
 fn fmt_ivr_timestamp(ts: &str) -> String {

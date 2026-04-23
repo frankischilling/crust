@@ -22,7 +22,10 @@ pub enum SettingsSection {
     Filters,
     Nicknames,
     Ignores,
+    Commands,
     Channels,
+    Hotkeys,
+    Notifications,
     StreamerMode,
     Integrations,
 }
@@ -42,7 +45,10 @@ impl SettingsSection {
             Self::Filters => "Filters",
             Self::Nicknames => "Nicknames",
             Self::Ignores => "Ignores",
+            Self::Commands => "Commands",
             Self::Channels => "Channels",
+            Self::Hotkeys => "Hotkeys",
+            Self::Notifications => "Notifications",
             Self::StreamerMode => "Streamer mode",
             Self::Integrations => "Integrations",
         }
@@ -56,7 +62,10 @@ impl SettingsSection {
             Self::Filters => "Message filtering and moderation",
             Self::Nicknames => "Custom display names for other users",
             Self::Ignores => "Blocked users and phrase filters",
+            Self::Commands => "Custom slash-command aliases with variable expansion",
             Self::Channels => "Auto-join channel management",
+            Self::Hotkeys => "Rebindable keyboard shortcuts",
+            Self::Notifications => "Desktop notifications and per-event sounds",
             Self::StreamerMode => "Hide sensitive info while broadcasting",
             Self::Integrations => "Plugins, Kick/IRC beta, and NickServ",
         }
@@ -124,6 +133,14 @@ pub struct SettingsPageState {
     pub ignored_users: Vec<crust_core::ignores::IgnoredUser>,
     /// Editable ignored-phrase entries (mirrors AppSettings.ignored_phrases).
     pub ignored_phrases: Vec<crust_core::ignores::IgnoredPhrase>,
+    /// Editable custom command aliases (mirrors AppSettings.command_aliases).
+    pub command_aliases: Vec<crust_core::commands::CommandAlias>,
+    /// Editable hotkey bindings (mirrors AppSettings.hotkey_bindings, merged with defaults).
+    pub hotkey_bindings: crust_core::HotkeyBindings,
+    /// Action currently awaiting key capture. `None` when no row is in
+    /// capture mode. The renderer polls egui input events to assign the
+    /// next key press to this action.
+    pub hotkey_capture_target: Option<crust_core::HotkeyAction>,
     /// Opt-in fetch of pronouns from alejo.io on user profile popup.
     pub show_pronouns_in_usercard: bool,
     pub plugin_statuses: Vec<PluginStatus>,
@@ -165,6 +182,593 @@ pub struct SettingsPageState {
     pub streamer_suppress_sounds: bool,
     /// True iff broadcasting software detection currently considers it active.
     pub streamer_mode_active: bool,
+    /// Streamlink binary path (empty = rely on PATH).
+    pub external_streamlink_path: String,
+    /// Preferred Streamlink quality token.
+    pub external_streamlink_quality: String,
+    /// Extra CLI args prepended to every Streamlink invocation.
+    pub external_streamlink_extra_args: String,
+    /// Command template for "Open in player".
+    pub external_player_template: String,
+    /// Path to the `mpv` binary (empty = rely on PATH).
+    pub external_mpv_path: String,
+    /// Twitch session `auth-token` cookie value (optional).
+    pub external_streamlink_session_token: String,
+    /// Per-event sound notification configuration (mention / whisper /
+    /// sub / raid / custom highlight). Edits sync back to the runtime via
+    /// [`crust_core::events::AppCommand::SetSoundSettings`].
+    pub sound_events: crust_core::sound::SoundSettings,
+    /// Preview request set by the settings page: each key maps to a
+    /// single-shot `true` after the user clicks "Preview" on that row.
+    /// The app reads this in the same frame and routes the request to the
+    /// [`crate::sound::SoundController`].
+    pub sound_preview_request: Option<crust_core::sound::SoundEvent>,
+    /// Whether chat-input spellchecking is enabled (mirrors
+    /// `AppSettings::spellcheck_enabled`).
+    pub spellcheck_enabled: bool,
+    /// Sorted snapshot of user-added spellcheck dictionary words (mirrors
+    /// `AppSettings::custom_spell_dict`). Edits in this view are serialised
+    /// via [`AppCommand::SetCustomSpellDictionary`].
+    pub spell_custom_dict: Vec<String>,
+    /// One-shot input buffer for the "Add word" field in the settings page.
+    pub spell_custom_dict_add_buf: String,
+}
+
+/// Render the Hotkeys settings page - one row per rebindable action
+/// with a "Click to bind" capture button. Conflicts render inline with a
+/// red warning.
+fn render_hotkeys_section(ui: &mut egui::Ui, state: &mut SettingsPageState, compact: bool) {
+    use crust_core::{HotkeyAction, HotkeyBindings, HotkeyCategory, KeyBinding};
+
+    ui.label(
+        RichText::new(
+            "Click a row's button, then press the key combination you want. Press Escape to cancel capture. Use Reset to restore defaults.",
+        )
+        .font(t::small())
+        .color(t::text_secondary()),
+    );
+    ui.add_space(6.0);
+
+    // Poll for a captured key press if a row is in capture mode. Done
+    // *before* drawing rows so the newly-assigned label paints this frame.
+    if let Some(target) = state.hotkey_capture_target {
+        let captured = ui.ctx().input(|i| capture_keybinding(i));
+        if let Some(capture) = captured {
+            match capture {
+                CaptureOutcome::Cancel => {
+                    state.hotkey_capture_target = None;
+                }
+                CaptureOutcome::Binding(binding) => {
+                    state.hotkey_bindings.set(target, binding);
+                    state.hotkey_capture_target = None;
+                }
+            }
+        } else {
+            ui.ctx().request_repaint();
+        }
+    }
+
+    let mut reset_all = false;
+    ui.horizontal(|ui| {
+        if ui
+            .button(RichText::new("Reset all to defaults").font(t::small()))
+            .clicked()
+        {
+            reset_all = true;
+        }
+        let conflicts = state.hotkey_bindings.conflicts();
+        if !conflicts.is_empty() {
+            ui.label(
+                RichText::new(format!(
+                    "{} binding{} conflict",
+                    conflicts.len(),
+                    if conflicts.len() == 1 { "" } else { "s" }
+                ))
+                .font(t::small())
+                .color(t::red())
+                .strong(),
+            );
+        }
+    });
+    if reset_all {
+        state.hotkey_bindings = HotkeyBindings::defaults();
+        state.hotkey_capture_target = None;
+    }
+    ui.add_space(4.0);
+
+    for category in HotkeyCategory::all() {
+        ui.label(
+            RichText::new(category.display_name())
+                .font(t::body())
+                .strong()
+                .color(t::text_primary()),
+        );
+        ui.add_space(2.0);
+
+        egui::Grid::new(("hotkeys_grid", category.as_str()))
+            .num_columns(4)
+            .striped(true)
+            .spacing(egui::vec2(10.0, 6.0))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new("Action")
+                        .font(t::tiny())
+                        .color(t::text_muted()),
+                );
+                ui.label(
+                    RichText::new("Binding")
+                        .font(t::tiny())
+                        .color(t::text_muted()),
+                );
+                ui.label(RichText::new("").font(t::tiny()));
+                ui.label(RichText::new("").font(t::tiny()));
+                ui.end_row();
+
+                for action in HotkeyAction::all() {
+                    if action.category() != category {
+                        continue;
+                    }
+                    let current = state.hotkey_bindings.get(action);
+                    let capture_active = state.hotkey_capture_target == Some(action);
+                    let conflict = state.hotkey_bindings.find_conflict(action, &current);
+
+                    let action_color = if conflict.is_some() {
+                        t::red()
+                    } else {
+                        t::text_primary()
+                    };
+                    ui.label(
+                        RichText::new(action.display_name())
+                            .font(t::small())
+                            .color(action_color),
+                    );
+
+                    let button_label = if capture_active {
+                        "Press any key…".to_owned()
+                    } else {
+                        current.display_label()
+                    };
+                    let button_color = if capture_active {
+                        t::accent()
+                    } else if conflict.is_some() {
+                        t::red()
+                    } else if current.is_unbound() {
+                        t::text_muted()
+                    } else {
+                        t::text_primary()
+                    };
+                    let btn = ui.button(
+                        RichText::new(button_label)
+                            .font(t::small())
+                            .color(button_color),
+                    );
+                    if btn.clicked() {
+                        state.hotkey_capture_target = if capture_active {
+                            None
+                        } else {
+                            Some(action)
+                        };
+                    }
+
+                    if ui
+                        .button(RichText::new("Clear").font(t::tiny()))
+                        .on_hover_text("Unbind this shortcut")
+                        .clicked()
+                    {
+                        state.hotkey_bindings.set(action, KeyBinding::default());
+                        if state.hotkey_capture_target == Some(action) {
+                            state.hotkey_capture_target = None;
+                        }
+                    }
+                    if ui
+                        .button(RichText::new("Reset").font(t::tiny()))
+                        .on_hover_text("Reset this binding to the default")
+                        .clicked()
+                    {
+                        state
+                            .hotkey_bindings
+                            .set(action, HotkeyBindings::defaults().get(action));
+                        if state.hotkey_capture_target == Some(action) {
+                            state.hotkey_capture_target = None;
+                        }
+                    }
+
+                    ui.end_row();
+
+                    if let Some(other) = conflict {
+                        ui.label("");
+                        ui.label(
+                            RichText::new(format!(
+                                "Conflicts with: {}",
+                                other.display_name()
+                            ))
+                            .font(t::tiny())
+                            .color(t::red()),
+                        );
+                        ui.label("");
+                        ui.label("");
+                        ui.end_row();
+                    }
+                }
+            });
+
+        ui.add_space(if compact { 6.0 } else { 10.0 });
+    }
+}
+
+/// Result of polling egui input for a hotkey-capture gesture.
+enum CaptureOutcome {
+    /// User pressed Escape → cancel capture, leave binding untouched.
+    Cancel,
+    /// User pressed a non-modifier key → assign it as the new binding.
+    Binding(crust_core::KeyBinding),
+}
+
+/// Inspect the current egui input frame for a fresh key-down event and
+/// translate it into a [`CaptureOutcome`]. Skips pure modifier presses so
+/// users can hold modifiers without prematurely committing the binding.
+fn capture_keybinding(input: &egui::InputState) -> Option<CaptureOutcome> {
+    for event in &input.events {
+        if let egui::Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } = event
+        {
+            if *key == egui::Key::Escape {
+                return Some(CaptureOutcome::Cancel);
+            }
+            let name = crate::app::egui_key_name(*key);
+            if name.is_empty() {
+                // Unsupported key (e.g. a key we haven't mapped).
+                // Ignore and keep waiting for a known one.
+                continue;
+            }
+            let binding = crust_core::KeyBinding {
+                ctrl: modifiers.ctrl,
+                shift: modifiers.shift,
+                alt: modifiers.alt,
+                command: modifiers.mac_cmd,
+                key: name.to_owned(),
+            };
+            return Some(CaptureOutcome::Binding(binding));
+        }
+    }
+    None
+}
+
+/// Render the Notifications settings page - desktop notification toggle
+/// plus per-event sound configuration (mention / whisper / sub / raid /
+/// custom highlight). Each row has an Enabled checkbox, a file-path text
+/// field, a volume slider, and a Preview button. A global "Streamer mode
+/// active" hint reminds the user that playback is gated while streaming
+/// when they've opted into `streamer_suppress_sounds`.
+fn render_notifications_section(
+    ui: &mut egui::Ui,
+    state: &mut SettingsPageState,
+    compact: bool,
+) {
+    use crust_core::sound::SoundEvent;
+
+    ui.label(
+        RichText::new(
+            "Desktop notifications and audio pings for highlights, mentions, whispers, subs, and raids.",
+        )
+        .font(t::small())
+        .color(t::text_secondary()),
+    );
+    ui.add_space(6.0);
+
+    ui.label(RichText::new("Desktop notifications").strong());
+    ui.checkbox(
+        &mut state.desktop_notifications_enabled,
+        "Show OS desktop notifications for mentions and highlights",
+    );
+    ui.label(
+        RichText::new(
+            "Also fires on whispers from other users. Windows users: requires the PowerShell toast fallback.",
+        )
+        .font(t::tiny())
+        .color(t::text_muted()),
+    );
+
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(6.0);
+
+    ui.label(RichText::new("Sound pings").strong());
+    ui.label(
+        RichText::new(
+            "Leave the file path empty to use the built-in default ping. Supported formats: WAV, MP3, OGG, FLAC.",
+        )
+        .font(t::tiny())
+        .color(t::text_muted()),
+    );
+
+    if state.streamer_mode_active && state.streamer_suppress_sounds {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(
+                "Streamer mode is active - live pings are muted. Preview still works so you can test files.",
+            )
+            .font(t::tiny())
+            .color(t::accent()),
+        );
+    }
+
+    ui.add_space(6.0);
+
+    let row_height = if compact { 6.0 } else { 8.0 };
+
+    for event in SoundEvent::all() {
+        let event = *event;
+        let key = event.as_key().to_owned();
+        let mut setting = state.sound_events.get(event);
+        let mut changed = false;
+
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                if ui
+                    .checkbox(&mut setting.enabled, "")
+                    .on_hover_text(format!("Enable {} sound", event.display_name()))
+                    .changed()
+                {
+                    changed = true;
+                }
+                ui.label(
+                    RichText::new(event.display_name())
+                        .font(t::body())
+                        .strong()
+                        .color(t::text_primary()),
+                );
+                ui.add_space(8.0);
+                if ui
+                    .button(RichText::new("Preview").font(t::tiny()))
+                    .on_hover_text("Play this sound once, ignoring streamer mode")
+                    .clicked()
+                {
+                    state.sound_preview_request = Some(event);
+                }
+                if !setting.path.trim().is_empty()
+                    && ui
+                        .button(RichText::new("Clear file").font(t::tiny()))
+                        .on_hover_text("Revert to the built-in default ping")
+                        .clicked()
+                {
+                    setting.path.clear();
+                    changed = true;
+                }
+            });
+
+            ui.add_space(row_height * 0.25);
+
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("File").font(t::tiny()).color(t::text_muted()));
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut setting.path)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Absolute path to a WAV/MP3/OGG/FLAC file (empty = default)"),
+                );
+                if response.changed() {
+                    changed = true;
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Volume")
+                        .font(t::tiny())
+                        .color(t::text_muted()),
+                );
+                let before = setting.volume;
+                ui.add(
+                    egui::Slider::new(&mut setting.volume, 0.0..=1.0)
+                        .show_value(true)
+                        .fixed_decimals(2),
+                );
+                if (before - setting.volume).abs() > f32::EPSILON {
+                    changed = true;
+                }
+            });
+        });
+
+        if changed {
+            state.sound_events.events.insert(key, setting);
+        }
+        ui.add_space(row_height * 0.5);
+    }
+}
+
+/// Render the Commands settings page - list + row editor for the user's
+/// custom command aliases. Mirrors the Nicknames editor layout.
+fn render_commands_section(ui: &mut egui::Ui, state: &mut SettingsPageState, compact: bool) {
+    use crust_core::commands::CommandAlias;
+
+    ui.label(
+        RichText::new("Custom Command Aliases")
+            .font(t::small())
+            .strong()
+            .color(t::text_primary()),
+    );
+    ui.label(
+        RichText::new(
+            "Define a trigger like `hi` and a body like `/me says hi {1} {2+}`. \
+             Variables: {1}, {2}, … {1+} (1st arg and everything after), {input}, \
+             {channel}, {streamer}, {user}. Aliases whose body starts with /<cmd> \
+             chain into the normal slash-command pipeline.",
+        )
+        .font(t::tiny())
+        .color(t::text_muted()),
+    );
+    ui.add_space(4.0);
+
+    // Detect duplicates by canonical trigger up-front so we can colour the
+    // offending rows.
+    let mut seen_triggers: HashSet<String> = HashSet::new();
+    let mut duplicate_triggers: HashSet<String> = HashSet::new();
+    for a in state.command_aliases.iter() {
+        let key = a.canonical_trigger();
+        if !key.is_empty() && !seen_triggers.insert(key.clone()) {
+            duplicate_triggers.insert(key);
+        }
+    }
+
+    let action_btn_size = egui::vec2(26.0, 22.0);
+    let mut delete_alias_idx: Option<usize> = None;
+
+    egui::Grid::new("command_aliases_grid")
+        .num_columns(5)
+        .spacing(egui::vec2(8.0, 6.0))
+        .show(ui, |ui| {
+            ui.label(RichText::new("On").font(t::tiny()).color(t::text_muted()));
+            ui.label(
+                RichText::new("Trigger")
+                    .font(t::tiny())
+                    .color(t::text_muted()),
+            );
+            ui.label(RichText::new("Body").font(t::tiny()).color(t::text_muted()));
+            ui.label(RichText::new(" ").font(t::tiny()));
+            ui.label(RichText::new(" ").font(t::tiny()));
+            ui.end_row();
+
+            for (i, alias) in state.command_aliases.iter_mut().enumerate() {
+                ui.checkbox(&mut alias.enabled, "");
+
+                let canonical = alias.canonical_trigger();
+                let is_duplicate = !canonical.is_empty()
+                    && duplicate_triggers.contains(&canonical);
+                let is_invalid = !alias.is_valid();
+                let trigger_color = if is_duplicate || is_invalid {
+                    t::red()
+                } else if alias.enabled {
+                    t::text_primary()
+                } else {
+                    t::text_muted()
+                };
+                ui.add(
+                    egui::TextEdit::singleline(&mut alias.trigger)
+                        .desired_width(if compact { 90.0 } else { 130.0 })
+                        .text_color(trigger_color)
+                        .hint_text("hi"),
+                );
+
+                let body_color = if alias.enabled {
+                    t::text_primary()
+                } else {
+                    t::text_muted()
+                };
+                ui.add(
+                    egui::TextEdit::singleline(&mut alias.body)
+                        .desired_width(if compact { 240.0 } else { 360.0 })
+                        .text_color(body_color)
+                        .hint_text("/me says hi {1} {2+}"),
+                );
+
+                // Live preview pill: shows the expansion for a fixed sample
+                // input so the user can sanity-check variable placement
+                // without sending a test message.
+                let preview_args = "alice bob how are you";
+                let preview_input = if canonical.is_empty() {
+                    String::new()
+                } else {
+                    format!("/{canonical} {preview_args}")
+                };
+                let preview_text = if preview_input.is_empty() || !alias.is_valid() {
+                    String::new()
+                } else {
+                    match crust_core::commands::expand_command_aliases(
+                        &preview_input,
+                        std::slice::from_ref(alias),
+                        "forsen",
+                        "me",
+                    ) {
+                        Ok(crust_core::commands::AliasExpansion::Expanded {
+                            text, ..
+                        }) => text,
+                        _ => String::new(),
+                    }
+                };
+                if preview_text.is_empty() {
+                    ui.label(RichText::new(" ").font(t::tiny()));
+                } else {
+                    ui.label(
+                        RichText::new(format!("⇒ {preview_text}"))
+                            .font(t::tiny())
+                            .color(t::text_muted()),
+                    )
+                    .on_hover_text(format!(
+                        "Sample input: {preview_input}\n\
+                         Expansion:    {preview_text}",
+                    ));
+                }
+
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("❌").font(t::tiny()).color(t::red()),
+                        )
+                        .min_size(action_btn_size),
+                    )
+                    .on_hover_text("Delete alias")
+                    .clicked()
+                {
+                    delete_alias_idx = Some(i);
+                }
+                ui.end_row();
+            }
+        });
+
+    if let Some(i) = delete_alias_idx {
+        state.command_aliases.remove(i);
+    }
+
+    if ui.button("+ Add alias").clicked() {
+        state
+            .command_aliases
+            .push(CommandAlias::new("", "/me "));
+    }
+
+    ui.add_space(6.0);
+
+    // Surface validation issues inline so users don't have to send a test
+    // message to discover a mistake.
+    let invalid_count = state
+        .command_aliases
+        .iter()
+        .filter(|a| !a.is_valid())
+        .count();
+    if invalid_count > 0 {
+        ui.label(
+            RichText::new(format!(
+                "⚠ {invalid_count} alias(es) have an empty trigger/body or whitespace in the trigger; they are ignored at runtime."
+            ))
+            .font(t::tiny())
+            .color(t::red()),
+        );
+    }
+    if !duplicate_triggers.is_empty() {
+        let mut list: Vec<&String> = duplicate_triggers.iter().collect();
+        list.sort();
+        let joined = list
+            .iter()
+            .map(|t| format!("/{t}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        ui.label(
+            RichText::new(format!(
+                "⚠ Duplicate trigger(s): {joined}. Only the first enabled entry for each trigger will be used."
+            ))
+            .font(t::tiny())
+            .color(t::red()),
+        );
+    }
+
+    ui.label(
+        RichText::new(format!("{} alias(es) defined.", state.command_aliases.len()))
+            .font(t::tiny())
+            .color(t::text_muted()),
+    );
 }
 
 pub fn parse_settings_lines(input: &str, lowercase: bool) -> Vec<String> {
@@ -189,7 +793,7 @@ pub fn parse_settings_lines(input: &str, lowercase: bool) -> Vec<String> {
     out
 }
 
-fn settings_sections() -> [SettingsSection; 9] {
+fn settings_sections() -> [SettingsSection; 12] {
     [
         SettingsSection::Appearance,
         SettingsSection::Chat,
@@ -197,7 +801,10 @@ fn settings_sections() -> [SettingsSection; 9] {
         SettingsSection::Filters,
         SettingsSection::Nicknames,
         SettingsSection::Ignores,
+        SettingsSection::Commands,
         SettingsSection::Channels,
+        SettingsSection::Hotkeys,
+        SettingsSection::Notifications,
         SettingsSection::StreamerMode,
         SettingsSection::Integrations,
     ]
@@ -760,6 +1367,118 @@ fn render_settings_content(
                             icon_url: None,
                         });
                     }
+
+                    // -- Spell check -----------------------------------------
+                    ui.add_space(12.0);
+                    ui.label(
+                        RichText::new("Spell check")
+                            .font(t::small())
+                            .strong()
+                            .color(t::text_primary()),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "Underline misspelled words in the chat input and offer\n\
+                             right-click suggestions. Use \"Add to dictionary\" in the\n\
+                             input's context menu to teach the checker new words.",
+                        )
+                        .font(t::tiny())
+                        .color(t::text_muted()),
+                    );
+                    ui.add_space(2.0);
+                    ui.checkbox(
+                        &mut state.spellcheck_enabled,
+                        if ultra_compact {
+                            "Enable spell check"
+                        } else {
+                            "Enable spell check for the chat input"
+                        },
+                    );
+
+                    ui.add_enabled_ui(state.spellcheck_enabled, |ui| {
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "Custom dictionary ({} word{})",
+                                state.spell_custom_dict.len(),
+                                if state.spell_custom_dict.len() == 1 { "" } else { "s" }
+                            ))
+                            .font(t::tiny())
+                            .color(t::text_muted()),
+                        );
+
+                        ui.horizontal(|ui| {
+                            let add_response = ui.add(
+                                egui::TextEdit::singleline(&mut state.spell_custom_dict_add_buf)
+                                    .hint_text("word")
+                                    .desired_width(if compact { 120.0 } else { 180.0 }),
+                            );
+                            let enter_pressed = add_response.lost_focus()
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            let add_clicked = ui
+                                .button(RichText::new("Add").font(t::small()))
+                                .clicked();
+                            if enter_pressed || add_clicked {
+                                let candidate = state
+                                    .spell_custom_dict_add_buf
+                                    .trim()
+                                    .to_ascii_lowercase();
+                                if !candidate.is_empty()
+                                    && candidate.len() <= 64
+                                    && candidate.chars().all(|c| c.is_ascii_alphabetic())
+                                    && !state.spell_custom_dict.iter().any(|w| w == &candidate)
+                                {
+                                    state.spell_custom_dict.push(candidate);
+                                    state.spell_custom_dict.sort();
+                                }
+                                state.spell_custom_dict_add_buf.clear();
+                                if enter_pressed {
+                                    add_response.request_focus();
+                                }
+                            }
+                        });
+
+                        if state.spell_custom_dict.is_empty() {
+                            ui.label(
+                                RichText::new("No custom words yet.")
+                                    .font(t::tiny())
+                                    .weak()
+                                    .italics(),
+                            );
+                        } else {
+                            let mut remove_idx: Option<usize> = None;
+                            egui::ScrollArea::vertical()
+                                .id_salt("spell_dict_scroll")
+                                .max_height(if compact { 120.0 } else { 160.0 })
+                                .show(ui, |ui| {
+                                    for (idx, word) in
+                                        state.spell_custom_dict.iter().enumerate()
+                                    {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new(word)
+                                                    .font(t::small())
+                                                    .color(t::text_primary()),
+                                            );
+                                            if ui
+                                                .small_button(
+                                                    RichText::new("Remove")
+                                                        .font(t::tiny())
+                                                        .color(t::red()),
+                                                )
+                                                .clicked()
+                                            {
+                                                remove_idx = Some(idx);
+                                            }
+                                        });
+                                    }
+                                });
+                            if let Some(i) = remove_idx {
+                                state.spell_custom_dict.remove(i);
+                            }
+                        }
+                    });
+
                     if has_host_panels_for_slot(&state.plugin_ui, PluginUiHostSlot::SettingsChat) {
                         ui.add_space(10.0);
                         render_host_panels_for_slot(
@@ -1695,6 +2414,9 @@ fn render_settings_content(
                         );
                     }
                 }
+                SettingsSection::Commands => {
+                    render_commands_section(ui, state, compact);
+                }
                 SettingsSection::Channels => {
                     ui.label(
                         RichText::new(
@@ -1725,6 +2447,12 @@ fn render_settings_content(
                         .font(t::tiny())
                         .color(t::text_muted()),
                     );
+                }
+                SettingsSection::Hotkeys => {
+                    render_hotkeys_section(ui, state, compact);
+                }
+                SettingsSection::Notifications => {
+                    render_notifications_section(ui, state, compact);
                 }
                 SettingsSection::StreamerMode => {
                     ui.label(
@@ -1907,6 +2635,151 @@ fn render_settings_content(
                         RichText::new("Enabling beta transports may require restarting Crust.")
                             .font(t::small())
                             .color(t::text_muted()),
+                    );
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("External Tools")
+                            .font(t::small())
+                            .strong()
+                            .color(t::text_primary()),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "Used by right-click → “Open in Streamlink” and “Open in player” on a Twitch channel.",
+                        )
+                        .font(t::tiny())
+                        .color(t::text_muted()),
+                    );
+                    // Platform-specific path hints so both Windows and Linux /
+                    // macOS users see an example that matches their system.
+                    let streamlink_hint = if cfg!(target_os = "windows") {
+                        r"leave blank to use PATH, e.g. C:\Program Files\Streamlink\bin"
+                    } else {
+                        "leave blank to use PATH, e.g. /usr/bin/streamlink"
+                    };
+                    let mpv_hint = if cfg!(target_os = "windows") {
+                        r"leave blank to use PATH, e.g. C:\Program Files\mpv\mpv.exe"
+                    } else {
+                        "leave blank to use PATH, e.g. /usr/bin/mpv"
+                    };
+                    let player_hint =
+                        "{streamlink} --player {mpv} twitch.tv/{channel} {quality}";
+                    if compact {
+                        ui.label("Streamlink path:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.external_streamlink_path)
+                                .hint_text(streamlink_hint)
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.label("Preferred quality:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.external_streamlink_quality)
+                                .hint_text("best")
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.label("Extra Streamlink args:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.external_streamlink_extra_args)
+                                .hint_text("--twitch-disable-ads")
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.label("mpv path:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.external_mpv_path)
+                                .hint_text(mpv_hint)
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.label(
+                            "Player command ({channel} / {url} / {quality} / {mpv} / {streamlink}):",
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.external_player_template)
+                                .hint_text(player_hint)
+                                .desired_width(f32::INFINITY),
+                        );
+                    } else {
+                        egui::Grid::new("settings_external_tools_grid")
+                            .num_columns(2)
+                            .spacing(egui::vec2(8.0, 6.0))
+                            .show(ui, |ui| {
+                                ui.label("Streamlink path:");
+                                ui.add(
+                                    egui::TextEdit::singleline(
+                                        &mut state.external_streamlink_path,
+                                    )
+                                    .hint_text(streamlink_hint)
+                                    .desired_width(f32::INFINITY),
+                                );
+                                ui.end_row();
+
+                                ui.label("Quality:");
+                                ui.add(
+                                    egui::TextEdit::singleline(
+                                        &mut state.external_streamlink_quality,
+                                    )
+                                    .hint_text("best")
+                                    .desired_width(f32::INFINITY),
+                                );
+                                ui.end_row();
+
+                                ui.label("Extra args:");
+                                ui.add(
+                                    egui::TextEdit::singleline(
+                                        &mut state.external_streamlink_extra_args,
+                                    )
+                                    .hint_text("--twitch-disable-ads")
+                                    .desired_width(f32::INFINITY),
+                                );
+                                ui.end_row();
+
+                                ui.label("mpv path:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut state.external_mpv_path)
+                                        .hint_text(mpv_hint)
+                                        .desired_width(f32::INFINITY),
+                                );
+                                ui.end_row();
+
+                                ui.label("Player command:");
+                                ui.add(
+                                    egui::TextEdit::singleline(
+                                        &mut state.external_player_template,
+                                    )
+                                    .hint_text(player_hint)
+                                    .desired_width(f32::INFINITY),
+                                );
+                                ui.end_row();
+                            });
+                    }
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("Twitch session token (optional):")
+                            .font(t::small())
+                            .color(t::text_secondary()),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut state.external_streamlink_session_token)
+                            .password(true)
+                            .hint_text("paste your twitch.tv `auth-token` cookie")
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "When set, Streamlink is launched with `--twitch-api-header \"Authorization=OAuth <token>\" --twitch-purge-client-integrity` so Turbo / subscriber ad-skip applies and age-gated streams play. Get the value from your browserDevTools → Application → Cookies → twitch.tv → the `auth-token` row (hex string, ~30 chars). The chat OAuth token will not work here; Twitch rejects it.",
+                        )
+                        .font(t::tiny())
+                        .color(t::text_muted()),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(
+                            "Streamlink and mpv must be installed separately. The player command is parsed with shell quoting. Variables: {channel}, {url}, {quality}, {mpv}, {streamlink}.",
+                        )
+                        .font(t::tiny())
+                        .color(t::text_muted()),
                     );
 
                     ui.add_space(10.0);

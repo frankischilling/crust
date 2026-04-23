@@ -4,6 +4,7 @@ use egui::{Color32, Id, RichText, ScrollArea, Ui};
 
 use crate::theme as t;
 use crust_core::model::{ChannelId, ChannelState};
+use crust_core::state::TabVisibilityRule;
 
 /// Left-sidebar channel list.
 pub struct ChannelList<'a> {
@@ -14,6 +15,21 @@ pub struct ChannelList<'a> {
     pub live_channels: Option<&'a HashMap<String, bool>>,
     pub show_live_indicator: bool,
     pub show_close_button: bool,
+    /// When true, render the pinned "Live" sentinel row at index 0.
+    pub show_live_feed_pin: bool,
+    /// Number of currently-live followed channels (for the count badge).
+    pub live_feed_count: usize,
+    /// When true, render the pinned "Mentions" sentinel row at index 1
+    /// (directly under the Live pin when both are present).
+    pub show_mentions_pin: bool,
+    /// Total mentions in the cross-channel buffer (for the count badge).
+    pub mentions_total: usize,
+    /// Unread mentions since the Mentions tab was last focused (bold badge).
+    pub mentions_unread: u32,
+    /// Per-channel tab visibility rules (only non-default entries). Used
+    /// to render the "Hide when offline" right-click toggle as a checked
+    /// menu entry when a rule is active.
+    pub tab_visibility_rules: &'a HashMap<ChannelId, TabVisibilityRule>,
 }
 
 pub struct ChannelListResult {
@@ -28,6 +44,13 @@ pub struct ChannelListResult {
     /// True while a drag is actively in progress (for rendering drop-zone
     /// overlay in the central panel).
     pub dragging_outside: bool,
+    /// Right-click → "Open in Streamlink" (Twitch channels only).
+    pub open_streamlink: Option<ChannelId>,
+    /// Right-click → "Open in player" (Twitch channels only).
+    pub open_player: Option<ChannelId>,
+    /// Right-click → "Hide when offline" toggled. Holds the new rule
+    /// the caller should persist + mirror into app state.
+    pub visibility_change: Option<(ChannelId, TabVisibilityRule)>,
 }
 
 /// Persistent-per-frame drag tracking stored in egui temp storage.
@@ -49,6 +72,9 @@ impl<'a> ChannelList<'a> {
             reordered: None,
             drag_split: None,
             dragging_outside: false,
+            open_streamlink: None,
+            open_player: None,
+            visibility_change: None,
         };
 
         let drag_id = Id::new("channel_list_drag");
@@ -66,6 +92,158 @@ impl<'a> ChannelList<'a> {
 
                 // Snapshot drag state at the start of the frame.
                 let drag: Option<DragState> = ui.data(|d| d.get_temp(drag_id));
+
+                if self.show_live_feed_pin {
+                    let live_id = crust_core::ChannelId::live_feed();
+                    let is_active = self.active == Some(&live_id);
+
+                    // Allocate the row rect.
+                    let row_rect = {
+                        let avail = ui.available_rect_before_wrap();
+                        egui::Rect::from_min_size(avail.min, egui::vec2(avail.width(), row_h))
+                    };
+                    let resp = ui.interact(
+                        row_rect,
+                        egui::Id::new("live_feed_pin_row"),
+                        egui::Sense::click(),
+                    );
+
+                    // Background color: active / hover / default.
+                    let bg = if is_active {
+                        t::active_channel_bg()
+                    } else if resp.hovered() {
+                        t::hover_row_bg()
+                    } else {
+                        Color32::TRANSPARENT
+                    };
+                    if bg != Color32::TRANSPARENT {
+                        ui.painter().rect_filled(row_rect, 4.0, bg);
+                    }
+
+                    // Red live dot at the left.
+                    let dot_center = row_rect.left_center() + egui::vec2(10.0, 0.0);
+                    ui.painter()
+                        .circle_filled(dot_center, 4.0, Color32::from_rgb(220, 60, 60));
+
+                    // "Live" label.
+                    let label_pos = row_rect.left_center() + egui::vec2(22.0, 0.0);
+                    ui.painter().text(
+                        label_pos,
+                        egui::Align2::LEFT_CENTER,
+                        "Live",
+                        t::tabs_font(),
+                        t::text_primary(),
+                    );
+
+                    // Count badge on the right.
+                    let badge_pos = row_rect.right_center() - egui::vec2(10.0, 0.0);
+                    ui.painter().text(
+                        badge_pos,
+                        egui::Align2::RIGHT_CENTER,
+                        format!("{}", self.live_feed_count),
+                        t::tabs_font(),
+                        t::text_muted(),
+                    );
+
+                    if resp.clicked() {
+                        result.selected = Some(live_id);
+                    }
+
+                    // Reserve the row's vertical space; egui's item_spacing.y
+                    // (set to CHANNEL_ROW_GAP above) supplies the gap to the
+                    // first regular channel row automatically.
+                    ui.allocate_space(egui::vec2(0.0, row_h));
+                }
+
+                if self.show_mentions_pin {
+                    let mentions_id = crust_core::ChannelId::mentions();
+                    let is_active = self.active == Some(&mentions_id);
+
+                    let row_rect = {
+                        let avail = ui.available_rect_before_wrap();
+                        egui::Rect::from_min_size(avail.min, egui::vec2(avail.width(), row_h))
+                    };
+                    let resp = ui.interact(
+                        row_rect,
+                        egui::Id::new("mentions_pin_row"),
+                        egui::Sense::click(),
+                    );
+
+                    let bg = if is_active {
+                        t::active_channel_bg()
+                    } else if resp.hovered() {
+                        t::hover_row_bg()
+                    } else {
+                        Color32::TRANSPARENT
+                    };
+                    if bg != Color32::TRANSPARENT {
+                        ui.painter().rect_filled(row_rect, 4.0, bg);
+                    }
+
+                    // "@" glyph where the Live dot sits - same alignment as
+                    // the Live pin so the two sentinels line up visually.
+                    let glyph_center = row_rect.left_center() + egui::vec2(10.0, 0.0);
+                    ui.painter().text(
+                        glyph_center,
+                        egui::Align2::CENTER_CENTER,
+                        "@",
+                        t::tabs_font(),
+                        t::accent(),
+                    );
+
+                    let label_pos = row_rect.left_center() + egui::vec2(22.0, 0.0);
+                    ui.painter().text(
+                        label_pos,
+                        egui::Align2::LEFT_CENTER,
+                        "Mentions",
+                        t::tabs_font(),
+                        t::text_primary(),
+                    );
+
+                    // Right-side count. Unread gets the warning-pill treatment
+                    // (matches how regular channel unread-mentions are drawn);
+                    // when fully read, fall back to a muted total count.
+                    if self.mentions_unread > 0 {
+                        let label = if self.mentions_unread > 99 {
+                            "99+".to_owned()
+                        } else {
+                            format!("{}", self.mentions_unread)
+                        };
+                        let badge_w = 28.0_f32;
+                        let badge_h = 14.0_f32;
+                        let badge_rect = egui::Rect::from_center_size(
+                            row_rect.right_center() - egui::vec2(6.0 + badge_w * 0.5, 0.0),
+                            egui::vec2(badge_w, badge_h),
+                        );
+                        ui.painter().rect_filled(
+                            badge_rect,
+                            t::RADIUS_SM,
+                            t::mention_pill_bg(),
+                        );
+                        ui.painter().text(
+                            badge_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            label,
+                            t::tiny(),
+                            t::text_primary(),
+                        );
+                    } else if self.mentions_total > 0 {
+                        let badge_pos = row_rect.right_center() - egui::vec2(10.0, 0.0);
+                        ui.painter().text(
+                            badge_pos,
+                            egui::Align2::RIGHT_CENTER,
+                            format!("{}", self.mentions_total),
+                            t::tabs_font(),
+                            t::text_muted(),
+                        );
+                    }
+
+                    if resp.clicked() {
+                        result.selected = Some(mentions_id);
+                    }
+
+                    ui.allocate_space(egui::vec2(0.0, row_h));
+                }
 
                 // Y reference for computing insert position from pointer.
                 let list_top = ui.cursor().min.y;
@@ -187,6 +365,48 @@ impl<'a> ChannelList<'a> {
                             };
                             ui.ctx().copy_text(copy);
                             ui.close_menu();
+                        }
+
+                        // Streamlink / player integrationTwitch only.
+                        if ch.is_twitch() {
+                            ui.separator();
+                            if ui
+                                .button(RichText::new("Open in Streamlink").font(t::small()))
+                                .clicked()
+                            {
+                                result.open_streamlink = Some(ch.clone());
+                                ui.close_menu();
+                            }
+                            if ui
+                                .button(RichText::new("Open in player").font(t::small()))
+                                .clicked()
+                            {
+                                result.open_player = Some(ch.clone());
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            let current_rule = self
+                                .tab_visibility_rules
+                                .get(ch)
+                                .copied()
+                                .unwrap_or(TabVisibilityRule::Always);
+                            let mut hide_offline =
+                                current_rule == TabVisibilityRule::HideWhenOffline;
+                            if ui
+                                .checkbox(
+                                    &mut hide_offline,
+                                    RichText::new("Hide when offline").font(t::small()),
+                                )
+                                .changed()
+                            {
+                                let new_rule = if hide_offline {
+                                    TabVisibilityRule::HideWhenOffline
+                                } else {
+                                    TabVisibilityRule::Always
+                                };
+                                result.visibility_change = Some((ch.clone(), new_rule));
+                                ui.close_menu();
+                            }
                         }
 
                         ui.separator();

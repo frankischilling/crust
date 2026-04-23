@@ -83,6 +83,17 @@ pub struct ChatInput<'a> {
     pub animate_emotes: bool,
 }
 
+/// A single image the user wants to upload (clipboard paste or file drop).
+#[derive(Debug, Clone)]
+pub struct PendingUpload {
+    /// Encoded image bytes ready to POST.
+    pub bytes: Vec<u8>,
+    /// Extension without the dot: `"png"`, `"gif"`, `"jpeg"`.
+    pub format: String,
+    /// Original file path if the source was a dropped file.
+    pub source_path: Option<std::path::PathBuf>,
+}
+
 /// Result from showing the chat input.
 pub struct ChatInputResult {
     /// The message text to send, if any.
@@ -91,6 +102,12 @@ pub struct ChatInputResult {
     pub toggle_emote_picker: bool,
     /// User clicked ✕ to dismiss the pending reply.
     pub dismiss_reply: bool,
+    /// Images queued for upload (clipboard or drag-drop).
+    pub uploads: Vec<PendingUpload>,
+    /// Word the user asked to add to their custom spellcheck dictionary via
+    /// the chat-input context menu. Caller should forward to
+    /// `AppCommand::AddWordToDictionary` so the change is persisted.
+    pub add_to_dictionary: Option<String>,
 }
 
 impl<'a> ChatInput<'a> {
@@ -100,7 +117,86 @@ impl<'a> ChatInput<'a> {
             send: None,
             toggle_emote_picker: false,
             dismiss_reply: false,
+            uploads: Vec::new(),
+            add_to_dictionary: None,
         };
+
+        // -- Clipboard image paste (Ctrl/Cmd+V) ------------------------------
+        // egui-winit 0.31's keyboard handler early-returns from a Ctrl+V
+        // *press* when its internal `clipboard.get()` fails (image-only
+        // clipboards trigger this path), so no `Event::Key` for V is ever
+        // pushed on press AND no `Event::Paste` is pushed either. The V
+        // RELEASE event, however, still goes through the normal push path
+        // with `modifiers.ctrl` attachedwe use that as our paste trigger.
+        // Also match `Event::Paste(_)` for the successful text-paste path
+        // (where clipboard had both text and image).
+        let paste_signal = ui.input(|i| {
+            i.events.iter().any(|e| match e {
+                egui::Event::Paste(_) => true,
+                // Key release with Ctrl/Cmdfires even when egui-winit
+                // swallowed the press event as a (failed) paste shortcut.
+                egui::Event::Key {
+                    key: Key::V,
+                    pressed: false,
+                    modifiers,
+                    ..
+                } => modifiers.command || modifiers.ctrl,
+                // Press event (only reachable when egui-winit does NOT
+                // match the paste shortcut, e.g. future versions).
+                egui::Event::Key {
+                    key: Key::V,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => modifiers.command || modifiers.ctrl,
+                _ => false,
+            })
+        });
+        // Debounce: fire at most once per unique press+release cycle. We
+        // stash the last frame number where we uploaded on this key so a
+        // future egui-winit change that pushes BOTH press and release
+        // wouldn't trigger a double upload.
+        let paste_debounce_id = ui.id().with("paste_debounce_frame");
+        let now_frame = ui.ctx().cumulative_pass_nr();
+        let last_frame: Option<u64> = ui.ctx().data(|d| d.get_temp(paste_debounce_id));
+        let paste_signal =
+            paste_signal && last_frame.map_or(true, |f| now_frame.saturating_sub(f) > 1);
+        if paste_signal {
+            match try_clipboard_image_as_png() {
+                Some(upload) => {
+                    ui.input_mut(|i| {
+                        i.events.retain(|e| {
+                            !matches!(e, egui::Event::Paste(_))
+                                && !matches!(
+                                    e,
+                                    egui::Event::Key {
+                                        key: Key::V,
+                                        modifiers,
+                                        ..
+                                    } if modifiers.command || modifiers.ctrl
+                                )
+                        });
+                    });
+                    ui.ctx()
+                        .data_mut(|d| d.insert_temp(paste_debounce_id, now_frame));
+                    tracing::info!("uploader: clipboard image captured via Ctrl+V");
+                    result.uploads.push(upload);
+                }
+                None => {
+                    tracing::debug!(
+                        "uploader: paste signal saw no clipboard image, falling through"
+                    );
+                }
+            }
+        }
+
+        // -- Drag-drop image file(s) -----------------------------------------
+        let dropped: Vec<egui::DroppedFile> = ui.ctx().input(|i| i.raw.dropped_files.clone());
+        for f in &dropped {
+            if let Some(upload) = dropped_file_to_upload(f) {
+                result.uploads.push(upload);
+            }
+        }
 
         // Reply banner
         if let Some(rep) = self.pending_reply {
@@ -259,7 +355,7 @@ impl<'a> ChatInput<'a> {
                     let hist_id = text_edit_id.with("msg_history_state");
 
                     // -- Paint red wavy underlines under misspelled words --
-                    {
+                    if crate::spellcheck::is_enabled() {
                         let galley = &te_output.galley;
                         let galley_pos = te_output.galley_pos;
                         let clip = te_output.text_clip_rect;
@@ -745,6 +841,7 @@ impl<'a> ChatInput<'a> {
                     }
 
                     let mut spell_replace: Option<(usize, usize, String)> = None;
+                    let mut spell_add_word: Option<String> = None;
                     let mut context_send_now = false;
                     let mut context_cut_input = false;
                     let mut context_copy_input = false;
@@ -776,7 +873,19 @@ impl<'a> ChatInput<'a> {
                         }
 
                         if ui.button(RichText::new("Paste").font(t::small())).clicked() {
-                            context_paste_input = true;
+                            // Prefer image paste when the clipboard holds one;
+                            // fall back to egui's text paste otherwise.
+                            match try_clipboard_image_as_png() {
+                                Some(up) => {
+                                    tracing::info!(
+                                        "uploader: clipboard image captured via right-click paste"
+                                    );
+                                    result.uploads.push(up);
+                                }
+                                None => {
+                                    context_paste_input = true;
+                                }
+                            }
                             ui.close_menu();
                         }
 
@@ -853,6 +962,20 @@ impl<'a> ChatInput<'a> {
                                     }
                                 }
                             }
+                            ui.separator();
+                            if ui
+                                .button(
+                                    RichText::new(format!(
+                                        "Add \"{display_word}\" to dictionary"
+                                    ))
+                                    .font(t::small()),
+                                )
+                                .clicked()
+                            {
+                                spell_add_word = Some(sc.word.clone());
+                                ui.ctx().data_mut(|d| d.remove::<SpellCtx>(sc_id));
+                                ui.close_menu();
+                            }
                         } else {
                             ui.label(RichText::new("Spelling OK ✓").color(t::green()));
                         }
@@ -907,6 +1030,20 @@ impl<'a> ChatInput<'a> {
                         buf.replace_range(start..end, &replacement);
                         move_cursor_to_end(ui.ctx(), text_edit_id, new_len);
                         ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
+                    }
+
+                    if let Some(word) = spell_add_word {
+                        // Update the in-memory user dictionary immediately so
+                        // the red underline disappears this frame; the caller
+                        // will also forward the word to the app runtime to
+                        // persist it in `AppSettings::custom_spell_dict`.
+                        if crate::spellcheck::add_to_user_dict(&word) {
+                            tracing::info!(
+                                target: "spellcheck",
+                                "user added \"{word}\" to custom dictionary"
+                            );
+                        }
+                        result.add_to_dictionary = Some(word);
                     }
                 });
             });
@@ -1836,6 +1973,114 @@ fn paint_wavy_underline(painter: &egui::Painter, x0: f32, x1: f32, y: f32, color
     if points.len() >= 2 {
         painter.add(egui::Shape::line(points, stroke));
     }
+}
+
+/// Read an image from the OS clipboard and re-encode as PNG.
+/// Returns `None` if the clipboard is empty, unavailable, or holds no image.
+///
+/// Retries briefly on Windows because egui-winit's own `arboard` instance may
+/// hold the clipboard open for a few milliseconds while it tries its
+/// text-paste attempt; a cold retry after a short sleep usually succeeds.
+fn try_clipboard_image_as_png() -> Option<PendingUpload> {
+    const ATTEMPTS: u32 = 4;
+    const SLEEP_MS: u64 = 15;
+    let mut last_err: Option<String> = None;
+    let img = (0..ATTEMPTS).find_map(|attempt| {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(SLEEP_MS));
+        }
+        let mut cb = match arboard::Clipboard::new() {
+            Ok(c) => c,
+            Err(e) => {
+                last_err = Some(format!("Clipboard::new: {e}"));
+                return None;
+            }
+        };
+        match cb.get_image() {
+            Ok(img) => Some(img),
+            Err(e) => {
+                last_err = Some(format!("get_image: {e}"));
+                None
+            }
+        }
+    });
+    let img = match img {
+        Some(i) => i,
+        None => {
+            if let Some(e) = last_err {
+                tracing::debug!("uploader: clipboard has no image after retries ({e})");
+            }
+            return None;
+        }
+    };
+    let (w, h) = (img.width as u32, img.height as u32);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let rgba = img.bytes.into_owned();
+    let mut png = Vec::new();
+    {
+        use image::codecs::png::PngEncoder;
+        use image::ImageEncoder;
+        let encoder = PngEncoder::new(&mut png);
+        if let Err(e) = encoder.write_image(&rgba, w, h, image::ExtendedColorType::Rgba8) {
+            tracing::warn!("uploader: png encode failed: {e}");
+            return None;
+        }
+    }
+    Some(PendingUpload {
+        bytes: png,
+        format: "png".to_owned(),
+        source_path: None,
+    })
+}
+
+/// Convert an `egui::DroppedFile` to a [`PendingUpload`] if it looks like an image.
+fn dropped_file_to_upload(f: &egui::DroppedFile) -> Option<PendingUpload> {
+    // Web drops give us bytes + name; desktop drops give us a path.
+    let (path, raw): (Option<std::path::PathBuf>, Option<Vec<u8>>) = match (&f.path, &f.bytes) {
+        (Some(p), _) => (Some(p.clone()), None),
+        (None, Some(b)) => (None, Some(b.to_vec())),
+        (None, None) => return None,
+    };
+
+    let name_lower = path
+        .as_ref()
+        .and_then(|p| p.extension())
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .or_else(|| {
+            let nm = &f.name;
+            nm.rsplit('.').next().map(|s| s.to_ascii_lowercase())
+        })
+        .unwrap_or_default();
+    let format = match name_lower.as_str() {
+        "png" => "png",
+        "jpg" | "jpeg" => "jpeg",
+        "gif" => "gif",
+        "webp" => "webp",
+        _ => return None,
+    };
+
+    let bytes = match raw {
+        Some(b) => b,
+        None => match std::fs::read(path.as_ref()?) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("uploader: read drop file failed: {e}");
+                return None;
+            }
+        },
+    };
+
+    // GIF + WEBP are uploaded as-is to preserve animation. PNG/JPEG likewise
+    // bypass re-encoding. Chatterino only re-encodes when the source is not a
+    // known image type.
+    Some(PendingUpload {
+        bytes,
+        format: format.to_owned(),
+        source_path: path,
+    })
 }
 
 #[cfg(test)]

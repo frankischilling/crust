@@ -863,7 +863,10 @@ impl LoadingScreen {
         if configured_startup_count > 0 {
             let joined_configured_count = startup_channels
                 .iter()
-                .filter(|ch| self.configured_startup_twitch_channels.contains(ch.as_str()))
+                .filter(|ch| {
+                    self.configured_startup_twitch_channels
+                        .contains(ch.as_str())
+                })
                 .count();
             if joined_configured_count < configured_startup_count {
                 if let Some(entered) = self.loading_entered_at {
@@ -878,16 +881,18 @@ impl LoadingScreen {
         let catalog_ok = self.catalog_loaded;
         // Non-Twitch channels don't currently emit full history/emote-load
         // signals. Don't block startup on those platform-specific side paths.
-        let tracked_startup_channels: Vec<&String> = if self.configured_startup_twitch_channels
-            .is_empty()
-        {
-            startup_channels
-        } else {
-            startup_channels
-                .into_iter()
-                .filter(|ch| self.configured_startup_twitch_channels.contains(ch.as_str()))
-                .collect()
-        };
+        let tracked_startup_channels: Vec<&String> =
+            if self.configured_startup_twitch_channels.is_empty() {
+                startup_channels
+            } else {
+                startup_channels
+                    .into_iter()
+                    .filter(|ch| {
+                        self.configured_startup_twitch_channels
+                            .contains(ch.as_str())
+                    })
+                    .collect()
+            };
         let history_ok = tracked_startup_channels
             .iter()
             .all(|ch| self.channel_history_settled(ch));
@@ -930,7 +935,10 @@ impl LoadingScreen {
         let joined_count = if configured_count > 0 {
             observed_blocking_channels
                 .iter()
-                .filter(|ch| self.configured_startup_twitch_channels.contains(ch.as_str()))
+                .filter(|ch| {
+                    self.configured_startup_twitch_channels
+                        .contains(ch.as_str())
+                })
                 .count()
         } else {
             observed_blocking_channels.len()
@@ -939,7 +947,10 @@ impl LoadingScreen {
         let tracked_channels: Vec<&String> = if configured_count > 0 {
             observed_blocking_channels
                 .into_iter()
-                .filter(|ch| self.configured_startup_twitch_channels.contains(ch.as_str()))
+                .filter(|ch| {
+                    self.configured_startup_twitch_channels
+                        .contains(ch.as_str())
+                })
                 .collect()
         } else {
             observed_blocking_channels

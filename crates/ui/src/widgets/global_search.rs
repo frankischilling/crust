@@ -54,12 +54,16 @@ impl GlobalSearchState {
 /// Compute a cheap fingerprint of the current buffer state.
 ///
 /// Used to decide whether the search result cache needs to be rebuilt.
-/// Collisions are acceptable — a missed refresh shows stale hits for one frame.
+/// Collisions are acceptablea missed refresh shows stale hits for one frame.
 pub fn fingerprint(channels: &HashMap<ChannelId, ChannelState>) -> u64 {
     let mut n: u64 = channels.len() as u64;
     for (id, state) in channels {
-        n = n.wrapping_mul(1469598103934665603).wrapping_add(state.messages.len() as u64);
-        n = n.wrapping_mul(1469598103934665603).wrapping_add(id.as_str().len() as u64);
+        n = n
+            .wrapping_mul(1469598103934665603)
+            .wrapping_add(state.messages.len() as u64);
+        n = n
+            .wrapping_mul(1469598103934665603)
+            .wrapping_add(id.as_str().len() as u64);
     }
     n
 }
@@ -147,7 +151,7 @@ const WINDOW_DEFAULT_HEIGHT: f32 = 380.0;
 const WINDOW_MIN_WIDTH: f32 = 360.0;
 const WINDOW_MIN_HEIGHT: f32 = 240.0;
 
-/// Output of one render pass — the caller applies these to app state.
+/// Output of one render passthe caller applies these to app state.
 #[derive(Default)]
 pub struct GlobalSearchOutput {
     pub load_older_requests: Vec<ChannelId>,
@@ -259,11 +263,7 @@ fn render_body(
     render_results(ui, channels, state, output);
 }
 
-fn render_header(
-    ui: &mut Ui,
-    state: &mut GlobalSearchState,
-    output: &mut GlobalSearchOutput,
-) {
+fn render_header(ui: &mut Ui, state: &mut GlobalSearchState, output: &mut GlobalSearchOutput) {
     ui.horizontal(|ui| {
         chrome::dialog_header(
             ui,
@@ -409,10 +409,7 @@ fn render_group_header(
         );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let label = if pending { "Loading…" } else { "Load older" };
-            let btn = ui.add_enabled(
-                !pending,
-                Button::new(RichText::new(label).font(t::tiny())),
-            );
+            let btn = ui.add_enabled(!pending, Button::new(RichText::new(label).font(t::tiny())));
             if btn.clicked() {
                 load_older_pending.insert(channel.clone(), std::time::Instant::now());
                 output.load_older_requests.push(channel.clone());
@@ -440,11 +437,7 @@ fn render_hit_row(
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 let ts = hit.message.timestamp.format("%H:%M").to_string();
-                ui.label(
-                    RichText::new(ts)
-                        .font(t::tiny())
-                        .color(t::text_muted()),
-                );
+                ui.label(RichText::new(ts).font(t::tiny()).color(t::text_muted()));
                 let color = hit
                     .message
                     .sender
@@ -459,10 +452,7 @@ fn render_hit_row(
                 );
                 let body = hit.message.raw_text.trim();
                 let body = truncate(body, 160);
-                ui.label(
-                    RichText::new(body)
-                        .font(t::small()),
-                );
+                ui.label(RichText::new(body).font(t::small()));
             });
         })
         .response;
@@ -492,11 +482,7 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-fn handle_keyboard(
-    ctx: &Context,
-    state: &mut GlobalSearchState,
-    output: &mut GlobalSearchOutput,
-) {
+fn handle_keyboard(ctx: &Context, state: &mut GlobalSearchState, output: &mut GlobalSearchOutput) {
     if state.results.is_empty() {
         return;
     }
@@ -598,7 +584,8 @@ mod tests {
         let (id2, mut c2) = mk_channel("b");
         c1.messages.push_back(mk_msg(1, "alice", "hello world", 20));
         c1.messages.push_back(mk_msg(2, "bob", "hello there", 10));
-        c2.messages.push_back(mk_msg(3, "alice", "no match here", 5));
+        c2.messages
+            .push_back(mk_msg(3, "alice", "no match here", 5));
         c2.messages.push_back(mk_msg(4, "alice", "hello again", 15));
         channels.insert(id1, c1);
         channels.insert(id2, c2);

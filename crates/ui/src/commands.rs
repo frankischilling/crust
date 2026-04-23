@@ -710,8 +710,7 @@ pub fn slash_command_matches_ranked(
                 return Some((cmd, 1, name));
             }
 
-            let exact = name == q
-                || cmd.aliases.iter().any(|al| al.eq_ignore_ascii_case(&q));
+            let exact = name == q || cmd.aliases.iter().any(|al| al.eq_ignore_ascii_case(&q));
             if exact {
                 return Some((cmd, 0, name));
             }

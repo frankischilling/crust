@@ -13,11 +13,12 @@ use crust_core::{
         AppCommand, AppEvent, AutoModQueueItem, ConnectionState, LinkPreview, UnbanRequestItem,
     },
     model::{
-        ChannelId, ChannelState, EmoteCatalogEntry, MessageId, MsgKind, ReplyInfo, Span,
-        TwitchEmotePos, IRC_SERVER_CONTROL_CHANNEL,
+        ChannelId, ChannelState, ChatMessage, EmoteCatalogEntry, MessageId, MsgKind, ReplyInfo,
+        Span, TwitchEmotePos, IRC_SERVER_CONTROL_CHANNEL,
     },
     plugin_command_infos, plugin_host,
     plugins::PluginUiHostSlot,
+    state::TabVisibilityRule,
     AppState, PluginAuthSnapshot, PluginChannelSnapshot,
 };
 
@@ -31,17 +32,18 @@ use crate::widgets::{
     channel_list::ChannelList,
     chat_input::ChatInput,
     chrome::{self, ChromeIcon, IconButtonState},
+    crash_viewer::{CrashReportMeta, CrashViewer},
     emote_picker::EmotePicker,
     emote_picker::EmotePickerPreferences,
+    global_search::{
+        refresh_if_stale, show_global_search_window, GlobalSearchOutput, GlobalSearchState,
+    },
     info_bars::{show_channel_info_bars, StreamStatusInfo},
     irc_status::IrcStatusPanel,
     join_dialog::JoinDialog,
     loading_screen::{LoadEvent, LoadingScreen},
     login_dialog::{LoginAction, LoginDialog},
     message_list::MessageList,
-    global_search::{
-        refresh_if_stale, show_global_search_window, GlobalSearchOutput, GlobalSearchState,
-    },
     message_search::{
         should_use_search_window, show_message_search_inline, show_message_search_window,
         MessageSearchState,
@@ -793,6 +795,8 @@ pub struct CrustApp {
     active_whisper_login: Option<String>,
     /// Deduplicates whisper emote/emoji image fetches while loading.
     whisper_pending_images: HashSet<String>,
+    /// Deduplicates live-feed thumbnail fetches.
+    live_feed_pending_thumbnails: HashSet<String>,
     /// Startup loading overlay (shown until initial emotes + history are ready).
     loading_screen: LoadingScreen,
     /// Cached stream status per channel (key = channel login, lowercase).
@@ -813,6 +817,12 @@ pub struct CrustApp {
     live_map_cache: HashMap<String, bool>,
     /// Tracks watched channels and suppresses duplicate live/offline transitions.
     stream_tracker: StreamStatusTracker,
+    /// Cross-platform audio ping player for highlight / whisper / sub / raid
+    /// / custom-highlight events. See [`crate::sound::SoundController`].
+    sound_controller: crate::sound::SoundController,
+    /// Per-event sound configuration for the settings-page editor
+    /// (mirrors `AppSettings.sounds`; normalised on every update).
+    settings_sounds: crust_core::sound::SoundSettings,
     /// Short-lived pop-in banners for Sub / Raid / Bits events (cap 5).
     event_toasts: Vec<EventToast>,
     /// Backlog of toasts waiting for paced rendering.
@@ -856,6 +866,29 @@ pub struct CrustApp {
     pending_restore_channel: Option<String>,
     /// Last channel we persisted to disk (avoids spamming writes).
     last_saved_active_channel: Option<String>,
+    /// Channels that just became active via user intent (tab click, keyboard
+    /// nav, etc.). The MessageList widget drains this at render time and
+    /// treats it as an explicit "snap to bottom" signal so the user never
+    /// opens into the middle of a stale scroll offset.  Without this signal
+    /// the re-entry detection based on egui's cumulative_pass_nr can miss
+    /// edge cases (rapid click sequences, multi-pass frames, channels whose
+    /// scroll state was frozen while the user was scrolled up), and the
+    /// channel opens "black" until the user clicks Resume scrolling.
+    pending_active_snap: std::collections::HashSet<ChannelId>,
+    /// Snapshot of channels that were "visible" (single-pane active
+    /// channel, or any split-pane channel) at the end of the previous
+    /// update() call.  Used at the top of each frame to detect channel
+    /// activations that bypassed `activate_channel` (keyboard shortcuts,
+    /// pane focus changes, split-pane bookkeeping, etc.) by diffing
+    /// against the current set and snapping any newly-visible channel.
+    prev_frame_visible_channels: std::collections::HashSet<ChannelId>,
+    /// Clone of the egui `Context` captured at the start of every
+    /// `update()`.  Lets us write to ctx temp storage (and request
+    /// repaints) from places that otherwise don't carry a ctx reference
+    /// - in particular `activate_channel`, which needs to surface the
+    /// force-snap flag inside the SAME frame that it runs (not the
+    /// following frame) so MessageList sees it before it renders.
+    egui_ctx: Option<egui::Context>,
     /// Twitch overflow handling mode:
     /// `true` = Prevent, `false` = Highlight.
     prevent_overlong_twitch_messages: bool,
@@ -908,6 +941,18 @@ pub struct CrustApp {
     /// Ignored-phrase list (phrase actions are applied app-side; UI just owns the editor state).
     ignored_phrases: Vec<crust_core::ignores::IgnoredPhrase>,
     settings_ignored_phrases: Vec<crust_core::ignores::IgnoredPhrase>,
+
+    /// User-defined command aliases (live expansion list).
+    command_aliases: Vec<crust_core::commands::CommandAlias>,
+    /// Settings-page draft copy (mirrors AppSettings.command_aliases).
+    settings_command_aliases: Vec<crust_core::commands::CommandAlias>,
+
+    /// Active hotkey bindings consulted by keyboard shortcut handlers.
+    hotkey_bindings: crust_core::HotkeyBindings,
+    /// Settings-page draft copy (mirrors AppSettings.hotkey_bindings, merged with defaults).
+    settings_hotkey_bindings: crust_core::HotkeyBindings,
+    /// Action currently awaiting a captured key press (settings page only).
+    hotkey_capture_target: Option<crust_core::HotkeyAction>,
 
     /// Fetch + show alejo.io pronouns on the user profile popup.
     show_pronouns_in_usercard: bool,
@@ -964,6 +1009,17 @@ pub struct CrustApp {
     chatters_last_rebuild: Option<std::time::Instant>,
     /// Last emote picker preferences acknowledged by runtime settings.
     emote_picker_prefs_last_saved: Option<EmotePickerPreferences>,
+    /// Whether chat-input spellchecking is currently enabled. Mirrors
+    /// `AppSettings::spellcheck_enabled`; updated via
+    /// [`AppEvent::SpellDictionaryUpdated`].
+    spellcheck_enabled: bool,
+    /// Sorted snapshot of the user's custom spellcheck dictionary. The
+    /// authoritative copy is persisted in settings - this is a UI-side
+    /// mirror for the settings editor. Updated via
+    /// [`AppEvent::SpellDictionaryUpdated`].
+    spell_custom_dict: Vec<String>,
+    /// Draft "add word" input buffer for the settings-page dictionary editor.
+    spell_custom_dict_add_buf: String,
     /// Moderation tools dialog visibility.
     mod_tools_open: bool,
     /// Held AutoMod queue keyed by channel.
@@ -991,6 +1047,17 @@ pub struct CrustApp {
     settings_streamer_hide_link_previews: bool,
     settings_streamer_hide_viewer_counts: bool,
     settings_streamer_suppress_sounds: bool,
+    /// External tools (Streamlink + custom player)live values pushed from the worker.
+    external_streamlink_path: String,
+    external_streamlink_quality: String,
+    external_streamlink_extra_args: String,
+    external_player_template: String,
+    external_mpv_path: String,
+    external_streamlink_session_token: String,
+    /// Modal surfaced on launch when the panic hook left a crash report
+    /// behind in the previous session. Populated via
+    /// [`CrustApp::set_pending_crash_reports`] before the first paint.
+    crash_viewer: CrashViewer,
 }
 
 /// Apply the Crust colour palette to egui, reading the current dark/light
@@ -1048,6 +1115,131 @@ fn apply_theme_visuals(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
+/// Convert the stable key name stored in [`crust_core::KeyBinding`] to an
+/// [`egui::Key`]. Case-insensitive; returns `None` for unknown keys (those
+/// bindings are treated as inert until the user rebinds them).
+pub fn egui_key_from_name(name: &str) -> Option<egui::Key> {
+    let n = name.trim();
+    if n.is_empty() {
+        return None;
+    }
+    // Match the exact `egui::Key` variant names first (what
+    // `egui_key_name` below emits). This is the hot path for bindings
+    // persisted by our own settings round-trip.
+    use egui::Key::*;
+    Some(match n {
+        "A" | "a" => A, "B" | "b" => B, "C" | "c" => C, "D" | "d" => D,
+        "E" | "e" => E, "F" | "f" => F, "G" | "g" => G, "H" | "h" => H,
+        "I" | "i" => I, "J" | "j" => J, "K" | "k" => K, "L" | "l" => L,
+        "M" | "m" => M, "N" | "n" => N, "O" | "o" => O, "P" | "p" => P,
+        "Q" | "q" => Q, "R" | "r" => R, "S" | "s" => S, "T" | "t" => T,
+        "U" | "u" => U, "V" | "v" => V, "W" | "w" => W, "X" | "x" => X,
+        "Y" | "y" => Y, "Z" | "z" => Z,
+        "Num0" | "0" => Num0, "Num1" | "1" => Num1, "Num2" | "2" => Num2,
+        "Num3" | "3" => Num3, "Num4" | "4" => Num4, "Num5" | "5" => Num5,
+        "Num6" | "6" => Num6, "Num7" | "7" => Num7, "Num8" | "8" => Num8,
+        "Num9" | "9" => Num9,
+        "F1" => F1, "F2" => F2, "F3" => F3, "F4" => F4, "F5" => F5,
+        "F6" => F6, "F7" => F7, "F8" => F8, "F9" => F9, "F10" => F10,
+        "F11" => F11, "F12" => F12,
+        "ArrowUp" | "Up" => ArrowUp,
+        "ArrowDown" | "Down" => ArrowDown,
+        "ArrowLeft" | "Left" => ArrowLeft,
+        "ArrowRight" | "Right" => ArrowRight,
+        "PageUp" => PageUp,
+        "PageDown" => PageDown,
+        "Home" => Home,
+        "End" => End,
+        "Tab" => Tab,
+        "Enter" | "Return" => Enter,
+        "Escape" | "Esc" => Escape,
+        "Backspace" => Backspace,
+        "Insert" | "Ins" => Insert,
+        "Delete" | "Del" => Delete,
+        "Space" => Space,
+        "Minus" | "-" => Minus,
+        "Plus" | "+" => Plus,
+        "Equals" | "=" => Equals,
+        "Comma" | "," => Comma,
+        "Period" | "." => Period,
+        "Semicolon" | ";" => Semicolon,
+        "Slash" | "/" => Slash,
+        "Backslash" | "\\" => Backslash,
+        "OpenBracket" | "[" => OpenBracket,
+        "CloseBracket" | "]" => CloseBracket,
+        "Backtick" | "`" => Backtick,
+        "Quote" | "'" => Quote,
+        _ => return None,
+    })
+}
+
+/// Stable reverse mapping used by the "capture hotkey" UI so we persist
+/// exactly the variant names `egui_key_from_name` expects back.
+pub fn egui_key_name(key: egui::Key) -> &'static str {
+    use egui::Key::*;
+    match key {
+        A => "A", B => "B", C => "C", D => "D", E => "E", F => "F",
+        G => "G", H => "H", I => "I", J => "J", K => "K", L => "L",
+        M => "M", N => "N", O => "O", P => "P", Q => "Q", R => "R",
+        S => "S", T => "T", U => "U", V => "V", W => "W", X => "X",
+        Y => "Y", Z => "Z",
+        Num0 => "Num0", Num1 => "Num1", Num2 => "Num2", Num3 => "Num3",
+        Num4 => "Num4", Num5 => "Num5", Num6 => "Num6", Num7 => "Num7",
+        Num8 => "Num8", Num9 => "Num9",
+        F1 => "F1", F2 => "F2", F3 => "F3", F4 => "F4", F5 => "F5",
+        F6 => "F6", F7 => "F7", F8 => "F8", F9 => "F9", F10 => "F10",
+        F11 => "F11", F12 => "F12",
+        ArrowUp => "ArrowUp", ArrowDown => "ArrowDown",
+        ArrowLeft => "ArrowLeft", ArrowRight => "ArrowRight",
+        PageUp => "PageUp", PageDown => "PageDown",
+        Home => "Home", End => "End",
+        Tab => "Tab", Enter => "Enter", Escape => "Escape",
+        Backspace => "Backspace", Insert => "Insert", Delete => "Delete",
+        Space => "Space",
+        Minus => "Minus", Plus => "Plus", Equals => "Equals",
+        Comma => "Comma", Period => "Period", Semicolon => "Semicolon",
+        Slash => "Slash", Backslash => "Backslash",
+        OpenBracket => "OpenBracket", CloseBracket => "CloseBracket",
+        Backtick => "Backtick", Quote => "Quote",
+        // Any other `egui::Key` variant we don't currently expose falls
+        // back to a stable string so persistence round-trips; next load
+        // `egui_key_from_name` will return None and the binding becomes
+        // inert until the user rebinds it.
+        _ => "",
+    }
+}
+
+/// Compose an [`egui::Modifiers`] mask from a [`crust_core::KeyBinding`].
+fn binding_modifiers(binding: &crust_core::KeyBinding) -> egui::Modifiers {
+    let mut m = egui::Modifiers::NONE;
+    if binding.ctrl {
+        m |= egui::Modifiers::CTRL;
+    }
+    if binding.shift {
+        m |= egui::Modifiers::SHIFT;
+    }
+    if binding.alt {
+        m |= egui::Modifiers::ALT;
+    }
+    if binding.command {
+        m |= egui::Modifiers::COMMAND;
+    }
+    m
+}
+
+/// Try to consume a hotkey press matching `binding` from the egui input
+/// queue. Returns false for unbound or unknown-key bindings so callers can
+/// short-circuit without extra checks.
+fn consume_binding(input: &mut egui::InputState, binding: &crust_core::KeyBinding) -> bool {
+    if binding.is_unbound() {
+        return false;
+    }
+    let Some(key) = egui_key_from_name(&binding.key) else {
+        return false;
+    };
+    input.consume_key(binding_modifiers(binding), key)
+}
+
 impl CrustApp {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
@@ -1100,6 +1292,7 @@ impl CrustApp {
             whisper_unread_mentions: HashMap::new(),
             active_whisper_login: None,
             whisper_pending_images: HashSet::new(),
+            live_feed_pending_thumbnails: HashSet::new(),
             loading_screen: LoadingScreen::default(),
             stream_statuses: HashMap::new(),
             stream_status_fetched: HashMap::new(),
@@ -1108,6 +1301,8 @@ impl CrustApp {
             last_active_stream_refresh: std::time::Instant::now(),
             live_map_cache: HashMap::new(),
             stream_tracker: StreamStatusTracker::default(),
+            sound_controller: crate::sound::SoundController::new(),
+            settings_sounds: crust_core::sound::SoundSettings::with_defaults(),
             event_toasts: Vec::new(),
             event_toast_queue: VecDeque::new(),
             last_event_toast_emit: None,
@@ -1130,6 +1325,9 @@ impl CrustApp {
             applied_pixels_per_point: 0.0,
             pending_restore_channel: None,
             last_saved_active_channel: None,
+            pending_active_snap: std::collections::HashSet::new(),
+            prev_frame_visible_channels: std::collections::HashSet::new(),
+            egui_ctx: None,
             prevent_overlong_twitch_messages: true,
             collapse_long_messages: true,
             collapse_long_message_lines: 8,
@@ -1157,6 +1355,11 @@ impl CrustApp {
             compiled_ignored_users: crust_core::ignores::CompiledIgnoredUsers::new(&[]),
             ignored_phrases: Vec::new(),
             settings_ignored_phrases: Vec::new(),
+            command_aliases: Vec::new(),
+            settings_command_aliases: Vec::new(),
+            hotkey_bindings: crust_core::HotkeyBindings::defaults(),
+            settings_hotkey_bindings: crust_core::HotkeyBindings::defaults(),
+            hotkey_capture_target: None,
             show_pronouns_in_usercard: false,
             desktop_notifications_enabled: false,
             update_checks_enabled: true,
@@ -1182,6 +1385,9 @@ impl CrustApp {
             chatters_dirty: HashSet::new(),
             chatters_last_rebuild: None,
             emote_picker_prefs_last_saved: None,
+            spellcheck_enabled: true,
+            spell_custom_dict: Vec::new(),
+            spell_custom_dict_add_buf: String::new(),
             mod_tools_open: false,
             automod_queue: HashMap::new(),
             unban_requests: HashMap::new(),
@@ -1197,7 +1403,35 @@ impl CrustApp {
             settings_streamer_hide_link_previews: true,
             settings_streamer_hide_viewer_counts: true,
             settings_streamer_suppress_sounds: true,
+            external_streamlink_path: String::new(),
+            external_streamlink_quality: "best".to_owned(),
+            external_streamlink_extra_args: String::new(),
+            external_player_template: "{streamlink} --player {mpv} twitch.tv/{channel} {quality}"
+                .to_owned(),
+            external_mpv_path: String::new(),
+            external_streamlink_session_token: String::new(),
+            crash_viewer: CrashViewer::default(),
         }
+    }
+
+    /// Install any crash reports that were recovered from the last
+    /// session's panic hook. Safe to call with an empty `Vec` - the
+    /// viewer widget only auto-opens when at least one report is
+    /// present.
+    pub fn set_pending_crash_reports(&mut self, reports: Vec<CrashReportMeta>) {
+        self.crash_viewer.set_pending_reports(reports);
+    }
+
+    /// Register a cleanup closure that runs before the crash viewer's
+    /// "Restart Crust" button calls `std::process::exit`. The app
+    /// crate uses this to defuse its active session sentinel so the
+    /// relaunched process does not treat the current run as an
+    /// abnormal shutdown.
+    pub fn set_crash_pre_exit_hook<F>(&mut self, f: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.crash_viewer.set_pre_exit_hook(f);
     }
 
     fn appearance_snapshot(&self) -> AppearanceSnapshot {
@@ -1286,9 +1520,17 @@ impl CrustApp {
         truncated
     }
 
+    /// Recompute whether the audio backend should stay muted based on the
+    /// current streamer-mode state. Called whenever either
+    /// `streamer_mode_active` or `streamer_suppress_sounds` changes.
+    fn sync_sound_suppression(&self) {
+        self.sound_controller
+            .set_suppressed(self.streamer_mode_active && self.streamer_suppress_sounds);
+    }
+
     fn dispatch_desktop_notification(&self, title: &str, body: &str, with_sound: bool) {
-        let with_sound = with_sound
-            && !(self.streamer_mode_active && self.streamer_suppress_sounds);
+        let with_sound =
+            with_sound && !(self.streamer_mode_active && self.streamer_suppress_sounds);
         #[cfg(target_os = "windows")]
         {
             if with_sound {
@@ -1525,6 +1767,9 @@ exit 1
             t::raid_cyan(),
             true,
         );
+
+        self.sound_controller
+            .play_event(crust_core::sound::SoundEvent::Subscribe);
 
         if self.desktop_notifications_enabled {
             self.request_user_attention(ctx, egui::UserAttentionType::Informational);
@@ -1852,9 +2097,9 @@ exit 1
             return false;
         };
 
-        if spans.iter().any(|span| {
-            matches!(span, Span::Mention { login } if login.eq_ignore_ascii_case(username))
-        }) {
+        if spans.iter().any(
+            |span| matches!(span, Span::Mention { login } if login.eq_ignore_ascii_case(username)),
+        ) {
             return true;
         }
 
@@ -1922,8 +2167,11 @@ exit 1
                 for login in thread_order {
                     let is_selected = login == current_thread;
                     let unread = self.whisper_unread.get(login).copied().unwrap_or(0);
-                    let unread_mentions =
-                        self.whisper_unread_mentions.get(login).copied().unwrap_or(0);
+                    let unread_mentions = self
+                        .whisper_unread_mentions
+                        .get(login)
+                        .copied()
+                        .unwrap_or(0);
                     let last_line = self
                         .whisper_threads
                         .get(login)
@@ -2603,22 +2851,30 @@ exit 1
                 }
                 let is_active = self.state.active_channel.as_ref() == Some(&channel);
 
-                let highlight_match = crust_core::highlight::first_match_context(
+                let highlight_rule = crust_core::highlight::first_match_context_rule(
                     &self.highlight_rules,
                     &message.raw_text,
                     &message.sender.login,
                     &message.sender.display_name,
                     channel.display_name(),
                     message.flags.is_mention,
-                );
-                if highlight_match.is_some() {
+                )
+                .cloned();
+                if highlight_rule.is_some() {
                     message.flags.is_highlighted = true;
                 }
-                let (highlight_mentions, _highlight_alert, highlight_sound) = highlight_match
-                    .map(|(_, show_in_mentions, has_alert, has_sound)| {
-                        (show_in_mentions, has_alert, has_sound)
-                    })
-                    .unwrap_or((false, false, false));
+                let (highlight_mentions, _highlight_alert, highlight_sound, highlight_sound_url) =
+                    highlight_rule
+                        .as_ref()
+                        .map(|rule| {
+                            (
+                                rule.show_in_mentions,
+                                rule.has_alert,
+                                rule.has_sound,
+                                rule.sound_url.clone().filter(|s| !s.trim().is_empty()),
+                            )
+                        })
+                        .unwrap_or((false, false, false, None));
 
                 // Generate a short-lived event toast for high-visibility events.
                 // Only pop banners for the channel the user is watching.
@@ -2694,6 +2950,29 @@ exit 1
                 let mut chatters_became_dirty = false;
                 let mut request_attention: Option<egui::UserAttentionType> = None;
                 let mut desktop_notification: Option<(String, String, bool)> = None;
+                // Decide up-front whether this message also belongs in the
+                // cross-channel Mentions pseudo-tab. Cloned here because
+                // `message` gets moved into `ch.push_message` below. The
+                // actual push into `state.mentions` happens after the
+                // per-channel borrow is released (tracked via
+                // `mention_bump_unread`).
+                let mentions_capture: Option<ChatMessage> = if message.flags.is_highlighted
+                    || message.flags.is_mention
+                    || message.flags.is_first_msg
+                    || message.flags.is_pinned
+                    || highlight_mentions
+                {
+                    Some(message.clone())
+                } else {
+                    None
+                };
+                let mut mention_pushable = mentions_capture.is_some();
+                let mentions_tab_active = self
+                    .state
+                    .active_channel
+                    .as_ref()
+                    .map(|c| c.is_mentions())
+                    .unwrap_or(false);
                 if let Some(ch) = self.state.channels.get_mut(&channel) {
                     // Track the sender for @username autocomplete.
                     // Only real user messages (Chat, Bits, Sub with text) are
@@ -2725,6 +3004,13 @@ exit 1
                     let absorbed = message.flags.is_self
                         && message.server_id.is_some()
                         && ch.absorb_own_echo(&message);
+                    if absorbed {
+                        // Echo landed on an existing local copy; the mention
+                        // (if any) was already recorded when that local copy
+                        // was first pushed. Skip the mirror to avoid
+                        // double-counting in the Mentions tab.
+                        mention_pushable = false;
+                    }
                     if !absorbed {
                         // Only count unreads for live messages in background channels.
                         if !is_active && !message.flags.is_history {
@@ -2736,6 +3022,35 @@ exit 1
                                 || highlight_mentions
                             {
                                 ch.unread_mentions += 1;
+                            }
+                        }
+
+                        if !message.flags.is_history {
+                            // Audio pings are routed through the
+                            // cross-platform SoundController; streamer
+                            // mode suppression and per-event volume/path
+                            // lookup happen inside the controller.  The
+                            // rate limiter inside the controller prevents
+                            // overlapping plays when a single message
+                            // matches several conditions (eg. a mention
+                            // that also fires a highlight rule).
+                            if message.flags.is_mention {
+                                self.sound_controller
+                                    .play_event(crust_core::sound::SoundEvent::Mention);
+                            } else if highlight_sound {
+                                self.sound_controller
+                                    .play_highlight_override(highlight_sound_url.as_deref());
+                            }
+                            match &message.msg_kind {
+                                MsgKind::Sub { .. } => {
+                                    self.sound_controller
+                                        .play_event(crust_core::sound::SoundEvent::Subscribe);
+                                }
+                                MsgKind::Raid { .. } => {
+                                    self.sound_controller
+                                        .play_event(crust_core::sound::SoundEvent::Raid);
+                                }
+                                _ => {}
                             }
                         }
 
@@ -2775,6 +3090,23 @@ exit 1
                         }
 
                         ch.push_message(message);
+                    }
+                }
+                // Mirror the message into the cross-channel Mentions buffer
+                // if it qualifies. Done after the per-channel borrow is
+                // released so we can mutably touch `self.state` again. Only
+                // bump the Mentions-tab unread counter when the user is not
+                // already looking at that tab and the message is live
+                // (history replays get `is_history = true` upstream).
+                if mention_pushable {
+                    if let Some(mut m) = mentions_capture {
+                        // Preserve per-channel attribution on the clone even
+                        // if upstream code tweaked the live copy's `channel`
+                        // (defensive: state model guarantees it already).
+                        m.channel = channel.clone();
+                        let is_history = m.flags.is_history;
+                        let bump = !mentions_tab_active && !is_history;
+                        self.state.push_mention(m, bump);
                     }
                 }
                 if let Some(attention) = request_attention {
@@ -2824,7 +3156,8 @@ exit 1
 
                 let text = text.to_owned();
                 let spans = self.tokenize_whisper_text(&text, &twitch_emotes);
-                let mentions_current_user = self.whisper_message_mentions_current_user(&spans, &text);
+                let mentions_current_user =
+                    self.whisper_message_mentions_current_user(&spans, &text);
                 self.queue_whisper_span_images(&spans);
                 let notification_body_text = text.trim().to_owned();
 
@@ -2872,6 +3205,13 @@ exit 1
                             .entry(partner_login.clone())
                             .or_insert(0) += 1;
                     }
+                    if !is_self {
+                        // Audio ping for incoming whispers (self-echoes
+                        // from our own outgoing whispers don't deserve a
+                        // notification sound).
+                        self.sound_controller
+                            .play_event(crust_core::sound::SoundEvent::Whisper);
+                    }
                     if self.desktop_notifications_enabled {
                         let title = Self::truncate_notification_text(
                             &format!("Whisper from {display_name}"),
@@ -2903,6 +3243,7 @@ exit 1
                 raw_bytes,
             } => {
                 self.whisper_pending_images.remove(&uri);
+                self.live_feed_pending_thumbnails.remove(&uri);
                 // Stub events (empty bytes) are emitted by failed fetches just
                 // to advance the loading-screen image counter; skip actual insert.
                 if !raw_bytes.is_empty() {
@@ -3134,19 +3475,27 @@ exit 1
                 };
                 self.push_event_toast(text, Color32::from_rgb(219, 116, 116), false);
             }
+            AppEvent::MentionsLoaded { messages } => {
+                // Backfill the cross-channel Mentions pseudo-tab from the
+                // SQLite log on startup. Merge by timestamp so live mentions
+                // already accumulated during startup interleave correctly.
+                self.state.prepend_mentions_history(messages);
+            }
             AppEvent::HistoryLoaded { channel, messages } => {
                 if let Some(ch) = self.state.channels.get_mut(&channel) {
                     // Scroll to the seam between history and live chat so the
                     // user sees context instead of waking up at the bottom.
-                    // Only scroll when few live messages have accumulated (fresh
-                    // joins / startup), not on mid-session reconnects where the
-                    // user is already watching a full backlog.
+                    // Only scroll when there is a real seami.e. live chat
+                    // has already started accumulating. When the channel has
+                    // no live messages yet, scrolling to the "seam" would
+                    // force the newest history row to the top of the viewport
+                    // and leave the rest of the history above the foldwhich
+                    // makes the user's most recent sent message look like it's
+                    // pinned at the top. Fall through to normal stick-to-bottom
+                    // in that case.
                     let live_count_before = ch.messages.len();
-                    let seam_id = if live_count_before < 100 {
-                        ch.messages
-                            .front()
-                            .and_then(|m| m.server_id.clone())
-                            .or_else(|| messages.last().and_then(|m| m.server_id.clone()))
+                    let seam_id = if live_count_before > 0 && live_count_before < 100 {
+                        ch.messages.front().and_then(|m| m.server_id.clone())
                     } else {
                         None
                     };
@@ -3512,6 +3861,12 @@ exit 1
                 self.emote_picker.apply_preferences(&prefs);
                 self.emote_picker_prefs_last_saved = Some(prefs);
             }
+            AppEvent::SpellDictionaryUpdated { enabled, words } => {
+                self.spellcheck_enabled = enabled;
+                self.spell_custom_dict = words.clone();
+                crate::spellcheck::set_enabled(enabled);
+                crate::spellcheck::set_user_dict(words);
+            }
             AppEvent::RestoreLastActiveChannel { channel } => {
                 if !channel.is_empty() {
                     self.pending_restore_channel = Some(channel.clone());
@@ -3530,8 +3885,7 @@ exit 1
                 self.ui_font_size = t::set_ui_font_size(ui_font_size);
                 self.topbar_font_size = t::set_topbar_font_size(topbar_font_size);
                 self.tabs_font_size = t::set_tabs_font_size(tabs_font_size);
-                self.timestamps_font_size =
-                    t::set_timestamps_font_size(timestamps_font_size);
+                self.timestamps_font_size = t::set_timestamps_font_size(timestamps_font_size);
                 self.pills_font_size = t::set_pills_font_size(pills_font_size);
             }
             AppEvent::AppearanceSettingsUpdated {
@@ -3593,6 +3947,17 @@ exit 1
                 self.ignored_phrases = phrases.clone();
                 self.settings_ignored_phrases = phrases;
             }
+            AppEvent::CommandAliasesUpdated { aliases } => {
+                self.command_aliases = aliases.clone();
+                self.settings_command_aliases = aliases;
+            }
+            AppEvent::HotkeyBindingsUpdated { bindings } => {
+                // Runtime always feeds us the defaults-merged set so we
+                // don't have to remember which actions were missing.
+                let merged = crust_core::HotkeyBindings::from_pairs(bindings);
+                self.hotkey_bindings = merged.clone();
+                self.settings_hotkey_bindings = merged;
+            }
             AppEvent::UserPronounsLoaded { login, pronouns } => {
                 tracing::info!(
                     "UI: UserPronounsLoaded login={login} pronouns={:?}",
@@ -3617,10 +3982,59 @@ exit 1
                 self.settings_streamer_hide_link_previews = hide_link_previews;
                 self.settings_streamer_hide_viewer_counts = hide_viewer_counts;
                 self.settings_streamer_suppress_sounds = suppress_sounds;
+                self.sync_sound_suppression();
             }
             AppEvent::StreamerModeActiveChanged { active } => {
                 self.streamer_mode_active = active;
+                self.sync_sound_suppression();
             }
+            AppEvent::SoundSettingsUpdated { events } => {
+                let settings = crust_core::sound::SoundSettings::from_pairs(events);
+                self.settings_sounds = settings.clone();
+                self.sound_controller.apply_settings(settings);
+            }
+            AppEvent::ExternalToolsSettingsUpdated {
+                streamlink_path,
+                streamlink_quality,
+                streamlink_extra_args,
+                player_template,
+                mpv_path,
+                streamlink_session_token,
+            } => {
+                self.external_streamlink_path = streamlink_path;
+                self.external_streamlink_quality = streamlink_quality;
+                self.external_streamlink_extra_args = streamlink_extra_args;
+                self.external_player_template = player_template;
+                self.external_mpv_path = mpv_path;
+                self.external_streamlink_session_token = streamlink_session_token;
+            }
+            AppEvent::TabVisibilityRulesUpdated { rules } => {
+                let map: HashMap<ChannelId, TabVisibilityRule> = rules.into_iter().collect();
+                self.state.replace_tab_visibility_rules(map);
+            }
+            AppEvent::UploadStarted { channel: _ } => {
+                // Status already shown as a SystemNotice inline message.
+            }
+            AppEvent::UploadFinished { channel, result } => match result {
+                Ok(url) => {
+                    let buf = self.input_buf_for_channel_mut(&channel);
+                    if !buf.is_empty() && !buf.ends_with(' ') {
+                        buf.push(' ');
+                    }
+                    buf.push_str(&url);
+                    buf.push(' ');
+                    self.send_cmd(AppCommand::InjectLocalMessage {
+                        channel,
+                        text: format!("Upload complete: {url}"),
+                    });
+                }
+                Err(err) => {
+                    self.send_cmd(AppCommand::InjectLocalMessage {
+                        channel,
+                        text: format!("Upload failed: {err}"),
+                    });
+                }
+            },
             AppEvent::AuthExpired => {
                 warn!("Auth expired - checking refresh path");
                 let now = std::time::Instant::now();
@@ -3849,7 +4263,33 @@ exit 1
                 // Plugin UI interaction events are routed directly back into the
                 // plugin host; the main app state does not reduce them.
             }
+            AppEvent::LiveFeedUpdated { channels } => {
+                self.request_live_feed_thumbnails(&channels);
+                self.state.apply_live_snapshot(channels);
+            }
+            AppEvent::LiveFeedError { message } => {
+                self.state.apply_live_error(message);
+            }
+            AppEvent::LiveFeedPartialUpdate { channels, error } => {
+                self.request_live_feed_thumbnails(&channels);
+                self.state.apply_live_partial(channels, error);
+            }
         }
+    }
+
+    /// Resolve the input-buffer that should receive text for `channel`.
+    /// Prefers a matching split pane; falls back to the classic single-channel
+    /// input buffer.
+    fn input_buf_for_channel_mut(&mut self, channel: &ChannelId) -> &mut String {
+        if let Some(pane) = self
+            .split_panes
+            .panes
+            .iter_mut()
+            .find(|p| &p.channel == channel)
+        {
+            return &mut pane.input_buf;
+        }
+        &mut self.chat_input_buf
     }
 
     fn send_cmd(&self, cmd: AppCommand) {
@@ -3865,6 +4305,43 @@ exit 1
             Err(TrySendError::Closed(_)) => {
                 warn!("Command channel closed");
             }
+        }
+    }
+
+    /// Apply the user's custom command aliases to `text` before it hits the
+    /// slash parser or chat backend. Returns `Ok(None)` when the text was
+    /// unchanged (no alias matched), `Ok(Some(expanded))` when an alias
+    /// expanded successfully, or `Err(cmd)` with an `InjectLocalMessage`
+    /// error the caller should dispatch instead of the original text (e.g.
+    /// when the alias chain cycled).
+    ///
+    /// Keep this side-effect free: the caller is responsible for injecting
+    /// the error and for routing the expanded text through the normal
+    /// dispatch path.
+    fn expand_outgoing_aliases(
+        &self,
+        text: &str,
+        channel: &ChannelId,
+    ) -> Result<Option<String>, AppCommand> {
+        if self.command_aliases.is_empty() {
+            return Ok(None);
+        }
+        let channel_login = channel.display_name();
+        let user_login = self.state.auth.username.clone().unwrap_or_default();
+        match crust_core::commands::expand_command_aliases(
+            text,
+            &self.command_aliases,
+            channel_login,
+            &user_login,
+        ) {
+            Ok(crust_core::commands::AliasExpansion::Unchanged) => Ok(None),
+            Ok(crust_core::commands::AliasExpansion::Expanded { text, .. }) => {
+                Ok(Some(text))
+            }
+            Err(err) => Err(AppCommand::InjectLocalMessage {
+                channel: channel.clone(),
+                text: err.user_message(),
+            }),
         }
     }
 
@@ -3915,12 +4392,11 @@ exit 1
             .map(|s| s.messages.iter().any(|m| m.id == msg_id))
             .unwrap_or(false);
         if !still_present {
-            self.push_event_toast(
-                "Message no longer in buffer".to_string(),
-                t::red(),
-                false,
+            self.push_event_toast("Message no longer in buffer".to_string(), t::red(), false);
+            tracing::warn!(
+                "global search jump target evicted from buffer: {:?}",
+                channel
             );
-            tracing::warn!("global search jump target evicted from buffer: {:?}", channel);
             return;
         }
         self.state.active_channel = Some(channel.clone());
@@ -4166,11 +4642,23 @@ exit 1
 
     /// Handle Ctrl+= / Ctrl+- / Ctrl+0 and Ctrl+scroll for chat-font zoom.
     fn handle_font_zoom_shortcuts(&mut self, ctx: &Context) {
+        let zoom_in = self.hotkey_bindings.get(crust_core::HotkeyAction::ZoomIn);
+        // Also accept Ctrl+Plus as a synonym when the default Ctrl+= is in
+        // effect - on many keyboard layouts Plus and Equals share a key
+        // and egui routes them differently.
+        let accept_plus_alias = zoom_in
+            == crust_core::KeyBinding::new("Equals").with_ctrl();
+        let zoom_out = self.hotkey_bindings.get(crust_core::HotkeyAction::ZoomOut);
+        let zoom_reset = self.hotkey_bindings.get(crust_core::HotkeyAction::ZoomReset);
         let (grow, shrink, reset, zoom_delta) = ctx.input_mut(|i| {
-            let grow = i.consume_key(egui::Modifiers::CTRL, egui::Key::Equals)
-                || i.consume_key(egui::Modifiers::CTRL, egui::Key::Plus);
-            let shrink = i.consume_key(egui::Modifiers::CTRL, egui::Key::Minus);
-            let reset = i.consume_key(egui::Modifiers::CTRL, egui::Key::Num0);
+            let mut grow = consume_binding(i, &zoom_in);
+            if accept_plus_alias
+                && i.consume_key(egui::Modifiers::CTRL, egui::Key::Plus)
+            {
+                grow = true;
+            }
+            let shrink = consume_binding(i, &zoom_out);
+            let reset = consume_binding(i, &zoom_reset);
             // egui collapses Ctrl+wheel into Zoom events. Drain them here so
             // they adjust chat font instead of the (unused) ctx pixels_per_point
             // zoom pipeline.
@@ -4232,18 +4720,19 @@ exit 1
     }
 
     fn handle_search_shortcuts(&mut self, ctx: &Context) {
-        // IMPORTANT: check Ctrl+Shift+F BEFORE Ctrl+F.
-        // egui's `consume_key` uses `matches_logically`, so Ctrl+Shift+F satisfies
-        // a plain Ctrl+F check. Most specific shortcut must run first.
-        let toggle_global = ctx.input_mut(|i| {
-            let shift_ctrl = egui::Modifiers {
-                ctrl: true,
-                shift: true,
-                ..Default::default()
-            };
-            i.consume_key(shift_ctrl, egui::Key::F)
-        });
-        if toggle_global {
+        // IMPORTANT: check the global (Ctrl+Shift+F by default) BEFORE the
+        // per-channel search. egui's `consume_key` uses
+        // `matches_logically`, so a binding like Ctrl+Shift+F satisfies a
+        // plain Ctrl+F check. Run the more specific shortcut first.
+        let toggle_global = self
+            .hotkey_bindings
+            .get(crust_core::HotkeyAction::ToggleGlobalSearch);
+        let open_msg_search = self
+            .hotkey_bindings
+            .get(crust_core::HotkeyAction::OpenMessageSearch);
+        let toggle_global_pressed =
+            ctx.input_mut(|i| consume_binding(i, &toggle_global));
+        if toggle_global_pressed {
             if self.global_search.open {
                 self.global_search.close();
             } else {
@@ -4251,7 +4740,9 @@ exit 1
             }
         }
 
-        let open_search = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::F));
+        let open_search = ctx.input_mut(|i| consume_binding(i, &open_msg_search));
+        // Escape is a fixed overlay-close gesture: not remappable because
+        // too many overlays rely on it.
         let close_search =
             ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         let Some(channel) = self.active_search_target() else {
@@ -4336,7 +4827,11 @@ exit 1
                 label: format!("@{display_name}"),
                 subtitle: Some("Whisper thread".to_owned()),
                 unread_count: self.whisper_unread.get(login).copied().unwrap_or(0),
-                unread_mentions: self.whisper_unread_mentions.get(login).copied().unwrap_or(0),
+                unread_mentions: self
+                    .whisper_unread_mentions
+                    .get(login)
+                    .copied()
+                    .unwrap_or(0),
             });
         }
 
@@ -4356,8 +4851,10 @@ exit 1
 
     /// Returns true when the quick-switch palette is open/consuming hotkeys.
     fn handle_quick_switch_shortcuts(&mut self, ctx: &Context) -> bool {
-        let open_requested =
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::K));
+        let open_binding = self
+            .hotkey_bindings
+            .get(crust_core::HotkeyAction::OpenQuickSwitcher);
+        let open_requested = ctx.input_mut(|i| consume_binding(i, &open_binding));
         if open_requested {
             self.open_channel_quick_switch();
             return true;
@@ -4432,7 +4929,9 @@ exit 1
                 let input_resp = ui.add(
                     egui::TextEdit::singleline(&mut self.quick_switch.query)
                         .desired_width(f32::INFINITY)
-                        .hint_text("Type channel/login (supports twitch:, kick:, irc://, whisper:)")
+                        .hint_text(
+                            "Type channel/login (supports twitch:, kick:, irc://, whisper:)",
+                        ),
                 );
                 if self.quick_switch.focus_query {
                     input_resp.request_focus();
@@ -4580,9 +5079,71 @@ exit 1
         });
     }
 
+    /// Known live state for `channel`, used by tab-visibility rules.
+    ///
+    /// Returns `Some(true)` / `Some(false)` when a stream-status snapshot
+    /// exists for a Twitch channel, `None` when the status is unknown
+    /// (pre-first-fetch, or non-Twitch channels where we don't track
+    /// live-state). Callers should treat `None` as "keep visible" so a
+    /// `hide_when_offline` tab never silently disappears before the
+    /// first status probe returns.
+    fn channel_live_status(&self, channel: &ChannelId) -> Option<bool> {
+        if !channel.is_twitch() || channel.is_virtual() {
+            return None;
+        }
+        self.live_map_cache
+            .get(&channel.display_name().to_ascii_lowercase())
+            .copied()
+    }
+
+    /// True when the tab for `channel` should be hidden by its configured
+    /// visibility rule given the current live state. The active channel
+    /// and virtual pins (Live / Mentions) are never reported hidden.
+    fn tab_is_hidden(&self, channel: &ChannelId) -> bool {
+        if channel.is_virtual() {
+            return false;
+        }
+        self.state
+            .is_tab_hidden(channel, self.channel_live_status(channel))
+    }
+
     fn activate_channel(&mut self, channel: ChannelId) {
         if let Some(state) = self.state.channels.get_mut(&channel) {
             state.mark_read();
+        }
+        // Activating the Mentions pseudo-tab clears its unread counter.
+        // (Real channels already clear via `mark_read` above; the Mentions
+        // buffer lives separately on AppState.)
+        if channel.is_mentions() {
+            self.state.clear_mentions_unread();
+        }
+        // Whenever the user explicitly activates a channel we want the
+        // MessageList to snap to the bottom and clear any stale "paused"
+        // state, so the channel never opens into dead space above a frozen
+        // scroll offset (the "channel is black until I click Resume
+        // scrolling" bug).  This is the authoritative user-intent signal,
+        // complementing the cumulative_pass_nr heuristic inside MessageList.
+        let channel_changed = self
+            .state
+            .active_channel
+            .as_ref()
+            .map(|cur| cur != &channel)
+            .unwrap_or(true);
+        if channel_changed {
+            self.pending_active_snap.insert(channel.clone());
+            // Also write the force-snap flag directly to egui temp storage
+            // so the MessageList that renders later in THIS same frame
+            // picks it up immediately.  Without this, activation only
+            // takes effect on the following frame (because the top-of-
+            // update flush already ran before the user click was
+            // processed), leaving a visible "black chat" transient or -
+            // worse - losing the snap entirely if the stale paused
+            // offset anchors below the viewport.
+            if let Some(ctx) = self.egui_ctx.as_ref() {
+                let key = egui::Id::new("ml_force_snap").with(channel.as_str());
+                ctx.data_mut(|d| d.insert_temp(key, true));
+                ctx.request_repaint();
+            }
         }
         if !self.split_panes.panes.is_empty() {
             let focused = self.split_panes.focused;
@@ -4597,6 +5158,9 @@ exit 1
 
     /// Persist the currently-focused channel so it can be restored next launch.
     fn persist_active_channel(&mut self, channel: &ChannelId) {
+        if channel.is_virtual() {
+            return; // Pseudo-tabs (Live / Mentions) can never be restored by id.
+        }
         let key = channel.0.clone();
         if self.last_saved_active_channel.as_deref() == Some(key.as_str()) {
             return;
@@ -4612,6 +5176,12 @@ exit 1
             return;
         };
         let target = ChannelId(key);
+        if target.is_virtual() {
+            // Pseudo-tab sentinels can never appear in state.channels; clear
+            // immediately so they don't permanently suppress persistence.
+            self.pending_restore_channel = None;
+            return;
+        }
         if self.state.channels.contains_key(&target) {
             self.activate_channel(target);
             self.pending_restore_channel = None;
@@ -4625,6 +5195,17 @@ exit 1
         // the previous-session channel to come online; otherwise a transient
         // "first channel in list" activation clobbers the user's choice.
         if self.pending_restore_channel.is_some() {
+            return;
+        }
+        // Never persist any pseudo-tab sentinel (Live / Mentions) as the
+        // last-active channel; restore would never find them anyway.
+        if self
+            .state
+            .active_channel
+            .as_ref()
+            .map(|c| c.is_virtual())
+            .unwrap_or(false)
+        {
             return;
         }
         let current = self.state.active_channel.as_ref().map(|c| c.0.clone());
@@ -4692,6 +5273,36 @@ exit 1
     }
 
     fn handle_channel_shortcuts(&mut self, ctx: &Context) {
+        use crust_core::HotkeyAction;
+        let next_b = self.hotkey_bindings.get(HotkeyAction::NextTab);
+        let prev_b = self.hotkey_bindings.get(HotkeyAction::PrevTab);
+        let move_left_b = self.hotkey_bindings.get(HotkeyAction::MoveTabLeft);
+        let move_right_b = self.hotkey_bindings.get(HotkeyAction::MoveTabRight);
+        let first_b = self.hotkey_bindings.get(HotkeyAction::FirstTab);
+        let last_b = self.hotkey_bindings.get(HotkeyAction::LastTab);
+        let split_prev_b = self.hotkey_bindings.get(HotkeyAction::SplitFocusPrev);
+        let split_next_b = self.hotkey_bindings.get(HotkeyAction::SplitFocusNext);
+        let split_move_left_b = self.hotkey_bindings.get(HotkeyAction::SplitMoveLeft);
+        let split_move_right_b = self.hotkey_bindings.get(HotkeyAction::SplitMoveRight);
+        let tab_slots = [
+            self.hotkey_bindings.get(HotkeyAction::SelectTab1),
+            self.hotkey_bindings.get(HotkeyAction::SelectTab2),
+            self.hotkey_bindings.get(HotkeyAction::SelectTab3),
+            self.hotkey_bindings.get(HotkeyAction::SelectTab4),
+            self.hotkey_bindings.get(HotkeyAction::SelectTab5),
+            self.hotkey_bindings.get(HotkeyAction::SelectTab6),
+            self.hotkey_bindings.get(HotkeyAction::SelectTab7),
+            self.hotkey_bindings.get(HotkeyAction::SelectTab8),
+            self.hotkey_bindings.get(HotkeyAction::SelectTab9),
+        ];
+
+        // Legacy aliases: users who haven't rebound get the full Chatterino
+        // Ctrl+Tab / Ctrl+PageDown / Alt+Right set for free.  Once they
+        // customize the binding, only their chosen shortcut fires.
+        let defaults = crust_core::HotkeyBindings::defaults();
+        let next_legacy = next_b == defaults.get(HotkeyAction::NextTab);
+        let prev_legacy = prev_b == defaults.get(HotkeyAction::PrevTab);
+
         let (
             next,
             prev,
@@ -4705,56 +5316,33 @@ exit 1
             split_move_left,
             split_move_right,
         ) = ctx.input_mut(|i| {
-            let ctrl_shift = egui::Modifiers {
-                ctrl: true,
-                shift: true,
-                ..Default::default()
-            };
-            let next = i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab)
-                || i.consume_key(egui::Modifiers::CTRL, egui::Key::PageDown)
-                || i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowRight);
-            let prev = i.consume_key(ctrl_shift, egui::Key::Tab)
-                || i.consume_key(egui::Modifiers::CTRL, egui::Key::PageUp)
-                || i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowLeft);
-            let move_left = i.consume_key(
-                egui::Modifiers::ALT | egui::Modifiers::SHIFT,
-                egui::Key::ArrowLeft,
-            );
-            let move_right = i.consume_key(
-                egui::Modifiers::ALT | egui::Modifiers::SHIFT,
-                egui::Key::ArrowRight,
-            );
-            let first = i.consume_key(egui::Modifiers::CTRL, egui::Key::Home);
-            let last = i.consume_key(egui::Modifiers::CTRL, egui::Key::End);
-            let split_prev = i.consume_key(
-                egui::Modifiers::CTRL | egui::Modifiers::ALT,
-                egui::Key::PageUp,
-            );
-            let split_next = i.consume_key(
-                egui::Modifiers::CTRL | egui::Modifiers::ALT,
-                egui::Key::PageDown,
-            );
-            let split_move_left = i.consume_key(
-                egui::Modifiers::CTRL | egui::Modifiers::ALT | egui::Modifiers::SHIFT,
-                egui::Key::ArrowLeft,
-            );
-            let split_move_right = i.consume_key(
-                egui::Modifiers::CTRL | egui::Modifiers::ALT | egui::Modifiers::SHIFT,
-                egui::Key::ArrowRight,
-            );
-            let direct_idx = [
-                egui::Key::Num1,
-                egui::Key::Num2,
-                egui::Key::Num3,
-                egui::Key::Num4,
-                egui::Key::Num5,
-                egui::Key::Num6,
-                egui::Key::Num7,
-                egui::Key::Num8,
-                egui::Key::Num9,
-            ]
-            .iter()
-            .position(|key| i.consume_key(egui::Modifiers::CTRL, *key));
+            let mut next = consume_binding(i, &next_b);
+            if next_legacy {
+                if i.consume_key(egui::Modifiers::CTRL, egui::Key::PageDown)
+                    || i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowRight)
+                {
+                    next = true;
+                }
+            }
+            let mut prev = consume_binding(i, &prev_b);
+            if prev_legacy {
+                if i.consume_key(egui::Modifiers::CTRL, egui::Key::PageUp)
+                    || i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowLeft)
+                {
+                    prev = true;
+                }
+            }
+            let move_left = consume_binding(i, &move_left_b);
+            let move_right = consume_binding(i, &move_right_b);
+            let first = consume_binding(i, &first_b);
+            let last = consume_binding(i, &last_b);
+            let split_prev = consume_binding(i, &split_prev_b);
+            let split_next = consume_binding(i, &split_next_b);
+            let split_move_left = consume_binding(i, &split_move_left_b);
+            let split_move_right = consume_binding(i, &split_move_right_b);
+            let direct_idx = tab_slots
+                .iter()
+                .position(|binding| consume_binding(i, binding));
             (
                 next,
                 prev,
@@ -4883,6 +5471,87 @@ exit 1
             self.activate_channel(target);
         }
     }
+
+    /// Dispatch `AppCommand::FetchImage` for every new thumbnail URL in a
+    /// live-feed snapshot, deduplicating via `live_feed_pending_thumbnails`
+    /// and the existing `emote_bytes` cache.
+    fn request_live_feed_thumbnails(
+        &mut self,
+        channels: &[crust_core::model::LiveChannelSnapshot],
+    ) {
+        for snap in channels {
+            if snap.thumbnail_url.is_empty() {
+                continue;
+            }
+            if self.emote_bytes.contains_key(&snap.thumbnail_url) {
+                continue;
+            }
+            if self
+                .live_feed_pending_thumbnails
+                .insert(snap.thumbnail_url.clone())
+            {
+                let _ = self
+                    .cmd_tx
+                    .try_send(crust_core::events::AppCommand::FetchImage {
+                        url: snap.thumbnail_url.clone(),
+                    });
+            }
+        }
+    }
+
+    /// Apply a `LiveFeedAction` produced by the LiveFeed widget.
+    fn handle_live_feed_action(&mut self, action: crate::widgets::live_feed::LiveFeedAction) {
+        use crate::widgets::live_feed::LiveFeedAction;
+        match action {
+            LiveFeedAction::OpenChannel(login) => {
+                let id = crust_core::ChannelId::new(&login);
+                if self.state.channel_order.contains(&id) {
+                    self.state.active_channel = Some(id);
+                } else {
+                    // Navigate to the new tab immediately; the JoinChannel
+                    // command's ChannelJoined event arrives later but won't
+                    // change `active_channel` since join_channel only sets it
+                    // when active_channel is None.
+                    self.state.active_channel = Some(id.clone());
+                    let _ = self
+                        .cmd_tx
+                        .try_send(crust_core::events::AppCommand::JoinChannel { channel: id });
+                }
+            }
+            LiveFeedAction::Refresh => {
+                let _ = self
+                    .cmd_tx
+                    .try_send(crust_core::events::AppCommand::LiveFeedRefresh);
+            }
+            LiveFeedAction::OpenStreamlink(login) => {
+                let _ = self
+                    .cmd_tx
+                    .try_send(crust_core::events::AppCommand::OpenStreamlink { channel: login });
+            }
+            LiveFeedAction::OpenInPlayer(login) => {
+                let _ = self
+                    .cmd_tx
+                    .try_send(crust_core::events::AppCommand::OpenPlayer { channel: login });
+            }
+        }
+    }
+
+    /// Handle a Mentions-tab row / pill click: switch to the source channel
+    /// and schedule a scroll-to-message for the next frame. If the source
+    /// channel is no longer joined, we silently no-op - the mention row
+    /// itself already contains the full message text so the user has not
+    /// lost information.
+    fn jump_to_mention(&mut self, target: crate::widgets::mentions::MentionJumpTarget) {
+        if !self.state.channels.contains_key(&target.channel) {
+            return;
+        }
+        // Queue the scroll-to BEFORE activating - activate_channel goes
+        // through the normal focus pipeline and next frame the chat renderer
+        // will consume `pending_scroll_to_message`.
+        self.pending_scroll_to_message
+            .insert(target.channel.clone(), target.message);
+        self.activate_channel(target.channel);
+    }
 }
 
 // eframe::App implementation
@@ -4895,6 +5564,14 @@ impl eframe::App for CrustApp {
         // `CRUST_SLOW_FRAME_MS` to an integer (default 100ms) to tune, or a
         // value over 10000 to disable.
         let frame_start = std::time::Instant::now();
+
+        // Keep a cloned ctx handle so non-UI code paths (e.g. activate_channel
+        // when triggered by events) can write to egui temp storage and
+        // request repaints directly.  egui::Context is internally Arc-based
+        // so cloning is cheap.
+        if self.egui_ctx.is_none() {
+            self.egui_ctx = Some(ctx.clone());
+        }
 
         if self.auth_refresh_inflight
             && self
@@ -4909,8 +5586,7 @@ impl eframe::App for CrustApp {
         // paint (one sort per dirty channel, regardless of how many new
         // chatters arrived).  Throttled to at most once every 500 ms so a
         // continuously-busy channel doesn't eat CPU on every paint.
-        const CHATTER_REBUILD_INTERVAL: std::time::Duration =
-            std::time::Duration::from_millis(500);
+        const CHATTER_REBUILD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
         if !self.chatters_dirty.is_empty()
             && self
                 .chatters_last_rebuild
@@ -4930,6 +5606,41 @@ impl eframe::App for CrustApp {
         self.apply_font_scale(ctx);
         self.try_restore_pending_channel();
         self.reconcile_last_active_channel();
+
+        // Detect channel activation that bypassed `activate_channel`
+        // (keyboard shortcuts, pane focus changes, split-pane swaps, etc.)
+        // by diffing the set of currently-visible channels against the
+        // previous frame's snapshot.  Any channel that wasn't visible
+        // last frame but is visible this frame counts as a fresh
+        // activation and is queued for snap-to-bottom.
+        let mut current_visible: std::collections::HashSet<ChannelId> =
+            std::collections::HashSet::new();
+        if let Some(ref ch) = self.state.active_channel {
+            current_visible.insert(ch.clone());
+        }
+        for pane in &self.split_panes.panes {
+            current_visible.insert(pane.channel.clone());
+        }
+        for ch in &current_visible {
+            if !self.prev_frame_visible_channels.contains(ch) {
+                self.pending_active_snap.insert(ch.clone());
+            }
+        }
+        self.prev_frame_visible_channels = current_visible;
+
+        // Surface any queued "user just activated this channel" signals to
+        // egui temp storage so MessageList::show can consume them this
+        // frame and force a snap-to-bottom regardless of stale paused
+        // state.  Drained on read inside MessageList.
+        if !self.pending_active_snap.is_empty() {
+            let queued: Vec<ChannelId> = self.pending_active_snap.drain().collect();
+            ctx.data_mut(|d| {
+                for ch in queued {
+                    let key = egui::Id::new("ml_force_snap").with(ch.as_str());
+                    d.insert_temp(key, true);
+                }
+            });
+        }
 
         let quick_switch_consumed = self.handle_quick_switch_shortcuts(ctx);
         if !quick_switch_consumed {
@@ -5200,6 +5911,11 @@ impl eframe::App for CrustApp {
         // -- Dialogs -----------------------------------------------------------
         self.show_channel_quick_switch(ctx);
 
+        // Surface recovered crash reports (if any) from the previous run.
+        // The viewer auto-opens when reports are installed and closes
+        // once the user dismisses or deletes them all.
+        self.crash_viewer.show(ctx);
+
         if let Some(ch) = self
             .join_dialog
             .show(ctx, self.kick_beta_enabled, self.irc_beta_enabled)
@@ -5304,6 +6020,9 @@ impl eframe::App for CrustApp {
                 nicknames: self.settings_nicknames.clone(),
                 ignored_users: self.settings_ignored_users.clone(),
                 ignored_phrases: self.settings_ignored_phrases.clone(),
+                command_aliases: self.settings_command_aliases.clone(),
+                hotkey_bindings: self.settings_hotkey_bindings.clone(),
+                hotkey_capture_target: self.hotkey_capture_target,
                 show_pronouns_in_usercard: self.show_pronouns_in_usercard,
                 plugin_ui: plugin_ui_snapshot.clone(),
                 plugin_statuses: plugin_host()
@@ -5315,6 +6034,17 @@ impl eframe::App for CrustApp {
                 streamer_hide_viewer_counts: self.settings_streamer_hide_viewer_counts,
                 streamer_suppress_sounds: self.settings_streamer_suppress_sounds,
                 streamer_mode_active: self.streamer_mode_active,
+                external_streamlink_path: self.external_streamlink_path.clone(),
+                external_streamlink_quality: self.external_streamlink_quality.clone(),
+                external_streamlink_extra_args: self.external_streamlink_extra_args.clone(),
+                external_player_template: self.external_player_template.clone(),
+                external_mpv_path: self.external_mpv_path.clone(),
+                external_streamlink_session_token: self.external_streamlink_session_token.clone(),
+                spellcheck_enabled: self.spellcheck_enabled,
+                spell_custom_dict: self.spell_custom_dict.clone(),
+                spell_custom_dict_add_buf: self.spell_custom_dict_add_buf.clone(),
+                sound_events: self.settings_sounds.clone(),
+                sound_preview_request: None,
             };
             let appearance_before = self.appearance_snapshot();
             let streamer_before = (
@@ -5363,17 +6093,12 @@ impl eframe::App for CrustApp {
                 || (state.timestamps_font_size - self.timestamps_font_size).abs() > 0.01
                 || (state.pills_font_size - self.pills_font_size).abs() > 0.01;
             if font_changed {
-                self.chat_font_size =
-                    t::set_chat_font_size(state.chat_font_size);
+                self.chat_font_size = t::set_chat_font_size(state.chat_font_size);
                 self.ui_font_size = t::set_ui_font_size(state.ui_font_size);
-                self.topbar_font_size =
-                    t::set_topbar_font_size(state.topbar_font_size);
-                self.tabs_font_size =
-                    t::set_tabs_font_size(state.tabs_font_size);
-                self.timestamps_font_size =
-                    t::set_timestamps_font_size(state.timestamps_font_size);
-                self.pills_font_size =
-                    t::set_pills_font_size(state.pills_font_size);
+                self.topbar_font_size = t::set_topbar_font_size(state.topbar_font_size);
+                self.tabs_font_size = t::set_tabs_font_size(state.tabs_font_size);
+                self.timestamps_font_size = t::set_timestamps_font_size(state.timestamps_font_size);
+                self.pills_font_size = t::set_pills_font_size(state.pills_font_size);
                 self.send_font_sizes();
             }
             if state.always_on_top != self.always_on_top {
@@ -5475,6 +6200,21 @@ impl eframe::App for CrustApp {
                     phrases: state.ignored_phrases.clone(),
                 });
             }
+            if state.command_aliases != self.settings_command_aliases {
+                self.send_cmd(crust_core::events::AppCommand::SetCommandAliases {
+                    aliases: state.command_aliases.clone(),
+                });
+            }
+            self.hotkey_capture_target = state.hotkey_capture_target;
+            if state.hotkey_bindings != self.settings_hotkey_bindings {
+                self.settings_hotkey_bindings = state.hotkey_bindings.clone();
+                // Update the live registry immediately so the change takes
+                // effect without waiting for the runtime's round-trip.
+                self.hotkey_bindings = state.hotkey_bindings.clone();
+                self.send_cmd(crust_core::events::AppCommand::SetHotkeyBindings {
+                    bindings: state.hotkey_bindings.to_pairs(),
+                });
+            }
             if state.show_pronouns_in_usercard != self.show_pronouns_in_usercard {
                 self.show_pronouns_in_usercard = state.show_pronouns_in_usercard;
                 self.send_cmd(crust_core::events::AppCommand::SetShowPronounsInUsercard {
@@ -5487,6 +6227,38 @@ impl eframe::App for CrustApp {
                     desktop_notifications_enabled: self.desktop_notifications_enabled,
                 });
             }
+            if let Some(event) = state.sound_preview_request {
+                self.sound_controller.preview_event(event);
+            }
+            if state.sound_events != self.settings_sounds {
+                let new_sounds = state.sound_events.clone().normalised();
+                self.settings_sounds = new_sounds.clone();
+                // Apply immediately so previews during the same
+                // settings-page session use the latest values even
+                // before the runtime round-trips a fresh snapshot.
+                self.sound_controller.apply_settings(new_sounds.clone());
+                self.send_cmd(AppCommand::SetSoundSettings {
+                    events: new_sounds.to_pairs(),
+                });
+            }
+            if state.spellcheck_enabled != self.spellcheck_enabled {
+                self.spellcheck_enabled = state.spellcheck_enabled;
+                crate::spellcheck::set_enabled(self.spellcheck_enabled);
+                self.send_cmd(AppCommand::SetSpellcheckEnabled {
+                    enabled: self.spellcheck_enabled,
+                });
+            }
+            self.spell_custom_dict_add_buf = state.spell_custom_dict_add_buf.clone();
+            if state.spell_custom_dict != self.spell_custom_dict {
+                // Optimistically mirror locally so the UI reflects the edit
+                // immediately. The runtime will echo back a sanitised list
+                // via `AppEvent::SpellDictionaryUpdated`.
+                self.spell_custom_dict = state.spell_custom_dict.clone();
+                crate::spellcheck::set_user_dict(self.spell_custom_dict.iter().cloned());
+                self.send_cmd(AppCommand::SetCustomSpellDictionary {
+                    words: state.spell_custom_dict.clone(),
+                });
+            }
             let streamer_after = (
                 state.streamer_mode.clone(),
                 state.streamer_hide_link_previews,
@@ -5495,16 +6267,37 @@ impl eframe::App for CrustApp {
             );
             if streamer_after != streamer_before {
                 self.settings_streamer_mode = state.streamer_mode.clone();
-                self.settings_streamer_hide_link_previews =
-                    state.streamer_hide_link_previews;
-                self.settings_streamer_hide_viewer_counts =
-                    state.streamer_hide_viewer_counts;
+                self.settings_streamer_hide_link_previews = state.streamer_hide_link_previews;
+                self.settings_streamer_hide_viewer_counts = state.streamer_hide_viewer_counts;
                 self.settings_streamer_suppress_sounds = state.streamer_suppress_sounds;
                 self.send_cmd(AppCommand::SetStreamerModeSettings {
                     mode: state.streamer_mode.clone(),
                     hide_link_previews: state.streamer_hide_link_previews,
                     hide_viewer_counts: state.streamer_hide_viewer_counts,
                     suppress_sounds: state.streamer_suppress_sounds,
+                });
+            }
+            if state.external_streamlink_path != self.external_streamlink_path
+                || state.external_streamlink_quality != self.external_streamlink_quality
+                || state.external_streamlink_extra_args != self.external_streamlink_extra_args
+                || state.external_player_template != self.external_player_template
+                || state.external_mpv_path != self.external_mpv_path
+                || state.external_streamlink_session_token != self.external_streamlink_session_token
+            {
+                self.external_streamlink_path = state.external_streamlink_path.clone();
+                self.external_streamlink_quality = state.external_streamlink_quality.clone();
+                self.external_streamlink_extra_args = state.external_streamlink_extra_args.clone();
+                self.external_player_template = state.external_player_template.clone();
+                self.external_mpv_path = state.external_mpv_path.clone();
+                self.external_streamlink_session_token =
+                    state.external_streamlink_session_token.clone();
+                self.send_cmd(AppCommand::SetExternalToolsSettings {
+                    streamlink_path: state.external_streamlink_path.clone(),
+                    streamlink_quality: state.external_streamlink_quality.clone(),
+                    streamlink_extra_args: state.external_streamlink_extra_args.clone(),
+                    player_template: state.external_player_template.clone(),
+                    mpv_path: state.external_mpv_path.clone(),
+                    streamlink_session_token: state.external_streamlink_session_token.clone(),
                 });
             }
             if state.update_checks_enabled != self.update_checks_enabled {
@@ -6094,7 +6887,10 @@ impl eframe::App for CrustApp {
                                 ui.menu_button(RichText::new("⋯").font(t::topbar_font()), |ui| {
                                     if visibility.show_join_in_overflow
                                         && ui
-                                            .button(RichText::new("Join channel").font(t::topbar_font()))
+                                            .button(
+                                                RichText::new("Join channel")
+                                                    .font(t::topbar_font()),
+                                            )
                                             .clicked()
                                     {
                                         self.join_dialog.toggle();
@@ -6124,7 +6920,8 @@ impl eframe::App for CrustApp {
                                         && moderation_available
                                         && ui
                                             .button(
-                                                RichText::new("Moderation tools").font(t::topbar_font()),
+                                                RichText::new("Moderation tools")
+                                                    .font(t::topbar_font()),
                                             )
                                             .clicked()
                                     {
@@ -6186,7 +6983,10 @@ impl eframe::App for CrustApp {
 
                                     if visibility.show_perf_in_overflow
                                         && ui
-                                            .button(RichText::new("Perf overlay").font(t::topbar_font()))
+                                            .button(
+                                                RichText::new("Perf overlay")
+                                                    .font(t::topbar_font()),
+                                            )
                                             .clicked()
                                     {
                                         self.perf.visible = !self.perf.visible;
@@ -6195,7 +6995,9 @@ impl eframe::App for CrustApp {
 
                                     if visibility.show_stats_in_overflow
                                         && ui
-                                            .button(RichText::new("Analytics").font(t::topbar_font()))
+                                            .button(
+                                                RichText::new("Analytics").font(t::topbar_font()),
+                                            )
                                             .clicked()
                                     {
                                         self.analytics_visible = !self.analytics_visible;
@@ -6209,7 +7011,10 @@ impl eframe::App for CrustApp {
                                             "Whispers".to_owned()
                                         };
                                         if ui
-                                            .button(RichText::new(whispers_label).font(t::topbar_font()))
+                                            .button(
+                                                RichText::new(whispers_label)
+                                                    .font(t::topbar_font()),
+                                            )
                                             .clicked()
                                         {
                                             self.whispers_visible = !self.whispers_visible;
@@ -6230,7 +7035,9 @@ impl eframe::App for CrustApp {
 
                                     if visibility.show_irc_in_overflow
                                         && ui
-                                            .button(RichText::new("IRC status").font(t::topbar_font()))
+                                            .button(
+                                                RichText::new("IRC status").font(t::topbar_font()),
+                                            )
                                             .clicked()
                                     {
                                         self.irc_status_visible = !self.irc_status_visible;
@@ -6259,7 +7066,9 @@ impl eframe::App for CrustApp {
                                         if visibility.show_mod_button {
                                             let mod_button = ui.add_enabled(
                                                 moderation_available,
-                                                egui::Button::new(RichText::new("Mod").font(t::tiny())),
+                                                egui::Button::new(
+                                                    RichText::new("Mod").font(t::tiny()),
+                                                ),
                                             );
                                             if mod_button.clicked() {
                                                 self.mod_tools_open = !self.mod_tools_open;
@@ -6267,9 +7076,11 @@ impl eframe::App for CrustApp {
                                                     if let Some(channel) =
                                                         moderation_channel_toolbar.clone()
                                                     {
-                                                        self.send_cmd(AppCommand::FetchUnbanRequests {
-                                                            channel,
-                                                        });
+                                                        self.send_cmd(
+                                                            AppCommand::FetchUnbanRequests {
+                                                                channel,
+                                                            },
+                                                        );
                                                     }
                                                 }
                                             }
@@ -6390,6 +7201,10 @@ impl eframe::App for CrustApp {
         let mut ch_reordered: Option<Vec<ChannelId>> = None;
         let mut ch_drag_split: Option<ChannelId> = None;
         let mut show_split_drop_zone = false;
+        let mut ch_open_streamlink: Option<ChannelId> = None;
+        let mut ch_open_player: Option<ChannelId> = None;
+        let mut ch_visibility_change: Option<(ChannelId, TabVisibilityRule)> = None;
+        let mut ch_unhide_bulk: Vec<ChannelId> = Vec::new();
 
         match effective_channel_layout {
             // -- Top-tab strip ------------------------------------------------
@@ -6410,7 +7225,171 @@ impl eframe::App for CrustApp {
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.spacing_mut().item_spacing.x = 4.0;
+                                    // Pinned "Live" chip at the start of the
+                                    // strip when logged-in. Mirrors the pinned
+                                    // sentinel row in the sidebar layout.
+                                    if self.state.auth.logged_in {
+                                        let live_id = crust_core::ChannelId::live_feed();
+                                        let is_active =
+                                            self.state.active_channel.as_ref() == Some(&live_id);
+                                        let (fg, bg) = if is_active {
+                                            (t::text_primary(), t::tab_selected_bg())
+                                        } else {
+                                            (t::text_primary(), t::bg_surface())
+                                        };
+                                        let stroke = if is_active {
+                                            egui::Stroke::new(1.0, t::border_accent())
+                                        } else {
+                                            egui::Stroke::new(1.0, t::border_subtle())
+                                        };
+                                        let count = self.state.live_channels.len();
+                                        let tab_frame = egui::Frame::new()
+                                            .fill(bg)
+                                            .stroke(stroke)
+                                            .corner_radius(t::RADIUS_SM)
+                                            .inner_margin(egui::Margin::symmetric(
+                                                tab_metrics.chip_pad_x,
+                                                tab_metrics.chip_pad_y,
+                                            ))
+                                            .show(ui, |ui| {
+                                                ui.set_height(tab_metrics.chip_height);
+                                                ui.horizontal(|ui| {
+                                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                                    ui.label(
+                                                        RichText::new("●")
+                                                            .font(t::tabs_font())
+                                                            .color(t::red()),
+                                                    );
+                                                    ui.label(
+                                                        RichText::new("Live")
+                                                            .font(t::tabs_font())
+                                                            .color(fg)
+                                                            .strong(),
+                                                    );
+                                                    if count > 0 {
+                                                        ui.label(
+                                                            RichText::new(format!("({count})"))
+                                                                .font(t::tabs_font())
+                                                                .color(t::text_muted()),
+                                                        );
+                                                    }
+                                                });
+                                            });
+                                        // Raw hit-test over the painted frame's
+                                        // rect - this does NOT apply egui widget
+                                        // visuals (no hover/active overlay on
+                                        // top of the custom frame fill).
+                                        let resp = ui.interact(
+                                            tab_frame.response.rect,
+                                            egui::Id::new("live_feed_tab_chip"),
+                                            egui::Sense::click(),
+                                        );
+                                        if resp.clicked() {
+                                            ch_selected = Some(live_id);
+                                        }
+                                    }
+                                    // Pinned "Mentions" chip next to the Live
+                                    // chip when logged in. Unread count takes
+                                    // priority over total count (matches the
+                                    // Live chip's viewer-count display rules).
+                                    if self.state.auth.logged_in {
+                                        let mentions_id = crust_core::ChannelId::mentions();
+                                        let is_active =
+                                            self.state.active_channel.as_ref() == Some(&mentions_id);
+                                        let (fg, bg) = if is_active {
+                                            (t::text_primary(), t::tab_selected_bg())
+                                        } else {
+                                            (t::text_primary(), t::bg_surface())
+                                        };
+                                        let stroke = if is_active {
+                                            egui::Stroke::new(1.0, t::border_accent())
+                                        } else {
+                                            egui::Stroke::new(1.0, t::border_subtle())
+                                        };
+                                        let total = self.state.mentions.len();
+                                        let unread = self.state.mentions_unread;
+                                        let tab_frame = egui::Frame::new()
+                                            .fill(bg)
+                                            .stroke(stroke)
+                                            .corner_radius(t::RADIUS_SM)
+                                            .inner_margin(egui::Margin::symmetric(
+                                                tab_metrics.chip_pad_x,
+                                                tab_metrics.chip_pad_y,
+                                            ))
+                                            .show(ui, |ui| {
+                                                ui.set_height(tab_metrics.chip_height);
+                                                ui.horizontal(|ui| {
+                                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                                    ui.label(
+                                                        RichText::new("@")
+                                                            .font(t::tabs_font())
+                                                            .color(t::accent())
+                                                            .strong(),
+                                                    );
+                                                    ui.label(
+                                                        RichText::new("Mentions")
+                                                            .font(t::tabs_font())
+                                                            .color(fg)
+                                                            .strong(),
+                                                    );
+                                                    if unread > 0 {
+                                                        let label = if unread > 99 {
+                                                            "99+".to_owned()
+                                                        } else {
+                                                            format!("{unread}")
+                                                        };
+                                                        egui::Frame::new()
+                                                            .fill(t::mention_pill_bg())
+                                                            .corner_radius(t::RADIUS_SM)
+                                                            .inner_margin(egui::Margin::symmetric(
+                                                                5, 0,
+                                                            ))
+                                                            .show(ui, |ui| {
+                                                                ui.label(
+                                                                    RichText::new(label)
+                                                                        .font(t::tiny())
+                                                                        .strong()
+                                                                        .color(t::text_primary()),
+                                                                );
+                                                            });
+                                                    } else if total > 0 {
+                                                        ui.label(
+                                                            RichText::new(format!("({total})"))
+                                                                .font(t::tabs_font())
+                                                                .color(t::text_muted()),
+                                                        );
+                                                    }
+                                                });
+                                            });
+                                        let resp = ui.interact(
+                                            tab_frame.response.rect,
+                                            egui::Id::new("mentions_tab_chip"),
+                                            egui::Sense::click(),
+                                        );
+                                        if resp.clicked() {
+                                            ch_selected = Some(mentions_id);
+                                        }
+                                    }
+                                    // Collect hidden channels up-front so we
+                                    // can both skip them in the render loop
+                                    // and surface them via the "N hidden"
+                                    // escape-hatch chip at the end of the
+                                    // strip. Without that chip an offline
+                                    // channel with `hide_when_offline` has
+                                    // no reachable right-click target -
+                                    // quick-switch (Ctrl+K) still works, but
+                                    // isn't discoverable enough.
+                                    let hidden_channels: Vec<ChannelId> = self
+                                        .state
+                                        .channel_order
+                                        .iter()
+                                        .filter(|ch| self.tab_is_hidden(ch))
+                                        .cloned()
+                                        .collect();
                                     for ch in self.state.channel_order.iter() {
+                                        if self.tab_is_hidden(ch) {
+                                            continue;
+                                        }
                                         let is_active =
                                             self.state.active_channel.as_ref() == Some(ch);
                                         let (unread, mentions) = self
@@ -6646,6 +7625,51 @@ impl eframe::App for CrustApp {
                                                 ui.ctx().copy_text(copy);
                                                 ui.close_menu();
                                             }
+                                            if ch.is_twitch() {
+                                                ui.separator();
+                                                if ui
+                                                    .button(
+                                                        RichText::new("Open in Streamlink")
+                                                            .font(t::small()),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    ch_open_streamlink = Some(ch.clone());
+                                                    ui.close_menu();
+                                                }
+                                                if ui
+                                                    .button(
+                                                        RichText::new("Open in player")
+                                                            .font(t::small()),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    ch_open_player = Some(ch.clone());
+                                                    ui.close_menu();
+                                                }
+                                                ui.separator();
+                                                let mut hide_offline = self
+                                                    .state
+                                                    .tab_visibility_rule(ch)
+                                                    == TabVisibilityRule::HideWhenOffline;
+                                                if ui
+                                                    .checkbox(
+                                                        &mut hide_offline,
+                                                        RichText::new("Hide when offline")
+                                                            .font(t::small()),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    let new_rule = if hide_offline {
+                                                        TabVisibilityRule::HideWhenOffline
+                                                    } else {
+                                                        TabVisibilityRule::Always
+                                                    };
+                                                    ch_visibility_change =
+                                                        Some((ch.clone(), new_rule));
+                                                    ui.close_menu();
+                                                }
+                                            }
                                             ui.separator();
                                             if ui
                                                 .button(
@@ -6658,6 +7682,88 @@ impl eframe::App for CrustApp {
                                                 ui.close_menu();
                                             }
                                         });
+                                    }
+
+                                    // "N hidden" escape-hatch chip. Lists
+                                    // every tab currently suppressed by its
+                                    // visibility rule and lets the user
+                                    // jump to one (making the active-tab
+                                    // exemption show it again) or clear
+                                    // the rule outright.
+                                    if !hidden_channels.is_empty() {
+                                        ui.menu_button(
+                                            RichText::new(format!(
+                                                "⊘ {} hidden",
+                                                hidden_channels.len()
+                                            ))
+                                            .font(t::tabs_font())
+                                            .color(t::text_muted()),
+                                            |ui| {
+                                                ui.label(
+                                                    RichText::new("Hidden tabs")
+                                                        .font(t::small())
+                                                        .strong()
+                                                        .color(t::text_secondary()),
+                                                );
+                                                ui.separator();
+                                                for ch in &hidden_channels {
+                                                    let label = format!(
+                                                        "#{}",
+                                                        ch.display_name()
+                                                    );
+                                                    ui.horizontal(|ui| {
+                                                        if ui
+                                                            .button(
+                                                                RichText::new(&label)
+                                                                    .font(t::small()),
+                                                            )
+                                                            .on_hover_text(
+                                                                "Switch to this channel",
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            ch_selected = Some(ch.clone());
+                                                            ui.close_menu();
+                                                        }
+                                                        if ui
+                                                            .button(
+                                                                RichText::new("Unhide")
+                                                                    .font(t::small()),
+                                                            )
+                                                            .on_hover_text(
+                                                                "Clear the visibility rule for this channel",
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            ch_visibility_change = Some((
+                                                                ch.clone(),
+                                                                TabVisibilityRule::Always,
+                                                            ));
+                                                            ui.close_menu();
+                                                        }
+                                                    });
+                                                }
+                                                ui.separator();
+                                                if ui
+                                                    .button(
+                                                        RichText::new("Unhide all")
+                                                            .font(t::small()),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    // Accumulate for bulk
+                                                    // application outside
+                                                    // the panel closure -
+                                                    // can't call `&mut self`
+                                                    // methods here because
+                                                    // the surrounding loop
+                                                    // already borrows self.
+                                                    ch_unhide_bulk =
+                                                        hidden_channels.clone();
+                                                    ui.close_menu();
+                                                }
+                                            },
+                                        );
                                     }
                                 });
                             });
@@ -6704,20 +7810,198 @@ impl eframe::App for CrustApp {
                         ui.add_space(4.0);
                         ui.add(egui::Separator::default().spacing(6.0));
 
+                        // Respect per-tab visibility rules: channels whose
+                        // rule + live-state combination says "hide" are
+                        // omitted from the sidebar entirely (and from drag
+                        // semantics). Hidden channels keep their slot in
+                        // the underlying `channel_order` so they pop back
+                        // in place the moment the state flips.
+                        let mut visible_channels: Vec<ChannelId> =
+                            Vec::with_capacity(self.state.channel_order.len());
+                        let mut hidden_channels: Vec<ChannelId> = Vec::new();
+                        for ch in self.state.channel_order.iter() {
+                            if self.tab_is_hidden(ch) {
+                                hidden_channels.push(ch.clone());
+                            } else {
+                                visible_channels.push(ch.clone());
+                            }
+                        }
+
+                        // Bottom-docked "N hidden" footer. Rendered as a
+                        // nested bottom panel BEFORE the channel list so
+                        // egui reserves its strip up-front; the sidebar's
+                        // ScrollArea uses `auto_shrink=[false; 2]` and
+                        // would otherwise eat this space, pushing the
+                        // footer off-screen.
+                        if !hidden_channels.is_empty() {
+                            egui::TopBottomPanel::bottom("sidebar_hidden_footer")
+                                .resizable(false)
+                                .frame(
+                                    Frame::new()
+                                        .fill(Color32::TRANSPARENT)
+                                        .inner_margin(egui::Margin::symmetric(0, 4)),
+                                )
+                                .show_inside(ui, |ui| {
+                                    // Full-width rail above the trigger that
+                                    // matches the separator at the top of the
+                                    // channel list (same `spacing(6.0)`) so
+                                    // the two dividers frame the list as a
+                                    // visual pair.
+                                    ui.add(egui::Separator::default().spacing(6.0));
+                                    // Render the trigger like a ghost channel
+                                    // row so the `⊘` glyph lines up with the
+                                    // `#` prefix in the rows above. Strip the
+                                    // default rounded button chrome so the
+                                    // trigger blends with the surrounding
+                                    // rail/rows instead of floating in a pill
+                                    // that clashes with the `CHANNELS`
+                                    // section header.
+                                    ui.scope(|ui| {
+                                        {
+                                            let style = ui.style_mut();
+                                            style.spacing.button_padding =
+                                                egui::vec2(8.0, 5.0);
+                                            let widgets =
+                                                &mut style.visuals.widgets;
+                                            widgets.inactive.bg_fill =
+                                                Color32::TRANSPARENT;
+                                            widgets.inactive.weak_bg_fill =
+                                                Color32::TRANSPARENT;
+                                            widgets.inactive.bg_stroke =
+                                                egui::Stroke::NONE;
+                                            widgets.inactive.expansion = 0.0;
+                                            widgets.hovered.bg_fill =
+                                                t::hover_row_bg();
+                                            widgets.hovered.weak_bg_fill =
+                                                t::hover_row_bg();
+                                            widgets.hovered.bg_stroke =
+                                                egui::Stroke::NONE;
+                                            widgets.hovered.expansion = 0.0;
+                                            widgets.active.bg_fill =
+                                                t::hover_row_bg();
+                                            widgets.active.weak_bg_fill =
+                                                t::hover_row_bg();
+                                            widgets.active.bg_stroke =
+                                                egui::Stroke::NONE;
+                                            widgets.active.expansion = 0.0;
+                                        }
+                                    ui.menu_button(
+                                        RichText::new(format!(
+                                            "⊘ {} hidden channel{}",
+                                            hidden_channels.len(),
+                                            if hidden_channels.len() == 1 {
+                                                ""
+                                            } else {
+                                                "s"
+                                            }
+                                        ))
+                                        .font(t::small())
+                                        .color(t::text_muted()),
+                                        |ui| {
+                                            ui.label(
+                                                RichText::new("Hidden tabs")
+                                                    .font(t::small())
+                                                    .strong()
+                                                    .color(t::text_secondary()),
+                                            );
+                                            ui.separator();
+                                            for ch in &hidden_channels {
+                                                ui.horizontal(|ui| {
+                                                    if ui
+                                                        .button(
+                                                            RichText::new(format!(
+                                                                "#{}",
+                                                                ch.display_name()
+                                                            ))
+                                                            .font(t::small()),
+                                                        )
+                                                        .on_hover_text(
+                                                            "Switch to this channel",
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        ch_selected = Some(ch.clone());
+                                                        ui.close_menu();
+                                                    }
+                                                    if ui
+                                                        .button(
+                                                            RichText::new("Unhide")
+                                                                .font(t::small()),
+                                                        )
+                                                        .on_hover_text(
+                                                            "Clear the visibility rule for this channel",
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        ch_visibility_change = Some((
+                                                            ch.clone(),
+                                                            TabVisibilityRule::Always,
+                                                        ));
+                                                        ui.close_menu();
+                                                    }
+                                                });
+                                            }
+                                            ui.separator();
+                                            if ui
+                                                .button(
+                                                    RichText::new("Unhide all")
+                                                        .font(t::small()),
+                                                )
+                                                .clicked()
+                                            {
+                                                ch_unhide_bulk = hidden_channels.clone();
+                                                ui.close_menu();
+                                            }
+                                        },
+                                    );
+                                    });
+                                });
+                        }
                         let mut list = ChannelList {
-                            channels: &self.state.channel_order,
+                            channels: &visible_channels,
                             active: self.state.active_channel.as_ref(),
                             channel_states: &self.state.channels,
                             live_channels: Some(&self.live_map_cache),
                             show_live_indicator: self.show_tab_live_indicators,
                             show_close_button: self.show_tab_close_buttons,
+                            show_live_feed_pin: self.state.auth.logged_in,
+                            live_feed_count: self.state.live_channels.len(),
+                            // Mentions pin: always visible when logged in so
+                            // users know the feature exists even before the
+                            // buffer has any content (mirrors Live-pin UX).
+                            show_mentions_pin: self.state.auth.logged_in,
+                            mentions_total: self.state.mentions.len(),
+                            mentions_unread: self.state.mentions_unread,
+                            tab_visibility_rules: &self.state.tab_visibility_rules,
                         };
                         let res = list.show(ui);
                         ch_selected = res.selected;
                         ch_closed = res.closed;
-                        ch_reordered = res.reordered;
+                        // `res.reordered` is the reordered VISIBLE subset;
+                        // splice hidden channels back into their original
+                        // absolute positions so they don't get bumped to
+                        // the end of the list just because they weren't
+                        // in the rendered slice.
+                        if let Some(new_visible) = res.reordered {
+                            let mut visible_iter = new_visible.into_iter();
+                            let mut merged: Vec<ChannelId> =
+                                Vec::with_capacity(self.state.channel_order.len());
+                            for ch in self.state.channel_order.iter() {
+                                if self.tab_is_hidden(ch) {
+                                    merged.push(ch.clone());
+                                } else if let Some(next) = visible_iter.next() {
+                                    merged.push(next);
+                                }
+                            }
+                            ch_reordered = Some(merged);
+                        }
                         ch_drag_split = res.drag_split;
                         show_split_drop_zone = res.dragging_outside;
+                        ch_open_streamlink = res.open_streamlink;
+                        ch_open_player = res.open_player;
+                        if let Some(change) = res.visibility_change {
+                            ch_visibility_change = Some(change);
+                        }
                     });
             }
 
@@ -6762,6 +8046,44 @@ impl eframe::App for CrustApp {
         }
         if let Some(new_order) = ch_reordered {
             self.state.channel_order = new_order;
+        }
+
+        // Streamlink / custom player launches (Twitch channels only).
+        if let Some(ch) = ch_open_streamlink {
+            if ch.is_twitch() {
+                self.send_cmd(AppCommand::OpenStreamlink {
+                    channel: ch.display_name().to_owned(),
+                });
+            }
+        }
+        if let Some(ch) = ch_open_player {
+            if ch.is_twitch() {
+                self.send_cmd(AppCommand::OpenPlayer {
+                    channel: ch.display_name().to_owned(),
+                });
+            }
+        }
+
+        // Per-tab visibility rule toggle ("Hide when offline"). Updates
+        // the local mirror immediately so the tab strip reflows on the
+        // next frame, then persists via the runtime which re-broadcasts
+        // the full rule set for cross-pane consistency.
+        if let Some((ch, rule)) = ch_visibility_change {
+            self.state
+                .set_tab_visibility_rule(ch.clone(), rule);
+            self.send_cmd(AppCommand::SetTabVisibilityRule {
+                channel: ch,
+                rule,
+            });
+        }
+        // "Unhide all" from the hidden-tabs escape hatch.
+        for ch in ch_unhide_bulk.drain(..) {
+            self.state
+                .set_tab_visibility_rule(ch.clone(), TabVisibilityRule::Always);
+            self.send_cmd(AppCommand::SetTabVisibilityRule {
+                channel: ch,
+                rule: TabVisibilityRule::Always,
+            });
         }
 
         // Drag-to-split: create a new pane for the dragged channel.
@@ -6938,6 +8260,49 @@ impl eframe::App for CrustApp {
                         pane_ui.set_clip_rect(pane_rect);
                         pane_ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
 
+                        if ch.is_live_feed() {
+                            use crate::widgets::live_feed::LiveFeed;
+                            use std::collections::HashSet;
+                            let joined: HashSet<String> = self
+                                .state
+                                .channel_order
+                                .iter()
+                                .filter(|c| {
+                                    c.platform() == crust_core::model::Platform::Twitch
+                                        && !c.is_live_feed()
+                                })
+                                .map(|c| c.0.clone())
+                                .collect();
+                            let action = LiveFeed {
+                                snapshots: &self.state.live_channels,
+                                loaded: self.state.live_feed_loaded,
+                                error: self.state.live_feed_error.as_deref(),
+                                last_updated: self.state.live_feed_last_updated,
+                                joined_logins: &joined,
+                                thumbnail_bytes: &self.emote_bytes,
+                            }
+                            .show(&mut pane_ui);
+                            if let Some(act) = action {
+                                self.handle_live_feed_action(act);
+                            }
+                            continue; // skip the rest of this pane iteration
+                        }
+
+                        if ch.is_mentions() {
+                            use crate::widgets::mentions::MentionsList;
+                            let action = MentionsList {
+                                mentions: &self.state.mentions,
+                                show_timestamps: self.show_timestamps,
+                                show_timestamp_seconds: self.show_timestamp_seconds,
+                                use_24h_timestamps: self.use_24h_timestamps,
+                            }
+                            .show(&mut pane_ui);
+                            if let Some(target) = action {
+                                self.jump_to_mention(target);
+                            }
+                            continue;
+                        }
+
                         // -- Pane header ------------------------------------
                         let (unread_count, unread_mentions) = self
                             .state
@@ -7049,6 +8414,17 @@ impl eframe::App for CrustApp {
                                 &mut inp_ui,
                                 &mut self.split_panes.panes[pi].input_buf,
                             );
+                            for up in inp.uploads {
+                                self.send_cmd(AppCommand::UploadImage {
+                                    channel: ch.clone(),
+                                    bytes: up.bytes,
+                                    format: up.format,
+                                    source_path: up.source_path.map(|p| p.display().to_string()),
+                                });
+                            }
+                            if let Some(word) = inp.add_to_dictionary {
+                                self.send_cmd(AppCommand::AddWordToDictionary { word });
+                            }
                             if let Some(text) = inp.send {
                                 if self
                                     .message_history
@@ -7096,19 +8472,35 @@ impl eframe::App for CrustApp {
                                 let live_channels = collect_live_channel_entries(
                                     &self.stream_statuses,
                                 );
-                                let pcmd = parse_slash_command(
-                                    &text,
-                                    &ch,
-                                    None,
-                                    None,
-                                    can_mod,
-                                    cc,
-                                    self.kick_beta_enabled,
-                                    self.irc_beta_enabled,
-                                    active_login.as_deref(),
-                                    &live_channels,
-                                );
-                                if let Some(cmd) = pcmd {
+                                // Apply user-defined command aliases before
+                                // dispatch so they compose with built-in
+                                // slash commands and the IRC fall-through.
+                                let alias_result = self
+                                    .expand_outgoing_aliases(&text, &ch);
+                                let (text, alias_error) = match alias_result {
+                                    Ok(Some(expanded)) => (expanded, None),
+                                    Ok(None) => (text, None),
+                                    Err(err_cmd) => (text, Some(err_cmd)),
+                                };
+                                let pcmd = if alias_error.is_some() {
+                                    None
+                                } else {
+                                    parse_slash_command(
+                                        &text,
+                                        &ch,
+                                        None,
+                                        None,
+                                        can_mod,
+                                        cc,
+                                        self.kick_beta_enabled,
+                                        self.irc_beta_enabled,
+                                        active_login.as_deref(),
+                                        &live_channels,
+                                    )
+                                };
+                                if let Some(err_cmd) = alias_error {
+                                    self.send_cmd(err_cmd);
+                                } else if let Some(cmd) = pcmd {
                                     if let AppCommand::SendMessage {
                                         text: ref out,
                                         ..
@@ -7334,6 +8726,48 @@ impl eframe::App for CrustApp {
                     }
                 // -- Classic single-channel mode --------------------------
                 } else if let Some(active_ch) = self.state.active_channel.clone() {
+                    if active_ch.is_live_feed() {
+                        use crate::widgets::live_feed::LiveFeed;
+                        use std::collections::HashSet;
+                        let joined: HashSet<String> = self
+                            .state
+                            .channel_order
+                            .iter()
+                            .filter(|c| {
+                                c.platform() == crust_core::model::Platform::Twitch
+                                    && !c.is_live_feed()
+                            })
+                            .map(|c| c.0.clone())
+                            .collect();
+                        let action = LiveFeed {
+                            snapshots: &self.state.live_channels,
+                            loaded: self.state.live_feed_loaded,
+                            error: self.state.live_feed_error.as_deref(),
+                            last_updated: self.state.live_feed_last_updated,
+                            joined_logins: &joined,
+                            thumbnail_bytes: &self.emote_bytes,
+                        }
+                        .show(ui);
+                        if let Some(act) = action {
+                            self.handle_live_feed_action(act);
+                        }
+                        return;  // skip the chat-rendering path entirely
+                    }
+
+                    if active_ch.is_mentions() {
+                        use crate::widgets::mentions::MentionsList;
+                        let action = MentionsList {
+                            mentions: &self.state.mentions,
+                            show_timestamps: self.show_timestamps,
+                            show_timestamp_seconds: self.show_timestamp_seconds,
+                            use_24h_timestamps: self.use_24h_timestamps,
+                        }
+                        .show(ui);
+                        if let Some(target) = action {
+                            self.jump_to_mention(target);
+                        }
+                        return;
+                    }
                     let active_reply = self
                         .pending_reply
                         .as_ref()
@@ -7379,6 +8813,17 @@ impl eframe::App for CrustApp {
                                 animate_emotes: animations_allowed,
                             };
                             let result = chat.show(ui, &mut self.chat_input_buf);
+                            for up in result.uploads {
+                                self.send_cmd(AppCommand::UploadImage {
+                                    channel: active_ch.clone(),
+                                    bytes: up.bytes,
+                                    format: up.format,
+                                    source_path: up.source_path.map(|p| p.display().to_string()),
+                                });
+                            }
+                            if let Some(word) = result.add_to_dictionary {
+                                self.send_cmd(AppCommand::AddWordToDictionary { word });
+                            }
                             if result.dismiss_reply && active_reply.is_some() {
                                 self.pending_reply = None;
                             }
@@ -7423,20 +8868,36 @@ impl eframe::App for CrustApp {
                                 let live_channels = collect_live_channel_entries(
                                     &self.stream_statuses,
                                 );
-                                let parsed_cmd = parse_slash_command(
-                                    &text,
-                                    &active_ch,
-                                    reply_to_msg_id.clone(),
-                                    active_reply.clone(),
-                                    can_moderate,
-                                    chatters_count,
-                                    self.kick_beta_enabled,
-                                    self.irc_beta_enabled,
-                                    active_login.as_deref(),
-                                    &live_channels,
-                                );
+                                // Expand user command aliases first; if the
+                                // chain cycles, emit the error and skip the
+                                // normal slash/send path.
+                                let alias_result = self
+                                    .expand_outgoing_aliases(&text, &active_ch);
+                                let (text, alias_error) = match alias_result {
+                                    Ok(Some(expanded)) => (expanded, None),
+                                    Ok(None) => (text, None),
+                                    Err(err_cmd) => (text, Some(err_cmd)),
+                                };
+                                let parsed_cmd = if alias_error.is_some() {
+                                    None
+                                } else {
+                                    parse_slash_command(
+                                        &text,
+                                        &active_ch,
+                                        reply_to_msg_id.clone(),
+                                        active_reply.clone(),
+                                        can_moderate,
+                                        chatters_count,
+                                        self.kick_beta_enabled,
+                                        self.irc_beta_enabled,
+                                        active_login.as_deref(),
+                                        &live_channels,
+                                    )
+                                };
 
-                                if !self.state.auth.logged_in {
+                                if let Some(err_cmd) = alias_error {
+                                    self.send_cmd(err_cmd);
+                                } else if !self.state.auth.logged_in {
                                     match parsed_cmd {
                                         Some(cmd) if is_anonymous_local_command(&cmd) => {
                                             // Some slash commands manipulate the popup directly.
@@ -7728,7 +9189,10 @@ impl eframe::App for CrustApp {
                     let border_stroke = if toast.confetti {
                         egui::Stroke::new(
                             1.6,
-                            rainbow_color((time * 0.16 + age * 0.35).fract(), (200.0 * opacity) as u8),
+                            rainbow_color(
+                                (time * 0.16 + age * 0.35).fract(),
+                                (200.0 * opacity) as u8,
+                            ),
                         )
                     } else {
                         egui::Stroke::new(1.5, t::alpha(toast.hue, (160.0 * opacity) as u8))
@@ -7882,6 +9346,7 @@ fn quick_switch_priority_bucket(unread_mentions: u32, unread_count: u32) -> u8 {
     }
 }
 
+#[cfg(test)]
 fn filter_channels_for_query(channels: &[ChannelId], query: &str) -> Vec<ChannelId> {
     let query = query.trim().to_ascii_lowercase();
     channels
@@ -8071,6 +9536,9 @@ fn dynamic_image_to_color_image(img: DynamicImage) -> Option<egui::ColorImage> {
 fn is_valid_twitch_login(login: &str) -> bool {
     let len = login.len();
     if !(3..=25).contains(&len) {
+        return false;
+    }
+    if login.starts_with('_') {
         return false;
     }
     login
@@ -8848,7 +10316,7 @@ fn parse_slash_command(
                 for entry in live_channels {
                     match &entry.game {
                         Some(game) if !game.is_empty() => {
-                            lines.push_str(&format!("  {} — {}\n", entry.login, game));
+                            lines.push_str(&format!("  {}{}\n", entry.login, game));
                         }
                         _ => {
                             lines.push_str(&format!("  {}\n", entry.login));
@@ -8990,7 +10458,8 @@ fn parse_slash_command(
             match user {
                 None => Some(AppCommand::InjectLocalMessage {
                     channel: channel.clone(),
-                    text: "Usage: /account-age [user]  (sign in to default to yourself).".to_owned(),
+                    text: "Usage: /account-age [user]  (sign in to default to yourself)."
+                        .to_owned(),
                 }),
                 Some(u) => Some(AppCommand::FetchAccountAge {
                     channel: channel.clone(),
@@ -9760,9 +11229,9 @@ fn whisper_fit_size(w: u32, h: u32, target_h: f32) -> egui::Vec2 {
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_channels_for_query, parse_slash_command, quick_switch_priority_bucket,
-        responsive_layout, toolbar_visibility, top_tab_metrics, whisper_thread_matches_query,
-        TabVisualStyle,
+        filter_channels_for_query, parse_slash_command, parse_twitch_channel_login_arg,
+        quick_switch_priority_bucket, responsive_layout, toolbar_visibility, top_tab_metrics,
+        whisper_thread_matches_query, TabVisualStyle,
     };
     use crate::theme as t;
     use crust_core::events::AppCommand;
@@ -9838,7 +11307,11 @@ mod tests {
     #[test]
     fn quick_switch_filter_matches_platform_prefixes_and_irc_hosts() {
         let irc = ChannelId::irc("irc.libera.chat", 6697, true, "rust");
-        let channels = vec![ChannelId::new("forsen"), ChannelId::kick("xqc"), irc.clone()];
+        let channels = vec![
+            ChannelId::new("forsen"),
+            ChannelId::kick("xqc"),
+            irc.clone(),
+        ];
 
         assert_eq!(
             filter_channels_for_query(&channels, "twitch:for"),
@@ -9853,28 +11326,55 @@ mod tests {
 
     #[test]
     fn quick_switch_priority_orders_mentions_then_unread_then_other() {
-        let mut buckets = vec![(0_u32, 0_u32), (0_u32, 3_u32), (2_u32, 2_u32), (1_u32, 0_u32)];
+        let mut buckets = vec![
+            (0_u32, 0_u32),
+            (0_u32, 3_u32),
+            (2_u32, 2_u32),
+            (1_u32, 0_u32),
+        ];
         buckets.sort_by_key(|(mentions, unread)| quick_switch_priority_bucket(*mentions, *unread));
         assert_eq!(buckets, vec![(2, 2), (1, 0), (0, 3), (0, 0)]);
     }
 
     #[test]
     fn whisper_query_matches_prefix_login_and_display_name() {
-        assert!(whisper_thread_matches_query("some_user", "Some User", "w:some"));
+        assert!(whisper_thread_matches_query(
+            "some_user",
+            "Some User",
+            "w:some"
+        ));
         assert!(whisper_thread_matches_query(
             "some_user",
             "Some User",
             "whisper:some"
         ));
-        assert!(whisper_thread_matches_query("some_user", "Some User", "@some user"));
-        assert!(!whisper_thread_matches_query("some_user", "Some User", "notthere"));
+        assert!(whisper_thread_matches_query(
+            "some_user",
+            "Some User",
+            "@some user"
+        ));
+        assert!(!whisper_thread_matches_query(
+            "some_user",
+            "Some User",
+            "notthere"
+        ));
     }
 
     #[test]
     fn slash_commercial_rejects_invalid_duration_argument() {
         let channel = ChannelId::new("somechannel");
-        let parsed =
-            parse_slash_command("/commercial 45", &channel, None, None, true, 0, true, true, None, &[]);
+        let parsed = parse_slash_command(
+            "/commercial 45",
+            &channel,
+            None,
+            None,
+            true,
+            0,
+            true,
+            true,
+            None,
+            &[],
+        );
 
         match parsed {
             Some(AppCommand::InjectLocalMessage { text, .. }) => {
@@ -9887,8 +11387,18 @@ mod tests {
     #[test]
     fn slash_commercial_accepts_supported_duration_argument() {
         let channel = ChannelId::new("somechannel");
-        let parsed =
-            parse_slash_command("/commercial 90", &channel, None, None, true, 0, true, true, None, &[]);
+        let parsed = parse_slash_command(
+            "/commercial 90",
+            &channel,
+            None,
+            None,
+            true,
+            0,
+            true,
+            true,
+            None,
+            &[],
+        );
 
         match parsed {
             Some(AppCommand::StartCommercial { length_secs, .. }) => {
@@ -9902,7 +11412,8 @@ mod tests {
     fn slash_marker_rejects_description_over_140_chars() {
         let channel = ChannelId::new("somechannel");
         let long = format!("/marker {}", "x".repeat(141));
-        let parsed = parse_slash_command(&long, &channel, None, None, true, 0, true, true, None, &[]);
+        let parsed =
+            parse_slash_command(&long, &channel, None, None, true, 0, true, true, None, &[]);
 
         match parsed {
             Some(AppCommand::InjectLocalMessage { text, .. }) => {
@@ -10032,8 +11543,18 @@ mod tests {
     #[test]
     fn slash_unbanrequests_maps_to_fetch_command() {
         let channel = ChannelId::new("somechannel");
-        let parsed =
-            parse_slash_command("/unbanrequests", &channel, None, None, true, 0, true, true, None, &[]);
+        let parsed = parse_slash_command(
+            "/unbanrequests",
+            &channel,
+            None,
+            None,
+            true,
+            0,
+            true,
+            true,
+            None,
+            &[],
+        );
 
         match parsed {
             Some(AppCommand::FetchUnbanRequests { channel }) => {
@@ -10044,9 +11565,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_twitch_channel_login_rejects_live_feed_sentinel() {
+        assert_eq!(parse_twitch_channel_login_arg("__live_feed__"), None);
+        assert_eq!(
+            parse_twitch_channel_login_arg("forsen"),
+            Some("forsen".to_owned())
+        );
+    }
+
+    #[test]
     fn slash_requests_defaults_to_current_channel_queue() {
         let channel = ChannelId::new("somechannel");
-        let parsed = parse_slash_command("/requests", &channel, None, None, false, 0, true, true, None, &[]);
+        let parsed = parse_slash_command(
+            "/requests",
+            &channel,
+            None,
+            None,
+            false,
+            0,
+            true,
+            true,
+            None,
+            &[],
+        );
 
         match parsed {
             Some(AppCommand::OpenUrl { url }) => {
@@ -10086,7 +11627,18 @@ mod tests {
     #[test]
     fn slash_vote_is_not_advertised_but_still_explains_locally() {
         let channel = ChannelId::new("somechannel");
-        let parsed = parse_slash_command("/vote 2", &channel, None, None, false, 0, true, true, None, &[]);
+        let parsed = parse_slash_command(
+            "/vote 2",
+            &channel,
+            None,
+            None,
+            false,
+            0,
+            true,
+            true,
+            None,
+            &[],
+        );
 
         match parsed {
             Some(AppCommand::InjectLocalMessage { text, .. }) => {
@@ -10102,8 +11654,18 @@ mod tests {
     #[test]
     fn slash_vote_hidden_guard_still_rejects_invalid_choice_numbers() {
         let channel = ChannelId::new("somechannel");
-        let parsed =
-            parse_slash_command("/vote winner", &channel, None, None, false, 0, true, true, None, &[]);
+        let parsed = parse_slash_command(
+            "/vote winner",
+            &channel,
+            None,
+            None,
+            false,
+            0,
+            true,
+            true,
+            None,
+            &[],
+        );
 
         match parsed {
             Some(AppCommand::InjectLocalMessage { text, .. }) => {
@@ -10171,7 +11733,18 @@ mod tests {
     #[test]
     fn slash_modtools_maps_to_open_tools_command() {
         let channel = ChannelId::new("somechannel");
-        let parsed = parse_slash_command("/modtools", &channel, None, None, true, 0, true, true, None, &[]);
+        let parsed = parse_slash_command(
+            "/modtools",
+            &channel,
+            None,
+            None,
+            true,
+            0,
+            true,
+            true,
+            None,
+            &[],
+        );
 
         match parsed {
             Some(AppCommand::OpenModerationTools { channel }) => {
@@ -10288,8 +11861,18 @@ mod tests {
     #[test]
     fn slash_logs_opens_logs_folder() {
         let channel = ChannelId::new("x");
-        let parsed =
-            parse_slash_command("/logs", &channel, None, None, true, 0, true, true, None, &[]);
+        let parsed = parse_slash_command(
+            "/logs",
+            &channel,
+            None,
+            None,
+            true,
+            0,
+            true,
+            true,
+            None,
+            &[],
+        );
         assert!(matches!(parsed, Some(AppCommand::OpenLogsFolder)));
     }
 
@@ -10558,20 +12141,11 @@ mod tests {
             },
         ];
         let parsed = parse_slash_command(
-            "/live",
-            &channel,
-            None,
-            None,
-            false,
-            0,
-            true,
-            true,
-            None,
-            &live,
+            "/live", &channel, None, None, false, 0, true, true, None, &live,
         );
         match parsed {
             Some(AppCommand::InjectLocalMessage { text, .. }) => {
-                assert!(text.contains("alice — Just Chatting"));
+                assert!(text.contains("aliceJust Chatting"));
                 assert!(text.contains("bob"));
             }
             other => panic!("expected local message listing live channels, got {other:?}"),

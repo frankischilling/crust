@@ -121,11 +121,31 @@ const ROW_PAD_X: f32 = 6.0;
 const ROW_PAD_Y: f32 = 2.0;
 /// Fallback height for rows we have never rendered before.
 const EST_H: f32 = 26.0;
-const HOT_WINDOW_TRIGGER: usize = 200;
-const HOT_WINDOW_ROWS: usize = 300;
+// Compaction thresholds tuned so typical chat sessions never hit the
+// virtualised "hot window" path. Lowering these aggressively (e.g.
+// TRIGGER=200) caused a first-render race: the snap-to-bottom dance
+// (`vertical_scroll_offset(f32::MAX)` → clamped to 0 → `apply_snap`
+// restores `max_scroll` next frame) interacted with repeated prefix
+// rebuilds (from just-measured row heights), so the viewport could
+// briefly settle in dead space above the hot window. Symptom: the
+// channel opens blank until the user clicks "Resume scrolling".
+// TRIGGER is deliberately high enough to cover full Twitch backlog
+// replays, and ROWS matches the virtual-window test expectations.
+const HOT_WINDOW_TRIGGER: usize = 600;
+const HOT_WINDOW_ROWS: usize = 400;
 const HOT_WINDOW_EXPAND_CHUNK: usize = 200;
 const HOT_WINDOW_EXPAND_THRESHOLD_PX: f32 = 24.0;
 const COMPACT_BOUNDARY_HEIGHT: f32 = 22.0;
+
+// Large-but-finite "snap to bottom" offset. Using `f32::MAX` here is UNSAFE:
+// egui positions content at `inner_rect.min - offset`, which overflows to
+// -inf and poisons `content_size` with NaN. The subsequent end-of-frame
+// clamp `offset.min(max_scroll)` then no-ops (NaN comparisons are false),
+// leaving `offset.y = f32::MAX` *permanently* and the viewport blank until
+// something external rewrites the offset (e.g. the Resume-scrolling click).
+// 1e9 is >> any realistic chat backlog pixel height but far from float
+// overflow, so layout produces finite numbers and clamping works correctly.
+const SNAP_TO_BOTTOM_TARGET: f32 = 1.0e9;
 
 // Twitch username fallback palette used when no explicit color is provided.
 const TWITCH_USERNAME_COLORS: [Color32; 15] = [
@@ -434,9 +454,7 @@ impl<'a> MessageList<'a> {
                 }
             }
 
-            if !self.ignored_users.is_empty()
-                && self.ignored_users.is_ignored(&msg.sender.login)
-            {
+            if !self.ignored_users.is_empty() && self.ignored_users.is_ignored(&msg.sender.login) {
                 return false;
             }
 
@@ -474,6 +492,26 @@ impl<'a> MessageList<'a> {
         let scroll_id = egui::Id::new("message_list").with(self.channel.as_str());
         let paused_key = egui::Id::new("scroll_paused").with(self.channel.as_str());
         let paused_snapshot_key = egui::Id::new("paused_snapshot_ids").with(self.channel.as_str());
+
+        // "Force snap" signal from the app layer: set whenever the user
+        // explicitly activates this channel (tab click, keyboard nav,
+        // sidebar click, etc.).  Drain it here and treat it as an
+        // authoritative request to show the latest messages - overrides
+        // any stale paused state that was frozen in from a previous
+        // visit.  This complements the cumulative_pass_nr heuristic below
+        // and closes the "channel opens black until I click Resume
+        // scrolling" bug class for cases the heuristic can miss.
+        let force_snap_key = egui::Id::new("ml_force_snap").with(self.channel.as_str());
+        let force_snap: bool = ui
+            .ctx()
+            .data_mut(|d| d.remove_temp(force_snap_key).unwrap_or(false));
+        if force_snap {
+            ui.ctx().data_mut(|d| {
+                d.insert_temp(paused_key, false);
+                d.remove_temp::<Vec<u64>>(paused_snapshot_key);
+            });
+        }
+
         let paused_before_show: bool = ui
             .ctx()
             .data_mut(|d| d.get_temp(paused_key).unwrap_or(false));
@@ -540,6 +578,39 @@ impl<'a> MessageList<'a> {
             }
             seen
         });
+
+        // Channel re-entry detector. `first_render` only fires the very
+        // first time a channel is ever visited in this session; clicking
+        // back into a channel you already opened once would otherwise
+        // inherit whatever scroll offset egui persisted for it - which
+        // on stale or never-populated state is 0 (top of an empty
+        // buffer), making the panel render as dead space until the user
+        // clicks "Resume scrolling". We fix this by detecting that this
+        // message list wasn't rendered on the immediately-preceding
+        // pass: that's the signal that the user just made this channel
+        // active again, and (if they weren't intentionally scrolled up
+        // when they last left) we should re-snap to the bottom.
+        let last_pass_key = egui::Id::new("ml_last_pass").with(self.channel.as_str());
+        let current_pass = ui.ctx().cumulative_pass_nr();
+        let last_pass: u64 = ui
+            .ctx()
+            .data_mut(|d| d.get_temp(last_pass_key).unwrap_or(0));
+        let reentered_channel = last_pass != 0 && current_pass.saturating_sub(last_pass) > 1;
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(last_pass_key, current_pass));
+        // "Needs snap" covers four cases:
+        //   1. Explicit user activation (`force_snap`) - tab click,
+        //      keyboard nav, sidebar click.  Authoritative, overrides
+        //      paused state.
+        //   2. Brand-new channel (`first_render`).
+        //   3. User just clicked back into a channel they left unpaused
+        //      (`reentered_channel && !paused_before_show`).  Safety net
+        //      for activation paths that bypass `force_snap`.
+        //   4. Stick-to-bottom can't rescue a stale persisted offset on
+        //      its own because egui only re-sticks when the scroll was
+        //      already at the bottom on the previous frame.
+        let needs_snap_to_bottom =
+            force_snap || first_render || (reentered_channel && !paused_before_show);
 
         // Threshold: below this, render all rows directly (no virtual scrolling).
         // This avoids height-estimation and stale-offset edge cases that cause
@@ -773,8 +844,22 @@ impl<'a> MessageList<'a> {
                 sa = sa.vertical_scroll_offset(offset);
             } else if let Some(offset) = paused_offset_compensation {
                 sa = sa.vertical_scroll_offset(offset);
-            } else if first_render {
-                sa = sa.vertical_scroll_offset(0.0);
+            } else if needs_snap_to_bottom {
+                // Snap to the bottom so the most-recent content is in
+                // view, overriding whatever offset egui had persisted
+                // from a previous visit. See `SNAP_TO_BOTTOM_TARGET`
+                // for why this is a large finite value, not f32::MAX.
+                //
+                // State is clamped to the real `max_scroll` at the END
+                // of the frame, so *this* frame's render is still blank
+                // and the *next* frame renders correctly - which is why
+                // we also request a repaint below and kick `apply_snap`
+                // into a keep-rewriting loop for any frames where new
+                // content arrives before stick_to_bottom engages.
+                sa = sa.vertical_scroll_offset(SNAP_TO_BOTTOM_TARGET);
+                let snap_key = Id::new("snap_to_bottom").with(self.channel.as_str());
+                ui.ctx().data_mut(|d| d.insert_temp(snap_key, true));
+                ui.ctx().request_repaint();
             }
             let output = sa.show(ui, |ui| {
                 let full_width = ui.available_width();
@@ -900,8 +985,17 @@ impl<'a> MessageList<'a> {
             sa = sa.vertical_scroll_offset(offset);
         } else if let Some(offset) = paused_offset_compensation {
             sa = sa.vertical_scroll_offset(offset);
-        } else if first_render {
-            sa = sa.vertical_scroll_offset(0.0);
+        } else if needs_snap_to_bottom {
+            // Same rationale as the simple-path branch above: use a
+            // large finite offset to request snap, set the snap key so
+            // `apply_snap` re-writes `max_scroll` next frame, and force
+            // a repaint so the second (correctly-rendered) frame
+            // actually runs instead of leaving the user stuck on this
+            // frame's off-screen render.
+            sa = sa.vertical_scroll_offset(SNAP_TO_BOTTOM_TARGET);
+            let snap_key = Id::new("snap_to_bottom").with(self.channel.as_str());
+            ui.ctx().data_mut(|d| d.insert_temp(snap_key, true));
+            ui.ctx().request_repaint();
         }
         let output = sa.show_viewport(ui, |ui, viewport| {
             let full_width = ui.available_width();
@@ -1702,6 +1796,19 @@ impl<'a> MessageList<'a> {
         let max_scroll = (output.content_size.y - viewport_h).max(0.0);
         let at_bottom = max_scroll < 1.0 || output.state.offset.y >= max_scroll - 20.0;
 
+        // Safety guard: if layout produced non-finite numbers (NaN/Inf),
+        // `at_bottom` can read as true even though offset is garbage,
+        // which would prematurely clear the snap flag and strand the
+        // viewport in dead space. Rewrite offset to 0 (a safe, always-
+        // visible position) and keep snapping until numbers recover.
+        if !output.state.offset.y.is_finite() || !output.content_size.y.is_finite() {
+            let mut state = output.state;
+            state.offset.y = 0.0;
+            state.store(ui.ctx(), output.id);
+            ui.ctx().request_repaint();
+            return;
+        }
+
         if at_bottom {
             // stick_to_bottom has taken over; clear the flag.
             ui.ctx().data_mut(|d| d.insert_temp(snap_key, false));
@@ -2001,12 +2108,12 @@ impl<'a> MessageList<'a> {
                     egui::Rect::from_min_size(ui.max_rect().left_top(), egui::Vec2::ZERO);
                 ui.interact(placeholder_rect, bg_click_id, egui::Sense::click());
 
-                // Keep selectable_labels off globally so timestamp / badge
-                // chip / separator labels stay non-interactive.  Text spans
-                // opt-in to selection via `.selectable(true)` and each has
-                // its own `.context_menu()` so right-click → Reply still works
-                // even when the label wins the hit test.
-                ui.style_mut().interaction.selectable_labels = false;
+                // Text selection: opt-in ON globally inside the message row
+                // so users can click-drag across timestamp / sender / body to
+                // copy. Widgets that must NOT be selectable (badges, emote
+                // placeholders, painted sender names) still set
+                // `.selectable(false)` explicitly.
+                ui.style_mut().interaction.selectable_labels = true;
 
                 if dimmed {
                     ui.set_opacity(if msg.flags.is_history { 0.35 } else { 0.45 });
@@ -2109,12 +2216,16 @@ impl<'a> MessageList<'a> {
                                 self.use_24h_timestamps,
                             );
                             ui.add(Label::new(
-                                RichText::new(ts).color(t::timestamp()).font(t::timestamps_font()),
+                                RichText::new(ts)
+                                    .color(t::timestamp())
+                                    .font(t::timestamps_font()),
                             ));
 
                             // Separator dot between timestamp and badges/name
                             ui.add(Label::new(
-                                RichText::new("·").color(t::separator()).font(t::timestamps_font()),
+                                RichText::new("·")
+                                    .color(t::separator())
+                                    .font(t::timestamps_font()),
                             ));
                         }
 
@@ -2555,7 +2666,9 @@ impl<'a> MessageList<'a> {
                                         self.use_24h_timestamps,
                                     );
                                     ui.add(Label::new(
-                                        RichText::new(ts).color(t::timestamp()).font(t::timestamps_font()),
+                                        RichText::new(ts)
+                                            .color(t::timestamp())
+                                            .font(t::timestamps_font()),
                                     ));
                                 }
 
@@ -2679,7 +2792,9 @@ impl<'a> MessageList<'a> {
                                     self.use_24h_timestamps,
                                 );
                                 ui.add(Label::new(
-                                    RichText::new(ts).color(t::timestamp()).font(t::timestamps_font()),
+                                    RichText::new(ts)
+                                        .color(t::timestamp())
+                                        .font(t::timestamps_font()),
                                 ));
                             }
 
@@ -3275,7 +3390,7 @@ impl<'a> MessageList<'a> {
     }
 }
 
-fn format_message_timestamp(
+pub(crate) fn format_message_timestamp(
     ts: &chrono::DateTime<chrono::Utc>,
     show_seconds: bool,
     use_24h: bool,

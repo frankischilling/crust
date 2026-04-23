@@ -15,10 +15,12 @@ egui_extras = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 image = { workspace = true }
-crust-core = { path = "../core", version = "0.4.9" }
+arboard = { workspace = true }
+crust-core = { path = "../core", version = "0.5.0" }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 directories = { workspace = true }
 regex = { workspace = true }
 smallvec = { workspace = true }
+rodio = { workspace = true }

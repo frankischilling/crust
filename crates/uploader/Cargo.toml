@@ -1,0 +1,21 @@
+[package]
+name = "crust-uploader"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Image upload engine for crust (Imgur / Nuuls / custom endpoints, ShareX SXCU-style)"
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { workspace = true, features = ["multipart"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+image = { workspace = true }
+regex = { workspace = true }
+directories = { workspace = true }

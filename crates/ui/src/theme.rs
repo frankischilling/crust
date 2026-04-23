@@ -7,16 +7,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use egui::{Color32, CornerRadius, FontId, Margin, Stroke, Vec2};
 
-// ---------------------------------------------------------------------------
 // Global theme mode
-// ---------------------------------------------------------------------------
 
 /// `false` = dark (default), `true` = light.
 static LIGHT_MODE: AtomicBool = AtomicBool::new(false);
 
-// ---------------------------------------------------------------------------
 // Global font sizing (chat body + UI scale)
-// ---------------------------------------------------------------------------
 
 /// Default chat body font size. `small/heading/tiny` are offsets from this.
 pub const DEFAULT_CHAT_FONT_SIZE: f32 = 13.5;
@@ -220,9 +216,7 @@ pub fn apply_from_str(s: &str) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Palette colours - each function returns the dark or light variant.
-// ---------------------------------------------------------------------------
 
 /// Deepest background - window body, sidebar.
 #[inline]

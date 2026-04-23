@@ -19,12 +19,28 @@
 //!   3. Soundex phonetic match (bonus for same-sounding words)
 //!   4. QWERTY keyboard proximity (bonus for adjacent-key typos)
 
-use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{OnceLock, RwLock};
 
 // -- Lazy-initialised data --------------------------------------------------
 
 static SPELL: OnceLock<SpellData> = OnceLock::new();
+
+/// User-managed custom dictionary. Words here are treated as correct and can
+/// also surface as suggestions. Persisted via
+/// [`crust_storage::AppSettings::custom_spell_dict`].
+static USER_DICT: OnceLock<RwLock<BTreeSet<String>>> = OnceLock::new();
+
+/// Global toggle mirroring `AppSettings::spellcheck_enabled`. When `false`
+/// the public helpers short-circuit to treat every word as correct and return
+/// no suggestions, so chat-input callers can leave their existing spellcheck
+/// call sites unchanged.
+static SPELLCHECK_ENABLED: AtomicBool = AtomicBool::new(true);
+
+fn user_dict() -> &'static RwLock<BTreeSet<String>> {
+    USER_DICT.get_or_init(|| RwLock::new(BTreeSet::new()))
+}
 
 struct SpellData {
     /// All known dictionary words (lowercase).
@@ -82,24 +98,123 @@ fn data() -> &'static SpellData {
 /// startup so the first right-click doesn't pay the parsing cost.
 pub fn init() {
     let _ = data();
+    let _ = user_dict();
+}
+
+/// Returns whether the spellchecker is currently enabled. When disabled,
+/// [`is_correct`] reports every word as correct and [`suggestions`] returns
+/// an empty list so the UI can leave its call sites unconditional.
+pub fn is_enabled() -> bool {
+    SPELLCHECK_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Flip the enabled/disabled state for the whole spellchecker. Persisted
+/// copy lives in [`crust_storage::AppSettings::spellcheck_enabled`].
+pub fn set_enabled(enabled: bool) {
+    SPELLCHECK_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
 /// Returns `true` when the word is known **or** should be skipped
 /// (non-alpha, single char, etc.).
 pub fn is_correct(word: &str) -> bool {
+    if !is_enabled() {
+        return true;
+    }
     if word.len() < 2 || !word.chars().all(|c| c.is_ascii_alphabetic()) {
         return true; // skip non-alpha / very short tokens
     }
     let lower = word.to_ascii_lowercase();
-    data().words.contains(lower.as_str())
+    if data().words.contains(lower.as_str()) {
+        return true;
+    }
+    if let Ok(dict) = user_dict().read() {
+        if dict.contains(&lower) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Add `word` to the user-managed custom dictionary. Returns `true` when the
+/// word was newly inserted (caller may want to persist).
+///
+/// Empty, non-alphabetic, or excessively long inputs are rejected.
+pub fn add_to_user_dict(word: &str) -> bool {
+    let trimmed = word.trim();
+    if trimmed.is_empty() || trimmed.len() > 64 {
+        return false;
+    }
+    if !trimmed.chars().all(|c| c.is_ascii_alphabetic()) {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if let Ok(mut dict) = user_dict().write() {
+        return dict.insert(lower);
+    }
+    false
+}
+
+/// Remove `word` from the user-managed custom dictionary. Returns `true`
+/// when a word was actually removed.
+pub fn remove_from_user_dict(word: &str) -> bool {
+    let lower = word.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    if let Ok(mut dict) = user_dict().write() {
+        return dict.remove(&lower);
+    }
+    false
+}
+
+/// Snapshot of the user's custom dictionary, sorted alphabetically (lower-cased).
+pub fn user_dict_snapshot() -> Vec<String> {
+    match user_dict().read() {
+        Ok(d) => d.iter().cloned().collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Replace the in-memory user dictionary with `words` (typically called once
+/// at startup from persisted settings). Words are normalised to lowercase and
+/// filtered the same way as [`add_to_user_dict`].
+pub fn set_user_dict<I, S>(words: I)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let filtered: BTreeSet<String> = words
+        .into_iter()
+        .filter_map(|w| {
+            let t = w.as_ref().trim();
+            if t.is_empty() || t.len() > 64 {
+                return None;
+            }
+            if !t.chars().all(|c| c.is_ascii_alphabetic()) {
+                return None;
+            }
+            Some(t.to_ascii_lowercase())
+        })
+        .collect();
+    if let Ok(mut dict) = user_dict().write() {
+        *dict = filtered;
+    }
 }
 
 /// Return up to `max` suggestions for a misspelled `word`, ranked by a
 /// combined metric of edit distance, word frequency, phonetic similarity
-/// and keyboard proximity.
+/// and keyboard proximity. The user's custom dictionary is folded in so
+/// recently-added words can resurface as suggestions.
 pub fn suggestions(word: &str, max: usize) -> Vec<String> {
+    if !is_enabled() || max == 0 {
+        return Vec::new();
+    }
     let lower = word.to_ascii_lowercase();
     let d = data();
+
+    // Snapshot of user-dict words so we can fold them into the candidate pool
+    // without holding the lock across the entire ranking loop.
+    let user_words: Vec<String> = user_dict_snapshot();
 
     // Maps candidate → minimum edit distance found.
     let mut candidates: HashMap<String, u8> = HashMap::new();
@@ -136,11 +251,30 @@ pub fn suggestions(word: &str, max: usize) -> Vec<String> {
         }
     }
 
+    // -- User-dictionary additions --------------------------------------
+    // Words the user has added get surfaced when close enough to the query.
+    for uw in &user_words {
+        if uw == &lower || candidates.contains_key(uw) {
+            continue;
+        }
+        let ed = edit_distance(&lower, uw);
+        if ed <= 3 {
+            candidates.insert(uw.clone(), ed as u8);
+        }
+    }
+
+    let user_set: HashSet<&str> = user_words.iter().map(String::as_str).collect();
+
     // -- Score, sort, truncate ------------------------------------------
     let mut scored: Vec<(String, f64)> = candidates
         .into_iter()
         .map(|(cand, dist)| {
-            let s = score(&lower, &cand, dist, &query_sx, d);
+            let mut s = score(&lower, &cand, dist, &query_sx, d);
+            // Words the user explicitly added get a modest bonus so they
+            // float to the top of ties.
+            if user_set.contains(cand.as_str()) {
+                s -= 150.0;
+            }
             (cand, s)
         })
         .collect();
@@ -400,5 +534,51 @@ fn key_pos(c: char) -> Option<(f64, f64)> {
         'n' => Some((2.0, 5.75)),
         'm' => Some((2.0, 6.75)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_dict_add_makes_word_correct() {
+        let fake = "qzqxvertfake";
+        // Ensure clean slate (prior tests may have added it).
+        remove_from_user_dict(fake);
+        assert!(!is_correct(fake));
+        assert!(add_to_user_dict(fake));
+        assert!(is_correct(fake));
+        assert!(!add_to_user_dict(fake), "second add is a no-op");
+        assert!(remove_from_user_dict(fake));
+        assert!(!is_correct(fake));
+    }
+
+    #[test]
+    fn user_dict_rejects_non_alpha() {
+        assert!(!add_to_user_dict(""));
+        assert!(!add_to_user_dict("hello123"));
+        assert!(!add_to_user_dict("he llo"));
+    }
+
+    #[test]
+    fn set_user_dict_replaces_contents() {
+        set_user_dict(["Kappa", "monkaS", "POGGERS"]);
+        // Only all-alpha words pass the filter. "monkaS" has uppercase S but
+        // is still alphabetic, so all three should pass.
+        let snap = user_dict_snapshot();
+        assert!(snap.contains(&"kappa".to_owned()));
+        assert!(snap.contains(&"monkas".to_owned()));
+        assert!(snap.contains(&"poggers".to_owned()));
+        // Reset so other tests don't see custom data.
+        set_user_dict(Vec::<String>::new());
+    }
+
+    #[test]
+    fn disabled_short_circuits_suggestions_and_correctness() {
+        set_enabled(false);
+        assert!(is_correct("asdkjfhqw"));
+        assert!(suggestions("teh", 5).is_empty());
+        set_enabled(true);
     }
 }
