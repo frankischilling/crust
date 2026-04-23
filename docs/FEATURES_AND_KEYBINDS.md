@@ -1,6 +1,6 @@
 # Features And Keybinds
 
-Last updated: 2026-04-06 (v0.4.3)
+Last updated: 2026-04-22 (v0.5.0)
 
 This page is a practical reference for what crust can do today: major features, keyboard shortcuts, high-use mouse actions, and built-in slash commands.
 
@@ -24,6 +24,9 @@ This page is a practical reference for what crust can do today: major features, 
 - Quick switch palette with unified channels + whisper threads
 - Mention-first quick switch ordering (mentions, then unread, then others)
 - Split-pane view (up to 4 panes)
+- Tab visibility rules: right-click any Twitch tab to "Hide when offline"; tab reappears automatically when the stream goes live
+- Live / followed-channels feed tab (aggregated list of every followed channel currently live)
+- Persistent cross-channel Mentions tab (ring buffer, restored from local log on startup)
 
 ### Messages and rendering
 
@@ -70,6 +73,13 @@ This page is a practical reference for what crust can do today: major features, 
 - Keyring-backed token storage with fallback
 - IRC identity settings (nick and NickServ auth)
 - Persisted settings for appearance, behavior, notifications, rules, filters, presets, and beta flags
+- Remappable keyboard shortcuts: every binding routes through a central hotkey registry; rebind from Settings → Hotkeys with conflict detection
+- Custom command aliases: user-defined `/trigger = body` pairs with `{1}`, `{1+}`, `{channel}`, `{user}`, `{input}`, `{streamer}` variables
+- Spellcheck with personal dictionary: underlines misspelled words in the chat input, right-click for top 5 suggestions or "Add to dictionary"
+- Sound event system: per-event ping sounds for mention / whisper / subscribe / raid / highlight, with per-event volume and streamer-mode muting
+- Image uploader: clipboard paste or drag-drop to a configurable host (Imgur, Nuuls, ShareX SXCU, or any custom multipart endpoint); deletion URLs logged locally
+- External tools: Streamlink integration with configurable path / quality / extra args, plus a custom player template (`{channel}`)
+- Crash handler: structured panic reports with backtrace, tracing log tail, and live settings snapshot; abnormal-shutdown detection via session sentinels; in-app crash viewer on next launch
 
 ### Search, history, and local data
 
@@ -96,12 +106,15 @@ This page is a practical reference for what crust can do today: major features, 
 
 ## Keybinds
 
+All shortcuts below are defaults. Every binding can be remapped from Settings → Hotkeys; conflicts are flagged inline.
+
 ### Global and navigation
 
 | Keybind | Behavior |
 | --- | --- |
 | Ctrl+K | Open quick switch palette |
 | Ctrl+F | Open message search on active channel/pane |
+| Ctrl+Shift+F | Open cross-channel search popup (predicate DSL) |
 | Escape | Close quick switch or close search (when open) |
 | Ctrl+Tab, Ctrl+PageDown, Alt+Right | Next channel (prioritizes mentions/unread) |
 | Ctrl+Shift+Tab, Ctrl+PageUp, Alt+Left | Previous channel (prioritizes mentions/unread) |
@@ -110,6 +123,9 @@ This page is a practical reference for what crust can do today: major features, 
 | Ctrl+End | Focus last channel (or last split in split mode) |
 | Alt+Shift+Left | Move active channel tab left (or move focused split left in split mode) |
 | Alt+Shift+Right | Move active channel tab right (or move focused split right in split mode) |
+| Ctrl+= | Increase chat font size on focused split |
+| Ctrl+- | Decrease chat font size on focused split |
+| Ctrl+0 | Reset chat font size on focused split |
 
 ### Split-mode only
 
@@ -142,14 +158,17 @@ Notes:
 - Autocomplete supports emotes, usernames, slash commands, and IRC /join channel suggestions.
 - Bare-word Tab completion cycles emote/username matches.
 - Twitch character count and over-limit behavior depends on the configured overflow mode.
+- Pasting an image from the clipboard or dropping an image file onto the chat input triggers the configured uploader; the returned URL is inserted at the caret.
 
 ## Common mouse and context actions
 
 - Right-click message row: reply/copy/moderation/workflow actions
 - Right-click message row (mod): quick delete/timeout/ban/warn + full moderation submenus
-- Right-click chat input: cut/copy/paste/select all/send now/clear input/insert /help/spell suggestions
+- Right-click chat input: cut/copy/paste/select all/send now/clear input/insert /help/spell suggestions (top 5) + "Add to dictionary"
+- Right-click channel tab: hide-when-offline toggle, Open in Streamlink
 - Click username: open user card
 - Click toolbar buttons: open settings, join dialog, analytics, whispers, IRC status, moderation tools
+- Paste image (Ctrl+V) or drop file on chat input: upload to configured host and insert returned URL
 
 ## Built-in slash commands
 
@@ -164,8 +183,8 @@ This is the built-in command surface in the UI parser. Unknown commands are pass
 - /chatters
 - /fakemsg <text>
 - /openurl <url>
-- /logs — open the Crust log/data folder in the system file manager
-- /live — list currently-live tracked Twitch channels
+- /logs open the Crust log/data folder in the system file manager
+- /live list currently-live tracked Twitch channels
 
 ### Polls and predictions
 
@@ -185,8 +204,8 @@ This is the built-in command surface in the UI parser. Unknown commands are pass
 - /announce
 - /shoutout
 - /requests
-- /setgame <category> — update the Twitch stream category (broadcaster only)
-- /settitle <title> — update the Twitch stream title (broadcaster only)
+- /setgame <category> update the Twitch stream category (broadcaster only)
+- /settitle <title> update the Twitch stream title (broadcaster only)
 
 ### Moderation and safety
 
@@ -202,7 +221,7 @@ This is the built-in command surface in the UI parser. Unknown commands are pass
 - /unrestrict
 - /banid
 - /untimeout
-- /shield <on|off> — toggle Twitch Shield Mode (mod/broadcaster only)
+- /shield <on|off> toggle Twitch Shield Mode (mod/broadcaster only)
 
 ### Chat and whisper helpers
 
@@ -216,9 +235,13 @@ This is the built-in command surface in the UI parser. Unknown commands are pass
 - /popout
 - /user
 - /usercard
-- /streamlink
-- /follow-age [user] — report how long a user has followed this channel (alias: /followage)
-- /account-age [user] — report the Twitch account age for a user (alias: /accountage)
+- /streamlink [channel] open the given (or current) Twitch channel in Streamlink using the configured path / quality / extra args
+- /follow-age [user] report how long a user has followed this channel (alias: /followage)
+- /account-age [user] report the Twitch account age for a user (alias: /accountage)
+
+### User-defined aliases
+
+User-defined command aliases (Settings → Commands) dispatch after the built-in table. Aliases support the variables `{1}`, `{1+}`, `{channel}`, `{user}`, `{input}`, and `{streamer}`, and recursive alias chains are rejected at save time.
 
 ### IRC-focused commands
 
@@ -242,4 +265,6 @@ This is the built-in command surface in the UI parser. Unknown commands are pass
 - [UI API](API_UI.md)
 - [Events API](API_Events.md)
 - [Plugin API reference](API.md)
-- [Release notes v0.4.3](Release_v0.4.3.md)
+- [Release notes v0.5.0](releases/Release_v0.5.0.md)
+- [Release notes v0.4.9](releases/Release_v0.4.9.md)
+- [Release notes v0.4.3](releases/Release_v0.4.3.md)

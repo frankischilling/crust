@@ -38,11 +38,17 @@ echo "[2/5] Staging Debian package layout..."
 rm -rf "${stage_root}"
 mkdir -p "${pkg_root}/DEBIAN"
 mkdir -p "${pkg_root}/usr/bin"
+mkdir -p "${pkg_root}/usr/share/applications"
 mkdir -p "${pkg_root}/usr/share/doc/crust"
+mkdir -p "${pkg_root}/usr/share/icons/hicolor/scalable/apps"
 
 install -m 0755 "${bin_path}" "${pkg_root}/usr/bin/crust"
 install -m 0644 "${repo_root}/README.md" "${pkg_root}/usr/share/doc/crust/README.md"
 install -m 0644 "${repo_root}/LICENSE" "${pkg_root}/usr/share/doc/crust/LICENSE"
+install -m 0644 "${repo_root}/crates/app/resources/crust.desktop" \
+    "${pkg_root}/usr/share/applications/crust.desktop"
+install -m 0644 "${repo_root}/crates/app/resources/crust.svg" \
+    "${pkg_root}/usr/share/icons/hicolor/scalable/apps/crust.svg"
 
 cat >"${pkg_root}/DEBIAN/control" <<EOF
 Package: crust

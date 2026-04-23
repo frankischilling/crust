@@ -122,7 +122,10 @@ Registers or replaces one floating plugin-owned window.
 ### `c2.ui.update_window(id, spec)`
 
 Replaces the retained window with id `id`. The first argument is the source of
-truth for the window id.
+truth for the window id. The current open/closed state is preserved the
+`open` field in `spec` is ignored for existing windows so tick-driven content
+refreshes can never fight the user clicking the window's close (X) button.
+Use `c2.ui.open_window` / `c2.ui.close_window` to change visibility.
 
 ### `c2.ui.open_window(id)`
 

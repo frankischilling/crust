@@ -8,10 +8,11 @@ members = [
     "crates/kick",
     "crates/emotes",
     "crates/storage",
+    "crates/uploader",
 ]
 
 [workspace.package]
-version = "0.4.9"
+version = "0.5.0"
 edition = "2021"
 authors = ["crust contributors"]
 license = "GPL-3.0-only"
@@ -72,6 +73,11 @@ regex = "1"
 once_cell = "1.19"
 rusqlite = { version = "0.31", features = ["bundled"] }
 cc = "1"
+# Audio playback for sound notifications (mention / whisper / sub / raid /
+# custom highlight). Default features enable cpal-based playback plus
+# symphonia decoders for wav/mp3/ogg/flac, which covers every file format
+# users are likely to drop in.
+rodio = "0.22"
 
 [profile.dev]
 # Keep dev builds lean on low-disk Windows setups:
@@ -79,3 +85,12 @@ cc = "1"
 # - `incremental = false` avoids sizable incremental cache directories
 debug = 0
 incremental = false
+# Mild optimization on our own crates so debug builds are usable
+# (egui/image decoding are unusably slow at opt-level = 0).
+opt-level = 1
+
+# Optimize all third-party dependencies even in debug builds.
+# This is the standard fix for egui/image/regex being unusably slow in `cargo run`.
+# Our workspace crates still build at opt-level = 1 above for fast iteration.
+[profile.dev.package."*"]
+opt-level = 3
