@@ -213,6 +213,15 @@ pub enum AppCommand {
     },
     /// Look up how long `user` has followed `channel`.
     FetchFollowAge { channel: ChannelId, user: String },
+    /// Silent variant of [`FetchFollowAge`] used by the user-card popup.
+    /// Result is delivered via [`AppEvent::UserCardFollowAgeLoaded`] rather
+    /// than as a system notice.
+    FetchUserCardFollowAge { channel: ChannelId, login: String },
+    /// Toggle auto-claim of channel-points "Bonus Points" rewards.
+    SetAutoClaimBonusPoints { enabled: bool },
+    /// Open the embedded Twitch sign-in window so the user can authenticate
+    /// the webview session. No-op when already signed in.
+    OpenTwitchSignIn,
     /// Look up the account creation date for `user` and report its age.
     FetchAccountAge {
         /// Channel to inject the resulting local message into.
@@ -278,11 +287,38 @@ pub enum AppCommand {
         timestamps_font_size: f32,
         /// Room-state / viewer-count pill size (pt).
         pills_font_size: f32,
+        /// Tooltip / popover label size (pt). 0.0 = auto.
+        popups_font_size: f32,
+        /// Inline chip / inline badge label size (pt). 0.0 = auto.
+        chips_font_size: f32,
+        /// User-card heading size (pt). 0.0 = auto.
+        usercard_font_size: f32,
+        /// Login / dialog helper-text size (pt). 0.0 = auto.
+        dialog_font_size: f32,
     },
     /// Persist the last-focused channel so it can be restored on next launch.
     SetLastActiveChannel {
         /// Serialised ChannelId (platform-prefixed key).
         channel: String,
+    },
+    /// Persist current window geometry (logical points). `None` means unknown.
+    SetWindowGeometry {
+        pos: Option<[f32; 2]>,
+        size: Option<[f32; 2]>,
+        maximized: bool,
+    },
+    /// Persist whispers-panel state.
+    SetWhispersPanel {
+        visible: bool,
+        active_login: String,
+    },
+    /// Persist user-arranged channel tab order.
+    SetChannelOrder { order: Vec<String> },
+    /// Persist split-pane layout.
+    SetSplitPanes {
+        /// Each entry: (channel_id, frac).
+        panes: Vec<(String, f32)>,
+        focused: usize,
     },
     /// Update the per-tab visibility rule for `channel`. Setting the rule
     /// to [`crate::state::TabVisibilityRule::Always`] removes any prior
@@ -537,7 +573,7 @@ pub enum AppEvent {
     ChannelParted {
         channel: ChannelId,
     },
-    /// An IRC channel redirect occurred (e.g. #chat → ##chat on Libera).
+    /// An IRC channel redirect occurred (e.g. #chat -> ##chat on Libera).
     /// The UI should replace the old channel tab with the new one.
     ChannelRedirected {
         old_channel: ChannelId,
@@ -635,6 +671,12 @@ pub enum AppEvent {
     LowTrustStatusUpdated {
         channel: ChannelId,
         login: String,
+        /// Twitch user-id; needed to call the Helix suspicious-user APIs
+        /// from the moderation tools UI. Empty when unknown (legacy
+        /// emitters before the field was added).
+        user_id: String,
+        /// Display name; lets the UI render the original casing.
+        display_name: String,
         status: Option<crate::model::LowTrustStatus>,
     },
     /// USERSTATE received - badges, color and mod status for the logged-in user.
@@ -651,6 +693,24 @@ pub enum AppEvent {
     /// The logged-in user's avatar URL has been resolved.
     SelfAvatarLoaded {
         avatar_url: String,
+    },
+    /// Source-channel profile for a Shared Chat message has been resolved. UI
+    /// back-fills `ChatMessage.shared.{login,display_name,profile_url}` on
+    /// every already-buffered message with a matching `room_id`, and caches
+    /// the result for future mirrored deliveries. Image bytes land in
+    /// `emote_bytes` via a companion `EmoteImageReady` event.
+    SharedChannelResolved {
+        room_id: String,
+        login: String,
+        display_name: String,
+        profile_url: Option<String>,
+    },
+    /// A channel's Shared Chat session snapshot has been refreshed. `None`
+    /// means the broadcaster is no longer in a shared-chat session (so the
+    /// viewer-total banner should be removed).
+    SharedChatSessionUpdated {
+        channel: super::model::ChannelId,
+        session: Option<crate::state::SharedChatSessionState>,
     },
     /// Open-Graph / Twitter-Card metadata is ready for a URL.
     LinkPreviewReady {
@@ -756,10 +816,22 @@ pub enum AppEvent {
     },
     /// Startup hint: the last-focused channel from the previous session.
     /// UI activates this channel once it has been joined and is present in
-    /// `AppState.channels`.
+    /// `AppState.channels`. Also carries previous-session UI layout
+    /// (channel order, split panes, whispers panel) so the UI can rebuild
+    /// the workspace exactly as the user left it.
     RestoreLastActiveChannel {
         /// Serialized ChannelId (platform-prefixed key).
         channel: String,
+        /// Previous-session channel tab order (serialized ChannelIds).
+        channel_order: Vec<String>,
+        /// Previous-session split-pane layout: (channel, frac).
+        split_panes: Vec<(String, f32)>,
+        /// Focused-pane index within `split_panes`.
+        split_panes_focused: usize,
+        /// Whispers panel was visible at last shutdown.
+        whispers_visible: bool,
+        /// Last-focused whisper thread login.
+        last_whisper_login: String,
     },
     /// Font sizing snapshot loaded/updated from persistent storage.
     FontSettingsUpdated {
@@ -775,6 +847,14 @@ pub enum AppEvent {
         timestamps_font_size: f32,
         /// Room-state / viewer-count pill size (pt).
         pills_font_size: f32,
+        /// Tooltip / popover label size (pt). 0.0 = auto.
+        popups_font_size: f32,
+        /// Inline chip / inline badge label size (pt). 0.0 = auto.
+        chips_font_size: f32,
+        /// User-card heading size (pt). 0.0 = auto.
+        usercard_font_size: f32,
+        /// Login / dialog helper-text size (pt). 0.0 = auto.
+        dialog_font_size: f32,
     },
     /// Per-tab visibility rules loaded/updated from persistent storage.
     /// Emitted at startup (initial snapshot) and after every successful
@@ -915,6 +995,35 @@ pub enum AppEvent {
         login: String,
         pronouns: Option<String>,
     },
+    /// Silent follow-age result for the user-card popup. `followed_at = None`
+    /// means the user does not follow `channel`. Carries the channel so the
+    /// popup can ignore stale results when its context has changed.
+    UserCardFollowAgeLoaded {
+        channel: ChannelId,
+        login: String,
+        followed_at: Option<String>,
+    },
+    /// Auto-claim setting changed (persisted in [`crate::*`] settings).
+    AutoClaimBonusPointsUpdated { enabled: bool },
+    /// Latest channel-points balance for the logged-in user in `channel`.
+    /// Emitted by the periodic claimer poll; safe to ignore when the user
+    /// is anonymous or not on a Twitch tab.
+    ChannelPointsBalanceUpdated {
+        channel: ChannelId,
+        balance: u64,
+    },
+    /// A "Bonus Points" claim has been auto-redeemed. `points` = the amount
+    /// the claim was worth, `balance` = the new running total.
+    ChannelPointsClaimed {
+        channel: ChannelId,
+        points: u64,
+        balance: u64,
+    },
+    /// Embedded webview login state changed.
+    /// `logged_in = None` during initial probe.
+    TwitchWebviewLoginState { logged_in: Option<bool> },
+    /// Embedded webview DOM-clicked a Bonus Points button on `channel`.
+    TwitchWebviewBonusClaimed { channel: crate::model::ChannelId },
     /// Usercard preferences loaded/updated (currently: show-pronouns toggle).
     UsercardSettingsUpdated {
         show_pronouns: bool,
@@ -1024,6 +1133,43 @@ pub enum AppEvent {
         channel: ChannelId,
         result: Result<String, String>,
     },
+    /// Hype train lifecycle update from Twitch EventSub.  Emitted for the
+    /// broadcaster's own channel once per EventSub notification (begin,
+    /// progress, end).  The UI renders a live banner from the latest state
+    /// until `phase == "end"` and the banner's configured cooldown elapses.
+    HypeTrainUpdated {
+        /// Target channel the hype train belongs to.
+        channel: ChannelId,
+        /// "begin", "progress", or "end".
+        phase: String,
+        /// Current level (1..=5, 0 when unavailable).
+        level: u32,
+        /// Points accumulated towards the next level.
+        progress: u64,
+        /// Points needed to reach the next level (0 on end events).
+        goal: u64,
+        /// Total points accumulated across the whole train.
+        total: u64,
+        /// Display name of the current top contributor.
+        top_contributor_login: Option<String>,
+        /// "bits" / "subscription" / other.
+        top_contributor_type: Option<String>,
+        /// Contribution size for the top contributor.
+        top_contributor_total: Option<u64>,
+        /// ISO 8601 timestamp the current phase expires (begin/progress) or
+        /// the cooldown ends (end).
+        ends_at: Option<String>,
+    },
+    /// A raid arrived for a channel. The UI reduces this into
+    /// `AppState.raid_banners` so a prominent banner renders above the chat
+    /// until dismissed or the TTL elapses. Also emitted for backfilled or
+    /// EventSub-sourced raids so both IRC and EventSub paths converge.
+    RaidBannerShown {
+        channel: ChannelId,
+        display_name: String,
+        viewer_count: u32,
+        source_login: Option<String>,
+    },
     /// Latest list of currently-live followed channels, already sorted
     /// desc by viewer_count. Replaces `AppState.live_channels` wholesale.
     LiveFeedUpdated {
@@ -1063,10 +1209,10 @@ impl std::fmt::Display for ConnectionState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConnectionState::Disconnected => write!(f, "Disconnected"),
-            ConnectionState::Connecting => write!(f, "Connecting…"),
+            ConnectionState::Connecting => write!(f, "Connecting..."),
             ConnectionState::Connected => write!(f, "Connected"),
             ConnectionState::Reconnecting { attempt } => {
-                write!(f, "Reconnecting (attempt {attempt})…")
+                write!(f, "Reconnecting (attempt {attempt})...")
             }
             ConnectionState::Error(e) => write!(f, "Error: {e}"),
         }

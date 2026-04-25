@@ -6,16 +6,16 @@
 //! expanded text. The UI layer calls [`expand_command_aliases`] before
 //! dispatching a message, so aliases compose with the built-in slash parser:
 //! aliases whose body starts with another `/<cmd>` get re-parsed through the
-//! normal slash-command pipeline (server-side `/me`, Helix `/announce`, …).
+//! normal slash-command pipeline (server-side `/me`, Helix `/announce`, ...).
 //!
 //! Supported variables in the alias body:
 //!
 //! | Token       | Expands to                                               |
 //! | ----------- | -------------------------------------------------------- |
 //! | `{1}`       | 1st whitespace-separated argument after the trigger      |
-//! | `{2}` …     | n-th argument                                            |
+//! | `{2}` ...     | n-th argument                                            |
 //! | `{1+}`      | 1st argument plus everything after it (verbatim)         |
-//! | `{2+}` …    | n-th argument plus everything after it                   |
+//! | `{2+}` ...    | n-th argument plus everything after it                   |
 //! | `{input}`   | Full argument list (everything after the trigger)        |
 //! | `{channel}` | Current channel login (display name, no leading `#`)     |
 //! | `{user}`    | Currently authenticated user login, or empty if anon     |
@@ -159,7 +159,7 @@ fn format_chain(chain: &[String]) -> String {
         .iter()
         .map(|t| format!("/{t}"))
         .collect::<Vec<_>>()
-        .join(" → ")
+        .join(" -> ")
 }
 
 /// Look up an alias by its trigger using case-insensitive matching. Disabled
@@ -270,7 +270,7 @@ fn split_args(args: &str) -> Vec<&str> {
 }
 
 /// Substitute `{N}`, `{N+}`, `{input}`, `{channel}`, `{streamer}`, `{user}`
-/// tokens in `body` using `args` as the remaining input. Unknown `{…}`
+/// tokens in `body` using `args` as the remaining input. Unknown `{...}`
 /// tokens are passed through verbatim.
 fn substitute_variables(body: &str, args: &str, channel: &str, user: &str) -> String {
     let tokens = split_args(args);
@@ -278,7 +278,7 @@ fn substitute_variables(body: &str, args: &str, channel: &str, user: &str) -> St
     let bytes = body.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        // Look for `{…}` patterns. Anything else is copied byte-for-byte.
+        // Look for `{...}` patterns. Anything else is copied byte-for-byte.
         if bytes[i] == b'{' {
             if let Some(close_rel) = body[i + 1..].find('}') {
                 let close = i + 1 + close_rel;

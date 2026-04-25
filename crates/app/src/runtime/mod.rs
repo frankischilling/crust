@@ -1,8 +1,11 @@
 pub(crate) mod assets;
 pub(crate) mod badges;
+pub(crate) mod channel_points_claimer;
 pub(crate) mod emote_loading;
+pub(crate) mod eventsub_backfill;
 pub(crate) mod eventsub_notices;
 pub(crate) mod history;
+pub(crate) mod hype_train_poller;
 pub(crate) mod link_preview;
 pub(crate) mod live_feed;
 pub(crate) mod plugins;

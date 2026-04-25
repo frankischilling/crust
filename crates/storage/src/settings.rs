@@ -79,7 +79,7 @@ pub struct ExternalToolsConfig {
     /// Empty = rely on `mpv` being on `PATH`.
     pub mpv_path: String,
     /// Optional Twitch session token (the `auth-token` cookie value from
-    /// twitch.tv in the browserDevTools → Application → Cookies → the
+    /// twitch.tv in the browserDevTools -> Application -> Cookies -> the
     /// `auth-token` row).  When non-empty, Streamlink is launched with
     /// `--twitch-api-header "Authorization=OAuth <token>"` so Turbo / sub
     /// ad-skip applies and Twitch's HLS edge serves the authenticated
@@ -128,6 +128,18 @@ pub struct AppSettings {
     /// Room-state / viewer-count pill label size (pt).
     #[serde(default = "default_pills_font_size")]
     pub pills_font_size: f32,
+    /// Tooltip / popover font size (pt). 0.0 = auto-follow chat font.
+    #[serde(default = "default_section_auto")]
+    pub popups_font_size: f32,
+    /// Inline chip / inline badge font size (pt). 0.0 = auto-follow chat font.
+    #[serde(default = "default_section_auto")]
+    pub chips_font_size: f32,
+    /// User-card heading font size (pt). 0.0 = auto-follow chat font.
+    #[serde(default = "default_section_auto")]
+    pub usercard_font_size: f32,
+    /// Login / setup dialog helper-text font size (pt). 0.0 = auto-follow chat font.
+    #[serde(default = "default_section_auto")]
+    pub dialog_font_size: f32,
     /// Last focused channel (restored on next launch). Stored as the
     /// serialized ChannelId debug/serde string.
     #[serde(default)]
@@ -239,7 +251,7 @@ pub struct AppSettings {
     /// Whether split headers show viewer counts when available.
     #[serde(default = "bool_true")]
     pub split_header_show_viewer_count: bool,
-    // -- Highlight rules (chatterino-style per-rule config) --------------
+    // Highlight rules (chatterino-style per-rule config)
     /// Structured highlight rules (replaces the flat `highlights` string list).
     /// When empty on load and `highlights` is non-empty, a migration populates it.
     #[serde(default)]
@@ -247,12 +259,12 @@ pub struct AppSettings {
     /// Structured filter records for hiding messages.
     #[serde(default)]
     pub filter_records: Vec<crust_core::model::filters::FilterRecord>,
-    // -- Moderation action presets ----------------------------------------
+    // Moderation action presets
     /// Saved moderation action presets shown in the user-card Moderation tab.
     /// When empty, the UI falls back to [`ModActionPreset::defaults()`].
     #[serde(default)]
     pub mod_action_presets: Vec<ModActionPreset>,
-    /// User login → custom display name aliases.
+    /// User login -> custom display name aliases.
     #[serde(default)]
     pub nicknames: Vec<crust_core::model::Nickname>,
     /// Structured per-user ignore list (supports regex + case sensitivity).
@@ -265,16 +277,20 @@ pub struct AppSettings {
     /// Off by default to respect privacy preferences.
     #[serde(default)]
     pub show_pronouns_in_usercard: bool,
-    // -- Desktop notifications --------------------------------------------
+    /// Auto-claim the "Bonus Points" channel-points reward whenever it
+    /// becomes available on a watched Twitch channel. Off by default.
+    #[serde(default)]
+    pub auto_claim_bonus_points: bool,
+    // Desktop notifications
     /// Fire an OS desktop notification when a highlight rule with
     /// `show_in_mentions = true` matches an incoming message.
     #[serde(default)]
     pub desktop_notifications_enabled: bool,
-    // -- Watched channels for stream status notifications --------------------
+    // Watched channels for stream status notifications
     /// Channels being watched for live/offline notifications.
     #[serde(default)]
     pub watched_channels: Vec<crust_core::notifications::WatchedChannel>,
-    // -- Updater settings/state (Windows + Debian-based Linux releases) ------
+    // Updater settings/state (Windows + Debian-based Linux releases)
     /// Whether startup/background update checks are enabled.
     #[serde(default = "bool_true")]
     pub update_checks_enabled: bool,
@@ -284,7 +300,7 @@ pub struct AppSettings {
     /// Semver string that the user skipped (if any).
     #[serde(default)]
     pub updater_skipped_version: String,
-    // -- Streamer mode -----------------------------------------------------
+    // Streamer mode
     /// Streamer mode setting: `off`, `auto`, or `on`.
     /// `auto` enables only when broadcasting software (OBS / Streamlabs) is detected.
     #[serde(default = "default_streamer_mode")]
@@ -298,27 +314,27 @@ pub struct AppSettings {
     /// Suppress sound notifications while streamer mode is active.
     #[serde(default = "bool_true")]
     pub streamer_suppress_sounds: bool,
-    // -- Sound events -------------------------------------------------------
+    // Sound events
     /// Per-event audio ping configuration (mention / whisper / sub / raid /
     /// custom highlight).  Stored under `[sounds]` in `settings.toml`.
     #[serde(default)]
     pub sounds: crust_core::sound::SoundSettings,
-    // -- Image uploader ----------------------------------------------------
+    // Image uploader
     /// Endpoint + JSON-path config for clipboard / drag-drop image uploads.
     #[serde(default)]
     pub image_uploader: UploaderConfig,
-    // -- External tools (Streamlink / custom player) -----------------------
+    // External tools (Streamlink / custom player)
     /// Streamlink path, quality, extra args, and player template.
     #[serde(default)]
     pub external_tools: ExternalToolsConfig,
-    // -- Per-tab visibility rules ------------------------------------------
+    // Per-tab visibility rules
     /// Per-channel tab visibility rules, keyed by the serialised
     /// `ChannelId` string and mapped to a `TabVisibilityRule` key
     /// (`always`, `hide_when_offline`). Mirrors Chatterino's per-tab
     /// "hide when offline" / "hide muted" options.
     #[serde(default)]
     pub tab_visibility_rules: BTreeMap<String, String>,
-    // -- Custom command aliases -------------------------------------------
+    // Custom command aliases
     /// User-defined slash-command aliases. Each entry maps a trigger like
     /// `hello` to an expansion body such as `/me says hi {1} {2+}`. See
     /// `crust_core::commands::alias` for the variable grammar.
@@ -330,7 +346,7 @@ pub struct AppSettings {
     /// upgrading the app doesn't wipe out bindings when new actions land.
     #[serde(default)]
     pub hotkey_bindings: BTreeMap<String, KeyBinding>,
-    // -- Spell check -------------------------------------------------------
+    // Spell check
     /// Whether to underline misspelled words in the chat input and show
     /// right-click suggestions. Mirrors Chatterino's input spellcheck toggle.
     #[serde(default = "bool_true")]
@@ -340,6 +356,47 @@ pub struct AppSettings {
     /// relaunches. Stored lower-case, alphabetic only.
     #[serde(default)]
     pub custom_spell_dict: Vec<String>,
+    // Window geometry (restored on next launch)
+    /// Last window outer position in logical points, if known.
+    #[serde(default)]
+    pub window_pos: Option<[f32; 2]>,
+    /// Last window inner size in logical points, if known.
+    #[serde(default)]
+    pub window_size: Option<[f32; 2]>,
+    /// Whether the window was maximized at last shutdown.
+    #[serde(default)]
+    pub window_maximized: bool,
+    // Whispers panel
+    /// Whether the whispers panel was open at last shutdown.
+    #[serde(default)]
+    pub whispers_panel_visible: bool,
+    /// Last-focused whisper thread login.
+    #[serde(default)]
+    pub last_whisper_login: String,
+    // Channel layout
+    /// User-arranged channel tab order. Each entry is a serialized ChannelId.
+    #[serde(default)]
+    pub channel_order: Vec<String>,
+    /// Persisted split-pane layout (channel + width fraction). Empty = single-pane mode.
+    #[serde(default)]
+    pub split_panes: Vec<PersistedPane>,
+    /// Index of the focused pane within `split_panes`.
+    #[serde(default)]
+    pub split_panes_focused: usize,
+}
+
+/// A single split-pane slot persisted across sessions.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PersistedPane {
+    /// Serialized ChannelId (platform-prefixed key).
+    pub channel: String,
+    /// Width fraction (0.0-1.0).
+    #[serde(default = "default_pane_frac")]
+    pub frac: f32,
+}
+
+fn default_pane_frac() -> f32 {
+    0.5
 }
 
 fn default_theme() -> String {
@@ -361,6 +418,9 @@ fn default_timestamps_font_size() -> f32 {
     0.0
 }
 fn default_pills_font_size() -> f32 {
+    0.0
+}
+fn default_section_auto() -> f32 {
     0.0
 }
 fn bool_true() -> bool {
@@ -392,6 +452,10 @@ impl Default for AppSettings {
             tabs_font_size: default_tabs_font_size(),
             timestamps_font_size: default_timestamps_font_size(),
             pills_font_size: default_pills_font_size(),
+            popups_font_size: default_section_auto(),
+            chips_font_size: default_section_auto(),
+            usercard_font_size: default_section_auto(),
+            dialog_font_size: default_section_auto(),
             last_active_channel: String::new(),
             username: String::new(),
             auto_join: Vec::new(),
@@ -435,6 +499,7 @@ impl Default for AppSettings {
             ignored_users: Vec::new(),
             ignored_phrases: Vec::new(),
             show_pronouns_in_usercard: false,
+            auto_claim_bonus_points: false,
             desktop_notifications_enabled: false,
             watched_channels: Vec::new(),
             update_checks_enabled: true,
@@ -452,6 +517,14 @@ impl Default for AppSettings {
             hotkey_bindings: BTreeMap::new(),
             spellcheck_enabled: true,
             custom_spell_dict: Vec::new(),
+            window_pos: None,
+            window_size: None,
+            window_maximized: false,
+            whispers_panel_visible: false,
+            last_whisper_login: String::new(),
+            channel_order: Vec::new(),
+            split_panes: Vec::new(),
+            split_panes_focused: 0,
         }
     }
 }
@@ -510,6 +583,12 @@ fn remove_account_from_settings(settings: &mut AppSettings, username: &str) {
 }
 
 impl SettingsStore {
+    /// Directory that holds `settings.toml`. Useful for siblings like the
+    /// webview's persistent user-data dir.
+    pub fn config_dir(&self) -> std::path::PathBuf {
+        self.config_path.parent().map(|p| p.to_path_buf()).unwrap_or_default()
+    }
+
     /// Construct and ensure config directory exists.
     pub fn new() -> Result<Self, StorageError> {
         let dirs = ProjectDirs::from("dev", "crust", "crust")
@@ -617,7 +696,7 @@ impl SettingsStore {
     /// Best-effort: write the token for `username` to the per-account keyring
     /// slot only - does NOT touch the settings file.  Use this after
     /// `save()` has already persisted the full settings struct so we avoid a
-    /// second load→modify→save cycle.
+    /// second load->modify->save cycle.
     pub fn try_save_account_keyring(&self, username: &str, token: &str) {
         let key = account_keyring_key(username);
         if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &key) {
@@ -841,6 +920,55 @@ split_header_show_viewer_count = false
         assert!(!cfg.split_header_show_title);
         assert!(cfg.split_header_show_game);
         assert!(!cfg.split_header_show_viewer_count);
+    }
+
+    #[test]
+    fn ui_layout_round_trip_from_toml() {
+        let cfg: AppSettings = toml::from_str(
+            r#"
+window_pos = [120.0, 240.0]
+window_size = [1600.0, 900.0]
+window_maximized = true
+whispers_panel_visible = true
+last_whisper_login = "vanessa"
+channel_order = ["twitch:foo", "twitch:bar"]
+split_panes_focused = 1
+
+[[split_panes]]
+channel = "twitch:foo"
+frac = 0.4
+
+[[split_panes]]
+channel = "twitch:bar"
+frac = 0.6
+"#,
+        )
+        .expect("ui layout config should parse");
+
+        assert_eq!(cfg.window_pos, Some([120.0, 240.0]));
+        assert_eq!(cfg.window_size, Some([1600.0, 900.0]));
+        assert!(cfg.window_maximized);
+        assert!(cfg.whispers_panel_visible);
+        assert_eq!(cfg.last_whisper_login, "vanessa");
+        assert_eq!(cfg.channel_order, vec!["twitch:foo", "twitch:bar"]);
+        assert_eq!(cfg.split_panes.len(), 2);
+        assert_eq!(cfg.split_panes[0].channel, "twitch:foo");
+        assert!((cfg.split_panes[0].frac - 0.4).abs() < 1e-6);
+        assert_eq!(cfg.split_panes_focused, 1);
+    }
+
+    #[test]
+    fn ui_layout_defaults_when_absent() {
+        let cfg: AppSettings = toml::from_str(r#"theme = "dark""#)
+            .expect("legacy config should parse without ui layout");
+        assert!(cfg.window_pos.is_none());
+        assert!(cfg.window_size.is_none());
+        assert!(!cfg.window_maximized);
+        assert!(!cfg.whispers_panel_visible);
+        assert!(cfg.last_whisper_login.is_empty());
+        assert!(cfg.channel_order.is_empty());
+        assert!(cfg.split_panes.is_empty());
+        assert_eq!(cfg.split_panes_focused, 0);
     }
 
     #[test]

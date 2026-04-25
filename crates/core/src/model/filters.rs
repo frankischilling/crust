@@ -1,4 +1,7 @@
-use crate::model::ChannelId;
+use std::sync::Arc;
+
+use crate::filters::{self as dsl, build_message_context, parse, Expression};
+use crate::model::{ChannelId, ChatMessage};
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +32,19 @@ impl Default for FilterAction {
     }
 }
 
+/// How the `pattern` field should be interpreted at compile time.
+///
+/// `Substring` is the historical default (plain text substring). `Regex`
+/// treats `pattern` as a [`regex::Regex`]. `Expression` treats `pattern` as
+/// a Chatterino-style filter DSL expression (see [`crate::filters`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum FilterMode {
+    #[default]
+    Substring,
+    Regex,
+    Expression,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct FilterRecord {
     pub name: String,
@@ -44,9 +60,16 @@ pub struct FilterRecord {
     /// Action to take when this filter matches (hide vs dim).
     #[serde(default)]
     pub action: FilterAction,
-    /// Filter username/sender rather than message content.
+    /// Filter username/sender rather than message content (legacy mode only).
     #[serde(default)]
     pub filter_sender: bool,
+    /// How `pattern` is interpreted.
+    ///
+    /// When absent from persisted data, falls back to [`FilterMode::Substring`]
+    /// (or `Regex` if the legacy `is_regex` field was `true`, handled at
+    /// compile time).
+    #[serde(default)]
+    pub mode: FilterMode,
 }
 
 fn bool_true() -> bool {
@@ -64,73 +87,123 @@ impl FilterRecord {
             scope,
             action: FilterAction::Hide,
             filter_sender: false,
+            mode: FilterMode::Substring,
         }
     }
 
-    /// Test whether this filter matches a given text string.
+    /// Effective mode after legacy `is_regex` migration.
+    pub fn effective_mode(&self) -> FilterMode {
+        match self.mode {
+            FilterMode::Substring if self.is_regex => FilterMode::Regex,
+            _ => self.mode.clone(),
+        }
+    }
+
+    /// Test whether this filter matches a given text string (legacy modes only).
+    ///
+    /// `Expression` mode always returns `false` here; use
+    /// [`check_filters_message`] for expression filters.
     pub fn matches_text(&self, text: &str) -> bool {
         if !self.enabled || self.pattern.is_empty() {
             return false;
         }
 
-        if self.is_regex {
-            // Regex path: compile on-the-fly for testing.
-            let mut builder = RegexBuilder::new(&self.pattern);
-            builder.case_insensitive(!self.case_sensitive);
-            if let Ok(re) = builder.build() {
-                return re.is_match(text);
+        match self.effective_mode() {
+            FilterMode::Expression => false,
+            FilterMode::Regex => {
+                let mut builder = RegexBuilder::new(&self.pattern);
+                builder.case_insensitive(!self.case_sensitive);
+                if let Ok(re) = builder.build() {
+                    return re.is_match(text);
+                }
+                false
             }
-            false
-        } else {
-            // Substring path
-            if self.case_sensitive {
-                text.contains(&self.pattern)
-            } else {
-                text.to_lowercase().contains(&self.pattern.to_lowercase())
+            FilterMode::Substring => {
+                if self.case_sensitive {
+                    text.contains(&self.pattern)
+                } else {
+                    text.to_lowercase().contains(&self.pattern.to_lowercase())
+                }
             }
         }
     }
 }
 
-/// The runtime-compiled version of a `FilterRecord` ready for fast matching.
+/// The runtime-compiled variant of a [`FilterRecord`].
 #[derive(Clone)]
 pub struct CompiledFilter {
     pub name: String,
-    pub pattern: regex::Regex,
     pub scope: FilterScope,
     pub action: FilterAction,
-    pub filter_sender: bool,
+    pub kind: CompiledFilterKind,
 }
 
+/// Compiled filter body: either a legacy regex match or a DSL expression.
+#[derive(Clone)]
+pub enum CompiledFilterKind {
+    Legacy {
+        pattern: regex::Regex,
+        filter_sender: bool,
+    },
+    Expression(Arc<Expression>),
+}
+
+/// Compile a slice of [`FilterRecord`]s into their runtime form.
+///
+/// Rules with invalid regex/expression are silently skipped and logged.
 pub fn compile_filters(records: &[FilterRecord]) -> Vec<CompiledFilter> {
     records
         .iter()
         .filter(|r| r.enabled && !r.pattern.is_empty())
-        .filter_map(|r| {
-            let pattern = if r.is_regex {
-                r.pattern.clone()
-            } else {
-                regex::escape(&r.pattern)
-            };
-
-            let mut builder = regex::RegexBuilder::new(&pattern);
-            builder.case_insensitive(!r.case_sensitive);
-
-            match builder.build() {
-                Ok(re) => Some(CompiledFilter {
+        .filter_map(|r| match r.effective_mode() {
+            FilterMode::Expression => match parse(&r.pattern) {
+                Ok(expr) => Some(CompiledFilter {
                     name: r.name.clone(),
-                    pattern: re,
                     scope: r.scope.clone(),
                     action: r.action.clone(),
-                    filter_sender: r.filter_sender,
+                    kind: CompiledFilterKind::Expression(Arc::new(expr)),
                 }),
-                Err(_) => None,
+                Err(e) => {
+                    tracing::warn!(
+                        "filter `{}`: invalid expression at {}..{}: {}",
+                        r.name,
+                        e.span().start,
+                        e.span().end,
+                        e
+                    );
+                    None
+                }
+            },
+            mode => {
+                let pattern = if matches!(mode, FilterMode::Regex) {
+                    r.pattern.clone()
+                } else {
+                    regex::escape(&r.pattern)
+                };
+                let mut builder = RegexBuilder::new(&pattern);
+                builder.case_insensitive(!r.case_sensitive);
+                match builder.build() {
+                    Ok(re) => Some(CompiledFilter {
+                        name: r.name.clone(),
+                        scope: r.scope.clone(),
+                        action: r.action.clone(),
+                        kind: CompiledFilterKind::Legacy {
+                            pattern: re,
+                            filter_sender: r.filter_sender,
+                        },
+                    }),
+                    Err(e) => {
+                        tracing::warn!("filter `{}`: invalid regex: {}", r.name, e);
+                        None
+                    }
+                }
             }
         })
         .collect()
 }
 
-/// Check if a message should be filtered. Returns `Some(action)` if filtered, `None` otherwise.
+/// Legacy `check_filters` entry point preserved for callers that don't yet
+/// have a full [`ChatMessage`] available. Expression filters are skipped.
 pub fn check_filters(
     compiled: &[CompiledFilter],
     channel_id: Option<&ChannelId>,
@@ -138,36 +211,99 @@ pub fn check_filters(
     sender_name: &str,
 ) -> Option<FilterAction> {
     for filter in compiled {
-        // Check scope
-        let scope_matches = match &filter.scope {
-            FilterScope::Global => true,
-            FilterScope::Channel(ch_id) => channel_id == Some(ch_id),
-        };
-        if !scope_matches {
+        if !scope_matches(&filter.scope, channel_id) {
             continue;
         }
-
-        // Check pattern
-        let text = if filter.filter_sender {
-            sender_name
-        } else {
-            message_text
-        };
-
-        if filter.pattern.is_match(text) {
-            return Some(filter.action.clone());
+        match &filter.kind {
+            CompiledFilterKind::Legacy {
+                pattern,
+                filter_sender,
+            } => {
+                let hay = if *filter_sender {
+                    sender_name
+                } else {
+                    message_text
+                };
+                if pattern.is_match(hay) {
+                    return Some(filter.action.clone());
+                }
+            }
+            CompiledFilterKind::Expression(_) => continue,
         }
     }
     None
 }
 
+/// Preferred entry point for runtime filtering.
+///
+/// Builds a [`crate::filters::Context`] once from `msg` and evaluates every
+/// active filter (legacy or expression) against it, returning the first
+/// matching [`FilterAction`].
+pub fn check_filters_message(
+    compiled: &[CompiledFilter],
+    channel_id: Option<&ChannelId>,
+    msg: &ChatMessage,
+    channel_display_name: &str,
+    channel_live: Option<bool>,
+    watching: bool,
+) -> Option<FilterAction> {
+    if compiled.is_empty() {
+        return None;
+    }
+
+    // Lazily build the expression context only if needed.
+    let mut expr_ctx: Option<dsl::Context> = None;
+
+    for filter in compiled {
+        if !scope_matches(&filter.scope, channel_id) {
+            continue;
+        }
+        match &filter.kind {
+            CompiledFilterKind::Legacy {
+                pattern,
+                filter_sender,
+            } => {
+                let hay = if *filter_sender {
+                    msg.sender.login.as_str()
+                } else {
+                    msg.raw_text.as_str()
+                };
+                if pattern.is_match(hay) {
+                    return Some(filter.action.clone());
+                }
+            }
+            CompiledFilterKind::Expression(expr) => {
+                let ctx = expr_ctx.get_or_insert_with(|| {
+                    build_message_context(msg, channel_display_name, channel_live, watching)
+                });
+                let v = dsl::evaluate(expr, ctx);
+                if v.truthy() {
+                    return Some(filter.action.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn scope_matches(scope: &FilterScope, channel_id: Option<&ChannelId>) -> bool {
+    match scope {
+        FilterScope::Global => true,
+        FilterScope::Channel(ch_id) => channel_id == Some(ch_id),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use smallvec::smallvec;
+
+    use crate::model::{Badge, MessageId, MsgKind, Sender, Span, UserId};
 
     #[test]
     fn filter_matches_substring_case_insensitive() {
-        let mut filter = FilterRecord::new("test", "SPAM", FilterScope::Global);
+        let filter = FilterRecord::new("test", "SPAM", FilterScope::Global);
         assert!(filter.matches_text("this is spam text"));
     }
 
@@ -224,5 +360,85 @@ mod tests {
 
         let result2 = check_filters(&compiled, None, "message from trolluser", "gooduser");
         assert_eq!(result2, None);
+    }
+
+    fn make_subbed_message(text: &str) -> ChatMessage {
+        ChatMessage {
+            id: MessageId(7),
+            server_id: None,
+            timestamp: Utc::now(),
+            channel: ChannelId("somech".into()),
+            sender: Sender {
+                user_id: UserId("99".into()),
+                login: "alice".into(),
+                display_name: "Alice".into(),
+                color: None,
+                name_paint: None,
+                badges: vec![Badge {
+                    name: "subscriber".into(),
+                    version: "6".into(),
+                    url: None,
+                }],
+            },
+            raw_text: text.to_string(),
+            spans: smallvec![Span::Text {
+                text: text.to_string(),
+                is_action: false
+            }],
+            twitch_emotes: Vec::new(),
+            flags: Default::default(),
+            reply: None,
+            msg_kind: MsgKind::Chat,
+            shared: None,
+        }
+    }
+
+    #[test]
+    fn expression_mode_filter_hides_subscriber_gg() {
+        let mut rec = FilterRecord::new(
+            "sub_gg",
+            "author.subscriber && message.content contains \"gg\"",
+            FilterScope::Global,
+        );
+        rec.mode = FilterMode::Expression;
+        rec.action = FilterAction::Hide;
+        let compiled = compile_filters(&[rec]);
+        let msg = make_subbed_message("gg ez");
+        let r = check_filters_message(&compiled, None, &msg, "somech", Some(true), false);
+        assert_eq!(r, Some(FilterAction::Hide));
+    }
+
+    #[test]
+    fn expression_mode_respects_per_channel_scope() {
+        let ch_a = ChannelId("a".into());
+        let ch_b = ChannelId("b".into());
+        let mut rec = FilterRecord::new(
+            "subgg_b",
+            "author.subscriber && message.content contains \"gg\"",
+            FilterScope::Channel(ch_b.clone()),
+        );
+        rec.mode = FilterMode::Expression;
+        let compiled = compile_filters(&[rec]);
+        let msg = make_subbed_message("gg ez");
+        assert!(check_filters_message(&compiled, Some(&ch_a), &msg, "a", None, false).is_none());
+        assert!(check_filters_message(&compiled, Some(&ch_b), &msg, "b", None, false).is_some());
+    }
+
+    #[test]
+    fn invalid_expression_silently_dropped_on_compile() {
+        let mut rec = FilterRecord::new("bad", "author.subscriber &&", FilterScope::Global);
+        rec.mode = FilterMode::Expression;
+        let compiled = compile_filters(&[rec]);
+        assert!(compiled.is_empty());
+    }
+
+    #[test]
+    fn legacy_filters_still_run_via_message_entry_point() {
+        let rec = FilterRecord::new("nope", "spam", FilterScope::Global);
+        let compiled = compile_filters(&[rec]);
+        let msg = make_subbed_message("this is spam");
+        assert!(
+            check_filters_message(&compiled, None, &msg, "somech", None, false).is_some()
+        );
     }
 }

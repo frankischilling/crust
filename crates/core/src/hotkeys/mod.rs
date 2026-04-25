@@ -23,6 +23,8 @@ pub enum HotkeyCategory {
     Tab,
     /// Split-pane focus and movement.
     Split,
+    /// Moderation-tools window (AutoMod / low-trust / unban queues).
+    Moderation,
 }
 
 impl HotkeyCategory {
@@ -31,6 +33,7 @@ impl HotkeyCategory {
             Self::Window => "window",
             Self::Tab => "tab",
             Self::Split => "split",
+            Self::Moderation => "moderation",
         }
     }
 
@@ -39,12 +42,13 @@ impl HotkeyCategory {
             Self::Window => "Window",
             Self::Tab => "Tabs",
             Self::Split => "Splits",
+            Self::Moderation => "Moderation",
         }
     }
 
     /// Stable iteration order for settings UI.
-    pub fn all() -> [HotkeyCategory; 3] {
-        [Self::Window, Self::Tab, Self::Split]
+    pub fn all() -> [HotkeyCategory; 4] {
+        [Self::Window, Self::Tab, Self::Split, Self::Moderation]
     }
 }
 
@@ -77,11 +81,27 @@ pub enum HotkeyAction {
     SplitFocusNext,
     SplitMoveLeft,
     SplitMoveRight,
+    /// Approve the focused queue entry in the moderation tools window.
+    ModApproveFocused,
+    /// Deny the focused queue entry in the moderation tools window.
+    ModDenyFocused,
+    /// Move focus to the next entry in the active moderation queue.
+    ModFocusNext,
+    /// Move focus to the previous entry in the active moderation queue.
+    ModFocusPrev,
+    /// Approve every entry in the active moderation queue.
+    ModBulkApprove,
+    /// Deny every entry in the active moderation queue.
+    ModBulkDeny,
+    /// Cycle to the next moderation tab (AutoMod -> Low Trust -> Unban -> AutoMod).
+    ModNextTab,
+    /// Cycle to the previous moderation tab.
+    ModPrevTab,
 }
 
 impl HotkeyAction {
     /// Stable iteration order matching the settings UI layout.
-    pub fn all() -> [HotkeyAction; 25] {
+    pub fn all() -> [HotkeyAction; 33] {
         [
             Self::ZoomIn,
             Self::ZoomOut,
@@ -108,6 +128,14 @@ impl HotkeyAction {
             Self::SplitFocusNext,
             Self::SplitMoveLeft,
             Self::SplitMoveRight,
+            Self::ModApproveFocused,
+            Self::ModDenyFocused,
+            Self::ModFocusNext,
+            Self::ModFocusPrev,
+            Self::ModBulkApprove,
+            Self::ModBulkDeny,
+            Self::ModNextTab,
+            Self::ModPrevTab,
         ]
     }
 
@@ -140,6 +168,14 @@ impl HotkeyAction {
             Self::SplitFocusNext => "split_focus_next",
             Self::SplitMoveLeft => "split_move_left",
             Self::SplitMoveRight => "split_move_right",
+            Self::ModApproveFocused => "mod_approve_focused",
+            Self::ModDenyFocused => "mod_deny_focused",
+            Self::ModFocusNext => "mod_focus_next",
+            Self::ModFocusPrev => "mod_focus_prev",
+            Self::ModBulkApprove => "mod_bulk_approve",
+            Self::ModBulkDeny => "mod_bulk_deny",
+            Self::ModNextTab => "mod_next_tab",
+            Self::ModPrevTab => "mod_prev_tab",
         }
     }
 
@@ -174,6 +210,14 @@ impl HotkeyAction {
             | Self::SplitFocusNext
             | Self::SplitMoveLeft
             | Self::SplitMoveRight => HotkeyCategory::Split,
+            Self::ModApproveFocused
+            | Self::ModDenyFocused
+            | Self::ModFocusNext
+            | Self::ModFocusPrev
+            | Self::ModBulkApprove
+            | Self::ModBulkDeny
+            | Self::ModNextTab
+            | Self::ModPrevTab => HotkeyCategory::Moderation,
         }
     }
 
@@ -205,6 +249,14 @@ impl HotkeyAction {
             Self::SplitFocusNext => "Focus next split",
             Self::SplitMoveLeft => "Move focused split left",
             Self::SplitMoveRight => "Move focused split right",
+            Self::ModApproveFocused => "Approve focused moderation entry",
+            Self::ModDenyFocused => "Deny focused moderation entry",
+            Self::ModFocusNext => "Focus next moderation entry",
+            Self::ModFocusPrev => "Focus previous moderation entry",
+            Self::ModBulkApprove => "Approve all in current moderation queue",
+            Self::ModBulkDeny => "Deny all in current moderation queue",
+            Self::ModNextTab => "Next moderation tab",
+            Self::ModPrevTab => "Previous moderation tab",
         }
     }
 }
@@ -227,7 +279,7 @@ pub struct KeyBinding {
     #[serde(default)]
     pub command: bool,
     /// Stable key identifier. Uses egui's `Key` variant names
-    /// (`"K"`, `"Tab"`, `"PageUp"`, `"ArrowLeft"`, `"Num1"`, `"F1"`, …).
+    /// (`"K"`, `"Tab"`, `"PageUp"`, `"ArrowLeft"`, `"Num1"`, `"F1"`, ...).
     /// Empty string means unbound.
     #[serde(default)]
     pub key: String,
@@ -374,6 +426,25 @@ impl HotkeyBindings {
                 b.shift = true;
                 b
             },
+        );
+        // Moderation: gated to mod-tools window focus, so single-letter binds
+        // don't conflict with global typing.
+        map.insert(HotkeyAction::ModApproveFocused, KeyBinding::new("A"));
+        map.insert(HotkeyAction::ModDenyFocused, KeyBinding::new("D"));
+        map.insert(HotkeyAction::ModFocusNext, KeyBinding::new("J"));
+        map.insert(HotkeyAction::ModFocusPrev, KeyBinding::new("K"));
+        map.insert(
+            HotkeyAction::ModBulkApprove,
+            KeyBinding::new("A").with_shift(),
+        );
+        map.insert(
+            HotkeyAction::ModBulkDeny,
+            KeyBinding::new("D").with_shift(),
+        );
+        map.insert(HotkeyAction::ModNextTab, KeyBinding::new("Tab"));
+        map.insert(
+            HotkeyAction::ModPrevTab,
+            KeyBinding::new("Tab").with_shift(),
         );
         Self { map }
     }

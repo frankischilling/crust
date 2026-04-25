@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crust_core::events::AppEvent;
@@ -117,13 +118,16 @@ pub(crate) fn persist_badge_map_cache(map: &BadgeMap) {
         return;
     }
 
-    let tmp = path.with_extension("json.tmp");
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.tmp.{}.{}", std::process::id(), seq));
     if let Err(e) = std::fs::write(&tmp, payload) {
         warn!("Failed writing temporary badge cache {:?}: {e}", tmp);
         return;
     }
     if let Err(e) = std::fs::rename(&tmp, &path) {
         warn!("Failed replacing badge cache {:?}: {e}", path);
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 

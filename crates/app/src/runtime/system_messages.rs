@@ -71,6 +71,7 @@ pub(crate) fn make_system_message(
             is_mention: false,
             custom_reward_id: None,
             is_history: false,
+            suppress_notification: false,
         },
         kind,
     )
@@ -103,6 +104,7 @@ pub(crate) fn make_custom_message(
         flags,
         reply: None,
         msg_kind: kind,
+        shared: None,
     }
 }
 

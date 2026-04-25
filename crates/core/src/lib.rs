@@ -2,6 +2,7 @@ pub mod badges;
 pub mod commands;
 pub mod emoji;
 pub mod events;
+pub mod filters;
 pub mod format;
 pub mod highlight;
 pub mod hotkeys;

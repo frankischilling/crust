@@ -55,6 +55,52 @@ impl TabVisibilityRule {
 /// long-running sessions.
 pub const MENTIONS_BUFFER_CAP: usize = 2_000;
 
+/// In-flight Twitch hype train state for a single channel. Populated from
+/// EventSub `channel.hype_train.*` notifications so the UI can render a
+/// live banner (see C4 in `CHATTERINO_PARITY_TODO.md`).
+///
+/// Cleared after the hype train ends and its cooldown elapses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HypeTrainState {
+    /// "begin", "progress", or "end".
+    pub phase: String,
+    /// Current level (1..=5, 0 when unknown).
+    pub level: u32,
+    /// Points accumulated towards the next level.
+    pub progress: u64,
+    /// Points needed to reach the next level (0 on end events).
+    pub goal: u64,
+    /// Total points accumulated across the whole train.
+    pub total: u64,
+    /// Display/login of the top contributor during the active train.
+    pub top_contributor_login: Option<String>,
+    /// Contribution channel: "bits" / "subscription" / other.
+    pub top_contributor_type: Option<String>,
+    /// Contribution total from the top contributor.
+    pub top_contributor_total: Option<u64>,
+    /// ISO 8601 time this phase ends (begin/progress) or cooldown ends (end).
+    pub ends_at: Option<String>,
+    /// Local instant the state was last applied; used for banner cooldown.
+    pub updated_at: Instant,
+}
+
+/// Active raid banner state for a single channel. Kept separately from the
+/// chat log so the UI can show and dismiss the banner independently of
+/// message history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaidBannerState {
+    /// Display name for the raiding channel or streamer.
+    pub display_name: String,
+    /// Viewer count reported with the raid.
+    pub viewer_count: u32,
+    /// Optional source login for linking back to the raider.
+    pub source_login: Option<String>,
+    /// Local instant the banner was shown.
+    pub shown_at: Instant,
+    /// Whether the banner was explicitly dismissed.
+    pub dismissed: bool,
+}
+
 /// Authentication state.
 #[derive(Debug, Clone, Default)]
 pub struct AuthState {
@@ -105,6 +151,77 @@ pub struct AppState {
     /// rule are stored; absence means [`TabVisibilityRule::Always`].
     /// Persisted across sessions via `AppSettings::tab_visibility_rules`.
     pub tab_visibility_rules: HashMap<ChannelId, TabVisibilityRule>,
+    /// Current hype-train state per channel, keyed by channel id. Populated
+    /// from EventSub `channel.hype_train.*` notifications. The entry is
+    /// cleared once the train's cooldown elapses (see
+    /// [`AppState::expire_stale_hype_trains`]).
+    pub hype_trains: HashMap<ChannelId, HypeTrainState>,
+    /// Current raid banner state per channel, keyed by channel id. Dismissal
+    /// marks the banner as dismissed; the next expiry sweep removes dismissed
+    /// or stale entries.
+    pub raid_banners: HashMap<ChannelId, RaidBannerState>,
+    /// Resolved Shared Chat source-channel metadata keyed by Twitch user id
+    /// (`source-room-id` IRC tag). Populated by background Helix/IVR lookups
+    /// that fire the first time the app sees a PRIVMSG mirrored from a
+    /// channel it does not already have open. The profile picture URL is
+    /// also pre-fetched into `emote_bytes` so the shared-chat badge chip
+    /// paints without a second frame.
+    pub shared_channel_profiles: HashMap<String, SharedChannelProfile>,
+    /// Active Shared Chat session per channel keyed by `ChannelId`.
+    /// Populated by `/helix/shared_chat/session` lookups; refreshed
+    /// periodically so the viewer-count total tracks reality.
+    pub shared_chat_sessions: HashMap<ChannelId, SharedChatSessionState>,
+}
+
+/// Live Shared Chat session metadata used by the viewer-total banner.
+/// Combines `/helix/shared_chat/session` (participants) with
+/// `/helix/streams` (per-participant live status + viewer count).
+#[derive(Debug, Clone)]
+pub struct SharedChatSessionState {
+    pub session_id: String,
+    pub host_broadcaster_id: String,
+    pub participants: Vec<SharedChatParticipant>,
+    /// Monotonic timestamp of the last successful refresh. Used to
+    /// throttle background polling (don't re-hit Helix more than once
+    /// per refresh interval).
+    pub updated_at: Instant,
+}
+
+impl SharedChatSessionState {
+    /// Sum of viewer counts across all live participants. Offline
+    /// participants contribute 0.
+    pub fn total_viewers(&self) -> u64 {
+        self.participants
+            .iter()
+            .filter(|p| p.live)
+            .map(|p| p.viewer_count)
+            .sum()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SharedChatParticipant {
+    /// Twitch broadcaster user id.
+    pub broadcaster_id: String,
+    /// Lowercase login.
+    pub login: String,
+    /// Display name (preserves unicode + capitalisation).
+    pub display_name: String,
+    /// Profile image URL, when resolved via Helix /users.
+    pub profile_url: Option<String>,
+    /// Current viewer count. `0` when offline.
+    pub viewer_count: u64,
+    /// Whether the participant is currently streaming.
+    pub live: bool,
+}
+
+/// Resolved metadata for a Shared Chat source channel. Shown on the
+/// shared-chat badge chip (matches Chatterino's `makeSharedChatBadge`).
+#[derive(Debug, Clone)]
+pub struct SharedChannelProfile {
+    pub login: String,
+    pub display_name: String,
+    pub profile_url: Option<String>,
 }
 
 impl Default for AppState {
@@ -123,6 +240,10 @@ impl Default for AppState {
             mentions: VecDeque::new(),
             mentions_unread: 0,
             tab_visibility_rules: HashMap::new(),
+            hype_trains: HashMap::new(),
+            raid_banners: HashMap::new(),
+            shared_channel_profiles: HashMap::new(),
+            shared_chat_sessions: HashMap::new(),
         }
     }
 }
@@ -142,6 +263,8 @@ impl AppState {
     pub fn leave_channel(&mut self, id: &ChannelId) {
         self.channels.remove(id);
         self.channel_order.retain(|c| c != id);
+        self.hype_trains.remove(id);
+        self.raid_banners.remove(id);
         if self.active_channel.as_ref() == Some(id) {
             self.active_channel = self.channel_order.first().cloned();
         }
@@ -174,6 +297,56 @@ impl AppState {
         self.active_channel
             .as_ref()
             .and_then(|id| self.channels.get_mut(id))
+    }
+
+    /// Apply the latest hype train update for `channel`. Overwrites the
+    /// previous state for that channel. Set the "end" phase to leave the
+    /// banner visible for a brief cooldown; callers should invoke
+    /// [`Self::expire_stale_hype_trains`] on a timer to drop stale entries.
+    pub fn apply_hype_train_update(&mut self, channel: ChannelId, state: HypeTrainState) {
+        self.hype_trains.insert(channel, state);
+    }
+
+    /// Evict hype-train entries whose "end" phase has been stale for more
+    /// than `cooldown`. Call this from the UI render loop so the banner
+    /// hides after a natural cooldown even if Twitch never delivers a
+    /// follow-up event.
+    pub fn expire_stale_hype_trains(&mut self, now: Instant, cooldown: std::time::Duration) {
+        self.hype_trains.retain(|_, st| {
+            if st.phase != "end" {
+                return true;
+            }
+            now.saturating_duration_since(st.updated_at) < cooldown
+        });
+    }
+
+    /// Fetch the active hype-train banner state for `channel`, if any.
+    pub fn hype_train_for(&self, channel: &ChannelId) -> Option<&HypeTrainState> {
+        self.hype_trains.get(channel)
+    }
+
+    /// Show or replace the raid banner for `channel`.
+    pub fn show_raid_banner(&mut self, channel: ChannelId, banner: RaidBannerState) {
+        self.raid_banners.insert(channel, banner);
+    }
+
+    /// Dismiss the raid banner for `channel`.
+    pub fn dismiss_raid_banner(&mut self, channel: &ChannelId) {
+        if let Some(banner) = self.raid_banners.get_mut(channel) {
+            banner.dismissed = true;
+        }
+    }
+
+    /// Evict banners that were already dismissed or have exceeded `ttl`.
+    pub fn expire_stale_raid_banners(&mut self, now: Instant, ttl: std::time::Duration) {
+        self.raid_banners.retain(|_, banner| {
+            !banner.dismissed && now.saturating_duration_since(banner.shown_at) < ttl
+        });
+    }
+
+    /// Fetch the current raid banner for `channel`, if any.
+    pub fn raid_banner_for(&self, channel: &ChannelId) -> Option<&RaidBannerState> {
+        self.raid_banners.get(channel).filter(|banner| !banner.dismissed)
     }
 
     /// Replace the live snapshot wholesale and mark loaded. Clears any
@@ -396,6 +569,94 @@ mod live_feed_state_tests {
 }
 
 #[cfg(test)]
+mod raid_banner_state_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn raid_banner_lifecycle_show_dismiss_and_expire() {
+        let channel = ChannelId::new("rustlang");
+        let mut state = AppState::default();
+        let now = Instant::now();
+
+        state.show_raid_banner(
+            channel.clone(),
+            RaidBannerState {
+                display_name: "Raider".into(),
+                viewer_count: 42,
+                source_login: Some("raider".into()),
+                shown_at: now,
+                dismissed: false,
+            },
+        );
+        assert_eq!(state.raid_banner_for(&channel).unwrap().viewer_count, 42);
+
+        state.dismiss_raid_banner(&channel);
+        assert!(state.raid_banner_for(&channel).is_none());
+        assert!(state
+            .raid_banners
+            .get(&channel)
+            .is_some_and(|banner| banner.dismissed));
+
+        state.show_raid_banner(
+            channel.clone(),
+            RaidBannerState {
+                display_name: "Raider".into(),
+                viewer_count: 99,
+                source_login: Some("raider".into()),
+                shown_at: now - Duration::from_secs(21),
+                dismissed: false,
+            },
+        );
+        state.expire_stale_raid_banners(now, Duration::from_secs(20));
+        assert!(state.raid_banner_for(&channel).is_none());
+        assert!(state.raid_banners.get(&channel).is_none());
+    }
+
+    #[test]
+    fn leave_channel_removes_raid_banner() {
+        let channel = ChannelId::new("rustlang");
+        let mut state = AppState::default();
+
+        state.show_raid_banner(
+            channel.clone(),
+            RaidBannerState {
+                display_name: "Raider".into(),
+                viewer_count: 42,
+                source_login: Some("raider".into()),
+                shown_at: Instant::now(),
+                dismissed: false,
+            },
+        );
+        state.leave_channel(&channel);
+
+        assert!(state.raid_banner_for(&channel).is_none());
+    }
+
+    #[test]
+    fn expire_stale_raid_banners_removes_dismissed_entries() {
+        let channel = ChannelId::new("rustlang");
+        let mut state = AppState::default();
+        let now = Instant::now();
+
+        state.show_raid_banner(
+            channel.clone(),
+            RaidBannerState {
+                display_name: "Raider".into(),
+                viewer_count: 42,
+                source_login: Some("raider".into()),
+                shown_at: now,
+                dismissed: false,
+            },
+        );
+        state.dismiss_raid_banner(&channel);
+        state.expire_stale_raid_banners(now, Duration::from_secs(20));
+
+        assert!(state.raid_banners.is_empty());
+    }
+}
+
+#[cfg(test)]
 mod mentions_state_tests {
     use super::*;
     use crate::model::{ChannelId, ChatMessage, MessageFlags, MessageId, MsgKind, Sender, UserId};
@@ -425,6 +686,7 @@ mod mentions_state_tests {
             },
             reply: None,
             msg_kind: MsgKind::Chat,
+            shared: None,
         }
     }
 
@@ -475,10 +737,10 @@ mod mentions_state_tests {
         // History rows: one older, one that duplicates the live one.
         s.prepend_mentions_history(vec![
             mention("older", 50, true),
-            mention("live", 100, true), // dup → must be skipped
+            mention("live", 100, true), // dup -> must be skipped
             mention("oldest", 10, true),
         ]);
-        // Ordered oldest → newest, with the dup dropped.
+        // Ordered oldest -> newest, with the dup dropped.
         let ids: Vec<_> = s
             .mentions
             .iter()

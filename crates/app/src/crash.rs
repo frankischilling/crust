@@ -744,7 +744,7 @@ mod tests {
                       timestamp_utc: 2026-04-22T23:34:00+00:00\n\
                       os: linux / arch: x86_64\nthread: tokio-runtime-worker\n\
                       location: src/foo.rs:10:5\npanic: explicit panic here\n\n\
-                      ---- backtrace ----\nstack frames …";
+                      ---- backtrace ----\nstack frames ...";
         let (ts, summary) = parse_report_header(sample, "crash-20260422-233400-000-run42.txt");
         assert_eq!(ts, "2026-04-22T23:34:00+00:00");
         assert_eq!(summary, "explicit panic here");

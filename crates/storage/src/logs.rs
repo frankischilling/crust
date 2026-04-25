@@ -99,7 +99,7 @@ impl LogStore {
         Ok(())
     }
 
-    /// Load recent messages for a channel, oldest → newest.
+    /// Load recent messages for a channel, oldest -> newest.
     pub fn recent_messages(
         &self,
         channel: &ChannelId,
@@ -133,7 +133,7 @@ impl LogStore {
     }
 
     /// Load the most-recent cross-channel *mention-matching* messages, oldest
-    /// → newest. A message qualifies if its persisted JSON payload has any
+    /// -> newest. A message qualifies if its persisted JSON payload has any
     /// of the "attention" flags set (`is_highlighted`, `is_mention`,
     /// `is_first_msg`, `is_pinned`). Whispers are excluded (they have their
     /// own dedicated UI feed via `whisper:` channel prefix).
@@ -177,11 +177,11 @@ impl LogStore {
                 }
             }
         }
-        out.reverse(); // oldest → newest so callers can merge by timestamp.
+        out.reverse(); // oldest -> newest so callers can merge by timestamp.
         Ok(out)
     }
 
-    /// Load older messages for a channel before `before_ts_ms`, oldest → newest.
+    /// Load older messages for a channel before `before_ts_ms`, oldest -> newest.
     pub fn older_messages(
         &self,
         channel: &ChannelId,
@@ -281,9 +281,11 @@ impl LogStore {
                 is_mention: false,
                 custom_reward_id: None,
                 is_history: false,
+                suppress_notification: false,
             },
             reply: None,
             msg_kind: MsgKind::Chat,
+            shared: None,
         };
         self.append_message(&msg)
     }
@@ -378,6 +380,7 @@ mod tests {
             flags: MessageFlags::default(),
             reply: None,
             msg_kind: MsgKind::Chat,
+            shared: None,
         };
 
         store.append_message(&mk(1, 0, "one")).expect("append one");
@@ -426,6 +429,7 @@ mod tests {
             flags,
             reply: None,
             msg_kind: MsgKind::Chat,
+            shared: None,
         };
 
         let hl = MessageFlags {

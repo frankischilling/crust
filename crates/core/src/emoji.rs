@@ -51,13 +51,30 @@ pub fn is_emoji_continuation(c: char) -> bool {
         )
 }
 
+/// A codepoint that attaches to the previous emoji base without a ZWJ.
+pub fn is_emoji_combiner(cp: u32) -> bool {
+    matches!(
+        cp,
+        0xFE00..=0xFE0F     // Variation Selectors
+        | 0x1F3FB..=0x1F3FF // Skin tone modifiers
+        | 0x20E3             // Combining Enclosing Keycap
+        | 0xE0020..=0xE007F  // Tags (flag sequences)
+        | 0xE0001            // Language tag
+    )
+}
+
+/// True for regional indicator symbols (flag halves).
+pub fn is_regional_indicator(cp: u32) -> bool {
+    (0x1F1E0..=0x1F1FF).contains(&cp)
+}
+
 /// Returns `true` only if the collected codepoint sequence is a real emoji
 /// that Twemoji is likely to have an image for.
 ///
 /// Rules (in order):
-/// - Any codepoint ≥ U+1F000 → SMP emoji plane, Twemoji covers these fully.
+/// - Any codepoint ≥ U+1F000 -> SMP emoji plane, Twemoji covers these fully.
 /// - BMP sequence containing U+FE0F (emoji presentation selector) or U+20E3
-///   (combining enclosing keycap) → explicitly emoji form.
+///   (combining enclosing keycap) -> explicitly emoji form.
 /// - Whitelist of the half-dozen unambiguous BMP single-char emoji that
 ///   always render as pictures even without FE0F (©, ®, ™, ℹ, ‼, ⁉).
 ///
@@ -97,7 +114,7 @@ pub fn is_definitely_emoji(codepoints: &[u32]) -> bool {
 /// Twemoji uses lowercase hex codepoints separated by `-`, stripping
 /// variation selectors like U+FE0F for most emoji.
 ///
-/// Example: 😀  → `1f600`, 🇺🇸 → `1f1fa-1f1f8`
+/// Example: 😀  -> `1f600`, 🇺🇸 -> `1f1fa-1f1f8`
 pub fn twemoji_url(codepoints: &[u32]) -> String {
     let hex: Vec<String> = codepoints
         .iter()

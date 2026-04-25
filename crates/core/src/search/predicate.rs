@@ -1,6 +1,6 @@
 use crate::model::{ChannelId, ChatMessage};
 
-/// Flag-style predicates (`is:highlighted`, `is:sub`, …).
+/// Flag-style predicates (`is:highlighted`, `is:sub`, ...).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlagKind {
     Highlighted,
@@ -153,6 +153,7 @@ mod tests {
             flags: MessageFlags::default(),
             reply: None,
             msg_kind: MsgKind::Chat,
+            shared: None,
         }
     }
 

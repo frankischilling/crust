@@ -268,6 +268,64 @@ pub(crate) fn format_eventsub_notice_text(kind: &EventSubNoticeKind) -> String {
         }
         EventSubNoticeKind::StreamOnline => "Stream is now live.".to_owned(),
         EventSubNoticeKind::StreamOffline => "Stream is now offline.".to_owned(),
+        EventSubNoticeKind::HypeTrainLifecycle {
+            phase,
+            level,
+            progress,
+            goal,
+            total,
+            top_contribution_login,
+            top_contribution_type,
+            top_contribution_total,
+            ..
+        } => match phase.as_str() {
+            "begin" => {
+                let mut out = format!("Hype Train started! (Level {level})");
+                if *goal > 0 {
+                    out.push_str(&format!(" {progress}/{goal}"));
+                }
+                if let (Some(login), Some(ty)) = (
+                    top_contribution_login.as_deref(),
+                    top_contribution_type.as_deref(),
+                ) {
+                    if let Some(total) = top_contribution_total {
+                        out.push_str(&format!(
+                            " - Top: {login} ({total} {})",
+                            humanize_contribution_type(ty)
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            " - Top: {login} ({})",
+                            humanize_contribution_type(ty)
+                        ));
+                    }
+                }
+                out
+            }
+            "progress" => {
+                let mut out = format!("Hype Train progress: Level {level}");
+                if *goal > 0 {
+                    out.push_str(&format!(" ({progress}/{goal})"));
+                }
+                if let Some(login) = top_contribution_login
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    out.push_str(&format!(" - Top: {login}"));
+                }
+                out
+            }
+            "end" => {
+                if *total > 0 {
+                    format!("Hype Train ended at Level {level} ({total} total points).")
+                } else {
+                    format!("Hype Train ended at Level {level}.")
+                }
+            }
+            other => {
+                format!("Hype Train {other}: Level {level} ({progress}/{goal})")
+            }
+        },
         EventSubNoticeKind::UserWhisperMessage {
             from_user_name,
             to_user_name,
@@ -349,19 +407,33 @@ pub(crate) fn eventsub_notice_to_message(kind: &EventSubNoticeKind) -> (MsgKind,
 }
 
 pub(crate) fn should_emit_eventsub_notice_message(kind: &EventSubNoticeKind) -> bool {
-    !matches!(
-        kind,
+    match kind {
         // IRC moderation events already emit equivalent ban/unban lines.
         EventSubNoticeKind::ChannelBan { .. }
-            | EventSubNoticeKind::ChannelUnban { .. }
-            | EventSubNoticeKind::AutoModMessageHold { .. }
-            | EventSubNoticeKind::AutoModMessageUpdate { .. }
-            | EventSubNoticeKind::ChannelChatUserMessageHold { .. }
-            | EventSubNoticeKind::ChannelChatUserMessageUpdate { .. }
-            | EventSubNoticeKind::SuspiciousUserMessage { .. }
-            | EventSubNoticeKind::SuspiciousUserUpdate { .. }
-            | EventSubNoticeKind::UserWhisperMessage { .. }
-    )
+        | EventSubNoticeKind::ChannelUnban { .. }
+        | EventSubNoticeKind::AutoModMessageHold { .. }
+        | EventSubNoticeKind::AutoModMessageUpdate { .. }
+        | EventSubNoticeKind::ChannelChatUserMessageHold { .. }
+        | EventSubNoticeKind::ChannelChatUserMessageUpdate { .. }
+        | EventSubNoticeKind::SuspiciousUserMessage { .. }
+        | EventSubNoticeKind::SuspiciousUserUpdate { .. }
+        | EventSubNoticeKind::UserWhisperMessage { .. }
+        // IRC USERNOTICE already renders styled `MsgKind::Sub` cards for
+        // subs / resubs / gift subs on the broadcaster's own channel (the
+        // only place these EventSub topics fire). Emitting the EventSub
+        // copy too would duplicate the chat line with a plain SystemInfo
+        // styling and also amplify gift-sub storms (one line per recipient
+        // on top of the collapsed IRC `submysterygift`).
+        | EventSubNoticeKind::Subscribe { .. }
+        | EventSubNoticeKind::SubscriptionGift { .. } => false,
+        // Hype train "progress" pings fire every few seconds - only emit a
+        // chat line on begin/end so the banner (HypeTrainUpdated) is the
+        // primary feedback channel.
+        EventSubNoticeKind::HypeTrainLifecycle { phase, .. } => {
+            matches!(phase.as_str(), "begin" | "end")
+        }
+        _ => true,
+    }
 }
 
 pub(crate) fn should_drop_duplicate_eventsub_notice(
@@ -398,6 +470,15 @@ pub(crate) fn stream_status_is_live_from_notice(kind: &EventSubNoticeKind) -> Op
         EventSubNoticeKind::StreamOnline => Some(true),
         EventSubNoticeKind::StreamOffline => Some(false),
         _ => None,
+    }
+}
+
+fn humanize_contribution_type(ty: &str) -> &'static str {
+    match ty.trim().to_ascii_lowercase().as_str() {
+        "bits" => "bits",
+        "subscription" | "subscriptions" => "subs",
+        "other" => "other",
+        _ => "points",
     }
 }
 

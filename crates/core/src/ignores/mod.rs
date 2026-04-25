@@ -99,7 +99,7 @@ impl IgnoredPhrase {
     }
 }
 
-// -- Compiled matchers --------------------------------------------------------
+// Compiled matchers
 
 enum UserMatcher {
     Exact {
@@ -170,7 +170,7 @@ impl CompiledIgnoredUsers {
     }
 }
 
-// -- Phrase matching ----------------------------------------------------------
+// Phrase matching
 
 enum PhraseMatcher {
     Substring {

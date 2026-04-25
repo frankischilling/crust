@@ -150,6 +150,10 @@ enum PluginEventKind {
     PluginUiChange,
     PluginUiSubmit,
     PluginUiWindowClosed,
+    SoundSettingsUpdated,
+    UploadStarted,
+    UploadFinished,
+    HotkeyBindingsUpdated,
 }
 
 #[link(name = "lua", kind = "static")]
@@ -315,6 +319,8 @@ pub struct LuaPluginHost {
     channels: RwLock<HashMap<ChannelId, PluginChannelSnapshot>>,
     current_channel: RwLock<Option<ChannelId>>,
     use_24h_timestamps: RwLock<bool>,
+    sound_settings: RwLock<Vec<(String, crust_core::sound::SoundEventSetting)>>,
+    hotkey_bindings: RwLock<Vec<(String, crust_core::hotkeys::KeyBinding)>>,
     plugin_root: PathBuf,
     session_started_unix_ms: i64,
 }
@@ -330,6 +336,8 @@ impl LuaPluginHost {
             channels: RwLock::new(HashMap::new()),
             current_channel: RwLock::new(None),
             use_24h_timestamps: RwLock::new(use_24h_timestamps),
+            sound_settings: RwLock::new(Vec::new()),
+            hotkey_bindings: RwLock::new(Vec::new()),
             plugin_root: Self::plugin_root_dir(),
             session_started_unix_ms: system_time_unix_ms(),
         });
@@ -983,6 +991,55 @@ impl LuaPluginHost {
                 native_session_started_ms,
                 plugin_idx,
             );
+            register_c2_fn(
+                vm,
+                c2_index,
+                "filters_parse",
+                native_filters_parse,
+                plugin_idx,
+            );
+            register_c2_fn(
+                vm,
+                c2_index,
+                "filters_evaluate",
+                native_filters_evaluate,
+                plugin_idx,
+            );
+            register_c2_fn(
+                vm,
+                c2_index,
+                "set_sound_settings",
+                native_set_sound_settings,
+                plugin_idx,
+            );
+            register_c2_fn(
+                vm,
+                c2_index,
+                "get_sound_settings",
+                native_get_sound_settings,
+                plugin_idx,
+            );
+            register_c2_fn(
+                vm,
+                c2_index,
+                "set_hotkey_bindings",
+                native_set_hotkey_bindings,
+                plugin_idx,
+            );
+            register_c2_fn(
+                vm,
+                c2_index,
+                "get_hotkey_bindings",
+                native_get_hotkey_bindings,
+                plugin_idx,
+            );
+            register_c2_fn(
+                vm,
+                c2_index,
+                "upload_image",
+                native_upload_image,
+                plugin_idx,
+            );
             lua_createtable(vm, 0, 0);
             let ui_index = lua_absindex(vm, -1);
             register_c2_fn(
@@ -1098,6 +1155,20 @@ impl LuaPluginHost {
 
     fn session_started_unix_ms(&self) -> i64 {
         self.session_started_unix_ms
+    }
+
+    fn current_sound_settings(&self) -> Vec<(String, crust_core::sound::SoundEventSetting)> {
+        self.sound_settings
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    fn current_hotkey_bindings(&self) -> Vec<(String, crust_core::hotkeys::KeyBinding)> {
+        self.hotkey_bindings
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     fn plugin_ui_snapshot_inner(&self) -> PluginUiSnapshot {
@@ -1233,6 +1304,22 @@ impl LuaPluginHost {
     }
 
     fn dispatch_event_inner(&self, event: &AppEvent) {
+        match event {
+            AppEvent::SoundSettingsUpdated { events } => {
+                *self
+                    .sound_settings
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner()) = events.clone();
+            }
+            AppEvent::HotkeyBindingsUpdated { bindings } => {
+                *self
+                    .hotkey_bindings
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner()) = bindings.clone();
+            }
+            _ => {}
+        }
+
         let plugins: Vec<_> = self
             .plugins
             .read()
@@ -1546,6 +1633,10 @@ fn event_kind_name(kind: PluginEventKind) -> &'static str {
         PluginEventKind::PluginUiChange => "PluginUiChange",
         PluginEventKind::PluginUiSubmit => "PluginUiSubmit",
         PluginEventKind::PluginUiWindowClosed => "PluginUiWindowClosed",
+        PluginEventKind::SoundSettingsUpdated => "SoundSettingsUpdated",
+        PluginEventKind::UploadStarted => "UploadStarted",
+        PluginEventKind::UploadFinished => "UploadFinished",
+        PluginEventKind::HotkeyBindingsUpdated => "HotkeyBindingsUpdated",
     }
 }
 
@@ -1614,6 +1705,10 @@ fn push_event_type_table(L: *mut lua_State) {
             PluginEventKind::IgnoredPhrasesUpdated,
             PluginEventKind::UserPronounsLoaded,
             PluginEventKind::UsercardSettingsUpdated,
+            PluginEventKind::SoundSettingsUpdated,
+            PluginEventKind::UploadStarted,
+            PluginEventKind::UploadFinished,
+            PluginEventKind::HotkeyBindingsUpdated,
         ];
         for (idx, kind) in kinds.into_iter().enumerate() {
             set_field_int(L, -1, event_kind_name(kind), idx as i64);
@@ -1686,6 +1781,10 @@ fn event_kind_from_value(L: *mut lua_State, idx: c_int) -> Option<PluginEventKin
                 58 => Some(PluginEventKind::FontSettingsUpdated),
                 59 => Some(PluginEventKind::RestoreLastActiveChannel),
                 60 => Some(PluginEventKind::LowTrustStatusUpdated),
+                61 => Some(PluginEventKind::SoundSettingsUpdated),
+                62 => Some(PluginEventKind::UploadStarted),
+                63 => Some(PluginEventKind::UploadFinished),
+                64 => Some(PluginEventKind::HotkeyBindingsUpdated),
                 _ => None,
             },
             LUA_TSTRING => {
@@ -1754,6 +1853,10 @@ fn event_kind_from_value(L: *mut lua_State, idx: c_int) -> Option<PluginEventKin
                     "usercardsettingsupdated" => PluginEventKind::UsercardSettingsUpdated,
                     "fontsettingsupdated" => PluginEventKind::FontSettingsUpdated,
                     "restorelastactivechannel" => PluginEventKind::RestoreLastActiveChannel,
+                    "soundsettingsupdated" => PluginEventKind::SoundSettingsUpdated,
+                    "uploadstarted" => PluginEventKind::UploadStarted,
+                    "uploadfinished" => PluginEventKind::UploadFinished,
+                    "hotkeybindingsupdated" => PluginEventKind::HotkeyBindingsUpdated,
                     _ => return None,
                 })
             }
@@ -2176,6 +2279,263 @@ unsafe extern "C" fn native_session_started_ms(L: *mut lua_State) -> c_int {
         .unwrap_or(0);
     lua_pushinteger(L, value);
     1
+}
+
+// Filter engine bridge (C9: Plugin API surface expansion)
+
+fn filter_context_from_lua(L: *mut lua_State, idx: c_int) -> crust_core::filters::Context {
+    use crust_core::filters::Value as FilterValue;
+    let mut ctx = crust_core::filters::Context::new();
+    unsafe {
+        if lua_type(L, idx) != LUA_TTABLE {
+            return ctx;
+        }
+        let idx = lua_absindex(L, idx);
+        // Iterate via next(): push nil, then lua_next. We don't have lua_next
+        // bound, so instead probe every identifier declared in the typing
+        // context and pull it by key. This is O(|typing|) per eval but the
+        // typing context is small (~40 entries) and the code path is only
+        // hit from explicit plugin calls.
+        for name in crust_core::filters::MESSAGE_TYPING_CONTEXT.keys() {
+            lua_getfield(L, idx, cstring(name).as_ptr());
+            let ty = lua_type(L, -1);
+            if ty != LUA_TNIL {
+                let value = match ty {
+                    LUA_TBOOLEAN => FilterValue::Bool(lua_value_bool(L, -1).unwrap_or(false)),
+                    LUA_TNUMBER => {
+                        if let Some(i) = lua_value_int(L, -1) {
+                            FilterValue::Int(i)
+                        } else {
+                            FilterValue::Int(lua_value_number(L, -1).unwrap_or(0.0) as i64)
+                        }
+                    }
+                    LUA_TSTRING => FilterValue::Str(lua_value_string(L, -1).unwrap_or_default()),
+                    LUA_TTABLE => {
+                        let mut items: Vec<FilterValue> = Vec::new();
+                        let len = lua_rawlen(L, -1);
+                        for i in 1..=len {
+                            lua_geti(L, -1, i as lua_Integer);
+                            if let Some(s) = lua_value_string(L, -1) {
+                                items.push(FilterValue::Str(s));
+                            }
+                            lua_pop(L, 1);
+                        }
+                        FilterValue::List(items)
+                    }
+                    _ => FilterValue::Bool(false),
+                };
+                ctx.insert(name.clone(), value);
+            }
+            lua_pop(L, 1);
+        }
+    }
+    ctx
+}
+
+unsafe extern "C" fn native_filters_parse(L: *mut lua_State) -> c_int {
+    let Some(expr) = lua_value_string(L, 1) else {
+        lua_createtable(L, 0, 2);
+        set_field_bool(L, -1, "ok", false);
+        set_field_string(L, -1, "error", "expected string expression");
+        return 1;
+    };
+    match crust_core::filters::parse(&expr) {
+        Ok(ast) => match crust_core::filters::synthesize_type(
+            &ast,
+            &crust_core::filters::MESSAGE_TYPING_CONTEXT,
+        ) {
+            Ok(ty) => {
+                lua_createtable(L, 0, 2);
+                set_field_bool(L, -1, "ok", true);
+                set_field_string(L, -1, "type", ty.label());
+                1
+            }
+            Err(err) => {
+                lua_createtable(L, 0, 2);
+                set_field_bool(L, -1, "ok", false);
+                set_field_string(L, -1, "error", &err.to_string());
+                1
+            }
+        },
+        Err(err) => {
+            lua_createtable(L, 0, 2);
+            set_field_bool(L, -1, "ok", false);
+            set_field_string(L, -1, "error", &err.to_string());
+            1
+        }
+    }
+}
+
+unsafe extern "C" fn native_filters_evaluate(L: *mut lua_State) -> c_int {
+    let Some(expr_src) = lua_value_string(L, 1) else {
+        lua_pushnil(L);
+        lua_pushstring(L, cstring("expected string expression").as_ptr());
+        return 2;
+    };
+    let ast = match crust_core::filters::parse(&expr_src) {
+        Ok(ast) => ast,
+        Err(err) => {
+            lua_pushnil(L);
+            lua_pushstring(L, cstring(&err.to_string()).as_ptr());
+            return 2;
+        }
+    };
+    if let Err(err) = crust_core::filters::synthesize_type(
+        &ast,
+        &crust_core::filters::MESSAGE_TYPING_CONTEXT,
+    ) {
+        lua_pushnil(L);
+        lua_pushstring(L, cstring(&err.to_string()).as_ptr());
+        return 2;
+    }
+    let ctx = filter_context_from_lua(L, 2);
+    let value = crust_core::filters::evaluate(&ast, &ctx);
+    lua_pushboolean(L, if value.truthy() { 1 } else { 0 });
+    1
+}
+
+// Sound settings bridge
+
+unsafe extern "C" fn native_set_sound_settings(L: *mut lua_State) -> c_int {
+    if lua_type(L, 1) != LUA_TTABLE {
+        return 0;
+    }
+    let idx = lua_absindex(L, 1);
+    let mut events: Vec<(String, crust_core::sound::SoundEventSetting)> = Vec::new();
+    for event in crust_core::sound::SoundEvent::all() {
+        let key = event.as_key();
+        lua_getfield(L, idx, cstring(key).as_ptr());
+        if lua_type(L, -1) == LUA_TTABLE {
+            let enabled = lua_table_bool(L, -1, "enabled", true);
+            let path = lua_table_string_value(L, -1, "path", "");
+            let volume = lua_table_number(L, -1, "volume").unwrap_or(0.7) as f32;
+            events.push((
+                key.to_owned(),
+                crust_core::sound::SoundEventSetting {
+                    enabled,
+                    path,
+                    volume,
+                },
+            ));
+        }
+        lua_pop(L, 1);
+    }
+    if !events.is_empty() {
+        send_lua_command(AppCommand::SetSoundSettings { events });
+    }
+    0
+}
+
+unsafe extern "C" fn native_get_sound_settings(L: *mut lua_State) -> c_int {
+    let Some(host) = global_host() else {
+        lua_createtable(L, 0, 0);
+        return 1;
+    };
+    let cached = host.current_sound_settings();
+    let pairs = if cached.is_empty() {
+        crust_core::sound::SoundSettings::with_defaults().to_pairs()
+    } else {
+        cached
+    };
+    lua_createtable(L, 0, pairs.len() as c_int);
+    for (key, setting) in pairs.iter() {
+        lua_createtable(L, 0, 3);
+        set_field_bool(L, -1, "enabled", setting.enabled);
+        set_field_string(L, -1, "path", &setting.path);
+        set_field_number(L, -1, "volume", setting.clamped_volume() as f64);
+        lua_setfield(L, -2, cstring(key).as_ptr());
+    }
+    1
+}
+
+// Hotkey bindings bridge
+
+unsafe extern "C" fn native_set_hotkey_bindings(L: *mut lua_State) -> c_int {
+    if lua_type(L, 1) != LUA_TTABLE {
+        return 0;
+    }
+    let idx = lua_absindex(L, 1);
+    let mut bindings: Vec<(String, crust_core::hotkeys::KeyBinding)> = Vec::new();
+    for action in crust_core::hotkeys::HotkeyAction::all() {
+        let key = action.as_key();
+        lua_getfield(L, idx, cstring(key).as_ptr());
+        if lua_type(L, -1) == LUA_TTABLE {
+            let binding = crust_core::hotkeys::KeyBinding {
+                ctrl: lua_table_bool(L, -1, "ctrl", false),
+                shift: lua_table_bool(L, -1, "shift", false),
+                alt: lua_table_bool(L, -1, "alt", false),
+                command: lua_table_bool(L, -1, "command", false),
+                key: lua_table_string_value(L, -1, "key", ""),
+            };
+            bindings.push((key.to_owned(), binding));
+        }
+        lua_pop(L, 1);
+    }
+    if !bindings.is_empty() {
+        send_lua_command(AppCommand::SetHotkeyBindings { bindings });
+    }
+    0
+}
+
+unsafe extern "C" fn native_get_hotkey_bindings(L: *mut lua_State) -> c_int {
+    let Some(host) = global_host() else {
+        lua_createtable(L, 0, 0);
+        return 1;
+    };
+    let cached = host.current_hotkey_bindings();
+    let pairs = if cached.is_empty() {
+        crust_core::hotkeys::HotkeyBindings::defaults().to_pairs()
+    } else {
+        cached
+    };
+    lua_createtable(L, 0, pairs.len() as c_int);
+    for (key, binding) in pairs.iter() {
+        lua_createtable(L, 0, 5);
+        set_field_bool(L, -1, "ctrl", binding.ctrl);
+        set_field_bool(L, -1, "shift", binding.shift);
+        set_field_bool(L, -1, "alt", binding.alt);
+        set_field_bool(L, -1, "command", binding.command);
+        set_field_string(L, -1, "key", &binding.key);
+        lua_setfield(L, -2, cstring(key).as_ptr());
+    }
+    1
+}
+
+// Uploader bridge
+
+unsafe extern "C" fn native_upload_image(L: *mut lua_State) -> c_int {
+    // Signature: c2.upload_image(channel, bytes_b64, format, source_path?)
+    if lua_gettop(L) < 3 {
+        return 0;
+    }
+    let Some(channel) = channel_from_value(L, 1) else {
+        return 0;
+    };
+    let Some(bytes_b64) = lua_value_string(L, 2) else {
+        return 0;
+    };
+    let Some(format) = lua_value_string(L, 3) else {
+        return 0;
+    };
+    let bytes = match BASE64_STANDARD.decode(bytes_b64.as_bytes()) {
+        Ok(b) => b,
+        Err(err) => {
+            warn!("plugins: upload_image rejected bad base64: {err}");
+            return 0;
+        }
+    };
+    let source_path = if lua_gettop(L) >= 4 {
+        lua_value_string(L, 4)
+    } else {
+        None
+    };
+    send_lua_command(AppCommand::UploadImage {
+        channel,
+        bytes,
+        format,
+        source_path,
+    });
+    0
 }
 
 unsafe extern "C" fn native_ui_register_window(L: *mut lua_State) -> c_int {
@@ -2805,9 +3165,10 @@ unsafe extern "C" fn native_set_highlight_rules(L: *mut lua_State) -> c_int {
                 } else {
                     None
                 };
+                let is_regex = lua_table_bool(L, -1, "is_regex", false);
                 rules.push(HighlightRule {
                     pattern,
-                    is_regex: lua_table_bool(L, -1, "is_regex", false),
+                    is_regex,
                     case_sensitive: lua_table_bool(L, -1, "case_sensitive", false),
                     enabled: lua_table_bool(L, -1, "enabled", true),
                     show_in_mentions: lua_table_bool(L, -1, "show_in_mentions", false),
@@ -2815,6 +3176,11 @@ unsafe extern "C" fn native_set_highlight_rules(L: *mut lua_State) -> c_int {
                     has_alert: lua_table_bool(L, -1, "has_alert", false),
                     has_sound: lua_table_bool(L, -1, "has_sound", false),
                     sound_url: lua_table_string(L, -1, "sound_url"),
+                    mode: if is_regex {
+                        crust_core::highlight::HighlightRuleMode::Regex
+                    } else {
+                        crust_core::highlight::HighlightRuleMode::Substring
+                    },
                 });
             }
             lua_pop(L, 1);
@@ -2845,15 +3211,21 @@ unsafe extern "C" fn native_set_filter_records(L: *mut lua_State) -> c_int {
                     "dim" => crust_core::model::filters::FilterAction::Dim,
                     _ => crust_core::model::filters::FilterAction::Hide,
                 };
+                let is_regex = lua_table_bool(L, -1, "is_regex", false);
                 records.push(FilterRecord {
                     name: lua_table_string_value(L, -1, "name", ""),
                     pattern: lua_table_string_value(L, -1, "pattern", ""),
-                    is_regex: lua_table_bool(L, -1, "is_regex", false),
+                    is_regex,
                     case_sensitive: lua_table_bool(L, -1, "case_sensitive", false),
                     enabled: lua_table_bool(L, -1, "enabled", true),
                     scope,
                     action,
                     filter_sender: lua_table_bool(L, -1, "filter_sender", false),
+                    mode: if is_regex {
+                        crust_core::model::filters::FilterMode::Regex
+                    } else {
+                        crust_core::model::filters::FilterMode::Substring
+                    },
                 });
             }
             lua_pop(L, 1);
@@ -3737,10 +4109,14 @@ fn push_msg_kind_table(L: *mut lua_State, kind: &MsgKind) {
             MsgKind::Raid {
                 display_name,
                 viewer_count,
+                source_login,
             } => {
                 set_field_string(L, -1, "type", "Raid");
                 set_field_string(L, -1, "display_name", display_name);
                 set_field_int(L, -1, "viewer_count", *viewer_count as i64);
+                if let Some(login) = source_login.as_deref() {
+                    set_field_string(L, -1, "source_login", login);
+                }
             }
             MsgKind::Timeout { login, seconds } => {
                 set_field_string(L, -1, "type", "Timeout");
@@ -3789,6 +4165,38 @@ fn push_msg_kind_table(L: *mut lua_State, kind: &MsgKind) {
             MsgKind::Bits { amount } => {
                 set_field_string(L, -1, "type", "Bits");
                 set_field_int(L, -1, "amount", *amount as i64);
+            }
+            MsgKind::HypeTrain {
+                phase,
+                train_id,
+                level,
+                progress,
+                goal,
+                total,
+                top_contributor_login,
+                top_contributor_type,
+                top_contributor_total,
+                ends_at,
+            } => {
+                set_field_string(L, -1, "type", "HypeTrain");
+                set_field_string(L, -1, "phase", phase);
+                set_field_string(L, -1, "train_id", train_id);
+                set_field_int(L, -1, "level", *level as i64);
+                set_field_int(L, -1, "progress", *progress as i64);
+                set_field_int(L, -1, "goal", *goal as i64);
+                set_field_int(L, -1, "total", *total as i64);
+                if let Some(login) = top_contributor_login.as_deref() {
+                    set_field_string(L, -1, "top_contributor_login", login);
+                }
+                if let Some(ty) = top_contributor_type.as_deref() {
+                    set_field_string(L, -1, "top_contributor_type", ty);
+                }
+                if let Some(n) = top_contributor_total {
+                    set_field_int(L, -1, "top_contributor_total", *n as i64);
+                }
+                if let Some(ts) = ends_at.as_deref() {
+                    set_field_string(L, -1, "ends_at", ts);
+                }
             }
         }
     }
@@ -4800,6 +5208,12 @@ fn event_kind(event: &AppEvent) -> Option<PluginEventKind> {
         AppEvent::IgnoredUsersUpdated { .. } => PluginEventKind::IgnoredUsersUpdated,
         AppEvent::IgnoredPhrasesUpdated { .. } => PluginEventKind::IgnoredPhrasesUpdated,
         AppEvent::UserPronounsLoaded { .. } => PluginEventKind::UserPronounsLoaded,
+        // Silent usercard follow-age result is a popup-only concern.
+        AppEvent::UserCardFollowAgeLoaded { .. } => return None,
+        // Channel-points auto-claim feedback is UI/analytics-only.
+        AppEvent::AutoClaimBonusPointsUpdated { .. }
+        | AppEvent::ChannelPointsBalanceUpdated { .. }
+        | AppEvent::ChannelPointsClaimed { .. } => return None,
         AppEvent::UsercardSettingsUpdated { .. } => PluginEventKind::UsercardSettingsUpdated,
         AppEvent::AuthExpired => PluginEventKind::AuthExpired,
         AppEvent::UpdaterSettingsUpdated { .. }
@@ -4810,13 +5224,14 @@ fn event_kind(event: &AppEvent) -> Option<PluginEventKind> {
         | AppEvent::UpdateCheckUpToDate { .. }
         | AppEvent::UpdateCheckFailed { .. } => PluginEventKind::Error,
         AppEvent::StreamerModeSettingsUpdated { .. }
-        | AppEvent::StreamerModeActiveChanged { .. }
-        | AppEvent::SoundSettingsUpdated { .. } => PluginEventKind::Error,
+        | AppEvent::StreamerModeActiveChanged { .. } => PluginEventKind::Error,
+        AppEvent::SoundSettingsUpdated { .. } => PluginEventKind::SoundSettingsUpdated,
         AppEvent::ExternalToolsSettingsUpdated { .. } => PluginEventKind::Error,
         AppEvent::TabVisibilityRulesUpdated { .. } => PluginEventKind::Error,
         // Alias edits are an internal UI concern; don't surface them to plugins.
         AppEvent::CommandAliasesUpdated { .. } => return None,
-        AppEvent::UploadStarted { .. } | AppEvent::UploadFinished { .. } => PluginEventKind::Error,
+        AppEvent::UploadStarted { .. } => PluginEventKind::UploadStarted,
+        AppEvent::UploadFinished { .. } => PluginEventKind::UploadFinished,
         AppEvent::SelfAvatarLoaded { .. } => PluginEventKind::SelfAvatarLoaded,
         AppEvent::LinkPreviewReady { .. } => PluginEventKind::LinkPreviewReady,
         AppEvent::SenderCosmeticsUpdated { .. } => PluginEventKind::SenderCosmeticsUpdated,
@@ -4839,11 +5254,29 @@ fn event_kind(event: &AppEvent) -> Option<PluginEventKind> {
         // to plugins (individual mention messages already arrive via the
         // normal MessageReceived dispatch path).
         AppEvent::MentionsLoaded { .. } => return None,
-        // Hotkey binding changes are a pure UI/settings concern.
-        AppEvent::HotkeyBindingsUpdated { .. } => return None,
+        AppEvent::HotkeyBindingsUpdated { .. } => PluginEventKind::HotkeyBindingsUpdated,
         // Spell dictionary edits are a pure UI/settings concern - not
         // surfaced to plugins.
         AppEvent::SpellDictionaryUpdated { .. } => return None,
+        // Hype train banner state is a UI-only concern; not surfaced to
+        // plugins. Plugins that care about hype trains can subscribe to
+        // the underlying EventSub notice via MessageReceived (begin/end
+        // chat lines).
+        AppEvent::HypeTrainUpdated { .. } => return None,
+        // Raid banner state is UI-only; the underlying raid is already
+        // delivered to plugins as a `MsgKind::Raid` chat line via
+        // MessageReceived.
+        AppEvent::RaidBannerShown { .. } => return None,
+        // Shared-chat source-channel metadata is UI-only; mirrored
+        // messages already carry the source `room_id` via
+        // `ChatMessage.shared` on MessageReceived.
+        AppEvent::SharedChannelResolved { .. } => return None,
+        // Shared-chat session snapshot drives the viewer-total banner;
+        // plugins already see mirrored messages on MessageReceived.
+        AppEvent::SharedChatSessionUpdated { .. } => return None,
+        // Embedded webview state is a UI/auth concern; not surfaced to plugins.
+        AppEvent::TwitchWebviewLoginState { .. }
+        | AppEvent::TwitchWebviewBonusClaimed { .. } => return None,
     })
 }
 
@@ -4974,11 +5407,15 @@ unsafe fn make_event_table(L: *mut lua_State, event: &AppEvent) -> c_int {
         AppEvent::LowTrustStatusUpdated {
             channel,
             login,
+            user_id,
+            display_name,
             status,
         } => {
             push_channel_table(L, channel);
             lua_setfield(L, -2, cstring("channel").as_ptr());
             set_field_string(L, -1, "login", login);
+            set_field_string(L, -1, "user_id", user_id);
+            set_field_string(L, -1, "display_name", display_name);
             let s = match status {
                 Some(crust_core::model::LowTrustStatus::Monitored) => "monitored",
                 Some(crust_core::model::LowTrustStatus::Restricted) => "restricted",
@@ -5144,6 +5581,10 @@ unsafe fn make_event_table(L: *mut lua_State, event: &AppEvent) -> c_int {
             tabs_font_size,
             timestamps_font_size,
             pills_font_size,
+            popups_font_size,
+            chips_font_size,
+            usercard_font_size,
+            dialog_font_size,
         } => {
             set_field_number(L, -1, "chat_font_size", *chat_font_size as f64);
             set_field_number(L, -1, "ui_font_size", *ui_font_size as f64);
@@ -5151,9 +5592,20 @@ unsafe fn make_event_table(L: *mut lua_State, event: &AppEvent) -> c_int {
             set_field_number(L, -1, "tabs_font_size", *tabs_font_size as f64);
             set_field_number(L, -1, "timestamps_font_size", *timestamps_font_size as f64);
             set_field_number(L, -1, "pills_font_size", *pills_font_size as f64);
+            set_field_number(L, -1, "popups_font_size", *popups_font_size as f64);
+            set_field_number(L, -1, "chips_font_size", *chips_font_size as f64);
+            set_field_number(L, -1, "usercard_font_size", *usercard_font_size as f64);
+            set_field_number(L, -1, "dialog_font_size", *dialog_font_size as f64);
         }
-        AppEvent::RestoreLastActiveChannel { channel } => {
+        AppEvent::RestoreLastActiveChannel {
+            channel,
+            whispers_visible,
+            last_whisper_login,
+            ..
+        } => {
             set_field_string(L, -1, "channel", channel);
+            set_field_bool(L, -1, "whispers_visible", *whispers_visible);
+            set_field_string(L, -1, "last_whisper_login", last_whisper_login);
         }
         AppEvent::AppearanceSettingsUpdated {
             channel_layout,
@@ -5614,13 +6066,34 @@ unsafe fn make_event_table(L: *mut lua_State, event: &AppEvent) -> c_int {
         AppEvent::StreamerModeActiveChanged { active } => {
             set_field_bool(L, -1, "active", *active);
         }
-        AppEvent::SoundSettingsUpdated { events: _ } => {
-            // Not yet surfaced to plugins with structured data; the
-            // default kind is `Error` so plugins that haven't opted in
-            // simply never see this event.
+        AppEvent::SoundSettingsUpdated { events } => {
+            lua_createtable(L, 0, events.len() as c_int);
+            for (key, setting) in events.iter() {
+                lua_createtable(L, 0, 3);
+                set_field_bool(L, -1, "enabled", setting.enabled);
+                set_field_string(L, -1, "path", &setting.path);
+                set_field_number(L, -1, "volume", setting.clamped_volume() as f64);
+                lua_setfield(L, -2, cstring(key).as_ptr());
+            }
+            lua_setfield(L, -2, cstring("events").as_ptr());
         }
-        AppEvent::UploadStarted { .. } | AppEvent::UploadFinished { .. } => {
-            // Not yet surfaced to plugins.
+        AppEvent::UploadStarted { channel } => {
+            push_channel_table(L, channel);
+            lua_setfield(L, -2, cstring("channel").as_ptr());
+        }
+        AppEvent::UploadFinished { channel, result } => {
+            push_channel_table(L, channel);
+            lua_setfield(L, -2, cstring("channel").as_ptr());
+            match result {
+                Ok(url) => {
+                    set_field_bool(L, -1, "ok", true);
+                    set_field_string(L, -1, "url", url);
+                }
+                Err(msg) => {
+                    set_field_bool(L, -1, "ok", false);
+                    set_field_string(L, -1, "error", msg);
+                }
+            }
         }
         AppEvent::ExternalToolsSettingsUpdated {
             streamlink_path,
@@ -5648,10 +6121,39 @@ unsafe fn make_event_table(L: *mut lua_State, event: &AppEvent) -> c_int {
         AppEvent::TabVisibilityRulesUpdated { .. } => {}
         // Command alias edits are an internal UI concern; not surfaced to plugins.
         AppEvent::CommandAliasesUpdated { .. } => {}
-        // Hotkey binding changes are UI/settings-only state.
-        AppEvent::HotkeyBindingsUpdated { .. } => {}
+        AppEvent::HotkeyBindingsUpdated { bindings } => {
+            lua_createtable(L, 0, bindings.len() as c_int);
+            for (key, binding) in bindings.iter() {
+                lua_createtable(L, 0, 5);
+                set_field_bool(L, -1, "ctrl", binding.ctrl);
+                set_field_bool(L, -1, "shift", binding.shift);
+                set_field_bool(L, -1, "alt", binding.alt);
+                set_field_bool(L, -1, "command", binding.command);
+                set_field_string(L, -1, "key", &binding.key);
+                lua_setfield(L, -2, cstring(key).as_ptr());
+            }
+            lua_setfield(L, -2, cstring("bindings").as_ptr());
+        }
         // Spell dictionary edits are UI/settings-only state.
         AppEvent::SpellDictionaryUpdated { .. } => {}
+        // Hype train state is UI-only banner data; plugins see the begin/end
+        // chat line via MessageReceived.
+        AppEvent::HypeTrainUpdated { .. } => {}
+        // Raid banner state is UI-only; plugins see the raid as a MsgKind::Raid line.
+        AppEvent::RaidBannerShown { .. } => {}
+        // Shared-chat source-channel metadata is UI-only.
+        AppEvent::SharedChannelResolved { .. } => {}
+        // Shared-chat viewer-total banner is UI-only.
+        AppEvent::SharedChatSessionUpdated { .. } => {}
+        // Silent usercard follow-age result is a popup-only concern.
+        AppEvent::UserCardFollowAgeLoaded { .. } => {}
+        // Channel-points auto-claim feedback is UI/analytics-only.
+        AppEvent::AutoClaimBonusPointsUpdated { .. } => {}
+        AppEvent::ChannelPointsBalanceUpdated { .. } => {}
+        AppEvent::ChannelPointsClaimed { .. } => {}
+        // Embedded webview state is a UI/auth concern.
+        AppEvent::TwitchWebviewLoginState { .. } => {}
+        AppEvent::TwitchWebviewBonusClaimed { .. } => {}
     }
 
     lua_gettop(L)

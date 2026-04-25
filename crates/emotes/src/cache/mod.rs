@@ -32,7 +32,7 @@ pub struct AssetKey {
 /// Stores:
 /// 1. An LRU in-memory byte cache (raw image bytes ready to decode).
 /// 2. A disk cache under `~/.cache/crust/emotes/`.
-/// 3. A code→EmoteInfo index (populated by loaders).
+/// 3. A code->EmoteInfo index (populated by loaders).
 #[derive(Clone)]
 pub struct EmoteCache {
     inner: Arc<Mutex<CacheInner>>,
@@ -42,8 +42,8 @@ pub struct EmoteCache {
 
 struct CacheInner {
     bytes: LruCache<AssetKey, (Bytes, Instant)>,
-    index: HashMap<String, EmoteInfo>, // code → info
-    /// In-flight request coalescing: URL → broadcast sender.
+    index: HashMap<String, EmoteInfo>, // code -> info
+    /// In-flight request coalescing: URL -> broadcast sender.
     /// While a network fetch is in progress for a URL, subsequent callers
     /// subscribe to the same broadcast instead of issuing a duplicate request.
     in_flight: HashMap<String, broadcast::Sender<Result<(u32, u32, Vec<u8>), String>>>,
@@ -136,7 +136,7 @@ impl EmoteCache {
     /// Image dimensions are read from the file header only - no full RGBA decode.
     /// egui's built-in loaders (WebP / GIF / Image) handle decoding + animation.
     ///
-    /// Checks memory → disk → network in order, writing through on a cache miss.
+    /// Checks memory -> disk -> network in order, writing through on a cache miss.
     pub async fn fetch_and_decode(&self, url: &str) -> Result<(u32, u32, Vec<u8>), EmoteError> {
         // Derive a stable disk path from a hash of the URL.
         let disk_path = self

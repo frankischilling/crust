@@ -63,6 +63,21 @@ pub enum MsgKind {
     Raid {
         display_name: String,
         viewer_count: u32,
+        #[serde(default)]
+        source_login: Option<String>,
+    },
+    /// Hype train status row (begin/progress/end).
+    HypeTrain {
+        phase: String,
+        train_id: String,
+        level: u32,
+        progress: u64,
+        goal: u64,
+        total: u64,
+        top_contributor_login: Option<String>,
+        top_contributor_type: Option<String>,
+        top_contributor_total: Option<u64>,
+        ends_at: Option<String>,
     },
     /// Target user was timed out.
     Timeout { login: String, seconds: u32 },
@@ -115,6 +130,40 @@ pub struct MessageFlags {
     pub custom_reward_id: Option<String>,
     /// True for messages loaded from chat history rather than received live.
     pub is_history: bool,
+    /// Equivalent to Chatterino's `MessageFlag::DoNotTriggerNotification`:
+    /// skip sound / desktop toast / mentions-feed side effects even when the
+    /// message is highlighted. Set for Shared Chat mirrors whose source
+    /// channel is also currently open.
+    #[serde(default)]
+    pub suppress_notification: bool,
+}
+
+/// Metadata for messages sent in a Shared Chat session (Twitch cross-channel
+/// mirroring). Populated when the incoming message's `source-room-id` IRC tag
+/// (or EventSub `source_broadcaster_user_id`) differs from the current room.
+///
+/// Upstream: see Chatterino `MessageBuilder::parseSharedChatInfo` + Twitch
+/// help article <https://help.twitch.tv/s/article/shared-chat>.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SharedChatSource {
+    /// Numeric broadcaster user-id of the source channel.
+    pub room_id: String,
+    /// Source-channel's msg-id tag, if present (`source-id`).
+    pub source_message_id: Option<String>,
+    /// Login of the source channel, resolved when known.
+    #[serde(default)]
+    pub login: Option<String>,
+    /// Display name of the source channel, resolved when known.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Source-channel profile picture URL (for the shared-chat badge).
+    #[serde(default)]
+    pub profile_url: Option<String>,
+    /// Mod/VIP badges issued by the source channel (Chatterino only appends
+    /// moderator + vip from `source-badges` since other slots already overlap
+    /// with normal `badges`).
+    #[serde(default)]
+    pub badges: Vec<super::Badge>,
 }
 
 /// Metadata for a message that is a reply to another message.
@@ -149,6 +198,10 @@ pub struct ChatMessage {
     pub reply: Option<ReplyInfo>,
     /// What kind of event produced this line.
     pub msg_kind: MsgKind,
+    /// Populated when this message is a mirrored Shared Chat delivery from
+    /// another channel; `None` means local to `channel`.
+    #[serde(default)]
+    pub shared: Option<SharedChatSource>,
 }
 
 /// Lightweight emote entry for the UI catalog (autocomplete / picker).
@@ -159,4 +212,28 @@ pub struct EmoteCatalogEntry {
     pub url: String,
     /// "global" or "channel".
     pub scope: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MsgKind;
+
+    #[test]
+    fn raid_deserializes_without_source_login() {
+        let msg_kind: MsgKind =
+            serde_json::from_str(r#"{"Raid":{"display_name":"Raider","viewer_count":42}}"#).unwrap();
+
+        match msg_kind {
+            MsgKind::Raid {
+                display_name,
+                viewer_count,
+                source_login,
+            } => {
+                assert_eq!(display_name, "Raider");
+                assert_eq!(viewer_count, 42);
+                assert_eq!(source_login, None);
+            }
+            other => panic!("unexpected message kind: {other:?}"),
+        }
+    }
 }

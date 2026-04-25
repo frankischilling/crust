@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// User login → custom display name mapping.
+/// User login -> custom display name mapping.
 ///
 /// Mirrors chatterino's `Nickname` entries but scoped per-field to the subset
 /// the rest of crust needs.  A nickname whose `channel` is `None` applies

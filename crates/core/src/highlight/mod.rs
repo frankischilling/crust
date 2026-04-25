@@ -1,14 +1,37 @@
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
+
+use crate::filters::{
+    self as dsl, build_message_context, parse as parse_expression, Expression,
+};
+use crate::model::ChatMessage;
 
 /// RGB highlight tint color (red, green, blue).
 pub type HighlightColor = [u8; 3];
 
+/// How the `pattern` field should be interpreted.
+///
+/// `Substring` matches plain text; `Regex` treats `pattern` as a
+/// [`regex::Regex`]; `Expression` parses `pattern` as a Chatterino-style
+/// filter DSL expression that must evaluate to truthy for the highlight to
+/// fire (see [`crate::filters`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum HighlightRuleMode {
+    #[default]
+    Substring,
+    Regex,
+    Expression,
+}
+
 /// A single highlight rule, mirroring chatterino's `HighlightPhrase` semantics.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HighlightRule {
-    /// The pattern string (plain substring or regex, depending on `is_regex`).
+    /// The pattern string (plain substring, regex, or expression - see `mode`).
     pub pattern: String,
-    /// Treat `pattern` as a regular expression.
+    /// Treat `pattern` as a regular expression (legacy flag; kept for
+    /// backward compatibility with old config files. When `mode` is unset
+    /// and `is_regex` is true we interpret the rule in [`HighlightRuleMode::Regex`]).
     #[serde(default)]
     pub is_regex: bool,
     /// Match is case-sensitive (default: false).
@@ -32,6 +55,10 @@ pub struct HighlightRule {
     /// Optional custom sound file URL/path for this highlight.
     #[serde(default)]
     pub sound_url: Option<String>,
+    /// How `pattern` is interpreted. Absent fields default to
+    /// [`HighlightRuleMode::Substring`].
+    #[serde(default)]
+    pub mode: HighlightRuleMode,
 }
 
 fn bool_true() -> bool {
@@ -51,6 +78,7 @@ impl HighlightRule {
             has_alert: false,
             has_sound: false,
             sound_url: None,
+            mode: HighlightRuleMode::Substring,
         }
     }
 
@@ -66,6 +94,32 @@ impl HighlightRule {
             has_alert: false,
             has_sound: false,
             sound_url: None,
+            mode: HighlightRuleMode::Regex,
+        }
+    }
+
+    /// Create a rule that evaluates a Chatterino-style filter expression.
+    pub fn expression(pattern: impl Into<String>) -> Self {
+        Self {
+            pattern: pattern.into(),
+            is_regex: false,
+            case_sensitive: false,
+            enabled: true,
+            show_in_mentions: false,
+            color: None,
+            has_alert: false,
+            has_sound: false,
+            sound_url: None,
+            mode: HighlightRuleMode::Expression,
+        }
+    }
+
+    /// Resolve `mode` accounting for legacy config files that only set
+    /// `is_regex`.
+    pub fn effective_mode(&self) -> HighlightRuleMode {
+        match self.mode {
+            HighlightRuleMode::Substring if self.is_regex => HighlightRuleMode::Regex,
+            _ => self.mode.clone(),
         }
     }
 
@@ -102,13 +156,14 @@ impl HighlightRule {
     }
 }
 
-// -- Compiled match helper -----------------------------------------------------
+// Compiled match helper
 
 /// Pre-compiled form of a [`HighlightRule`] used for efficient per-message
 /// evaluation.  Build once via [`compile_rules`] and reuse across frames.
 pub enum CompiledMatcher {
     Substring(String),
     Regex(regex::Regex),
+    Expression(Arc<Expression>),
 }
 
 pub struct HighlightMatch {
@@ -118,6 +173,11 @@ pub struct HighlightMatch {
 
 impl HighlightMatch {
     /// Test whether this match fires for the given message text.
+    ///
+    /// Expression-mode rules cannot be evaluated from a bare `text`
+    /// argument (they need a full [`ChatMessage`] context) and always
+    /// return `false` here. Use [`first_match_context_rule_message`] for
+    /// expression-aware matching.
     pub fn is_match(&self, text: &str) -> bool {
         if !self.rule.enabled {
             return false;
@@ -133,6 +193,7 @@ impl HighlightMatch {
                 }
             }
             CompiledMatcher::Regex(re) => re.is_match(text),
+            CompiledMatcher::Expression(_) => false,
         }
     }
 
@@ -152,6 +213,12 @@ impl HighlightMatch {
         is_mention: bool,
     ) -> bool {
         if !self.rule.enabled {
+            return false;
+        }
+
+        // Expression-mode rules need a ChatMessage context which isn't
+        // available here; defer to the `_message` helpers for those.
+        if matches!(self.matcher, CompiledMatcher::Expression(_)) {
             return false;
         }
 
@@ -287,21 +354,36 @@ fn regex_match(pattern: &str, text: &str, case_insensitive: bool) -> bool {
 }
 
 /// Compile a slice of [`HighlightRule`]s into a vec of [`HighlightMatch`]
-/// entries, silently skipping any rules with invalid regex patterns.
+/// entries, silently skipping any rules with invalid regex or expression
+/// patterns (a warning is logged for troubleshooting).
 pub fn compile_rules(rules: &[HighlightRule]) -> Vec<HighlightMatch> {
     rules
         .iter()
         .filter(|r| r.enabled && !r.pattern.is_empty())
         .filter_map(|rule| {
-            let matcher = if rule.is_regex {
-                let mut builder = regex::RegexBuilder::new(&rule.pattern);
-                builder.case_insensitive(!rule.case_sensitive);
-                match builder.build() {
-                    Ok(re) => CompiledMatcher::Regex(re),
-                    Err(_) => return None, // skip invalid regex
+            let matcher = match rule.effective_mode() {
+                HighlightRuleMode::Expression => match parse_expression(&rule.pattern) {
+                    Ok(expr) => CompiledMatcher::Expression(Arc::new(expr)),
+                    Err(e) => {
+                        tracing::warn!(
+                            "highlight rule `{}`: invalid expression at {}..{}: {}",
+                            rule.pattern,
+                            e.span().start,
+                            e.span().end,
+                            e
+                        );
+                        return None;
+                    }
+                },
+                HighlightRuleMode::Regex => {
+                    let mut builder = regex::RegexBuilder::new(&rule.pattern);
+                    builder.case_insensitive(!rule.case_sensitive);
+                    match builder.build() {
+                        Ok(re) => CompiledMatcher::Regex(re),
+                        Err(_) => return None, // skip invalid regex
+                    }
                 }
-            } else {
-                CompiledMatcher::Substring(rule.pattern.clone())
+                HighlightRuleMode::Substring => CompiledMatcher::Substring(rule.pattern.clone()),
             };
             Some(HighlightMatch {
                 rule: rule.clone(),
@@ -394,7 +476,81 @@ pub fn is_highlighted_rules(rules: &[HighlightRule], text: &str) -> bool {
     is_highlighted(&compiled, text)
 }
 
-// -- ASCII case-insensitive search ---------------------------------------------
+/// Expression-aware first match.
+///
+/// Iterates all compiled rules. For legacy matchers, falls back to
+/// [`HighlightMatch::is_match_context`] using `msg.raw_text`,
+/// `msg.sender.*`, `channel_display_name`, and `msg.flags.is_mention`.
+/// For expression matchers, builds a [`crate::filters::Context`] once and
+/// evaluates each expression against it.
+pub fn first_match_context_rule_message<'a>(
+    compiled: &'a [HighlightMatch],
+    msg: &ChatMessage,
+    channel_display_name: &str,
+    channel_live: Option<bool>,
+    watching: bool,
+) -> Option<&'a HighlightRule> {
+    if compiled.is_empty() {
+        return None;
+    }
+    let mut expr_ctx: Option<dsl::Context> = None;
+
+    for m in compiled {
+        if !m.rule.enabled {
+            continue;
+        }
+        match &m.matcher {
+            CompiledMatcher::Expression(expr) => {
+                let ctx = expr_ctx.get_or_insert_with(|| {
+                    build_message_context(msg, channel_display_name, channel_live, watching)
+                });
+                if dsl::evaluate(expr, ctx).truthy() {
+                    return Some(&m.rule);
+                }
+            }
+            _ => {
+                if m.is_match_context(
+                    &msg.raw_text,
+                    &msg.sender.login,
+                    &msg.sender.display_name,
+                    channel_display_name,
+                    msg.flags.is_mention,
+                ) {
+                    return Some(&m.rule);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Tuple-returning sibling of [`first_match_context_rule_message`], matching
+/// the shape of [`first_match_context`].
+pub fn first_match_context_message(
+    compiled: &[HighlightMatch],
+    msg: &ChatMessage,
+    channel_display_name: &str,
+    channel_live: Option<bool>,
+    watching: bool,
+) -> Option<(Option<HighlightColor>, bool, bool, bool)> {
+    first_match_context_rule_message(
+        compiled,
+        msg,
+        channel_display_name,
+        channel_live,
+        watching,
+    )
+    .map(|rule| {
+        (
+            rule.color,
+            rule.show_in_mentions,
+            rule.has_alert,
+            rule.has_sound,
+        )
+    })
+}
+
+// ASCII case-insensitive search
 
 fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
     let h = haystack.as_bytes();
@@ -424,7 +580,7 @@ fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
     false
 }
 
-// -- Tests ---------------------------------------------------------------------
+// Tests
 
 #[cfg(test)]
 mod tests {
@@ -434,7 +590,7 @@ mod tests {
         HighlightRule::new(pattern)
     }
 
-    // -- substring matching --------------------------------------------------
+    // substring matching
 
     #[test]
     fn case_insensitive_match() {
@@ -450,7 +606,7 @@ mod tests {
         assert!(!is_highlighted(&compiled, "hello world"));
     }
 
-    // -- regex matching ------------------------------------------------------
+    // regex matching
 
     #[test]
     fn regex_rule_matches() {
@@ -471,22 +627,22 @@ mod tests {
         let mut rule = HighlightRule::regex("[unclosed");
         rule.enabled = true;
         let compiled = compile_rules(&[rule]);
-        // Invalid regex → compiled to 0 entries; no panic
+        // Invalid regex -> compiled to 0 entries; no panic
         assert_eq!(compiled.len(), 0);
     }
 
-    // -- disabled rules ------------------------------------------------------
+    // disabled rules
 
     #[test]
     fn disabled_rule_skipped() {
         let mut rule = make_rule("hello");
         rule.enabled = false;
         let compiled = compile_rules(&[rule]);
-        // disabled rule → not included in compiled set
+        // disabled rule -> not included in compiled set
         assert_eq!(compiled.len(), 0);
     }
 
-    // -- color propagation ---------------------------------------------------
+    // color propagation
 
     #[test]
     fn color_returned_on_match() {
@@ -506,7 +662,7 @@ mod tests {
         assert_eq!(result, Some((None, true, false, false)));
     }
 
-    // -- case sensitivity ----------------------------------------------------
+    // case sensitivity
 
     #[test]
     fn case_sensitive_no_match() {
@@ -562,5 +718,75 @@ mod tests {
             false,
         );
         assert!(matched.is_some());
+    }
+
+    // expression mode
+
+    fn fake_subbed_message(text: &str) -> crate::model::ChatMessage {
+        use crate::model::{
+            Badge, ChannelId, ChatMessage, MessageId, MsgKind, Sender, Span as MsgSpan, UserId,
+        };
+        use chrono::Utc;
+        use smallvec::smallvec;
+        ChatMessage {
+            id: MessageId(1),
+            server_id: None,
+            timestamp: Utc::now(),
+            channel: ChannelId("somechan".into()),
+            sender: Sender {
+                user_id: UserId("1".into()),
+                login: "alice".into(),
+                display_name: "Alice".into(),
+                color: None,
+                name_paint: None,
+                badges: vec![Badge {
+                    name: "subscriber".into(),
+                    version: "3".into(),
+                    url: None,
+                }],
+            },
+            raw_text: text.into(),
+            spans: smallvec![MsgSpan::Text {
+                text: text.into(),
+                is_action: false
+            }],
+            twitch_emotes: Vec::new(),
+            flags: Default::default(),
+            reply: None,
+            msg_kind: MsgKind::Chat,
+            shared: None,
+        }
+    }
+
+    #[test]
+    fn expression_mode_highlight_fires_for_subscriber_gg() {
+        let mut rule = HighlightRule::expression(
+            "author.subscriber && message.content contains \"gg\"",
+        );
+        rule.color = Some([255, 200, 100]);
+        let compiled = compile_rules(&[rule]);
+        let msg = fake_subbed_message("gg ez");
+        let hit = first_match_context_rule_message(&compiled, &msg, "somechan", None, false);
+        assert!(hit.is_some());
+        assert_eq!(hit.unwrap().color, Some([255, 200, 100]));
+    }
+
+    #[test]
+    fn expression_mode_highlight_skips_non_subscribers() {
+        let rule = HighlightRule::expression(
+            "author.subscriber && message.content contains \"gg\"",
+        );
+        let compiled = compile_rules(&[rule]);
+        let mut msg = fake_subbed_message("gg ez");
+        msg.sender.badges.clear();
+        let hit = first_match_context_rule_message(&compiled, &msg, "somechan", None, false);
+        assert!(hit.is_none());
+    }
+
+    #[test]
+    fn invalid_expression_rule_dropped_on_compile() {
+        let rule = HighlightRule::expression("author.subscriber &&");
+        let compiled = compile_rules(&[rule]);
+        assert!(compiled.is_empty());
     }
 }

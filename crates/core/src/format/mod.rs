@@ -4,7 +4,7 @@
 //! 1. Mark Twitch-native emote ranges (from the `emotes` IRC tag).
 //! 2. Walk remaining text word-by-word:
 //!    a. Check third-party emote index (BTTV / FFZ / 7TV).
-//!    b. Detect emoji → produce Twemoji image URL.
+//!    b. Detect emoji -> produce Twemoji image URL.
 //!    c. Detect URLs.
 //!    d. Detect @mentions.
 //!    e. Otherwise plain text.
@@ -220,16 +220,53 @@ fn tokenize_with_emoji(word: &str, is_action: bool, out: &mut SmallVec<[Span; 8]
     let mut chars = word.chars().peekable();
     while let Some(c) = chars.next() {
         if emoji::is_emoji_start(c) {
-            // Collect the full grapheme cluster (ZWJ sequences, variation selectors)
+            // Collect the full grapheme cluster (ZWJ sequences, variation selectors,
+            // tone modifiers). Adjacent independent emoji must NOT merge.
             let mut codepoints = vec![c as u32];
             loop {
-                match chars.peek() {
-                    Some(&next) if emoji::is_emoji_continuation(next) => {
-                        codepoints.push(next as u32);
-                        chars.next();
-                    }
-                    _ => break,
+                let Some(&next) = chars.peek() else { break };
+                let ncp = next as u32;
+
+                if emoji::is_emoji_combiner(ncp) {
+                    codepoints.push(ncp);
+                    chars.next();
+                    continue;
                 }
+
+                if ncp == 0x200D {
+                    // ZWJ only extends if another emoji follows.
+                    let mut lookahead = chars.clone();
+                    lookahead.next();
+                    if matches!(lookahead.peek(), Some(&after) if emoji::is_emoji_start(after)) {
+                        codepoints.push(0x200D);
+                        chars.next();
+                        continue;
+                    }
+                    break;
+                }
+
+                if emoji::is_regional_indicator(ncp)
+                    && emoji::is_regional_indicator(*codepoints.last().unwrap())
+                    && codepoints
+                        .iter()
+                        .filter(|&&cp| emoji::is_regional_indicator(cp))
+                        .count()
+                        < 2
+                {
+                    // Complete a single flag pair; another RI beyond that starts a new flag.
+                    codepoints.push(ncp);
+                    chars.next();
+                    continue;
+                }
+
+                // Sequence started with a ZWJ just absorbed: accept the next base.
+                if matches!(codepoints.last(), Some(&0x200D)) && emoji::is_emoji_start(next) {
+                    codepoints.push(ncp);
+                    chars.next();
+                    continue;
+                }
+
+                break;
             }
 
             if emoji::is_definitely_emoji(&codepoints) {
@@ -427,6 +464,50 @@ mod tests {
                 "https://cdn.7tv.app/emote/01K2AN1RWND0043X61B48HNQFA/2x.webp".to_owned()
             ))
         );
+    }
+
+    #[test]
+    fn adjacent_emoji_do_not_merge() {
+        // 😙 (1F619) + 👌🏻 (1F44C + 1F3FB) + 💨 (1F4A8) -> 3 distinct spans.
+        let spans = tokenize("\u{1F619}\u{1F44C}\u{1F3FB}\u{1F4A8}", false, &[], &|_| None);
+        let emoji_urls: Vec<&str> = spans
+            .iter()
+            .filter_map(|s| match s {
+                Span::Emoji { url, .. } => Some(url.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(emoji_urls.len(), 3);
+        assert!(emoji_urls[0].ends_with("1f619.png"));
+        assert!(emoji_urls[1].ends_with("1f44c-1f3fb.png"));
+        assert!(emoji_urls[2].ends_with("1f4a8.png"));
+    }
+
+    #[test]
+    fn zwj_sequence_merges() {
+        // 👨‍💻 man + ZWJ + laptop -> one span.
+        let spans = tokenize("\u{1F468}\u{200D}\u{1F4BB}", false, &[], &|_| None);
+        let emoji_count = spans
+            .iter()
+            .filter(|s| matches!(s, Span::Emoji { .. }))
+            .count();
+        assert_eq!(emoji_count, 1);
+    }
+
+    #[test]
+    fn two_flags_do_not_merge() {
+        // 🇺🇸🇯🇵 -> two flag spans, not one super-flag.
+        let spans = tokenize(
+            "\u{1F1FA}\u{1F1F8}\u{1F1EF}\u{1F1F5}",
+            false,
+            &[],
+            &|_| None,
+        );
+        let emoji_count = spans
+            .iter()
+            .filter(|s| matches!(s, Span::Emoji { .. }))
+            .count();
+        assert_eq!(emoji_count, 2);
     }
 
     #[test]

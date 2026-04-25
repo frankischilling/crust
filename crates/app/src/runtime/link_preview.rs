@@ -40,7 +40,7 @@ pub(crate) async fn fetch_link_preview(
     // Direct image URLs (image hosts, uploader output, hot-linked assets)
     // don't serve OG tagsthey serve the image itself. Short-circuit by
     // using the URL as its own thumbnail so the hover tooltip shows a real
-    // image preview instead of "Loading preview…" forever.
+    // image preview instead of "Loading preview..." forever.
     if is_direct_image_url(url) {
         fetch_emote_image(url, cache, evt_tx).await;
         let _ = evt_tx
@@ -146,7 +146,7 @@ fn is_youtube_url(url: &str) -> bool {
 }
 
 /// Return true when the URL's path looks like a direct image asset.
-/// Strips query + fragment so `?token=…` / `#anchor` don't break matching.
+/// Strips query + fragment so `?token=...` / `#anchor` don't break matching.
 fn is_direct_image_url(url: &str) -> bool {
     let path = url
         .split('#')

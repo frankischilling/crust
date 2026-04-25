@@ -55,8 +55,8 @@ use runtime::history::{
 use runtime::link_preview::fetch_link_preview;
 use runtime::plugins::init_plugins;
 use runtime::profiles::{
-    fetch_ivr_logs, fetch_self_avatar, fetch_twitch_stream_status, fetch_twitch_user_profile,
-    fetch_user_profile_for_channel,
+    fetch_ivr_logs, fetch_self_avatar, fetch_shared_channel_profile, fetch_shared_chat_session,
+    fetch_twitch_stream_status, fetch_twitch_user_profile, fetch_user_profile_for_channel,
 };
 use runtime::system_messages::{
     build_sub_text, extract_irc_msg_echo, format_timeout_text, is_twitch_pinned_notice,
@@ -137,7 +137,7 @@ fn crust_icon_data() -> egui::IconData {
 static HISTORY_MSG_ID: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(u64::MAX / 2);
 
-/// Shared emote index: "provider:code" → EmoteInfo.
+/// Shared emote index: "provider:code" -> EmoteInfo.
 /// Keyed by compound key so that emotes with the same code from different
 /// providers are all preserved (important for the emote picker catalog).
 type EmoteIndex = Arc<RwLock<std::collections::HashMap<String, EmoteInfo>>>;
@@ -172,7 +172,7 @@ fn main() -> Result<()> {
     // SIGPIPE: handle broken pipe signals on Wayland
     // On Wayland, when a protocol socket (compositor, XWayland, portal)
     // dies, writes produce SIGPIPE. With Rust edition 2021 the default
-    // disposition is SIG_DFL → terminate.  Ignore it so the IO layer
+    // disposition is SIG_DFL -> terminate.  Ignore it so the IO layer
     // returns EPIPE normally and libraries can handle the error.
     #[cfg(unix)]
     unsafe {
@@ -189,7 +189,7 @@ fn main() -> Result<()> {
     // compositor doesn't implement it, arboard falls back to X11 clipboard
     // via XWayland. That X11 worker thread can crash when the XWayland
     // connection is closed or times out, which takes down the entire
-    // winit event loop ("Io error: Broken pipe" → Exit Failure: 1).
+    // winit event loop ("Io error: Broken pipe" -> Exit Failure: 1).
     //
     // Fix: on Wayland, clear DISPLAY so arboard never attempts the X11
     // fallback. The window itself is rendered via Wayland - DISPLAY is
@@ -266,6 +266,15 @@ fn main() -> Result<()> {
     let (live_feed_evt_tx, live_feed_evt_rx) =
         mpsc::channel::<runtime::live_feed::LiveFeedEvent>(64);
 
+    // Hype-train poller (unofficial GQL) - polls joined Twitch channels for
+    // hype-train state so viewers (not just broadcasters) see the banner.
+    let (hype_train_poller_tx, hype_train_poller_rx) =
+        mpsc::channel::<runtime::hype_train_poller::HypeTrainPollerCommand>(16);
+
+    // Channel-points poller / auto-claimer (unofficial GQL).
+    let (channel_points_tx, channel_points_rx) =
+        mpsc::channel::<runtime::channel_points_claimer::ChannelPointsClaimerCommand>(16);
+
     // AuthedHelix is the trait-object plumbed into the live-feed task; it
     // is reconfigured on every login/logout via set_auth / clear_auth.
     let authed_helix = std::sync::Arc::new(crust_twitch::helix::AuthedHelix::new());
@@ -280,7 +289,7 @@ fn main() -> Result<()> {
     // Emote cache for disk/network
     let emote_cache = EmoteCache::new().ok();
 
-    // Badge map: (set, version) → URL
+    // Badge map: (set, version) -> URL
     let badge_map: BadgeMap = Arc::new(RwLock::new(std::collections::HashMap::new()));
     let loaded_cached_badges = load_badge_map_cache_into(&badge_map);
     if loaded_cached_badges > 0 {
@@ -388,7 +397,11 @@ fn main() -> Result<()> {
         });
     }
 
-    // Spawn Twitch EventSub websocket/session manager.
+    // Spawn Twitch EventSub websocket/session manager. We keep a clone of
+    // the event sender around so the reconnect-backfill runner can inject
+    // synthetic `EventSubEvent::Notice`s back through the same channel and
+    // pick up the main-loop 45s dedup window.
+    let eventsub_evt_tx_for_backfill = eventsub_evt_tx.clone();
     rt.spawn({
         let session = EventSubSession::new(eventsub_evt_tx, eventsub_cmd_rx);
         session.run()
@@ -405,6 +418,67 @@ fn main() -> Result<()> {
             live_feed_evt_tx.clone(),
         );
     }
+
+    // Spawn the hype-train poller.  Shares no state with EventSub; the
+    // poller only reads `https://gql.twitch.tv/gql` and emits HypeTrainUpdated
+    // AppEvents through the same reducer channel that EventSub uses, so the
+    // UI can't tell the two sources apart.
+    {
+        let http_for_hype = reqwest::Client::builder()
+            .user_agent(concat!("crust/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        let _hype_train_poller_handle = runtime::hype_train_poller::spawn_on(
+            rt.handle(),
+            http_for_hype,
+            hype_train_poller_rx,
+            evt_tx.clone(),
+        );
+    }
+
+    // Spawn the channel-points poller. Same shape as the hype-train task -
+    // it polls every joined Twitch channel for the viewer's balance and, if
+    // the user has enabled auto-claim, redeems the "Bonus Points" reward.
+    {
+        let http_for_points = reqwest::Client::builder()
+            .user_agent(concat!("crust/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        let _channel_points_handle = runtime::channel_points_claimer::spawn_on(
+            rt.handle(),
+            http_for_points,
+            initial_settings
+                .external_tools
+                .streamlink_session_token
+                .clone(),
+            channel_points_rx,
+            evt_tx.clone(),
+        );
+    }
+
+    // Spawn the active-channel watch heartbeat. Uses the chat OAuth token
+    // (same one the IRC client holds) - unlike the channel-points GQL
+    // endpoints, StreamPlaybackAccessToken accepts chat scopes.
+    // Embedded Twitch webview for channel-points auto-claim. Owns its own
+    // cookies in the Crust config dir, so the user signs in once and stays
+    // signed in across launches. Balance display still comes from the GQL
+    // poll in channel_points_claimer.
+    let (webview_evt_tx, webview_evt_rx) =
+        mpsc::channel::<crust_webview::WebviewEvent>(16);
+    let webview_handle = {
+        let data_dir = settings_store
+            .as_ref()
+            .map(|s| s.config_dir().join("webview"))
+            .unwrap_or_else(|| std::path::PathBuf::from("./webview-data"));
+        if let Err(e) = std::fs::create_dir_all(&data_dir) {
+            warn!("crust-webview: failed to create data dir {data_dir:?}: {e}");
+        }
+        let handle = crust_webview::spawn(data_dir, webview_evt_tx);
+        handle.send(crust_webview::WebviewCommand::SetEnabled(
+            initial_settings.auto_claim_bonus_points,
+        ));
+        handle
+    };
 
     // Kick off a one-shot backfill of the cross-channel Mentions pseudo-tab
     // from the local SQLite log. Gated on the same `local_log_indexing_enabled`
@@ -437,7 +511,7 @@ fn main() -> Result<()> {
         });
     }
 
-    // Spawn the reducer (bridges twitch/kick events → tokenized AppEvents for UI)
+    // Spawn the reducer (bridges twitch/kick events -> tokenized AppEvents for UI)
     rt.spawn({
         let idx = emote_index.clone();
         let cache = emote_cache.clone();
@@ -455,7 +529,12 @@ fn main() -> Result<()> {
             kick_cmd_tx,
             irc_cmd_tx,
             eventsub_cmd_tx,
+            eventsub_evt_tx_for_backfill,
             live_feed_cmd_tx,
+            hype_train_poller_tx,
+            channel_points_tx,
+            webview_handle,
+            webview_evt_rx,
             authed_helix,
             idx,
             cache,
@@ -469,14 +548,27 @@ fn main() -> Result<()> {
         )
     });
 
-    // eframe / egui: UI framework initialization
+    // eframe / egui: UI framework initialization.
+    // Restore last-known window geometry when present, falling back to defaults.
+    let saved_size = initial_settings
+        .window_size
+        .filter(|s| s[0] >= APP_MIN_INNER_SIZE[0] && s[1] >= APP_MIN_INNER_SIZE[1]);
+    let saved_pos = initial_settings.window_pos;
+    let saved_max = initial_settings.window_maximized;
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("Crust - Twitch, Kick & IRC Chat")
+        .with_inner_size(saved_size.unwrap_or(APP_INITIAL_INNER_SIZE))
+        .with_min_inner_size(APP_MIN_INNER_SIZE)
+        .with_icon(crust_icon_data())
+        .with_app_id("crust");
+    if let Some(pos) = saved_pos {
+        viewport = viewport.with_position(egui::pos2(pos[0], pos[1]));
+    }
+    if saved_max {
+        viewport = viewport.with_maximized(true);
+    }
     let native_opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Crust - Twitch, Kick & IRC Chat")
-            .with_inner_size(APP_INITIAL_INNER_SIZE)
-            .with_min_inner_size(APP_MIN_INNER_SIZE)
-            .with_icon(crust_icon_data())
-            .with_app_id("crust"),
+        viewport,
         ..Default::default()
     };
 
@@ -648,7 +740,12 @@ async fn reducer_loop(
     kick_tx: mpsc::Sender<KickSessionCommand>,
     irc_tx: mpsc::Sender<GenericIrcSessionCommand>,
     eventsub_tx: mpsc::Sender<EventSubCommand>,
+    eventsub_evt_tx_for_backfill: mpsc::Sender<EventSubEvent>,
     live_feed_tx: mpsc::Sender<runtime::live_feed::LiveFeedCommand>,
+    hype_train_poller_tx: mpsc::Sender<runtime::hype_train_poller::HypeTrainPollerCommand>,
+    channel_points_tx: mpsc::Sender<runtime::channel_points_claimer::ChannelPointsClaimerCommand>,
+    webview_handle: crust_webview::WebviewHandle,
+    mut webview_evt_rx: mpsc::Receiver<crust_webview::WebviewEvent>,
     authed_helix: std::sync::Arc<crust_twitch::helix::AuthedHelix>,
     emote_index: EmoteIndex,
     emote_cache: Option<EmoteCache>,
@@ -713,6 +810,24 @@ async fn reducer_loop(
     let mut channel_room_ids: std::collections::HashMap<ChannelId, String> =
         std::collections::HashMap::new();
     let mut channel_mod_status: HashMap<ChannelId, bool> = HashMap::new();
+    // Cache of Shared Chat source-channel metadata keyed by Twitch room-id.
+    // Populated by the channel_room_ids inverse lookup (when the source
+    // channel is also an open tab) and by background Helix users?id=<id>
+    // lookups for out-of-tab source channels. Keeps us from hammering Helix
+    // for every mirrored message from the same source. Wrapped in an
+    // Arc<Mutex<_>> because the Helix fetch runs in a detached tokio task
+    // that writes the result back into the cache before emitting
+    // `AppEvent::SharedChannelResolved`.
+    let shared_channel_cache: Arc<std::sync::Mutex<
+        HashMap<String, (String, String, Option<String>)>,
+    >> = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let mut shared_channel_pending: HashSet<String> = HashSet::new();
+    // Throttle per-channel Shared Chat session refreshes: we hit Helix once
+    // on join, again when a shared PRIVMSG arrives past the debounce
+    // window, and on a low-frequency background ticker while the tab is
+    // open. Keyed by `ChannelId`.
+    let mut shared_session_last_fetch: HashMap<ChannelId, Instant> = HashMap::new();
+    const SHARED_SESSION_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
     // Per-channel cache of the logged-in user's badges + color (from USERSTATE).
     let mut self_badges: HashMap<ChannelId, Vec<Badge>> = HashMap::new();
@@ -809,6 +924,18 @@ async fn reducer_loop(
     // Consume the immediate first tick so periodic checks happen 24h after startup.
     update_check_interval.tick().await;
 
+    // Periodic tick used to republish the joined-Twitch-channels list to the
+    // hype-train poller.  Republishing is idempotent and dirt cheap, so a
+    // short interval lets us skip the churn of wiring every join/leave site
+    // to the poller directly.
+    let mut hype_channels_tick =
+        tokio::time::interval(std::time::Duration::from_secs(5));
+    hype_channels_tick
+        .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Consume the immediate first tick so we don't fire before startup
+    // auto-join populates `joined_channels`.
+    hype_channels_tick.tick().await;
+
     /// Persist the current `joined_channels` set back to disk.
     fn save_channels(
         store: &Option<SettingsStore>,
@@ -848,7 +975,7 @@ async fn reducer_loop(
     // Connected events arriving before validation completes don't trigger
     // premature channel rejoins.
     if let Some(token) = saved_token {
-        info!("Found saved token, spawning background validation…");
+        info!("Found saved token, spawning background validation...");
         auth_in_progress = true;
         let tx = token_val_tx.clone();
         tokio::spawn(async move {
@@ -959,15 +1086,30 @@ async fn reducer_loop(
             tabs_font_size: settings.tabs_font_size,
             timestamps_font_size: settings.timestamps_font_size,
             pills_font_size: settings.pills_font_size,
+            popups_font_size: settings.popups_font_size,
+            chips_font_size: settings.chips_font_size,
+            usercard_font_size: settings.usercard_font_size,
+            dialog_font_size: settings.dialog_font_size,
         })
         .await;
-    if !settings.last_active_channel.is_empty() {
-        let _ = evt_tx
-            .send(AppEvent::RestoreLastActiveChannel {
-                channel: settings.last_active_channel.clone(),
-            })
-            .await;
-    }
+    // Always send a restore event so the UI can rebuild channel order /
+    // split panes / whispers state, even when no last-active channel was
+    // recorded.
+    let split_panes_pairs: Vec<(String, f32)> = settings
+        .split_panes
+        .iter()
+        .map(|p| (p.channel.clone(), p.frac))
+        .collect();
+    let _ = evt_tx
+        .send(AppEvent::RestoreLastActiveChannel {
+            channel: settings.last_active_channel.clone(),
+            channel_order: settings.channel_order.clone(),
+            split_panes: split_panes_pairs,
+            split_panes_focused: settings.split_panes_focused,
+            whispers_visible: settings.whispers_panel_visible,
+            last_whisper_login: settings.last_whisper_login.clone(),
+        })
+        .await;
     let _ = evt_tx
         .send(AppEvent::UpdaterSettingsUpdated {
             update_checks_enabled: settings.update_checks_enabled,
@@ -1037,6 +1179,12 @@ async fn reducer_loop(
     let _ = evt_tx
         .send(AppEvent::UsercardSettingsUpdated {
             show_pronouns: settings.show_pronouns_in_usercard,
+        })
+        .await;
+
+    let _ = evt_tx
+        .send(AppEvent::AutoClaimBonusPointsUpdated {
+            enabled: settings.auto_claim_bonus_points,
         })
         .await;
 
@@ -1132,6 +1280,62 @@ async fn reducer_loop(
                     update_check_inflight = true;
                     spawn_update_check(UpdateCheckTrigger::Interval, update_check_tx.clone());
                 }
+            }
+
+            // Keep the hype-train poller's channel list in sync with the
+            // reducer's joined-channels set.  The poller itself handles the
+            // per-channel polling interval; here we just announce the
+            // current Twitch-only subset.
+            _ = hype_channels_tick.tick() => {
+                let twitch_channels: Vec<(ChannelId, String)> = joined_channels
+                    .iter()
+                    .map(|s| ChannelId(s.clone()))
+                    .filter(|id| id.is_twitch())
+                    .map(|id| {
+                        let name = id.display_name().to_owned();
+                        (id, name)
+                    })
+                    .collect();
+                let _ = hype_train_poller_tx
+                    .try_send(
+                        runtime::hype_train_poller::HypeTrainPollerCommand::SetChannels(
+                            twitch_channels.clone(),
+                        ),
+                    );
+                let _ = channel_points_tx.try_send(
+                    runtime::channel_points_claimer::ChannelPointsClaimerCommand::SetChannels(
+                        twitch_channels,
+                    ),
+                );
+                // Republish the session-token auth here too - idempotent on
+                // the claimer side, and saves us from wiring every
+                // login/logout site individually.
+                // gql.twitch.tv requires the web session "auth-token"
+                // cookie, NOT the chat IRC OAuth token (different scope set;
+                // Twitch returns 401 Unauthorized for the IRC token here).
+                // We reuse the same field Streamlink uses.
+                let _ = channel_points_tx.try_send(
+                    runtime::channel_points_claimer::ChannelPointsClaimerCommand::SetAuth(
+                        settings.external_tools.streamlink_session_token.clone(),
+                    ),
+                );
+                // Republish webview master toggle + active channel. The UI
+                // only sends SetLastActiveChannel on a *change*, so if the
+                // user restores to the same channel across launches we'd
+                // never tell the webview which channel is active.
+                // Republishing here is idempotent on the receiver side and
+                // cheap.
+                webview_handle.send(crust_webview::WebviewCommand::SetEnabled(
+                    settings.auto_claim_bonus_points,
+                ));
+                let active_for_webview = parse_saved_channel(
+                    settings.last_active_channel.as_str(),
+                )
+                .filter(|id| id.is_twitch())
+                .map(|id| id.display_name().to_ascii_lowercase());
+                webview_handle.send(
+                    crust_webview::WebviewCommand::SetActiveChannel(active_for_webview),
+                );
             }
 
             // Twitch IRC event
@@ -1271,6 +1475,34 @@ async fn reducer_loop(
                         tokio::spawn(async move {
                             fetch_current_twitch_pinned_message(ch_pin, etx_pin).await;
                         });
+                        // Kick off an initial Shared Chat session probe. This
+                        // is a no-op (emits SessionUpdated{None}) for channels
+                        // that aren't in a shared-chat session right now.
+                        if let (Some(cid), true) = (
+                            helix_client_id.as_deref(),
+                            !settings.oauth_token.trim().is_empty(),
+                        ) {
+                            let bare = settings
+                                .oauth_token
+                                .strip_prefix("oauth:")
+                                .unwrap_or(settings.oauth_token.as_str())
+                                .to_owned();
+                            let ch_sc = channel.clone();
+                            let bid = channel_room_ids
+                                .get(&channel)
+                                .cloned()
+                                .unwrap_or_default();
+                            let cid_owned = cid.to_owned();
+                            let etx_sc = evt_tx.clone();
+                            if !bid.is_empty() {
+                                tokio::spawn(async move {
+                                    fetch_shared_chat_session(
+                                        ch_sc, bid, bare, cid_owned, etx_sc,
+                                    )
+                                    .await;
+                                });
+                            }
+                        }
                     }
                     TwitchEvent::Authenticated { username, user_id } => {
                         // If we got here because of an explicit Authenticate
@@ -1393,6 +1625,111 @@ async fn reducer_loop(
                         if compiled_ignored_users.is_ignored(&msg.sender.login) {
                             continue;
                         }
+                        // Shared Chat: if this message is mirrored from a
+                        // channel the user also has open, suppress
+                        // notifications (toast/sound/mentions feed) so the
+                        // source-channel delivery of the same line stays the
+                        // single source of truth. Chatterino mirrors this via
+                        // `MessageFlag::DoNotTriggerNotification`. Also resolve
+                        // source-channel login + profile picture so the UI can
+                        // paint the shared-message badge exactly like
+                        // Chatterino's `makeSharedChatBadge`.
+                        if let Some(shared) = msg.shared.as_mut() {
+                            let source_open = channel_room_ids
+                                .values()
+                                .any(|rid| rid == &shared.room_id);
+                            if source_open {
+                                msg.flags.suppress_notification = true;
+                            }
+                            if let Some((ch_id, _)) = channel_room_ids
+                                .iter()
+                                .find(|(_, rid)| *rid == &shared.room_id)
+                            {
+                                if shared.login.is_none() {
+                                    shared.login = Some(ch_id.display_name().to_owned());
+                                }
+                                if shared.display_name.is_none() {
+                                    shared.display_name = Some(ch_id.display_name().to_owned());
+                                }
+                            }
+                            let cached = shared_channel_cache
+                                .lock()
+                                .ok()
+                                .and_then(|g| g.get(&shared.room_id).cloned());
+                            if let Some((login, display, profile_url)) = cached {
+                                if shared.login.is_none() {
+                                    shared.login = Some(login);
+                                }
+                                if shared.display_name.is_none() {
+                                    shared.display_name = Some(display);
+                                }
+                                if shared.profile_url.is_none() {
+                                    shared.profile_url = profile_url;
+                                }
+                            } else if !shared_channel_pending.contains(&shared.room_id) {
+                                shared_channel_pending.insert(shared.room_id.clone());
+                                let room_id = shared.room_id.clone();
+                                let tx = evt_tx.clone();
+                                let bare = (!settings.oauth_token.trim().is_empty()).then(|| {
+                                    settings
+                                        .oauth_token
+                                        .strip_prefix("oauth:")
+                                        .unwrap_or(settings.oauth_token.as_str())
+                                        .to_owned()
+                                });
+                                let cid = helix_client_id.clone();
+                                let cache = shared_channel_cache.clone();
+                                tokio::spawn(async move {
+                                    fetch_shared_channel_profile(
+                                        room_id,
+                                        bare.as_deref(),
+                                        cid.as_deref(),
+                                        cache,
+                                        tx,
+                                    )
+                                    .await;
+                                });
+                            }
+
+                            // Refresh the receiving channel's Shared Chat
+                            // session snapshot (participants + viewer totals)
+                            // when a mirrored line arrives, throttled to at
+                            // most once per SHARED_SESSION_MIN_INTERVAL so
+                            // busy chats don't hammer Helix.
+                            if let (Some(cid), Some(broadcaster_id)) = (
+                                helix_client_id.as_deref(),
+                                channel_room_ids.get(&msg.channel).cloned(),
+                            ) {
+                                if !settings.oauth_token.trim().is_empty() {
+                                    let stale = shared_session_last_fetch
+                                        .get(&msg.channel)
+                                        .map(|t| t.elapsed() >= SHARED_SESSION_MIN_INTERVAL)
+                                        .unwrap_or(true);
+                                    if stale {
+                                        shared_session_last_fetch
+                                            .insert(msg.channel.clone(), Instant::now());
+                                        let bare = settings
+                                            .oauth_token
+                                            .strip_prefix("oauth:")
+                                            .unwrap_or(settings.oauth_token.as_str())
+                                            .to_owned();
+                                        let ch_sc = msg.channel.clone();
+                                        let cid_owned = cid.to_owned();
+                                        let etx_sc = evt_tx.clone();
+                                        tokio::spawn(async move {
+                                            fetch_shared_chat_session(
+                                                ch_sc,
+                                                broadcaster_id,
+                                                bare,
+                                                cid_owned,
+                                                etx_sc,
+                                            )
+                                            .await;
+                                        });
+                                    }
+                                }
+                            }
+                        }
                         // Apply ignored-phrase actions *before* tokenization so
                         // that a Replace rule's output text goes through normal
                         // emote/URL/mention detection.  A Block rule drops the
@@ -1436,11 +1773,30 @@ async fn reducer_loop(
                             );
                         }
 
-                        // Resolve badge image URLs
+                        // Resolve badge image URLs for both the user's own
+                        // badges (scoped to the receiving channel) and the
+                        // Shared Chat source channel's mod/vip badges (scoped
+                        // to the source channel when it is open locally,
+                        // otherwise falling back to the global set).
                         {
                             let bm = badge_map.read().unwrap();
                             for badge in &mut msg.sender.badges {
                                 badge.url = resolve_badge_url(&bm, &msg.channel.0, &badge.name, &badge.version);
+                            }
+                            if let Some(shared) = msg.shared.as_mut() {
+                                let source_scope: String = channel_room_ids
+                                    .iter()
+                                    .find(|(_, rid)| *rid == &shared.room_id)
+                                    .map(|(ch, _)| ch.0.clone())
+                                    .unwrap_or_default();
+                                for badge in &mut shared.badges {
+                                    badge.url = resolve_badge_url(
+                                        &bm,
+                                        source_scope.as_str(),
+                                        &badge.name,
+                                        &badge.version,
+                                    );
+                                }
                             }
                         }
 
@@ -1540,7 +1896,13 @@ async fn reducer_loop(
                                 }
                             }
                         }
-                        // Queue badge image fetches
+                        // Queue badge image fetches for the user's own
+                        // badges plus any Shared Chat source-channel badges.
+                        let shared_badge_urls: Vec<String> = msg
+                            .shared
+                            .as_ref()
+                            .map(|s| s.badges.iter().filter_map(|b| b.url.clone()).collect())
+                            .unwrap_or_default();
                         for badge in &msg.sender.badges {
                             if let Some(url) = &badge.url {
                                 if !pending_images.contains(url) {
@@ -1552,6 +1914,16 @@ async fn reducer_loop(
                                         fetch_emote_image(&url, &cache, &evt_tx).await;
                                     });
                                 }
+                            }
+                        }
+                        for url in shared_badge_urls {
+                            if !pending_images.contains(&url) {
+                                pending_images.insert(url.clone());
+                                let evt_tx = evt_tx.clone();
+                                let cache = emote_cache.clone();
+                                tokio::spawn(async move {
+                                    fetch_emote_image(&url, &cache, &evt_tx).await;
+                                });
                             }
                         }
 
@@ -1709,16 +2081,26 @@ async fn reducer_loop(
                             message: msg,
                         }).await;
                     }
-                    TwitchEvent::Raid { channel, display_name, viewer_count } => {
+                    TwitchEvent::Raid { channel, display_name, viewer_count, source_login } => {
                         let text = format!("{display_name} is raiding with {viewer_count} viewers!");
                         let msg = make_system_message(
                             local_msg_id, channel.clone(), text, Utc::now(),
-                            MsgKind::Raid { display_name, viewer_count },
+                            MsgKind::Raid {
+                                display_name: display_name.clone(),
+                                viewer_count,
+                                source_login: source_login.clone(),
+                            },
                         );
                         local_msg_id += 1;
                         let _ = evt_tx.send(AppEvent::MessageReceived {
-                            channel,
+                            channel: channel.clone(),
                             message: msg,
+                        }).await;
+                        let _ = evt_tx.send(AppEvent::RaidBannerShown {
+                            channel,
+                            display_name,
+                            viewer_count,
+                            source_login,
                         }).await;
                     }
                     TwitchEvent::UserStateUpdated { channel, is_mod, mut badges, color } => {
@@ -2028,7 +2410,7 @@ async fn reducer_loop(
                         new_channel,
                     } => {
                         info!(
-                            "IRC channel redirect: #{old_channel} → #{new_channel} on {host}:{port}"
+                            "IRC channel redirect: #{old_channel} -> #{new_channel} on {host}:{port}"
                         );
                         let old_id = ChannelId::irc(&host, port, tls, &old_channel);
                         let new_id = ChannelId::irc(&host, port, tls, &new_channel);
@@ -2038,7 +2420,7 @@ async fn reducer_loop(
                         joined_channels.insert(new_id.as_str().to_lowercase());
                         save_channels(&settings_store, &mut settings, &joined_channels);
 
-                        // Tell UI to seamlessly replace old tab with new one
+                        // Tell UI to replace old tab with new one
                         let _ = evt_tx
                             .send(AppEvent::ChannelRedirected {
                                 old_channel: old_id.clone(),
@@ -2173,28 +2555,24 @@ async fn reducer_loop(
                     EventSubEvent::Reconnecting { attempt } => {
                         debug!("EventSub reconnect attempt {attempt}");
                     }
-                    EventSubEvent::BackfillRequested => {
-                        // Refresh per-channel profile snapshots after reconnect so
-                        // online/offline title/game UI catches up immediately.
-                        let twitch_channels: Vec<String> = channel_room_ids
-                            .keys()
-                            .filter(|ch| ch.is_twitch())
-                            .map(|ch| ch.display_name().to_owned())
-                            .collect();
-                        for login in twitch_channels {
-                            let etx = evt_tx.clone();
-                            let token = settings.oauth_token.clone();
-                            let client_id = helix_client_id.clone();
-                            tokio::spawn(async move {
-                                fetch_twitch_user_profile(
-                                    &login,
-                                    Some(token.as_str()),
-                                    client_id.as_deref(),
-                                    etx,
-                                )
-                                .await;
-                            });
-                        }
+                    EventSubEvent::Backfill(plan) => {
+                        // Fan out Helix refreshes for stream status, unban queue,
+                        // active poll, active prediction, and latest hype train.
+                        // Synthetic notices produced by the runner are routed back
+                        // through `eventsub_evt_tx_for_backfill` so they pick up
+                        // this loop's 45s `should_drop_duplicate_eventsub_notice`
+                        // window when the websocket replays the same event id.
+                        let ctx = runtime::eventsub_backfill::BackfillContext {
+                            evt_tx: evt_tx.clone(),
+                            eventsub_evt_tx: eventsub_evt_tx_for_backfill.clone(),
+                            helix: authed_helix.clone() as Arc<dyn crust_twitch::helix::HelixApi>,
+                            oauth_token: settings.oauth_token.clone(),
+                            helix_client_id: helix_client_id.clone(),
+                            auth_user_id: auth_user_id.clone(),
+                            channel_room_ids: channel_room_ids.clone(),
+                            channel_mod_status: channel_mod_status.clone(),
+                        };
+                        runtime::eventsub_backfill::run_backfill(plan, ctx);
                     }
                     EventSubEvent::Notice(notice) => {
                         if let Some(event_id) = notice.event_id.as_deref() {
@@ -2409,6 +2787,7 @@ async fn reducer_loop(
                                     }
                                 }
                                 EventSubNoticeKind::SuspiciousUserMessage {
+                                    user_id,
                                     user_login,
                                     user_name,
                                     low_trust_status,
@@ -2434,6 +2813,8 @@ async fn reducer_loop(
                                             .send(AppEvent::LowTrustStatusUpdated {
                                                 channel: channel.clone(),
                                                 login: user_login.to_ascii_lowercase(),
+                                                user_id: user_id.clone(),
+                                                display_name: user_name.clone(),
                                                 status: Some(s),
                                             })
                                             .await;
@@ -2507,6 +2888,7 @@ async fn reducer_loop(
                                     }
                                 }
                                 EventSubNoticeKind::SuspiciousUserUpdate {
+                                    user_id,
                                     moderator_user_id,
                                     moderator_login,
                                     moderator_name,
@@ -2532,6 +2914,8 @@ async fn reducer_loop(
                                             .send(AppEvent::LowTrustStatusUpdated {
                                                 channel: channel.clone(),
                                                 login: user_login.to_ascii_lowercase(),
+                                                user_id: user_id.clone(),
+                                                display_name: user_name.clone(),
                                                 status: s,
                                             })
                                             .await;
@@ -2666,6 +3050,53 @@ async fn reducer_loop(
                                             }
                                         }
                                     }
+                                }
+                                EventSubNoticeKind::Raid {
+                                    from_login,
+                                    viewers,
+                                } => {
+                                    // EventSub `channel.raid` fires when a
+                                    // broadcaster/mod-scoped subscription is
+                                    // live; IRC USERNOTICE already triggers
+                                    // the banner for viewers, so this branch
+                                    // just covers the EventSub-only path.
+                                    let _ = evt_tx
+                                        .send(AppEvent::RaidBannerShown {
+                                            channel: channel.clone(),
+                                            display_name: from_login.clone(),
+                                            viewer_count: *viewers,
+                                            source_login: Some(
+                                                from_login.to_ascii_lowercase(),
+                                            ),
+                                        })
+                                        .await;
+                                }
+                                EventSubNoticeKind::HypeTrainLifecycle {
+                                    phase,
+                                    level,
+                                    progress,
+                                    goal,
+                                    total,
+                                    top_contribution_login,
+                                    top_contribution_type,
+                                    top_contribution_total,
+                                    ends_at,
+                                    ..
+                                } => {
+                                    let _ = evt_tx
+                                        .send(AppEvent::HypeTrainUpdated {
+                                            channel: channel.clone(),
+                                            phase: phase.clone(),
+                                            level: *level,
+                                            progress: *progress,
+                                            goal: *goal,
+                                            total: *total,
+                                            top_contributor_login: top_contribution_login.clone(),
+                                            top_contributor_type: top_contribution_type.clone(),
+                                            top_contributor_total: *top_contribution_total,
+                                            ends_at: ends_at.clone(),
+                                        })
+                                        .await;
                                 }
                                 EventSubNoticeKind::StreamOnline
                                 | EventSubNoticeKind::StreamOffline => {
@@ -3031,7 +3462,7 @@ async fn reducer_loop(
                         }
                     }
                     AppCommand::Login { token } => {
-                        info!("Login requested, spawning background validation…");
+                        info!("Login requested, spawning background validation...");
                         let tx = token_val_tx.clone();
                         tokio::spawn(async move {
                             let result = validate_token(&token).await;
@@ -3067,7 +3498,7 @@ async fn reducer_loop(
                         }).await;
                     }
                     AppCommand::AddAccount { token } => {
-                        info!("AddAccount requested, spawning background validation…");
+                        info!("AddAccount requested, spawning background validation...");
                         let tx = token_val_tx.clone();
                         tokio::spawn(async move {
                             let result = validate_token(&token).await;
@@ -3174,7 +3605,7 @@ async fn reducer_loop(
                         }).await;
                     }
                     AppCommand::SetDefaultAccount { username } => {
-                        info!("SetDefaultAccount → {}", if username.is_empty() { "(none)" } else { &username });
+                        info!("SetDefaultAccount -> {}", if username.is_empty() { "(none)" } else { &username });
                         settings.default_account = username.clone();
                         if let Some(store) = &settings_store {
                             let _ = store.save(&settings);
@@ -3284,6 +3715,10 @@ async fn reducer_loop(
                         tabs_font_size,
                         timestamps_font_size,
                         pills_font_size,
+                        popups_font_size,
+                        chips_font_size,
+                        usercard_font_size,
+                        dialog_font_size,
                     } => {
                         let chat = if chat_font_size.is_finite() {
                             chat_font_size.clamp(8.0, 32.0)
@@ -3308,12 +3743,20 @@ async fn reducer_loop(
                         let tabs = clamp_section(tabs_font_size);
                         let timestamps = clamp_section(timestamps_font_size);
                         let pills = clamp_section(pills_font_size);
+                        let popups = clamp_section(popups_font_size);
+                        let chips = clamp_section(chips_font_size);
+                        let usercard = clamp_section(usercard_font_size);
+                        let dialog = clamp_section(dialog_font_size);
                         settings.font_size = chat;
                         settings.ui_font_size = ui;
                         settings.topbar_font_size = topbar;
                         settings.tabs_font_size = tabs;
                         settings.timestamps_font_size = timestamps;
                         settings.pills_font_size = pills;
+                        settings.popups_font_size = popups;
+                        settings.chips_font_size = chips;
+                        settings.usercard_font_size = usercard;
+                        settings.dialog_font_size = dialog;
                         if let Some(store) = &settings_store {
                             if let Err(e) = store.save(&settings) {
                                 warn!("Failed to save font size settings: {e}");
@@ -3327,14 +3770,85 @@ async fn reducer_loop(
                                 tabs_font_size: tabs,
                                 timestamps_font_size: timestamps,
                                 pills_font_size: pills,
+                                popups_font_size: popups,
+                                chips_font_size: chips,
+                                usercard_font_size: usercard,
+                                dialog_font_size: dialog,
                             })
                             .await;
                     }
                     AppCommand::SetLastActiveChannel { channel } => {
-                        settings.last_active_channel = channel;
+                        settings.last_active_channel = channel.clone();
                         if let Some(store) = &settings_store {
                             if let Err(e) = store.save(&settings) {
                                 warn!("Failed to save last active channel: {e}");
+                            }
+                        }
+                    }
+                    AppCommand::SetWindowGeometry { pos, size, maximized } => {
+                        if settings.window_pos == pos
+                            && settings.window_size == size
+                            && settings.window_maximized == maximized
+                        {
+                            // No-op, avoid unnecessary disk writes.
+                        } else {
+                            settings.window_pos = pos;
+                            settings.window_size = size;
+                            settings.window_maximized = maximized;
+                            if let Some(store) = &settings_store {
+                                if let Err(e) = store.save(&settings) {
+                                    warn!("Failed to save window geometry: {e}");
+                                }
+                            }
+                        }
+                    }
+                    AppCommand::SetWhispersPanel { visible, active_login } => {
+                        if settings.whispers_panel_visible != visible
+                            || settings.last_whisper_login != active_login
+                        {
+                            settings.whispers_panel_visible = visible;
+                            settings.last_whisper_login = active_login;
+                            if let Some(store) = &settings_store {
+                                if let Err(e) = store.save(&settings) {
+                                    warn!("Failed to save whispers panel state: {e}");
+                                }
+                            }
+                        }
+                    }
+                    AppCommand::SetChannelOrder { order } => {
+                        if settings.channel_order != order {
+                            settings.channel_order = order;
+                            if let Some(store) = &settings_store {
+                                if let Err(e) = store.save(&settings) {
+                                    warn!("Failed to save channel order: {e}");
+                                }
+                            }
+                        }
+                    }
+                    AppCommand::SetSplitPanes { panes, focused } => {
+                        let mapped: Vec<crust_storage::settings::PersistedPane> = panes
+                            .into_iter()
+                            .map(|(channel, frac)| crust_storage::settings::PersistedPane {
+                                channel,
+                                frac,
+                            })
+                            .collect();
+                        let changed = settings.split_panes_focused != focused
+                            || settings.split_panes.len() != mapped.len()
+                            || settings
+                                .split_panes
+                                .iter()
+                                .zip(mapped.iter())
+                                .any(|(a, b)| {
+                                    a.channel != b.channel || (a.frac - b.frac).abs() > 0.001
+                                });
+                        if changed {
+                            settings.split_panes = mapped;
+                            settings.split_panes_focused = focused;
+                            if let Some(store) = &settings_store {
+                                if let Err(e) = store.save(&settings) {
+                                    warn!("Failed to save split panes: {e}");
+                                }
                             }
                         }
                     }
@@ -4162,9 +4676,11 @@ async fn reducer_loop(
                                     is_mention: false,
                                     custom_reward_id: None,
                                     is_history: false,
+                                    suppress_notification: false,
                                 },
                                 reply: reply.clone(),
                                 msg_kind: MsgKind::Chat,
+                                shared: None,
                             };
 
                             if let Some(style) = stv_user_styles_resolved.get(uid) {
@@ -4219,8 +4735,8 @@ async fn reducer_loop(
                         }
 
                         // Local echo for generic IRC channels (servers may not echo PRIVMSG).
-                        // Handles plain text → echo to current channel, and
-                        // /msg or /privmsg #chan text → echo body to target channel.
+                        // Handles plain text -> echo to current channel, and
+                        // /msg or /privmsg #chan text -> echo body to target channel.
                         // Also works from the server tab for /msg and /privmsg.
                         if channel.is_irc() {
                             let irc_echo = if channel.is_irc_server_tab() {
@@ -4265,9 +4781,11 @@ async fn reducer_loop(
                                         is_mention: false,
                                         custom_reward_id: None,
                                         is_history: false,
+                                        suppress_notification: false,
                                     },
                                     reply: None,
                                     msg_kind: MsgKind::Chat,
+                                    shared: None,
                                 };
 
                                 {
@@ -4443,6 +4961,17 @@ async fn reducer_loop(
                             .send(AppEvent::UsercardSettingsUpdated {
                                 show_pronouns: enabled,
                             })
+                            .await;
+                    }
+                    AppCommand::SetAutoClaimBonusPoints { enabled } => {
+                        settings.auto_claim_bonus_points = enabled;
+                        if let Some(store) = &settings_store {
+                            if let Err(e) = store.save(&settings) {
+                                warn!("Failed to save auto-claim toggle: {e}");
+                            }
+                        }
+                        let _ = evt_tx
+                            .send(AppEvent::AutoClaimBonusPointsUpdated { enabled })
                             .await;
                     }
                     AppCommand::FetchStreamStatus { login } => {
@@ -5143,6 +5672,23 @@ async fn reducer_loop(
                             .await;
                         });
                     }
+                    AppCommand::FetchUserCardFollowAge { channel, login } => {
+                        let broadcaster_id = channel_room_ids.get(&channel).cloned();
+                        let token = settings.oauth_token.clone();
+                        let client_id = helix_client_id.clone();
+                        let evt_tx2 = evt_tx.clone();
+                        tokio::spawn(async move {
+                            helix_fetch_follow_age_silent(
+                                &token,
+                                client_id.as_deref(),
+                                broadcaster_id.as_deref(),
+                                &login,
+                                &channel,
+                                evt_tx2,
+                            )
+                            .await;
+                        });
+                    }
                     AppCommand::FetchAccountAge { channel, user } => {
                         let token = settings.oauth_token.clone();
                         let client_id = helix_client_id.clone();
@@ -5212,7 +5758,7 @@ async fn reducer_loop(
                         let _ = etx.send(AppEvent::UploadStarted { channel: ch.clone() }).await;
                         let _ = etx.send(AppEvent::SystemNotice(crust_core::model::SystemNotice {
                             channel: Some(ch.clone()),
-                            text: "Uploading image…".to_owned(),
+                            text: "Uploading image...".to_owned(),
                             timestamp: Utc::now(),
                         })).await;
                         tokio::spawn(async move {
@@ -5357,6 +5903,9 @@ async fn reducer_loop(
                             .send(runtime::live_feed::LiveFeedCommand::ForceRefresh)
                             .await;
                     }
+                    AppCommand::OpenTwitchSignIn => {
+                        webview_handle.send(crust_webview::WebviewCommand::OpenLoginWindow);
+                    }
                 }
             }
 
@@ -5373,6 +5922,39 @@ async fn reducer_loop(
                     }
                 };
                 let _ = evt_tx.send(app_evt).await;
+            }
+
+            Some(evt) = webview_evt_rx.recv() => {
+                match evt {
+                    crust_webview::WebviewEvent::LoginStateChanged(state) => {
+                        use crust_webview::LoginState;
+                        info!("webview: login state changed to {state:?}");
+                        let logged_in = match state {
+                            LoginState::LoggedIn => Some(true),
+                            LoginState::LoggedOut => Some(false),
+                            LoginState::Unknown => None,
+                        };
+                        let _ = evt_tx
+                            .send(AppEvent::TwitchWebviewLoginState { logged_in })
+                            .await;
+                    }
+                    crust_webview::WebviewEvent::BonusClaimed => {
+                        let ch = parse_saved_channel(&settings.last_active_channel)
+                            .filter(|id| id.is_twitch());
+                        info!("webview: bonus claimed on {ch:?}");
+                        if let Some(channel) = ch {
+                            let _ = evt_tx
+                                .send(AppEvent::TwitchWebviewBonusClaimed { channel })
+                                .await;
+                        }
+                    }
+                    crust_webview::WebviewEvent::BalanceObserved(value) => {
+                        info!("webview: balance observed value={value}");
+                    }
+                    crust_webview::WebviewEvent::ScriptError { location, message } => {
+                        info!("webview: script error [{location}]: {message}");
+                    }
+                }
             }
 
             Some(update_result) = update_check_rx.recv() => {
@@ -5872,7 +6454,7 @@ fn kick_inline_emote_url(id: &str) -> String {
 
 /// Call `POST /helix/moderation/bans` to timeout or permanently ban a user.
 ///
-/// `duration_secs` = `None` → permanent ban; `Some(n)` → timeout for `n` seconds.
+/// `duration_secs` = `None` -> permanent ban; `Some(n)` -> timeout for `n` seconds.
 async fn helix_delete_message(
     token: &str,
     client_id: Option<&str>,
@@ -6594,7 +7176,7 @@ async fn helix_resolve_automod_message(
 
 /// Fetch pending unban requests via
 /// `GET /helix/moderation/unban_requests`.
-async fn helix_fetch_unban_requests(
+pub(crate) async fn helix_fetch_unban_requests(
     token: &str,
     client_id: Option<&str>,
     broadcaster_id: Option<&str>,
@@ -7151,9 +7733,11 @@ fn persist_whisper_message(
             is_mention: false,
             custom_reward_id: None,
             is_history: false,
+            suppress_notification: false,
         },
         reply: None,
         msg_kind: MsgKind::Chat,
+        shared: None,
     };
 
     log_store.append_message(&msg)
@@ -8565,7 +9149,7 @@ enum ValidateError {
     /// The Twitch API explicitly rejected the token (HTTP 401 / 403).
     /// The token should be deleted from storage.
     Unauthorized,
-    /// A transient problem (network error, server 5xx, parse failure, …).
+    /// A transient problem (network error, server 5xx, parse failure, ...).
     /// The token should be kept so it can be retried next launch.
     Transient(String),
 }
@@ -9081,10 +9665,10 @@ async fn helix_update_channel_info(
     if status.is_success() {
         let mut parts: Vec<String> = Vec::new();
         if let Some(t) = title {
-            parts.push(format!("title → \"{t}\""));
+            parts.push(format!("title -> \"{t}\""));
         }
         if let Some(g) = game_name {
-            parts.push(format!("category → \"{g}\""));
+            parts.push(format!("category -> \"{g}\""));
         }
         let summary = if parts.is_empty() {
             "Channel info updated.".to_owned()
@@ -9212,6 +9796,69 @@ async fn helix_fetch_follow_age(
         },
     };
     emit_helix_system_info(evt_tx, channel, text).await;
+}
+
+/// Silent variant of [`helix_fetch_follow_age`] used by the user-card popup.
+/// Emits [`AppEvent::UserCardFollowAgeLoaded`] on success or miss; emits no
+/// event on hard failure (the popup will simply not show a follow row).
+async fn helix_fetch_follow_age_silent(
+    token: &str,
+    client_id: Option<&str>,
+    broadcaster_id: Option<&str>,
+    user_login: &str,
+    channel: &ChannelId,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let Ok((cid, bid)) = require_helix_context(client_id, broadcaster_id) else {
+        return;
+    };
+
+    let bare = token.strip_prefix("oauth:").unwrap_or(token);
+    if bare.trim().is_empty() {
+        return;
+    }
+    let Ok(user_id) = helix_user_id_by_login(bare, cid, user_login).await else {
+        return;
+    };
+
+    let url = format!(
+        "https://api.twitch.tv/helix/channels/followers?broadcaster_id={bid}&user_id={user_id}"
+    );
+
+    #[derive(serde::Deserialize)]
+    struct FollowerItem {
+        followed_at: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct FollowersResponse {
+        data: Vec<FollowerItem>,
+    }
+
+    let client = reqwest::Client::new();
+    let Ok(resp) = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {bare}"))
+        .header("Client-Id", cid)
+        .send()
+        .await
+    else {
+        return;
+    };
+    if !resp.status().is_success() {
+        return;
+    }
+    let Ok(parsed) = resp.json::<FollowersResponse>().await else {
+        return;
+    };
+
+    let followed_at = parsed.data.into_iter().next().map(|i| i.followed_at);
+    let _ = evt_tx
+        .send(AppEvent::UserCardFollowAgeLoaded {
+            channel: channel.clone(),
+            login: user_login.to_owned(),
+            followed_at,
+        })
+        .await;
 }
 
 /// Call `GET /helix/users` to report the account age for `user_login`.
@@ -9556,6 +10203,69 @@ mod tests {
                 user_login: "viewer".to_owned(),
                 text: Some("please unban".to_owned()),
                 created_at: Some("2026-03-31T19:35:00Z".to_owned()),
+            }
+        ));
+    }
+
+    #[test]
+    fn eventsub_notice_emission_suppresses_subscribe_and_gift_overlap_with_irc_usernotice() {
+        // IRC USERNOTICE already renders styled `MsgKind::Sub` cards for
+        // subs/resubs/gifts on the broadcaster's own channel (the only place
+        // these EventSub topics fire). Emitting the EventSub copy would
+        // double-render the line as a plain SystemInfo and amplify gift
+        // storms beyond what IRC's `submysterygift` collapse produces.
+        assert!(!should_emit_eventsub_notice_message(
+            &EventSubNoticeKind::Subscribe {
+                user_login: "viewer".to_owned(),
+                tier: "Tier 1".to_owned(),
+                is_gift: false,
+            }
+        ));
+        assert!(!should_emit_eventsub_notice_message(
+            &EventSubNoticeKind::Subscribe {
+                user_login: "recipient".to_owned(),
+                tier: "Tier 1".to_owned(),
+                is_gift: true,
+            }
+        ));
+        assert!(!should_emit_eventsub_notice_message(
+            &EventSubNoticeKind::SubscriptionGift {
+                gifter_login: Some("gifter".to_owned()),
+                tier: "Tier 1".to_owned(),
+                total: Some(5),
+            }
+        ));
+    }
+
+    #[test]
+    fn eventsub_notice_emission_keeps_follow_raid_and_redemption() {
+        // Follow has no IRC equivalent; EventSub is the only delivery path.
+        assert!(should_emit_eventsub_notice_message(
+            &EventSubNoticeKind::Follow {
+                user_login: "new_follower".to_owned(),
+            }
+        ));
+        // Raid survives for the rare case where the notice reaches this
+        // function (the registry drops `channel.raid` via the IrcUsernotice
+        // fallback, so in practice this branch is unreachable, but the
+        // emission rule itself is about "what if it did fire?").
+        assert!(should_emit_eventsub_notice_message(
+            &EventSubNoticeKind::Raid {
+                from_login: "raider".to_owned(),
+                viewers: 42,
+            }
+        ));
+        // Redemptions have no IRC analog and must still render.
+        assert!(should_emit_eventsub_notice_message(
+            &EventSubNoticeKind::ChannelPointsRedemption {
+                user_login: "redeemer".to_owned(),
+                reward_title: "Highlight My Message".to_owned(),
+                cost: 100,
+                reward_id: Some("r1".to_owned()),
+                redemption_id: Some("rd1".to_owned()),
+                user_input: None,
+                status: Some("UNFULFILLED".to_owned()),
+                is_update: false,
             }
         ));
     }

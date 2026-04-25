@@ -75,7 +75,7 @@ pub fn spawn_detector(
             tokio::select! {
                 changed = setting_rx.changed() => {
                     if changed.is_err() {
-                        break; // channel closed → app shutting down
+                        break; // channel closed -> app shutting down
                     }
                     current = *setting_rx.borrow();
                     apply_setting(&active_state, current, &evt_tx).await;

@@ -969,6 +969,425 @@ pub(crate) async fn fetch_kick_user_profile(login: &str, evt_tx: mpsc::Sender<Ap
     let _ = evt_tx.send(AppEvent::UserProfileLoaded { profile }).await;
 }
 
+/// Resolve a Shared Chat source channel by its Twitch user-id (room-id) via
+/// Helix `/users?id=<id>` and emit `AppEvent::SharedChannelResolved`.  When
+/// Helix credentials are missing we fall back to IVR's login-less endpoint,
+/// which also accepts numeric ids. Also pre-fetches the profile picture so
+/// `emote_bytes` has the bytes ready by the time the UI paints.
+pub(crate) async fn fetch_shared_channel_profile(
+    room_id: String,
+    bare_token: Option<&str>,
+    client_id: Option<&str>,
+    cache: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, (String, String, Option<String>)>,
+        >,
+    >,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let trimmed = room_id.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    let mut login = String::new();
+    let mut display = String::new();
+    let mut profile_url: Option<String> = None;
+
+    // Preferred: Helix users?id=<room_id> when we have creds.
+    if let (Some(bare), Some(cid)) = (bare_token, client_id) {
+        if !bare.trim().is_empty() && !cid.trim().is_empty() {
+            #[derive(serde::Deserialize)]
+            struct HelixUser {
+                #[serde(default)]
+                login: String,
+                #[serde(default)]
+                display_name: String,
+                #[serde(default)]
+                profile_image_url: Option<String>,
+            }
+            #[derive(serde::Deserialize)]
+            struct HelixResp {
+                data: Vec<HelixUser>,
+            }
+
+            let url = format!("https://api.twitch.tv/helix/users?id={trimmed}");
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(8))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new());
+            if let Ok(resp) = client
+                .get(&url)
+                .header("Authorization", format!("Bearer {bare}"))
+                .header("Client-Id", cid)
+                .send()
+                .await
+            {
+                if resp.status().is_success() {
+                    if let Ok(parsed) = resp.json::<HelixResp>().await {
+                        if let Some(user) = parsed.data.into_iter().next() {
+                            login = user.login;
+                            display = user.display_name;
+                            profile_url = user.profile_image_url.filter(|u| !u.is_empty());
+                        }
+                    }
+                } else {
+                    warn!(
+                        "Helix users?id={trimmed} failed with status {}",
+                        resp.status()
+                    );
+                }
+            }
+        }
+    }
+
+    // Fallback: IVR's v2 endpoint accepts numeric ids on the `id` query key.
+    if login.is_empty() {
+        #[derive(serde::Deserialize)]
+        struct IvrUser {
+            #[serde(default)]
+            login: String,
+            #[serde(rename = "displayName", default)]
+            display_name: String,
+            #[serde(default)]
+            logo: Option<String>,
+        }
+
+        let url = format!("https://api.ivr.fi/v2/twitch/user?id={trimmed}");
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(8))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        if let Ok(resp) = client.get(&url).send().await {
+            if resp.status().is_success() {
+                if let Ok(users) = resp.json::<Vec<IvrUser>>().await {
+                    if let Some(user) = users.into_iter().next() {
+                        login = user.login;
+                        display = user.display_name;
+                        profile_url = user.logo.filter(|u| !u.is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    if login.is_empty() {
+        debug!("Shared chat profile lookup returned no data for id {trimmed}");
+        return;
+    }
+    if display.is_empty() {
+        display = login.clone();
+    }
+
+    // Pre-fetch the image bytes so the 18x18 shared badge chip can render
+    // immediately without a second frame.
+    if let Some(ref url) = profile_url {
+        if let Ok((w, h, raw)) = fetch_and_decode_raw(url).await {
+            let _ = evt_tx
+                .send(AppEvent::EmoteImageReady {
+                    uri: url.clone(),
+                    width: w,
+                    height: h,
+                    raw_bytes: raw,
+                })
+                .await;
+        }
+    }
+
+    // Write to the session-scoped cache *before* emitting the event so the
+    // main reducer's next shared message sees the resolved metadata
+    // immediately (no race between event delivery and subsequent PRIVMSGs).
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(
+            trimmed.to_owned(),
+            (login.clone(), display.clone(), profile_url.clone()),
+        );
+    }
+
+    let _ = evt_tx
+        .send(AppEvent::SharedChannelResolved {
+            room_id: trimmed.to_owned(),
+            login,
+            display_name: display,
+            profile_url,
+        })
+        .await;
+}
+
+/// Fetch the current Shared Chat session for a broadcaster via Helix
+/// `/helix/shared_chat/session`, then hydrate per-participant login /
+/// display-name / profile-url / live viewer count via `/helix/users` +
+/// `/helix/streams`. Emits `AppEvent::SharedChatSessionUpdated` with either
+/// the full session or `None` when the broadcaster is not currently in a
+/// shared-chat session. Used for the total-viewers banner shown above a
+/// channel's message list. No-ops without Helix credentials.
+pub(crate) async fn fetch_shared_chat_session(
+    channel: crust_core::model::ChannelId,
+    broadcaster_id: String,
+    bare_token: String,
+    client_id: String,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    use crust_core::state::{SharedChatParticipant, SharedChatSessionState};
+
+    let broadcaster_id = broadcaster_id.trim().to_owned();
+    let bare_token = bare_token.trim().to_owned();
+    let client_id = client_id.trim().to_owned();
+    if broadcaster_id.is_empty() || bare_token.is_empty() || client_id.is_empty() {
+        return;
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    #[derive(serde::Deserialize)]
+    struct SessionParticipant {
+        broadcaster_id: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct SessionItem {
+        #[serde(default)]
+        session_id: String,
+        #[serde(default)]
+        host_broadcaster_id: String,
+        #[serde(default)]
+        participants: Vec<SessionParticipant>,
+    }
+    #[derive(serde::Deserialize)]
+    struct SessionResp {
+        data: Vec<SessionItem>,
+    }
+
+    let url = format!(
+        "https://api.twitch.tv/helix/shared_chat/session?broadcaster_id={broadcaster_id}"
+    );
+    let resp = match client
+        .get(&url)
+        .header("Authorization", format!("Bearer {bare_token}"))
+        .header("Client-Id", client_id.as_str())
+        .header(reqwest::header::CACHE_CONTROL, "no-cache")
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("shared-chat session fetch failed for {broadcaster_id}: {e}");
+            return;
+        }
+    };
+
+    if !resp.status().is_success() {
+        // Non-2xx is not necessarily an error; broadcasters who aren't in a
+        // shared-chat session get 404. Emit `None` so the UI can clear any
+        // stale banner.
+        let status = resp.status();
+        if status.as_u16() == 404 {
+            let _ = evt_tx
+                .send(AppEvent::SharedChatSessionUpdated {
+                    channel,
+                    session: None,
+                })
+                .await;
+            return;
+        }
+        let body = resp.text().await.unwrap_or_default();
+        warn!("shared-chat session HTTP {status} for {broadcaster_id}: {body}");
+        return;
+    }
+
+    let parsed: SessionResp = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("shared-chat session decode failed for {broadcaster_id}: {e}");
+            return;
+        }
+    };
+
+    let Some(session) = parsed.data.into_iter().next() else {
+        // No active session -> clear banner.
+        let _ = evt_tx
+            .send(AppEvent::SharedChatSessionUpdated {
+                channel,
+                session: None,
+            })
+            .await;
+        return;
+    };
+
+    if session.participants.len() < 2 {
+        // A "session" with only the host isn't a real shared chat from the
+        // user's point of view; hide the banner.
+        let _ = evt_tx
+            .send(AppEvent::SharedChatSessionUpdated {
+                channel,
+                session: None,
+            })
+            .await;
+        return;
+    }
+
+    // Fetch users + streams in parallel for all participants.
+    let participant_ids: Vec<String> = session
+        .participants
+        .iter()
+        .map(|p| p.broadcaster_id.clone())
+        .filter(|id| !id.is_empty())
+        .collect();
+    if participant_ids.is_empty() {
+        return;
+    }
+
+    #[derive(serde::Deserialize)]
+    struct HelixUser {
+        id: String,
+        login: String,
+        display_name: String,
+        #[serde(default)]
+        profile_image_url: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct HelixUsersResp {
+        data: Vec<HelixUser>,
+    }
+    #[derive(serde::Deserialize)]
+    struct HelixStreamItem {
+        user_id: String,
+        #[serde(default)]
+        viewer_count: u64,
+    }
+    #[derive(serde::Deserialize)]
+    struct HelixStreamsResp {
+        data: Vec<HelixStreamItem>,
+    }
+
+    // Build `id=A&id=B&...` query string via reqwest's tuple form.
+    let users_query: Vec<(&str, &str)> =
+        participant_ids.iter().map(|id| ("id", id.as_str())).collect();
+    let streams_query: Vec<(&str, &str)> = participant_ids
+        .iter()
+        .map(|id| ("user_id", id.as_str()))
+        .collect();
+
+    let users_fut = client
+        .get("https://api.twitch.tv/helix/users")
+        .query(&users_query)
+        .header("Authorization", format!("Bearer {bare_token}"))
+        .header("Client-Id", client_id.as_str())
+        .send();
+    let streams_fut = client
+        .get("https://api.twitch.tv/helix/streams")
+        .query(&streams_query)
+        .header("Authorization", format!("Bearer {bare_token}"))
+        .header("Client-Id", client_id.as_str())
+        .header(reqwest::header::CACHE_CONTROL, "no-cache")
+        .send();
+
+    let (users_res, streams_res) = tokio::join!(users_fut, streams_fut);
+
+    let users: Vec<HelixUser> = match users_res {
+        Ok(r) if r.status().is_success() => match r.json::<HelixUsersResp>().await {
+            Ok(v) => v.data,
+            Err(e) => {
+                warn!("shared-chat users decode failed: {e}");
+                Vec::new()
+            }
+        },
+        Ok(r) => {
+            warn!("shared-chat users HTTP {}", r.status());
+            Vec::new()
+        }
+        Err(e) => {
+            warn!("shared-chat users request failed: {e}");
+            Vec::new()
+        }
+    };
+    let streams: Vec<HelixStreamItem> = match streams_res {
+        Ok(r) if r.status().is_success() => match r.json::<HelixStreamsResp>().await {
+            Ok(v) => v.data,
+            Err(e) => {
+                warn!("shared-chat streams decode failed: {e}");
+                Vec::new()
+            }
+        },
+        Ok(r) => {
+            warn!("shared-chat streams HTTP {}", r.status());
+            Vec::new()
+        }
+        Err(e) => {
+            warn!("shared-chat streams request failed: {e}");
+            Vec::new()
+        }
+    };
+
+    let stream_map: std::collections::HashMap<String, u64> = streams
+        .into_iter()
+        .map(|s| (s.user_id, s.viewer_count))
+        .collect();
+
+    let mut participants: Vec<SharedChatParticipant> = participant_ids
+        .iter()
+        .map(|id| {
+            let user = users.iter().find(|u| &u.id == id);
+            let viewer_count = stream_map.get(id).copied().unwrap_or(0);
+            let live = stream_map.contains_key(id);
+            SharedChatParticipant {
+                broadcaster_id: id.clone(),
+                login: user.map(|u| u.login.clone()).unwrap_or_default(),
+                display_name: user
+                    .map(|u| u.display_name.clone())
+                    .unwrap_or_else(|| id.clone()),
+                profile_url: user.and_then(|u| {
+                    u.profile_image_url.clone().filter(|s| !s.is_empty())
+                }),
+                viewer_count,
+                live,
+            }
+        })
+        .collect();
+
+    // Host first, then the rest sorted by viewer count desc for stable UI
+    // ordering regardless of Helix's ordering. The user's own channel stays
+    // near the top even when a bigger co-streamer is in the session.
+    participants.sort_by(|a, b| {
+        let a_host = a.broadcaster_id == session.host_broadcaster_id;
+        let b_host = b.broadcaster_id == session.host_broadcaster_id;
+        b_host.cmp(&a_host).then_with(|| b.viewer_count.cmp(&a.viewer_count))
+    });
+
+    // Queue pre-fetch of each participant's avatar so the banner can
+    // paint instantly rather than flickering from text fallback to image.
+    for p in &participants {
+        if let Some(url) = p.profile_url.as_ref().filter(|s| !s.is_empty()) {
+            if let Ok((w, h, raw)) = fetch_and_decode_raw(url).await {
+                let _ = evt_tx
+                    .send(AppEvent::EmoteImageReady {
+                        uri: url.clone(),
+                        width: w,
+                        height: h,
+                        raw_bytes: raw,
+                    })
+                    .await;
+            }
+        }
+    }
+
+    let session_state = SharedChatSessionState {
+        session_id: session.session_id,
+        host_broadcaster_id: session.host_broadcaster_id,
+        participants,
+        updated_at: std::time::Instant::now(),
+    };
+
+    let _ = evt_tx
+        .send(AppEvent::SharedChatSessionUpdated {
+            channel,
+            session: Some(session_state),
+        })
+        .await;
+}
+
 /// Fetch the logged-in user's avatar URL and image bytes for the top-bar pill.
 pub(crate) async fn fetch_self_avatar(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
     if login.is_empty() {
