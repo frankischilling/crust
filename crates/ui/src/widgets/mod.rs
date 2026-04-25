@@ -6,7 +6,9 @@ pub mod chrome;
 pub mod crash_viewer;
 pub mod emoji_list;
 pub mod emote_picker;
+pub mod filter_editor;
 pub mod global_search;
+pub mod hype_train_banner;
 pub mod info_bars;
 pub mod irc_status;
 pub mod join_dialog;
@@ -18,13 +20,14 @@ pub mod message_list;
 pub mod message_search;
 pub mod plugin_ui;
 pub mod settings_page;
+pub mod shared_chat_banner;
 pub mod split_header;
 pub mod user_profile_popup;
 
 /// Build a `bytes://` URI for egui image loading.
 ///
 /// egui's `ImageCrateLoader` determines the image format from the URI's file
-/// extension.  Many CDN URLs (Twitch, Twemoji, …) either lack an extension or
+/// extension.  Many CDN URLs (Twitch, Twemoji, ...) either lack an extension or
 /// lie about the real format (e.g. the Twitch CDN may serve WebP even from a
 /// path that has no extension at all).  We therefore sniff the actual format
 /// from the first few magic bytes and append the correct extension hint so
@@ -56,7 +59,7 @@ fn sniff_image_ext(raw: &[u8]) -> &'static str {
     } else if raw.starts_with(b"\xff\xd8\xff") {
         ".jpg"
     } else {
-        // No recognised magic → omit extension so egui falls back to
+        // No recognised magic -> omit extension so egui falls back to
         // `image::load_from_memory` which does its own auto-detection.
         ""
     }

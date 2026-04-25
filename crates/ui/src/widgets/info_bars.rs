@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use egui::{Color32, Context, Frame, RichText, TopBottomPanel};
 
+use crust_core::model::ChannelId;
 use crust_core::plugins::{PluginUiHostSlot, PluginUiSnapshot};
 use crust_core::AppState;
 
@@ -24,6 +25,7 @@ pub fn show_channel_info_bars(
     ctx: &Context,
     state: &AppState,
     stream_statuses: &HashMap<String, StreamStatusInfo>,
+    channel_points: &HashMap<ChannelId, u64>,
     plugin_ui: &PluginUiSnapshot,
     plugin_ui_session: &mut PluginUiSessionState,
 ) {
@@ -139,6 +141,7 @@ pub fn show_channel_info_bars(
                     }
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = if ultra_compact { 4.0 } else { 8.0 };
+                        let points = channel_points.get(active_ch).copied();
                         match status {
                             None => {
                                 // Not fetched yet - show the channel name only.
@@ -157,6 +160,9 @@ pub fn show_channel_info_bars(
                                     .font(t::small())
                                     .color(t::text_primary()),
                                 );
+                                if let Some(pts) = points {
+                                    points_pill(ui, pts);
+                                }
                                 if !ultra_compact {
                                     ui.label(
                                         RichText::new("Fetching stream status...")
@@ -213,6 +219,10 @@ pub fn show_channel_info_bars(
                                     .font(t::small())
                                     .color(t::text_primary()),
                                 );
+
+                                if let Some(pts) = points {
+                                    points_pill(ui, pts);
+                                }
 
                                 // Viewer count (live only)
                                 if s.is_live {
@@ -393,7 +403,7 @@ pub fn show_channel_info_bars(
                                 .strong()
                                 .color(t::gold()),
                         );
-                        ui.label(RichText::new("·").font(t::small()).color(t::text_muted()));
+                        ui.label(RichText::new("|").font(t::small()).color(t::text_muted()));
                         ui.label(
                             RichText::new(format!("{sender}:"))
                                 .font(t::small())
@@ -411,6 +421,37 @@ pub fn show_channel_info_bars(
                     });
                 });
         }
+    }
+}
+
+/// Channel-points balance pill shown next to the channel name in the info
+/// bar. Uses the accent palette so it reads as a viewer-focused metric, not
+/// a room-state or moderation flag.
+fn points_pill(ui: &mut egui::Ui, balance: u64) {
+    let color = t::gold();
+    egui::Frame::new()
+        .fill(t::alpha(color, 22))
+        .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.5)))
+        .corner_radius(t::RADIUS_SM)
+        .inner_margin(egui::Margin::symmetric(6, 1))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(format!("★ {} pts", fmt_points(balance)))
+                    .font(t::small())
+                    .color(color)
+                    .strong(),
+            )
+            .on_hover_text(format!("Channel points balance: {balance}"));
+        });
+}
+
+fn fmt_points(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 10_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
     }
 }
 

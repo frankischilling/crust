@@ -119,7 +119,7 @@ impl LoginDialog {
                 );
                 ui.add_space(6.0);
 
-                // -- Account list --------------------------------------------
+                // Account list
                 if shown_accounts.is_empty() {
                     ui.add_space(6.0);
                     ui.vertical_centered(|ui| {
@@ -151,7 +151,7 @@ impl LoginDialog {
                     ui.add(egui::Separator::default().spacing(4.0));
                 }
 
-                // -- Add-account form / button --------------------------------
+                // Add-account form / button
                 if self.show_add_form {
                     ui.add_space(6.0);
                     ui.label(
@@ -163,7 +163,7 @@ impl LoginDialog {
 
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut self.token_buf)
-                            .hint_text("oauth:abc123…")
+                            .hint_text("oauth:abc123...")
                             .password(true)
                             .desired_width((ui.available_width() - 8.0).max(96.0)),
                     );
@@ -231,7 +231,7 @@ impl LoginDialog {
                     ui.add_space(4.0);
                 }
 
-                // -- Footer ---------------------------------------------------
+                // Footer
                 ui.add_space(2.0);
                 ui.add(egui::Separator::default().spacing(4.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
@@ -252,7 +252,7 @@ impl LoginDialog {
     }
 }
 
-// -- Private helpers ----------------------------------------------------------
+// Private helpers
 
 /// Render a single account row: avatar • name • status • action buttons.
 fn draw_account_row(
@@ -336,14 +336,14 @@ fn draw_account_row(
             if is_active {
                 ui.label(
                     RichText::new("● Active")
-                        .font(egui::FontId::proportional(10.0))
+                        .font(t::dialog_font())
                         .color(t::green()),
                 );
             }
             if is_default {
                 ui.label(
                     RichText::new("★ Auto-login")
-                        .font(egui::FontId::proportional(10.0))
+                        .font(t::dialog_font())
                         .color(t::gold()),
                 );
             }

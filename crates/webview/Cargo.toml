@@ -1,0 +1,22 @@
+[package]
+name = "crust-webview"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Parent-side control of the Crust Twitch-auto-claim sidecar."
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+# Pure-Rust deps only. wry / tao live in the `crust-webview-host` binary
+# crate - they never enter the main `crust` process's address space.
+tokio = { workspace = true, features = ["sync", "rt"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = "1"
+tempfile = "3"

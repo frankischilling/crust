@@ -536,7 +536,7 @@ impl EmotePicker {
                     ui.label("🔍");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.filter)
-                            .hint_text("Search emotes…")
+                            .hint_text("Search emotes...")
                             .desired_width(ui.available_width()),
                     );
                 });

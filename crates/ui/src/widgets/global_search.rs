@@ -408,7 +408,7 @@ fn render_group_header(
                 .color(t::text_secondary()),
         );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let label = if pending { "Loading…" } else { "Load older" };
+            let label = if pending { "Loading..." } else { "Load older" };
             let btn = ui.add_enabled(!pending, Button::new(RichText::new(label).font(t::tiny())));
             if btn.clicked() {
                 load_older_pending.insert(channel.clone(), std::time::Instant::now());
@@ -477,7 +477,7 @@ fn truncate(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         let mut out: String = s.chars().take(max).collect();
-        out.push('…');
+        out.push_str("...");
         out
     }
 }
@@ -564,6 +564,7 @@ mod tests {
             flags: MessageFlags::default(),
             reply: None,
             msg_kind: MsgKind::Chat,
+            shared: None,
         }
     }
 

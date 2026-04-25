@@ -13,9 +13,9 @@ pub enum LiveFeedAction {
     OpenChannel(String),
     /// Refresh button in the header.
     Refresh,
-    /// Right-click → "Open in Streamlink".
+    /// Right-click -> "Open in Streamlink".
     OpenStreamlink(String),
-    /// Right-click → "Open in player".
+    /// Right-click -> "Open in player".
     OpenInPlayer(String),
 }
 
@@ -25,8 +25,8 @@ pub struct LiveFeed<'a> {
     pub error: Option<&'a str>,
     pub last_updated: Option<Instant>,
     pub joined_logins: &'a HashSet<String>,
-    /// URL → (width, height, bytes) cache for thumbnails. Entries populated
-    /// by the app after `AppCommand::FetchImage` → `AppEvent::EmoteImageReady`.
+    /// URL -> (width, height, bytes) cache for thumbnails. Entries populated
+    /// by the app after `AppCommand::FetchImage` -> `AppEvent::EmoteImageReady`.
     pub thumbnail_bytes: &'a HashMap<String, (u32, u32, Arc<[u8]>)>,
 }
 

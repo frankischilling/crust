@@ -1,5 +1,5 @@
-//! Comprehensive list of standard Unicode emoji for the Emoji tab in the emote
-//! picker. Each entry is `(emoji_char, descriptive_name)`.
+//! Standard Unicode emoji table used by the Emoji tab in the emote picker.
+//! Each entry is `(emoji_char, descriptive_name)`.
 
 use crust_core::emoji::twemoji_url;
 use crust_core::model::EmoteCatalogEntry;
@@ -22,7 +22,7 @@ pub fn emoji_catalog_entries() -> Vec<EmoteCatalogEntry> {
 
 /// `(emoji, name)` - ordered by category for a natural browsing experience.
 pub const EMOJI_LIST: &[(&str, &str)] = &[
-    // -- Smileys & Emotion -----------------------------------------------
+    // Smileys & Emotion
     ("😀", "grinning face"),
     ("😃", "grinning face with big eyes"),
     ("😄", "grinning face with smiling eyes"),
@@ -176,7 +176,7 @@ pub const EMOJI_LIST: &[(&str, &str)] = &[
     ("💬", "speech balloon"),
     ("💭", "thought balloon"),
     ("💤", "zzz"),
-    // -- Gestures & People ------------------------------------------------
+    // Gestures & People
     ("👋", "waving hand"),
     ("🤚", "raised back of hand"),
     ("🖐️", "hand with fingers splayed"),
@@ -225,7 +225,7 @@ pub const EMOJI_LIST: &[(&str, &str)] = &[
     ("👄", "mouth"),
     ("🫦", "biting lip"),
     ("🧠", "brain"),
-    // -- Animals & Nature -------------------------------------------------
+    // Animals & Nature
     ("🐶", "dog face"),
     ("🐱", "cat face"),
     ("🐭", "mouse face"),
@@ -347,7 +347,7 @@ pub const EMOJI_LIST: &[(&str, &str)] = &[
     ("💐", "bouquet"),
     ("🍄", "mushroom"),
     ("🌰", "chestnut"),
-    // -- Food & Drink -----------------------------------------------------
+    // Food & Drink
     ("🍎", "red apple"),
     ("🍏", "green apple"),
     ("🍐", "pear"),
@@ -458,7 +458,7 @@ pub const EMOJI_LIST: &[(&str, &str)] = &[
     ("🧃", "beverage box"),
     ("🧉", "mate"),
     ("🧊", "ice"),
-    // -- Activities & Objects ----------------------------------------------
+    // Activities & Objects
     ("⚽", "soccer ball"),
     ("🏀", "basketball"),
     ("🏈", "american football"),
@@ -569,7 +569,7 @@ pub const EMOJI_LIST: &[(&str, &str)] = &[
     ("🎃", "jack-o-lantern"),
     ("🎆", "fireworks"),
     ("🎇", "sparkler"),
-    ("✨", "sparkles"),
+    ("", "sparkles"),
     ("🎋", "tanabata tree"),
     ("🎏", "carp streamer"),
     ("🎐", "wind chime"),
@@ -583,7 +583,7 @@ pub const EMOJI_LIST: &[(&str, &str)] = &[
     ("🥇", "1st place medal"),
     ("🥈", "2nd place medal"),
     ("🥉", "3rd place medal"),
-    // -- Travel & Places --------------------------------------------------
+    // Travel & Places
     ("🌍", "globe showing Europe-Africa"),
     ("🌎", "globe showing Americas"),
     ("🌏", "globe showing Asia-Australia"),
@@ -678,7 +678,7 @@ pub const EMOJI_LIST: &[(&str, &str)] = &[
     ("🛸", "flying saucer"),
     ("🛰️", "satellite"),
     ("🧳", "luggage"),
-    // -- Weather & Sky ----------------------------------------------------
+    // Weather & Sky
     ("🌙", "crescent moon"),
     ("🌛", "first quarter moon face"),
     ("🌜", "last quarter moon face"),
@@ -709,7 +709,7 @@ pub const EMOJI_LIST: &[(&str, &str)] = &[
     ("🔥", "fire"),
     ("💧", "droplet"),
     ("🌊", "water wave"),
-    // -- Symbols ----------------------------------------------------------
+    // Symbols
     ("❤️", "red heart"),
     ("🩷", "pink heart"),
     ("🧡", "orange heart"),
@@ -783,8 +783,8 @@ pub const EMOJI_LIST: &[(&str, &str)] = &[
     ("🈶", "Japanese not free of charge button"),
     ("🈚", "Japanese free of charge button"),
     ("🈲", "Japanese prohibited button"),
-    ("✅", "check mark button"),
-    ("❌", "cross mark"),
+    ("", "check mark button"),
+    ("", "cross mark"),
     ("❎", "cross mark button"),
     ("➕", "plus"),
     ("➖", "minus"),
@@ -830,7 +830,7 @@ pub const EMOJI_LIST: &[(&str, &str)] = &[
     ("🏳️", "white flag"),
     ("🏳️\u{200D}🌈", "rainbow flag"),
     ("🏴\u{200D}☠️", "pirate flag"),
-    // -- Flags (popular) -------------------------------------------------
+    // Flags (popular)
     ("🇺🇸", "United States"),
     ("🇬🇧", "United Kingdom"),
     ("🇨🇦", "Canada"),

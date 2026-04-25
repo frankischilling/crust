@@ -153,7 +153,7 @@ impl LoadingScreen {
                 if matches!(self.phase, Phase::Connecting) {
                     self.phase = Phase::Connecting;
                 }
-                self.push_log("Connecting to Twitch…", t::text_secondary());
+                self.push_log("Connecting to Twitch...", t::text_secondary());
             }
             LoadEvent::Connected => {
                 // Don't regress from Loading if an optimistic Authenticated
@@ -161,7 +161,7 @@ impl LoadingScreen {
                 if matches!(self.phase, Phase::Connecting | Phase::Authenticating) {
                     self.phase = Phase::Authenticating;
                 }
-                self.push_log("Connected - authenticating…", t::green());
+                self.push_log("Connected - authenticating...", t::green());
             }
             LoadEvent::Authenticated { username } => {
                 self.push_log(format!("Authenticated as {username}"), t::green());
@@ -397,7 +397,7 @@ impl LoadingScreen {
                                         spin_painter.text(
                                             center,
                                             Align2::CENTER_CENTER,
-                                            "✓",
+                                            "",
                                             FontId::proportional(28.0),
                                             a(t::green()),
                                         );
@@ -445,7 +445,7 @@ impl LoadingScreen {
                                         ));
                                     } else if self.phase == Phase::Loading {
                                         pills.push((
-                                            "Loading global emotes…".to_owned(),
+                                            "Loading global emotes...".to_owned(),
                                             t::text_muted(),
                                         ));
                                     }
@@ -570,7 +570,7 @@ impl LoadingScreen {
                                                                 Vec2::new(inner_w, 0.0),
                                                                 egui::Label::new(
                                                                     egui::RichText::new(
-                                                                        "Waiting for startup events…",
+                                                                        "Waiting for startup events...",
                                                                     )
                                                                     .font(t::small())
                                                                     .color(a(t::text_muted())),
@@ -674,7 +674,7 @@ impl LoadingScreen {
                                 spin_painter.text(
                                     center,
                                     Align2::CENTER_CENTER,
-                                    "✓",
+                                    "",
                                     FontId::proportional(24.0),
                                     a(t::green()),
                                 );
@@ -720,7 +720,7 @@ impl LoadingScreen {
                             );
                         } else if self.phase == Phase::Loading {
                             ui.label(
-                                egui::RichText::new("Global emotes: loading…")
+                                egui::RichText::new("Global emotes: loading...")
                                     .font(t::small())
                                     .color(a(t::text_muted())),
                             );
@@ -769,7 +769,7 @@ impl LoadingScreen {
                                     ui.add_sized(
                                         Vec2::new(inner_w, 0.0),
                                         egui::Label::new(
-                                            egui::RichText::new("Waiting for startup events…")
+                                            egui::RichText::new("Waiting for startup events...")
                                                 .font(t::small())
                                                 .color(a(t::text_muted())),
                                         )
@@ -795,9 +795,9 @@ impl LoadingScreen {
 
     fn stage_label(&self) -> (&'static str, Color32) {
         match self.phase {
-            Phase::Connecting => ("Connecting to Twitch…", t::yellow()),
-            Phase::Authenticating => ("Authenticating…", t::yellow()),
-            Phase::Loading => ("Loading startup data…", t::text_secondary()),
+            Phase::Connecting => ("Connecting to Twitch...", t::yellow()),
+            Phase::Authenticating => ("Authenticating...", t::yellow()),
+            Phase::Loading => ("Loading startup data...", t::text_secondary()),
             Phase::Ready => ("Ready", t::green()),
             Phase::Done => ("Done", t::green()),
         }

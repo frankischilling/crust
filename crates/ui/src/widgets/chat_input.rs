@@ -46,11 +46,11 @@ struct TabState {
 /// Message-history recall state (Up / Down arrows).
 #[derive(Clone, Default)]
 struct HistState {
-    /// -1 = normal input, 0 = most recent sent msg, 1 = second-most-recent, …
+    /// -1 = normal input, 0 = most recent sent msg, 1 = second-most-recent, ...
     idx: i32,
     /// The original unsent input saved when history navigation started.
     saved_input: String,
-    /// What we set the buffer to (to detect user edits → reset).
+    /// What we set the buffer to (to detect user edits -> reset).
     expected_buf: String,
 }
 
@@ -121,7 +121,7 @@ impl<'a> ChatInput<'a> {
             add_to_dictionary: None,
         };
 
-        // -- Clipboard image paste (Ctrl/Cmd+V) ------------------------------
+        // Clipboard image paste (Ctrl/Cmd+V)
         // egui-winit 0.31's keyboard handler early-returns from a Ctrl+V
         // *press* when its internal `clipboard.get()` fails (image-only
         // clipboards trigger this path), so no `Event::Key` for V is ever
@@ -190,7 +190,7 @@ impl<'a> ChatInput<'a> {
             }
         }
 
-        // -- Drag-drop image file(s) -----------------------------------------
+        // Drag-drop image file(s)
         let dropped: Vec<egui::DroppedFile> = ui.ctx().input(|i| i.raw.dropped_files.clone());
         for f in &dropped {
             if let Some(upload) = dropped_file_to_upload(f) {
@@ -354,7 +354,7 @@ impl<'a> ChatInput<'a> {
                     let tab_id = text_edit_id.with("tab_complete_state");
                     let hist_id = text_edit_id.with("msg_history_state");
 
-                    // -- Paint red wavy underlines under misspelled words --
+                    // Paint red wavy underlines under misspelled words
                     if crate::spellcheck::is_enabled() {
                         let galley = &te_output.galley;
                         let galley_pos = te_output.galley_pos;
@@ -408,7 +408,7 @@ impl<'a> ChatInput<'a> {
                     let mut accepted_join_channel: Option<String> = None;
 
                     if !matches.is_empty() {
-                        // -- Colon-autocomplete active --
+                        // Colon-autocomplete active
                         let n = matches.len() as i32;
                         ac_sel = ac_sel.clamp(0, n - 1);
 
@@ -426,7 +426,7 @@ impl<'a> ChatInput<'a> {
                             ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                         }
                     } else if !username_matches.is_empty() {
-                        // -- @username autocomplete active --
+                        // @username autocomplete active
                         let n = username_matches.len() as i32;
                         ac_sel = ac_sel.clamp(0, n - 1);
 
@@ -443,7 +443,7 @@ impl<'a> ChatInput<'a> {
                             ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                         }
                     } else if !slash_matches.is_empty() {
-                        // -- Slash-command autocomplete active --
+                        // Slash-command autocomplete active
                         let n = slash_matches.len() as i32;
                         ac_sel = ac_sel.clamp(0, n - 1);
 
@@ -461,7 +461,7 @@ impl<'a> ChatInput<'a> {
                             ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                         }
                     } else if !join_matches.is_empty() {
-                        // -- `/join` channel autocomplete active --
+                        // `/join` channel autocomplete active
                         let n = join_matches.len() as i32;
                         ac_sel = ac_sel.clamp(0, n - 1);
 
@@ -480,7 +480,7 @@ impl<'a> ChatInput<'a> {
                     } else {
                         ac_sel = 0;
 
-                        // -- Bare-word Tab completion (emotes + usernames) --
+                        // Bare-word Tab completion (emotes + usernames)
                         if consumed_tab {
                             let mut ts: TabState = ui
                                 .ctx()
@@ -579,13 +579,13 @@ impl<'a> ChatInput<'a> {
                             }
                         }
 
-                        // -- Message history (Up / Down) --
+                        // Message history (Up / Down)
                         if (consumed_up || consumed_down) && !self.message_history.is_empty() {
                             let mut hs: HistState = ui
                                 .ctx()
                                 .data_mut(|d| d.get_temp(hist_id).unwrap_or_default());
 
-                            // Detect user edits → reset history position
+                            // Detect user edits -> reset history position
                             if hs.idx >= 0 && *buf != hs.expected_buf {
                                 hs.idx = -1;
                             }
@@ -671,7 +671,7 @@ impl<'a> ChatInput<'a> {
                         && !buf.trim().is_empty()
                         && (self.logged_in || is_slash_input);
 
-                    // -- Send on Enter (only fires when we did NOT consume it) --
+                    // Send on Enter (only fires when we did NOT consume it)
                     let enter_pressed =
                         resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
 
@@ -759,7 +759,7 @@ impl<'a> ChatInput<'a> {
                         );
                     }
 
-                    // -- Draw autocomplete popup above input ----------
+                    // Draw autocomplete popup above input
                     let show_popup = (!matches.is_empty()
                         || !username_matches.is_empty()
                         || !slash_matches.is_empty()
@@ -808,7 +808,7 @@ impl<'a> ChatInput<'a> {
                         }
                     }
 
-                    // -- Spell-check context menu (right-click) ------
+                    // Spell-check context menu (right-click)
                     let sc_id = Id::new("spell_check_ctx");
 
                     // On right-click, determine the word at the cursor and
@@ -977,7 +977,7 @@ impl<'a> ChatInput<'a> {
                                 ui.close_menu();
                             }
                         } else {
-                            ui.label(RichText::new("Spelling OK ✓").color(t::green()));
+                            ui.label(RichText::new("Spelling OK ").color(t::green()));
                         }
                     });
 
@@ -1928,7 +1928,7 @@ fn iter_words(buf: &str) -> Vec<(&str, usize, usize, usize)> {
         }
         let char_start = start;
         let char_end = i;
-        // Convert char indices → byte slice
+        // Convert char indices -> byte slice
         let byte_start: usize = buf
             .char_indices()
             .nth(char_start)
@@ -1954,7 +1954,7 @@ fn paint_wavy_underline(painter: &egui::Painter, x0: f32, x1: f32, y: f32, color
 
     let mut x = x0;
     while x <= x1 {
-        // Triangle wave: cycles through 0 → +H → 0 → -H → 0 over WAVE_LEN
+        // Triangle wave: cycles through 0 -> +H -> 0 -> -H -> 0 over WAVE_LEN
         let phase = (x - x0) % WAVE_LEN;
         let half = WAVE_LEN / 2.0;
         let dy = if phase < half {

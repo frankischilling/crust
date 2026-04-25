@@ -37,7 +37,7 @@ pub struct MessageListPerfStats {
     pub height_cache_misses: usize,
 }
 
-// -- Zero-allocation visible-index abstraction ----------------------------
+// Zero-allocation visible-index abstraction
 // When no search filter is active, `VisibleIndices::All(n)` avoids
 // allocating a Vec<usize> with one entry per message every frame.
 
@@ -124,7 +124,7 @@ const EST_H: f32 = 26.0;
 // Compaction thresholds tuned so typical chat sessions never hit the
 // virtualised "hot window" path. Lowering these aggressively (e.g.
 // TRIGGER=200) caused a first-render race: the snap-to-bottom dance
-// (`vertical_scroll_offset(f32::MAX)` → clamped to 0 → `apply_snap`
+// (`vertical_scroll_offset(f32::MAX)` -> clamped to 0 -> `apply_snap`
 // restores `max_scroll` next frame) interacted with repeated prefix
 // rebuilds (from just-measured row heights), so the viewport could
 // briefly settle in dead space above the hot window. Symptom: the
@@ -297,7 +297,7 @@ pub struct KeywordHighlightMatch {
 /// Scrollable, bottom-anchored list of chat messages with inline emote images.
 pub struct MessageList<'a> {
     messages: &'a VecDeque<ChatMessage>,
-    /// Raw image bytes keyed by CDN URL: CDN url → (width, height, raw_bytes)
+    /// Raw image bytes keyed by CDN URL: CDN url -> (width, height, raw_bytes)
     emote_bytes: &'a HashMap<String, (u32, u32, Arc<[u8]>)>,
     /// For sending on-demand image-fetch requests (e.g. HD emote on hover).
     cmd_tx: &'a mpsc::Sender<AppCommand>,
@@ -332,11 +332,17 @@ pub struct MessageList<'a> {
     /// Moderation action presets
     mod_action_presets: &'a [crust_core::model::mod_actions::ModActionPreset],
     /// Per-user low-trust treatment for this channel, keyed by lowercased login.
-    low_trust_users: &'a HashMap<String, LowTrustStatus>,
+    low_trust_users: &'a HashMap<String, crust_core::model::LowTrustEntry>,
     /// When `Some`, scroll to the message with this id on this frame.
     scroll_to: Option<MessageId>,
     /// When true, link preview tooltips are suppressed (streamer mode).
     hide_link_previews: bool,
+    /// Optional "live" flag for this channel, exposed to filter expressions
+    /// as `channel.live`. `None` leaves the identifier evaluating to `false`.
+    channel_live: Option<bool>,
+    /// Whether this channel is the currently-watched stream, exposed to
+    /// filter expressions as `channel.watching`.
+    channel_watching: bool,
 }
 
 impl<'a> MessageList<'a> {
@@ -345,11 +351,13 @@ impl<'a> MessageList<'a> {
             return None;
         }
 
-        crust_core::model::filters::check_filters(
+        crust_core::model::filters::check_filters_message(
             self.filter_records,
             Some(self.channel),
-            &msg.raw_text,
-            &msg.sender.login,
+            msg,
+            self.channel.display_name(),
+            self.channel_live,
+            self.channel_watching,
         )
     }
 
@@ -372,7 +380,7 @@ impl<'a> MessageList<'a> {
         highlight_rules: &'a [crust_core::highlight::HighlightMatch],
         filter_records: &'a [crust_core::model::filters::CompiledFilter],
         mod_action_presets: &'a [crust_core::model::mod_actions::ModActionPreset],
-        low_trust_users: &'a HashMap<String, LowTrustStatus>,
+        low_trust_users: &'a HashMap<String, crust_core::model::LowTrustEntry>,
     ) -> Self {
         Self {
             messages,
@@ -396,6 +404,8 @@ impl<'a> MessageList<'a> {
             low_trust_users,
             scroll_to: None,
             hide_link_previews: false,
+            channel_live: None,
+            channel_watching: false,
         }
     }
 
@@ -408,6 +418,13 @@ impl<'a> MessageList<'a> {
     /// Suppress link preview hover tooltips for this frame (streamer mode).
     pub fn with_hide_link_previews(mut self, hide: bool) -> Self {
         self.hide_link_previews = hide;
+        self
+    }
+
+    /// Expose the current stream live/watching state to filter expressions.
+    pub fn with_channel_status(mut self, live: Option<bool>, watching: bool) -> Self {
+        self.channel_live = live;
+        self.channel_watching = watching;
         self
     }
 
@@ -621,7 +638,7 @@ impl<'a> MessageList<'a> {
         // Height cache
         // Keyed by MessageId (u64). Persisted in egui temp storage so that
         // off-screen rows are not re-measured every frame.  Shared between
-        // the simple and virtual paths so the transition is seamless.
+        // the simple and virtual paths so heights stay consistent.
         //
         // PERF: use remove_temp (ownership via mem::take) instead of get_temp
         // (which clones the entire HashMap every frame).  The cache is put
@@ -744,7 +761,7 @@ impl<'a> MessageList<'a> {
             height_cache_misses: 0,
         };
 
-        // -- Pre-compute highlight state once per frame -------------------
+        // Pre-compute highlight state once per frame
         // Previously this was looked up via 2× data_mut calls inside every
         // render_message invocation.  Computing it once here avoids dozens
         // of redundant lock acquisitions per frame.
@@ -970,7 +987,7 @@ impl<'a> MessageList<'a> {
         let boundary_h = hot_plan.boundary_height();
         let total_h = boundary_h + *prefix.last().unwrap_or(&0.0);
 
-        // -- Virtual-scrolling render pass --------------------------------
+        // Virtual-scrolling render pass
         // show_viewport gives us the currently-visible rect in content-local
         // coordinates.  We allocate dead space for off-screen rows and only
         // call render_message for rows whose y-range overlaps the viewport.
@@ -1898,7 +1915,7 @@ impl<'a> MessageList<'a> {
             // stick_to_bottom will catch up next frame.
             false
         } else {
-            // was_paused and no explicit un-pause action → stay paused.
+            // was_paused and no explicit un-pause action -> stay paused.
             // This prevents content resizes from silently clearing the pause.
             true
         };
@@ -1953,7 +1970,7 @@ impl<'a> MessageList<'a> {
             let text = if raw_text.chars().count() > max_chars {
                 let mut trimmed: String =
                     raw_text.chars().take(max_chars.saturating_sub(1)).collect();
-                trimmed.push('…');
+                trimmed.push_str("...");
                 trimmed
             } else {
                 raw_text
@@ -1962,7 +1979,7 @@ impl<'a> MessageList<'a> {
                 paused_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 text,
-                egui::FontId::proportional(12.0),
+                t::popups_font(),
                 t::text_primary(),
             );
         }
@@ -1984,7 +2001,7 @@ impl<'a> MessageList<'a> {
                 btn_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 "Resume scrolling",
-                egui::FontId::proportional(12.0),
+                t::popups_font(),
                 t::text_on_accent(),
             );
 
@@ -2043,7 +2060,7 @@ impl<'a> MessageList<'a> {
         let reply_key = rctx.reply_key;
         let scroll_to_key = rctx.scroll_to_key;
 
-        // -- Message background ------------------------------------------
+        // Message background
         // Use pre-computed highlight state from RenderCtx instead of per-
         // message data_mut lookups.
         let highlight_alpha: f32 = match (&rctx.highlight_server_id, msg.server_id.as_deref()) {
@@ -2139,7 +2156,7 @@ impl<'a> MessageList<'a> {
                                 .nth(80)
                                 .map(|(i, _)| i)
                                 .unwrap_or(rep.parent_msg_body.len());
-                            format!("{}…", &rep.parent_msg_body[..cut])
+                            format!("{}...", &rep.parent_msg_body[..cut])
                         } else {
                             rep.parent_msg_body.clone()
                         };
@@ -2174,7 +2191,7 @@ impl<'a> MessageList<'a> {
                         }
                     });
                 }
-                // -- Notification banner (pinned / first / highlighted / rewards) --
+                // Notification banner (pinned / first / highlighted / rewards)
                 // Rendered inside the Frame so the background fill covers
                 // the banner as well, and the interaction rect is contiguous.
                 if let Some((label, stripe_color)) = notification_label(
@@ -2223,15 +2240,61 @@ impl<'a> MessageList<'a> {
 
                             // Separator dot between timestamp and badges/name
                             ui.add(Label::new(
-                                RichText::new("·")
+                                RichText::new("|")
                                     .color(t::separator())
                                     .font(t::timestamps_font()),
                             ));
                         }
 
-                        // Badges: image if loaded, else text fallback
-                        for badge in &msg.sender.badges {
-                            let tooltip_label = pretty_badge_name(&badge.name, &badge.version);
+                        if let Some(shared) = msg.shared.as_ref() {
+                            render_shared_chat_chip(ui, shared, self.emote_bytes);
+                        }
+
+                        // Badges: image if loaded, else text fallback. For
+                        // Shared Chat mirrors we also append the source
+                        // channel's mod/vip badges with a "(from <source>)"
+                        // tooltip suffix (matches Chatterino
+                        // `appendSharedChatBadges`).
+                        let shared_badge_tooltip_suffix =
+                            msg.shared.as_ref().and_then(|s| {
+                                s.display_name
+                                    .clone()
+                                    .or_else(|| s.login.clone())
+                                    .filter(|v| !v.is_empty())
+                            });
+                        let own_badge_keys: std::collections::HashSet<(String, String)> = msg
+                            .sender
+                            .badges
+                            .iter()
+                            .map(|b| (b.name.clone(), b.version.clone()))
+                            .collect();
+                        let extra_shared_badges: Vec<_> = msg
+                            .shared
+                            .as_ref()
+                            .map(|s| {
+                                s.badges
+                                    .iter()
+                                    .filter(|b| {
+                                        (b.name == "moderator" || b.name == "vip")
+                                            && !own_badge_keys
+                                                .contains(&(b.name.clone(), b.version.clone()))
+                                    })
+                                    .cloned()
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        for badge in msg.sender.badges.iter().chain(extra_shared_badges.iter()) {
+                            let mut tooltip_label =
+                                pretty_badge_name(&badge.name, &badge.version);
+                            if extra_shared_badges
+                                .iter()
+                                .any(|b| std::ptr::eq(b, badge) || (b.name == badge.name && b.version == badge.version))
+                                && (badge.name == "moderator" || badge.name == "vip")
+                            {
+                                if let Some(src) = &shared_badge_tooltip_suffix {
+                                    tooltip_label = format!("{tooltip_label} ({src})");
+                                }
+                            }
                             if let Some(url) = &badge.url {
                                 if let Some(&(w, h, ref raw)) = self.emote_bytes.get(url.as_str()) {
                                     let size = fit_size(w, h, BADGE_SIZE);
@@ -2271,12 +2334,11 @@ impl<'a> MessageList<'a> {
                             render_badge_fallback(ui, &badge.name, &badge.version, &tooltip_label);
                         }
 
-                        if let Some(status) = self
+                        if let Some(entry) = self
                             .low_trust_users
                             .get(&msg.sender.login.to_ascii_lowercase())
-                            .copied()
                         {
-                            render_low_trust_chip(ui, status);
+                            render_low_trust_chip(ui, entry.status);
                         }
 
                         // Sender name - clickable to open user profile card.
@@ -2419,7 +2481,7 @@ impl<'a> MessageList<'a> {
             let msg_frame_resp = prepared.end(ui);
 
             // Re-register the background click widget with the actual frame rect.
-            // Same `bg_click_id` → updates in-place, keeping low hit-test priority.
+            // Same `bg_click_id` -> updates in-place, keeping low hit-test priority.
             let bg_click = ui.interact(msg_frame_resp.rect, bg_click_id, egui::Sense::click());
             bg_click.context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
 
@@ -2445,13 +2507,12 @@ impl<'a> MessageList<'a> {
         if msg.raw_text.is_empty() {
             return None;
         }
-        crust_core::highlight::first_match_context(
+        crust_core::highlight::first_match_context_message(
             self.highlight_rules,
-            &msg.raw_text,
-            &msg.sender.login,
-            &msg.sender.display_name,
+            msg,
             self.channel.display_name(),
-            msg.flags.is_mention,
+            self.channel_live,
+            self.channel_watching,
         )
         .map(
             |(color, _show_in_mentions, _has_alert, _has_sound)| KeywordHighlightMatch {
@@ -2570,12 +2631,20 @@ impl<'a> MessageList<'a> {
             MsgKind::Raid {
                 display_name,
                 viewer_count,
-            } => (
-                t::raid_cyan(),
-                Some(format!(
+                source_login,
+            } => {
+                let mut text = format!(
                     "🎉  {display_name} is raiding with {viewer_count} viewers!"
-                )),
-            ),
+                );
+                if let Some(login) = source_login
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case(display_name))
+                {
+                    text.push_str(&format!(" (from {login})"));
+                }
+                (t::raid_cyan(), Some(text))
+            }
             MsgKind::Timeout { login, seconds } => {
                 let dur = if *seconds < 60 {
                     format!("{seconds}s")
@@ -2981,7 +3050,7 @@ impl<'a> MessageList<'a> {
                                 let host = url_hostname(url);
                                 ui.label(RichText::new(host).small().color(t::link()));
                                 ui.label(
-                                    RichText::new("Loading preview…")
+                                    RichText::new("Loading preview...")
                                         .small()
                                         .italics()
                                         .color(t::text_secondary()),
@@ -3147,7 +3216,7 @@ impl<'a> MessageList<'a> {
                                 RichText::new(ts).color(t::timestamp()).font(t::timestamps_font()),
                             ));
                             ui.add(Label::new(
-                                RichText::new("·").color(t::separator()).font(t::timestamps_font()),
+                                RichText::new("|").color(t::separator()).font(t::timestamps_font()),
                             ));
                         }
 
@@ -3234,9 +3303,13 @@ impl<'a> MessageList<'a> {
                         let low_trust = self
                             .low_trust_users
                             .get(&msg.sender.login.to_ascii_lowercase())
-                            .copied()
+                            .map(|e| e.status)
                             .unwrap_or(LowTrustStatus::Restricted);
                         render_low_trust_chip(ui, low_trust);
+
+                        if let Some(shared) = msg.shared.as_ref() {
+                            render_shared_chat_chip(ui, shared, self.emote_bytes);
+                        }
 
                         let name = if msg.flags.is_action {
                             format!("* {}:", msg.sender.display_name)
@@ -3457,9 +3530,9 @@ fn collapse_by_char_budget(text: &str, char_budget: usize) -> Option<String> {
 fn with_ellipsis(text: &str, cut: usize) -> String {
     let trimmed = text[..cut].trim_end();
     if trimmed.is_empty() {
-        "…".to_owned()
+        "...".to_owned()
     } else {
-        format!("{trimmed} …")
+        format!("{trimmed} ...")
     }
 }
 
@@ -4218,6 +4291,116 @@ fn pretty_badge_name(name: &str, version: &str) -> String {
     label
 }
 
+/// Shared Chat badge chip. Rendered at the start of the badge row so it
+/// stands out like a source-channel label. Mirrors Chatterino's "Shared
+/// Message from <sourceName>" badge (`BadgeElement` with
+/// `MessageElementFlag::BadgeSharedChannel` + `makeSharedChatBadge`):
+/// source-channel profile picture at ~18x18 when resolved, else a text
+/// fallback chip with the channel login.
+fn render_shared_chat_chip(
+    ui: &mut Ui,
+    shared: &crust_core::model::SharedChatSource,
+    emote_bytes: &HashMap<String, (u32, u32, Arc<[u8]>)>,
+) {
+    let who = shared
+        .display_name
+        .as_deref()
+        .or(shared.login.as_deref())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("another channel");
+    let tooltip = format!("Shared Message from {who}");
+
+    // Happy path: we have the source profile picture loaded.
+    if let Some(url) = shared.profile_url.as_deref().filter(|s| !s.is_empty()) {
+        if let Some(&(w, h, ref raw)) = emote_bytes.get(url) {
+            let size = fit_size(w, h, BADGE_SIZE);
+            let url_key = super::bytes_uri(url, raw);
+            // Round the avatar slightly so it reads as a profile picture
+            // rather than a flat badge. Chatterino does this via a circular
+            // image element; egui can only approximate with a rounded
+            // frame, but the tooltip carries the semantics.
+            let resp = egui::Frame::new()
+                .corner_radius(egui::CornerRadius::same(3))
+                .inner_margin(egui::Margin::same(0))
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Image::from_bytes(
+                            url_key.clone(),
+                            egui::load::Bytes::Shared(raw.clone()),
+                        )
+                        .fit_to_exact_size(size)
+                        .corner_radius(egui::CornerRadius::same(3)),
+                    );
+                })
+                .response;
+            resp.on_hover_ui_at_pointer(|ui| {
+                let tooltip_size = fit_size(w, h, TOOLTIP_BADGE_SIZE);
+                ui.set_max_width(200.0);
+                ui.vertical_centered(|ui| {
+                    ui.add(
+                        egui::Image::from_bytes(
+                            url_key.clone(),
+                            egui::load::Bytes::Shared(raw.clone()),
+                        )
+                        .fit_to_exact_size(tooltip_size),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(&tooltip).strong());
+                    if let Some(id) = &shared.source_message_id {
+                        ui.label(
+                            RichText::new(format!("source-id: {id}"))
+                                .color(t::separator())
+                                .font(t::tiny()),
+                        );
+                    }
+                });
+            });
+            return;
+        }
+    }
+
+    // Fallback: text-only chip with the resolved login (or a generic label
+    // while the Helix lookup is still in flight).
+    let label_text = shared
+        .display_name
+        .as_deref()
+        .or(shared.login.as_deref())
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("↗ {s}"))
+        .unwrap_or_else(|| "↗ Shared".to_owned());
+    let bg = Color32::from_rgb(112, 46, 158);
+    let fg = Color32::from_rgb(248, 235, 255);
+    let stroke = if t::is_light() {
+        bg.gamma_multiply(0.72)
+    } else {
+        bg.gamma_multiply(1.25)
+    };
+    let response = egui::Frame::new()
+        .fill(bg)
+        .stroke(egui::Stroke::new(1.0, stroke))
+        .corner_radius(egui::CornerRadius::same(4))
+        .inner_margin(egui::Margin::symmetric(3, 1))
+        .show(ui, |ui| {
+            ui.add(Label::new(
+                RichText::new(&label_text)
+                    .font(t::tiny())
+                    .color(fg)
+                    .strong(),
+            ));
+        })
+        .response;
+    response.on_hover_ui_at_pointer(|ui| {
+        ui.label(RichText::new(&tooltip).strong());
+        if let Some(id) = &shared.source_message_id {
+            ui.label(
+                RichText::new(format!("source-id: {id}"))
+                    .color(t::separator())
+                    .font(t::tiny()),
+            );
+        }
+    });
+}
+
 fn render_low_trust_chip(ui: &mut Ui, status: LowTrustStatus) {
     let (label, tooltip, bg, fg) = match status {
         LowTrustStatus::Restricted => (
@@ -4276,7 +4459,10 @@ fn render_badge_fallback(ui: &mut Ui, name: &str, version: &str, tooltip: &str) 
     response.on_hover_ui_at_pointer(|ui| {
         ui.vertical_centered(|ui| {
             ui.add(Label::new(
-                RichText::new(&chip_text).size(18.0).color(fg).strong(),
+                RichText::new(&chip_text)
+                    .size(t::chips_font_size())
+                    .color(fg)
+                    .strong(),
             ));
             ui.add_space(4.0);
             ui.label(RichText::new(tooltip).strong());
@@ -4802,6 +4988,7 @@ mod tests {
             flags: MessageFlags::default(),
             reply: None,
             msg_kind: MsgKind::Chat,
+            shared: None,
         }
     }
 
@@ -4979,7 +5166,7 @@ mod tests {
     fn collapse_message_for_display_collapses_after_newline_budget() {
         let text = "line1\nline2\nline3\nline4";
         let collapsed = collapse_message_for_display(text, 3);
-        assert_eq!(collapsed, Some("line1\nline2\nline3 …".to_owned()));
+        assert_eq!(collapsed, Some("line1\nline2\nline3 ...".to_owned()));
     }
 
     #[test]
@@ -4988,7 +5175,7 @@ mod tests {
         let collapsed = collapse_message_for_display(&text, 4);
         assert!(collapsed.is_some());
         let rendered = collapsed.unwrap_or_default();
-        assert!(rendered.ends_with('…'));
+        assert!(rendered.ends_with("..."));
         assert!(rendered.len() < text.len());
     }
 

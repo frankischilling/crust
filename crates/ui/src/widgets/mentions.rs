@@ -63,7 +63,7 @@ impl<'a> MentionsList<'a> {
                 bottom: 0,
             })
             .show(ui, |ui| {
-                // -- Sticky header (does not scroll) ----------------------
+                // Sticky header (does not scroll)
                 //
                 // Header gets the same `pad_x` as each row so the title
                 // and the channel pills/text below align perfectly.
@@ -89,7 +89,7 @@ impl<'a> MentionsList<'a> {
                 ui.add(egui::Separator::default().spacing(0.0));
                 ui.add_space(4.0);
 
-                // -- Empty state -----------------------------------------
+                // Empty state
                 if self.mentions.is_empty() {
                     ui.vertical_centered(|ui| {
                         ui.add_space(40.0);
@@ -112,7 +112,7 @@ impl<'a> MentionsList<'a> {
                     return;
                 }
 
-                // -- Scrollable list --------------------------------------
+                // Scrollable list
                 //
                 // Bound the ScrollArea to `available_height - bottom_pad`
                 // so the last row never lands flush with the central-panel
@@ -127,7 +127,7 @@ impl<'a> MentionsList<'a> {
                     .max_height(scroll_h)
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 1.0;
-                        // Oldest → newest; `stick_to_bottom` keeps the
+                        // Oldest -> newest; `stick_to_bottom` keeps the
                         // newest visible on arrival, matching the rest
                         // of the chat UI.
                         for msg in self.mentions.iter() {

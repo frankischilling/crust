@@ -4,10 +4,10 @@ use crust_core::model::ChannelId;
 /// Simple popup for joining a channel by name.
 ///
 /// Supports Twitch, Kick and generic IRC channels:
-/// - `channelname` or `twitch:channelname` → Twitch
-/// - `kick:channelname` → Kick
-/// - `irc://host[:port]/channel` or `ircs://host[:port]/channel` → IRC
-/// - `irc://host` or `ircs://host` → connect server tab, then `/join #channel`
+/// - `channelname` or `twitch:channelname` -> Twitch
+/// - `kick:channelname` -> Kick
+/// - `irc://host[:port]/channel` or `ircs://host[:port]/channel` -> IRC
+/// - `irc://host` or `ircs://host` -> connect server tab, then `/join #channel`
 #[derive(Default)]
 pub struct JoinDialog {
     pub open: bool,

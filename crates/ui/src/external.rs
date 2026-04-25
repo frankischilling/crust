@@ -1,6 +1,6 @@
 //! External-tool process spawners (Streamlink, custom player).
 //!
-//! Mirrors Chatterino's Streamlink integration: right-click a Twitch channel →
+//! Mirrors Chatterino's Streamlink integration: right-click a Twitch channel ->
 //! "Open in Streamlink" / "Open in player" spawns a detached process using
 //! configuration from `AppSettings::external_tools`.
 //!
@@ -119,7 +119,7 @@ fn spawn_with(cmd: &mut Command, program: &str) -> Result<Child, String> {
         Err(e) if e.kind() == ErrorKind::NotFound => {
             warn!("Spawn failed: {program} not found");
             Err(format!(
-                "`{program}` not found. Install it or set the full path in Settings → Integrations → External Tools."
+                "`{program}` not found. Install it or set the full path in Settings -> Integrations -> External Tools."
             ))
         }
         Err(e) => {
@@ -257,7 +257,7 @@ pub fn spawn_player(
     let template = template.trim();
     if template.is_empty() {
         return Err(
-            "Player command is empty. Set one in Settings → Integrations → External Tools."
+            "Player command is empty. Set one in Settings -> Integrations -> External Tools."
                 .to_owned(),
         );
     }

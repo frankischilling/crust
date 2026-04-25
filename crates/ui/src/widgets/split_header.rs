@@ -180,7 +180,7 @@ pub fn show_split_header(
     };
     if !compact {
         if let Some(meta_text) = meta_text.filter(|text| !text.is_empty()) {
-            title.push_str("  ·  ");
+            title.push_str("  |  ");
             title.push_str(meta_text);
         }
     }

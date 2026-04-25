@@ -1,0 +1,23 @@
+[package]
+name = "crust-webview-host"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Sidecar binary for Crust's Twitch auto-claim WebView."
+repository.workspace = true
+homepage.workspace = true
+
+[[bin]]
+# Host binary is named `crust-webview.exe` so the parent can locate it
+# next to `crust.exe` via a simple basename match.
+name = "crust-webview"
+path = "src/main.rs"
+
+[dependencies]
+crust-webview = { path = "../webview", version = "0.5.1" }
+wry = { version = "0.55", default-features = false, features = ["os-webview", "protocol"] }
+tao = "0.30"
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = "0.3"

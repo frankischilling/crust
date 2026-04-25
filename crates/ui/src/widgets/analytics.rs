@@ -1,11 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use egui::{Frame, RichText, ScrollArea, Ui};
 use serde::{Deserialize, Serialize};
 
-use crust_core::model::{ChannelState, MsgKind, Span};
+use crust_core::model::{ChannelId, ChannelState, MsgKind, Span};
 
 use crate::theme as t;
 
@@ -285,6 +285,17 @@ fn extract_twitch_emote_code(raw_text: &str, start: usize, end_inclusive: usize)
 
 // Widget
 
+/// One auto-claim event recorded for the analytics log.
+#[derive(Debug, Clone)]
+struct BonusClaimEntry {
+    at: DateTime<Utc>,
+    points: u64,
+    balance: u64,
+}
+
+/// Capped ring of recent claims per channel (most-recent first).
+const BONUS_CLAIM_LOG_LIMIT: usize = 30;
+
 pub struct AnalyticsPanel {
     time_window: TimeWindow,
     active_tab: Tab,
@@ -293,6 +304,7 @@ pub struct AnalyticsPanel {
     cached_window: Option<TimeWindow>,
     wipe_time: Option<DateTime<Utc>>,
     toast: Option<(String, Instant)>,
+    bonus_claims: HashMap<ChannelId, VecDeque<BonusClaimEntry>>,
 }
 
 impl Default for AnalyticsPanel {
@@ -305,11 +317,29 @@ impl Default for AnalyticsPanel {
             cached_window: None,
             wipe_time: None,
             toast: None,
+            bonus_claims: HashMap::new(),
         }
     }
 }
 
 impl AnalyticsPanel {
+    /// Append a single auto-claim event to the per-channel log.
+    pub fn record_bonus_claim(&mut self, channel: &ChannelId, points: u64, balance: u64) {
+        let entry = BonusClaimEntry {
+            at: Utc::now(),
+            points,
+            balance,
+        };
+        let log = self
+            .bonus_claims
+            .entry(channel.clone())
+            .or_insert_with(VecDeque::new);
+        log.push_front(entry);
+        while log.len() > BONUS_CLAIM_LOG_LIMIT {
+            log.pop_back();
+        }
+    }
+
     pub fn tick(&mut self, channel: &ChannelState) {
         let window_changed = self.cached_window != Some(self.time_window);
         let stale = self
@@ -453,7 +483,36 @@ impl AnalyticsPanel {
 
         let stats = self.cached.as_ref().unwrap();
         match self.active_tab {
-            Tab::Overview => show_overview(ui, stats),
+            Tab::Overview => {
+                show_overview(ui, stats);
+                if let Some(log) = self.bonus_claims.get(&channel.id) {
+                    if !log.is_empty() {
+                        ui.add_space(6.0);
+                        section_header(ui, "BONUS POINT CLAIMS");
+                        ui.add_space(3.0);
+                        let card = Frame::new()
+                            .fill(t::bg_raised())
+                            .corner_radius(t::RADIUS_SM)
+                            .inner_margin(egui::Margin::symmetric(8, 6));
+                        card.show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            for entry in log.iter().take(8) {
+                                let local = entry.at.with_timezone(&chrono::Local);
+                                let label = format!("{}", local.format("%H:%M:%S"));
+                                let value = format!("+{} (now {})", entry.points, entry.balance);
+                                stat_row(ui, &label, &value);
+                            }
+                            if log.len() > 8 {
+                                ui.label(
+                                    RichText::new(format!("+{} more this session", log.len() - 8))
+                                        .font(t::tiny())
+                                        .color(t::text_muted()),
+                                );
+                            }
+                        });
+                    }
+                }
+            }
             Tab::Chatters => show_chatters(ui, stats),
             Tab::Emotes => show_emotes(ui, stats),
             Tab::Activity => show_activity(ui, stats),
@@ -786,6 +845,7 @@ mod tests {
             flags: MessageFlags::default(),
             reply: None,
             msg_kind,
+            shared: None,
         }
     }
 

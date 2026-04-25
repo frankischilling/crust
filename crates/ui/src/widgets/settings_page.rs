@@ -110,6 +110,14 @@ pub struct SettingsPageState {
     pub timestamps_font_size: f32,
     /// Room-state pill size (pt).
     pub pills_font_size: f32,
+    /// Tooltip / popover label size (pt). 0.0 = auto.
+    pub popups_font_size: f32,
+    /// Inline chip / inline badge size (pt). 0.0 = auto.
+    pub chips_font_size: f32,
+    /// User-card heading size (pt). 0.0 = auto.
+    pub usercard_font_size: f32,
+    /// Login / dialog helper-text size (pt). 0.0 = auto.
+    pub dialog_font_size: f32,
     pub channel_layout: ChannelLayout,
     pub sidebar_visible: bool,
     pub analytics_visible: bool,
@@ -143,6 +151,12 @@ pub struct SettingsPageState {
     pub hotkey_capture_target: Option<crust_core::HotkeyAction>,
     /// Opt-in fetch of pronouns from alejo.io on user profile popup.
     pub show_pronouns_in_usercard: bool,
+    /// Opt-in auto-claim of channel-points "Bonus Points" rewards.
+    pub auto_claim_bonus_points: bool,
+    /// Last-known login state from the embedded webview. `None` = unknown.
+    pub twitch_webview_logged_in: Option<bool>,
+    /// Set to `true` when the user clicked "Open Twitch sign-in".
+    pub twitch_sign_in_requested: bool,
     pub plugin_statuses: Vec<PluginStatus>,
     pub plugin_ui: PluginUiSnapshot,
     pub plugin_reload_requested: bool,
@@ -212,6 +226,9 @@ pub struct SettingsPageState {
     pub spell_custom_dict: Vec<String>,
     /// One-shot input buffer for the "Add word" field in the settings page.
     pub spell_custom_dict_add_buf: String,
+    /// Advanced filter-expression editor modal state (shared by highlight
+    /// rules and filter records).
+    pub filter_editor_modal: super::filter_editor::FilterEditorModal,
 }
 
 /// Render the Hotkeys settings page - one row per rebindable action
@@ -324,7 +341,7 @@ fn render_hotkeys_section(ui: &mut egui::Ui, state: &mut SettingsPageState, comp
                     );
 
                     let button_label = if capture_active {
-                        "Press any key…".to_owned()
+                        "Press any key...".to_owned()
                     } else {
                         current.display_label()
                     };
@@ -398,9 +415,9 @@ fn render_hotkeys_section(ui: &mut egui::Ui, state: &mut SettingsPageState, comp
 
 /// Result of polling egui input for a hotkey-capture gesture.
 enum CaptureOutcome {
-    /// User pressed Escape → cancel capture, leave binding untouched.
+    /// User pressed Escape -> cancel capture, leave binding untouched.
     Cancel,
-    /// User pressed a non-modifier key → assign it as the new binding.
+    /// User pressed a non-modifier key -> assign it as the new binding.
     Binding(crust_core::KeyBinding),
 }
 
@@ -594,7 +611,7 @@ fn render_commands_section(ui: &mut egui::Ui, state: &mut SettingsPageState, com
     ui.label(
         RichText::new(
             "Define a trigger like `hi` and a body like `/me says hi {1} {2+}`. \
-             Variables: {1}, {2}, … {1+} (1st arg and everything after), {input}, \
+             Variables: {1}, {2}, ... {1+} (1st arg and everything after), {input}, \
              {channel}, {streamer}, {user}. Aliases whose body starts with /<cmd> \
              chain into the normal slash-command pipeline.",
         )
@@ -706,7 +723,7 @@ fn render_commands_section(ui: &mut egui::Ui, state: &mut SettingsPageState, com
                 if ui
                     .add(
                         egui::Button::new(
-                            RichText::new("❌").font(t::tiny()).color(t::red()),
+                            RichText::new("").font(t::tiny()).color(t::red()),
                         )
                         .min_size(action_btn_size),
                     )
@@ -1121,6 +1138,10 @@ fn render_settings_content(
                         ("Channel tabs", &mut state.tabs_font_size, 1.0),
                         ("Timestamps", &mut state.timestamps_font_size, 1.0),
                         ("Room-state pills", &mut state.pills_font_size, 2.0),
+                        ("Tooltips & popovers", &mut state.popups_font_size, 1.5),
+                        ("Inline chips", &mut state.chips_font_size, -4.5),
+                        ("User card heading", &mut state.usercard_font_size, -14.5),
+                        ("Dialog helper text", &mut state.dialog_font_size, 3.5),
                     ] {
                         let auto_value = (chat_font - auto_offset).max(8.5);
                         let mut is_auto = *slot <= 0.0;
@@ -1345,7 +1366,7 @@ fn render_settings_content(
                                 if ui
                                     .add(
                                         egui::Button::new(
-                                            RichText::new("❌").font(t::tiny()).color(t::red()),
+                                            RichText::new("").font(t::tiny()).color(t::red()),
                                         )
                                         .min_size(egui::vec2(24.0, 20.0)),
                                     )
@@ -1368,7 +1389,7 @@ fn render_settings_content(
                         });
                     }
 
-                    // -- Spell check -----------------------------------------
+                    // Spell check
                     ui.add_space(12.0);
                     ui.label(
                         RichText::new("Spell check")
@@ -1490,7 +1511,7 @@ fn render_settings_content(
                     }
                 }
                 SettingsSection::Highlights => {
-                    // -- Highlight rules table -----------------------------
+                    // Highlight rules table
                     ui.label(
                         RichText::new("Highlight Rules")
                             .font(t::small())
@@ -1519,61 +1540,63 @@ fn render_settings_content(
                     let mut move_up_idx: Option<usize> = None;
                     let mut move_down_idx: Option<usize> = None;
                     let mut duplicate_idx: Option<usize> = None;
-                    let action_btn_size = egui::vec2(26.0, 22.0);
+                    let action_btn_size =
+                        egui::vec2(26.0, super::filter_editor::ROW_BTN_HEIGHT);
 
+                    let mut open_modal_for: Option<usize> = None;
                     egui::Grid::new("highlight_rules_grid")
-                        .num_columns(10)
-                        .spacing(egui::vec2(8.0, 6.0))
+                        .num_columns(11)
+                        .spacing(egui::vec2(6.0, 6.0))
+                        .min_row_height(super::filter_editor::ROW_BTN_HEIGHT)
                         .show(ui, |ui| {
-                            // Header row
-                            ui.label(RichText::new("On").font(t::tiny()).color(t::text_muted()));
-                            ui.label(RichText::new("Pattern").font(t::tiny()).color(t::text_muted()));
-                            ui.label(RichText::new("Re").font(t::tiny()).color(t::text_muted())
-                                .strong());
-                            ui.label(RichText::new("Aa").font(t::tiny()).color(t::text_muted()));
-                            ui.label(RichText::new("Alert").font(t::tiny()).color(t::text_muted()));
-                            ui.label(RichText::new("Sound").font(t::tiny()).color(t::text_muted()));
-                            ui.label(RichText::new("").font(t::tiny()));
-                            ui.label(RichText::new("").font(t::tiny()));
-                            ui.label(RichText::new("").font(t::tiny()));
-                            ui.label(RichText::new("").font(t::tiny()));
+                            fn hdr(ui: &mut egui::Ui, s: &str) {
+                                ui.label(
+                                    RichText::new(s)
+                                        .font(t::tiny())
+                                        .color(t::text_muted())
+                                        .strong(),
+                                );
+                            }
+                            hdr(ui, "On");
+                            hdr(ui, "Mode");
+                            hdr(ui, "Pattern");
+                            hdr(ui, "Edit");
+                            hdr(ui, "Aa");
+                            hdr(ui, "Alert");
+                            hdr(ui, "Sound");
+                            hdr(ui, "Del");
+                            hdr(ui, "↑");
+                            hdr(ui, "↓");
+                            hdr(ui, "Dup");
                             ui.end_row();
 
                             for (i, rule) in state.highlight_rules.iter_mut().enumerate() {
                                 // Enabled toggle
                                 ui.checkbox(&mut rule.enabled, "");
 
-                                // Pattern text field
+                                // Mode cycler + pattern cell (Aa / .* / ƒx).
+                                let mut mode = super::filter_editor::EditorMode::from_highlight(
+                                    &rule.effective_mode(),
+                                );
                                 let buf = &mut state.highlight_rule_bufs[i];
-                                let te = egui::TextEdit::singleline(buf)
-                                    .desired_width(if compact { 90.0 } else { 140.0 })
-                                    .hint_text("keyword")
-                                    .text_color(if rule.enabled {
-                                        t::text_primary()
-                                    } else {
-                                        t::text_muted()
-                                    });
-                                let resp = ui.add(te);
-                                if resp.changed() {
-                                    rule.pattern = buf.clone();
-                                }
-
-                                // Regex toggle ("Re")
-                                let re_col = if rule.is_regex {
-                                    t::link()
-                                } else {
-                                    t::text_muted()
-                                };
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("Re").font(t::tiny()).color(re_col),
-                                        )
-                                        .min_size(action_btn_size),
-                                    )
-                                    .clicked()
-                                {
-                                    rule.is_regex = !rule.is_regex;
+                                let cell = super::filter_editor::render_pattern_cell(
+                                    ui,
+                                    &mut mode,
+                                    buf,
+                                    &mut rule.pattern,
+                                    "keyword or expression",
+                                    rule.enabled,
+                                    compact,
+                                );
+                                rule.mode = mode.to_highlight();
+                                // Reset legacy `is_regex` when picking a non-regex mode so
+                                // we don't accidentally re-interpret as regex later.
+                                rule.is_regex = matches!(
+                                    rule.mode,
+                                    crust_core::highlight::HighlightRuleMode::Regex
+                                );
+                                if cell.open_modal {
+                                    open_modal_for = Some(i);
                                 }
 
                                 // Case-sensitive toggle ("Aa")
@@ -1714,6 +1737,14 @@ fn render_settings_content(
                         state.highlight_rules.remove(idx);
                         state.highlight_rule_bufs.remove(idx);
                     }
+                    if let Some(idx) = open_modal_for {
+                        let initial = state
+                            .highlight_rule_bufs
+                            .get(idx)
+                            .cloned()
+                            .unwrap_or_default();
+                        state.filter_editor_modal.open_highlight(idx, &initial);
+                    }
 
                     if ui.button("+ Add rule").clicked() {
                         let new_rule = HighlightRule::new("");
@@ -1759,7 +1790,7 @@ fn render_settings_content(
                     ui.separator();
                     ui.add_space(4.0);
 
-                    // -- Ignored users -------------------------------------
+                    // Ignored users
                     ui.label(
                         RichText::new("Ignored usernames (one per line or comma-separated)")
                             .font(t::small())
@@ -1787,7 +1818,7 @@ fn render_settings_content(
                     ui.add_space(4.0);
                 }
                 SettingsSection::Filters => {
-                    // -- Filter Records table ------------------------------
+                    // Filter Records table
                     ui.label(
                         RichText::new("Filter Records (Hide/Dim Messages)")
                             .font(t::small())
@@ -1817,21 +1848,33 @@ fn render_settings_content(
                     let mut filter_move_down_idx: Option<usize> = None;
                     let mut filter_duplicate_idx: Option<usize> = None;
 
+                    let mut open_filter_modal_for: Option<usize> = None;
+                    let filter_btn_size =
+                        egui::vec2(26.0, super::filter_editor::ROW_BTN_HEIGHT);
                     egui::Grid::new("filter_records_grid")
-                        .num_columns(10)
-                        .spacing(egui::vec2(4.0, 4.0))
+                        .num_columns(11)
+                        .spacing(egui::vec2(6.0, 6.0))
+                        .min_row_height(super::filter_editor::ROW_BTN_HEIGHT)
                         .show(ui, |ui| {
-                            // Header row
-                            ui.label(RichText::new("On").font(t::tiny()).color(t::text_muted()));
-                            ui.label(RichText::new("Name").font(t::tiny()).color(t::text_muted()));
-                            ui.label(RichText::new("Pattern").font(t::tiny()).color(t::text_muted()));
-                            ui.label(RichText::new("Re").font(t::tiny()).color(t::text_muted()).strong());
-                            ui.label(RichText::new("User").font(t::tiny()).color(t::text_muted()));
-                            ui.label(RichText::new("Act").font(t::tiny()).color(t::text_muted()));
-                            ui.label(RichText::new("").font(t::tiny()));
-                            ui.label(RichText::new("").font(t::tiny()));
-                            ui.label(RichText::new("").font(t::tiny()));
-                            ui.label(RichText::new("").font(t::tiny()));
+                            fn hdr(ui: &mut egui::Ui, s: &str) {
+                                ui.label(
+                                    RichText::new(s)
+                                        .font(t::tiny())
+                                        .color(t::text_muted())
+                                        .strong(),
+                                );
+                            }
+                            hdr(ui, "On");
+                            hdr(ui, "Name");
+                            hdr(ui, "Mode");
+                            hdr(ui, "Pattern");
+                            hdr(ui, "Edit");
+                            hdr(ui, "User");
+                            hdr(ui, "Act");
+                            hdr(ui, "Del");
+                            hdr(ui, "↑");
+                            hdr(ui, "↓");
+                            hdr(ui, "Dup");
                             ui.end_row();
 
                             for (i, filter) in state.filter_records.iter_mut().enumerate() {
@@ -1839,39 +1882,37 @@ fn render_settings_content(
                                 ui.checkbox(&mut filter.enabled, "");
 
                                 // Name text field
-                                ui.add(egui::TextEdit::singleline(&mut filter.name).desired_width(60.0).hint_text("Name"));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut filter.name)
+                                        .desired_width(72.0)
+                                        .min_size(egui::vec2(
+                                            72.0,
+                                            super::filter_editor::ROW_BTN_HEIGHT,
+                                        ))
+                                        .hint_text("Name"),
+                                );
 
-                                // Pattern text field
+                                // Mode cycler + pattern cell
+                                let mut mode = super::filter_editor::EditorMode::from_filter(
+                                    &filter.effective_mode(),
+                                );
                                 let buf = &mut state.filter_record_bufs[i];
-                                let te = egui::TextEdit::singleline(buf)
-                                    .desired_width(if compact { 90.0 } else { 140.0 })
-                                    .hint_text("regex or keyword")
-                                    .text_color(if filter.enabled {
-                                        t::text_primary()
-                                    } else {
-                                        t::text_muted()
-                                    });
-                                let resp = ui.add(te);
-                                if resp.changed() {
-                                    filter.pattern = buf.clone();
-                                }
-
-                                // Regex toggle ("Re")
-                                let re_col = if filter.is_regex {
-                                    t::link()
-                                } else {
-                                    t::text_muted()
-                                };
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("Re").font(t::tiny()).color(re_col),
-                                        )
-                                        .min_size(egui::vec2(24.0, 20.0)),
-                                    )
-                                    .clicked()
-                                {
-                                    filter.is_regex = !filter.is_regex;
+                                let cell = super::filter_editor::render_pattern_cell(
+                                    ui,
+                                    &mut mode,
+                                    buf,
+                                    &mut filter.pattern,
+                                    "regex, keyword, or expression",
+                                    filter.enabled,
+                                    compact,
+                                );
+                                filter.mode = mode.to_filter();
+                                filter.is_regex = matches!(
+                                    filter.mode,
+                                    crust_core::model::filters::FilterMode::Regex
+                                );
+                                if cell.open_modal {
+                                    open_filter_modal_for = Some(i);
                                 }
 
                                 // Filter sender toggle
@@ -1885,7 +1926,7 @@ fn render_settings_content(
                                         egui::Button::new(
                                             RichText::new("👤").font(t::tiny()).color(user_col),
                                         )
-                                        .min_size(egui::vec2(24.0, 20.0)),
+                                        .min_size(filter_btn_size),
                                     )
                                     .on_hover_text("Filter by username instead of message content")
                                     .clicked()
@@ -1908,7 +1949,7 @@ fn render_settings_content(
                                         egui::Button::new(
                                             RichText::new(action_text).font(t::tiny()).color(action_col),
                                         )
-                                        .min_size(egui::vec2(24.0, 20.0)),
+                                        .min_size(filter_btn_size),
                                     )
                                     .on_hover_text("Toggle action: Hide vs Dim")
                                     .clicked()
@@ -1919,16 +1960,14 @@ fn render_settings_content(
                                     };
                                 }
 
-                                // Delete button
                                 if ui
                                     .add(
                                         egui::Button::new(
-                                            RichText::new("🗑").font(t::tiny()).color(
-                                                t::red(),
-                                            ),
+                                            RichText::new("🗑").font(t::tiny()).color(t::red()),
                                         )
-                                        .min_size(egui::vec2(20.0, 20.0)),
+                                        .min_size(filter_btn_size),
                                     )
+                                    .on_hover_text("Delete filter")
                                     .clicked()
                                 {
                                     filter_delete_idx = Some(i);
@@ -1939,7 +1978,7 @@ fn render_settings_content(
                                         egui::Button::new(
                                             RichText::new("↑").font(t::tiny()).color(t::text_secondary()),
                                         )
-                                        .min_size(egui::vec2(20.0, 20.0)),
+                                        .min_size(filter_btn_size),
                                     )
                                     .on_hover_text("Move filter up")
                                     .clicked()
@@ -1952,7 +1991,7 @@ fn render_settings_content(
                                         egui::Button::new(
                                             RichText::new("↓").font(t::tiny()).color(t::text_secondary()),
                                         )
-                                        .min_size(egui::vec2(20.0, 20.0)),
+                                        .min_size(filter_btn_size),
                                     )
                                     .on_hover_text("Move filter down")
                                     .clicked()
@@ -1965,7 +2004,7 @@ fn render_settings_content(
                                         egui::Button::new(
                                             RichText::new("⎘").font(t::tiny()).color(t::text_secondary()),
                                         )
-                                        .min_size(egui::vec2(20.0, 20.0)),
+                                        .min_size(filter_btn_size),
                                     )
                                     .on_hover_text("Duplicate filter")
                                     .clicked()
@@ -2001,6 +2040,21 @@ fn render_settings_content(
                         state.filter_records.remove(idx);
                         state.filter_record_bufs.remove(idx);
                     }
+                    if let Some(idx) = open_filter_modal_for {
+                        let initial = state
+                            .filter_record_bufs
+                            .get(idx)
+                            .cloned()
+                            .unwrap_or_default();
+                        let name = state
+                            .filter_records
+                            .get(idx)
+                            .map(|r| r.name.clone())
+                            .unwrap_or_default();
+                        state
+                            .filter_editor_modal
+                            .open_filter(idx, &initial, &name);
+                    }
 
                     if ui.button("+ Add filter").clicked() {
                         use crust_core::model::filters::{FilterRecord, FilterScope};
@@ -2011,9 +2065,11 @@ fn render_settings_content(
 
                     ui.add_space(8.0);
                     ui.label(
-                        RichText::new("💡 Tip: Use regex mode for advanced patterns like \\b(spam|scam)\\b")
-                            .font(t::tiny())
-                            .color(t::text_muted()),
+                        RichText::new(
+                            "💡 Tip: set mode to ƒx for filter DSL expressions like `author.subscriber && message.content contains \"gg\"`",
+                        )
+                        .font(t::tiny())
+                        .color(t::text_muted()),
                     );
                 }
                 SettingsSection::Nicknames => {
@@ -2112,7 +2168,7 @@ fn render_settings_content(
                                 if ui
                                     .add(
                                         egui::Button::new(
-                                            RichText::new("❌").font(t::tiny()).color(t::red()),
+                                            RichText::new("").font(t::tiny()).color(t::red()),
                                         )
                                         .min_size(action_btn_size),
                                     )
@@ -2222,7 +2278,7 @@ fn render_settings_content(
                                 if ui
                                     .add(
                                         egui::Button::new(
-                                            RichText::new("❌").font(t::tiny()).color(t::red()),
+                                            RichText::new("").font(t::tiny()).color(t::red()),
                                         )
                                         .min_size(action_btn_size),
                                     )
@@ -2365,7 +2421,7 @@ fn render_settings_content(
                                 if ui
                                     .add(
                                         egui::Button::new(
-                                            RichText::new("❌").font(t::tiny()).color(t::red()),
+                                            RichText::new("").font(t::tiny()).color(t::red()),
                                         )
                                         .min_size(action_btn_size),
                                     )
@@ -2526,6 +2582,48 @@ fn render_settings_content(
                     );
                     ui.add_space(8.0);
                     ui.label(
+                        RichText::new("Channel Points")
+                            .font(t::small())
+                            .strong()
+                            .color(t::text_primary()),
+                    );
+                    ui.checkbox(
+                        &mut state.auto_claim_bonus_points,
+                        "Auto-claim Bonus Points",
+                    );
+                    ui.label(
+                        RichText::new(
+                            "Silently claims the Bonus Points button on every joined Twitch channel as soon as it appears. Also displays your point balance in the channel header.\n\nRequires the Twitch session token (auth-token cookie) to be set under External Tools - the chat OAuth token will not work for this. With no session token set, balance and auto-claim do nothing.",
+                        )
+                        .font(t::tiny())
+                        .color(t::text_muted()),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let (badge_text, badge_col) = match state.twitch_webview_logged_in {
+                            Some(true)  => ("Signed in",   t::green()),
+                            Some(false) => ("Not signed in", t::red()),
+                            None        => ("Unknown",      t::text_muted()),
+                        };
+                        ui.label(
+                            RichText::new(format!("Twitch browser session: {badge_text}"))
+                                .font(t::tiny())
+                                .color(badge_col),
+                        );
+                        if ui.button("Open Twitch sign-in").clicked() {
+                            state.twitch_sign_in_requested = true;
+                        }
+                    });
+                    ui.label(
+                        RichText::new(
+                            "Opens an embedded browser window where you can sign in to twitch.tv. \
+                             Cookies are stored under the Crust config directory and persist across restarts.",
+                        )
+                        .font(t::tiny())
+                        .color(t::text_muted()),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
                         RichText::new("Lua Plugins")
                             .font(t::small())
                             .strong()
@@ -2648,7 +2746,7 @@ fn render_settings_content(
                     );
                     ui.label(
                         RichText::new(
-                            "Used by right-click → “Open in Streamlink” and “Open in player” on a Twitch channel.",
+                            "Used by right-click -> 'Open in Streamlink' and 'Open in player' on a Twitch channel.",
                         )
                         .font(t::tiny())
                         .color(t::text_muted()),
@@ -2768,7 +2866,7 @@ fn render_settings_content(
                     );
                     ui.label(
                         RichText::new(
-                            "When set, Streamlink is launched with `--twitch-api-header \"Authorization=OAuth <token>\" --twitch-purge-client-integrity` so Turbo / subscriber ad-skip applies and age-gated streams play. Get the value from your browserDevTools → Application → Cookies → twitch.tv → the `auth-token` row (hex string, ~30 chars). The chat OAuth token will not work here; Twitch rejects it.",
+                            "When set, Streamlink is launched with `--twitch-api-header \"Authorization=OAuth <token>\" --twitch-purge-client-integrity` so Turbo / subscriber ad-skip applies and age-gated streams play. Get the value from your browserDevTools -> Application -> Cookies -> twitch.tv -> the `auth-token` row (hex string, ~30 chars). The chat OAuth token will not work here; Twitch rejects it.",
                         )
                         .font(t::tiny())
                         .color(t::text_muted()),
@@ -2961,4 +3059,19 @@ pub fn show_settings_page(
                 });
             }
         });
+
+    // Render the shared advanced-expression modal (no-op when closed).
+    // This is drawn above the settings window so the user can tweak the
+    // expression without losing the underlying row's context.
+    {
+        let (hi_rules, hi_bufs, fi_records, fi_bufs) = (
+            state.highlight_rules.as_mut_slice(),
+            state.highlight_rule_bufs.as_mut_slice(),
+            state.filter_records.as_mut_slice(),
+            state.filter_record_bufs.as_mut_slice(),
+        );
+        state
+            .filter_editor_modal
+            .show(ctx, hi_rules, hi_bufs, fi_records, fi_bufs);
+    }
 }

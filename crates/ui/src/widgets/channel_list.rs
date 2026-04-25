@@ -11,7 +11,7 @@ pub struct ChannelList<'a> {
     pub channels: &'a [ChannelId],
     pub active: Option<&'a ChannelId>,
     pub channel_states: &'a HashMap<ChannelId, ChannelState>,
-    /// Optional map of channel-login → is_live for drawing live status dots.
+    /// Optional map of channel-login -> is_live for drawing live status dots.
     pub live_channels: Option<&'a HashMap<String, bool>>,
     pub show_live_indicator: bool,
     pub show_close_button: bool,
@@ -44,11 +44,11 @@ pub struct ChannelListResult {
     /// True while a drag is actively in progress (for rendering drop-zone
     /// overlay in the central panel).
     pub dragging_outside: bool,
-    /// Right-click → "Open in Streamlink" (Twitch channels only).
+    /// Right-click -> "Open in Streamlink" (Twitch channels only).
     pub open_streamlink: Option<ChannelId>,
-    /// Right-click → "Open in player" (Twitch channels only).
+    /// Right-click -> "Open in player" (Twitch channels only).
     pub open_player: Option<ChannelId>,
-    /// Right-click → "Hide when offline" toggled. Holds the new rule
+    /// Right-click -> "Hide when offline" toggled. Holds the new rule
     /// the caller should persist + mirror into app state.
     pub visibility_change: Option<(ChannelId, TabVisibilityRule)>,
 }
@@ -321,7 +321,7 @@ impl<'a> ChannelList<'a> {
                                 .map(|p| p.x > sidebar_rect.right() + 30.0)
                                 .unwrap_or(false);
                             if outside {
-                                // Pointer released outside sidebar → split pane
+                                // Pointer released outside sidebar -> split pane
                                 result.drag_split = Some(self.channels[ds.dragging_idx].clone());
                             } else {
                                 let raw = ds.insert_before;
@@ -604,7 +604,7 @@ impl<'a> ChannelList<'a> {
                     }
                 }
 
-                // -- Floating drag ghost --------------------------
+                // Floating drag ghost
                 // Rendered on a foreground layer, follows the cursor.
                 if let Some(ref ds) = drag {
                     if let Some(pos) = ui.ctx().pointer_latest_pos() {

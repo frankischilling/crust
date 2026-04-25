@@ -138,6 +138,10 @@ pub struct UserProfilePopup {
     /// Stored by lowercase login so `set_profile` can merge them in when the
     /// profile finally loads.  `Some(None)` means "fetch confirmed unspecified".
     pending_pronouns: std::collections::HashMap<String, Option<String>>,
+    /// Tri-state follow-age resolution for the channel this card was opened in.
+    /// `None` = not yet known, `Some(None)` = confirmed not following,
+    /// `Some(Some(ts))` = following since the ISO 8601 timestamp.
+    follow_age_resolved: Option<Option<String>>,
 }
 
 impl UserProfilePopup {
@@ -167,6 +171,40 @@ impl UserProfilePopup {
         self.ivr_logs_error = None;
         self.ivr_logs_requested = false;
         self.shared_channels.clear();
+        self.follow_age_resolved = None;
+    }
+
+    /// Apply a silent Helix follow-age lookup result to the popup. Only
+    /// applied when the popup is still showing the same login + channel.
+    pub fn set_follow_age_resolved(
+        &mut self,
+        login: &str,
+        channel: &ChannelId,
+        followed_at: Option<String>,
+    ) {
+        let channel_matches = self
+            .channel
+            .as_ref()
+            .map(|c| c == channel)
+            .unwrap_or(false);
+        if !channel_matches {
+            return;
+        }
+        let login_matches = match self.profile.as_ref() {
+            Some(p) => p.login.eq_ignore_ascii_case(login),
+            None => self.loading_login.eq_ignore_ascii_case(login),
+        };
+        if !login_matches {
+            return;
+        }
+        if let Some(ref ts) = followed_at {
+            if let Some(p) = self.profile.as_mut() {
+                if p.followed_at.is_none() {
+                    p.followed_at = Some(ts.clone());
+                }
+            }
+        }
+        self.follow_age_resolved = Some(followed_at);
     }
 
     /// Store pre-filtered chat logs for this user (called from `app.rs` when
@@ -307,7 +345,7 @@ impl UserProfilePopup {
         ui.add_space(20.0);
         ui.vertical_centered(|ui| {
             ui.label(
-                RichText::new("Loading profile…")
+                RichText::new("Loading profile...")
                     .color(t::text_secondary())
                     .italics(),
             );
@@ -372,7 +410,7 @@ impl UserProfilePopup {
                     av_rect.center(),
                     egui::Align2::CENTER_CENTER,
                     initial.to_string(),
-                    egui::FontId::proportional(28.0),
+                    t::usercard_font(),
                     t::text_primary(),
                 );
             }
@@ -391,7 +429,7 @@ impl UserProfilePopup {
                     ui.add(egui::Label::new(
                         RichText::new(&profile.display_name)
                             .strong()
-                            .size(16.0)
+                            .size((t::usercard_font_size() * 0.57).max(10.0))
                             .color(t::text_primary()),
                     ));
                     if profile.is_live {
@@ -403,7 +441,7 @@ impl UserProfilePopup {
                                 ui.add(egui::Label::new(
                                     RichText::new("● LIVE")
                                         .color(t::text_on_accent())
-                                        .size(10.0)
+                                        .size((t::usercard_font_size() * 0.36).max(8.0))
                                         .strong(),
                                 ));
                             });
@@ -417,7 +455,7 @@ impl UserProfilePopup {
                                 ui.add(egui::Label::new(
                                     RichText::new("BANNED")
                                         .color(t::text_on_accent())
-                                        .size(10.0)
+                                        .size((t::usercard_font_size() * 0.36).max(8.0))
                                         .strong(),
                                 ));
                             });
@@ -819,11 +857,17 @@ impl UserProfilePopup {
                 if let Some(ref pronouns) = profile.pronouns {
                     add_row("Pronouns", pronouns.clone());
                 }
-                if let Some(ref ts) = profile.followed_at {
-                    let age = fmt_follow_age(ts);
-                    if !age.is_empty() {
-                        add_row("Follow age", age);
+                match (&self.follow_age_resolved, &profile.followed_at) {
+                    (Some(Some(ts)), _) | (None, Some(ts)) => {
+                        let age = fmt_follow_age(ts);
+                        if !age.is_empty() {
+                            add_row("Follow age", age);
+                        }
                     }
+                    (Some(None), _) => {
+                        add_row("Follow age", "Not following".to_owned());
+                    }
+                    (None, None) => {}
                 }
                 if let Some(ref ts) = profile.created_at {
                     add_row("Account age", fmt_account_age(ts));
@@ -949,7 +993,7 @@ impl UserProfilePopup {
         ui.add_sized(
             [ui.available_width(), 22.0],
             egui::TextEdit::singleline(&mut self.mod_reason)
-                .hint_text("e.g. spam, hate speech…")
+                .hint_text("e.g. spam, hate speech...")
                 .font(t::small()),
         );
         ui.add_space(6.0);
@@ -1214,7 +1258,7 @@ impl UserProfilePopup {
             ui.add_space(8.0);
             ui.vertical_centered(|ui| {
                 ui.label(
-                    RichText::new("Fetching logs…")
+                    RichText::new("Fetching logs...")
                         .color(t::text_secondary())
                         .italics(),
                 );
@@ -1499,7 +1543,9 @@ fn badge_text_pill(ui: &mut egui::Ui, name: &str) {
         .inner_margin(egui::Margin::symmetric(4, 1))
         .show(ui, |ui| {
             ui.add(egui::Label::new(
-                RichText::new(name).color(text_col).size(10.0),
+                RichText::new(name)
+                    .color(text_col)
+                    .size((t::usercard_font_size() * 0.36).max(8.0)),
             ));
         });
 }
@@ -1723,7 +1769,7 @@ fn fmt_uptime(ts: &str) -> String {
 }
 
 /// Parse an ISO 8601 UTC datetime into Unix seconds.
-/// Handles `"YYYY-MM-DDTHH:MM:SSZ"`, `"…+00:00"`, and fractional seconds.
+/// Handles `"YYYY-MM-DDTHH:MM:SSZ"`, `"...+00:00"`, and fractional seconds.
 fn iso_to_unix_secs(ts: &str) -> Option<u64> {
     let ts = ts.trim_end_matches('Z');
     let ts = match ts.rfind('+') {
@@ -1751,7 +1797,7 @@ fn iso_to_unix_secs(ts: &str) -> Option<u64> {
     let min: u64 = tp[1].parse().ok()?;
     let sec: u64 = tp[2].parse().ok()?;
 
-    // Gregorian date → Julian Day Number → Unix days
+    // Gregorian date -> Julian Day Number -> Unix days
     let a = (14 - month) / 12;
     let yy = year + 4800 - a;
     let mm = month + 12 * a - 3;

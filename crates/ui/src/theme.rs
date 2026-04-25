@@ -34,6 +34,10 @@ pub const DEFAULT_TOPBAR_FONT_SIZE: f32 = 0.0;
 pub const DEFAULT_TABS_FONT_SIZE: f32 = 0.0;
 pub const DEFAULT_TIMESTAMPS_FONT_SIZE: f32 = 0.0;
 pub const DEFAULT_PILLS_FONT_SIZE: f32 = 0.0;
+pub const DEFAULT_POPUPS_FONT_SIZE: f32 = 0.0;
+pub const DEFAULT_CHIPS_FONT_SIZE: f32 = 0.0;
+pub const DEFAULT_USERCARD_FONT_SIZE: f32 = 0.0;
+pub const DEFAULT_DIALOG_FONT_SIZE: f32 = 0.0;
 pub const MIN_SECTION_FONT_SIZE: f32 = 8.0;
 pub const MAX_SECTION_FONT_SIZE: f32 = 28.0;
 
@@ -61,6 +65,10 @@ static TOPBAR_FONT_SIZE_BITS: AtomicU32 = AtomicU32::new(0);
 static TABS_FONT_SIZE_BITS: AtomicU32 = AtomicU32::new(0);
 static TIMESTAMPS_FONT_SIZE_BITS: AtomicU32 = AtomicU32::new(0);
 static PILLS_FONT_SIZE_BITS: AtomicU32 = AtomicU32::new(0);
+static POPUPS_FONT_SIZE_BITS: AtomicU32 = AtomicU32::new(0);
+static CHIPS_FONT_SIZE_BITS: AtomicU32 = AtomicU32::new(0);
+static USERCARD_FONT_SIZE_BITS: AtomicU32 = AtomicU32::new(0);
+static DIALOG_FONT_SIZE_BITS: AtomicU32 = AtomicU32::new(0);
 
 fn load_f32(slot: &AtomicU32, fallback: f32) -> f32 {
     let bits = slot.load(Ordering::Relaxed);
@@ -192,6 +200,80 @@ pub fn timestamps_font() -> FontId {
 #[inline]
 pub fn pills_font() -> FontId {
     FontId::proportional(pills_font_size())
+}
+
+/// Tooltip / popover label size (effective pt). Auto-follows chat at -1.5.
+#[inline]
+pub fn popups_font_size() -> f32 {
+    effective_section(&POPUPS_FONT_SIZE_BITS, 1.5)
+}
+#[inline]
+pub fn popups_font_size_raw() -> f32 {
+    raw_section_font(&POPUPS_FONT_SIZE_BITS)
+}
+#[inline]
+pub fn set_popups_font_size(size: f32) -> f32 {
+    set_section_font(&POPUPS_FONT_SIZE_BITS, size)
+}
+#[inline]
+pub fn popups_font() -> FontId {
+    FontId::proportional(popups_font_size())
+}
+
+/// Inline chip / inline badge size (effective pt). Auto-follows chat at +4.5
+/// so default lands near the original 18pt for viewer-count chips.
+#[inline]
+pub fn chips_font_size() -> f32 {
+    effective_section(&CHIPS_FONT_SIZE_BITS, -4.5)
+}
+#[inline]
+pub fn chips_font_size_raw() -> f32 {
+    raw_section_font(&CHIPS_FONT_SIZE_BITS)
+}
+#[inline]
+pub fn set_chips_font_size(size: f32) -> f32 {
+    set_section_font(&CHIPS_FONT_SIZE_BITS, size)
+}
+#[inline]
+pub fn chips_font() -> FontId {
+    FontId::proportional(chips_font_size())
+}
+
+/// User-card heading size (effective pt). Auto-follows chat at +14.5
+/// so default lands near the original 28pt username heading.
+#[inline]
+pub fn usercard_font_size() -> f32 {
+    effective_section(&USERCARD_FONT_SIZE_BITS, -14.5)
+}
+#[inline]
+pub fn usercard_font_size_raw() -> f32 {
+    raw_section_font(&USERCARD_FONT_SIZE_BITS)
+}
+#[inline]
+pub fn set_usercard_font_size(size: f32) -> f32 {
+    set_section_font(&USERCARD_FONT_SIZE_BITS, size)
+}
+#[inline]
+pub fn usercard_font() -> FontId {
+    FontId::proportional(usercard_font_size())
+}
+
+/// Login / setup dialog helper-text size (effective pt).
+#[inline]
+pub fn dialog_font_size() -> f32 {
+    effective_section(&DIALOG_FONT_SIZE_BITS, 3.5)
+}
+#[inline]
+pub fn dialog_font_size_raw() -> f32 {
+    raw_section_font(&DIALOG_FONT_SIZE_BITS)
+}
+#[inline]
+pub fn set_dialog_font_size(size: f32) -> f32 {
+    set_section_font(&DIALOG_FONT_SIZE_BITS, size)
+}
+#[inline]
+pub fn dialog_font() -> FontId {
+    FontId::proportional(dialog_font_size())
 }
 
 /// Switch to dark mode.

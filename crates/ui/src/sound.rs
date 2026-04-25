@@ -288,9 +288,9 @@ impl SoundController {
     ///
     /// | Event              | Signature                                     |
     /// | ------------------ | --------------------------------------------- |
-    /// | `Mention`          | two-tone bing-bong 880 Hz → 660 Hz            |
+    /// | `Mention`          | two-tone bing-bong 880 Hz -> 660 Hz            |
     /// | `Whisper`          | soft single low ding at 520 Hz                |
-    /// | `Subscribe`        | rising major-triad arpeggio C5 → E5 → G5      |
+    /// | `Subscribe`        | rising major-triad arpeggio C5 -> E5 -> G5      |
     /// | `Raid`             | urgent two-pulse 988 Hz repeat                |
     /// | `CustomHighlight`  | crisp double-tap at 784 Hz                    |
     ///

@@ -76,11 +76,11 @@ pub fn is_correct(word: &str) -> bool {
     {
         return true;
     }
-    // Contains digits → likely a number / username / emote code
+    // Contains digits -> likely a number / username / emote code
     if trimmed.chars().any(|c| c.is_ascii_digit()) {
         return true;
     }
-    // Mixed-case interior (e.g. "PogChamp", "catJAM") → likely emote
+    // Mixed-case interior (e.g. "PogChamp", "catJAM") -> likely emote
     if looks_like_emote(trimmed) {
         return true;
     }
