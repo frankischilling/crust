@@ -9,10 +9,12 @@ members = [
     "crates/emotes",
     "crates/storage",
     "crates/uploader",
+    "crates/webview",
+    "crates/webview-host",
 ]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 authors = ["crust contributors"]
 license = "GPL-3.0-only"

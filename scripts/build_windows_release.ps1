@@ -6,12 +6,16 @@ $repoRoot = Resolve-Path (Join-Path $scriptDir "..")
 Push-Location $repoRoot
 
 try {
-    Write-Host "[1/4] Building crust release binary..."
-    cargo build -p crust --release
+    Write-Host "[1/4] Building crust + crust-webview release binaries..."
+    cargo build -p crust -p crust-webview-host --release
 
     $exePath = Join-Path $repoRoot "target\release\crust.exe"
     if (-not (Test-Path $exePath)) {
         throw "Release binary not found at $exePath"
+    }
+    $webviewPath = Join-Path $repoRoot "target\release\crust-webview.exe"
+    if (-not (Test-Path $webviewPath)) {
+        throw "Webview sidecar not found at $webviewPath"
     }
 
     $metadata = cargo metadata --format-version 1 --no-deps | ConvertFrom-Json
@@ -32,6 +36,7 @@ try {
 
     Write-Host "[2/4] Copying artifacts..."
     Copy-Item $exePath (Join-Path $stagingDir "crust.exe") -Force
+    Copy-Item $webviewPath (Join-Path $stagingDir "crust-webview.exe") -Force
     Copy-Item (Join-Path $repoRoot "README.md") (Join-Path $stagingDir "README.md") -Force
     Copy-Item (Join-Path $repoRoot "LICENSE") (Join-Path $stagingDir "LICENSE") -Force
 

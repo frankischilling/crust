@@ -146,6 +146,93 @@ Channel snapshot fields:
 - `kick`
 - `irc`
 
+## Filter Engine
+
+Crust exposes the Chatterino-compatible filter expression language to
+plugins. See the appendix in the main parity doc for grammar.
+
+### `c2.filters_parse(expression)`
+
+Parse and type-check a filter expression against the chat-message typing
+context. Returns a table:
+
+- on success: `{ ok = true, type = "Bool" }` (the `type` field is the
+  label of the result type, usually `Bool`)
+- on failure: `{ ok = false, error = "<message>" }`
+
+### `c2.filters_evaluate(expression, context)`
+
+Parse, type-check, and evaluate `expression` against a Lua table of
+identifier -> value bindings.
+
+- `expression`: filter expression string
+- `context`: table keyed by identifier name (`author.login`,
+  `message.content`, `channel.name`, `flags.reply`, ...). Values may be
+  booleans, numbers, strings, or string-array tables.
+
+Return values:
+
+- on success: a boolean (the expression's truthiness)
+- on parse / type error: `nil, error_message`
+
+Identifiers that are not present in `context` resolve to
+`false` / empty string / empty list, matching Chatterino's lenient
+runtime semantics.
+
+## Uploader
+
+### `c2.upload_image(channel, bytes_b64, format, source_path?)`
+
+Queue an image upload through the configured uploader endpoint.
+
+- `channel`: channel snapshot table (e.g. `ctx.channel`)
+- `bytes_b64`: base64-encoded image bytes
+- `format`: file extension without the dot (`"png"`, `"gif"`, `"jpeg"`)
+- `source_path`: optional original on-disk path
+
+The upload progresses asynchronously. Subscribe to
+`c2.EventType.UploadStarted` and `c2.EventType.UploadFinished` to observe
+progress; on success the resolved URL is also appended to the input
+buffer of `channel` by the host.
+
+## Sound Events
+
+### `c2.set_sound_settings(events)`
+
+Replace the full per-event sound settings map. `events` is keyed by
+event name (`mention`, `whisper`, `subscribe`, `raid`,
+`custom_highlight`); each value is a table of `{ enabled, path, volume }`.
+Missing keys fall back to the host default.
+
+Subscribe to `c2.EventType.SoundSettingsUpdated` to observe the current
+snapshot (emitted on startup and after every successful change).
+
+### `c2.get_sound_settings()`
+
+Return the current per-event sound settings map. Same shape as the
+`events` argument to `set_sound_settings`. Useful when a plugin loads
+after the startup `SoundSettingsUpdated` snapshot has fired. Returns
+host defaults if no snapshot has been cached yet.
+
+## Hotkeys
+
+### `c2.set_hotkey_bindings(bindings)`
+
+Replace the full hotkey binding map. `bindings` is keyed by action key
+(`zoom_in`, `open_quick_switcher`, `next_tab`, ...); each value is a table
+of `{ ctrl, shift, alt, command, key }`. Missing keys keep their prior
+(or default) binding.
+
+Subscribe to `c2.EventType.HotkeyBindingsUpdated` to observe the current
+snapshot (emitted on startup and after every successful change).
+
+### `c2.get_hotkey_bindings()`
+
+Return the current hotkey binding map. Same shape as the `bindings`
+argument to `set_hotkey_bindings`. Useful when a plugin loads after the
+startup `HotkeyBindingsUpdated` snapshot has fired. Returns the built-in
+defaults if no snapshot has been cached yet.
+
 ## Example
 
 ```lua

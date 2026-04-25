@@ -15,12 +15,31 @@ if ! command -v dpkg-deb >/dev/null 2>&1; then
     exit 1
 fi
 
-echo "[1/5] Building crust release binary..."
-cargo build -p crust --release
+missing_pkgs=()
+for pc in webkit2gtk-4.1 libsoup-3.0 javascriptcoregtk-4.1 gtk+-3.0; do
+    if ! pkg-config --exists "${pc}" 2>/dev/null; then
+        missing_pkgs+=("${pc}")
+    fi
+done
+if [[ ${#missing_pkgs[@]} -gt 0 ]]; then
+    echo "Missing pkg-config packages required by crust-webview sidecar:" >&2
+    printf '  %s\n' "${missing_pkgs[@]}" >&2
+    echo "On Debian / Ubuntu install with:" >&2
+    echo "  sudo apt install libwebkit2gtk-4.1-dev libsoup-3.0-dev libgtk-3-dev libjavascriptcoregtk-4.1-dev pkg-config build-essential" >&2
+    exit 1
+fi
+
+echo "[1/5] Building crust + crust-webview release binaries..."
+cargo build -p crust -p crust-webview-host --release
 
 bin_path="${repo_root}/target/release/crust"
 if [[ ! -f "${bin_path}" ]]; then
     echo "Release binary not found at ${bin_path}" >&2
+    exit 1
+fi
+webview_path="${repo_root}/target/release/crust-webview"
+if [[ ! -f "${webview_path}" ]]; then
+    echo "Webview sidecar not found at ${webview_path}" >&2
     exit 1
 fi
 
@@ -43,6 +62,7 @@ mkdir -p "${pkg_root}/usr/share/doc/crust"
 mkdir -p "${pkg_root}/usr/share/icons/hicolor/scalable/apps"
 
 install -m 0755 "${bin_path}" "${pkg_root}/usr/bin/crust"
+install -m 0755 "${webview_path}" "${pkg_root}/usr/bin/crust-webview"
 install -m 0644 "${repo_root}/README.md" "${pkg_root}/usr/share/doc/crust/README.md"
 install -m 0644 "${repo_root}/LICENSE" "${pkg_root}/usr/share/doc/crust/LICENSE"
 install -m 0644 "${repo_root}/crates/app/resources/crust.desktop" \
@@ -57,7 +77,7 @@ Section: net
 Priority: optional
 Architecture: ${arch}
 Maintainer: crust contributors <noreply@github.com>
-Depends: libc6, libgcc-s1, libstdc++6
+Depends: libc6, libgcc-s1, libstdc++6, libwebkit2gtk-4.1-0 | libwebkit2gtk-4.0-37
 Description: Native Twitch chat client desktop application
  Crust is a native desktop chat client focused on Twitch.
 EOF

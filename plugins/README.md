@@ -29,6 +29,7 @@ On Windows, the default location is:
 - [`ui_window_showcase_plugin`](./ui_window_showcase_plugin) - floating retained plugin UI window with host-form fields, submit handling, and a `link_button`
 - [`ui_settings_demo_plugin`](./ui_settings_demo_plugin) - retained plugin settings page with host-form submit handling
 - [`ui_host_panels_demo_plugin`](./ui_host_panels_demo_plugin) - retained host panels rendered into `settings.appearance`, `sidebar.top`, and `channel_header`
+- [`c9_api_expansion_demo`](./c9_api_expansion_demo) - exercises the filter engine, sound/hotkey snapshots, and upload events exposed by the C9 plugin API expansion
 
 ## Install
 
@@ -45,6 +46,7 @@ cp -r plugins/channel_toolbox_plugin ~/.local/share/crust/plugins/
 cp -r plugins/ui_window_showcase_plugin ~/.local/share/crust/plugins/
 cp -r plugins/ui_settings_demo_plugin ~/.local/share/crust/plugins/
 cp -r plugins/ui_host_panels_demo_plugin ~/.local/share/crust/plugins/
+cp -r plugins/c9_api_expansion_demo ~/.local/share/crust/plugins/
 ```
 
 Then restart Crust or run `/reloadplugins`.

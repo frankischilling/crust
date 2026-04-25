@@ -27,21 +27,17 @@ Kick support is currently super cooked and munted (very incomplete / unstable).
 - [Crust docs home](docs/HOME.md)
 - [Features and keybinds](docs/FEATURES_AND_KEYBINDS.md)
 - [Plugin API reference](docs/API.md)
-- [Release notes v0.4.5](docs/Release_v0.4.5.md)
-- [Release notes v0.4.3](docs/Release_v0.4.3.md)
-- [Release notes v0.4.2](docs/Release_v0.4.2.md)
-
-See:
-
-- [docs/REFERENCE_POLICY.md](docs/REFERENCE_POLICY.md)
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-- [CONTRIBUTING.md](CONTRIBUTING.md)
+- [Release notes v0.5.1](docs/releases/Release_v0.5.1.md)
+- [Release notes v0.5.0](docs/releases/Release_v0.5.0.md)
+- [Release notes v0.4.9](docs/releases/Release_v0.4.9.md)
+- [Release notes v0.4.5](docs/releases/Release_v0.4.5.md)
 
 ## Features
 
 ### Platforms and transports
 
 - Twitch chat via IRC over WebSocket (anonymous and authenticated modes)
+- Twitch EventSub coverage: subs / gift subs / raids / channel-points redemptions / poll + prediction lifecycle / stream `online` + `offline` / hype-train begin/progress/end / moderator + AutoMod + suspicious-user + whisper topics, with `session_reconnect` continuity, 10 000-entry event-id LRU dedupe, and per-reconnect backfill
 - Kick chat integration (beta / currently incomplete)
 - Generic IRC integration (beta), including IRC server tabs and keyed channel joins
 - IRC channel redirect handling (old channel target -> new channel target)
@@ -78,6 +74,8 @@ See:
 - Message types rendered in chat include:
   - standard chat and actions
   - subscriptions, raids, bits, channel points redemptions
+  - hype train begin/progress/end with progress bar + level + top contributor (`channel.hype_train.*` EventSub)
+  - shared chat (cross-channel mirror) with source-channel chip, source mod/vip badges, and notification suppression for already-open source channels
   - timeout/ban/clear notices and system notices
   - first-message and pinned-message indicators
 - Inline reply/thread support with reply metadata
@@ -99,6 +97,9 @@ See:
 - `:` emote autocomplete and Tab completion
 - Slash command handling for chat, moderation, and creator workflows
 - Command usage tracking for ranking/autocomplete improvements
+- Custom command aliases (`/hi = /me says hi {1}`) with `{channel}`, `{user}`, `{input}`, `{streamer}` variables
+- Spellcheck on the input box (Norvig + Soundex + QWERTY proximity) with right-click suggestions and a personal dictionary
+- Image paste / drag-drop uploader (Imgur, Nuuls, ShareX SXCU, or any custom multipart endpoint)
 
 ### Emotes, badges, and cosmetics
 
@@ -138,11 +139,15 @@ See:
   - timeout/ban/unban/warn
   - delete message
   - clear user messages locally
-  - suspicious-user monitor/restrict/clear
+  - suspicious-user / low-trust monitor + restrict + clear
   - AutoMod message approve/deny
   - unban request fetch/resolve
 - Moderation presets for reusable actions
-- Moderation tools window and workflow links
+- Moderation tools window with dedicated AutoMod / Low-trust / Unban-requests tabs:
+  - per-tab item-count badges
+  - shared filter strip (login or message text)
+  - per-row approve / deny actions and bulk approve / bulk deny
+  - keyboard nav: `J` / `K` focus, `A` / `D` approve / deny, `Shift+A` / `Shift+D` bulk, `Tab` / `Shift+Tab` switch tab
 - Creator tools:
   - polls (create/end/cancel)
   - predictions (create/lock/resolve/cancel)
@@ -151,14 +156,19 @@ See:
   - announcements
   - shoutouts
   - reward redemption status updates
+  - auto-claim of channel-points "Bonus Points" button (Crust-only; opt-in, via embedded Twitch webview)
 
 ### Profiles, stream state, and notifications
 
-- User profile popup with account metadata, avatar/badges, and recent messages
+- User profile popup with account metadata, avatar/badges, recent messages, follow age, account age, shared-channels list, and prior-timeouts log in moderator view
 - Stream status fetch and live/offline updates
 - Stream watch/tracker behavior for channel presence indicators
+- Live / followed-channels feed virtual tab fed by `stream.online` / `stream.offline` EventSub
+- Mentions-only cross-channel feed tab with restart-survival via local SQLite log
+- Tab visibility rules ("Hide when offline" per-channel)
 - Desktop notifications for mentions/highlights/whispers (configurable)
 - In-app event toast banners for high-visibility events
+- Per-event sound notifications (mention / whisper / subscribe / raid / custom highlight) with file-path + volume sliders, baked-in synthetic ping fallback, and streamer-mode mute integration
 
 ### Accounts, auth, and settings
 
@@ -171,12 +181,21 @@ See:
 - Settings persistence for:
   - general behavior (timestamps, local log indexing, auto-join, ignores/highlights)
   - appearance/layout
+  - per-section font sizes (chat body, UI scale, topbar, tabs, timestamps, pills, popups, chips, usercard, dialog)
   - chat UI behavior
   - notification preferences
-  - emote picker preferences
+  - emote picker preferences (favorites, recents, provider boost)
   - highlight rules
-  - filter records
+  - filter records (typed expression DSL with `author.*`, `message.*`, `channel.*`, `flags.*`, `has.*`)
+  - ignored users + ignored phrases
   - mod action presets
+  - sound events (per-event enabled / file path / volume)
+  - hotkey bindings (rebindable, conflict detection)
+  - command aliases
+  - tab visibility rules
+  - image uploader endpoint config
+  - external tools (Streamlink path, quality, extra args, custom player template)
+  - streamer mode (link previews, viewer counts, sound suppression while live)
   - beta feature flags
 
 ### Search, history, and local data
@@ -191,13 +210,16 @@ See:
 
 - Lua plugin runtime with plugin lifecycle management
 - Plugin command registration and execution
-- Event callback registration across account/chat/settings/moderation/UI events
+- Event callback registration across account/chat/settings/moderation/UI events including `SoundSettingsUpdated`, `HotkeyBindingsUpdated`, `UploadStarted`, `UploadFinished`, `FontSettingsUpdated`
 - Plugin UI surfaces:
   - custom windows
   - settings pages
   - host-panel extensions
 - Host callback helpers for image fetch, profile fetch, link preview fetch, and IVR log fetch
-- Example plugin set in [plugins](plugins/)
+- Filter engine bridge: `c2.filters_parse(expr)` / `c2.filters_evaluate(expr, ctx)` for the typed expression DSL
+- Image uploader bridge: `c2.upload_image(channel, bytes_b64, format, source_path?)`
+- Sound + hotkey bridges: `c2.set_sound_settings(events)` / `c2.get_sound_settings()` and `c2.set_hotkey_bindings(bindings)` / `c2.get_hotkey_bindings()`
+- Example plugin set in [plugins](plugins/) including `c9_api_expansion_demo` exercising every new surface
 
 ### Updater and release flow
 
@@ -209,21 +231,37 @@ See:
 - Background and manual update check flows
 - PowerShell launch fallback chain for installer reliability
 
+### Reliability
+
+- Crash handler with persistent reports under `{data_dir}/logs/crashes/`:
+  - structured panic reports (version, target triple, run id, OS / arch / display server, pid, thread, payload, force-captured backtrace, last ~512 tracing events, live settings snapshot)
+  - synthetic "abnormal exit" reports on SIGKILL / power loss / native crash detected via session sentinel
+  - rolling 20-report + 40-sentinel retention
+  - in-app crash viewer with View / Copy / Show on disk / Delete / Dismiss / Restart actions
+
 ## Workspace layout
 
 - `crates/app` - binary entrypoint, runtime wiring, reducer/event loop
 - `crates/ui` - `egui` application and widgets
-- `crates/core` - shared domain models, events, tokenizer/highlight/state
-- `crates/twitch` - IRC parser + Twitch session client/reconnect/rate limiting
+- `crates/core` - shared domain models, events, tokenizer / highlight / filter DSL / hotkeys / sound / state
+- `crates/twitch` - IRC parser + Twitch session client / reconnect / rate limiting / EventSub / Helix / GraphQL providers
+- `crates/kick` - Kick chat session (beta)
 - `crates/emotes` - provider loaders and image cache (memory + disk)
-- `crates/storage` - settings/token + log storage
+- `crates/storage` - settings / token / log storage and persistence
+- `crates/uploader` - image-upload backend (Imgur, Nuuls, ShareX SXCU, custom)
+- `crates/webview` / `crates/webview-host` - embedded Twitch webview for auth + auto-claim flows
 
 ## Requirements
 
 - Rust stable toolchain (edition 2021)
 - Cargo
 - Linux desktop dependencies for `eframe`/`winit` (X11 or Wayland)
+- Linux dev dependencies for the embedded Twitch webview sidecar (`crust-webview`): WebKitGTK 4.1, libsoup 3, GTK 3
+  - Ubuntu / Debian: `sudo apt install libwebkit2gtk-4.1-dev libsoup-3.0-dev libgtk-3-dev libjavascriptcoregtk-4.1-dev pkg-config build-essential`
+  - Fedora: `sudo dnf install webkit2gtk4.1-devel libsoup3-devel gtk3-devel pkgconf-pkg-config`
+  - Arch: `sudo pacman -S webkit2gtk-4.1 libsoup3 gtk3 pkgconf`
 - Windows 10/11 or Debian-based Linux for built-in auto-install updates
+- Windows: WebView2 Runtime (preinstalled on Windows 11; Windows 10 may need the Evergreen runtime from Microsoft)
 
 ## Build and run
 

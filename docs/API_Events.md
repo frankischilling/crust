@@ -209,9 +209,9 @@ Fields:
 `state` is currently rendered to one of these strings:
 
 - `Disconnected`
-- `Connecting…`
+- `Connecting...`
 - `Connected`
-- `Reconnecting (attempt N)…`
+- `Reconnecting (attempt N)...`
 - `Error: ...`
 
 ### `c2.EventType.AuthExpired`
@@ -839,6 +839,53 @@ Notes:
 
 - this event is emitted when the user closes a floating plugin window through the window chrome
 - calling `c2.ui.close_window(id)` updates retained state but does not emit `PluginUiWindowClosed`
+
+## Subsystem Settings Events
+
+### `c2.EventType.SoundSettingsUpdated`
+
+Full snapshot of per-event sound notification settings.
+
+Fields:
+
+- `events`: table keyed by event name (`mention`, `whisper`, `subscribe`, `raid`, `custom_highlight`). Each value has:
+  - `enabled`: boolean
+  - `path`: file path (empty string = built-in default ping)
+  - `volume`: linear `[0.0, 1.0]`
+
+Notes:
+
+- emitted once at startup with the persisted settings and after every successful `c2.set_sound_settings` call
+- missing events in the snapshot fall back to host defaults
+
+### `c2.EventType.HotkeyBindingsUpdated`
+
+Full snapshot of rebindable hotkeys.
+
+Fields:
+
+- `bindings`: table keyed by action name (`zoom_in`, `open_quick_switcher`, `next_tab`, ...). Each value has:
+  - `ctrl`, `shift`, `alt`, `command`: booleans
+  - `key`: stable key name (`"K"`, `"Tab"`, `"PageUp"`, ...). Empty = unbound.
+
+Notes:
+
+- emitted once at startup (persisted bindings, or defaults) and after every successful `c2.set_hotkey_bindings` call
+
+### `c2.EventType.UploadStarted`
+
+Fields:
+
+- `channel`: channel snapshot table (the channel whose input initiated the upload)
+
+### `c2.EventType.UploadFinished`
+
+Fields:
+
+- `channel`: channel snapshot table
+- `ok`: boolean
+- `url`: resolved image URL (only when `ok == true`)
+- `error`: error message (only when `ok == false`)
 
 ## Example
 

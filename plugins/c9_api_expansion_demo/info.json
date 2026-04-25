@@ -1,0 +1,9 @@
+{
+  "name": "C9 API Expansion Demo",
+  "description": "Exercises filter engine, sound/hotkey snapshots, and upload events exposed in C9.",
+  "authors": ["Crust"],
+  "version": "1.0.0",
+  "license": "MIT",
+  "permissions": [],
+  "entry": "init.lua"
+}

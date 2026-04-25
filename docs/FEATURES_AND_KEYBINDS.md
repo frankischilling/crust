@@ -73,7 +73,7 @@ This page is a practical reference for what crust can do today: major features, 
 - Keyring-backed token storage with fallback
 - IRC identity settings (nick and NickServ auth)
 - Persisted settings for appearance, behavior, notifications, rules, filters, presets, and beta flags
-- Remappable keyboard shortcuts: every binding routes through a central hotkey registry; rebind from Settings → Hotkeys with conflict detection
+- Remappable keyboard shortcuts: every binding routes through a central hotkey registry; rebind from Settings -> Hotkeys with conflict detection
 - Custom command aliases: user-defined `/trigger = body` pairs with `{1}`, `{1+}`, `{channel}`, `{user}`, `{input}`, `{streamer}` variables
 - Spellcheck with personal dictionary: underlines misspelled words in the chat input, right-click for top 5 suggestions or "Add to dictionary"
 - Sound event system: per-event ping sounds for mention / whisper / subscribe / raid / highlight, with per-event volume and streamer-mode muting
@@ -106,7 +106,7 @@ This page is a practical reference for what crust can do today: major features, 
 
 ## Keybinds
 
-All shortcuts below are defaults. Every binding can be remapped from Settings → Hotkeys; conflicts are flagged inline.
+All shortcuts below are defaults. Every binding can be remapped from Settings -> Hotkeys; conflicts are flagged inline.
 
 ### Global and navigation
 
@@ -241,7 +241,7 @@ This is the built-in command surface in the UI parser. Unknown commands are pass
 
 ### User-defined aliases
 
-User-defined command aliases (Settings → Commands) dispatch after the built-in table. Aliases support the variables `{1}`, `{1+}`, `{channel}`, `{user}`, `{input}`, and `{streamer}`, and recursive alias chains are rejected at save time.
+User-defined command aliases (Settings -> Commands) dispatch after the built-in table. Aliases support the variables `{1}`, `{1+}`, `{channel}`, `{user}`, `{input}`, and `{streamer}`, and recursive alias chains are rejected at save time.
 
 ### IRC-focused commands
 
