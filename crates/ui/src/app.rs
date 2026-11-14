@@ -13256,10 +13256,17 @@ mod tests {
             }
             fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
         }
-        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<WorkRecord>>>);
+        struct Capture(Option<std::sync::Arc<std::sync::Mutex<Vec<WorkRecord>>>>);
         impl tracing::Subscriber for Capture {
             fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-                metadata.target() == "crust_ui::timing"
+                self.0.is_some() && metadata.target() == "crust_ui::timing"
+            }
+            fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+                Some(if self.0.is_some() {
+                    tracing::metadata::LevelFilter::TRACE
+                } else {
+                    tracing::metadata::LevelFilter::OFF
+                })
             }
             fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
                 tracing::span::Id::from_u64(1)
@@ -13269,14 +13276,29 @@ mod tests {
             fn enter(&self, _: &tracing::span::Id) {}
             fn exit(&self, _: &tracing::span::Id) {}
             fn event(&self, event: &tracing::Event<'_>) {
+                let Some(records) = &self.0 else { return };
                 let mut record = WorkRecord::default();
                 event.record(&mut record);
-                self.0.lock().unwrap().push(record);
+                records.lock().unwrap().push(record);
             }
         }
 
         let records = std::sync::Arc::new(std::sync::Mutex::new(Vec::<WorkRecord>::new()));
-        tracing::subscriber::with_default(Capture(records.clone()), || {
+        // Register both interests before enabling tracing, so another test thread cannot
+        // cache a new callsite using only its empty thread-local subscriber.
+        let _disabled = tracing::Dispatch::new(Capture(None));
+        tracing::subscriber::with_default(Capture(Some(records.clone())), || {
+            fn capture_probe() {
+                tracing::debug!(target: "crust_ui::timing", "capture probe");
+            }
+            // A parallel test can register a callsite before the capturing thread uses it.
+            std::thread::spawn(capture_probe).join().unwrap();
+            assert!(records.lock().unwrap().is_empty(), "foreign-thread events must not be captured");
+            capture_probe();
+            assert_eq!(records.lock().unwrap().len(), 1,
+                "a callsite first visited without a subscriber must still be captured");
+            records.lock().unwrap().clear();
+
             let (mut app, _commands) = test_app();
             let ctx = egui::Context::default();
             production_ui_frame(&ctx, &mut app, Vec::new());
