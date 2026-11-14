@@ -130,8 +130,7 @@ pub struct MessageFlags {
     pub custom_reward_id: Option<String>,
     /// True for messages loaded from chat history rather than received live.
     pub is_history: bool,
-    /// Equivalent to Chatterino's `MessageFlag::DoNotTriggerNotification`:
-    /// skip sound / desktop toast / mentions-feed side effects even when the
+    /// Skip sound, desktop toast, and mentions-feed side effects even when the
     /// message is highlighted. Set for Shared Chat mirrors whose source
     /// channel is also currently open.
     #[serde(default)]
@@ -142,8 +141,7 @@ pub struct MessageFlags {
 /// mirroring). Populated when the incoming message's `source-room-id` IRC tag
 /// (or EventSub `source_broadcaster_user_id`) differs from the current room.
 ///
-/// Upstream: see Chatterino `MessageBuilder::parseSharedChatInfo` + Twitch
-/// help article <https://help.twitch.tv/s/article/shared-chat>.
+/// See <https://help.twitch.tv/s/article/shared-chat>.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SharedChatSource {
     /// Numeric broadcaster user-id of the source channel.
@@ -159,9 +157,8 @@ pub struct SharedChatSource {
     /// Source-channel profile picture URL (for the shared-chat badge).
     #[serde(default)]
     pub profile_url: Option<String>,
-    /// Mod/VIP badges issued by the source channel (Chatterino only appends
-    /// moderator + vip from `source-badges` since other slots already overlap
-    /// with normal `badges`).
+    /// Moderator and VIP badges issued by the source channel. Other badge slots
+    /// overlap with the message's regular badges.
     #[serde(default)]
     pub badges: Vec<super::Badge>,
 }
@@ -216,7 +213,7 @@ pub struct EmoteCatalogEntry {
     pub url_hd: Option<String>,
     /// "global", "channel", or "personal".
     pub scope: String,
-    /// Channel that owns this entry; absent for global and personal entries.
+    /// Channel where this entry is available; personal entries may also be restricted.
     #[serde(default)]
     pub channel: Option<super::ChannelId>,
     /// Sender who may use this personal emote.
@@ -235,7 +232,11 @@ impl EmoteCatalogEntry {
     /// Larger values win when several available entries use the same code.
     pub fn resolution_priority(&self) -> u8 {
         if self.user_id.is_some() {
-            return if self.provider == "twitch" { 90 } else { 80 };
+            return match (self.provider.as_str(), self.channel.is_some()) {
+                ("twitch", true) => 95,
+                ("twitch", false) => 90,
+                _ => 80,
+            };
         }
         match (self.channel.is_some(), self.provider.as_str()) {
             (true, "kick") => 70,

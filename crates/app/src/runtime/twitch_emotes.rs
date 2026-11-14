@@ -1,10 +1,15 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::pin::Pin;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
+use crust_core::model::ChannelId;
 use crust_emotes::EmoteInfo;
 use serde::Deserialize;
 use tokio::task::JoinHandle;
+
+use super::emote_registry::TwitchFollowerTarget;
 
 const USER_EMOTES_URL: &str = "https://api.twitch.tv/helix/chat/emotes/user";
 const EMOTES_SCOPE: &str = "user:read:emotes";
@@ -15,6 +20,8 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_PAGES: usize = 100;
 const MAX_EMOTES: usize = 20_000;
 const MAX_PAGE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_REQUESTS: usize = 4;
+const MAX_FOLLOWER_EMOTES: usize = 256;
 
 #[derive(Debug)]
 enum LoadError {
@@ -45,6 +52,10 @@ struct UserEmote {
     format: Vec<String>,
     scale: Vec<String>,
     theme_mode: Vec<String>,
+    #[serde(default)]
+    emote_type: String,
+    #[serde(default)]
+    owner_id: String,
 }
 
 impl UserEmote {
@@ -115,39 +126,24 @@ async fn fetch_inventory_at(
     let mut cursors = HashSet::new();
     let mut after: Option<String> = None;
     for _ in 0..MAX_PAGES {
-        let mut request = client
-            .get(url)
-            .timeout(PAGE_TIMEOUT)
-            .bearer_auth(token.strip_prefix("oauth:").unwrap_or(token))
-            .header("Client-Id", client_id)
-            .query(&[("user_id", user_id)]);
-        if let Some(after) = &after {
-            request = request.query(&[("after", after)]);
-        }
-        let mut response = request.send().await.map_err(|_| LoadError::Transport)?;
-        if !response.status().is_success() {
-            return Err(LoadError::Http(response.status().as_u16()));
-        }
-        if response
-            .content_length()
-            .is_some_and(|bytes| bytes > MAX_PAGE_BYTES as u64)
-        {
-            return Err(LoadError::LimitExceeded);
-        }
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|_| LoadError::Transport)? {
-            if bytes.len().saturating_add(chunk.len()) > MAX_PAGE_BYTES {
-                return Err(LoadError::LimitExceeded);
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        let page: EmotePage = serde_json::from_slice(&bytes).map_err(|_| LoadError::InvalidData)?;
+        let page = fetch_page_at(
+            client,
+            url,
+            user_id,
+            client_id,
+            token,
+            None,
+            after.as_deref(),
+        )
+        .await?;
         for emote in page.data {
             if emote_ids.insert(emote.id.clone()) {
-                if emotes.len() >= MAX_EMOTES {
+                if emote_ids.len() > MAX_EMOTES {
                     return Err(LoadError::LimitExceeded);
                 }
-                emotes.push(emote.into_info(&page.template)?);
+                if emote.emote_type != "follower" {
+                    emotes.push(emote.into_info(&page.template)?);
+                }
             }
         }
         after = page.pagination.cursor.filter(|cursor| !cursor.is_empty());
@@ -162,18 +158,107 @@ async fn fetch_inventory_at(
     Err(LoadError::LimitExceeded)
 }
 
+async fn fetch_page_at(
+    client: &reqwest::Client,
+    url: &str,
+    user_id: &str,
+    client_id: &str,
+    token: &str,
+    broadcaster_id: Option<&str>,
+    after: Option<&str>,
+) -> Result<EmotePage, LoadError> {
+    let mut request = client
+        .get(url)
+        .timeout(PAGE_TIMEOUT)
+        .bearer_auth(token.strip_prefix("oauth:").unwrap_or(token))
+        .header("Client-Id", client_id)
+        .query(&[("user_id", user_id)]);
+    if let Some(broadcaster_id) = broadcaster_id {
+        request = request.query(&[("broadcaster_id", broadcaster_id)]);
+    }
+    if let Some(after) = after {
+        request = request.query(&[("after", after)]);
+    }
+    let mut response = request.send().await.map_err(|_| LoadError::Transport)?;
+    if !response.status().is_success() {
+        return Err(LoadError::Http(response.status().as_u16()));
+    }
+    if response
+        .content_length()
+        .is_some_and(|bytes| bytes > MAX_PAGE_BYTES as u64)
+    {
+        return Err(LoadError::LimitExceeded);
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| LoadError::Transport)? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_PAGE_BYTES {
+            return Err(LoadError::LimitExceeded);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).map_err(|_| LoadError::InvalidData)
+}
+
+async fn fetch_follower_inventory_at(
+    client: &reqwest::Client,
+    url: &str,
+    user_id: &str,
+    client_id: &str,
+    token: &str,
+    broadcaster_id: &str,
+) -> Result<Vec<EmoteInfo>, LoadError> {
+    // The service adds follower emotes to the first page. Further pages repeat
+    // the account inventory, which has its own paginated request.
+    let page = fetch_page_at(
+        client,
+        url,
+        user_id,
+        client_id,
+        token,
+        Some(broadcaster_id),
+        None,
+    )
+    .await?;
+    let mut emotes = Vec::new();
+    let mut ids = HashSet::new();
+    for emote in page.data {
+        if emote.emote_type != "follower" || emote.owner_id != broadcaster_id {
+            continue;
+        }
+        if ids.insert(emote.id.clone()) {
+            if emotes.len() >= MAX_FOLLOWER_EMOTES {
+                return Err(LoadError::LimitExceeded);
+            }
+            emotes.push(emote.into_info(&page.template)?);
+        }
+    }
+    Ok(emotes)
+}
+
 struct InventoryRequest {
     user_id: String,
     generation: u64,
     task: JoinHandle<Result<Vec<EmoteInfo>, LoadError>>,
 }
 
-/// Keep one private inventory request alive for the validated account.
+struct FollowerRequest {
+    target: TwitchFollowerTarget,
+    request: InventoryRequest,
+}
+
+enum Completion {
+    Account(Result<Vec<EmoteInfo>, LoadError>),
+    Follower(ChannelId, Result<Vec<EmoteInfo>, LoadError>),
+}
+
+/// Account and channel entitlements share a bounded request budget.
 #[derive(Default)]
 pub(crate) struct TwitchEmoteInventory {
     owner: Option<String>,
     request: Option<InventoryRequest>,
     next_request: Option<Instant>,
+    follower_requests: HashMap<ChannelId, FollowerRequest>,
+    follower_schedule: HashMap<ChannelId, (TwitchFollowerTarget, Instant)>,
 }
 
 impl TwitchEmoteInventory {
@@ -190,6 +275,10 @@ impl TwitchEmoteInventory {
             self.clear();
             return false;
         };
+        if self.owner.as_deref() != Some(user_id) {
+            self.clear();
+            self.owner = Some(user_id.to_owned());
+        }
         if !scopes.iter().any(|scope| scope == EMOTES_SCOPE) {
             self.clear();
             return index.write().unwrap().clear_twitch_inventory(user_id);
@@ -200,28 +289,69 @@ impl TwitchEmoteInventory {
         if token.trim().is_empty() {
             return false;
         }
-        if self.owner.as_deref() == Some(user_id)
-            && (self.request.is_some()
-                || self.next_request.is_some_and(|time| Instant::now() < time))
+        let now = Instant::now();
+        if self.request.is_none()
+            && self.follower_requests.len() < MAX_REQUESTS
+            && self.next_request.is_none_or(|due| now >= due)
         {
-            return false;
+            let owned_user = user_id.to_owned();
+            let owned_client = client_id.to_owned();
+            let owned_token = token.to_owned();
+            self.start_at(user_id, index, now, async move {
+                let client = reqwest::Client::builder()
+                    .connect_timeout(Duration::from_secs(5))
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .map_err(|_| LoadError::Transport)?;
+                tokio::time::timeout(
+                    LOAD_TIMEOUT,
+                    fetch_inventory_at(
+                        &client,
+                        USER_EMOTES_URL,
+                        &owned_user,
+                        &owned_client,
+                        &owned_token,
+                    ),
+                )
+                .await
+                .map_err(|_| LoadError::TimedOut)?
+            });
         }
-        let owned_user = user_id.to_owned();
-        let client_id = client_id.to_owned();
-        let token = token.to_owned();
-        self.start_at(user_id, index, Instant::now(), async move {
-            let client = reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(5))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .map_err(|_| LoadError::Transport)?;
-            tokio::time::timeout(
-                LOAD_TIMEOUT,
-                fetch_inventory_at(&client, USER_EMOTES_URL, &owned_user, &client_id, &token),
-            )
-            .await
-            .map_err(|_| LoadError::TimedOut)?
-        });
+        let mut targets = index.read().unwrap().twitch_follower_targets();
+        targets.sort_by(|left, right| left.channel.as_str().cmp(right.channel.as_str()));
+        self.retain_followers(&targets);
+        for target in targets {
+            if self.follower_requests.len() + usize::from(self.request.is_some()) >= MAX_REQUESTS {
+                break;
+            }
+            if !self.follower_due(&target, now) {
+                continue;
+            }
+            let owned_user = user_id.to_owned();
+            let owned_client = client_id.to_owned();
+            let owned_token = token.to_owned();
+            let room_id = target.room_id.clone();
+            self.start_follower_at(user_id, target, index, now, async move {
+                let client = reqwest::Client::builder()
+                    .connect_timeout(Duration::from_secs(5))
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .map_err(|_| LoadError::Transport)?;
+                tokio::time::timeout(
+                    LOAD_TIMEOUT,
+                    fetch_follower_inventory_at(
+                        &client,
+                        USER_EMOTES_URL,
+                        &owned_user,
+                        &owned_client,
+                        &owned_token,
+                        &room_id,
+                    ),
+                )
+                .await
+                .map_err(|_| LoadError::TimedOut)?
+            });
+        }
         false
     }
 
@@ -239,7 +369,10 @@ impl TwitchEmoteInventory {
             self.clear();
             self.owner = Some(user_id.to_owned());
         }
-        if self.request.is_some() || self.next_request.is_some_and(|time| now < time) {
+        if self.request.is_some()
+            || self.follower_requests.len() >= MAX_REQUESTS
+            || self.next_request.is_some_and(|time| now < time)
+        {
             return false;
         }
         let Some(generation) = index.write().unwrap().begin_twitch_inventory(user_id) else {
@@ -253,25 +386,121 @@ impl TwitchEmoteInventory {
         true
     }
 
+    fn retain_followers(&mut self, targets: &[TwitchFollowerTarget]) {
+        self.follower_requests.retain(|_, request| {
+            if targets.contains(&request.target) {
+                true
+            } else {
+                request.request.task.abort();
+                false
+            }
+        });
+        self.follower_schedule
+            .retain(|_, (target, _)| targets.contains(target));
+    }
+
+    fn start_follower_at<F>(
+        &mut self,
+        user_id: &str,
+        target: TwitchFollowerTarget,
+        index: &crate::EmoteIndex,
+        now: Instant,
+        load: F,
+    ) -> bool
+    where
+        F: Future<Output = Result<Vec<EmoteInfo>, LoadError>> + Send + 'static,
+    {
+        if self.owner.as_deref() != Some(user_id) {
+            self.clear();
+            self.owner = Some(user_id.to_owned());
+        }
+        if self.follower_requests.len() + usize::from(self.request.is_some()) >= MAX_REQUESTS
+            || !self.follower_due(&target, now)
+        {
+            return false;
+        }
+        let Some(generation) = index
+            .write()
+            .unwrap()
+            .begin_twitch_follower_inventory(user_id, &target)
+        else {
+            return false;
+        };
+        self.follower_requests.insert(
+            target.channel.clone(),
+            FollowerRequest {
+                target,
+                request: InventoryRequest {
+                    user_id: user_id.to_owned(),
+                    generation,
+                    task: tokio::spawn(load),
+                },
+            },
+        );
+        true
+    }
+
+    fn follower_due(&self, target: &TwitchFollowerTarget, now: Instant) -> bool {
+        !self.follower_requests.contains_key(&target.channel)
+            && self
+                .follower_schedule
+                .get(&target.channel)
+                .is_none_or(|(previous, due)| previous != target || now >= *due)
+    }
+
     pub(crate) fn has_pending(&self) -> bool {
-        self.request.is_some()
+        self.request.is_some() || !self.follower_requests.is_empty()
     }
 
     pub(crate) async fn complete_next(&mut self, index: &crate::EmoteIndex) -> bool {
-        let Some(request) = self.request.as_mut() else {
+        let Some(completion) = futures_util::future::poll_fn(|cx| {
+            if let Some(request) = self.request.as_mut() {
+                if let Poll::Ready(result) = Pin::new(&mut request.task).poll(cx) {
+                    return Poll::Ready(Some(Completion::Account(
+                        result.unwrap_or(Err(LoadError::TaskFailed)),
+                    )));
+                }
+            }
+            for (channel, request) in &mut self.follower_requests {
+                if let Poll::Ready(result) = Pin::new(&mut request.request.task).poll(cx) {
+                    return Poll::Ready(Some(Completion::Follower(
+                        channel.clone(),
+                        result.unwrap_or(Err(LoadError::TaskFailed)),
+                    )));
+                }
+            }
+            if self.has_pending() {
+                Poll::Pending
+            } else {
+                Poll::Ready(None)
+            }
+        })
+        .await
+        else {
             return false;
         };
-        let result = (&mut request.task)
-            .await
-            .unwrap_or(Err(LoadError::TaskFailed));
-        let request = self.request.take().unwrap();
-        let emotes = match result {
-            Ok(emotes) => {
-                self.next_request = Some(Instant::now() + REFRESH_INTERVAL);
-                Some(emotes)
+        let (request, target, result) = match completion {
+            Completion::Account(result) => (self.request.take().unwrap(), None, result),
+            Completion::Follower(channel, result) => {
+                let request = self.follower_requests.remove(&channel).unwrap();
+                (request.request, Some(request.target), result)
             }
+        };
+        let next_request = Instant::now()
+            + if result.is_ok() {
+                REFRESH_INTERVAL
+            } else {
+                RETRY_INTERVAL
+            };
+        if let Some(target) = &target {
+            self.follower_schedule
+                .insert(target.channel.clone(), (target.clone(), next_request));
+        } else {
+            self.next_request = Some(next_request);
+        }
+        let emotes = match result {
+            Ok(emotes) => Some(emotes),
             Err(error) => {
-                self.next_request = Some(Instant::now() + RETRY_INTERVAL);
                 match error {
                     LoadError::Http(status) => {
                         tracing::warn!("Twitch emote inventory request failed (HTTP {status})")
@@ -281,17 +510,27 @@ impl TwitchEmoteInventory {
                 None
             }
         };
-        index.write().unwrap().complete_twitch_inventory(
-            &request.user_id,
-            request.generation,
-            emotes,
-        )
+        let mut registry = index.write().unwrap();
+        if let Some(target) = target {
+            registry.complete_twitch_follower_inventory(
+                &request.user_id,
+                &target,
+                request.generation,
+                emotes,
+            )
+        } else {
+            registry.complete_twitch_inventory(&request.user_id, request.generation, emotes)
+        }
     }
 
     pub(crate) fn clear(&mut self) {
         if let Some(request) = self.request.take() {
             request.task.abort();
         }
+        for (_, request) in self.follower_requests.drain() {
+            request.request.task.abort();
+        }
+        self.follower_schedule.clear();
         self.owner = None;
         self.next_request = None;
     }
@@ -324,6 +563,13 @@ mod tests {
         serde_json::json!({"data": data, "template": TEMPLATE,
             "pagination": cursor.map(|cursor| serde_json::json!({"cursor": cursor})).unwrap_or(serde_json::json!({}))})
             .to_string()
+    }
+
+    fn follower_emote(id: &str, code: &str, owner: &str) -> serde_json::Value {
+        let mut value = emote(id, code);
+        value["emote_type"] = "follower".into();
+        value["owner_id"] = owner.into();
+        value
     }
 
     fn info(id: &str, code: &str) -> EmoteInfo {
@@ -461,6 +707,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn follower_query_uses_only_the_first_page_and_matching_channel_entitlements() {
+        let (url, server) = server(vec![(
+            200,
+            page(
+                vec![
+                    emote("sub", "AccountSub"),
+                    follower_emote("other", "OtherFollow", "999"),
+                    follower_emote("follow", "ChannelFollow", "123"),
+                    follower_emote("follow", "ChannelFollow", "123"),
+                ],
+                Some("account-next"),
+            ),
+        )])
+        .await;
+        let inventory = fetch_follower_inventory_at(
+            &reqwest::Client::new(),
+            &url,
+            "42",
+            "client",
+            "oauth:token",
+            "123",
+        )
+        .await
+        .unwrap();
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(inventory[0].id, "follow");
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let target = requests[0].split_whitespace().nth(1).unwrap();
+        let target = reqwest::Url::parse(&format!("http://test{target}")).unwrap();
+        let params: HashMap<_, _> = target.query_pairs().into_owned().collect();
+        assert_eq!(
+            params.get("broadcaster_id").map(String::as_str),
+            Some("123")
+        );
+        assert_eq!(params.get("user_id").map(String::as_str), Some("42"));
+        assert!(!params.contains_key("after"));
+        assert!(requests[0]
+            .to_ascii_lowercase()
+            .contains("authorization: bearer token\r\n"));
+    }
+
+    #[tokio::test]
+    async fn follower_responses_never_enter_the_account_wide_inventory() {
+        let (url, task) = server(vec![(
+            200,
+            page(
+                vec![
+                    follower_emote("follow", "ChannelOnly", "123"),
+                    emote("sub", "AccountSub"),
+                ],
+                None,
+            ),
+        )])
+        .await;
+        let inventory = fetch_inventory_at(&reqwest::Client::new(), &url, "42", "client", "token")
+            .await
+            .unwrap();
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(inventory[0].id, "sub");
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn valid_empty_inventory_is_distinct_from_a_malformed_response() {
         for (body, valid) in [(page(Vec::new(), None), true), ("{}".into(), false)] {
             let (url, task) = server(vec![(200, body)]).await;
@@ -485,6 +795,136 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(3), requests.complete_next(index))
             .await
             .unwrap()
+    }
+
+    fn follower_target(index: &crate::EmoteIndex, room: &str) -> TwitchFollowerTarget {
+        let channel = ChannelId::new(room);
+        let mut registry = index.write().unwrap();
+        registry.open_channel(&channel);
+        registry.begin_channel_load(&channel, room, false).unwrap();
+        registry
+            .twitch_follower_targets()
+            .into_iter()
+            .find(|target| target.channel == channel)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn follower_requests_share_the_budget_and_finish_without_waiting_for_account_inventory() {
+        let index = index("alice");
+        let targets: Vec<_> = (1..=4)
+            .map(|room| follower_target(&index, &room.to_string()))
+            .collect();
+        let mut requests = TwitchEmoteInventory::default();
+        assert!(requests.start_at("alice", &index, Instant::now(), std::future::pending()));
+        for target in &targets[..3] {
+            assert!(requests.start_follower_at(
+                "alice",
+                target.clone(),
+                &index,
+                Instant::now(),
+                async { Ok(vec![info("follow", "ChannelFollow")]) }
+            ));
+        }
+        assert!(!requests.start_follower_at(
+            "alice",
+            targets[3].clone(),
+            &index,
+            Instant::now(),
+            async { Ok(Vec::new()) }
+        ));
+        assert!(complete(&mut requests, &index).await);
+        assert!(requests
+            .request
+            .as_ref()
+            .is_some_and(|request| !request.task.is_finished()));
+        assert!(requests.start_follower_at(
+            "alice",
+            targets[3].clone(),
+            &index,
+            Instant::now(),
+            async { Ok(Vec::new()) }
+        ));
+        requests.clear();
+        assert!(!requests.has_pending());
+    }
+
+    #[tokio::test]
+    async fn follower_refresh_retries_failures_and_clears_successful_empty_results() {
+        let index = index("alice");
+        let target = follower_target(&index, "123");
+        let mut requests = TwitchEmoteInventory::default();
+        let now = Instant::now();
+        assert!(
+            requests.start_follower_at("alice", target.clone(), &index, now, async {
+                Ok(vec![info("follow", "ChannelFollow")])
+            })
+        );
+        assert!(complete(&mut requests, &index).await);
+        assert!(
+            !requests.start_follower_at("alice", target.clone(), &index, now, async {
+                Ok(Vec::new())
+            })
+        );
+        let due = requests.follower_schedule[&target.channel].1;
+        assert!(
+            requests.start_follower_at("alice", target.clone(), &index, due, async {
+                Err(LoadError::Transport)
+            })
+        );
+        assert!(!complete(&mut requests, &index).await);
+        assert!(index
+            .read()
+            .unwrap()
+            .twitch_for_channel_user(&target.channel, "alice", "ChannelFollow")
+            .is_some());
+        let due = requests.follower_schedule[&target.channel].1;
+        assert!(
+            requests.start_follower_at("alice", target.clone(), &index, due, async {
+                Ok(Vec::new())
+            })
+        );
+        assert!(complete(&mut requests, &index).await);
+        assert!(index
+            .read()
+            .unwrap()
+            .twitch_for_channel_user(&target.channel, "alice", "ChannelFollow")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn leaving_or_switching_accounts_cancels_follower_requests() {
+        let index = index("alice");
+        let target = follower_target(&index, "123");
+        let mut requests = TwitchEmoteInventory::default();
+        let (mut completion, pending) = tokio::sync::oneshot::channel();
+        assert!(requests.start_follower_at(
+            "alice",
+            target.clone(),
+            &index,
+            Instant::now(),
+            async { pending.await.unwrap() }
+        ));
+        index.write().unwrap().close_channel(&target.channel);
+        requests.retain_followers(&index.read().unwrap().twitch_follower_targets());
+        tokio::time::timeout(Duration::from_secs(3), completion.closed())
+            .await
+            .unwrap();
+        assert!(!requests.has_pending());
+
+        let target = follower_target(&index, "123");
+        let (mut completion, pending) = tokio::sync::oneshot::channel();
+        assert!(
+            requests.start_follower_at("alice", target, &index, Instant::now(), async {
+                pending.await.unwrap()
+            })
+        );
+        index.write().unwrap().set_account(Some("bob"));
+        assert!(requests.start_at("bob", &index, Instant::now(), async { Ok(Vec::new()) }));
+        tokio::time::timeout(Duration::from_secs(3), completion.closed())
+            .await
+            .unwrap();
+        assert!(requests.follower_requests.is_empty());
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 //! alejo.io pronouns provider (HTTP GET + in-memory TTL cache).
 //!
-//! Chatterino parity: the public API exposes two endpoints:
+//! The public API exposes two endpoints:
 //! - `GET /v1/pronouns` → map of `pronoun_id` → `{subject, object, singular}`.
 //! - `GET /v1/users/:login` → `{pronoun_id: "..."}` or 404 when unset.
 //!
@@ -19,7 +19,7 @@ const API_USERS: &str = "https://api.pronouns.alejo.io/v1/users";
 /// Cache TTL - pronoun choices change rarely, so a generous window keeps
 /// repeat usercard opens instant without blocking on the network.
 const CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 6);
-/// Request timeout for a single HTTP call (per chatterino's network defaults).
+/// Request timeout for a single HTTP call.
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(4_500);
 
 #[derive(Clone, Debug, PartialEq, Eq)]

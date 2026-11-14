@@ -5,7 +5,11 @@
 //! uploaded frame, rather than leaving old animation textures resident.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+mod animation;
 
 use egui::load::{
     ImageLoadResult, ImageLoader, ImagePoll, LoadError, SizeHint, SizedTexture, TextureLoadResult,
@@ -14,6 +18,33 @@ use egui::load::{
 
 const IMAGE_LOADER_ID: &str = "crust::bounded_image_loader";
 const TEXTURE_LOADER_ID: &str = "crust::bounded_texture_loader";
+const METRICS_ID: &str = "crust::image_work_metrics";
+
+#[derive(Default)]
+struct LoaderMetrics {
+    animation_bytes: AtomicUsize,
+    pending_decodes: AtomicUsize,
+    completed_decodes: AtomicU64,
+    decode_micros: AtomicU64,
+    texture_uploads: AtomicU64,
+    texture_upload_micros: AtomicU64,
+}
+
+pub(super) fn work_stats(ctx: &egui::Context) -> super::ImageWorkStats {
+    let Some(metrics) =
+        ctx.data(|data| data.get_temp::<Arc<LoaderMetrics>>(egui::Id::new(METRICS_ID)))
+    else {
+        return super::ImageWorkStats::default();
+    };
+    super::ImageWorkStats {
+        animation_bytes: metrics.animation_bytes.load(Ordering::Relaxed),
+        pending_decodes: metrics.pending_decodes.load(Ordering::Relaxed),
+        completed_decodes: metrics.completed_decodes.load(Ordering::Relaxed),
+        decode_micros: metrics.decode_micros.load(Ordering::Relaxed),
+        texture_uploads: metrics.texture_uploads.load(Ordering::Relaxed),
+        texture_upload_micros: metrics.texture_upload_micros.load(Ordering::Relaxed),
+    }
+}
 
 type Decoder = Arc<dyn ImageLoader + Send + Sync>;
 
@@ -37,7 +68,14 @@ pub(super) fn install(ctx: &egui::Context, bytes: usize, entries: usize) {
     if images.iter().any(|loader| loader.id() == IMAGE_LOADER_ID) {
         return;
     }
-    let inner = std::mem::take(&mut *images);
+    let metrics = Arc::new(LoaderMetrics::default());
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new(METRICS_ID), metrics.clone()));
+    let mut inner = std::mem::take(&mut *images);
+    inner.push(Arc::new(animation::AnimationLoader::new(
+        bytes,
+        entries,
+        metrics.clone(),
+    )));
     images.push(Arc::new(BoundedImageLoader {
         inner,
         cache: Mutex::default(),
@@ -51,6 +89,7 @@ pub(super) fn install(ctx: &egui::Context, bytes: usize, entries: usize) {
         cache: Mutex::default(),
         bytes_limit: bytes,
         entries_limit: entries,
+        metrics,
     }));
 }
 
@@ -198,9 +237,9 @@ impl ImageLoader for BoundedImageLoader {
     }
 }
 
-fn preflight_decoded_size(raw: &[u8], limit: usize) -> Result<(), String> {
+fn preflight_decoded_size(raw: &[u8], limit: usize) -> Result<usize, String> {
     let Ok(format) = image::guess_format(raw) else {
-        return Ok(());
+        return Ok(0);
     };
     let (width, height) = image::ImageReader::with_format(std::io::Cursor::new(raw), format)
         .into_dimensions()
@@ -221,7 +260,7 @@ fn preflight_decoded_size(raw: &[u8], limit: usize) -> Result<(), String> {
     if frames > max_frames {
         return Err("Animation exceeds the decoded byte limit".to_owned());
     }
-    Ok(())
+    Ok(frame_bytes * frames)
 }
 
 fn gif_frame_count(raw: &[u8], max_frames: usize) -> Result<usize, String> {
@@ -368,6 +407,7 @@ struct BoundedTextureLoader {
     cache: Mutex<TextureCache>,
     bytes_limit: usize,
     entries_limit: usize,
+    metrics: Arc<LoaderMetrics>,
 }
 
 impl TextureLoader for BoundedTextureLoader {
@@ -447,7 +487,13 @@ impl TextureLoader for BoundedTextureLoader {
             };
             cache.remove(&oldest, options);
         }
+        let upload_started = Instant::now();
         let handle = ctx.load_texture(uri, image, options);
+        self.metrics.texture_uploads.fetch_add(1, Ordering::Relaxed);
+        self.metrics.texture_upload_micros.fetch_add(
+            upload_started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
         let texture = SizedTexture::from_handle(&handle);
         cache.bytes += handle.byte_size();
         cache.count += 1;
@@ -581,6 +627,25 @@ mod tests {
         ctx.try_load_texture(uri, egui::TextureOptions::LINEAR, SizeHint::default())
     }
 
+    fn ready_image(ctx: &egui::Context, uri: &str) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match ctx.try_load_image(uri, SizeHint::default()) {
+                Ok(ImagePoll::Ready { .. }) => return,
+                Ok(ImagePoll::Pending { .. }) => {
+                    assert!(Instant::now() < deadline, "image did not finish decoding");
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => panic!("image decode failed: {error:?}"),
+            }
+        }
+    }
+
+    fn ready_texture(ctx: &egui::Context, uri: &str) -> TextureLoadResult {
+        ready_image(ctx, uri);
+        texture(ctx, uri)
+    }
+
     #[test]
     fn animation_budget_is_checked_before_the_decoder_runs() {
         let ctx = egui::Context::default();
@@ -691,7 +756,7 @@ mod tests {
         ctx.include_bytes(uri, raw.clone());
         let first = format!("{uri}#0");
         let second = format!("{uri}#1");
-        let first_id = texture(&ctx, &first).unwrap().texture_id();
+        let first_id = ready_texture(&ctx, &first).unwrap().texture_id();
         assert!(matches!(
             texture(&ctx, &second),
             Ok(TexturePoll::Ready { .. })
@@ -735,7 +800,7 @@ mod tests {
             0
         );
         ctx.include_bytes(uri, raw);
-        assert_ne!(texture(&ctx, &first).unwrap().texture_id(), first_id);
+        assert_ne!(ready_texture(&ctx, &first).unwrap().texture_id(), first_id);
     }
 
     #[test]
@@ -745,6 +810,7 @@ mod tests {
             ("bytes://returning.webp", animated_webp()),
         ] {
             let ctx = context(1024, 1);
+            ctx.include_bytes(uri, raw.clone());
             let image = egui::Image::from_bytes(uri, raw);
             let mut first_id = None;
             let at = |time| egui::RawInput {
@@ -752,6 +818,7 @@ mod tests {
                 ..Default::default()
             };
             let _ = ctx.run(at(0.0), |ctx| {
+                ready_image(ctx, &format!("{uri}#0"));
                 first_id = image
                     .load_for_size(ctx, egui::vec2(2.0, 1.0))
                     .unwrap()
@@ -787,6 +854,7 @@ mod tests {
                         .texture_id(),
                     first_id
                 );
+                ready_image(ctx, &format!("{uri}#0"));
                 assert!(ctx
                     .data(|data| data.get_temp::<egui::FrameDurations>(egui::Id::new(uri)))
                     .is_some());
@@ -812,7 +880,7 @@ mod tests {
         assert!(preflight_decoded_size(&raw, 8).is_err());
         let ctx = context(1024, 10);
         ctx.include_bytes("bytes://animation.webp", raw);
-        let first = texture(&ctx, "bytes://animation.webp#0")
+        let first = ready_texture(&ctx, "bytes://animation.webp#0")
             .unwrap()
             .texture_id();
         let second = texture(&ctx, "bytes://animation.webp#1")
@@ -846,6 +914,56 @@ mod tests {
                 .map(|loader| loader.byte_size())
                 .sum::<usize>(),
             0
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated cold animation decode timing"]
+    fn perf_animation_cold_load() {
+        use std::time::{Duration, Instant};
+
+        let mut raw = Vec::new();
+        let mut encoder = image::codecs::gif::GifEncoder::new(&mut raw);
+        for frame in 0..120 {
+            let pixels = image::RgbaImage::from_fn(112, 112, |x, y| {
+                image::Rgba([
+                    ((x * 3 + frame) % 256) as u8,
+                    ((y * 3 + frame * 2) % 256) as u8,
+                    ((x + y + frame * 5) % 256) as u8,
+                    255,
+                ])
+            });
+            encoder
+                .encode_frame(image::Frame::from_parts(
+                    pixels,
+                    0,
+                    0,
+                    image::Delay::from_numer_denom_ms(20, 1),
+                ))
+                .unwrap();
+        }
+        drop(encoder);
+        let mut first_calls = Vec::new();
+        let mut totals = Vec::new();
+        for _ in 0..7 {
+            let ctx = context(128 * 1024 * 1024, 4096);
+            ctx.include_bytes("bytes://cold.gif", raw.clone());
+            let started = Instant::now();
+            let mut result = texture(&ctx, "bytes://cold.gif#0");
+            first_calls.push(started.elapsed().as_secs_f64() * 1000.0);
+            while matches!(result, Ok(TexturePoll::Pending { .. })) {
+                assert!(started.elapsed() < Duration::from_secs(10));
+                std::thread::sleep(Duration::from_millis(1));
+                result = texture(&ctx, "bytes://cold.gif#0");
+            }
+            assert!(matches!(result, Ok(TexturePoll::Ready { .. })));
+            totals.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        first_calls.sort_by(f64::total_cmp);
+        totals.sort_by(f64::total_cmp);
+        eprintln!(
+            "cold GIF 112x112x120, encoded_bytes={}, first_call_ms={first_calls:?}, complete_ms={totals:?}",
+            raw.len(),
         );
     }
 }

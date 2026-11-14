@@ -30,6 +30,7 @@ pub struct MessageSearchState {
     compiled_pattern: String,
     regex_error: Option<String>,
     focus_keyword: bool,
+    focused_control: Option<Id>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -47,6 +48,16 @@ impl MessageSearchState {
     pub fn close(&mut self) {
         self.open = false;
         self.focus_keyword = false;
+        self.focused_control = None;
+    }
+
+    pub(crate) fn owns_keyboard(&self, ctx: &Context) -> bool {
+        self.open && self.focused_control.is_some_and(|id| {
+            ctx.memory(|memory| {
+                memory.has_focus(id)
+                    || (memory.focused().is_none() && memory.had_focus_last_frame(id))
+            }) && ctx.read_response(id).is_some()
+        })
     }
 
     pub fn clear_filters(&mut self) {
@@ -208,7 +219,10 @@ pub fn show_message_search_window(
         .with_window_level(level);
 
     ctx.show_viewport_immediate(viewport_id, builder, |child_ctx, class| {
-        let esc = child_ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape));
+        let owns_escape = !matches!(class, ViewportClass::Embedded)
+            || search.owns_keyboard(child_ctx);
+        let esc = owns_escape && !child_ctx.is_context_menu_open()
+            && child_ctx.input_mut(|i| crate::app::consume_exact_key(i, egui::Modifiers::NONE, Key::Escape));
         let close_requested = child_ctx.input(|i| i.viewport().close_requested());
         if esc {
             search.close();
@@ -353,6 +367,11 @@ fn show_message_search_contents(
             .color(t::text_secondary()),
         );
     }
+    search.focused_control = ui.ctx().memory(|memory| memory.focused()).filter(|id| {
+        ui.ctx().read_response(*id).is_some_and(|response| {
+            response.layer_id == ui.layer_id() && ui.min_rect().contains_rect(response.rect)
+        })
+    });
 }
 
 fn show_message_search_header(

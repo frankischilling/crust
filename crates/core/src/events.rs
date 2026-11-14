@@ -627,6 +627,8 @@ pub enum AppEvent {
     /// A failed private send belongs to the account that initiated it.
     WhisperSendFailed {
         owner_user_id: String,
+        target_login: String,
+        text: String,
         message: String,
     },
     MessageDeleted {

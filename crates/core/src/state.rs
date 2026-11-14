@@ -8,9 +8,7 @@ use crate::{
     model::{ChannelId, ChannelState, ChatMessage, LiveChannelSnapshot},
 };
 
-/// Per-tab visibility rule. Mirrors Chatterino's right-click "hide when
-/// offline" / "hide muted" tab options: lets users declutter the tab strip
-/// for channels they only care about sometimes.
+/// Per-channel visibility in the sidebar and top tab strip.
 ///
 /// The rule is evaluated at render time against live runtime state (e.g. the
 /// current live/offline status for Twitch channels); the tab reappears the
@@ -215,7 +213,7 @@ pub struct SharedChatParticipant {
 }
 
 /// Resolved metadata for a Shared Chat source channel. Shown on the
-/// shared-chat badge chip (matches Chatterino's `makeSharedChatBadge`).
+/// shared-chat badge chip.
 #[derive(Debug, Clone)]
 pub struct SharedChannelProfile {
     pub login: String,

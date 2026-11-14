@@ -63,7 +63,7 @@ const BUILTIN_SLASH_COMMANDS: &[SlashCommandInfo] = &[
     SlashCommandInfo {
         name: "poll",
         usage: "/poll --title \"<title>\" --choice \"<choice 1>\" --choice \"<choice 2>\" [--choice \"<choice 3>\"] [--duration <15..1800>|<60s|1m>] [--points <n>]",
-        summary: "Create a Twitch poll with Chatterino-style flags (mod/broadcaster only).",
+        summary: "Create a Twitch poll (moderators and broadcasters only).",
         aliases: &[],
     },
     SlashCommandInfo {

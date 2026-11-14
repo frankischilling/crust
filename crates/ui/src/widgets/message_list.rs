@@ -29,7 +29,10 @@ pub struct MessageListResult {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MessageListPerfStats {
+    /// Messages in the channel's retained deque, before filtering or pausing.
     pub retained_rows: usize,
+    /// Rows remaining after filters and any frozen reading snapshot.
+    pub eligible_rows: usize,
     pub active_rows: usize,
     pub rendered_rows: usize,
     pub boundary_hidden_rows: usize,
@@ -902,7 +905,8 @@ impl<'a> MessageList<'a> {
             None
         };
         let mut perf_stats = MessageListPerfStats {
-            retained_rows: n,
+            retained_rows: self.messages.len(),
+            eligible_rows: n,
             active_rows: hot_plan.active_len,
             rendered_rows: 0,
             boundary_hidden_rows: hot_plan.hidden_rows,
@@ -4331,12 +4335,6 @@ fn pretty_badge_name(name: &str, version: &str) -> String {
     label
 }
 
-/// Shared Chat badge chip. Rendered at the start of the badge row so it
-/// stands out like a source-channel label. Mirrors Chatterino's "Shared
-/// Message from <sourceName>" badge (`BadgeElement` with
-/// `MessageElementFlag::BadgeSharedChannel` + `makeSharedChatBadge`):
-/// source-channel profile picture at ~18x18 when resolved, else a text
-/// fallback chip with the channel login.
 fn moderation_notice_text(msg: &ChatMessage) -> Option<&str> {
     if msg.server_id.as_deref().is_some_and(|id| id.starts_with("eventsub:moderation:")) {
         let text = msg.raw_text.trim();
@@ -4357,6 +4355,7 @@ fn message_badges(msg: &ChatMessage) -> impl Iterator<Item = (&Badge, bool)> {
         .chain(source_badges.map(|badge| (badge, true)))
 }
 
+/// Show the source channel's avatar or login before a shared message's badges.
 fn render_shared_chat_chip(
     ui: &mut Ui,
     shared: &crust_core::model::SharedChatSource,
@@ -4375,10 +4374,7 @@ fn render_shared_chat_chip(
         if let Some(&(w, h, ref raw)) = emote_bytes.get(url) {
             let size = fit_size(w, h, BADGE_SIZE);
             let url_key = super::bytes_uri(url, raw);
-            // Round the avatar slightly so it reads as a profile picture
-            // rather than a flat badge. Chatterino does this via a circular
-            // image element; egui can only approximate with a rounded
-            // frame, but the tooltip carries the semantics.
+            // Rounded corners distinguish the source avatar from role badges.
             let resp = egui::Frame::new()
                 .corner_radius(egui::CornerRadius::same(3))
                 .inner_margin(egui::Margin::same(0))
@@ -5416,7 +5412,8 @@ mod tests {
         }
         assert!(!render_test_messages(&ctx, &messages, &first).prefix_rebuilt);
         let stats = render_test_messages(&ctx, &messages, &second);
-        assert_eq!(stats.retained_rows, 99);
+        assert_eq!(stats.retained_rows, 100);
+        assert_eq!(stats.eligible_rows, 99);
         assert!(stats.prefix_rebuilt);
     }
 
@@ -5489,7 +5486,9 @@ mod tests {
                     d.insert_temp(Id::new("paused_snapshot_ids").with("rustlang"), vec![1_u64, 2]);
                 });
             }
-            assert_eq!(render_test_messages(&ctx, &messages, &filters).retained_rows, 1);
+            let stats = render_test_messages(&ctx, &messages, &filters);
+            assert_eq!(stats.retained_rows, 2);
+            assert_eq!(stats.eligible_rows, 1);
         }
     }
 
@@ -5507,10 +5506,12 @@ mod tests {
             data.insert_temp(snapshot, messages.iter().map(|message| message.id.0).collect::<Vec<_>>());
         });
         let filters = compile_filters(&[FilterRecord::new("hidden", "hidden-marker", FilterScope::Global)]);
-        assert_eq!(render_test_messages(&ctx, &messages, &filters).retained_rows, 79);
+        assert_eq!(render_test_messages(&ctx, &messages, &filters).eligible_rows, 79);
         messages.push_back(test_buffer(81, 1).pop_front().unwrap());
         ctx.data_mut(|data| data.insert_temp(paused, true));
-        assert_eq!(render_test_messages(&ctx, &messages, &[]).retained_rows, 80);
+        let stats = render_test_messages(&ctx, &messages, &[]);
+        assert_eq!(stats.retained_rows, 81);
+        assert_eq!(stats.eligible_rows, 80);
         assert!(ctx.data_mut(|data| data.get_temp::<Vec<u64>>(snapshot).unwrap()).contains(&11));
     }
 
@@ -5563,6 +5564,106 @@ mod tests {
         old_times.sort();
         new_times.sort();
         eprintln!("5000 paused frames, 1500 rows: rebuild {:?}; cached {:?}", old_times[2], new_times[2]);
+    }
+
+    #[test]
+    #[ignore = "isolated four-channel rendering workload"]
+    fn perf_four_channel_backlog() {
+        use std::time::Instant;
+
+        let ctx = egui::Context::default();
+        let channels: [ChannelId; 4] = std::array::from_fn(|index| ChannelId::new(format!("loadtest{index}")));
+        let make_message = |id: u64, channel: &ChannelId| {
+            let mut message = test_msg(&format!("viewer{}", id % 1_000), "1", None);
+            message.id = MessageId(id);
+            message.channel = channel.clone();
+            message.raw_text = format!("Message {id}: rendering several channels while reading chat and receiving new messages.");
+            message.spans.push(Span::Text { text: message.raw_text.clone(), is_action: false });
+            message
+        };
+        let mut messages: [VecDeque<ChatMessage>; 4] = std::array::from_fn(|index| {
+            (1..=5_000).map(|id| make_message(id, &channels[index])).collect()
+        });
+        let images = UiImageCache::default();
+        let previews = HashMap::new();
+        let ignored = HashSet::new();
+        let ignored_users = crust_core::ignores::CompiledIgnoredUsers::new(&[]);
+        let low_trust = HashMap::new();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let sender = UiCommandSender::new(sender);
+        let render = |messages: &[VecDeque<ChatMessage>; 4], events| {
+            let mut stats: [MessageListPerfStats; 4] = std::array::from_fn(|_| Default::default());
+            let _ = ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))),
+                events,
+                ..Default::default()
+            }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    for index in 0..4 {
+                        let rect = egui::Rect::from_min_size(
+                            egui::pos2(8.0 + (index % 2) as f32 * 636.0, 8.0 + (index / 2) as f32 * 396.0),
+                            egui::vec2(628.0, 388.0),
+                        );
+                        let mut child = ui.new_child(egui::UiBuilder::new()
+                            .id_salt(("load_pane", index))
+                            .max_rect(rect)
+                            .layout(egui::Layout::top_down(egui::Align::LEFT)));
+                        child.set_clip_rect(rect);
+                        let list = MessageList::new(
+                            &messages[index], &images, &sender, &channels[index], &previews, None,
+                            false, 3, false, true, false, true, false,
+                            &ignored, &ignored_users, &[], &[], &[], &low_trust,
+                        ).with_pane(index as u64 + 1, index == 0);
+                        stats[index] = list.show(&mut child).perf_stats;
+                    }
+                });
+            });
+            stats
+        };
+        for _ in 0..12 {
+            render(&messages, Vec::new());
+        }
+        let mut next_id = 5_001;
+        for (name, append, paused) in [("warm", false, false), ("live append", true, false), ("paused append", true, true)] {
+            if paused {
+                render(&messages, vec![
+                    egui::Event::PointerMoved(egui::pos2(200.0, 180.0)),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, 180.0),
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]);
+                for _ in 0..8 { render(&messages, Vec::new()); }
+                assert_eq!(ctx.data(|data| data.get_temp::<bool>(view_state_id(&channels[0], Some(1), "scroll_paused"))), Some(true));
+            }
+            let mut elapsed = Vec::new();
+            let mut rendered = Vec::new();
+            let mut active = 0;
+            let mut misses = 0;
+            for _ in 0..120 {
+                if append {
+                    for index in 0..4 {
+                        for id in next_id..next_id + 10 {
+                            messages[index].pop_front();
+                            messages[index].push_back(make_message(id, &channels[index]));
+                        }
+                    }
+                    next_id += 10;
+                }
+                let started = Instant::now();
+                let stats = render(&messages, Vec::new());
+                elapsed.push(started.elapsed().as_secs_f64() * 1000.0);
+                rendered.push(stats.iter().map(|stats| stats.rendered_rows).sum::<usize>());
+                active = stats.iter().map(|stats| stats.active_rows).sum::<usize>();
+                misses += stats.iter().map(|stats| stats.height_cache_misses).sum::<usize>();
+                assert!(stats.iter().all(|stats| stats.retained_rows == 5_000));
+            }
+            elapsed.sort_by(f64::total_cmp);
+            rendered.sort_unstable();
+            eprintln!("4 channels x 5000 text rows, {name}, 120 frames: render_ms median={:.3} p95={:.3} max={:.3}; rendered median={} max={}; active={active}; height_misses={misses}",
+                elapsed[60], elapsed[113], elapsed[119], rendered[60], rendered[119]);
+        }
     }
 
     #[test]

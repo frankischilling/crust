@@ -383,6 +383,15 @@ pub fn text_muted() -> Color32 {
         Color32::from_rgb(72, 72, 90)
     }
 }
+/// Helper text, section labels, and dialog subtitles.
+#[inline]
+pub fn text_helper() -> Color32 {
+    if is_light() {
+        text_muted()
+    } else {
+        text_secondary()
+    }
+}
 /// High-contrast text for colored pills/buttons.
 #[inline]
 pub fn text_on_accent() -> Color32 {

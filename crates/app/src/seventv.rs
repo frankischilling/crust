@@ -1,11 +1,15 @@
 use std::collections::HashMap;
 
-use crust_core::model::{Badge, Sender, SenderNamePaint, SenderNamePaintShadow, SenderNamePaintStop};
+use crust_core::model::{
+    Badge, Sender, SenderNamePaint, SenderNamePaintShadow, SenderNamePaintStop,
+};
 use crust_emotes::{
-    providers::{read_bounded_json, SevenTvProvider},
+    providers::{personal_emote_set_id, read_bounded_json, SevenTvProvider},
     EmoteInfo,
 };
 use tracing::{debug, info, warn};
+
+use crate::runtime::live_emotes::{LiveSource, Provider};
 
 const SEVENTV_GQL_URL: &str = "https://api.7tv.app/v3/gql";
 
@@ -20,6 +24,7 @@ pub(crate) struct SevenTvUserStyleRaw {
 pub(crate) struct SevenTvUserProfile {
     pub(crate) style: SevenTvUserStyleRaw,
     pub(crate) personal_emotes: Option<Vec<EmoteInfo>>,
+    pub(crate) personal_source: Option<LiveSource>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,8 +84,12 @@ struct SevenTvGraphQlError {
 impl<T> SevenTvGraphQlResponse<T> {
     fn successful_data(self) -> Option<T> {
         if !self.errors.is_empty() {
-            let messages = self.errors.iter().map(|error| error.message.as_str())
-                .collect::<Vec<_>>().join(" | ");
+            let messages = self
+                .errors
+                .iter()
+                .map(|error| error.message.as_str())
+                .collect::<Vec<_>>()
+                .join(" | ");
             warn!("7TV cosmetics GraphQL errors: {messages}");
             return None;
         }
@@ -110,7 +119,10 @@ pub(crate) fn resolve_7tv_user_style(
             url: Some(b.url.clone()),
         });
 
-    let name_paint = style.paint_id.as_ref().and_then(|id| paints.get(id))
+    let name_paint = style
+        .paint_id
+        .as_ref()
+        .and_then(|id| paints.get(id))
         .map(|paint| SenderNamePaint {
             function: paint.function.clone(),
             angle: paint.angle,
@@ -145,7 +157,9 @@ pub(crate) fn apply_7tv_cosmetics_to_sender(sender: &mut Sender, style: &SevenTv
             sender.badges.insert(0, badge.clone());
         }
     } else {
-        sender.badges.retain(|badge| !badge.name.eq_ignore_ascii_case("7tv"));
+        sender
+            .badges
+            .retain(|badge| !badge.name.eq_ignore_ascii_case("7tv"));
     }
 }
 
@@ -155,11 +169,25 @@ pub(crate) fn complete_7tv_user_profile(
     twitch_user_id: &str,
     generation: u64,
     profile: Option<SevenTvUserProfile>,
-) -> Option<(crate::runtime::emote_registry::UserEmoteUpdate, Option<SevenTvUserStyleRaw>)> {
-    let (style, emotes) = profile.map(|profile| (Some(profile.style), profile.personal_emotes))
+) -> Option<(
+    crate::runtime::emote_registry::UserEmoteUpdate,
+    Option<SevenTvUserStyleRaw>,
+)> {
+    let (style, emotes, source) = profile
+        .map(|profile| {
+            (
+                Some(profile.style),
+                profile.personal_emotes,
+                profile.personal_source,
+            )
+        })
         .unwrap_or_default();
-    let update = index.write().unwrap()
-        .complete_personal_load(twitch_user_id, generation, emotes)?;
+    let update = index.write().unwrap().complete_personal_load_with_source(
+        twitch_user_id,
+        generation,
+        emotes,
+        source,
+    )?;
     Some((update, style))
 }
 
@@ -373,6 +401,7 @@ pub(crate) async fn load_7tv_user_for_twitch(
     let query = r#"
         query($id: String!) {
             userByConnection(platform: TWITCH, id: $id) {
+                id
                 avatar_url
                 style { color badge_id paint_id }
                 emote_sets { id flags }
@@ -406,15 +435,47 @@ pub(crate) async fn load_7tv_user_for_twitch(
         return Some(SevenTvUserProfile {
             style: SevenTvUserStyleRaw::default(),
             personal_emotes: Some(Vec::new()),
+            personal_source: None,
         });
     }
     let style = parse_7tv_user_style(user)?;
+    let personal_source = personal_source(twitch_user_id, user)?;
     let personal_emotes = SevenTvProvider::with_client(client.clone())
         .load_personal_from_user(user)
         .await;
     Some(SevenTvUserProfile {
         style,
         personal_emotes,
+        personal_source: Some(personal_source),
+    })
+}
+
+fn personal_source(twitch_user_id: &str, user: &serde_json::Value) -> Option<LiveSource> {
+    let user_id = user.get("id")?.as_str()?;
+    let sets = user.get("emote_sets")?.as_array()?;
+    if user_id.is_empty()
+        || user_id.len() > 128
+        || sets.len() > 64
+        || !user_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        || sets.iter().any(|set| {
+            set.get("id").and_then(serde_json::Value::as_str).is_none()
+                || set
+                    .get("flags")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_none()
+        })
+    {
+        return None;
+    }
+    Some(LiveSource {
+        provider: Provider::SevenTv,
+        room_id: twitch_user_id.to_owned(),
+        platform: "TWITCH".into(),
+        user_id: Some(user_id.to_owned()),
+        set_id: personal_emote_set_id(user).map(str::to_owned),
+        connection_index: None,
     })
 }
 
@@ -439,13 +500,18 @@ fn parse_7tv_user_style(response: &serde_json::Value) -> Option<SevenTvUserStyle
         })
         .filter(|id| !id.is_empty())
         .map(str::to_owned);
-    let paint = style.and_then(|style| style.get("paint_id")
-        .or_else(|| style.get("paint")?.get("id")));
+    let paint = style.and_then(|style| {
+        style
+            .get("paint_id")
+            .or_else(|| style.get("paint")?.get("id"))
+    });
     if style.is_some() && paint.is_none() {
         return None;
     }
     let paint_id = match paint {
-        Some(serde_json::Value::String(id)) => (!id.trim().is_empty()).then(|| id.trim().to_owned()),
+        Some(serde_json::Value::String(id)) => {
+            (!id.trim().is_empty()).then(|| id.trim().to_owned())
+        }
         Some(serde_json::Value::Null) | None => None,
         _ => return None,
     };
@@ -591,47 +657,87 @@ mod tests {
 
     #[test]
     fn selected_paint_resolves_and_successful_removal_clears_it() {
-        let paints = HashMap::from([("selected".to_owned(), SevenTvPaintMeta {
-            function: "url".to_owned(),
-            angle: Some(45.0),
-            repeat: true,
-            image_url: Some("https://example.test/paint.webp".to_owned()),
-            shadows: vec![SenderNamePaintShadow {
-                x_offset: 1.0, y_offset: 2.0, radius: 3.0, color: "#112233FF".to_owned(),
-            }],
-            stops: vec![SenderNamePaintStop { at: 0.0, color: "#123456".to_owned() }],
-        })]);
-        let badges = HashMap::from([("selected-badge".to_owned(), SevenTvBadgeMeta {
-            tooltip: Some("Selected badge".to_owned()),
-            url: "https://example.test/badge.webp".to_owned(),
-        })]);
+        let paints = HashMap::from([(
+            "selected".to_owned(),
+            SevenTvPaintMeta {
+                function: "url".to_owned(),
+                angle: Some(45.0),
+                repeat: true,
+                image_url: Some("https://example.test/paint.webp".to_owned()),
+                shadows: vec![SenderNamePaintShadow {
+                    x_offset: 1.0,
+                    y_offset: 2.0,
+                    radius: 3.0,
+                    color: "#112233FF".to_owned(),
+                }],
+                stops: vec![SenderNamePaintStop {
+                    at: 0.0,
+                    color: "#123456".to_owned(),
+                }],
+            },
+        )]);
+        let badges = HashMap::from([(
+            "selected-badge".to_owned(),
+            SevenTvBadgeMeta {
+                tooltip: Some("Selected badge".to_owned()),
+                url: "https://example.test/badge.webp".to_owned(),
+            },
+        )]);
         let selected = parse_7tv_user_style(&serde_json::json!({
             "style": {"paint_id": "selected", "badge_id": "selected-badge"}
-        })).unwrap();
+        }))
+        .unwrap();
         let mut sender = Sender {
-            user_id: crust_core::UserId("42".to_owned()), login: "sender".to_owned(),
-            display_name: "Sender".to_owned(), original_display_name: None,
-            color: Some("#ABCDEF".to_owned()), name_paint: None,
+            user_id: crust_core::UserId("42".to_owned()),
+            login: "sender".to_owned(),
+            display_name: "Sender".to_owned(),
+            original_display_name: None,
+            color: Some("#ABCDEF".to_owned()),
+            name_paint: None,
             badges: vec![
-                Badge { name: "moderator".to_owned(), version: "1".to_owned(), url: None },
-                Badge { name: "bttv".to_owned(), version: "1".to_owned(), url: None },
+                Badge {
+                    name: "moderator".to_owned(),
+                    version: "1".to_owned(),
+                    url: None,
+                },
+                Badge {
+                    name: "bttv".to_owned(),
+                    version: "1".to_owned(),
+                    url: None,
+                },
             ],
         };
-        apply_7tv_cosmetics_to_sender(&mut sender, &resolve_7tv_user_style(&selected, &badges, &paints));
+        apply_7tv_cosmetics_to_sender(
+            &mut sender,
+            &resolve_7tv_user_style(&selected, &badges, &paints),
+        );
         let paint = sender.name_paint.as_ref().unwrap();
         assert_eq!(paint.function, "url");
-        assert_eq!(paint.image_url.as_deref(), Some("https://example.test/paint.webp"));
+        assert_eq!(
+            paint.image_url.as_deref(),
+            Some("https://example.test/paint.webp")
+        );
         assert_eq!(paint.angle, Some(45.0));
         assert!(paint.repeat);
         assert_eq!(paint.shadows[0].radius, 3.0);
         assert_eq!(paint.stops[0].color, "#123456");
         assert_eq!(sender.badges[0].name, "7tv");
-        let removed = parse_7tv_user_style(&serde_json::json!({"style": {"paint_id": null}})).unwrap();
-        apply_7tv_cosmetics_to_sender(&mut sender, &resolve_7tv_user_style(&removed, &badges, &paints));
+        let removed =
+            parse_7tv_user_style(&serde_json::json!({"style": {"paint_id": null}})).unwrap();
+        apply_7tv_cosmetics_to_sender(
+            &mut sender,
+            &resolve_7tv_user_style(&removed, &badges, &paints),
+        );
         assert!(sender.name_paint.is_none());
         assert_eq!(sender.color.as_deref(), Some("#ABCDEF"));
-        assert_eq!(sender.badges.iter().map(|badge| badge.name.as_str()).collect::<Vec<_>>(),
-            ["moderator", "bttv"]);
+        assert_eq!(
+            sender
+                .badges
+                .iter()
+                .map(|badge| badge.name.as_str())
+                .collect::<Vec<_>>(),
+            ["moderator", "bttv"]
+        );
         assert!(parse_7tv_user_style(&serde_json::json!({"style": {"paint_id": 123}})).is_none());
         assert!(parse_7tv_user_style(&serde_json::json!({"style": {"badge_id": null}})).is_none());
         assert!(parse_7tv_user_style(&serde_json::json!({"style": "invalid"})).is_none());
@@ -640,7 +746,8 @@ mod tests {
     #[test]
     fn stale_and_failed_profiles_cannot_replace_current_paint_metadata() {
         let index: crate::EmoteIndex = std::sync::Arc::new(std::sync::RwLock::new(
-            crate::runtime::emote_registry::EmoteRegistry::default()));
+            crate::runtime::emote_registry::EmoteRegistry::default(),
+        ));
         let (stale, current) = {
             let mut registry = index.write().unwrap();
             registry.set_account(Some("42"));
@@ -649,12 +756,19 @@ mod tests {
             registry.set_account(Some("42"));
             (stale, registry.begin_personal_load("42", None).unwrap())
         };
-        let profile = |paint: &str| Some(SevenTvUserProfile {
-            style: SevenTvUserStyleRaw { paint_id: Some(paint.to_owned()), ..Default::default() },
-            personal_emotes: Some(Vec::new()),
-        });
+        let profile = |paint: &str| {
+            Some(SevenTvUserProfile {
+                style: SevenTvUserStyleRaw {
+                    paint_id: Some(paint.to_owned()),
+                    ..Default::default()
+                },
+                personal_emotes: Some(Vec::new()),
+                personal_source: None,
+            })
+        };
         assert!(complete_7tv_user_profile(&index, "42", stale, profile("old")).is_none());
-        let (_, style) = complete_7tv_user_profile(&index, "42", current, profile("current")).unwrap();
+        let (_, style) =
+            complete_7tv_user_profile(&index, "42", current, profile("current")).unwrap();
         assert_eq!(style.unwrap().paint_id.as_deref(), Some("current"));
         assert!(complete_7tv_user_profile(&index, "42", stale, profile("old")).is_none());
 
@@ -664,17 +778,22 @@ mod tests {
             registry.begin_personal_load("99", None).unwrap()
         };
         let (_, failed_style) = complete_7tv_user_profile(&index, "99", retry, None).unwrap();
-        assert!(failed_style.is_none(), "failed requests must not emit a cosmetic replacement");
+        assert!(
+            failed_style.is_none(),
+            "failed requests must not emit a cosmetic replacement"
+        );
     }
 
     #[test]
     fn partial_catalog_errors_do_not_replace_the_last_catalog() {
-        let response: SevenTvGraphQlResponse<serde_json::Value> = serde_json::from_value(
-            serde_json::json!({"data": {"cosmetics": {"paints": []}},
-                "errors": [{"message": "paint lookup unavailable"}]})).unwrap();
+        let response: SevenTvGraphQlResponse<serde_json::Value> =
+            serde_json::from_value(serde_json::json!({"data": {"cosmetics": {"paints": []}},
+                "errors": [{"message": "paint lookup unavailable"}]}))
+            .unwrap();
         assert!(response.successful_data().is_none());
-        let empty: SevenTvGraphQlResponse<serde_json::Value> = serde_json::from_value(
-            serde_json::json!({"data": {"cosmetics": {"paints": []}}})).unwrap();
+        let empty: SevenTvGraphQlResponse<serde_json::Value> =
+            serde_json::from_value(serde_json::json!({"data": {"cosmetics": {"paints": []}}}))
+                .unwrap();
         assert!(empty.successful_data().is_some());
     }
 

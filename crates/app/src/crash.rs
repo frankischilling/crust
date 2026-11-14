@@ -36,10 +36,8 @@
 //! "session ended abnormally" reports so killed/SEGV'd runs aren't
 //! lost.
 //!
-//! This mirrors the intent of Chatterino's
-//! `src/singletons/CrashHandler.hpp`, minus the Crashpad IPC: Crust
-//! runs inside a single-process egui app so an in-process panic hook
-//! plus a session sentinel is enough.
+//! The desktop process records Rust panics through a panic hook and uses a
+//! session sentinel to detect exits that bypass that hook.
 
 use std::collections::{HashSet, VecDeque};
 use std::fs;

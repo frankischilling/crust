@@ -5,6 +5,48 @@ use crust_storage::LogStore;
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
+const MAX_PENDING_WHISPER_SENDS: usize = 32;
+
+#[derive(Default)]
+pub(crate) struct WhisperSendTasks {
+    generation: u64,
+    tasks: tokio::task::JoinSet<(u64, AppEvent)>,
+}
+
+impl WhisperSendTasks {
+    pub(crate) fn clear(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.tasks.abort_all();
+    }
+
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.tasks.is_empty()
+    }
+
+    pub(crate) fn spawn(
+        &mut self,
+        send: impl std::future::Future<Output = AppEvent> + Send + 'static,
+    ) -> bool {
+        if self.tasks.len() >= MAX_PENDING_WHISPER_SENDS {
+            return false;
+        }
+        let generation = self.generation;
+        self.tasks.spawn(async move { (generation, send.await) });
+        true
+    }
+
+    pub(crate) async fn complete_next(&mut self) -> Option<AppEvent> {
+        while let Some(result) = self.tasks.join_next().await {
+            match result {
+                Ok((generation, event)) if generation == self.generation => return Some(event),
+                Err(error) if !error.is_cancelled() => warn!("whisper-send: task failed: {error}"),
+                _ => {}
+            }
+        }
+        None
+    }
+}
+
 pub(crate) struct ChatSendPublisher {
     tails: std::collections::HashMap<ChannelId, oneshot::Receiver<()>>,
     slots: std::sync::Arc<tokio::sync::Semaphore>,
@@ -182,6 +224,20 @@ async fn saved_chat_echo(echo: ChatMessage, log_store: Option<LogStore>) -> AppE
     }
 }
 
+pub(crate) fn whisper_send_failure(
+    owner_user_id: &str,
+    target_login: &str,
+    text: &str,
+    message: impl Into<String>,
+) -> AppEvent {
+    AppEvent::WhisperSendFailed {
+        owner_user_id: owner_user_id.to_owned(),
+        target_login: target_login.trim().trim_start_matches('@').to_ascii_lowercase(),
+        text: text.to_owned(),
+        message: message.into(),
+    }
+}
+
 pub(crate) fn complete_whisper_send(
     status: reqwest::StatusCode,
     body: &str,
@@ -201,10 +257,10 @@ pub(crate) fn complete_whisper_send(
         {
             message.push_str(" Re-login with a token that includes user:manage:whispers.");
         }
-        return AppEvent::WhisperSendFailed {
-            owner_user_id: from_user_id.to_owned(),
-            message: format!("Could not send whisper to {target_login}: {message}"),
-        };
+        return whisper_send_failure(
+            from_user_id, target_login, text,
+            format!("Could not send whisper to {target_login}: {message}"),
+        );
     }
 
     let timestamp = Utc::now();
@@ -214,7 +270,7 @@ pub(crate) fn complete_whisper_send(
         from_login: from_login.to_owned(),
         from_display_name: from_login.to_owned(),
         target_login: target_login.to_owned(),
-        text: text.to_owned(),
+        text: text.trim().to_owned(),
         twitch_emotes,
         is_self: true,
         timestamp,
@@ -233,6 +289,60 @@ pub(crate) fn complete_whisper_send(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn completed_whisper_outcomes_cannot_cross_account_lifetimes() {
+        for old_succeeded in [false, true] {
+            let mut sends = WhisperSendTasks::default();
+            let (finished, ready) = oneshot::channel();
+            assert!(sends.spawn(async move {
+                let event = complete_whisper_send(
+                    if old_succeeded { reqwest::StatusCode::NO_CONTENT }
+                    else { reqwest::StatusCode::FORBIDDEN },
+                    "old result", "10", "alice", "friend", "same body", Vec::new(), None,
+                );
+                let _ = finished.send(());
+                event
+            }));
+            ready.await.unwrap();
+            tokio::task::yield_now().await;
+
+            // An already-completed result can remain queued while accounts change.
+            sends.clear();
+            sends.clear();
+            let (finish_new, new_result) = oneshot::channel();
+            assert!(sends.spawn(async move { new_result.await.unwrap() }));
+            assert!(tokio::time::timeout(
+                std::time::Duration::from_millis(10), sends.complete_next(),
+            ).await.is_err(), "an old outcome reached the replacement attempt");
+
+            finish_new.send(whisper_send_failure(
+                "10", "friend", "same body", "new result",
+            )).unwrap();
+            assert!(matches!(sends.complete_next().await,
+                Some(AppEvent::WhisperSendFailed { owner_user_id, target_login, text, message })
+                    if owner_user_id == "10" && target_login == "friend"
+                        && text == "same body" && message == "new result"));
+            assert!(!sends.has_pending());
+        }
+    }
+
+    #[tokio::test]
+    async fn whisper_send_work_stays_bounded_and_account_changes_cancel_held_requests() {
+        let mut sends = WhisperSendTasks::default();
+        for _ in 0..MAX_PENDING_WHISPER_SENDS {
+            assert!(sends.spawn(std::future::pending()));
+        }
+        assert!(!sends.spawn(async { panic!("a rejected send must never start") }));
+        sends.clear();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_secs(1), sends.complete_next(),
+        ).await.unwrap().is_none());
+        assert!(!sends.has_pending());
+        assert!(sends.spawn(async { whisper_send_failure("20", "friend", "new", "rejected") }));
+        assert!(matches!(sends.complete_next().await,
+            Some(AppEvent::WhisperSendFailed { owner_user_id, .. }) if owner_user_id == "20"));
+    }
     use crust_core::model::{MsgKind, UserId};
 
     fn pending() -> (OutgoingChat, ChatMessage) {
@@ -506,11 +616,12 @@ mod tests {
             "123",
             "alice",
             "bob",
-            "hello",
+            "  hello 🦀  ",
             Vec::new(),
             Some(&store),
         );
-        assert!(matches!(event, AppEvent::WhisperSendFailed { owner_user_id, .. } if owner_user_id == "123"));
+        assert!(matches!(event, AppEvent::WhisperSendFailed { owner_user_id, target_login, text, .. }
+            if owner_user_id == "123" && target_login == "bob" && text == "  hello 🦀  "));
         assert!(store.recent_messages(&channel, 10).unwrap().is_empty());
         let event = complete_whisper_send(
             reqwest::StatusCode::NO_CONTENT,
@@ -518,18 +629,20 @@ mod tests {
             "123",
             "alice",
             "bob",
-            "hello",
-            Vec::new(),
+            "  🦀 Kappa  ",
+            vec![TwitchEmotePos { id: "25".into(), start: 2, end: 6 }],
             Some(&store),
         );
         assert!(matches!(
             event,
-            AppEvent::WhisperReceived { is_self: true, owner_user_id, from_user_id, .. }
-                if owner_user_id == "123" && from_user_id == "123"
+            AppEvent::WhisperReceived { is_self: true, owner_user_id, from_user_id, text, twitch_emotes, .. }
+                if owner_user_id == "123" && from_user_id == "123" && text == "🦀 Kappa"
+                    && twitch_emotes.len() == 1 && twitch_emotes[0].id == "25"
+                    && twitch_emotes[0].start == 2 && twitch_emotes[0].end == 6
         ));
         let messages = store.recent_messages(&channel, 10).unwrap();
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].raw_text, "hello");
+        assert_eq!(messages[0].raw_text, "🦀 Kappa");
         assert_eq!(messages[0].sender.login, "alice");
         assert_eq!(messages[0].sender.user_id.0, "123");
     }

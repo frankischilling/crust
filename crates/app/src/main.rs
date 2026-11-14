@@ -59,7 +59,7 @@ use runtime::history::{
 };
 use runtime::link_preview::fetch_link_preview;
 use runtime::live_emotes::LiveEmoteUpdates;
-use runtime::outgoing::{chat_echo_body, complete_whisper_send, twitch_message_error, ChatSendPublisher, OutgoingChat};
+use runtime::outgoing::{chat_echo_body, complete_whisper_send, twitch_message_error, whisper_send_failure, ChatSendPublisher, OutgoingChat, WhisperSendTasks};
 use runtime::plugins::init_plugins;
 use runtime::profiles::{
     fetch_ivr_logs, fetch_self_avatar, fetch_shared_channel_profile, fetch_shared_chat_session,
@@ -498,6 +498,10 @@ fn main() -> Result<()> {
             load_global_badges(&bm, token).await;
         });
     }
+    let _global_emote_refresh = {
+        let _runtime_scope = rt.enter();
+        runtime::emote_loading::spawn_global_refresh(&emote_index, &evt_tx)
+    };
 
     // Spawn the reducer (bridges twitch/kick events -> tokenized AppEvents for UI)
     rt.spawn({
@@ -769,6 +773,7 @@ async fn reducer_loop(
     let mut auth_user_id: Option<String> = None;
     let mut auth_scopes: Vec<String> = Vec::new();
     let mut whisper_history = WhisperHistory::default();
+    let mut whisper_sends = WhisperSendTasks::default();
     let mut twitch_inventory = TwitchEmoteInventory::default();
     let mut local_msg_id: u64 = 1_000_000; // offset to avoid collisions with session IDs
     let mut chat_publisher = ChatSendPublisher::default();
@@ -1227,6 +1232,10 @@ async fn reducer_loop(
     loop {
         tokio::select! {
             Some(()) = live_emote_updates.recv() => { personal_catalog_dirty = true; }
+            Some(event) = whisper_sends.complete_next(), if whisper_sends.has_pending() => {
+                // Serialize publication with account changes, including while UI capacity is full.
+                let _ = evt_tx.send(event).await;
+            }
             () = badge_requests.complete_next(), if badge_requests.has_pending() => {}
             changed = twitch_inventory.complete_next(&emote_index), if twitch_inventory.has_pending() => {
                 if changed { send_emote_catalog(&emote_index, &evt_tx).await; }
@@ -1355,6 +1364,7 @@ async fn reducer_loop(
                         auth_scopes.clear();
                         helix_client_id = None;
                         whisper_history.clear();
+                        whisper_sends.clear();
                         settings.username.clear();
                         settings.oauth_token.clear();
                         if let Some(store) = &settings_store {
@@ -1496,6 +1506,7 @@ async fn reducer_loop(
                         auth_username = Some(username.clone());
                         auth_user_id = Some(user_id.clone());
                         if account_changed {
+                            whisper_sends.clear();
                             badge_requests.clear();
                             let bm = badge_map.clone();
                             let token = Some(settings.oauth_token.clone());
@@ -1572,15 +1583,9 @@ async fn reducer_loop(
                         if compiled_ignored_users.is_ignored(&msg.sender.login) {
                             continue;
                         }
-                        // Shared Chat: if this message is mirrored from a
-                        // channel the user also has open, suppress
-                        // notifications (toast/sound/mentions feed) so the
-                        // source-channel delivery of the same line stays the
-                        // single source of truth. Chatterino mirrors this via
-                        // `MessageFlag::DoNotTriggerNotification`. Also resolve
-                        // source-channel login + profile picture so the UI can
-                        // paint the shared-message badge exactly like
-                        // Chatterino's `makeSharedChatBadge`.
+                        // Suppress notifications for a mirrored message when its
+                        // source channel is open. Resolve that channel's login
+                        // and profile picture for the shared-message badge.
                         if let Some(shared) = msg.shared.as_mut() {
                             let source_open = channel_room_ids
                                 .values()
@@ -3142,6 +3147,7 @@ async fn reducer_loop(
                     twitch_inventory.clear();
                     clear_personal_emotes(&emote_index, &evt_tx).await;
                     whisper_history.clear();
+                    whisper_sends.clear();
                     let _ = sess_tx.send(SessionCommand::LogoutAndReconnect).await;
                     clear_account_channel_state(&mut channel_mod_status, &mut self_badges, &mut self_color, &evt_tx).await;
                     let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
@@ -3385,6 +3391,7 @@ async fn reducer_loop(
                         auth_scopes.clear();
                         helix_client_id = None;
                         whisper_history.clear();
+                        whisper_sends.clear();
                         clear_account_channel_state(&mut channel_mod_status, &mut self_badges, &mut self_color, &evt_tx).await;
                         let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
                         clear_live_feed_auth(&live_feed_tx, &authed_helix).await;
@@ -3440,6 +3447,7 @@ async fn reducer_loop(
                             twitch_inventory.clear();
                             clear_personal_emotes(&emote_index, &evt_tx).await;
                             whisper_history.clear();
+                            whisper_sends.clear();
                             clear_account_channel_state(&mut channel_mod_status, &mut self_badges, &mut self_color, &evt_tx).await;
                             let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
                             clear_live_feed_auth(&live_feed_tx, &authed_helix).await;
@@ -4387,6 +4395,7 @@ async fn reducer_loop(
                                     let emote_guard = emote_index.read().unwrap();
                                     infer_twitch_emote_positions_from_text(
                                         &emote_guard,
+                                        None,
                                         from_user_id.as_deref().unwrap_or_default(),
                                         &whisper_text,
                                     )
@@ -4396,8 +4405,11 @@ async fn reducer_loop(
                                 } else {
                                     None
                                 };
-                                let evt_tx2 = evt_tx.clone();
-                                tokio::spawn(async move {
+                                let rejected = whisper_send_failure(
+                                    from_user_id.as_deref().unwrap_or_default(), &target_login, &whisper_text,
+                                    "Too many whispers are waiting to finish. Try again after they complete.",
+                                );
+                                if !whisper_sends.spawn(async move {
                                     helix_send_whisper(
                                         &token,
                                         client_id.as_deref(),
@@ -4407,10 +4419,11 @@ async fn reducer_loop(
                                         &whisper_text,
                                         whisper_twitch_emotes,
                                         whisper_log_store.as_ref(),
-                                        evt_tx2,
                                     )
-                                    .await;
-                                });
+                                    .await
+                                }) {
+                                    let _ = evt_tx.send(rejected).await;
+                                }
                                 continue;
                             }
                         }
@@ -4536,7 +4549,7 @@ async fn reducer_loop(
                             {
                                 let emote_guard = emote_index.read().unwrap();
                                 echo.twitch_emotes = infer_twitch_emote_positions_from_text(
-                                    &emote_guard, &echo.sender.user_id.0, &echo.raw_text);
+                                    &emote_guard, Some(&echo.channel), &echo.sender.user_id.0, &echo.raw_text);
                                 echo.spans = crust_core::format::tokenize(
                                     &echo.raw_text,
                                     echo.flags.is_action,
@@ -4671,7 +4684,7 @@ async fn reducer_loop(
                         let whisper_text = text.trim().to_owned();
                         let whisper_twitch_emotes = {
                             let emote_guard = emote_index.read().unwrap();
-                            infer_twitch_emote_positions_from_text(&emote_guard,
+                            infer_twitch_emote_positions_from_text(&emote_guard, None,
                                 from_user_id.as_deref().unwrap_or_default(), &whisper_text)
                         };
                         let whisper_log_store = if settings.local_log_indexing_enabled {
@@ -4679,21 +4692,25 @@ async fn reducer_loop(
                         } else {
                             None
                         };
-                        let evt_tx2 = evt_tx.clone();
-                        tokio::spawn(async move {
+                        let rejected = whisper_send_failure(
+                            from_user_id.as_deref().unwrap_or_default(), &target_login, &text,
+                            "Too many whispers are waiting to finish. Try again after they complete.",
+                        );
+                        if !whisper_sends.spawn(async move {
                             helix_send_whisper(
                                 &token,
                                 client_id.as_deref(),
                                 from_user_id.as_deref(),
                                 from_login.as_deref(),
                                 &target_login,
-                                &whisper_text,
+                                &text,
                                 whisper_twitch_emotes,
                                 whisper_log_store.as_ref(),
-                                evt_tx2,
                             )
-                            .await;
-                        });
+                            .await
+                        }) {
+                            let _ = evt_tx.send(rejected).await;
+                        }
                     }
                     AppCommand::FetchUserProfile { login } => {
                         let etx = evt_tx.clone();
@@ -5907,6 +5924,7 @@ async fn reducer_loop(
                             twitch_inventory.clear();
                             clear_personal_emotes(&emote_index, &evt_tx).await;
                             whisper_history.clear();
+                            whisper_sends.clear();
                             clear_account_channel_state(
                                 &mut channel_mod_status,
                                 &mut self_badges,
@@ -5967,6 +5985,7 @@ async fn reducer_loop(
                             auth_scopes.clear();
                             helix_client_id = None;
                             whisper_history.clear();
+                            whisper_sends.clear();
                             clear_account_channel_state(
                                 &mut channel_mod_status,
                                 &mut self_badges,
@@ -7407,6 +7426,7 @@ fn whisper_thread_channel_id(owner_user_id: &str, partner_login: &str) -> Channe
 
 fn infer_twitch_emote_positions_from_text(
     idx: &runtime::emote_registry::EmoteRegistry,
+    channel: Option<&ChannelId>,
     sender_user_id: &str,
     text: &str,
 ) -> Vec<TwitchEmotePos> {
@@ -7420,7 +7440,11 @@ fn infer_twitch_emote_positions_from_text(
             let leading_ws = word.chars().take_while(|c| c.is_whitespace()).count();
             let trimmed_len = trimmed.chars().count();
             if trimmed_len > 0 {
-                if let Some(info) = idx.twitch_for_user(sender_user_id, trimmed) {
+                let emote = match channel {
+                    Some(channel) => idx.twitch_for_channel_user(channel, sender_user_id, trimmed),
+                    None => idx.twitch_for_user(sender_user_id, trimmed),
+                };
+                if let Some(info) = emote {
                     let start = cursor_chars + leading_ws;
                     let end = start + trimmed_len - 1;
                     out.push(TwitchEmotePos {
@@ -7566,44 +7590,28 @@ async fn helix_send_whisper(
     text: &str,
     twitch_emotes: Vec<TwitchEmotePos>,
     log_store: Option<&LogStore>,
-    evt_tx: mpsc::Sender<AppEvent>,
-) {
+) -> AppEvent {
     info!("Whisper send requested to {}", target_login.trim());
     let sender_id = match from_user_id.and_then(normalize_whisper_user_id) {
         Some(id) => id,
         None => {
-            let _ = evt_tx
-                .send(AppEvent::Error {
-                    context: "Whisper".into(),
-                    message: "You must be logged in to send whispers.".into(),
-                })
-                .await;
-            return;
+            return AppEvent::Error {
+                context: "Whisper".into(),
+                message: "You must be logged in to send whispers.".into(),
+            };
         }
     };
 
     let cid = match client_id {
         Some(cid) => cid,
         None => {
-            let _ = evt_tx
-                .send(AppEvent::WhisperSendFailed {
-                    owner_user_id: sender_id.to_owned(),
-                    message: "Missing Twitch Client-ID.".into(),
-                })
-                .await;
-            return;
+            return whisper_send_failure(sender_id, target_login, text, "Missing Twitch Client-ID.");
         }
     };
 
     let bare = token.strip_prefix("oauth:").unwrap_or(token);
     if bare.trim().is_empty() {
-        let _ = evt_tx
-            .send(AppEvent::WhisperSendFailed {
-                owner_user_id: sender_id.to_owned(),
-                message: "You must be logged in to send whispers.".into(),
-            })
-            .await;
-        return;
+        return whisper_send_failure(sender_id, target_login, text, "You must be logged in to send whispers.");
     }
 
     let login = target_login
@@ -7611,58 +7619,29 @@ async fn helix_send_whisper(
         .trim_start_matches('@')
         .to_ascii_lowercase();
     if login.is_empty() {
-        let _ = evt_tx
-            .send(AppEvent::WhisperSendFailed {
-                owner_user_id: sender_id.to_owned(),
-                message: "Usage: /w <user> <message>".into(),
-            })
-            .await;
-        return;
+        return whisper_send_failure(sender_id, target_login, text, "Usage: /w <user> <message>");
     }
 
     if from_login
         .map(|current| current.eq_ignore_ascii_case(&login))
         .unwrap_or(false)
     {
-        let _ = evt_tx
-            .send(AppEvent::WhisperSendFailed {
-                owner_user_id: sender_id.to_owned(),
-                message: "You cannot whisper yourself.".into(),
-            })
-            .await;
-        return;
+        return whisper_send_failure(sender_id, target_login, text, "You cannot whisper yourself.");
     }
 
     let trimmed_text = text.trim();
     if trimmed_text.is_empty() {
-        let _ = evt_tx
-            .send(AppEvent::WhisperSendFailed {
-                owner_user_id: sender_id.to_owned(),
-                message: "Whisper message cannot be empty.".into(),
-            })
-            .await;
-        return;
+        return whisper_send_failure(sender_id, target_login, text, "Whisper message cannot be empty.");
     }
     if trimmed_text.chars().count() > TWITCH_MAX_MESSAGE_CHARS {
-        let _ = evt_tx
-            .send(AppEvent::WhisperSendFailed {
-                owner_user_id: sender_id.to_owned(),
-                message: format!("Whisper too long (>{TWITCH_MAX_MESSAGE_CHARS} characters)."),
-            })
-            .await;
-        return;
+        return whisper_send_failure(sender_id, target_login, text,
+            format!("Whisper too long (>{TWITCH_MAX_MESSAGE_CHARS} characters)."));
     }
 
     let to_user_id = match helix_user_id_by_login(bare, cid, &login).await {
         Ok(id) => id,
         Err(msg) => {
-            let _ = evt_tx
-                .send(AppEvent::WhisperSendFailed {
-                    owner_user_id: sender_id.to_owned(),
-                    message: msg,
-                })
-                .await;
-            return;
+            return whisper_send_failure(sender_id, target_login, text, msg);
         }
     };
 
@@ -7689,13 +7668,8 @@ async fn helix_send_whisper(
     {
         Ok(r) => r,
         Err(e) => {
-            let _ = evt_tx
-                .send(AppEvent::WhisperSendFailed {
-                    owner_user_id: sender_id.to_owned(),
-                    message: format!("Send whisper request failed: {e}"),
-                })
-                .await;
-            return;
+            return whisper_send_failure(sender_id, target_login, text,
+                format!("Send whisper request failed: {e}"));
         }
     };
 
@@ -7705,17 +7679,16 @@ async fn helix_send_whisper(
         .map(str::trim)
         .filter(|login| !login.is_empty())
         .unwrap_or(sender_id);
-    let event = complete_whisper_send(
+    complete_whisper_send(
         status,
         &body_text,
         sender_id,
         sender_login,
         &login,
-        trimmed_text,
+        text,
         twitch_emotes,
         log_store,
-    );
-    let _ = evt_tx.send(event).await;
+    )
 }
 
 async fn helix_send_announcement(
@@ -9735,15 +9708,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn whisper_validation_failures_keep_the_sending_account_id() {
-        let (events, mut received) = tokio::sync::mpsc::channel(2);
+    async fn whisper_validation_failures_keep_the_owner_recipient_and_original_draft() {
         for (token, client_id) in [("token", None), ("", Some("client"))] {
-            super::helix_send_whisper(
-                token, client_id, Some("10"), Some("alice"), "bob", "hello",
-                Vec::new(), None, events.clone(),
+            let event = super::helix_send_whisper(
+                token, client_id, Some("10"), Some("alice"), " @BoB ", "  hello 🦀  ",
+                Vec::new(), None,
             ).await;
-            assert!(matches!(received.try_recv(), Ok(crust_core::AppEvent::WhisperSendFailed { owner_user_id, .. })
-                if owner_user_id == "10"));
+            assert!(matches!(event, crust_core::AppEvent::WhisperSendFailed { owner_user_id, target_login, text, .. }
+                if owner_user_id == "10" && target_login == "bob" && text == "  hello 🦀  "));
         }
     }
 
@@ -9761,12 +9733,36 @@ mod tests {
         registry.complete_twitch_inventory("alice", generation,
             Some(vec![emote("subscription", "SubLove")]));
         let text = "🙂 SubLove\tKappa";
-        let positions = super::infer_twitch_emote_positions_from_text(&registry, "alice", text);
+        let positions = super::infer_twitch_emote_positions_from_text(&registry, None, "alice", text);
         assert_eq!(positions.iter().map(|pos| (pos.id.as_str(), pos.start, pos.end)).collect::<Vec<_>>(),
             vec![("subscription", 2, 8), ("global", 10, 14)]);
-        assert_eq!(super::infer_twitch_emote_positions_from_text(&registry, "bob", text).len(), 1);
+        assert_eq!(super::infer_twitch_emote_positions_from_text(&registry, None, "bob", text).len(), 1);
         registry.set_account(None);
-        assert_eq!(super::infer_twitch_emote_positions_from_text(&registry, "alice", text).len(), 1);
+        assert_eq!(super::infer_twitch_emote_positions_from_text(&registry, None, "alice", text).len(), 1);
+    }
+
+    #[test]
+    fn outgoing_follower_emotes_stay_in_their_channel_and_out_of_whispers() {
+        let mut registry = crate::runtime::emote_registry::EmoteRegistry::default();
+        let channel = crust_core::ChannelId::new("followed");
+        let other = crust_core::ChannelId::new("other");
+        registry.open_channel(&channel);
+        registry.begin_channel_load(&channel, "42", false).unwrap();
+        registry.set_account(Some("alice"));
+        let target = registry.twitch_follower_targets().pop().unwrap();
+        let generation = registry.begin_twitch_follower_inventory("alice", &target).unwrap();
+        assert!(registry.complete_twitch_follower_inventory("alice", &target, generation,
+            Some(vec![crust_emotes::EmoteInfo {
+                id: "follower-id".into(), code: "FollowWave".into(), provider: "twitch".into(),
+                url_1x: "https://example.invalid/follower.webp".into(), url_2x: None, url_4x: None,
+            }])));
+        let text = "🙂 FollowWave";
+        let positions = super::infer_twitch_emote_positions_from_text(&registry, Some(&channel), "alice", text);
+        assert_eq!(positions.iter().map(|pos| (pos.id.as_str(), pos.start, pos.end)).collect::<Vec<_>>(),
+            vec![("follower-id", 2, 11)]);
+        for (context, sender) in [(None, "alice"), (Some(&other), "alice"), (Some(&channel), "bob")] {
+            assert!(super::infer_twitch_emote_positions_from_text(&registry, context, sender, text).is_empty());
+        }
     }
 
     #[test]
@@ -10161,7 +10157,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_poll_message_reports_winner_like_chatterino() {
+    fn completed_poll_message_reports_winner_and_vote_totals() {
         let poll = HelixPollSummary {
             title: "Best snack".to_owned(),
             choices: vec![

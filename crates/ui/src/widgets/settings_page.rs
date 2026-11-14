@@ -14,7 +14,7 @@ use super::{
     plugin_ui::{has_host_panels_for_slot, render_host_panels_for_slot, PluginUiSessionState},
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SettingsSection {
     Appearance,
     Chat,
@@ -28,6 +28,9 @@ pub enum SettingsSection {
     Notifications,
     StreamerMode,
     Integrations,
+    Plugins,
+    ExternalTools,
+    Updates,
 }
 
 impl Default for SettingsSection {
@@ -50,7 +53,10 @@ impl SettingsSection {
             Self::Hotkeys => "Hotkeys",
             Self::Notifications => "Notifications",
             Self::StreamerMode => "Streamer mode",
-            Self::Integrations => "Integrations",
+            Self::Integrations => "Connections",
+            Self::Plugins => "Plugins",
+            Self::ExternalTools => "External tools",
+            Self::Updates => "Updates",
         }
     }
 
@@ -67,9 +73,62 @@ impl SettingsSection {
             Self::Hotkeys => "Rebindable keyboard shortcuts",
             Self::Notifications => "Desktop notifications and per-event sounds",
             Self::StreamerMode => "Hide sensitive info while broadcasting",
-            Self::Integrations => "Plugins, Kick/IRC beta, and NickServ",
+            Self::Integrations => "Chat services, sign-in, and channel points",
+            Self::Plugins => "Installed plugins and their settings",
+            Self::ExternalTools => "Streamlink and external video players",
+            Self::Updates => "Check for and install Crust updates",
         }
     }
+
+    fn group(self) -> &'static str {
+        match self {
+            Self::Appearance | Self::Hotkeys | Self::Notifications | Self::StreamerMode => {
+                "Interface"
+            }
+            Self::Chat
+            | Self::Highlights
+            | Self::Filters
+            | Self::Nicknames
+            | Self::Ignores
+            | Self::Commands
+            | Self::Channels => "Chat tools",
+            Self::Integrations | Self::Plugins | Self::ExternalTools | Self::Updates => "Services",
+        }
+    }
+
+    fn search_terms(self) -> &'static str {
+        match self {
+            Self::Appearance => "theme dark light font text size scale zoom always top window layout sidebar tabs split header title game viewer count close buttons live indicators analytics",
+            Self::Chat => "timestamps seconds clock 24 hour history logs indexing collapse long messages lines overflow character limit animations focus moderation presets spell check spelling dictionary",
+            Self::Highlights => "highlight rules keyword regex regular expression case sensitive visual alert flash sound ignored usernames",
+            Self::Filters => "filter hide dim message sender username pattern regex regular expression moderation",
+            Self::Nicknames => "nickname alias login display name channel case sensitive mention",
+            Self::Ignores => "ignore block user phrase regex regular expression case sensitive replace highlight mention",
+            Self::Commands => "command slash alias trigger expansion variables",
+            Self::Channels => "channel auto join startup",
+            Self::Hotkeys => "hotkey keyboard shortcut key binding rebind reset conflict",
+            Self::Notifications => "notification desktop toast audio sound ping volume file preview whisper mention gifted subscription raid alert",
+            Self::StreamerMode => "streamer privacy broadcasting obs hide link preview viewer counts mute suppress sounds",
+            Self::Integrations => "integration connection twitch browser session sign in login channel points bonus auto claim pronouns user cards kick irc nickserv username password beta transport",
+            Self::Plugins => "plugin lua scripts reload permissions settings extensions",
+            Self::ExternalTools => "external tools streamlink mpv player video quality arguments path command twitch session token cookie",
+            Self::Updates => "update version install restart check automatic release skip",
+        }
+    }
+
+    fn matches(self, query: &str) -> bool {
+        let title = self.title().to_ascii_lowercase();
+        let subtitle = self.subtitle().to_ascii_lowercase();
+        query.split_whitespace().all(|term| {
+            title.contains(term) || subtitle.contains(term) || self.search_terms().contains(term)
+        })
+    }
+}
+
+#[derive(Clone, Default)]
+struct SettingsNavigation {
+    query: String,
+    selected_before_search: Option<SettingsSection>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -236,97 +295,56 @@ pub struct SettingsPageState {
 /// red warning.
 fn render_hotkeys_section(ui: &mut egui::Ui, state: &mut SettingsPageState, compact: bool) {
     use crust_core::{HotkeyAction, HotkeyBindings, HotkeyCategory, KeyBinding};
-
     ui.label(
         RichText::new(
-            "Click a row's button, then press the key combination you want. Press Escape to cancel capture. Use Reset to restore defaults.",
+            "Choose a binding, then press the new key combination. Escape cancels capture.",
         )
         .font(t::small())
         .color(t::text_secondary()),
     );
-    ui.add_space(6.0);
-
-    let mut reset_all = false;
-    ui.horizontal(|ui| {
-        if ui
-            .button(RichText::new("Reset all to defaults").font(t::small()))
-            .clicked()
-        {
-            reset_all = true;
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("Reset all to defaults").clicked() {
+            state.hotkey_bindings = HotkeyBindings::defaults();
+            state.hotkey_capture_target = None;
         }
-        let conflicts = state.hotkey_bindings.conflicts();
-        if !conflicts.is_empty() {
+        let conflicts = state.hotkey_bindings.conflicts().len();
+        if conflicts > 0 {
             ui.label(
-                RichText::new(format!(
-                    "{} binding{} conflict",
-                    conflicts.len(),
-                    if conflicts.len() == 1 { "" } else { "s" }
-                ))
-                .font(t::small())
-                .color(t::red())
-                .strong(),
+                RichText::new(format!("{conflicts} conflicting bindings"))
+                    .font(t::small())
+                    .color(t::red()),
             );
         }
     });
-    if reset_all {
-        state.hotkey_bindings = HotkeyBindings::defaults();
-        state.hotkey_capture_target = None;
-    }
-    ui.add_space(4.0);
-
     for category in HotkeyCategory::all() {
+        ui.add_space(8.0);
         ui.label(
             RichText::new(category.display_name())
                 .font(t::body())
-                .strong()
-                .color(t::text_primary()),
+                .strong(),
         );
-        ui.add_space(2.0);
-
-        egui::Grid::new(("hotkeys_grid", category.as_str()))
-            .num_columns(4)
-            .striped(true)
-            .spacing(egui::vec2(10.0, 6.0))
-            .show(ui, |ui| {
-                ui.label(
-                    RichText::new("Action")
-                        .font(t::tiny())
-                        .color(t::text_muted()),
-                );
-                ui.label(
-                    RichText::new("Binding")
-                        .font(t::tiny())
-                        .color(t::text_muted()),
-                );
-                ui.label(RichText::new("").font(t::tiny()));
-                ui.label(RichText::new("").font(t::tiny()));
-                ui.end_row();
-
-                for action in HotkeyAction::all() {
-                    if action.category() != category {
-                        continue;
-                    }
-                    let current = state.hotkey_bindings.get(action);
-                    let capture_active = state.hotkey_capture_target == Some(action);
-                    let conflict = state.hotkey_bindings.find_conflict(action, &current);
-
-                    let action_color = if conflict.is_some() {
+        for action in HotkeyAction::all() {
+            if action.category() != category {
+                continue;
+            }
+            ui.push_id(action.display_name(), |ui| {
+                let current = state.hotkey_bindings.get(action);
+                let capture_active = state.hotkey_capture_target == Some(action);
+                let conflict = state.hotkey_bindings.find_conflict(action, &current);
+                ui.label(RichText::new(action.display_name()).font(t::small()).color(
+                    if conflict.is_some() {
                         t::red()
                     } else {
                         t::text_primary()
-                    };
-                    ui.label(
-                        RichText::new(action.display_name())
-                            .font(t::small())
-                            .color(action_color),
-                    );
-
-                    let button_label = if capture_active {
+                    },
+                ));
+                ui.horizontal_wrapped(|ui| {
+                    let label = if capture_active {
                         "Press any key...".to_owned()
                     } else {
                         current.display_label()
                     };
-                    let button_color = if capture_active {
+                    let color = if capture_active {
                         t::accent()
                     } else if conflict.is_some() {
                         t::red()
@@ -335,34 +353,35 @@ fn render_hotkeys_section(ui: &mut egui::Ui, state: &mut SettingsPageState, comp
                     } else {
                         t::text_primary()
                     };
-                    let btn = ui.button(
-                        RichText::new(button_label)
-                            .font(t::small())
-                            .color(button_color),
-                    );
-                    // The focus lock needs a prior focused frame. Establish it
-                    // on press so Tab is captured immediately after release.
-                    if btn.is_pointer_button_down_on() {
-                        btn.request_focus();
+                    let bind = ui.button(RichText::new(label).font(t::small()).color(color));
+                    if bind.is_pointer_button_down_on() {
+                        bind.request_focus();
                     }
-                    if btn.clicked() {
+                    if bind.clicked() {
                         state.hotkey_capture_target = if capture_active {
                             None
                         } else {
-                            btn.request_focus();
+                            bind.request_focus();
                             Some(action)
                         };
                     }
-                    ui.memory_mut(|memory| memory.set_focus_lock_filter(btn.id,
-                        if state.hotkey_capture_target == Some(action) {
-                            egui::EventFilter { tab: true, horizontal_arrows: true,
-                                vertical_arrows: true, escape: true }
-                        } else {
-                            egui::EventFilter::default()
-                        }));
-
+                    ui.memory_mut(|memory| {
+                        memory.set_focus_lock_filter(
+                            bind.id,
+                            if state.hotkey_capture_target == Some(action) {
+                                egui::EventFilter {
+                                    tab: true,
+                                    horizontal_arrows: true,
+                                    vertical_arrows: true,
+                                    escape: true,
+                                }
+                            } else {
+                                egui::EventFilter::default()
+                            },
+                        )
+                    });
                     if ui
-                        .button(RichText::new("Clear").font(t::tiny()))
+                        .button("Clear")
                         .on_hover_text("Unbind this shortcut")
                         .clicked()
                     {
@@ -372,8 +391,8 @@ fn render_hotkeys_section(ui: &mut egui::Ui, state: &mut SettingsPageState, comp
                         }
                     }
                     if ui
-                        .button(RichText::new("Reset").font(t::tiny()))
-                        .on_hover_text("Reset this binding to the default")
+                        .button("Reset")
+                        .on_hover_text("Restore the default binding")
                         .clicked()
                     {
                         state
@@ -383,27 +402,17 @@ fn render_hotkeys_section(ui: &mut egui::Ui, state: &mut SettingsPageState, comp
                             state.hotkey_capture_target = None;
                         }
                     }
-
-                    ui.end_row();
-
-                    if let Some(other) = conflict {
-                        ui.label("");
-                        ui.label(
-                            RichText::new(format!(
-                                "Conflicts with: {}",
-                                other.display_name()
-                            ))
+                });
+                if let Some(other) = conflict {
+                    ui.label(
+                        RichText::new(format!("Also assigned to {}", other.display_name()))
                             .font(t::tiny())
                             .color(t::red()),
-                        );
-                        ui.label("");
-                        ui.label("");
-                        ui.end_row();
-                    }
+                    );
                 }
             });
-
-        ui.add_space(if compact { 6.0 } else { 10.0 });
+            ui.add_space(if compact { 4.0 } else { 6.0 });
+        }
     }
 }
 
@@ -422,12 +431,22 @@ pub(crate) fn handle_hotkey_capture(
     target: &mut Option<crust_core::HotkeyAction>,
     bindings: &mut crust_core::HotkeyBindings,
 ) -> bool {
-    let Some(action) = *target else { return false; };
+    let Some(action) = *target else {
+        return false;
+    };
     let captured = ctx.input_mut(|input| {
         let captured = capture_keybinding(input);
-        input.events.retain(|event| !matches!(event,
-            egui::Event::Key { .. } | egui::Event::Text(_) | egui::Event::Paste(_)
-                | egui::Event::Copy | egui::Event::Cut | egui::Event::Ime(_)));
+        input.events.retain(|event| {
+            !matches!(
+                event,
+                egui::Event::Key { .. }
+                    | egui::Event::Text(_)
+                    | egui::Event::Paste(_)
+                    | egui::Event::Copy
+                    | egui::Event::Cut
+                    | egui::Event::Ime(_)
+            )
+        });
         captured
     });
     if let Some(captured) = captured {
@@ -480,11 +499,7 @@ fn capture_keybinding(input: &egui::InputState) -> Option<CaptureOutcome> {
 /// field, a volume slider, and a Preview button. A global "Streamer mode
 /// active" hint reminds the user that playback is gated while streaming
 /// when they've opted into `streamer_suppress_sounds`.
-fn render_notifications_section(
-    ui: &mut egui::Ui,
-    state: &mut SettingsPageState,
-    compact: bool,
-) {
+fn render_notifications_section(ui: &mut egui::Ui, state: &mut SettingsPageState, compact: bool) {
     use crust_core::sound::SoundEvent;
 
     ui.label(
@@ -502,12 +517,13 @@ fn render_notifications_section(
         "Show OS desktop notifications for mentions and highlights",
     );
     ui.label(
-        RichText::new(
-            "Also fires on whispers from other users. Windows users: requires the PowerShell toast fallback.",
-        )
-        .font(t::tiny())
-        .color(t::text_muted()),
+        RichText::new("Whispers from other users also trigger notifications.")
+            .font(t::tiny())
+            .color(t::text_muted()),
     );
+    if ui.button("Test gifted sub alert").clicked() {
+        state.request_test_gifted_sub_alert = true;
+    }
 
     ui.add_space(10.0);
     ui.separator();
@@ -544,7 +560,7 @@ fn render_notifications_section(
         let mut changed = false;
 
         ui.group(|ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui
                     .checkbox(&mut setting.enabled, "")
                     .on_hover_text(format!("Enable {} sound", event.display_name()))
@@ -618,11 +634,11 @@ fn render_notifications_section(
 
 /// Render the Commands settings page - list + row editor for the user's
 /// custom command aliases. Mirrors the Nicknames editor layout.
-fn render_commands_section(ui: &mut egui::Ui, state: &mut SettingsPageState, compact: bool) {
+fn render_commands_section(ui: &mut egui::Ui, state: &mut SettingsPageState, _compact: bool) {
     use crust_core::commands::CommandAlias;
 
     ui.label(
-        RichText::new("Custom Command Aliases")
+        RichText::new("Custom command aliases")
             .font(t::small())
             .strong()
             .color(t::text_primary()),
@@ -650,119 +666,63 @@ fn render_commands_section(ui: &mut egui::Ui, state: &mut SettingsPageState, com
         }
     }
 
-    let action_btn_size = egui::vec2(26.0, 22.0);
-    let mut delete_alias_idx: Option<usize> = None;
-
-    egui::Grid::new("command_aliases_grid")
-        .num_columns(5)
-        .spacing(egui::vec2(8.0, 6.0))
-        .show(ui, |ui| {
-            ui.label(RichText::new("On").font(t::tiny()).color(t::text_muted()));
-            ui.label(
-                RichText::new("Trigger")
-                    .font(t::tiny())
-                    .color(t::text_muted()),
-            );
-            ui.label(RichText::new("Body").font(t::tiny()).color(t::text_muted()));
-            ui.label(RichText::new(" ").font(t::tiny()));
-            ui.label(RichText::new(" ").font(t::tiny()));
-            ui.end_row();
-
-            for (i, alias) in state.command_aliases.iter_mut().enumerate() {
-                ui.checkbox(&mut alias.enabled, "");
-
+    let mut delete_alias_idx = None;
+    for (i, alias) in state.command_aliases.iter_mut().enumerate() {
+        ui.push_id(("command_alias", i), |ui| {
+            ui.group(|ui| {
+                ui.set_min_width(ui.available_width());
+                ui.checkbox(&mut alias.enabled, "Enabled");
                 let canonical = alias.canonical_trigger();
-                let is_duplicate = !canonical.is_empty()
-                    && duplicate_triggers.contains(&canonical);
-                let is_invalid = !alias.is_valid();
-                let trigger_color = if is_duplicate || is_invalid {
-                    t::red()
-                } else if alias.enabled {
-                    t::text_primary()
-                } else {
-                    t::text_muted()
-                };
+                let invalid = !alias.is_valid() || duplicate_triggers.contains(&canonical);
+                ui.label("Trigger");
                 ui.add(
                     egui::TextEdit::singleline(&mut alias.trigger)
-                        .desired_width(if compact { 90.0 } else { 130.0 })
-                        .text_color(trigger_color)
-                        .hint_text("hi"),
+                        .desired_width(f32::INFINITY)
+                        .hint_text("hi")
+                        .text_color(if invalid { t::red() } else { t::text_primary() }),
                 );
-
-                let body_color = if alias.enabled {
-                    t::text_primary()
-                } else {
-                    t::text_muted()
-                };
+                ui.label("Command");
                 ui.add(
                     egui::TextEdit::singleline(&mut alias.body)
-                        .desired_width(if compact { 240.0 } else { 360.0 })
-                        .text_color(body_color)
+                        .desired_width(f32::INFINITY)
                         .hint_text("/me says hi {1} {2+}"),
                 );
-
-                // Live preview pill: shows the expansion for a fixed sample
-                // input so the user can sanity-check variable placement
-                // without sending a test message.
-                let preview_args = "alice bob how are you";
-                let preview_input = if canonical.is_empty() {
-                    String::new()
-                } else {
-                    format!("/{canonical} {preview_args}")
-                };
-                let preview_text = if preview_input.is_empty() || !alias.is_valid() {
-                    String::new()
-                } else {
-                    match crust_core::commands::expand_command_aliases(
-                        &preview_input,
-                        std::slice::from_ref(alias),
-                        "forsen",
-                        "me",
-                    ) {
-                        Ok(crust_core::commands::AliasExpansion::Expanded {
-                            text, ..
-                        }) => text,
-                        _ => String::new(),
-                    }
-                };
-                if preview_text.is_empty() {
-                    ui.label(RichText::new(" ").font(t::tiny()));
-                } else {
-                    ui.label(
-                        RichText::new(format!("⇒ {preview_text}"))
-                            .font(t::tiny())
-                            .color(t::text_muted()),
-                    )
-                    .on_hover_text(format!(
-                        "Sample input: {preview_input}\n\
-                         Expansion:    {preview_text}",
-                    ));
-                }
-
-                if ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new("×").font(t::tiny()).color(t::red()),
+                if alias.is_valid() {
+                    let preview_input =
+                        format!("/{} alice bob how are you", alias.canonical_trigger());
+                    if let Ok(crust_core::commands::AliasExpansion::Expanded { text, .. }) =
+                        crust_core::commands::expand_command_aliases(
+                            &preview_input,
+                            std::slice::from_ref(alias),
+                            "channel",
+                            "me",
                         )
-                        .min_size(action_btn_size),
-                    )
-                    .on_hover_text("Delete alias")
+                    {
+                        ui.label(
+                            RichText::new(format!("Preview: {text}"))
+                                .font(t::tiny())
+                                .color(t::text_secondary()),
+                        )
+                        .on_hover_text(format!("Sample input: {preview_input}"));
+                    }
+                }
+                if ui
+                    .button(RichText::new("Remove alias").color(t::red()))
                     .clicked()
                 {
                     delete_alias_idx = Some(i);
                 }
-                ui.end_row();
-            }
+            });
         });
+        ui.add_space(6.0);
+    }
 
     if let Some(i) = delete_alias_idx {
         state.command_aliases.remove(i);
     }
 
     if ui.button("+ Add alias").clicked() {
-        state
-            .command_aliases
-            .push(CommandAlias::new("", "/me "));
+        state.command_aliases.push(CommandAlias::new("", "/me "));
     }
 
     ui.add_space(6.0);
@@ -801,9 +761,12 @@ fn render_commands_section(ui: &mut egui::Ui, state: &mut SettingsPageState, com
     }
 
     ui.label(
-        RichText::new(format!("{} alias(es) defined.", state.command_aliases.len()))
-            .font(t::tiny())
-            .color(t::text_muted()),
+        RichText::new(format!(
+            "{} alias(es) defined.",
+            state.command_aliases.len()
+        ))
+        .font(t::tiny())
+        .color(t::text_muted()),
     );
 }
 
@@ -829,9 +792,12 @@ pub fn parse_settings_lines(input: &str, lowercase: bool) -> Vec<String> {
     out
 }
 
-fn settings_sections() -> [SettingsSection; 12] {
+fn settings_sections() -> [SettingsSection; 15] {
     [
         SettingsSection::Appearance,
+        SettingsSection::Hotkeys,
+        SettingsSection::Notifications,
+        SettingsSection::StreamerMode,
         SettingsSection::Chat,
         SettingsSection::Highlights,
         SettingsSection::Filters,
@@ -839,10 +805,10 @@ fn settings_sections() -> [SettingsSection; 12] {
         SettingsSection::Ignores,
         SettingsSection::Commands,
         SettingsSection::Channels,
-        SettingsSection::Hotkeys,
-        SettingsSection::Notifications,
-        SettingsSection::StreamerMode,
         SettingsSection::Integrations,
+        SettingsSection::Plugins,
+        SettingsSection::ExternalTools,
+        SettingsSection::Updates,
     ]
 }
 
@@ -850,6 +816,39 @@ fn plugin_status_counts(statuses: &[PluginStatus]) -> (usize, usize) {
     let loaded = statuses.iter().filter(|status| status.loaded).count();
     let failed = statuses.len().saturating_sub(loaded);
     (loaded, failed)
+}
+
+#[derive(Clone, Copy)]
+enum RuleAction {
+    MoveUp,
+    MoveDown,
+    Duplicate,
+    Delete,
+}
+
+fn render_rule_actions(ui: &mut egui::Ui, index: usize, count: usize) -> Option<RuleAction> {
+    let mut action = None;
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .add_enabled(index > 0, egui::Button::new("Move up"))
+            .clicked()
+        {
+            action = Some(RuleAction::MoveUp);
+        }
+        if ui
+            .add_enabled(index + 1 < count, egui::Button::new("Move down"))
+            .clicked()
+        {
+            action = Some(RuleAction::MoveDown);
+        }
+        if ui.button("Duplicate").clicked() {
+            action = Some(RuleAction::Duplicate);
+        }
+        if ui.button(RichText::new("Remove").color(t::red())).clicked() {
+            action = Some(RuleAction::Delete);
+        }
+    });
+    action
 }
 
 fn render_plugin_manifest_line(ui: &mut egui::Ui, label: &str, value: &str) {
@@ -934,118 +933,156 @@ fn render_plugin_status_card(ui: &mut egui::Ui, status: &PluginStatus, compact: 
     });
 }
 
+fn matching_sections(query: &str) -> Vec<SettingsSection> {
+    let query = query.trim().to_ascii_lowercase();
+    settings_sections()
+        .into_iter()
+        .filter(|section| section.matches(&query))
+        .collect()
+}
+
+fn render_settings_search(
+    ui: &mut egui::Ui,
+    navigation: &mut SettingsNavigation,
+    selected: &mut SettingsSection,
+) -> Vec<SettingsSection> {
+    let search_id = egui::Id::new("settings_search");
+    let focused = ui.memory(|memory| memory.has_focus(search_id));
+    let (previous, next, accept, clear) = if focused {
+        ui.input_mut(|input| {
+            (
+                input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                input.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+                !navigation.query.is_empty()
+                    && input.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+            )
+        })
+    } else {
+        (false, false, false, false)
+    };
+    let was_empty = navigation.query.trim().is_empty();
+    if was_empty {
+        navigation.selected_before_search = Some(*selected);
+    }
+    let mut changed = false;
+    let response = ui
+        .horizontal(|ui| {
+            let clear_width = if navigation.query.is_empty() {
+                0.0
+            } else {
+                52.0
+            };
+            let response = ui
+                .add(
+                    egui::TextEdit::singleline(&mut navigation.query)
+                        .id(search_id)
+                        .hint_text("Find a setting...")
+                        .desired_width((ui.available_width() - clear_width).max(20.0)),
+                )
+                .on_hover_text(
+                    "Search settings pages by name or option. Use Up and Down to choose a result.",
+                );
+            changed |= response.changed();
+            if clear || (!navigation.query.is_empty() && ui.button("Clear").clicked()) {
+                navigation.query.clear();
+                changed = true;
+                response.request_focus();
+            }
+            response
+        })
+        .inner;
+    ui.memory_mut(|memory| {
+        memory.set_focus_lock_filter(
+            search_id,
+            egui::EventFilter {
+                escape: true,
+                vertical_arrows: true,
+                ..Default::default()
+            },
+        )
+    });
+    let matches = matching_sections(&navigation.query);
+    if changed {
+        if navigation.query.trim().is_empty() {
+            if let Some(previous) = navigation.selected_before_search.take() {
+                *selected = previous;
+            }
+        } else if !matches.contains(selected) {
+            if let Some(first) = matches.first() {
+                *selected = *first;
+            }
+        }
+    }
+    if !matches.is_empty() && (previous || next) {
+        let current = matches
+            .iter()
+            .position(|section| section == selected)
+            .unwrap_or(0);
+        let next_index = if next {
+            (current + 1).min(matches.len() - 1)
+        } else {
+            current.saturating_sub(1)
+        };
+        *selected = matches[next_index];
+    }
+    if accept && !matches.is_empty() {
+        navigation.selected_before_search = Some(*selected);
+        response.surrender_focus();
+    }
+    matches
+}
+
 fn render_sections_nav(
     ui: &mut egui::Ui,
-    settings_section: &mut SettingsSection,
-    stats: SettingsStats,
+    selected: &mut SettingsSection,
+    navigation: &mut SettingsNavigation,
+    sections: &[SettingsSection],
     compact: bool,
-    ultra_compact: bool,
 ) {
-    let section_margin = if ultra_compact { 6 } else { 10 };
-    egui::Frame::new()
-        .fill(t::bg_surface())
-        .stroke(egui::Stroke::new(1.0_f32, t::border_subtle()))
-        .inner_margin(Margin::same(section_margin))
-        .show(ui, |ui| {
-            ui.label(
-                RichText::new("Sections")
-                    .font(t::small())
-                    .strong()
-                    .color(t::text_primary()),
-            );
-            ui.add_space(8.0);
-
-            if compact {
-                if ultra_compact {
-                    egui::ComboBox::from_id_salt("settings_section_combo")
-                        .selected_text(settings_section.title())
-                        .width(ui.available_width().max(120.0))
-                        .show_ui(ui, |ui| {
-                            for section in settings_sections() {
-                                ui.selectable_value(settings_section, section, section.title());
-                            }
-                        });
-                } else {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
-                        for section in settings_sections() {
-                            let selected = *settings_section == section;
-                            let title = if selected {
-                                RichText::new(section.title())
-                                    .font(t::small())
-                                    .strong()
-                                    .color(t::text_primary())
-                            } else {
-                                RichText::new(section.title())
-                                    .font(t::small())
-                                    .color(t::text_secondary())
-                            };
-                            if ui.selectable_label(selected, title).clicked() {
-                                *settings_section = section;
-                            }
-                        }
-                    });
-                }
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new(settings_section.subtitle())
-                        .font(t::tiny())
-                        .color(t::text_muted()),
-                );
-            } else {
-                for section in settings_sections() {
-                    let selected = *settings_section == section;
-                    let title = if selected {
-                        RichText::new(section.title())
-                            .font(t::body())
-                            .strong()
-                            .color(t::text_primary())
-                    } else {
-                        RichText::new(section.title())
-                            .font(t::body())
-                            .color(t::text_secondary())
-                    };
-                    let resp = ui.selectable_label(selected, title);
-                    if resp.clicked() {
-                        *settings_section = section;
+    let previous = *selected;
+    if compact {
+        egui::ComboBox::from_id_salt("settings_section_combo")
+            .selected_text(selected.title())
+            .width(ui.available_width().max(40.0))
+            .show_ui(ui, |ui| {
+                let mut group = "";
+                for section in sections {
+                    if group != section.group() {
+                        group = section.group();
+                        ui.label(RichText::new(group).font(t::tiny()).color(t::text_helper()));
                     }
-                    ui.add_space(1.0);
-                    ui.label(
-                        RichText::new(section.subtitle())
-                            .font(t::tiny())
-                            .color(t::text_muted()),
-                    );
+                    ui.selectable_value(selected, *section, section.title());
+                }
+            });
+    } else {
+        let mut group = "";
+        for section in sections {
+            if group != section.group() {
+                if !group.is_empty() {
                     ui.add_space(8.0);
                 }
+                group = section.group();
+                ui.label(RichText::new(group).font(t::tiny()).color(t::text_helper()));
             }
-        });
-
-    ui.add_space(8.0);
-    let stats_label = if ultra_compact {
-        format!(
-            "{} hl • {} ign • {} join",
-            stats.highlights_count, stats.ignores_count, stats.auto_join_count
-        )
-    } else {
-        format!(
-            "{} highlights, {} ignored, {} auto-join",
-            stats.highlights_count, stats.ignores_count, stats.auto_join_count
-        )
-    };
-    ui.label(
-        RichText::new(stats_label)
-            .font(t::tiny())
-            .color(t::text_muted()),
-    );
-    ui.label(
-        RichText::new(if ultra_compact {
-            "Tip: one value per line"
-        } else {
-            "Tip: put one value per line for easier editing."
-        })
-        .font(t::tiny())
-        .color(t::text_muted()),
-    );
+            if ui
+                .add_sized(
+                    [ui.available_width(), 24.0],
+                    egui::SelectableLabel::new(
+                        *selected == *section,
+                        RichText::new(section.title()).font(t::small()),
+                    ),
+                )
+                .on_hover_text(section.subtitle())
+                .clicked()
+            {
+                *selected = *section;
+            }
+        }
+    }
+    if *selected != previous {
+        navigation.selected_before_search = Some(*selected);
+    }
 }
 
 fn render_settings_content(
@@ -1060,6 +1097,7 @@ fn render_settings_content(
     chrome::card_frame()
         .inner_margin(Margin::same(content_margin))
         .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
             chrome::dialog_header(
                 ui,
                 settings_section.title(),
@@ -1070,7 +1108,7 @@ fn render_settings_content(
             match settings_section {
                 SettingsSection::Appearance => {
                     ui.label(
-                        RichText::new("Theme and Shell")
+                        RichText::new("Theme and window")
                             .font(t::small())
                             .strong()
                             .color(t::text_primary()),
@@ -1141,18 +1179,17 @@ fn render_settings_content(
                     ui.label(
                         RichText::new("Tip: Ctrl+= / Ctrl+- / Ctrl+0 or Ctrl+scroll to zoom chat.")
                             .font(t::tiny())
-                            .color(t::text_muted()),
+                            .color(t::text_helper()),
                     );
                     ui.add_space(4.0);
-                    ui.label(
-                        RichText::new("Section sizes (uncheck Auto to override)")
-                            .font(t::small())
-                            .strong()
-                            .color(t::text_secondary()),
-                    );
-                    let section_range = t::MIN_SECTION_FONT_SIZE..=t::MAX_SECTION_FONT_SIZE;
-                    let chat_font = state.chat_font_size;
-                    for (label, slot, auto_offset) in [
+                    egui::CollapsingHeader::new("Advanced text sizes")
+                        .id_salt("settings_advanced_text_sizes")
+                        .show(ui, |ui| {
+                        ui.label(RichText::new("Uncheck Auto to set a size for one part of the interface.")
+                            .font(t::tiny()).color(t::text_helper()));
+                        let section_range = t::MIN_SECTION_FONT_SIZE..=t::MAX_SECTION_FONT_SIZE;
+                        let chat_font = state.chat_font_size;
+                        for (label, slot, auto_offset) in [
                         ("Top bar", &mut state.topbar_font_size, 1.0_f32),
                         ("Channel tabs", &mut state.tabs_font_size, 1.0),
                         ("Timestamps", &mut state.timestamps_font_size, 1.0),
@@ -1165,7 +1202,7 @@ fn render_settings_content(
                         let auto_value = (chat_font - auto_offset).max(8.5);
                         let mut is_auto = *slot <= 0.0;
                         let mut override_val = if *slot > 0.0 { *slot } else { auto_value };
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label(format!("{label}:"));
                             ui.checkbox(&mut is_auto, "Auto");
                             ui.add_enabled_ui(!is_auto, |ui| {
@@ -1177,7 +1214,8 @@ fn render_settings_content(
                             });
                         });
                         *slot = if is_auto { 0.0 } else { override_val };
-                    }
+                        }
+                    });
                     ui.add_space(6.0);
                     ui.label(
                         RichText::new("Layout")
@@ -1217,12 +1255,12 @@ fn render_settings_content(
                         ui.label(
                             RichText::new("Enable IRC beta to use the IRC diagnostics panel.")
                                 .font(t::tiny())
-                                .color(t::text_muted()),
+                                .color(t::text_helper()),
                         );
                     }
                     ui.add_space(6.0);
                     ui.label(
-                        RichText::new("Tabs and Split Headers")
+                        RichText::new("Tabs and split headers")
                             .font(t::small())
                             .strong()
                             .color(t::text_primary()),
@@ -1347,7 +1385,7 @@ fn render_settings_content(
 
                     ui.add_space(8.0);
                     ui.label(
-                        RichText::new("Moderation Action Presets")
+                        RichText::new("Moderation actions")
                             .font(t::small())
                             .strong()
                             .color(t::text_primary()),
@@ -1533,7 +1571,7 @@ fn render_settings_content(
                 SettingsSection::Highlights => {
                     // Highlight rules table
                     ui.label(
-                        RichText::new("Highlight Rules")
+                        RichText::new("Highlight rules")
                             .font(t::small())
                             .strong()
                             .color(t::text_primary()),
@@ -1560,178 +1598,37 @@ fn render_settings_content(
                     let mut move_up_idx: Option<usize> = None;
                     let mut move_down_idx: Option<usize> = None;
                     let mut duplicate_idx: Option<usize> = None;
-                    let action_btn_size =
-                        egui::vec2(26.0, super::filter_editor::ROW_BTN_HEIGHT);
 
-                    let mut open_modal_for: Option<usize> = None;
-                    egui::Grid::new("highlight_rules_grid")
-                        .num_columns(11)
-                        .spacing(egui::vec2(6.0, 6.0))
-                        .min_row_height(super::filter_editor::ROW_BTN_HEIGHT)
-                        .show(ui, |ui| {
-                            fn hdr(ui: &mut egui::Ui, s: &str) {
-                                ui.label(
-                                    RichText::new(s)
-                                        .font(t::tiny())
-                                        .color(t::text_muted())
-                                        .strong(),
-                                );
-                            }
-                            hdr(ui, "On");
-                            hdr(ui, "Mode");
-                            hdr(ui, "Pattern");
-                            hdr(ui, "Edit");
-                            hdr(ui, "Aa");
-                            hdr(ui, "Alert");
-                            hdr(ui, "Sound");
-                            hdr(ui, "Del");
-                            hdr(ui, "↑");
-                            hdr(ui, "↓");
-                            hdr(ui, "Dup");
-                            ui.end_row();
-
-                            for (i, rule) in state.highlight_rules.iter_mut().enumerate() {
-                                // Enabled toggle
-                                ui.checkbox(&mut rule.enabled, "");
-
-                                // Mode cycler + pattern cell (Aa / .* / ƒx).
-                                let mut mode = super::filter_editor::EditorMode::from_highlight(
-                                    &rule.effective_mode(),
-                                );
-                                let buf = &mut state.highlight_rule_bufs[i];
-                                let cell = super::filter_editor::render_pattern_cell(
-                                    ui,
-                                    &mut mode,
-                                    buf,
-                                    &mut rule.pattern,
-                                    "keyword or expression",
-                                    rule.enabled,
-                                    compact,
-                                );
+                    let mut open_modal_for = None;
+                    let rule_count = state.highlight_rules.len();
+                    for (i, rule) in state.highlight_rules.iter_mut().enumerate() {
+                        ui.push_id(("highlight_rule", i), |ui| {
+                            ui.group(|ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.checkbox(&mut rule.enabled, "Enabled");
+                                let mut mode = super::filter_editor::EditorMode::from_highlight(&rule.effective_mode());
+                                let cell = super::filter_editor::render_pattern_editor(ui, &mut mode,
+                                    &mut state.highlight_rule_bufs[i], &mut rule.pattern,
+                                    "Keyword, regular expression, or expression", rule.enabled);
                                 rule.mode = mode.to_highlight();
-                                // Reset legacy `is_regex` when picking a non-regex mode so
-                                // we don't accidentally re-interpret as regex later.
-                                rule.is_regex = matches!(
-                                    rule.mode,
-                                    crust_core::highlight::HighlightRuleMode::Regex
-                                );
-                                if cell.open_modal {
-                                    open_modal_for = Some(i);
+                                rule.is_regex = matches!(rule.mode, crust_core::highlight::HighlightRuleMode::Regex);
+                                if cell.open_modal { open_modal_for = Some(i); }
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.checkbox(&mut rule.case_sensitive, "Case sensitive");
+                                    ui.checkbox(&mut rule.has_alert, "Visual alert");
+                                    ui.checkbox(&mut rule.has_sound, "Sound");
+                                });
+                                match render_rule_actions(ui, i, rule_count) {
+                                    Some(RuleAction::MoveUp) => move_up_idx = Some(i),
+                                    Some(RuleAction::MoveDown) => move_down_idx = Some(i),
+                                    Some(RuleAction::Duplicate) => duplicate_idx = Some(i),
+                                    Some(RuleAction::Delete) => delete_idx = Some(i),
+                                    None => {}
                                 }
-
-                                // Case-sensitive toggle ("Aa")
-                                let aa_col = if rule.case_sensitive {
-                                    t::yellow()
-                                } else {
-                                    t::text_muted()
-                                };
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("Aa").font(t::tiny()).color(aa_col),
-                                        )
-                                        .min_size(action_btn_size),
-                                    )
-                                    .clicked()
-                                {
-                                    rule.case_sensitive = !rule.case_sensitive;
-                                }
-
-                                // Visual alert toggle
-                                let alert_col = if rule.has_alert {
-                                    t::bits_orange()
-                                } else {
-                                    t::text_muted()
-                                };
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("⚠").font(t::tiny()).color(alert_col),
-                                        )
-                                        .min_size(action_btn_size),
-                                    )
-                                    .on_hover_text("Show visual alert/flash on match")
-                                    .clicked()
-                                {
-                                    rule.has_alert = !rule.has_alert;
-                                }
-
-                                // Sound notification toggle
-                                let sound_col = if rule.has_sound {
-                                    t::green()
-                                } else {
-                                    t::text_muted()
-                                };
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("🔊").font(t::tiny()).color(sound_col),
-                                        )
-                                        .min_size(action_btn_size),
-                                    )
-                                    .on_hover_text("Play sound notification on match")
-                                    .clicked()
-                                {
-                                    rule.has_sound = !rule.has_sound;
-                                }
-
-                                // Delete button
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("🗑").font(t::tiny()).color(
-                                                t::red(),
-                                            ),
-                                        )
-                                        .min_size(action_btn_size),
-                                    )
-                                    .clicked()
-                                {
-                                    delete_idx = Some(i);
-                                }
-
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("↑").font(t::tiny()).color(t::text_secondary()),
-                                        )
-                                        .min_size(action_btn_size),
-                                    )
-                                    .on_hover_text("Move rule up")
-                                    .clicked()
-                                {
-                                    move_up_idx = Some(i);
-                                }
-
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("↓").font(t::tiny()).color(t::text_secondary()),
-                                        )
-                                        .min_size(action_btn_size),
-                                    )
-                                    .on_hover_text("Move rule down")
-                                    .clicked()
-                                {
-                                    move_down_idx = Some(i);
-                                }
-
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("⎘").font(t::tiny()).color(t::text_secondary()),
-                                        )
-                                        .min_size(action_btn_size),
-                                    )
-                                    .on_hover_text("Duplicate rule")
-                                    .clicked()
-                                {
-                                    duplicate_idx = Some(i);
-                                }
-
-                                ui.end_row();
-                            }
+                            });
                         });
+                        ui.add_space(6.0);
+                    }
 
                     if let Some(idx) = duplicate_idx {
                         let clone = state.highlight_rules.get(idx).cloned();
@@ -1774,7 +1671,7 @@ fn render_settings_content(
 
                     ui.add_space(8.0);
                     ui.label(
-                        RichText::new("Keyword Highlights (Legacy)")
+                        RichText::new("Keyword highlights")
                             .font(t::small())
                             .strong()
                             .color(t::text_primary()),
@@ -1840,7 +1737,7 @@ fn render_settings_content(
                 SettingsSection::Filters => {
                     // Filter Records table
                     ui.label(
-                        RichText::new("Filter Records (Hide/Dim Messages)")
+                        RichText::new("Message filters")
                             .font(t::small())
                             .strong()
                             .color(t::text_primary()),
@@ -1869,172 +1766,41 @@ fn render_settings_content(
                     let mut filter_duplicate_idx: Option<usize> = None;
 
                     let mut open_filter_modal_for: Option<usize> = None;
-                    let filter_btn_size =
-                        egui::vec2(26.0, super::filter_editor::ROW_BTN_HEIGHT);
-                    egui::Grid::new("filter_records_grid")
-                        .num_columns(11)
-                        .spacing(egui::vec2(6.0, 6.0))
-                        .min_row_height(super::filter_editor::ROW_BTN_HEIGHT)
-                        .show(ui, |ui| {
-                            fn hdr(ui: &mut egui::Ui, s: &str) {
-                                ui.label(
-                                    RichText::new(s)
-                                        .font(t::tiny())
-                                        .color(t::text_muted())
-                                        .strong(),
-                                );
-                            }
-                            hdr(ui, "On");
-                            hdr(ui, "Name");
-                            hdr(ui, "Mode");
-                            hdr(ui, "Pattern");
-                            hdr(ui, "Edit");
-                            hdr(ui, "User");
-                            hdr(ui, "Act");
-                            hdr(ui, "Del");
-                            hdr(ui, "↑");
-                            hdr(ui, "↓");
-                            hdr(ui, "Dup");
-                            ui.end_row();
 
-                            for (i, filter) in state.filter_records.iter_mut().enumerate() {
-                                // Enabled toggle
-                                ui.checkbox(&mut filter.enabled, "");
-
-                                // Name text field
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut filter.name)
-                                        .desired_width(72.0)
-                                        .min_size(egui::vec2(
-                                            72.0,
-                                            super::filter_editor::ROW_BTN_HEIGHT,
-                                        ))
-                                        .hint_text("Name"),
-                                );
-
-                                // Mode cycler + pattern cell
-                                let mut mode = super::filter_editor::EditorMode::from_filter(
-                                    &filter.effective_mode(),
-                                );
-                                let buf = &mut state.filter_record_bufs[i];
-                                let cell = super::filter_editor::render_pattern_cell(
-                                    ui,
-                                    &mut mode,
-                                    buf,
-                                    &mut filter.pattern,
-                                    "regex, keyword, or expression",
-                                    filter.enabled,
-                                    compact,
-                                );
+                    let filter_count = state.filter_records.len();
+                    for (i, filter) in state.filter_records.iter_mut().enumerate() {
+                        ui.push_id(("filter_record", i), |ui| {
+                            ui.group(|ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.checkbox(&mut filter.enabled, "Enabled");
+                                ui.label("Name");
+                                ui.add(egui::TextEdit::singleline(&mut filter.name)
+                                    .desired_width(f32::INFINITY).hint_text("Filter name"));
+                                let mut mode = super::filter_editor::EditorMode::from_filter(&filter.effective_mode());
+                                let cell = super::filter_editor::render_pattern_editor(ui, &mut mode,
+                                    &mut state.filter_record_bufs[i], &mut filter.pattern,
+                                    "Keyword, regular expression, or expression", filter.enabled);
                                 filter.mode = mode.to_filter();
-                                filter.is_regex = matches!(
-                                    filter.mode,
-                                    crust_core::model::filters::FilterMode::Regex
-                                );
-                                if cell.open_modal {
-                                    open_filter_modal_for = Some(i);
+                                filter.is_regex = matches!(filter.mode, crust_core::model::filters::FilterMode::Regex);
+                                if cell.open_modal { open_filter_modal_for = Some(i); }
+                                ui.checkbox(&mut filter.filter_sender, "Match the sender's username");
+                                ui.horizontal_wrapped(|ui| {
+                                    use crust_core::model::filters::FilterAction;
+                                    ui.label("Matching messages:");
+                                    ui.selectable_value(&mut filter.action, FilterAction::Hide, "Hide");
+                                    ui.selectable_value(&mut filter.action, FilterAction::Dim, "Dim");
+                                });
+                                match render_rule_actions(ui, i, filter_count) {
+                                    Some(RuleAction::MoveUp) => filter_move_up_idx = Some(i),
+                                    Some(RuleAction::MoveDown) => filter_move_down_idx = Some(i),
+                                    Some(RuleAction::Duplicate) => filter_duplicate_idx = Some(i),
+                                    Some(RuleAction::Delete) => filter_delete_idx = Some(i),
+                                    None => {}
                                 }
-
-                                // Filter sender toggle
-                                let user_col = if filter.filter_sender {
-                                    t::bits_orange()
-                                } else {
-                                    t::text_muted()
-                                };
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("👤").font(t::tiny()).color(user_col),
-                                        )
-                                        .min_size(filter_btn_size),
-                                    )
-                                    .on_hover_text("Filter by username instead of message content")
-                                    .clicked()
-                                {
-                                    filter.filter_sender = !filter.filter_sender;
-                                }
-
-                                // Action toggle (Hide/Dim)
-                                use crust_core::model::filters::FilterAction;
-                                let action_text = match filter.action {
-                                    FilterAction::Hide => "🚫",
-                                    FilterAction::Dim => "🔅",
-                                };
-                                let action_col = match filter.action {
-                                    FilterAction::Hide => t::red(),
-                                    FilterAction::Dim => t::text_secondary(),
-                                };
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new(action_text).font(t::tiny()).color(action_col),
-                                        )
-                                        .min_size(filter_btn_size),
-                                    )
-                                    .on_hover_text("Toggle action: Hide vs Dim")
-                                    .clicked()
-                                {
-                                    filter.action = match filter.action {
-                                        FilterAction::Hide => FilterAction::Dim,
-                                        FilterAction::Dim => FilterAction::Hide,
-                                    };
-                                }
-
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("🗑").font(t::tiny()).color(t::red()),
-                                        )
-                                        .min_size(filter_btn_size),
-                                    )
-                                    .on_hover_text("Delete filter")
-                                    .clicked()
-                                {
-                                    filter_delete_idx = Some(i);
-                                }
-
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("↑").font(t::tiny()).color(t::text_secondary()),
-                                        )
-                                        .min_size(filter_btn_size),
-                                    )
-                                    .on_hover_text("Move filter up")
-                                    .clicked()
-                                {
-                                    filter_move_up_idx = Some(i);
-                                }
-
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("↓").font(t::tiny()).color(t::text_secondary()),
-                                        )
-                                        .min_size(filter_btn_size),
-                                    )
-                                    .on_hover_text("Move filter down")
-                                    .clicked()
-                                {
-                                    filter_move_down_idx = Some(i);
-                                }
-
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("⎘").font(t::tiny()).color(t::text_secondary()),
-                                        )
-                                        .min_size(filter_btn_size),
-                                    )
-                                    .on_hover_text("Duplicate filter")
-                                    .clicked()
-                                {
-                                    filter_duplicate_idx = Some(i);
-                                }
-
-                                ui.end_row();
-                            }
+                            });
                         });
+                        ui.add_space(6.0);
+                    }
 
                     if let Some(idx) = filter_duplicate_idx {
                         let clone = state.filter_records.get(idx).cloned();
@@ -2094,7 +1860,7 @@ fn render_settings_content(
                 }
                 SettingsSection::Nicknames => {
                     ui.label(
-                        RichText::new("Nickname Aliases")
+                        RichText::new("Nickname aliases")
                             .font(t::small())
                             .strong()
                             .color(t::text_primary()),
@@ -2109,97 +1875,34 @@ fn render_settings_content(
                     ui.add_space(4.0);
 
                     let mut delete_nick_idx: Option<usize> = None;
-                    let action_btn_size = egui::vec2(26.0, 22.0);
 
-                    egui::Grid::new("nicknames_grid")
-                        .num_columns(6)
-                        .spacing(egui::vec2(8.0, 6.0))
-                        .show(ui, |ui| {
-                            ui.label(RichText::new("Login").font(t::tiny()).color(t::text_muted()));
-                            ui.label(RichText::new("Alias").font(t::tiny()).color(t::text_muted()));
-                            ui.label(RichText::new("Channel").font(t::tiny()).color(t::text_muted()));
-                            ui.label(RichText::new("Aa").font(t::tiny()).color(t::text_muted()));
-                            ui.label(RichText::new("@").font(t::tiny()).color(t::text_muted()));
-                            ui.label(RichText::new("").font(t::tiny()));
-                            ui.end_row();
-
-                            for (i, n) in state.nicknames.iter_mut().enumerate() {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut n.login)
-                                        .desired_width(if compact { 90.0 } else { 140.0 })
-                                        .hint_text("login"),
-                                );
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut n.nickname)
-                                        .desired_width(if compact { 90.0 } else { 140.0 })
-                                        .hint_text("Alias"),
-                                );
-                                let mut channel_buf = n.channel.clone().unwrap_or_default();
-                                let resp = ui.add(
-                                    egui::TextEdit::singleline(&mut channel_buf)
-                                        .desired_width(if compact { 80.0 } else { 120.0 })
-                                        .hint_text("all channels"),
-                                );
-                                if resp.changed() {
-                                    let trimmed = channel_buf.trim();
-                                    n.channel = if trimmed.is_empty() {
-                                        None
-                                    } else {
-                                        Some(trimmed.to_owned())
-                                    };
+                    for (i, nickname) in state.nicknames.iter_mut().enumerate() {
+                        ui.push_id(("nickname", i), |ui| {
+                            ui.group(|ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.label("Login");
+                                ui.add(egui::TextEdit::singleline(&mut nickname.login)
+                                    .desired_width(f32::INFINITY).hint_text("login"));
+                                ui.label("Display name");
+                                ui.add(egui::TextEdit::singleline(&mut nickname.nickname)
+                                    .desired_width(f32::INFINITY).hint_text("Alias"));
+                                ui.label("Channel");
+                                let mut channel = nickname.channel.clone().unwrap_or_default();
+                                if ui.add(egui::TextEdit::singleline(&mut channel)
+                                    .desired_width(f32::INFINITY).hint_text("All channels")).changed() {
+                                    nickname.channel = (!channel.trim().is_empty()).then(|| channel.trim().to_owned());
                                 }
-
-                                let aa_col = if n.case_sensitive {
-                                    t::yellow()
-                                } else {
-                                    t::text_muted()
-                                };
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("Aa").font(t::tiny()).color(aa_col),
-                                        )
-                                        .min_size(action_btn_size),
-                                    )
-                                    .on_hover_text("Case-sensitive login match")
-                                    .clicked()
-                                {
-                                    n.case_sensitive = !n.case_sensitive;
-                                }
-
-                                let mention_col = if n.replace_mentions {
-                                    t::link()
-                                } else {
-                                    t::text_muted()
-                                };
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("@").font(t::tiny()).color(mention_col),
-                                        )
-                                        .min_size(action_btn_size),
-                                    )
-                                    .on_hover_text("Treat alias as self-mention")
-                                    .clicked()
-                                {
-                                    n.replace_mentions = !n.replace_mentions;
-                                }
-
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("×").font(t::tiny()).color(t::red()),
-                                        )
-                                        .min_size(action_btn_size),
-                                    )
-                                    .on_hover_text("Delete nickname alias")
-                                    .clicked()
-                                {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.checkbox(&mut nickname.case_sensitive, "Case-sensitive login");
+                                        ui.checkbox(&mut nickname.replace_mentions, "Use nickname in mentions");
+                                });
+                                if ui.button(RichText::new("Remove nickname").color(t::red())).clicked() {
                                     delete_nick_idx = Some(i);
                                 }
-                                ui.end_row();
-                            }
+                            });
                         });
+                        ui.add_space(6.0);
+                    }
 
                     if let Some(i) = delete_nick_idx {
                         state.nicknames.remove(i);
@@ -2218,7 +1921,7 @@ fn render_settings_content(
                 }
                 SettingsSection::Ignores => {
                     ui.label(
-                        RichText::new("Ignored Users")
+                        RichText::new("Ignored users")
                             .font(t::small())
                             .strong()
                             .color(t::text_primary()),
@@ -2232,85 +1935,33 @@ fn render_settings_content(
                     );
                     ui.add_space(4.0);
 
-                    let action_btn_size = egui::vec2(26.0, 22.0);
-                    let mut delete_user_idx: Option<usize> = None;
 
-                    egui::Grid::new("ignored_users_grid")
-                        .num_columns(5)
-                        .spacing(egui::vec2(8.0, 6.0))
-                        .show(ui, |ui| {
-                            ui.label(RichText::new("On").font(t::tiny()).color(t::text_muted()));
-                            ui.label(RichText::new("Login / regex").font(t::tiny()).color(t::text_muted()));
-                            ui.label(RichText::new("Re").font(t::tiny()).color(t::text_muted()));
-                            ui.label(RichText::new("Aa").font(t::tiny()).color(t::text_muted()));
-                            ui.label(RichText::new("").font(t::tiny()));
-                            ui.end_row();
-
-                            for (i, u) in state.ignored_users.iter_mut().enumerate() {
-                                ui.checkbox(&mut u.enabled, "");
-                                let regex_ok = if u.is_regex {
-                                    let mut b = regex::RegexBuilder::new(&u.login);
-                                    b.case_insensitive(!u.case_sensitive);
-                                    b.build().is_ok()
-                                } else {
-                                    true
-                                };
-                                let text_color = if !regex_ok {
-                                    t::red()
-                                } else if u.enabled {
-                                    t::text_primary()
-                                } else {
-                                    t::text_muted()
-                                };
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut u.login)
-                                        .desired_width(if compact { 140.0 } else { 200.0 })
-                                        .text_color(text_color)
-                                        .hint_text("login or regex"),
-                                );
-                                let re_col = if u.is_regex { t::link() } else { t::text_muted() };
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("Re").font(t::tiny()).color(re_col),
-                                        )
-                                        .min_size(action_btn_size),
-                                    )
-                                    .clicked()
-                                {
-                                    u.is_regex = !u.is_regex;
+                    let mut delete_user_idx = None;
+                    for (i, user) in state.ignored_users.iter_mut().enumerate() {
+                        ui.push_id(("ignored_user", i), |ui| {
+                            ui.group(|ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.checkbox(&mut user.enabled, "Enabled");
+                                ui.label("Login or pattern");
+                                ui.add(egui::TextEdit::singleline(&mut user.login)
+                                    .desired_width(f32::INFINITY).hint_text("login or regular expression"));
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.checkbox(&mut user.is_regex, "Regular expression");
+                                    ui.checkbox(&mut user.case_sensitive, "Case sensitive");
+                                });
+                                if user.is_regex {
+                                    if let Err(error) = regex::RegexBuilder::new(&user.login)
+                                        .case_insensitive(!user.case_sensitive).build() {
+                                        ui.label(RichText::new(error.to_string()).font(t::tiny()).color(t::red()));
+                                    }
                                 }
-                                let aa_col = if u.case_sensitive {
-                                    t::yellow()
-                                } else {
-                                    t::text_muted()
-                                };
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("Aa").font(t::tiny()).color(aa_col),
-                                        )
-                                        .min_size(action_btn_size),
-                                    )
-                                    .clicked()
-                                {
-                                    u.case_sensitive = !u.case_sensitive;
-                                }
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("×").font(t::tiny()).color(t::red()),
-                                        )
-                                        .min_size(action_btn_size),
-                                    )
-                                    .on_hover_text("Remove ignored user")
-                                    .clicked()
-                                {
+                                if ui.button(RichText::new("Remove user").color(t::red())).clicked() {
                                     delete_user_idx = Some(i);
                                 }
-                                ui.end_row();
-                            }
+                            });
                         });
+                        ui.add_space(6.0);
+                    }
 
                     if let Some(i) = delete_user_idx {
                         state.ignored_users.remove(i);
@@ -2323,7 +1974,7 @@ fn render_settings_content(
 
                     ui.add_space(12.0);
                     ui.label(
-                        RichText::new("Ignored Phrases")
+                        RichText::new("Ignored phrases")
                             .font(t::small())
                             .strong()
                             .color(t::text_primary()),
@@ -2340,121 +1991,50 @@ fn render_settings_content(
 
                     let mut delete_phrase_idx: Option<usize> = None;
 
-                    egui::Grid::new("ignored_phrases_grid")
-                        .num_columns(7)
-                        .spacing(egui::vec2(8.0, 6.0))
-                        .show(ui, |ui| {
-                            ui.label(RichText::new("On").font(t::tiny()).color(t::text_muted()));
-                            ui.label(RichText::new("Pattern").font(t::tiny()).color(t::text_muted()));
-                            ui.label(RichText::new("Re").font(t::tiny()).color(t::text_muted()));
-                            ui.label(RichText::new("Aa").font(t::tiny()).color(t::text_muted()));
-                            ui.label(RichText::new("Action").font(t::tiny()).color(t::text_muted()));
-                            ui.label(RichText::new("Replace").font(t::tiny()).color(t::text_muted()));
-                            ui.label(RichText::new("").font(t::tiny()));
-                            ui.end_row();
 
-                            for (i, p) in state.ignored_phrases.iter_mut().enumerate() {
-                                ui.checkbox(&mut p.enabled, "");
-                                let regex_ok = p.is_regex_valid();
-                                let text_color = if !regex_ok {
-                                    t::red()
-                                } else if p.enabled {
-                                    t::text_primary()
-                                } else {
-                                    t::text_muted()
-                                };
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut p.pattern)
-                                        .desired_width(if compact { 120.0 } else { 180.0 })
-                                        .text_color(text_color)
-                                        .hint_text("pattern"),
-                                );
-                                let re_col = if p.is_regex { t::link() } else { t::text_muted() };
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("Re").font(t::tiny()).color(re_col),
-                                        )
-                                        .min_size(action_btn_size),
-                                    )
-                                    .clicked()
-                                {
-                                    p.is_regex = !p.is_regex;
-                                }
-                                let aa_col = if p.case_sensitive {
-                                    t::yellow()
-                                } else {
-                                    t::text_muted()
-                                };
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("Aa").font(t::tiny()).color(aa_col),
-                                        )
-                                        .min_size(action_btn_size),
-                                    )
-                                    .clicked()
-                                {
-                                    p.case_sensitive = !p.case_sensitive;
-                                }
-
-                                egui::ComboBox::from_id_salt(("phrase_action", i))
-                                    .selected_text(match p.action {
-                                        crust_core::ignores::IgnoredPhraseAction::Block => "Block",
-                                        crust_core::ignores::IgnoredPhraseAction::Replace => "Replace",
-                                        crust_core::ignores::IgnoredPhraseAction::HighlightOnly => "Highlight only",
-                                        crust_core::ignores::IgnoredPhraseAction::MentionOnly => "Mention only",
-                                    })
-                                    .width(if compact { 90.0 } else { 120.0 })
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(
-                                            &mut p.action,
-                                            crust_core::ignores::IgnoredPhraseAction::Block,
-                                            "Block",
-                                        );
-                                        ui.selectable_value(
-                                            &mut p.action,
-                                            crust_core::ignores::IgnoredPhraseAction::Replace,
-                                            "Replace",
-                                        );
-                                        ui.selectable_value(
-                                            &mut p.action,
-                                            crust_core::ignores::IgnoredPhraseAction::HighlightOnly,
-                                            "Highlight only",
-                                        );
-                                        ui.selectable_value(
-                                            &mut p.action,
-                                            crust_core::ignores::IgnoredPhraseAction::MentionOnly,
-                                            "Mention only",
-                                        );
-                                    });
-
-                                let replace_enabled = matches!(
-                                    p.action,
-                                    crust_core::ignores::IgnoredPhraseAction::Replace
-                                );
-                                ui.add_enabled_ui(replace_enabled, |ui| {
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut p.replace_with)
-                                            .desired_width(if compact { 60.0 } else { 80.0 })
-                                            .hint_text("***"),
-                                    );
+                    for (i, phrase) in state.ignored_phrases.iter_mut().enumerate() {
+                        ui.push_id(("ignored_phrase", i), |ui| {
+                            ui.group(|ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.checkbox(&mut phrase.enabled, "Enabled");
+                                ui.label("Pattern");
+                                ui.add(egui::TextEdit::singleline(&mut phrase.pattern)
+                                    .desired_width(f32::INFINITY).hint_text("Phrase or regular expression"));
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.checkbox(&mut phrase.is_regex, "Regular expression");
+                                    ui.checkbox(&mut phrase.case_sensitive, "Case sensitive");
                                 });
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("×").font(t::tiny()).color(t::red()),
-                                        )
-                                        .min_size(action_btn_size),
-                                    )
-                                    .on_hover_text("Remove ignored phrase")
-                                    .clicked()
-                                {
+                                if !phrase.is_regex_valid() {
+                                    ui.label(RichText::new("This regular expression is invalid.")
+                                        .font(t::tiny()).color(t::red()));
+                                }
+                                use crust_core::ignores::IgnoredPhraseAction;
+                                ui.label("Action");
+                                egui::ComboBox::from_id_salt("phrase_action")
+                                    .selected_text(match phrase.action {
+                                        IgnoredPhraseAction::Block => "Block",
+                                        IgnoredPhraseAction::Replace => "Replace",
+                                        IgnoredPhraseAction::HighlightOnly => "Highlight only",
+                                        IgnoredPhraseAction::MentionOnly => "Mention only",
+                                    }).width(ui.available_width().min(240.0))
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut phrase.action, IgnoredPhraseAction::Block, "Block");
+                                        ui.selectable_value(&mut phrase.action, IgnoredPhraseAction::Replace, "Replace");
+                                        ui.selectable_value(&mut phrase.action, IgnoredPhraseAction::HighlightOnly, "Highlight only");
+                                        ui.selectable_value(&mut phrase.action, IgnoredPhraseAction::MentionOnly, "Mention only");
+                                    });
+                                if matches!(phrase.action, IgnoredPhraseAction::Replace) {
+                                    ui.label("Replacement");
+                                    ui.add(egui::TextEdit::singleline(&mut phrase.replace_with)
+                                        .desired_width(f32::INFINITY).hint_text("Replacement text"));
+                                }
+                                if ui.button(RichText::new("Remove phrase").color(t::red())).clicked() {
                                     delete_phrase_idx = Some(i);
                                 }
-                                ui.end_row();
-                            }
+                            });
                         });
+                        ui.add_space(6.0);
+                    }
 
                     if let Some(i) = delete_phrase_idx {
                         state.ignored_phrases.remove(i);
@@ -2544,7 +2124,7 @@ fn render_settings_content(
                     ui.add_space(6.0);
 
                     ui.label(RichText::new("Mode").strong());
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.radio_value(&mut state.streamer_mode, "off".to_owned(), "Off");
                         ui.radio_value(
                             &mut state.streamer_mode,
@@ -2587,7 +2167,7 @@ fn render_settings_content(
                     ui.checkbox(&mut state.irc_beta_enabled, "IRC chat compatibility (beta)");
                     ui.add_space(8.0);
                     ui.label(
-                        RichText::new("User Cards")
+                        RichText::new("User cards")
                             .font(t::small())
                             .strong()
                             .color(t::text_primary()),
@@ -2605,7 +2185,7 @@ fn render_settings_content(
                     );
                     ui.add_space(8.0);
                     ui.label(
-                        RichText::new("Channel Points")
+                        RichText::new("Channel points")
                             .font(t::small())
                             .strong()
                             .color(t::text_primary()),
@@ -2622,7 +2202,7 @@ fn render_settings_content(
                         .color(t::text_muted()),
                     );
                     ui.add_space(6.0);
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         let (badge_text, badge_col) = match state.twitch_webview_logged_in {
                             Some(true)  => ("Signed in",   t::green()),
                             Some(false) => ("Not signed in", t::red()),
@@ -2646,67 +2226,9 @@ fn render_settings_content(
                         .color(t::text_muted()),
                     );
                     ui.add_space(8.0);
-                    ui.label(
-                        RichText::new("Lua Plugins")
-                            .font(t::small())
-                            .strong()
-                            .color(t::text_primary()),
-                    );
-                    let (loaded_count, failed_count) = plugin_status_counts(&state.plugin_statuses);
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.button("Reload plugins").clicked() {
-                            state.plugin_reload_requested = true;
-                        }
-                        ui.label(
-                            RichText::new(format!(
-                                "{} loaded, {} failed",
-                                loaded_count, failed_count
-                            ))
-                            .font(t::tiny())
-                            .color(t::text_muted()),
-                        );
-                    });
-                    if state.plugin_statuses.is_empty() {
-                        ui.label(
-                            RichText::new("No plugins found in the Crust plugin directory.")
-                                .font(t::tiny())
-                                .color(t::text_muted()),
-                        );
-                    } else {
-                        ui.add_space(4.0);
-                        egui::ScrollArea::vertical()
-                            .max_height(if compact { 220.0 } else { 280.0 })
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                ui.spacing_mut().item_spacing.y = 8.0;
-                                for status in &state.plugin_statuses {
-                                    render_plugin_status_card(ui, status, compact);
-                                }
-                            });
-                    }
-                    if !state.plugin_ui.settings_pages.is_empty() {
-                        super::plugin_ui::render_plugin_settings_hub(
-                            ui,
-                            &state.plugin_ui,
-                            plugin_ui_session,
-                        );
-                    }
-                    if has_host_panels_for_slot(
-                        &state.plugin_ui,
-                        PluginUiHostSlot::SettingsIntegrations,
-                    ) {
-                        ui.add_space(10.0);
-                        render_host_panels_for_slot(
-                            ui,
-                            &state.plugin_ui,
-                            plugin_ui_session,
-                            PluginUiHostSlot::SettingsIntegrations,
-                        );
-                    }
-                    ui.add_space(8.0);
                     if state.irc_beta_enabled {
                         ui.label(
-                            RichText::new("IRC NickServ Auto-Identify")
+                            RichText::new("IRC NickServ sign-in")
                                 .font(t::small())
                                 .strong()
                                 .color(t::text_primary()),
@@ -2758,15 +2280,34 @@ fn render_settings_content(
                             .color(t::text_muted()),
                     );
 
-                    ui.add_space(10.0);
-                    ui.separator();
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new("External Tools")
-                            .font(t::small())
-                            .strong()
-                            .color(t::text_primary()),
-                    );
+                }
+                SettingsSection::Plugins => {
+                    let (loaded_count, failed_count) = plugin_status_counts(&state.plugin_statuses);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Reload plugins").clicked() {
+                            state.plugin_reload_requested = true;
+                        }
+                        ui.label(RichText::new(format!("{loaded_count} loaded, {failed_count} failed"))
+                            .font(t::tiny()).color(t::text_muted()));
+                    });
+                    if state.plugin_statuses.is_empty() {
+                        ui.label(RichText::new("No plugins found in the Crust plugin directory.")
+                            .font(t::small()).color(t::text_secondary()));
+                    }
+                    for status in &state.plugin_statuses {
+                        ui.add_space(8.0);
+                        render_plugin_status_card(ui, status, compact);
+                    }
+                    if !state.plugin_ui.settings_pages.is_empty() {
+                        super::plugin_ui::render_plugin_settings_hub(ui, &state.plugin_ui, plugin_ui_session);
+                    }
+                    if has_host_panels_for_slot(&state.plugin_ui, PluginUiHostSlot::SettingsIntegrations) {
+                        ui.add_space(10.0);
+                        render_host_panels_for_slot(ui, &state.plugin_ui, plugin_ui_session,
+                            PluginUiHostSlot::SettingsIntegrations);
+                    }
+                }
+                SettingsSection::ExternalTools => {
                     ui.label(
                         RichText::new(
                             "Used by right-click -> 'Open in Streamlink' and 'Open in player' on a Twitch channel.",
@@ -2903,15 +2444,8 @@ fn render_settings_content(
                         .color(t::text_muted()),
                     );
 
-                    ui.add_space(10.0);
-                    ui.separator();
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new("Updates")
-                            .font(t::small())
-                            .strong()
-                            .color(t::text_primary()),
-                    );
+                }
+                SettingsSection::Updates => {
                     ui.label(
                         RichText::new(format!(
                             "Current version: v{}",
@@ -2957,10 +2491,6 @@ fn render_settings_content(
                         ui.horizontal_wrapped(|ui| {
                             if ui.button("Check now").clicked() {
                                 state.request_update_check_now = true;
-                            }
-
-                            if ui.button("Test gifted sub alert").clicked() {
-                                state.request_test_gifted_sub_alert = true;
                             }
 
                             if let Some(version) = state.updater_available_version.as_ref() {
@@ -3035,12 +2565,16 @@ pub fn show_settings_page(
     settings_section: &mut SettingsSection,
     state: &mut SettingsPageState,
     plugin_ui_session: &mut PluginUiSessionState,
-    stats: SettingsStats,
+    _stats: SettingsStats,
 ) {
     if !*settings_open || *settings_section != SettingsSection::Hotkeys {
         state.hotkey_capture_target = None;
     }
-    handle_hotkey_capture(ctx, &mut state.hotkey_capture_target, &mut state.hotkey_bindings);
+    handle_hotkey_capture(
+        ctx,
+        &mut state.hotkey_capture_target,
+        &mut state.hotkey_bindings,
+    );
     let bounds = ctx.screen_rect().shrink(8.0);
     let style = ctx.style();
     let frame = egui::Frame::window(&style);
@@ -3055,8 +2589,13 @@ pub fn show_settings_page(
     let min_size = egui::vec2(300.0, 280.0).min(max_size);
     let default_size = egui::vec2(760.0, 560.0).min(max_size);
     let settings_default_pos = (bounds.center() - default_size * 0.5).max(bounds.min);
+    let navigation_id = egui::Id::new("settings_navigation_state");
+    let mut navigation = ctx
+        .data_mut(|data| data.get_temp::<SettingsNavigation>(navigation_id))
+        .unwrap_or_default();
     egui::Window::new("Settings")
         .open(settings_open)
+        .enabled(!state.filter_editor_modal.open)
         .collapsible(false)
         .resizable(true)
         .order(egui::Order::Foreground)
@@ -3067,78 +2606,81 @@ pub fn show_settings_page(
         .default_pos(settings_default_pos)
         .default_size(default_size)
         .show(ctx, |ui| {
-            let compact_layout = ui.available_width() < 720.0;
+            let compact_layout = ui.available_width() < 650.0;
             let ultra_compact_layout = ui.available_width() < 500.0;
-            ui.vertical(|ui| {
-                chrome::dialog_header(
-                    ui,
-                    "Crust Settings",
-                    (!ultra_compact_layout).then_some("Changes apply and save automatically."),
+            let matches = render_settings_search(ui, &mut navigation, settings_section);
+            ui.label(
+                RichText::new("Changes save automatically.")
+                    .font(t::tiny())
+                    .color(t::text_helper()),
+            );
+            ui.add_space(6.0);
+            if matches.is_empty() {
+                ui.label("No matching settings.");
+                ui.label(
+                    RichText::new("Try a page name or an option such as font, sound, or updates.")
+                        .font(t::small())
+                        .color(t::text_secondary()),
                 );
-            });
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(8.0);
-
+                ui.allocate_space(ui.available_size().max(egui::Vec2::ZERO));
+                return;
+            }
             if compact_layout {
-                let nav_height = (ui.available_height() * 0.4).min(180.0);
-                bounded_settings_scroll(ui, "settings_compact_nav", nav_height, false, |ui| {
-                    render_sections_nav(ui, settings_section, stats, true, ultra_compact_layout);
-                });
+                render_sections_nav(ui, settings_section, &mut navigation, &matches, true);
                 ui.add_space(8.0);
+            }
+            let body = ui.available_rect_before_wrap();
+            ui.allocate_rect(body, egui::Sense::hover());
+            let mut content_rect = body;
+            if !compact_layout {
+                let nav_rect =
+                    egui::Rect::from_min_size(body.min, egui::vec2(170.0, body.height()));
+                let mut nav_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt("settings_navigation")
+                        .max_rect(nav_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
                 bounded_settings_scroll(
-                    ui,
-                    "settings_compact_content",
-                    ui.available_height(),
+                    &mut nav_ui,
+                    "settings_navigation_scroll",
+                    body.height(),
                     true,
                     |ui| {
-                        render_settings_content(
-                            ui,
-                            *settings_section,
-                            state,
-                            plugin_ui_session,
-                            true,
-                            ultra_compact_layout,
-                        );
+                        render_sections_nav(ui, settings_section, &mut navigation, &matches, false);
                     },
                 );
-            } else {
-                let height = ui.available_height();
-                ui.horizontal_top(|ui| {
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(200.0, height),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            bounded_settings_scroll(ui, "settings_wide_nav", height, true, |ui| {
-                                render_sections_nav(ui, settings_section, stats, false, false);
-                            });
-                        },
-                    );
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(ui.available_width(), height),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            bounded_settings_scroll(
-                                ui,
-                                "settings_wide_content",
-                                height,
-                                true,
-                                |ui| {
-                                    render_settings_content(
-                                        ui,
-                                        *settings_section,
-                                        state,
-                                        plugin_ui_session,
-                                        false,
-                                        false,
-                                    );
-                                },
-                            );
-                        },
-                    );
-                });
+                content_rect.min.x = nav_rect.right() + 10.0;
             }
+            // A section keeps the same parent identity in both layouts, including
+            // its text fields and scroll position.
+            let mut content_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt(("settings_section", *settings_section))
+                    .max_rect(content_rect)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+            );
+            bounded_settings_scroll(
+                &mut content_ui,
+                "settings_content_scroll",
+                content_rect.height(),
+                true,
+                |ui| {
+                    render_settings_content(
+                        ui,
+                        *settings_section,
+                        state,
+                        plugin_ui_session,
+                        content_rect.width() < 600.0,
+                        ultra_compact_layout,
+                    );
+                },
+            );
         });
+    ctx.data_mut(|data| data.insert_temp(navigation_id, navigation));
+    if !*settings_open {
+        state.filter_editor_modal.close();
+    }
 
     if !*settings_open || *settings_section != SettingsSection::Hotkeys {
         state.hotkey_capture_target = None;
@@ -3257,6 +2799,245 @@ mod responsive_tests {
         })
     }
 
+    fn key_event(key: egui::Key, pressed: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn settings_search_finds_moved_options_and_clear_restores_the_previous_page() {
+        let mut harness = SettingsHarness::new();
+        let size = egui::vec2(1100.0, 800.0);
+        let mut output = egui::FullOutput::default();
+        for _ in 0..4 {
+            output = harness.frame(size, Vec::new());
+        }
+        harness.click(
+            size,
+            visible_text_rect(&output, "Find a setting...")
+                .unwrap()
+                .center(),
+        );
+        harness.frame(size, vec![egui::Event::Text("INSTALL UPDATE".to_owned())]);
+        output = harness.frame(size, Vec::new());
+        assert_eq!(harness.section, SettingsSection::Updates);
+        let check =
+            visible_text_rect(&output, "Check now").expect("update action is immediately visible");
+        harness.click(size, check.center());
+        assert!(harness.state.request_update_check_now);
+        output = harness.frame(size, Vec::new());
+        harness.click(size, visible_text_rect(&output, "Clear").unwrap().center());
+        assert_eq!(harness.section, SettingsSection::Appearance);
+        output = harness.frame(size, Vec::new());
+        assert!(visible_text_rect(&output, "Theme and window").is_some());
+        assert!(visible_text_rect(&output, "Advanced text sizes").is_some());
+    }
+
+    #[test]
+    fn settings_search_keeps_keyboard_navigation_in_results_and_hides_unrelated_controls() {
+        let mut harness = SettingsHarness::new();
+        let size = egui::vec2(480.0, 640.0);
+        let mut output = egui::FullOutput::default();
+        for _ in 0..4 {
+            output = harness.frame(size, Vec::new());
+        }
+        harness.click(
+            size,
+            visible_text_rect(&output, "Find a setting...")
+                .unwrap()
+                .center(),
+        );
+        harness.frame(size, vec![egui::Event::Text("sound".to_owned())]);
+        assert_eq!(harness.section, SettingsSection::Notifications);
+        harness.frame(size, vec![key_event(egui::Key::ArrowDown, true)]);
+        assert_eq!(harness.section, SettingsSection::StreamerMode);
+        harness.frame(
+            size,
+            vec![
+                key_event(egui::Key::ArrowDown, false),
+                key_event(egui::Key::Enter, true),
+            ],
+        );
+        assert!(!harness
+            .ctx
+            .memory(|memory| memory.has_focus(egui::Id::new("settings_search"))));
+        output = harness.frame(size, vec![key_event(egui::Key::Enter, false)]);
+        harness.click(size, visible_text_rect(&output, "Clear").unwrap().center());
+        assert_eq!(harness.section, SettingsSection::StreamerMode);
+        harness.frame(size, vec![egui::Event::Text("no-such-option".to_owned())]);
+        output = harness.frame(size, Vec::new());
+        assert!(visible_text_rect(&output, "No matching settings.").is_some());
+        assert!(visible_text_rect(&output, "Suppress sound notifications").is_none());
+        harness.frame(size, vec![key_event(egui::Key::Escape, true)]);
+        output = harness.frame(size, vec![key_event(egui::Key::Escape, false)]);
+        assert!(visible_text_rect(&output, "Suppress sound notifications").is_some());
+    }
+
+    #[test]
+    fn settings_pages_restore_their_own_scroll_positions() {
+        let mut harness = SettingsHarness::new();
+        harness.section = SettingsSection::Chat;
+        let size = egui::vec2(1100.0, 800.0);
+        let mut output = egui::FullOutput::default();
+        for _ in 0..4 {
+            output = harness.frame(size, Vec::new());
+        }
+        let window = harness.window_rect();
+        harness.frame(
+            size,
+            vec![
+                egui::Event::PointerMoved(egui::pos2(
+                    window.right() - 80.0,
+                    window.bottom() - 60.0,
+                )),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -3000.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        for _ in 0..30 {
+            output = harness.frame(size, Vec::new());
+        }
+        assert!(visible_text_rect(&output, "No custom words yet.").is_some());
+        harness.click(
+            size,
+            visible_text_rect(&output, "Appearance").unwrap().center(),
+        );
+        output = harness.frame(size, Vec::new());
+        assert!(
+            visible_text_rect(&output, "Theme and window").is_some(),
+            "a new page must open at its top"
+        );
+        harness.click(size, visible_text_rect(&output, "Chat").unwrap().center());
+        output = harness.frame(size, Vec::new());
+        assert!(
+            visible_text_rect(&output, "No custom words yet.").is_some(),
+            "returning must restore the old page position"
+        );
+    }
+
+    #[test]
+    fn settings_search_focus_survives_the_responsive_breakpoint() {
+        let mut harness = SettingsHarness::new();
+        let wide = egui::vec2(1100.0, 800.0);
+        let mut output = egui::FullOutput::default();
+        for _ in 0..4 {
+            output = harness.frame(wide, Vec::new());
+        }
+        harness.click(
+            wide,
+            visible_text_rect(&output, "Find a setting...")
+                .unwrap()
+                .center(),
+        );
+        harness.frame(wide, vec![egui::Event::Text("external".to_owned())]);
+        assert_eq!(harness.section, SettingsSection::ExternalTools);
+        let narrow = egui::vec2(320.0, 420.0);
+        for _ in 0..4 {
+            harness.frame(narrow, Vec::new());
+        }
+        assert!(harness
+            .ctx
+            .memory(|memory| memory.has_focus(egui::Id::new("settings_search"))));
+        harness.frame(narrow, vec![egui::Event::Text(" player".to_owned())]);
+        assert_eq!(harness.section, SettingsSection::ExternalTools);
+        assert_eq!(
+            harness
+                .ctx
+                .data_mut(|data| data
+                    .get_temp::<SettingsNavigation>(egui::Id::new("settings_navigation_state")))
+                .unwrap()
+                .query,
+            "external player"
+        );
+    }
+
+    #[test]
+    fn populated_settings_editors_keep_actions_reachable_without_horizontal_scrolling() {
+        let size = egui::vec2(320.0, 640.0);
+        for (section, remove) in [
+            (SettingsSection::Highlights, "Remove"),
+            (SettingsSection::Filters, "Remove"),
+            (SettingsSection::Nicknames, "Remove nickname"),
+            (SettingsSection::Ignores, "Remove user"),
+            (SettingsSection::Commands, "Remove alias"),
+        ] {
+            let mut harness = SettingsHarness::new();
+            harness.section = section;
+            harness.state.highlight_rules = vec![HighlightRule::new("hello")];
+            harness.state.filter_records = vec![crust_core::model::filters::FilterRecord::new(
+                "Test",
+                "hello",
+                crust_core::model::filters::FilterScope::Global,
+            )];
+            harness.state.nicknames = vec![crust_core::model::Nickname::new("viewer", "Friend")];
+            harness.state.ignored_users = vec![crust_core::ignores::IgnoredUser::new("ignored")];
+            let mut output = egui::FullOutput::default();
+            for _ in 0..4 {
+                output = harness.frame(size, Vec::new());
+            }
+            let action = visible_text_rect(&output, remove).unwrap_or_else(|| {
+                panic!("{section:?}: {remove} must be fully visible in a narrow editor")
+            });
+            harness.click(size, action.center());
+            let empty = match section {
+                SettingsSection::Highlights => harness.state.highlight_rules.is_empty(),
+                SettingsSection::Filters => harness.state.filter_records.is_empty(),
+                SettingsSection::Nicknames => harness.state.nicknames.is_empty(),
+                SettingsSection::Ignores => harness.state.ignored_users.is_empty(),
+                SettingsSection::Commands => harness.state.command_aliases.is_empty(),
+                _ => unreachable!(),
+            };
+            assert!(empty, "{section:?} action must still edit its own list");
+        }
+    }
+
+    #[test]
+    fn highlight_cards_reorder_duplicate_and_remove_the_matching_edit_buffers() {
+        let mut harness = SettingsHarness::new();
+        harness.section = SettingsSection::Highlights;
+        harness.state.highlight_rules =
+            vec![HighlightRule::new("first"), HighlightRule::new("second")];
+        let size = egui::vec2(480.0, 640.0);
+        let mut output = egui::FullOutput::default();
+        for _ in 0..4 {
+            output = harness.frame(size, Vec::new());
+        }
+        harness.click(
+            size,
+            visible_text_rect(&output, "Move down").unwrap().center(),
+        );
+        assert_eq!(harness.state.highlight_rule_bufs, ["second", "first"]);
+        output = harness.frame(size, Vec::new());
+        harness.click(
+            size,
+            visible_text_rect(&output, "Duplicate").unwrap().center(),
+        );
+        assert_eq!(
+            harness.state.highlight_rule_bufs,
+            ["second", "second", "first"]
+        );
+        output = harness.frame(size, Vec::new());
+        harness.click(size, visible_text_rect(&output, "Remove").unwrap().center());
+        assert_eq!(harness.state.highlight_rule_bufs, ["second", "first"]);
+        assert_eq!(
+            harness
+                .state
+                .highlight_rules
+                .iter()
+                .map(|rule| rule.pattern.as_str())
+                .collect::<Vec<_>>(),
+            ["second", "first"]
+        );
+    }
+
     #[test]
     fn hotkey_capture_keeps_tab_in_the_binding_and_restores_normal_focus_afterward() {
         let mut harness = SettingsHarness::new();
@@ -3265,17 +3046,25 @@ mod responsive_tests {
         let action = crust_core::HotkeyAction::ZoomIn;
         let label = harness.state.hotkey_bindings.get(action).display_label();
         let mut output = egui::FullOutput::default();
-        for _ in 0..4 { output = harness.frame(size, Vec::new()); }
+        for _ in 0..4 {
+            output = harness.frame(size, Vec::new());
+        }
         let bind = visible_text_rect(&output, &label).expect("binding button is visible");
         harness.click(size, bind.center());
         assert_eq!(harness.state.hotkey_capture_target, Some(action));
         let focused = harness.ctx.memory(|memory| memory.focused()).unwrap();
         let key = |pressed| egui::Event::Key {
-            key: egui::Key::Tab, physical_key: None, pressed, repeat: false,
+            key: egui::Key::Tab,
+            physical_key: None,
+            pressed,
+            repeat: false,
             modifiers: egui::Modifiers::NONE,
         };
         harness.frame(size, vec![key(true)]);
-        assert_eq!(harness.state.hotkey_bindings.get(action), crust_core::KeyBinding::new("Tab"));
+        assert_eq!(
+            harness.state.hotkey_bindings.get(action),
+            crust_core::KeyBinding::new("Tab")
+        );
         assert!(harness.state.hotkey_capture_target.is_none());
         assert_eq!(harness.ctx.memory(|memory| memory.focused()), Some(focused));
         harness.frame(size, vec![key(false)]);
@@ -3293,7 +3082,9 @@ mod responsive_tests {
             let previous = harness.state.hotkey_bindings.clone();
             let label = harness.state.hotkey_bindings.get(action).display_label();
             let mut output = egui::FullOutput::default();
-            for _ in 0..4 { output = harness.frame(size, Vec::new()); }
+            for _ in 0..4 {
+                output = harness.frame(size, Vec::new());
+            }
             harness.click(size, visible_text_rect(&output, &label).unwrap().center());
             assert_eq!(harness.state.hotkey_capture_target, Some(action));
             let target = if close_window {
@@ -3305,14 +3096,23 @@ mod responsive_tests {
             };
             harness.click(size, target);
             assert!(harness.state.hotkey_capture_target.is_none());
-            if close_window { assert!(!harness.open); }
-            else { assert_eq!(harness.section, SettingsSection::Appearance); }
+            if close_window {
+                assert!(!harness.open);
+            } else {
+                assert_eq!(harness.section, SettingsSection::Appearance);
+            }
             harness.open = true;
             harness.section = SettingsSection::Hotkeys;
-            harness.frame(size, vec![egui::Event::Key {
-                key: egui::Key::K, physical_key: None, pressed: true, repeat: false,
-                modifiers: egui::Modifiers::CTRL,
-            }]);
+            harness.frame(
+                size,
+                vec![egui::Event::Key {
+                    key: egui::Key::K,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::CTRL,
+                }],
+            );
             assert_eq!(harness.state.hotkey_bindings, previous);
         }
     }
@@ -3353,7 +3153,7 @@ mod responsive_tests {
     #[test]
     fn narrow_settings_scroll_to_bottom_controls_without_moving_the_title() {
         let mut harness = SettingsHarness::new();
-        let size = egui::vec2(480.0, 640.0);
+        let size = egui::vec2(480.0, 420.0);
         let mut output = egui::FullOutput::default();
         for _ in 0..4 {
             output = harness.frame(size, Vec::new());

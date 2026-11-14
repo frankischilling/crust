@@ -32,6 +32,7 @@ fn active_emote(id: &str, code: &str) -> Value {
 struct Harness {
     index: crate::EmoteIndex,
     channel: ChannelId,
+    scope: LiveScope,
     desired: watch::Sender<Vec<LiveTarget>>,
     dirty: mpsc::Receiver<()>,
     websocket: TcpListener,
@@ -42,29 +43,60 @@ struct Harness {
 
 impl Harness {
     async fn new(provider: Provider, emotes: Vec<EmoteInfo>) -> Self {
+        Self::new_scoped(
+            provider,
+            emotes,
+            LiveScope::Channel(ChannelId::new("loopback")),
+        )
+        .await
+    }
+
+    async fn new_scoped(provider: Provider, emotes: Vec<EmoteInfo>, scope: LiveScope) -> Self {
         let index = crate::EmoteIndex::default();
         let channel = ChannelId::new("loopback");
+        let global = matches!(scope, LiveScope::Global);
         let source = LiveSource {
             provider,
-            room_id: "42".into(),
-            platform: "TWITCH".into(),
-            user_id: (provider == Provider::SevenTv).then(|| "user-id".into()),
+            room_id: if global { "global" } else { "42" }.into(),
+            platform: if global { "GLOBAL" } else { "TWITCH" }.into(),
+            user_id: (provider == Provider::SevenTv && !global).then(|| "user-id".into()),
             set_id: (provider == Provider::SevenTv).then(|| "set-id".into()),
-            connection_index: (provider == Provider::SevenTv).then_some(0),
+            connection_index: (provider == Provider::SevenTv
+                && matches!(scope, LiveScope::Channel(_)))
+            .then_some(0),
         };
         {
             let mut registry = index.write().unwrap();
-            registry.open_channel(&channel);
-            let generation = registry.begin_channel_load(&channel, "42", false).unwrap();
-            assert!(registry.replace_channel_with_source(
-                &channel,
-                generation,
-                provider.name(),
-                Some(emotes),
-                Some(source),
-                None
-            ));
-            assert!(registry.complete_channel_load(&channel, generation));
+            match &scope {
+                LiveScope::Channel(channel) => {
+                    registry.open_channel(channel);
+                    let generation = registry.begin_channel_load(channel, "42", false).unwrap();
+                    assert!(registry.replace_channel_with_source(
+                        channel,
+                        generation,
+                        provider.name(),
+                        Some(emotes),
+                        Some(source),
+                        None,
+                    ));
+                    assert!(registry.complete_channel_load(channel, generation));
+                }
+                LiveScope::Global => {
+                    registry.replace_global_live(source, emotes, None);
+                }
+                LiveScope::Personal(user) => {
+                    registry.set_account(Some(user));
+                    let generation = registry.begin_personal_load(user, None).unwrap();
+                    registry
+                        .complete_personal_load_with_source(
+                            user,
+                            generation,
+                            Some(emotes),
+                            Some(source),
+                        )
+                        .unwrap();
+                }
+            }
         }
         let websocket = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -89,6 +121,7 @@ impl Harness {
         Self {
             index,
             channel,
+            scope,
             desired,
             dirty,
             websocket,
@@ -99,10 +132,14 @@ impl Harness {
     }
 
     fn has(&self, code: &str) -> bool {
+        let user = match &self.scope {
+            LiveScope::Personal(user) => user.as_str(),
+            _ => "",
+        };
         self.index
             .read()
             .unwrap()
-            .resolve(&self.channel, "", code)
+            .resolve(&self.channel, user, code)
             .is_some()
     }
 
@@ -249,6 +286,207 @@ fn graphql_snapshot(set: &str, emotes: Vec<Value>) -> Value {
         ]},
         "sets": [{ "id": set, "emotes": emotes }]
     }})
+}
+
+fn scoped_snapshot(scope: &LiveScope, set: &str, emotes: Vec<Value>) -> Value {
+    match scope {
+        LiveScope::Channel(_) => graphql_snapshot(set, emotes),
+        LiveScope::Global => json!({"data": {"sets": [{"id": set, "emotes": emotes}]}}),
+        LiveScope::Personal(_) => json!({"data": {
+            "userByConnection": {"id": "user-id", "emote_sets": [{"id": set, "flags": 4}]},
+            "sets": [{"id": set, "emotes": emotes}]
+        }}),
+    }
+}
+
+async fn ready_scoped(fixture: &mut Harness) {
+    let count = if matches!(fixture.scope, LiveScope::Global) {
+        2
+    } else {
+        3
+    };
+    send(
+        &mut fixture.socket,
+        json!({"op": 1, "d": {"heartbeat_interval": 60000, "subscription_limit": 100}}),
+    )
+    .await;
+    let mut subscriptions = Vec::new();
+    for _ in 0..count {
+        subscriptions.push(next_text(&mut fixture.socket).await);
+    }
+    for subscription in &subscriptions[..count - 1] {
+        acknowledge(&mut fixture.socket, subscription).await;
+    }
+    barrier(&mut fixture.socket, b"scoped-partial-acks").await;
+    fixture.assert_no_request().await;
+    acknowledge(&mut fixture.socket, &subscriptions[count - 1]).await;
+}
+
+#[tokio::test]
+async fn seven_tv_global_and_personal_scopes_reconcile_live_changes_and_offline_removals() {
+    for scope in [LiveScope::Global, LiveScope::Personal("42".into())] {
+        let mut fixture = Harness::new_scoped(
+            Provider::SevenTv,
+            vec![emote(Provider::SevenTv, "gone", "Gone")],
+            scope.clone(),
+        )
+        .await;
+        ready_scoped(&mut fixture).await;
+        let (mut request, headers) = fixture.request().await;
+        let body: Value = serde_json::from_str(headers.split_once("\r\n\r\n").unwrap().1).unwrap();
+        let query = body["query"].as_str().unwrap();
+        assert_eq!(
+            query.contains("userByConnection"),
+            matches!(scope, LiveScope::Personal(_))
+        );
+        if matches!(scope, LiveScope::Personal(_)) {
+            assert!(query.contains("emote_sets"));
+        }
+        send(&mut fixture.socket, json!({"op": 0, "d": {"type": "emote_set.update", "body": {
+            "id": "set-id", "pulled": [{"key": "emotes", "old_value": {"id": "gone", "name": "Gone"}}],
+            "pushed": [{"key": "emotes", "value": active_emote("live", "Live")}]
+        }}})).await;
+        barrier(&mut fixture.socket, b"scoped-live-change").await;
+        assert!(!fixture.has("Gone"));
+        assert!(fixture.has("Live"));
+        respond(
+            &mut request,
+            scoped_snapshot(
+                &scope,
+                "set-id",
+                vec![
+                    active_emote("gone", "Gone"),
+                    active_emote("rest", "RestMarker"),
+                ],
+            ),
+        )
+        .await;
+        fixture.wait_for("RestMarker").await;
+        assert!(!fixture.has("Gone"));
+        assert!(fixture.has("Live"));
+        if matches!(scope, LiveScope::Personal(_)) {
+            assert!(fixture
+                .index
+                .read()
+                .unwrap()
+                .resolve(&fixture.channel, "someone-else", "Live")
+                .is_none());
+            assert!(fixture
+                .index
+                .read()
+                .unwrap()
+                .resolve(&ChannelId::kick("room"), "42", "Live")
+                .is_none());
+        }
+
+        send(&mut fixture.socket, json!({"op": 4, "d": {}})).await;
+        fixture.reconnect().await;
+        ready_scoped(&mut fixture).await;
+        let (mut request, _) = fixture.request().await;
+        respond(
+            &mut request,
+            scoped_snapshot(
+                &scope,
+                "set-id",
+                vec![active_emote("fresh", "FreshSnapshot")],
+            ),
+        )
+        .await;
+        fixture.wait_for("FreshSnapshot").await;
+        assert!(
+            !fixture.has("Live"),
+            "reconnect retained an emote removed while offline"
+        );
+        assert!(!fixture.has("RestMarker"));
+        fixture.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn seven_tv_personal_assignment_changes_refresh_membership_and_replace_the_socket_binding() {
+    personal_assignment_change(false).await;
+}
+
+#[tokio::test]
+async fn seven_tv_personal_assignment_change_during_a_snapshot_is_not_delayed_until_periodic_refresh(
+) {
+    personal_assignment_change(true).await;
+}
+
+async fn personal_assignment_change(during_snapshot: bool) {
+    let scope = LiveScope::Personal("42".into());
+    let mut fixture = Harness::new_scoped(
+        Provider::SevenTv,
+        vec![emote(Provider::SevenTv, "old", "OldPersonal")],
+        scope.clone(),
+    )
+    .await;
+    ready_scoped(&mut fixture).await;
+    let (mut request, _) = fixture.request().await;
+    let changed = json!({"op": 0, "d": {"type": "user.update", "body": {
+        "id": "user-id", "pushed": [{"key": "emote_sets", "value": {"id": "new-personal", "flags": 4}}]
+    }}});
+    if during_snapshot {
+        send(&mut fixture.socket, changed.clone()).await;
+        barrier(&mut fixture.socket, b"personal-change-during-snapshot").await;
+    }
+    respond(
+        &mut request,
+        scoped_snapshot(&scope, "set-id", vec![active_emote("rest", "Ready")]),
+    )
+    .await;
+    fixture.wait_for("Ready").await;
+    if !during_snapshot {
+        send(&mut fixture.socket, changed).await;
+    }
+    let (mut request, _) = fixture.request().await;
+    respond(
+        &mut request,
+        scoped_snapshot(&scope, "new-personal", Vec::new()),
+    )
+    .await;
+    within(async {
+        loop {
+            if fixture.index.read().unwrap().live_targets()[0]
+                .source
+                .set_id
+                .as_deref()
+                == Some("new-personal")
+            {
+                break;
+            }
+            fixture.dirty.recv().await.unwrap();
+        }
+    })
+    .await;
+    assert!(!fixture.has("Ready"));
+    let targets = fixture.index.read().unwrap().live_targets();
+    fixture.desired.send(targets).unwrap();
+    fixture.reconnect().await;
+    ready_scoped(&mut fixture).await;
+    let (mut request, headers) = fixture.request().await;
+    let body: Value = serde_json::from_str(headers.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(body["variables"]["set"], "new-personal");
+    respond(
+        &mut request,
+        scoped_snapshot(
+            &scope,
+            "new-personal",
+            vec![active_emote("new", "NewPersonal")],
+        ),
+    )
+    .await;
+    fixture.wait_for("NewPersonal").await;
+    send(
+        &mut fixture.socket,
+        json!({"op": 0, "d": {"type": "emote_set.update", "body": {
+            "id": "set-id", "pushed": [{"key": "emotes", "value": active_emote("stale", "Stale")}]
+        }}}),
+    )
+    .await;
+    barrier(&mut fixture.socket, b"old-personal-set").await;
+    assert!(!fixture.has("Stale"));
+    fixture.stop().await;
 }
 
 #[tokio::test]

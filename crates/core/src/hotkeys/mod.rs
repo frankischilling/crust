@@ -1,7 +1,6 @@
 //! Hotkey registry with rebindable shortcuts.
 //!
-//! Mirrors the Chatterino hotkey controller: every user-visible keyboard
-//! action is represented by a [`HotkeyAction`], grouped by
+//! Every keyboard action is represented by a [`HotkeyAction`], grouped by
 //! [`HotkeyCategory`]. [`HotkeyBindings`] maps every action to exactly one
 //! [`KeyBinding`] and supports conflict detection + defaults.
 //!
@@ -357,8 +356,7 @@ pub struct HotkeyBindings {
 }
 
 impl HotkeyBindings {
-    /// Factory for default Crust keybindings. Kept close to Chatterino
-    /// defaults where sensible.
+    /// Default Crust keybindings.
     pub fn defaults() -> Self {
         let mut map = BTreeMap::new();
         // Window

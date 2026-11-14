@@ -1,7 +1,6 @@
 //! Broadcasting-software detection for streamer mode.
 //!
-//! Mirrors Chatterino's `StreamerMode` singleton: when the user picks `auto`
-//! we periodically check whether OBS / Streamlabs / similar processes are
+//! In `auto` mode, periodically check whether OBS, Streamlabs, or similar processes are
 //! running and toggle the effective active flag accordingly.
 
 use std::process::Command;
@@ -31,7 +30,7 @@ const WINDOWS_BROADCASTING_BINARIES: &[&str] = &[
 #[cfg(unix)]
 const UNIX_BROADCASTING_BINARIES: &[&str] = &["obs", "Twitch Studio", "Streamlabs Desktop"];
 
-/// Poll interval matches Chatterino (~20 seconds).
+/// Interval between broadcasting-process checks.
 const POLL_INTERVAL: Duration = Duration::from_secs(20);
 
 /// Streamer mode setting selected by the user.

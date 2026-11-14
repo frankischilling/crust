@@ -11,8 +11,6 @@ use crust_core::model::EmoteCatalogEntry;
 use super::emoji_list::emoji_catalog_entries;
 use crate::theme as t;
 
-use super::chrome;
-
 const EMOTE_SIZE: f32 = 28.0;
 const CELL_SIZE: f32 = EMOTE_SIZE + 8.0;
 const ROW_H: f32 = CELL_SIZE + 4.0;
@@ -496,6 +494,7 @@ impl EmotePicker {
             boosted: bool,
             usage: u32,
             recent: usize,
+            emoji: bool,
             code_len: usize,
             code_lower: String,
         }
@@ -520,6 +519,7 @@ impl EmotePicker {
                         .get(entry.url.as_str())
                         .copied()
                         .unwrap_or(usize::MAX),
+                    emoji: entry.provider == "emoji",
                     code_len: entry.code.len(),
                     code_lower,
                 }
@@ -533,6 +533,7 @@ impl EmotePicker {
                 .then_with(|| b.boosted.cmp(&a.boosted))
                 .then_with(|| b.usage.cmp(&a.usage))
                 .then_with(|| a.recent.cmp(&b.recent))
+                .then_with(|| a.emoji.cmp(&b.emoji))
                 .then_with(|| a.code_len.cmp(&b.code_len))
                 .then_with(|| a.code_lower.cmp(&b.code_lower))
         });
@@ -567,20 +568,28 @@ impl EmotePicker {
         let mut next_provider_boost = self.provider_boost.clone();
         let mut pending_favorite_toggle: Option<String> = None;
 
+        let bounds = ctx.screen_rect().shrink(8.0);
+        let style = ctx.style();
+        let frame = egui::Frame::window(&style);
+        let title_height = ctx
+            .fonts(|fonts| fonts.row_height(&egui::TextStyle::Heading.resolve(&style)))
+            .max(style.spacing.interact_size.y)
+            + frame.inner_margin.sum().y
+            + frame.stroke.width;
+        let max_size = (bounds.size() - frame.total_margin().sum() - egui::vec2(0.0, title_height))
+            .max(egui::Vec2::splat(1.0));
         let window_resp = egui::Window::new("Emotes")
             .open(&mut still_open)
-            .default_size([280.0, 340.0])
-            .min_size([200.0, 180.0])
+            .default_size(egui::vec2(320.0, 380.0).min(max_size))
+            .min_size(egui::vec2(200.0, 180.0).min(max_size))
+            .max_size(max_size)
+            .constrain_to(bounds)
             .resizable(true)
-            .collapsible(true)
+            .collapsible(false)
             .scroll(false)
             .show(ctx, |ui| {
-                chrome::dialog_header(ui, "Emotes", Some("Browse channel emotes and emoji."));
-                ui.add_space(6.0);
-
                 // Search bar
                 ui.horizontal(|ui| {
-                    ui.label("🔍");
                     let search = ui.add(
                         egui::TextEdit::singleline(&mut self.filter)
                             .id(Self::search_id())
@@ -646,26 +655,26 @@ impl EmotePicker {
                     }
                 });
 
-                // Provider boost controls for ranking preference.
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Boost").small().color(t::text_muted()));
-                    let none_active = next_provider_boost.is_none();
-                    if ui
-                        .selectable_label(none_active, RichText::new("None").small())
-                        .clicked()
-                    {
-                        next_provider_boost = None;
-                    }
-                    for &(provider_key, label) in TABS {
-                        let selected = next_provider_boost.as_deref() == Some(provider_key);
-                        if ui
-                            .selectable_label(selected, RichText::new(label).small())
-                            .clicked()
-                        {
-                            next_provider_boost = Some(provider_key.to_owned());
+                let order_label = TABS
+                    .iter()
+                    .find(|(key, _)| next_provider_boost.as_deref() == Some(*key))
+                    .map(|(_, label)| format!("Prefer {label}"))
+                    .unwrap_or_else(|| "Default order".to_owned());
+                egui::ComboBox::from_id_salt("emote_picker_order")
+                    .selected_text(order_label)
+                    .width(ui.available_width())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut next_provider_boost, None, "Default order");
+                        for &(provider_key, label) in TABS {
+                            ui.selectable_value(
+                                &mut next_provider_boost,
+                                Some(provider_key.to_owned()),
+                                format!("Prefer {label}"),
+                            );
                         }
-                    }
-                });
+                    })
+                    .response
+                    .on_hover_text("Prefer a provider after search matches and favorites.");
                 ui.separator();
 
                 let display_indices =
@@ -684,7 +693,7 @@ impl EmotePicker {
                 }
 
                 let available_w = ui.available_width();
-                let available_h = ui.available_height();
+                let available_h = ui.available_height().max(0.0);
                 let cols = ((available_w / CELL_SIZE) as usize).max(1);
                 let num_rows = (display_indices.len() + cols - 1) / cols;
                 let mut has_animated_visible = false;
@@ -1032,6 +1041,33 @@ mod tests {
         assert!(!cached
             .index_by_url
             .contains_key("https://example.test/first.png"));
+    }
+
+    #[test]
+    fn all_view_starts_with_emotes_and_keeps_explicit_emoji_preferences() {
+        let mut picker = EmotePicker::default();
+        picker.emoji_entries = vec![entry("🙂", "emoji", "https://example.test/smile.png")];
+        let catalog = [entry(
+            "LongEmoteName",
+            "twitch",
+            "https://example.test/emote.png",
+        )];
+        picker.ensure_cache(&catalog);
+        assert_eq!(
+            picker.display_indices_for(PickerView::All, None).as_ref(),
+            &[0, 1]
+        );
+        assert_eq!(
+            picker
+                .display_indices_for(PickerView::All, Some("emoji"))
+                .as_ref(),
+            &[1, 0]
+        );
+        picker.toggle_favorite_url("https://example.test/smile.png");
+        assert_eq!(
+            picker.display_indices_for(PickerView::All, None).as_ref(),
+            &[1, 0]
+        );
     }
 
     #[test]

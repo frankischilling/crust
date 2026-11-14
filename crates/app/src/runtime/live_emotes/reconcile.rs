@@ -9,6 +9,7 @@ use super::{EmoteDelta, LiveBinding, LiveSource};
 static NEXT_BINDING: AtomicU64 = AtomicU64::new(1);
 
 const MAX_JOURNAL: usize = 4_096;
+const MAX_RETIRED_SETS: usize = 64;
 // The public cached endpoint currently advertises five minutes of freshness
 // plus ten minutes of stale-while-revalidate. Keep a wider reconciliation window.
 const CACHED_SNAPSHOT_WINDOW: Duration = Duration::from_secs(30 * 60);
@@ -30,6 +31,8 @@ pub(crate) struct LiveState {
     revision: u64,
     journal: VecDeque<ObservedDelta>,
     overflowed_at: Option<(Instant, u64)>,
+    fresh_snapshot_at: Option<Instant>,
+    retired_sets: VecDeque<(Option<String>, Instant)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +57,8 @@ impl LiveState {
             revision: 0,
             journal: VecDeque::new(),
             overflowed_at: None,
+            fresh_snapshot_at: None,
+            retired_sets: VecDeque::new(),
         }
     }
 
@@ -73,8 +78,36 @@ impl LiveState {
             self.binding_generation = NEXT_BINDING.fetch_add(1, Ordering::Relaxed);
             self.epoch = 0;
         } else {
+            let retired_sets = std::mem::take(&mut self.retired_sets);
             *self = Self::new(source);
+            self.retired_sets = retired_sets;
         }
+    }
+
+    pub(crate) fn rebind_authoritative(&mut self, source: LiveSource, now: Instant) {
+        if self.source.same_catalog(&source) {
+            self.rebind(source);
+            return;
+        }
+        let previous = self.source.set_id.clone();
+        self.rebind(source);
+        self.retired_sets.retain(|(set, retired)| {
+            set != &self.source.set_id
+                && set != &previous
+                && now.saturating_duration_since(*retired) < CACHED_SNAPSHOT_WINDOW
+        });
+        if self.retired_sets.len() >= MAX_RETIRED_SETS {
+            self.retired_sets.pop_front();
+        }
+        self.retired_sets.push_back((previous, now));
+    }
+
+    pub(crate) fn accepts_cached_source(&self, source: &LiveSource) -> bool {
+        // A request started after a live switch can still return the previous
+        // assignment from an edge cache. Keep those source removals bounded.
+        !self.retired_sets.iter().any(|(set, retired)| {
+            set == &source.set_id && retired.elapsed() < CACHED_SNAPSHOT_WINDOW
+        })
     }
 
     pub(crate) fn begin_epoch(&mut self, epoch: u64) -> bool {
@@ -139,7 +172,7 @@ impl LiveState {
         ticket: SnapshotTicket,
         snapshot: Vec<EmoteInfo>,
         fresh: bool,
-        _now: Instant,
+        now: Instant,
     ) -> ApplyResult {
         if ticket.epoch != self.epoch {
             return ApplyResult::default();
@@ -180,6 +213,9 @@ impl LiveState {
         }
         let changed = *current != next;
         *current = next;
+        if fresh {
+            self.fresh_snapshot_at = Some(now);
+        }
         ApplyResult {
             changed,
             needs_snapshot: self.overflowed_at.is_some(),
@@ -187,7 +223,19 @@ impl LiveState {
     }
 
     /// Initial/manual REST loads obey the same tombstones as reconnect snapshots.
-    pub(crate) fn overlay_snapshot(&self, snapshot: Vec<EmoteInfo>) -> Emotes {
+    pub(crate) fn overlay_snapshot(
+        &self,
+        snapshot: Vec<EmoteInfo>,
+        current: Option<&Emotes>,
+    ) -> Emotes {
+        // Cached metadata must not replace a recent authoritative snapshot after
+        // that snapshot has retired the older live-change journal.
+        if self
+            .fresh_snapshot_at
+            .is_some_and(|fresh| fresh.elapsed() < CACHED_SNAPSHOT_WINDOW)
+        {
+            return current.cloned().unwrap_or_default();
+        }
         let mut next = snapshot
             .into_iter()
             .map(|emote| (emote.code.clone(), emote))
@@ -326,6 +374,78 @@ mod tests {
         );
         assert!(current.is_empty());
         assert_eq!(state.journal.len(), 1);
+    }
+
+    #[test]
+    fn a_recent_fresh_snapshot_prevents_cached_refresh_from_restoring_removed_emotes() {
+        let now = Instant::now();
+        let old = emote("id", "Gone");
+        let mut state = state();
+        let mut current = HashMap::from([("Gone".into(), old.clone())]);
+        state.begin_epoch(1);
+        state.observe(
+            &mut current,
+            1,
+            EmoteDelta::Remove {
+                id: "id".into(),
+                code: None,
+            },
+            now,
+        );
+        let confirmed = state.ticket(1).unwrap();
+        state.replace_snapshot(&mut current, confirmed, Vec::new(), true, now);
+        assert!(state.journal.is_empty());
+        assert!(state
+            .overlay_snapshot(vec![old.clone()], Some(&current))
+            .is_empty());
+
+        let mut replacement = state.source.clone();
+        replacement.set_id = Some("new-set".into());
+        state.rebind(replacement);
+        assert!(state
+            .overlay_snapshot(vec![old], Some(&current))
+            .contains_key("Gone"));
+    }
+
+    #[test]
+    fn retired_sources_expire_and_authoritative_changes_can_restore_a_previous_set() {
+        let now = Instant::now();
+        let mut state = state();
+        let no_set = state.source.clone();
+        let mut first = no_set.clone();
+        first.set_id = Some("first".into());
+        state.rebind_authoritative(first.clone(), now);
+        assert!(!state.accepts_cached_source(&no_set));
+        let mut second = first.clone();
+        second.set_id = Some("second".into());
+        state.rebind_authoritative(second.clone(), now);
+        assert!(!state.accepts_cached_source(&first));
+        state.rebind_authoritative(first.clone(), now);
+        assert!(state.accepts_cached_source(&first));
+        assert!(!state.accepts_cached_source(&second));
+
+        let mut expired = LiveState::new(no_set.clone());
+        expired.rebind_authoritative(first, now - CACHED_SNAPSHOT_WINDOW - Duration::from_secs(1));
+        assert!(expired.accepts_cached_source(&no_set));
+    }
+
+    #[test]
+    fn cached_refresh_can_recover_when_authoritative_snapshots_stop() {
+        let old = emote("id", "Back");
+        let mut state = state();
+        let mut current = HashMap::new();
+        state.begin_epoch(1);
+        let confirmed = state.ticket(1).unwrap();
+        state.replace_snapshot(
+            &mut current,
+            confirmed,
+            Vec::new(),
+            true,
+            Instant::now() - CACHED_SNAPSHOT_WINDOW - Duration::from_secs(1),
+        );
+        assert!(state
+            .overlay_snapshot(vec![old], Some(&current))
+            .contains_key("Back"));
     }
 
     #[test]

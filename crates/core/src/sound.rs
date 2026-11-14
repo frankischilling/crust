@@ -1,6 +1,6 @@
 //! Sound event configuration shared between storage, runtime, and UI.
 //!
-//! Mirrors Chatterino's per-event sound notifications:
+//! Each notification type has its own sound settings:
 //!
 //! - mention / whisper / subscribe / raid / custom highlight each have a
 //!   user-selected file path and a per-event volume (0.0 - 1.0),

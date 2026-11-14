@@ -1,7 +1,7 @@
 //! Ignored users + ignored phrases.
 //!
-//! Mirrors the chatterino split between [`IgnoredUser`] (full-user block list)
-//! and [`IgnoredPhrase`] (per-message text pattern with an action).  The UI
+//! [`IgnoredUser`] blocks a user; [`IgnoredPhrase`] applies an action to messages
+//! that match a text pattern. The UI
 //! manages both in a single settings tab.
 
 use serde::{Deserialize, Serialize};
