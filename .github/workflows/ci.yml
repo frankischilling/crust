@@ -46,7 +46,7 @@ jobs:
           restore-keys: |
             linux-${{ steps.rust.outputs.version }}-
       - name: Run workspace tests
-        run: cargo test --workspace --all-targets --release --locked
+        run: cargo test --workspace --all-targets --release --locked --no-fail-fast
       - name: Check correctness lints
         run: cargo clippy --workspace --all-targets --release --locked -- -A clippy::style -A clippy::complexity -D clippy::correctness
       - name: Build the Debian package
