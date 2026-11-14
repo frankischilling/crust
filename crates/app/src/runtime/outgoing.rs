@@ -64,6 +64,9 @@ impl ChatSendPublisher {
                         echo.sender.user_id.0 = nick.clone();
                         echo.sender.login = nick.to_ascii_lowercase();
                         echo.sender.display_name = nick;
+                        if echo.channel.is_irc_query() {
+                            let _ = events.send(AppEvent::ChannelJoined { channel: echo.channel.clone() }).await;
+                        }
                         Some(saved_chat_echo(echo, log_store).await)
                     } else {
                         None
@@ -182,6 +185,7 @@ async fn saved_chat_echo(echo: ChatMessage, log_store: Option<LogStore>) -> AppE
 pub(crate) fn complete_whisper_send(
     status: reqwest::StatusCode,
     body: &str,
+    from_user_id: &str,
     from_login: &str,
     target_login: &str,
     text: &str,
@@ -197,29 +201,16 @@ pub(crate) fn complete_whisper_send(
         {
             message.push_str(" Re-login with a token that includes user:manage:whispers.");
         }
-        return AppEvent::Error {
-            context: "Whisper".into(),
+        return AppEvent::WhisperSendFailed {
+            owner_user_id: from_user_id.to_owned(),
             message: format!("Could not send whisper to {target_login}: {message}"),
         };
     }
 
     let timestamp = Utc::now();
-    if let Some(store) = log_store {
-        if let Err(error) = crate::persist_whisper_message(
-            store,
-            Some(from_login),
-            from_login,
-            from_login,
-            target_login,
-            text,
-            &twitch_emotes,
-            true,
-            timestamp,
-        ) {
-            warn!("whisper-history: failed to persist sent whisper: {error}");
-        }
-    }
-    AppEvent::WhisperReceived {
+    let event = AppEvent::WhisperReceived {
+        owner_user_id: from_user_id.to_owned(),
+        from_user_id: from_user_id.to_owned(),
         from_login: from_login.to_owned(),
         from_display_name: from_login.to_owned(),
         target_login: target_login.to_owned(),
@@ -228,7 +219,15 @@ pub(crate) fn complete_whisper_send(
         is_self: true,
         timestamp,
         is_history: false,
+    };
+    if let Some(store) = log_store {
+        if let Err(error) = crate::persist_whisper_message(
+            store, Some(from_login), Some(from_user_id), &event,
+        ) {
+            warn!("whisper-history: failed to persist sent whisper: {error}");
+        }
     }
+    event
 }
 
 #[cfg(test)]
@@ -500,21 +499,23 @@ mod tests {
     #[test]
     fn failed_whispers_never_enter_sent_history() {
         let store = LogStore::with_db_path(":memory:".into()).unwrap();
-        let channel = crate::whisper_thread_channel_id("bob");
+        let channel = crate::whisper_thread_channel_id("123", "bob");
         let event = complete_whisper_send(
             reqwest::StatusCode::FORBIDDEN,
             "rejected",
+            "123",
             "alice",
             "bob",
             "hello",
             Vec::new(),
             Some(&store),
         );
-        assert!(matches!(event, AppEvent::Error { .. }));
+        assert!(matches!(event, AppEvent::WhisperSendFailed { owner_user_id, .. } if owner_user_id == "123"));
         assert!(store.recent_messages(&channel, 10).unwrap().is_empty());
         let event = complete_whisper_send(
             reqwest::StatusCode::NO_CONTENT,
             "",
+            "123",
             "alice",
             "bob",
             "hello",
@@ -523,11 +524,36 @@ mod tests {
         );
         assert!(matches!(
             event,
-            AppEvent::WhisperReceived { is_self: true, .. }
+            AppEvent::WhisperReceived { is_self: true, owner_user_id, from_user_id, .. }
+                if owner_user_id == "123" && from_user_id == "123"
         ));
         let messages = store.recent_messages(&channel, 10).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].raw_text, "hello");
         assert_eq!(messages[0].sender.login, "alice");
+        assert_eq!(messages[0].sender.user_id.0, "123");
+    }
+
+    #[tokio::test]
+    async fn private_echo_opens_its_conversation_only_after_a_successful_write() {
+        for succeeds in [false, true] {
+            let mut publisher = ChatSendPublisher::default();
+            let (events, mut received) = mpsc::channel(4);
+            let (receipt, outcome) = oneshot::channel();
+            let (draft, mut echo) = pending();
+            let query = ChannelId::irc_query("irc.example", 6697, true, "bob");
+            echo.channel = query.clone();
+            assert!(publisher.submit_irc(outcome, draft, Some(echo), None, events).await);
+            receipt.send(if succeeds { Ok("alice".into()) } else { Err("offline".into()) }).unwrap();
+            let first = tokio::time::timeout(std::time::Duration::from_secs(3), received.recv()).await.unwrap().unwrap();
+            if succeeds {
+                assert!(matches!(first, AppEvent::ChannelJoined { channel } if channel == query));
+                let echo = tokio::time::timeout(std::time::Duration::from_secs(3), received.recv()).await.unwrap().unwrap();
+                assert!(matches!(echo, AppEvent::MessageReceived { channel, message } if channel == query && message.sender.login == "alice"));
+            } else {
+                assert!(matches!(first, AppEvent::MessageSendRejected { .. }));
+                assert!(received.try_recv().is_err());
+            }
+        }
     }
 }

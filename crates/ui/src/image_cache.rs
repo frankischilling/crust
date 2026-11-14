@@ -154,6 +154,7 @@ impl UiImageCache {
     }
 
     /// Inspect presence without requesting an off-screen prefetch or pinning it.
+    #[cfg(test)]
     pub(crate) fn contains_key(&self, url: &str) -> bool {
         self.entries.contains_key(url)
     }

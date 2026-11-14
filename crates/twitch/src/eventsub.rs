@@ -435,10 +435,29 @@ impl EventSubSession {
 
     async fn connect_once(&mut self, url: &str) -> Result<EventSubConnectOutcome, String> {
         info!("Connecting EventSub websocket: {url}");
-        let (ws, _) = tokio::time::timeout(Duration::from_secs(10), connect_async(url))
-            .await
-            .map_err(|_| "EventSub connection timed out".to_owned())?
-            .map_err(|e| format!("connect failed: {e}"))?;
+        let connecting = tokio::time::timeout(Duration::from_secs(10), connect_async(url));
+        tokio::pin!(connecting);
+        let (ws, _) = loop {
+            tokio::select! {
+                biased;
+                command = self.cmd_rx.recv() => {
+                    let Some(command) = command else {
+                        return Ok(EventSubConnectOutcome::Stop);
+                    };
+                    if self.apply_command(command) == CommandEffect::AuthChanged {
+                        return Ok(EventSubConnectOutcome::Reconnect {
+                            reconnect_url: None,
+                            immediate: true,
+                        });
+                    }
+                }
+                result = &mut connecting => {
+                    break result
+                        .map_err(|_| "EventSub connection timed out".to_owned())?
+                        .map_err(|error| format!("connect failed: {error}"))?;
+                }
+            }
+        };
         let (mut sink, mut stream) = ws.split();
 
         let mut session_id: Option<String> = None;
@@ -2258,6 +2277,81 @@ mod tests {
         })
         .await
         .expect("ping was not processed");
+    }
+
+    #[tokio::test]
+    async fn account_changes_cancel_a_stalled_initial_handshake() {
+        for clear_auth in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let (mut session, commands, _events) = test_session();
+            session.apply_command(EventSubCommand::SetAuth {
+                token: "old-token".into(),
+                client_id: "client".into(),
+                user_id: "old-user".into(),
+                scopes: Vec::new(),
+            });
+            let client = tokio::spawn(async move {
+                let result = session.connect_once(&url).await;
+                (session, result)
+            });
+            let (_socket, _) = listener.accept().await.unwrap();
+            let command = if clear_auth {
+                EventSubCommand::ClearAuth
+            } else {
+                EventSubCommand::SetAuth {
+                    token: "new-token".into(),
+                    client_id: "client".into(),
+                    user_id: "new-user".into(),
+                    scopes: Vec::new(),
+                }
+            };
+            commands.send(command).await.unwrap();
+            let (session, result) = tokio::time::timeout(Duration::from_secs(3), client)
+                .await.expect("account change waited for the connection timeout").unwrap();
+            assert!(matches!(result, Ok(EventSubConnectOutcome::Reconnect {
+                reconnect_url: None, immediate: true,
+            })));
+            assert_eq!(session.auth.as_ref().map(|auth| auth.user_id.as_str()),
+                if clear_auth { None } else { Some("new-user") });
+        }
+    }
+
+    #[tokio::test]
+    async fn closing_commands_cancels_a_stalled_initial_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (mut session, commands, _events) = test_session();
+        let client = tokio::spawn(async move { session.connect_once(&url).await });
+        let (_socket, _) = listener.accept().await.unwrap();
+        drop(commands);
+        let result = tokio::time::timeout(Duration::from_secs(3), client)
+            .await.expect("shutdown waited for the connection timeout").unwrap();
+        assert!(matches!(result, Ok(EventSubConnectOutcome::Stop)));
+    }
+
+    #[tokio::test]
+    async fn channel_changes_during_handshake_keep_the_original_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (mut session, commands, _events) = test_session();
+        let client = tokio::spawn(async move {
+            let result = session.connect_once(&url).await;
+            (session, result)
+        });
+        let (_socket, _) = listener.accept().await.unwrap();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(5)).await;
+        commands.send(EventSubCommand::WatchChannel {
+            broadcaster_id: "channel".into(), can_moderate: false,
+        }).await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+        tokio::time::resume();
+        let (session, result) = tokio::time::timeout(Duration::from_secs(3), client)
+            .await.expect("channel command restarted the connection deadline").unwrap();
+        assert!(matches!(result, Err(error) if error == "EventSub connection timed out"));
+        assert!(session.watched_broadcasters.contains_key("channel"));
     }
 
     #[tokio::test]

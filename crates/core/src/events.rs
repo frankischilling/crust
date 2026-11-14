@@ -603,6 +603,10 @@ pub enum AppEvent {
     },
     /// Incoming Twitch whisper delivered out-of-band from channel chat.
     WhisperReceived {
+        /// Stable Twitch ID of the account that owns this delivery or history row.
+        owner_user_id: String,
+        /// Twitch sender ID, or empty when an older history row has no ID.
+        from_user_id: String,
         /// Login of the whisper sender.
         from_login: String,
         /// Display name of the whisper sender.
@@ -619,6 +623,11 @@ pub enum AppEvent {
         timestamp: DateTime<Utc>,
         /// True when this whisper is replayed from local history.
         is_history: bool,
+    },
+    /// A failed private send belongs to the account that initiated it.
+    WhisperSendFailed {
+        owner_user_id: String,
+        message: String,
     },
     MessageDeleted {
         channel: ChannelId,
@@ -718,6 +727,8 @@ pub enum AppEvent {
     },
     /// The logged-in user's avatar URL has been resolved.
     SelfAvatarLoaded {
+        /// Normalized login of the account that requested the avatar.
+        account: String,
         avatar_url: String,
     },
     /// Source-channel profile for a Shared Chat message has been resolved. UI
@@ -904,8 +915,8 @@ pub enum AppEvent {
         split_header_show_game: bool,
         split_header_show_viewer_count: bool,
     },
-    /// A batch of image prefetch tasks has been queued.  The loading screen
-    /// uses this to track progress vs `EmoteImageReady` completions.
+    /// Legacy notification retained for plugin event compatibility.
+    /// Runtime image requests now come from visible widgets.
     ImagePrefetchQueued {
         count: usize,
     },

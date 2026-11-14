@@ -313,7 +313,7 @@ impl LogStore {
         limit: usize,
     ) -> Result<Vec<String>, StorageError> {
         let safe_limit = limit.clamp(1, 1_000) as i64;
-        let like_pattern = format!("{prefix}%");
+        let like_pattern = format!("{}%", prefix.replace('!', "!!").replace('%', "!%").replace('_', "!_"));
         let conn = self
             .conn
             .lock()
@@ -321,7 +321,7 @@ impl LogStore {
         let mut stmt = conn.prepare(
             "SELECT channel
              FROM chat_messages
-             WHERE channel LIKE ?1
+             WHERE channel LIKE ?1 ESCAPE '!'
              GROUP BY channel
              ORDER BY MAX(ts_ms) DESC
              LIMIT ?2",
@@ -602,6 +602,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn channel_prefixes_treat_sql_wildcards_as_literal_account_names() {
+        let store = LogStore::with_db_path(PathBuf::from(":memory:")).unwrap();
+        let channels = ["whisper:some_one:bob", "whisper:somexone:bob", "whisper:some%one:bob", "whisper:some!one:bob"];
+        for (index, channel) in channels.iter().enumerate() {
+            store.append_message(&message(index as u64, 1000 + index as i64, channel)).unwrap();
+        }
+        for channel in channels {
+            let prefix = channel.strip_suffix("bob").unwrap();
+            assert_eq!(store.recent_channels_with_prefix(prefix, 1).unwrap(), vec![channel]);
+        }
     }
 
     #[test]

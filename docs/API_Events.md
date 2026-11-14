@@ -189,7 +189,7 @@ Return a table with:
 
 Fields:
 
-- `username`
+- `username`: validated Twitch login, which can differ from the display name
 - `user_id`
 
 ### `c2.EventType.LoggedOut`
@@ -262,7 +262,8 @@ Fields:
 
 - `count`
 
-This event reports how many image-prefetch jobs were queued.
+Retained for compatibility with existing plugins. The runtime now requests
+images from visible widgets and no longer publishes bulk-prefetch progress.
 
 ## Chat and channel events
 
@@ -344,8 +345,13 @@ For `ChannelPointsReward`, `reward_id`, `redemption_id`, `user_input`, and
 
 ### `c2.EventType.WhisperReceived`
 
+Only whispers whose `owner_user_id` matches the signed-in account's `user_id`
+reach plugin callbacks. This also applies to saved history replay.
+
 Fields:
 
+- `owner_user_id`: immutable Twitch user ID of the authenticated account that owns the conversation
+- `from_user_id`: the supplied sender ID, or an empty string when unknown
 - `from_login`
 - `from_display_name`
 - `target_login`
@@ -354,6 +360,11 @@ Fields:
 - `is_self`
 - `timestamp`
 - `is_history`
+
+The owner ID stays the same after an account rename. Replay identifies the local
+sender or recipient by the owner's current login. Older rows with no owner ID,
+including rows keyed by login, remain stored but are not replayed for a current
+account.
 
 Each `twitch_emotes` entry includes:
 
@@ -395,6 +406,12 @@ Fields:
 
 - `context`
 - `message`
+- `owner_user_id`: immutable Twitch user ID of the account that started a failed whisper send; omitted for other errors
+
+Whisper send errors reach callbacks only while their owner ID matches the
+signed-in account. Delayed failures from a previous account are discarded.
+The UI shows these errors as temporary notices for the owning account. Switching
+accounts or logging out removes them. They are not added to channel messages.
 
 ### `c2.EventType.IrcTopicChanged`
 
@@ -425,7 +442,10 @@ the badge has no image URL.
 
 Fields:
 
+- `account`: normalized login of the account that requested the avatar
 - `avatar_url`
+
+Responses for an inactive account are discarded before plugin callbacks.
 
 ### `c2.EventType.SenderCosmeticsUpdated`
 
@@ -433,9 +453,13 @@ Fields:
 
 - `user_id`
 - `color`: omitted when no color update is available
-- `name_paint`: omitted when no name-paint update is available
-- `badge`: omitted when no badge update is available
-- `avatar_url`: omitted when no avatar update is available
+- `name_paint`: omitted when the sender has no selected paint
+- `badge`: omitted when the sender has no 7TV badge
+- `avatar_url`: omitted when the sender has no 7TV avatar
+
+The paint, badge, and avatar fields describe the current resolved selection.
+An omitted field clears the previous selection. Failed or obsolete profile
+requests do not emit a replacement selection.
 
 When present, `name_paint` includes:
 

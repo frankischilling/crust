@@ -13,4 +13,6 @@ pub(crate) mod live_feed;
 pub(crate) mod outgoing;
 pub(crate) mod plugins;
 pub(crate) mod profiles;
+pub(crate) mod snapshots;
 pub(crate) mod system_messages;
+pub(crate) mod twitch_emotes;

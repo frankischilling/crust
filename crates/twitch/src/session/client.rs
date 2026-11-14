@@ -54,6 +54,8 @@ pub enum TwitchEvent {
     ChatMessage(ChatMessage),
     /// Incoming or echoed whisper message (WHISPER).
     Whisper {
+        generation: u64,
+        from_user_id: String,
         from_login: String,
         from_display_name: String,
         target_login: String,
@@ -713,6 +715,7 @@ impl TwitchSession {
             }
             "WHISPER" => {
                 if let Some((
+                    from_user_id,
                     from_login,
                     from_display_name,
                     target_login,
@@ -723,6 +726,8 @@ impl TwitchSession {
                 )) = self.parse_whisper(msg)
                 {
                     self.emit(TwitchEvent::Whisper {
+                        generation: self.auth_generation,
+                        from_user_id,
                         from_login,
                         from_display_name,
                         target_login,
@@ -1015,6 +1020,7 @@ impl TwitchSession {
         String,
         String,
         String,
+        String,
         Vec<TwitchEmotePos>,
         bool,
         chrono::DateTime<Utc>,
@@ -1042,6 +1048,7 @@ impl TwitchSession {
             return None;
         }
 
+        let from_user_id = msg.tags.get("user-id").unwrap_or_default().trim().to_owned();
         let from_display_name = msg
             .tags
             .get("display-name")
@@ -1061,6 +1068,7 @@ impl TwitchSession {
             .unwrap_or_else(Utc::now);
 
         Some((
+            from_user_id,
             from_login,
             from_display_name,
             target_login,
@@ -1462,6 +1470,23 @@ mod tests {
         assert!(parse_privmsg_irc(&chat, None, 1).is_none());
         let whisper = parse_line(":alice!user@host WHISPER bob").unwrap();
         assert!(session.parse_whisper(&whisper).is_none());
+    }
+
+    #[tokio::test]
+    async fn whispers_preserve_sender_ids_without_guessing_from_logins() {
+        let (mut session, mut events) = session();
+        session.auth_nick = Some("alice".into());
+        session.auth_generation = 42;
+        for (raw, expected_id) in [
+            ("@user-id=123;display-name=Bob :bob!user@host WHISPER alice :PersonalHello", "123"),
+            (":bob!user@host WHISPER alice :PersonalHello", ""),
+        ] {
+            session.handle_irc(&parse_line(raw).unwrap()).await;
+            assert!(matches!(events.try_recv().unwrap(), TwitchEvent::Whisper {
+                generation: 42, from_user_id, from_login, target_login, text, is_self: false, ..
+            } if from_user_id == expected_id && from_login == "bob"
+                && target_login == "alice" && text == "PersonalHello"));
+        }
     }
 
     #[test]

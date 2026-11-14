@@ -4,7 +4,6 @@ use crust_core::{
     events::AppEvent,
     model::{ChannelId, ChatMessage, HistoryCursor, LocalHistoryMessageIdentity, LocalHistoryPageInfo, MessageId},
 };
-use crust_emotes::cache::EmoteCache;
 use crust_storage::LogStore;
 use crust_twitch::{parse_line, parse_privmsg_irc};
 use tokio::sync::mpsc;
@@ -13,9 +12,390 @@ use tracing::{info, warn};
 use crate::seventv::SevenTvCosmeticUpdate;
 
 use super::badges::{resolve_badge_url, BadgeMap};
-use super::emote_loading::prefetch_emote_images;
 
-const WHISPER_HISTORY_CHANNEL_PREFIX: &str = "whisper:";
+const WHISPER_HISTORY_CHANNEL_PREFIX: &str = "whisper:uid:";
+
+/// Filter account-owned events before either plugins or the UI receive them.
+#[derive(Default)]
+pub(crate) struct WhisperAccount {
+    owner: Option<String>,
+    user_id: Option<String>,
+}
+
+impl WhisperAccount {
+    pub(crate) fn accepts(&mut self, event: &AppEvent) -> bool {
+        match event {
+            AppEvent::Authenticated { username, user_id } => {
+                self.owner = crate::normalize_whisper_login(username);
+                self.user_id = crate::normalize_whisper_user_id(user_id).map(str::to_owned);
+            }
+            AppEvent::LoggedOut => {
+                self.owner = None;
+                self.user_id = None;
+            }
+            AppEvent::WhisperReceived { owner_user_id, from_user_id, from_login, target_login, is_self, .. } => {
+                if self.user_id.as_deref() != crate::normalize_whisper_user_id(owner_user_id)
+                    || self.user_id.is_none()
+                    || (*is_self && crate::normalize_whisper_user_id(from_user_id) != self.user_id.as_deref())
+                {
+                    return false;
+                }
+                let owner = if *is_self { from_login } else { target_login };
+                return self.owner.as_ref().is_some_and(|active| {
+                    crate::normalize_whisper_login(owner).as_ref() == Some(active)
+                });
+            }
+            AppEvent::WhisperSendFailed { owner_user_id, .. } => {
+                return self.user_id.is_some()
+                    && self.user_id.as_deref() == crate::normalize_whisper_user_id(owner_user_id);
+            }
+            AppEvent::SelfAvatarLoaded { account, .. } => {
+                return self.owner.as_ref().is_some_and(|active| {
+                    crate::normalize_whisper_login(account).as_ref() == Some(active)
+                });
+            }
+            _ => {}
+        }
+        true
+    }
+}
+
+/// Keep the sender's supplied identity when live whispers enter history and the UI.
+pub(crate) fn prepare_live_whisper(
+    event: AppEvent,
+    local_login: Option<&str>,
+    local_user_id: Option<&str>,
+    emote_index: &crate::EmoteIndex,
+    log_store: Option<&LogStore>,
+) -> Option<AppEvent> {
+    let AppEvent::WhisperReceived {
+        owner_user_id, from_user_id, from_login, target_login, is_self, ..
+    } = &event else { return None; };
+    let local_login = local_login.and_then(crate::normalize_whisper_login)?;
+    let local_user_id = local_user_id.and_then(crate::normalize_whisper_user_id)?;
+    if crate::normalize_whisper_user_id(owner_user_id) != Some(local_user_id)
+        || (*is_self && crate::normalize_whisper_user_id(from_user_id) != Some(local_user_id))
+    {
+        return None;
+    }
+    let owner = crate::normalize_whisper_login(if *is_self { from_login } else { target_login });
+    if owner.as_deref() != Some(local_login.as_str()) {
+        return None;
+    }
+    emote_index.write().unwrap().queue_whisper_sender(local_user_id, from_user_id);
+    if !*is_self {
+        if let Some(store) = log_store {
+            if let Err(error) = crate::persist_whisper_message(
+                store, Some(&local_login), Some(local_user_id), &event,
+            ) {
+                warn!("whisper-history: failed to persist whisper: {error}");
+            }
+        }
+    }
+    Some(event)
+}
+
+#[derive(Default)]
+pub(crate) struct WhisperHistory {
+    owner: Option<(String, String)>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl WhisperHistory {
+    pub(crate) fn load(
+        &mut self,
+        log_store: LogStore,
+        owner: &str,
+        owner_user_id: &str,
+        emote_index: &crate::EmoteIndex,
+        evt_tx: mpsc::Sender<AppEvent>,
+    ) {
+        let Some(owner) = crate::normalize_whisper_login(owner) else { return; };
+        let Some(owner_user_id) = crate::normalize_whisper_user_id(owner_user_id).map(str::to_owned) else { return; };
+        let identity = (owner_user_id.clone(), owner.clone());
+        if self.owner.as_ref() == Some(&identity) {
+            return;
+        }
+        self.clear();
+        self.owner = Some(identity);
+        self.task = Some(tokio::spawn(load_local_recent_whispers(
+            log_store, Some(owner), Some(owner_user_id), evt_tx, Some(emote_index.clone()),
+        )));
+    }
+
+    pub(crate) fn clear(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        self.owner = None;
+    }
+}
+
+impl Drop for WhisperHistory {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+#[cfg(test)]
+mod whisper_tests {
+    use super::*;
+
+    fn whisper(owner_user_id: &str, owner: &str, is_self: bool) -> AppEvent {
+        AppEvent::WhisperReceived {
+            owner_user_id: owner_user_id.to_owned(),
+            from_user_id: if is_self { owner_user_id.to_owned() } else { String::new() },
+            from_login: if is_self { owner } else { "bob" }.into(),
+            from_display_name: "Bob".into(),
+            target_login: if is_self { "bob" } else { owner }.into(),
+            text: "private message".into(),
+            twitch_emotes: Vec::new(),
+            is_self,
+            timestamp: chrono::Utc::now(),
+            is_history: false,
+        }
+    }
+
+    fn save(store: &LogStore, owner_user_id: &str, owner: &str, text: &str) {
+        let mut event = whisper(owner_user_id, owner, false);
+        if let AppEvent::WhisperReceived { text: body, .. } = &mut event { *body = text.to_owned(); }
+        crate::persist_whisper_message(store, Some(owner), Some(owner_user_id), &event).unwrap();
+    }
+
+    #[test]
+    fn account_filter_rejects_old_callbacks_before_plugin_dispatch() {
+        let mut account = WhisperAccount::default();
+        assert!(!account.accepts(&whisper("1", "alice", false)));
+        account.accepts(&AppEvent::Authenticated { username: "Alice".into(), user_id: "1".into() });
+        assert!(account.accepts(&whisper("1", "ALICE", false)));
+        assert!(account.accepts(&whisper("1", "alice", true)));
+        account.accepts(&AppEvent::LoggedOut);
+        assert!(!account.accepts(&whisper("1", "alice", false)));
+        account.accepts(&AppEvent::Authenticated { username: "carol".into(), user_id: "2".into() });
+        assert!(!account.accepts(&whisper("1", "alice", false)));
+        assert!(!account.accepts(&whisper("1", "alice", true)));
+        assert!(account.accepts(&whisper("2", "carol", false)));
+        account.accepts(&AppEvent::Authenticated { username: "carol".into(), user_id: "3".into() });
+        assert!(!account.accepts(&whisper("2", "carol", false)));
+        assert!(!account.accepts(&whisper("2", "carol", true)));
+        assert!(account.accepts(&whisper("3", "carol", false)));
+    }
+
+    #[test]
+    fn whisper_failures_follow_owner_ids_before_plugin_dispatch() {
+        let mut account = WhisperAccount::default();
+        let failed = |owner: &str| super::super::outgoing::complete_whisper_send(
+            reqwest::StatusCode::FORBIDDEN, "unavailable", owner, "alice", "bob",
+            "private message", Vec::new(), None,
+        );
+        assert!(!account.accepts(&failed("1")));
+        account.accepts(&AppEvent::Authenticated { username: "alice".into(), user_id: "1".into() });
+        assert!(account.accepts(&failed("1")));
+        account.accepts(&AppEvent::LoggedOut);
+        assert!(!account.accepts(&failed("1")));
+        account.accepts(&AppEvent::Authenticated { username: "alice".into(), user_id: "2".into() });
+        assert!(!account.accepts(&failed("1")));
+        assert!(!account.accepts(&failed("")));
+        assert!(account.accepts(&failed("2")));
+        account.accepts(&AppEvent::Authenticated { username: "renamed".into(), user_id: "2".into() });
+        assert!(account.accepts(&failed("2")));
+    }
+
+    #[test]
+    fn account_filter_rejects_stale_avatars_before_plugin_dispatch() {
+        let mut account = WhisperAccount::default();
+        let avatar = |owner: &str| AppEvent::SelfAvatarLoaded {
+            account: owner.to_owned(), avatar_url: "https://example.test/avatar.png".to_owned(),
+        };
+        assert!(!account.accepts(&avatar("alice")));
+        account.accepts(&AppEvent::Authenticated { username: "Alice".into(), user_id: "1".into() });
+        assert!(account.accepts(&avatar("ALICE")));
+        assert!(!account.accepts(&avatar("")));
+        account.accepts(&AppEvent::Authenticated { username: "carol".into(), user_id: "2".into() });
+        assert!(!account.accepts(&avatar("alice")));
+        assert!(account.accepts(&avatar("carol")));
+        account.accepts(&AppEvent::LoggedOut);
+        assert!(!account.accepts(&avatar("carol")));
+    }
+
+    #[tokio::test]
+    async fn history_reads_only_owned_threads_and_leaves_legacy_rows_unassigned() {
+        let store = LogStore::with_db_path(":memory:".into()).unwrap();
+        save(&store, "1", "reused", "first account");
+        save(&store, "2", "reused", "second account");
+        let mut legacy = super::super::system_messages::make_system_message(
+            42, ChannelId("whisper:bob".into()), "unowned legacy".into(),
+            chrono::Utc::now(), crust_core::model::MsgKind::Chat,
+        );
+        legacy.sender.login = "bob".into();
+        store.append_message(&legacy).unwrap();
+        legacy.channel = ChannelId("whisper:reused:bob".into());
+        legacy.raw_text = "login-owned legacy".into();
+        store.append_message(&legacy).unwrap();
+        let (events, mut received) = mpsc::channel(8);
+        for (owner, text) in [("1", "first account"), ("2", "second account")] {
+            load_local_recent_whispers(store.clone(), Some("reused".into()), Some(owner.into()), events.clone(), None).await;
+            let AppEvent::WhisperReceived { owner_user_id, target_login, text: actual, from_login, .. } = received.try_recv().unwrap() else {
+                panic!("expected account whisper history");
+            };
+            assert_eq!(owner_user_id, owner);
+            assert_eq!(target_login, "reused");
+            assert_eq!(actual, text);
+            assert_eq!(from_login, "bob");
+            assert!(received.try_recv().is_err());
+        }
+        load_local_recent_whispers(store.clone(), None, Some("1".into()), events.clone(), None).await;
+        load_local_recent_whispers(store.clone(), Some("reused".into()), None, events, None).await;
+        assert!(received.try_recv().is_err());
+        assert_eq!(store.recent_messages(&ChannelId("whisper:bob".into()), 10).unwrap().len(), 1);
+        assert_eq!(store.recent_messages(&ChannelId("whisper:reused:bob".into()), 10).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn renamed_accounts_keep_history_and_replay_self_rows_by_sender_id() {
+        let store = LogStore::with_db_path(":memory:".into()).unwrap();
+        save(&store, "10", "before", "incoming before rename");
+        let mut sent = whisper("10", "before", true);
+        if let AppEvent::WhisperReceived { text, .. } = &mut sent { *text = "sent before rename".into(); }
+        crate::persist_whisper_message(&store, Some("before"), Some("10"), &sent).unwrap();
+        let channel = crate::whisper_thread_channel_id("10", "bob");
+        let mut bad_self = store.recent_messages(&channel, 10).unwrap().into_iter().find(|message| message.flags.is_self).unwrap();
+        bad_self.sender.user_id.0 = "99".into();
+        bad_self.raw_text = "wrong sender ID".into();
+        store.append_message(&bad_self).unwrap();
+        bad_self.sender.user_id.0.clear();
+        bad_self.raw_text = "unknown sender ID".into();
+        store.append_message(&bad_self).unwrap();
+        let (events, mut received) = mpsc::channel(8);
+        load_local_recent_whispers(store, Some("after".into()), Some("10".into()), events, None).await;
+        let mut count = 0;
+        while let Ok(event) = received.try_recv() {
+            let AppEvent::WhisperReceived { owner_user_id, from_user_id, from_login, target_login, text, is_self, .. } = event else {
+                panic!("expected renamed account history");
+            };
+            assert_eq!(owner_user_id, "10");
+            if is_self {
+                assert_eq!(from_user_id, "10");
+                assert_eq!(from_login, "after");
+                assert_eq!(target_login, "bob");
+                assert_eq!(text, "sent before rename");
+            } else {
+                assert_eq!(from_login, "bob");
+                assert_eq!(target_login, "after");
+                assert_eq!(text, "incoming before rename");
+            }
+            count += 1;
+        }
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn stale_whispers_cannot_be_saved_under_a_different_account() {
+        let store = LogStore::with_db_path(":memory:".into()).unwrap();
+        for is_self in [false, true] {
+            let event = whisper("1", "alice", is_self);
+            for (local, local_id) in [
+                (Some("carol"), Some("1")), (Some("alice"), Some("2")),
+                (Some("alice"), None), (None, Some("1")),
+            ] {
+                crate::persist_whisper_message(&store, local, local_id, &event).unwrap();
+            }
+        }
+        assert!(store.recent_channels_with_prefix("whisper:", 20).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_whisper_sender_ids_survive_storage_and_replay_for_personal_emotes() {
+        let store = LogStore::with_db_path(":memory:".into()).unwrap();
+        let live_index = crate::EmoteIndex::default();
+        live_index.write().unwrap().set_account(Some("10"));
+        let mut live = whisper("10", "alice", false);
+        if let AppEvent::WhisperReceived { from_user_id, text, is_history, .. } = &mut live {
+            *from_user_id = "20".into();
+            *text = "PersonalHello".into();
+            *is_history = false;
+        }
+        let forwarded = prepare_live_whisper(live, Some("alice"), Some("10"), &live_index, Some(&store)).unwrap();
+        assert!(matches!(forwarded, AppEvent::WhisperReceived { from_user_id, is_history: false, .. } if from_user_id == "20"));
+        assert_eq!(live_index.write().unwrap().next_deferred_personal_load(), Some(("20".into(), None)));
+        let rows = store.recent_messages(&crate::whisper_thread_channel_id("10", "bob"), 10).unwrap();
+        assert_eq!(rows[0].sender.user_id.0, "20");
+
+        // Rows without IDs and the old login placeholders still display, but
+        // neither can enroll a guessed sender in personal-emote lookups.
+        save(&store, "10", "alice", "missing ID");
+        let mut legacy = rows[0].clone();
+        legacy.sender.user_id.0 = legacy.sender.login.clone();
+        legacy.raw_text = "legacy placeholder".into();
+        store.append_message(&legacy).unwrap();
+
+        let replay_index = crate::EmoteIndex::default();
+        replay_index.write().unwrap().set_account(Some("10"));
+        let (events, mut received) = mpsc::channel(8);
+        load_local_recent_whispers(store, Some("alice".into()), Some("10".into()), events,
+            Some(replay_index.clone())).await;
+        let mut identities = HashMap::new();
+        while let Ok(event) = received.try_recv() {
+            let AppEvent::WhisperReceived { from_user_id, text, target_login, is_history, .. } = event else {
+                panic!("expected whisper replay");
+            };
+            assert!(is_history);
+            assert_eq!(target_login, "alice");
+            identities.insert(text, from_user_id);
+        }
+        assert_eq!(identities["PersonalHello"], "20");
+        assert_eq!(identities["missing ID"], "");
+        assert_eq!(identities["legacy placeholder"], "");
+
+        let mut registry = replay_index.write().unwrap();
+        assert_eq!(registry.next_deferred_personal_load(), Some(("20".into(), None)));
+        assert!(registry.next_deferred_personal_load().is_none());
+        let generation = registry.begin_personal_load("20", None).unwrap();
+        registry.complete_personal_load("20", generation, Some(vec![crust_emotes::EmoteInfo {
+            provider: "7tv".into(), id: "personal".into(), code: "PersonalHello".into(),
+            url_1x: "https://example.test/personal.png".into(), url_2x: None, url_4x: None,
+        }])).unwrap();
+        assert!(registry.resolve(&ChannelId::mentions(), "20", "PersonalHello").is_some());
+        assert!(registry.resolve(&ChannelId::mentions(), "10", "PersonalHello").is_none());
+        assert!(registry.resolve(&ChannelId::mentions(), "", "PersonalHello").is_none());
+    }
+
+    #[test]
+    fn stale_live_whispers_do_not_schedule_sender_lookups_or_history() {
+        let store = LogStore::with_db_path(":memory:".into()).unwrap();
+        let index = crate::EmoteIndex::default();
+        index.write().unwrap().set_account(Some("30"));
+        let mut stale = whisper("10", "alice", false);
+        if let AppEvent::WhisperReceived { from_user_id, .. } = &mut stale { *from_user_id = "20".into(); }
+        assert!(prepare_live_whisper(stale, Some("alice"), Some("30"), &index, Some(&store)).is_none());
+        assert!(index.write().unwrap().next_deferred_personal_load().is_none());
+        assert!(store.recent_channels_with_prefix("whisper:", 20).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn clearing_history_aborts_blocked_replays_and_allows_the_next_account() {
+        let store = LogStore::with_db_path(":memory:".into()).unwrap();
+        save(&store, "1", "alice", "old account");
+        save(&store, "2", "carol", "new account");
+        let (events, mut received) = mpsc::channel(1);
+        events.send(AppEvent::LoggedOut).await.unwrap();
+        let mut replay = WhisperHistory::default();
+        let emotes = crate::EmoteIndex::default();
+        replay.load(store.clone(), "alice", "1", &emotes, events.clone());
+        let handle = replay.task.as_ref().unwrap().abort_handle();
+        replay.clear();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !handle.is_finished() { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        assert!(matches!(received.try_recv().unwrap(), AppEvent::LoggedOut));
+        assert!(received.try_recv().is_err());
+        replay.load(store, "carol", "2", &emotes, events);
+        tokio::time::timeout(std::time::Duration::from_secs(3), replay.task.take().unwrap()).await.unwrap().unwrap();
+        assert!(matches!(received.try_recv().unwrap(), AppEvent::WhisperReceived { target_login, text, .. }
+            if target_login == "carol" && text == "new account"));
+        assert!(received.try_recv().is_err());
+    }
+}
 
 /// Load locally persisted chat history from SQLite and replay it as
 /// `AppEvent::HistoryLoaded` for the channel.
@@ -195,11 +575,21 @@ pub(crate) async fn load_local_recent_mentions(
 pub(crate) async fn load_local_recent_whispers(
     log_store: LogStore,
     self_login: Option<String>,
+    self_user_id: Option<String>,
     evt_tx: mpsc::Sender<AppEvent>,
+    emotes: Option<crate::EmoteIndex>,
 ) {
+    let Some(self_login) = self_login.as_deref().and_then(crate::normalize_whisper_login) else {
+        return;
+    };
+    let Some(self_user_id) = self_user_id.as_deref().and_then(crate::normalize_whisper_user_id) else {
+        return;
+    };
+    let account_prefix = format!("{WHISPER_HISTORY_CHANNEL_PREFIX}{self_user_id}:");
     let channels = tokio::task::spawn_blocking({
         let store = log_store.clone();
-        move || store.recent_channels_with_prefix(WHISPER_HISTORY_CHANNEL_PREFIX, 250)
+        let prefix = account_prefix.clone();
+        move || store.recent_channels_with_prefix(&prefix, 250)
     })
     .await;
 
@@ -219,17 +609,10 @@ pub(crate) async fn load_local_recent_whispers(
         return;
     }
 
-    let self_login = self_login
-        .map(|v| v.trim().to_ascii_lowercase())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_default();
-
     for channel in whisper_channels {
         let Some(partner_login) = channel
-            .strip_prefix(WHISPER_HISTORY_CHANNEL_PREFIX)
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .filter(|v| !v.is_empty())
+            .strip_prefix(&account_prefix)
+            .and_then(crate::normalize_whisper_login)
         else {
             continue;
         };
@@ -257,19 +640,30 @@ pub(crate) async fn load_local_recent_whispers(
         };
 
         for msg in messages {
-            let from_login = msg.sender.login.trim().to_ascii_lowercase();
-            if from_login.is_empty() {
-                continue;
-            }
+            let stored_login = msg.sender.login.trim().to_ascii_lowercase();
+            let from_user_id = crate::normalize_whisper_user_id(&msg.sender.user_id.0)
+                .unwrap_or_default().to_owned();
+            let (from_login, from_display_name) = if msg.flags.is_self {
+                if from_user_id != self_user_id { continue; }
+                (self_login.clone(), self_login.clone())
+            } else {
+                if stored_login.is_empty() || stored_login != partner_login { continue; }
+                (stored_login, msg.sender.display_name)
+            };
             let target_login = if msg.flags.is_self {
                 partner_login.clone()
             } else {
                 self_login.clone()
             };
-            let _ = evt_tx
+            if let Some(index) = &emotes {
+                index.write().unwrap().queue_whisper_sender(self_user_id, &from_user_id);
+            }
+            if evt_tx
                 .send(AppEvent::WhisperReceived {
+                    owner_user_id: self_user_id.to_owned(),
+                    from_user_id,
                     from_login,
-                    from_display_name: msg.sender.display_name,
+                    from_display_name,
                     target_login,
                     text: msg.raw_text,
                     twitch_emotes: msg.twitch_emotes,
@@ -277,7 +671,10 @@ pub(crate) async fn load_local_recent_whispers(
                     timestamp: msg.timestamp,
                     is_history: true,
                 })
-                .await;
+                .await.is_err()
+            {
+                return;
+            }
         }
     }
 }
@@ -291,7 +688,6 @@ pub(crate) async fn load_recent_messages(
     local_nick: Option<&str>,
     emote_index: &crate::EmoteIndex,
     badge_map: &BadgeMap,
-    emote_cache: &Option<EmoteCache>,
     evt_tx: &mpsc::Sender<AppEvent>,
     stv_update_tx: &mpsc::Sender<SevenTvCosmeticUpdate>,
 ) {
@@ -444,11 +840,8 @@ pub(crate) async fn load_recent_messages(
     let channel_scope = ch.to_owned();
 
     // Move parse + tokenize CPU work off async executors.
-    let (messages, image_urls) = tokio::task::spawn_blocking(move || {
+    let messages = tokio::task::spawn_blocking(move || {
         let mut messages: Vec<ChatMessage> = Vec::with_capacity(raw_lines.len());
-        // Deduplicate image fetch URLs across all history messages.
-        let mut seen_urls: HashSet<String> = HashSet::new();
-        let mut image_urls: Vec<String> = Vec::new();
 
         for line in &raw_lines {
             let irc_msg = match parse_line(line) {
@@ -506,30 +899,9 @@ pub(crate) async fn load_recent_messages(
                 msg.flags.is_mention = has_mention || is_reply_to_me;
             }
 
-            // Collect unique image URLs (emotes, emoji, badges) for batch prefetch
-            for span in &msg.spans {
-                let url = match span {
-                    crust_core::Span::Emote { url, .. } => Some(url.clone()),
-                    crust_core::Span::Emoji { url, .. } => Some(url.clone()),
-                    _ => None,
-                };
-                if let Some(u) = url {
-                    if seen_urls.insert(u.clone()) {
-                        image_urls.push(u);
-                    }
-                }
-            }
-            for badge in &msg.sender.badges {
-                if let Some(ref u) = badge.url {
-                    if seen_urls.insert(u.clone()) {
-                        image_urls.push(u.clone());
-                    }
-                }
-            }
-
             messages.push(msg);
         }
-        (messages, image_urls)
+        messages
     })
     .await
     .unwrap_or_default();
@@ -567,11 +939,6 @@ pub(crate) async fn load_recent_messages(
                 })
                 .await;
         }
-    }
-
-    // Batch-prefetch all unique image URLs.
-    if !image_urls.is_empty() {
-        prefetch_emote_images(image_urls, emote_cache, evt_tx);
     }
 
     let _ = evt_tx

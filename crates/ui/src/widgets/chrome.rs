@@ -47,21 +47,27 @@ pub fn icon_button(
         t::icon_btn()
     };
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(
+        egui::WidgetType::Button, ui.is_enabled(), state.selected, tooltip,
+    ));
     let hovered = resp.hovered();
+    let focused = resp.has_focus();
     let fill = if state.danger {
-        if hovered {
+        if hovered || focused {
             t::danger_bg().gamma_multiply(1.2)
         } else {
             t::danger_bg()
         }
     } else if state.selected {
         t::tab_selected_bg()
-    } else if hovered {
+    } else if hovered || focused {
         t::tab_hover_bg()
     } else {
         Color32::TRANSPARENT
     };
-    let stroke = if state.selected {
+    let stroke = if focused {
+        Stroke::new(2.0_f32, t::accent())
+    } else if state.selected {
         Stroke::new(1.0_f32, t::border_accent())
     } else if state.danger {
         Stroke::new(1.0_f32, t::red().gamma_multiply(0.4))
@@ -314,4 +320,75 @@ fn paint_icon(ui: &Ui, rect: egui::Rect, icon: ChromeIcon, state: IconButtonStat
         }
     }
     let _ = Align2::CENTER_CENTER;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(ctx: &egui::Context, events: Vec<egui::Event>) -> (egui::FullOutput, [Response; 2]) {
+        let mut responses = None;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(400.0, 200.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        responses = Some([
+                            icon_button(ui, ChromeIcon::Settings, "Open application settings", IconButtonState::default()),
+                            icon_button(ui, ChromeIcon::Account, "Open accounts", IconButtonState::default()),
+                        ]);
+                    });
+                });
+            },
+        );
+        (output, responses.unwrap())
+    }
+
+    fn key(key: egui::Key, pressed: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn icon_buttons_show_keyboard_focus_and_publish_named_activation_events() {
+        let ctx = egui::Context::default();
+        let _ = frame(&ctx, Vec::new());
+        let (_, buttons) = frame(&ctx, vec![key(egui::Key::Tab, true)]);
+        assert!(ctx.memory(|memory| memory.has_focus(buttons[0].id)));
+
+        let (output, buttons) = frame(&ctx, vec![
+            key(egui::Key::Tab, false), key(egui::Key::Tab, true),
+        ]);
+        assert!(buttons[1].has_focus());
+        assert!(!buttons[0].has_focus());
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::epaint::Shape::Rect(rect) if rect.rect == buttons[1].rect
+                && rect.stroke.width == 2.0 && rect.stroke.color == t::accent())));
+        assert!(output.platform_output.events.iter().any(|event| matches!(event,
+            egui::output::OutputEvent::FocusGained(info)
+                if info.typ == egui::WidgetType::Button && info.enabled
+                    && info.label.as_deref() == Some("Open accounts"))));
+
+        let (output, buttons) = frame(&ctx, vec![
+            key(egui::Key::Tab, false), key(egui::Key::Enter, true),
+        ]);
+        assert!(buttons[1].clicked());
+        assert!(!buttons[0].clicked());
+        assert!(output.platform_output.events.iter().any(|event| matches!(event,
+            egui::output::OutputEvent::Clicked(info)
+                if info.typ == egui::WidgetType::Button
+                    && info.label.as_deref() == Some("Open accounts"))));
+    }
 }

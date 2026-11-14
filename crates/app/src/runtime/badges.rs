@@ -1,20 +1,16 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
-use crust_core::events::AppEvent;
-use crust_emotes::cache::EmoteCache;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
 use tracing::{info, warn};
-
-use super::assets::fetch_emote_image;
 
 /// Shared badge map: (scope, set_name, version) -> image URL.
 /// `scope` is "" for global badges, or the channel name for channel-specific badges.
-pub(crate) type BadgeMap = Arc<RwLock<HashMap<(String, String, String), String>>>;
+pub(crate) type BadgeDefinitions = HashMap<(String, String, String), String>;
+pub(crate) type BadgeMap = Arc<RwLock<BadgeDefinitions>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BadgeCacheEntry {
@@ -84,7 +80,65 @@ pub(crate) fn load_badge_map_cache_into(map: &BadgeMap) -> usize {
     parsed.len()
 }
 
-pub(crate) fn persist_badge_map_cache(map: &BadgeMap) {
+struct BadgeCacheWrites {
+    pending: Option<BadgeMap>,
+    running: bool,
+}
+
+struct BadgeCacheWriter {
+    writes: Mutex<BadgeCacheWrites>,
+}
+
+impl BadgeCacheWriter {
+    const fn new() -> Self {
+        Self {
+            writes: Mutex::new(BadgeCacheWrites {
+                pending: None,
+                running: false,
+            }),
+        }
+    }
+
+    fn queue(&self, map: &BadgeMap) -> bool {
+        let mut writes = self.writes.lock().unwrap();
+        writes.pending = Some(map.clone());
+        if writes.running {
+            return false;
+        }
+        writes.running = true;
+        true
+    }
+
+    fn drain(&self, mut write: impl FnMut(&BadgeMap)) {
+        loop {
+            let map = {
+                let mut writes = self.writes.lock().unwrap();
+                match writes.pending.take() {
+                    Some(map) => map,
+                    None => {
+                        writes.running = false;
+                        return;
+                    }
+                }
+            };
+            write(&map);
+        }
+    }
+}
+
+/// Coalesce refreshes without blocking the runtime on serialization or disk I/O.
+fn persist_badge_map_cache(map: &BadgeMap) {
+    static WRITER: BadgeCacheWriter = BadgeCacheWriter::new();
+    if WRITER.queue(map) {
+        tokio::task::spawn_blocking(|| WRITER.drain(write_badge_map_cache));
+    }
+}
+
+fn write_badge_map_cache(map: &BadgeMap) {
+    // Capture the current map only after obtaining the cache writer lock. A
+    // delayed save must not replace a newer file with a stale queued snapshot.
+    static WRITE: Mutex<()> = Mutex::new(());
+    let _write = WRITE.lock().unwrap();
     let Some(path) = badge_cache_path() else {
         return;
     };
@@ -183,7 +237,7 @@ fn parse_ivr_badge_response(
     body: &str,
     scope: &str,
     map: &mut HashMap<(String, String, String), String>,
-) {
+) -> bool {
     #[derive(serde::Deserialize)]
     struct Version {
         id: String,
@@ -268,7 +322,7 @@ fn parse_ivr_badge_response(
                 }
             }
         }
-        return;
+        return true;
     }
 
     // Bundled shape: { "set_id": [{ id, image, ... }, ...], ... }
@@ -281,7 +335,9 @@ fn parse_ivr_badge_response(
                 }
             }
         }
+        return true;
     }
+    false
 }
 
 /// Parse Twitch legacy badges.v1 response and insert into the badge map.
@@ -289,7 +345,7 @@ fn parse_badges_v1_response(
     body: &str,
     scope: &str,
     map: &mut HashMap<(String, String, String), String>,
-) {
+) -> bool {
     #[derive(serde::Deserialize)]
     struct Version {
         #[serde(default)]
@@ -338,7 +394,7 @@ fn parse_badges_v1_response(
 
     let payload = match serde_json::from_str::<Payload>(body) {
         Ok(v) => v,
-        Err(_) => return,
+        Err(_) => return false,
     };
 
     let scope = scope.to_owned();
@@ -357,13 +413,14 @@ fn parse_badges_v1_response(
             }
         }
     }
+    true
 }
 
 fn parse_helix_badge_response(
     body: &str,
     scope: &str,
     map: &mut HashMap<(String, String, String), String>,
-) {
+) -> bool {
     #[derive(serde::Deserialize)]
     struct Version {
         id: String,
@@ -411,7 +468,7 @@ fn parse_helix_badge_response(
 
     let payload = match serde_json::from_str::<Payload>(body) {
         Ok(v) => v,
-        Err(_) => return,
+        Err(_) => return false,
     };
 
     let scope = scope.to_owned();
@@ -427,6 +484,7 @@ fn parse_helix_badge_response(
             }
         }
     }
+    true
 }
 
 fn normalize_oauth_token(token: Option<&str>) -> Option<String> {
@@ -448,11 +506,68 @@ async fn helix_auth_from_token(oauth_token: Option<&str>) -> Option<(String, Str
     }
 }
 
-async fn load_global_badges_v1_fallback(
+fn parse_badge_snapshot(
+    body: &str,
+    scope: &str,
+    parse: fn(&str, &str, &mut BadgeDefinitions) -> bool,
+) -> Option<BadgeDefinitions> {
+    let mut incoming = BadgeDefinitions::new();
+    parse(body, scope, &mut incoming).then_some(incoming)
+}
+
+// Global fallback sources supplement one another. Parse outside the shared
+// lock, then merge only returned keys without cloning every loaded badge URL.
+fn merge_badge_response(
+    body: &str,
+    scope: &str,
     badge_map: &BadgeMap,
-    cache: &Option<EmoteCache>,
-    evt_tx: &mpsc::Sender<AppEvent>,
+    parse: fn(&str, &str, &mut BadgeDefinitions) -> bool,
+) -> Option<usize> {
+    let incoming = parse_badge_snapshot(body, scope, parse)?;
+    let mut map = badge_map.write().unwrap();
+    let mut changed = 0;
+    for (key, url) in incoming {
+        if map.get(&key) != Some(&url) {
+            map.insert(key, url);
+            changed += 1;
+        }
+    }
+    Some(changed)
+}
+
+pub(crate) fn replace_channel_badges(
+    channel: &str,
+    badge_map: &BadgeMap,
+    mut definitions: BadgeDefinitions,
+) -> bool {
+    definitions.retain(|(scope, _, _), _| scope == channel);
+    let mut map = badge_map.write().unwrap();
+    let previous_count = map.keys().filter(|(scope, _, _)| scope == channel).count();
+    if previous_count == definitions.len()
+        && definitions
+            .iter()
+            .all(|(key, value)| map.get(key) == Some(value))
+    {
+        return false;
+    }
+    map.retain(|(scope, _, _), _| scope != channel);
+    map.extend(definitions);
+    true
+}
+
+/// Apply a completed snapshot only after the caller verifies its load generation.
+/// Successful empty snapshots clear old channel badges; other scopes are retained.
+pub(crate) fn publish_channel_badges(
+    channel: &str,
+    badge_map: &BadgeMap,
+    definitions: BadgeDefinitions,
 ) {
+    if replace_channel_badges(channel, badge_map, definitions) {
+        persist_badge_map_cache(badge_map);
+    }
+}
+
+async fn load_global_badges_v1_fallback(badge_map: &BadgeMap) {
     if !host_resolves("badges.twitch.tv").await {
         warn_badges_twitch_unresolved_once();
         return;
@@ -472,33 +587,19 @@ async fn load_global_badges_v1_fallback(
     .await
     {
         let badge_map_for_parse = badge_map.clone();
-        let new_urls = parse_badges_on_large_stack("badge-global-v1-parse", move || {
-            let mut map = badge_map_for_parse.write().unwrap();
-            let before: HashSet<String> = map.values().cloned().collect();
-            parse_badges_v1_response(&text, "", &mut map);
-            map.values()
-                .filter(|u| !before.contains(*u))
-                .cloned()
-                .collect::<Vec<_>>()
+        let changed = parse_badges_on_large_stack("badge-global-v1-parse", move || {
+            merge_badge_response(&text, "", &badge_map_for_parse, parse_badges_v1_response)
         })
+        .flatten()
         .unwrap_or_default();
-        if !new_urls.is_empty() {
-            info!(
-                "Loaded {} global badges via badges.twitch.tv fallback",
-                new_urls.len()
-            );
-            prefetch_badge_images(new_urls, cache, evt_tx);
+        if changed != 0 {
+            info!("Updated {changed} global badge definitions via badges.twitch.tv fallback");
             persist_badge_map_cache(&badge_map);
         }
     }
 }
 
-async fn load_global_badges_helix(
-    badge_map: &BadgeMap,
-    cache: &Option<EmoteCache>,
-    evt_tx: &mpsc::Sender<AppEvent>,
-    oauth_token: Option<&str>,
-) {
+async fn load_global_badges_helix(badge_map: &BadgeMap, oauth_token: Option<&str>) {
     let Some((client_id, token)) = helix_auth_from_token(oauth_token).await else {
         return;
     };
@@ -518,29 +619,19 @@ async fn load_global_badges_helix(
     .await
     {
         let badge_map_for_parse = badge_map.clone();
-        let new_urls = parse_badges_on_large_stack("badge-global-helix-parse", move || {
-            let mut map = badge_map_for_parse.write().unwrap();
-            let before: HashSet<String> = map.values().cloned().collect();
-            parse_helix_badge_response(&text, "", &mut map);
-            map.values()
-                .filter(|u| !before.contains(*u))
-                .cloned()
-                .collect::<Vec<_>>()
+        let changed = parse_badges_on_large_stack("badge-global-helix-parse", move || {
+            merge_badge_response(&text, "", &badge_map_for_parse, parse_helix_badge_response)
         })
+        .flatten()
         .unwrap_or_default();
-        if !new_urls.is_empty() {
-            info!("Loaded {} global badges via Helix", new_urls.len());
-            prefetch_badge_images(new_urls, cache, evt_tx);
+        if changed != 0 {
+            info!("Updated {changed} global badge definitions via Helix");
             persist_badge_map_cache(badge_map);
         }
     }
 }
 
-async fn load_global_badges_ivr_fallback(
-    badge_map: &BadgeMap,
-    cache: &Option<EmoteCache>,
-    evt_tx: &mpsc::Sender<AppEvent>,
-) {
+async fn load_global_badges_ivr_fallback(badge_map: &BadgeMap) {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .user_agent("crust-badges/1.0")
@@ -556,34 +647,22 @@ async fn load_global_badges_ivr_fallback(
     .await
     {
         let badge_map_for_parse = badge_map.clone();
-        let new_urls = parse_badges_on_large_stack("badge-global-ivr-parse", move || {
-            let mut map = badge_map_for_parse.write().unwrap();
-            let before: HashSet<String> = map.values().cloned().collect();
-            parse_ivr_badge_response(&text, "", &mut map);
-            map.values()
-                .filter(|u| !before.contains(*u))
-                .cloned()
-                .collect::<Vec<_>>()
+        let changed = parse_badges_on_large_stack("badge-global-ivr-parse", move || {
+            merge_badge_response(&text, "", &badge_map_for_parse, parse_ivr_badge_response)
         })
+        .flatten()
         .unwrap_or_default();
-        if !new_urls.is_empty() {
-            info!("Loaded {} global badges via IVR", new_urls.len());
-            prefetch_badge_images(new_urls, cache, evt_tx);
+        if changed != 0 {
+            info!("Updated {changed} global badge definitions via IVR");
             persist_badge_map_cache(badge_map);
         }
     }
 }
 
-async fn load_channel_badges_v1_fallback(
-    room_id: &str,
-    channel: &str,
-    badge_map: &BadgeMap,
-    cache: &Option<EmoteCache>,
-    evt_tx: &mpsc::Sender<AppEvent>,
-) {
+async fn load_channel_badges_v1_fallback(room_id: &str, channel: &str) -> Option<BadgeDefinitions> {
     if !host_resolves("badges.twitch.tv").await {
         warn_badges_twitch_unresolved_once();
-        return;
+        return None;
     }
 
     let client = reqwest::Client::builder()
@@ -601,82 +680,55 @@ async fn load_channel_badges_v1_fallback(
     .await
     {
         let channel = channel.to_owned();
-        let badge_map_for_parse = badge_map.clone();
-        let new_urls = parse_badges_on_large_stack("badge-channel-v1-parse", move || {
-            let mut map = badge_map_for_parse.write().unwrap();
-            let before: HashSet<String> = map.values().cloned().collect();
-            parse_badges_v1_response(&text, &channel, &mut map);
-            map.values()
-                .filter(|u| !before.contains(*u))
-                .cloned()
-                .collect::<Vec<_>>()
+        let definitions = parse_badges_on_large_stack("badge-channel-v1-parse", move || {
+            parse_badge_snapshot(&text, &channel, parse_badges_v1_response)
         })
-        .unwrap_or_default();
-        if !new_urls.is_empty() {
+        .flatten();
+        if let Some(ref definitions) = definitions {
             info!(
-                "Loaded {} channel badges for room {room_id} via badges.twitch.tv fallback",
-                new_urls.len()
+                "Loaded {} channel badge definitions for room {room_id} via badges.twitch.tv fallback",
+                definitions.len()
             );
-            prefetch_badge_images(new_urls, cache, evt_tx);
-            persist_badge_map_cache(&badge_map);
         }
+        return definitions;
     }
+    None
 }
 
 /// Load global Twitch badges via Helix/IVR with bundled fallback.
-pub(crate) async fn load_global_badges(
-    badge_map: &BadgeMap,
-    cache: &Option<EmoteCache>,
-    evt_tx: &mpsc::Sender<AppEvent>,
-    oauth_token: Option<String>,
-) {
+pub(crate) async fn load_global_badges(badge_map: &BadgeMap, oauth_token: Option<String>) {
     let badge_map_for_parse = badge_map.clone();
-    let new_urls = parse_badges_on_large_stack("badge-global-bundled-parse", move || {
-        let mut map = badge_map_for_parse.write().unwrap();
-        let before: HashSet<String> = map.values().cloned().collect();
-        parse_ivr_badge_response(CRUST_TWITCH_BADGES_JSON, "", &mut map);
-        map.values()
-            .filter(|u| !before.contains(*u))
-            .cloned()
-            .collect::<Vec<_>>()
+    let changed = parse_badges_on_large_stack("badge-global-bundled-parse", move || {
+        merge_badge_response(
+            CRUST_TWITCH_BADGES_JSON,
+            "",
+            &badge_map_for_parse,
+            parse_ivr_badge_response,
+        )
     })
+    .flatten()
     .unwrap_or_default();
 
-    if !new_urls.is_empty() {
-        info!(
-            "Loaded {} global badges from bundled Twitch snapshot",
-            new_urls.len()
-        );
-        prefetch_badge_images(new_urls, cache, evt_tx);
+    if changed != 0 {
+        info!("Updated {changed} global badge definitions from bundled Twitch snapshot");
         persist_badge_map_cache(badge_map);
     }
 
     let badge_map_for_refresh = badge_map.clone();
-    let cache = cache.clone();
-    let evt_tx = evt_tx.clone();
-    let oauth_token_for_refresh = oauth_token.clone();
     tokio::spawn(async move {
-        load_global_badges_helix(
-            &badge_map_for_refresh,
-            &cache,
-            &evt_tx,
-            oauth_token_for_refresh.as_deref(),
-        )
-        .await;
-        load_global_badges_ivr_fallback(&badge_map_for_refresh, &cache, &evt_tx).await;
-        load_global_badges_v1_fallback(&badge_map_for_refresh, &cache, &evt_tx).await;
+        load_global_badges_helix(&badge_map_for_refresh, oauth_token.as_deref()).await;
+        load_global_badges_ivr_fallback(&badge_map_for_refresh).await;
+        load_global_badges_v1_fallback(&badge_map_for_refresh).await;
     });
 }
 
-/// Load channel-specific Twitch badges.
+/// Fetch an owned channel snapshot without changing shared state. A valid empty
+/// response returns `Some(empty)`; network errors or malformed data return `None`.
 pub(crate) async fn load_channel_badges(
     room_id: &str,
     channel: &str,
-    badge_map: &BadgeMap,
-    cache: &Option<EmoteCache>,
-    evt_tx: &mpsc::Sender<AppEvent>,
     oauth_token: Option<String>,
-) {
+) -> Option<BadgeDefinitions> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .user_agent("crust-badges/1.0")
@@ -694,24 +746,17 @@ pub(crate) async fn load_channel_badges(
         .await
         {
             let channel = channel.to_owned();
-            let badge_map_for_parse = badge_map.clone();
-            let new_urls = parse_badges_on_large_stack("badge-channel-helix-parse", move || {
-                let mut map = badge_map_for_parse.write().unwrap();
-                let before: HashSet<String> = map.values().cloned().collect();
-                parse_helix_badge_response(&text, &channel, &mut map);
-                map.values()
-                    .filter(|u| !before.contains(*u))
-                    .cloned()
-                    .collect::<Vec<_>>()
+            let definitions = parse_badges_on_large_stack("badge-channel-helix-parse", move || {
+                parse_badge_snapshot(&text, &channel, parse_helix_badge_response)
             })
-            .unwrap_or_default();
-            info!(
-                "Loaded {} channel badges for room {room_id} via Helix",
-                new_urls.len()
-            );
-            prefetch_badge_images(new_urls, cache, evt_tx);
-            persist_badge_map_cache(&badge_map);
-            return;
+            .flatten();
+            if let Some(definitions) = definitions {
+                info!(
+                    "Loaded {} channel badge definitions for room {room_id} via Helix",
+                    definitions.len()
+                );
+                return Some(definitions);
+            }
         }
     }
 
@@ -726,26 +771,19 @@ pub(crate) async fn load_channel_badges(
     .await
     {
         let channel = channel.to_owned();
-        let badge_map_for_parse = badge_map.clone();
-        let new_urls = parse_badges_on_large_stack("badge-channel-ivr-parse", move || {
-            let mut map = badge_map_for_parse.write().unwrap();
-            let before: HashSet<String> = map.values().cloned().collect();
-            parse_ivr_badge_response(&text, &channel, &mut map);
-            map.values()
-                .filter(|u| !before.contains(*u))
-                .cloned()
-                .collect::<Vec<_>>()
+        let definitions = parse_badges_on_large_stack("badge-channel-ivr-parse", move || {
+            parse_badge_snapshot(&text, &channel, parse_ivr_badge_response)
         })
-        .unwrap_or_default();
-        info!(
-            "Loaded {} channel badges for room {room_id} via IVR",
-            new_urls.len()
-        );
-        prefetch_badge_images(new_urls, cache, evt_tx);
-        persist_badge_map_cache(&badge_map);
-    } else {
-        load_channel_badges_v1_fallback(room_id, channel, badge_map, cache, evt_tx).await;
+        .flatten();
+        if let Some(definitions) = definitions {
+            info!(
+                "Loaded {} channel badge definitions for room {room_id} via IVR",
+                definitions.len()
+            );
+            return Some(definitions);
+        }
     }
+    load_channel_badges_v1_fallback(room_id, channel).await
 }
 
 async fn fetch_badge_payload_with_retries(
@@ -794,22 +832,164 @@ fn warn_badges_twitch_unresolved_once() {
     }
 }
 
-/// Eagerly prefetch a list of badge image URLs.
-fn prefetch_badge_images(
-    urls: Vec<String>,
-    cache: &Option<EmoteCache>,
-    evt_tx: &mpsc::Sender<AppEvent>,
-) {
-    if urls.is_empty() {
-        return;
-    }
-    info!("Prefetching {} badge images...", urls.len());
-    let _ = evt_tx.try_send(AppEvent::ImagePrefetchQueued { count: urls.len() });
-    for url in urls {
-        let cache = cache.clone();
-        let evt_tx = evt_tx.clone();
-        tokio::spawn(async move {
-            fetch_emote_image(&url, &cache, &evt_tx).await;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn badge_cache_writes_coalesce_updates_while_a_save_is_running() {
+        let writer = Arc::new(BadgeCacheWriter::new());
+        let map = BadgeMap::default();
+        let key = ("room".to_owned(), "subscriber".to_owned(), "1".to_owned());
+        map.write()
+            .unwrap()
+            .insert(key.clone(), "initial".to_owned());
+        assert!(writer.queue(&map));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = writer.clone();
+        let worker_key = key.clone();
+        let saved = std::thread::spawn(move || {
+            let mut snapshots = Vec::new();
+            worker.drain(|map| {
+                if snapshots.is_empty() {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                }
+                snapshots.push(map.read().unwrap()[&worker_key].clone());
+            });
+            snapshots
         });
+        started_rx.recv().unwrap();
+        for update in 0..32 {
+            map.write()
+                .unwrap()
+                .insert(key.clone(), format!("update-{update}"));
+            assert!(!writer.queue(&map), "one writer must own all queued saves");
+        }
+        release_tx.send(()).unwrap();
+        assert_eq!(saved.join().unwrap(), ["update-31", "update-31"]);
+        assert!(
+            writer.queue(&map),
+            "later refreshes can start another writer"
+        );
+        let mut writes = 0;
+        writer.drain(|_| writes += 1);
+        assert_eq!(writes, 1);
+    }
+
+    #[test]
+    fn badge_refresh_merges_changed_keys_and_preserves_other_channels() {
+        let map = BadgeMap::default();
+        let first = r#"[{"set_id":"subscriber","versions":[{"id":"1","image_url_1x":"https://example.test/first.png"}]}]"#;
+        let second = r#"[{"set_id":"subscriber","versions":[{"id":"1","image_url_1x":"https://example.test/second.png"}]}]"#;
+        assert_eq!(
+            merge_badge_response(first, "a", &map, parse_ivr_badge_response),
+            Some(1)
+        );
+        assert_eq!(
+            merge_badge_response(first, "b", &map, parse_ivr_badge_response),
+            Some(1)
+        );
+        assert_eq!(
+            merge_badge_response(first, "a", &map, parse_ivr_badge_response),
+            Some(0)
+        );
+        assert_eq!(
+            merge_badge_response(second, "a", &map, parse_ivr_badge_response),
+            Some(1)
+        );
+        let map = map.read().unwrap();
+        assert_eq!(
+            resolve_badge_url(&map, "a", "subscriber", "1").as_deref(),
+            Some("https://example.test/second.png")
+        );
+        assert_eq!(
+            resolve_badge_url(&map, "b", "subscriber", "1").as_deref(),
+            Some("https://example.test/first.png")
+        );
+    }
+
+    #[test]
+    fn badge_refresh_persists_new_keys_even_when_the_image_url_is_already_known() {
+        let map = BadgeMap::default();
+        let body = r#"[{"set_id":"subscriber","versions":[{"id":"1","image_url_1x":"https://example.test/shared.png"}]}]"#;
+        assert_eq!(
+            merge_badge_response(body, "a", &map, parse_ivr_badge_response),
+            Some(1)
+        );
+        assert_eq!(
+            merge_badge_response(body, "b", &map, parse_ivr_badge_response),
+            Some(1)
+        );
+        assert_eq!(
+            merge_badge_response("invalid", "a", &map, parse_ivr_badge_response),
+            None
+        );
+        assert_eq!(map.read().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn badge_parsers_distinguish_valid_empty_responses_from_invalid_data() {
+        let map = BadgeMap::default();
+        let responses: [(fn(&str, &str, &mut BadgeDefinitions) -> bool, &str); 4] = [
+            (parse_ivr_badge_response, "[]"),
+            (parse_ivr_badge_response, "{}"),
+            (parse_helix_badge_response, r#"{"data":[]}"#),
+            (parse_badges_v1_response, r#"{"badge_sets":{}}"#),
+        ];
+        for (parse, empty) in responses {
+            assert_eq!(merge_badge_response(empty, "room", &map, parse), Some(0));
+            assert_eq!(merge_badge_response("not json", "room", &map, parse), None);
+            assert_eq!(merge_badge_response("null", "room", &map, parse), None);
+            assert_eq!(
+                merge_badge_response(r#"{"error":"unavailable"}"#, "room", &map, parse),
+                None
+            );
+        }
+        assert!(map.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn channel_snapshot_replaces_its_scope_and_clears_removed_badges() {
+        let map = BadgeMap::default();
+        let key = |scope: &str, version: &str| {
+            (
+                scope.to_owned(),
+                "subscriber".to_owned(),
+                version.to_owned(),
+            )
+        };
+        map.write().unwrap().extend([
+            (key("", "1"), "global".to_owned()),
+            (key("a", "1"), "old".to_owned()),
+            (key("a", "2"), "removed".to_owned()),
+            (key("b", "1"), "other-channel".to_owned()),
+        ]);
+        let definitions = BadgeDefinitions::from([(key("a", "1"), "current".to_owned())]);
+        assert!(replace_channel_badges("a", &map, definitions.clone()));
+        assert!(!replace_channel_badges("a", &map, definitions));
+        {
+            let snapshot = map.read().unwrap();
+            assert_eq!(
+                snapshot.get(&key("a", "1")).map(String::as_str),
+                Some("current")
+            );
+            assert!(!snapshot.contains_key(&key("a", "2")));
+            assert_eq!(
+                snapshot.get(&key("", "1")).map(String::as_str),
+                Some("global")
+            );
+            assert_eq!(
+                snapshot.get(&key("b", "1")).map(String::as_str),
+                Some("other-channel")
+            );
+        }
+        let empty =
+            parse_badge_snapshot(r#"{"data":[]}"#, "a", parse_helix_badge_response).unwrap();
+        assert!(replace_channel_badges("a", &map, empty));
+        let snapshot = map.read().unwrap();
+        assert_eq!(snapshot.len(), 2);
+        assert!(snapshot.keys().all(|(scope, _, _)| scope != "a"));
     }
 }

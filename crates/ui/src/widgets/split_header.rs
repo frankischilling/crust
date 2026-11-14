@@ -167,24 +167,31 @@ pub fn show_split_header(
         }
     }
 
+    let prefix = if channel.is_irc_query() {
+        "@ "
+    } else if ultra_compact || channel.is_kick() || channel.is_irc_server_tab() || channel.is_virtual() {
+        ""
+    } else {
+        "# "
+    };
     let mut title = if !ultra_compact && unread_mentions > 0 {
         format!(
             "{}{} [{}]",
-            if ultra_compact { "" } else { "# " },
+            prefix,
             channel.display_name(),
             badge_count_label(unread_mentions)
         )
     } else if !ultra_compact && unread_count > 0 {
         format!(
             "{}{} ({})",
-            if ultra_compact { "" } else { "# " },
+            prefix,
             channel.display_name(),
             badge_count_label(unread_count)
         )
     } else {
         format!(
             "{}{}",
-            if ultra_compact { "" } else { "# " },
+            prefix,
             channel.display_name()
         )
     };

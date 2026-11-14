@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use crust_core::model::{ChannelId, EmoteCatalogEntry, UserId};
@@ -27,6 +27,8 @@ pub(crate) struct UserEmoteUpdate {
 struct ChannelEmotes {
     generation: u64,
     source_id: Option<String>,
+    loading: bool,
+    load_failed: bool,
     emotes: ProviderEmotes,
     /// Definitions carried by incoming messages survive older fetched snapshots.
     inline_emotes: ProviderEmotes,
@@ -38,6 +40,7 @@ pub(crate) struct EmoteRegistry {
     global: ProviderEmotes,
     channels: HashMap<ChannelId, ChannelEmotes>,
     personal: HashMap<String, ProviderEmotes>,
+    whisper_senders: HashSet<String>,
     pending_users: HashMap<String, UserLookup>,
     deferred_users: HashMap<String, Option<ChannelId>>,
     deferred_user_order: VecDeque<String>,
@@ -45,6 +48,8 @@ pub(crate) struct EmoteRegistry {
     cached_user_order: VecDeque<String>,
     personal_emote_count: usize,
     active_account: Option<String>,
+    twitch_inventory: ProviderEmotes,
+    twitch_inventory_generation: Option<u64>,
     next_generation: u64,
 }
 
@@ -95,6 +100,8 @@ impl EmoteRegistry {
         let scope = self.channels.entry(channel.clone()).or_default();
         scope.source_id = None;
         scope.generation = self.next_generation;
+        scope.loading = false;
+        scope.load_failed = false;
     }
 
     /// Reserve a generation before spawning a load, rejecting mode-only refreshes.
@@ -111,7 +118,24 @@ impl EmoteRegistry {
         self.next_generation = self.next_generation.wrapping_add(1);
         scope.generation = self.next_generation;
         scope.source_id = Some(source_id.to_owned());
+        scope.loading = true;
+        scope.load_failed = false;
         Some(scope.generation)
+    }
+
+    /// Allow a failed provider to retry only after every provider has settled.
+    pub(crate) fn complete_channel_load(&mut self, channel: &ChannelId, generation: u64) -> bool {
+        let Some(scope) = self.channels.get_mut(channel) else {
+            return false;
+        };
+        if scope.generation != generation || !scope.loading {
+            return false;
+        }
+        scope.loading = false;
+        if scope.load_failed {
+            scope.source_id = None;
+        }
+        true
     }
 
     pub(crate) fn replace_channel(
@@ -124,7 +148,7 @@ impl EmoteRegistry {
         let Some(scope) = self.channels.get_mut(channel) else {
             return false;
         };
-        if scope.generation != generation {
+        if scope.generation != generation || !scope.loading {
             return false;
         }
         if let Some(emotes) = emotes {
@@ -136,8 +160,8 @@ impl EmoteRegistry {
                     .collect(),
             );
         } else {
-            // Keep the last usable set and let a later room state retry this load.
-            scope.source_id = None;
+            // Keep the last usable set while other providers finish this generation.
+            scope.load_failed = true;
         }
         true
     }
@@ -181,7 +205,69 @@ impl EmoteRegistry {
             return;
         }
         self.active_account = user_id.map(str::to_owned);
+        self.twitch_inventory.clear();
+        self.twitch_inventory_generation = None;
+        self.whisper_senders.clear();
         self.pending_users.clear();
+        self.deferred_users.retain(|_, channel| channel.is_some());
+        let deferred = &self.deferred_users;
+        self.deferred_user_order.retain(|user| deferred.contains_key(user));
+    }
+
+    pub(crate) fn begin_twitch_inventory(&mut self, user_id: &str) -> Option<u64> {
+        if user_id.is_empty() || self.active_account.as_deref() != Some(user_id) {
+            return None;
+        }
+        self.next_generation = self.next_generation.wrapping_add(1);
+        self.twitch_inventory_generation = Some(self.next_generation);
+        Some(self.next_generation)
+    }
+
+    /// Private entitlements never share storage with public sender emotes.
+    pub(crate) fn complete_twitch_inventory(
+        &mut self,
+        user_id: &str,
+        generation: u64,
+        emotes: Option<Vec<EmoteInfo>>,
+    ) -> bool {
+        if self.active_account.as_deref() != Some(user_id)
+            || self.twitch_inventory_generation != Some(generation)
+        {
+            return false;
+        }
+        self.twitch_inventory_generation = None;
+        let Some(emotes) = emotes else { return false; };
+        let inventory = provider_maps(emotes);
+        let changed = self.twitch_inventory != inventory;
+        self.twitch_inventory = inventory;
+        changed
+    }
+
+    pub(crate) fn clear_twitch_inventory(&mut self, user_id: &str) -> bool {
+        if self.active_account.as_deref() != Some(user_id) {
+            return false;
+        }
+        self.twitch_inventory_generation = None;
+        let changed = !self.twitch_inventory.is_empty();
+        self.twitch_inventory.clear();
+        changed
+    }
+
+    /// Schedule a known whisper sender through the same bounded queue as chat senders.
+    pub(crate) fn queue_whisper_sender(&mut self, account_user_id: &str, sender_user_id: &str) -> bool {
+        if account_user_id.is_empty() || self.active_account.as_deref() != Some(account_user_id)
+            || sender_user_id.is_empty()
+        {
+            return false;
+        }
+        if sender_user_id != account_user_id {
+            if self.whisper_senders.len() >= MAX_CACHED_USERS && !self.whisper_senders.contains(sender_user_id) {
+                return false;
+            }
+            self.whisper_senders.insert(sender_user_id.to_owned());
+        }
+        self.defer_personal_load(sender_user_id, None);
+        true
     }
 
     fn needs_personal_load(&self, user_id: &str, channel: Option<&ChannelId>) -> bool {
@@ -193,7 +279,9 @@ impl EmoteRegistry {
                 .is_some_and(|retry_at| Instant::now() < *retry_at)
             && match channel {
                 Some(channel) => channel.is_twitch() && self.channels.contains_key(channel),
-                None => self.active_account.as_deref() == Some(user_id),
+                None => self.active_account.as_deref().is_some_and(|account| {
+                    account == user_id || self.whisper_senders.contains(user_id)
+                }),
             }
     }
 
@@ -253,7 +341,7 @@ impl EmoteRegistry {
         None
     }
 
-    /// Reserve one bounded lookup for a sender observed in an open channel or the active account.
+    /// Reserve one bounded lookup for an open channel or the current account's senders.
     pub(crate) fn begin_personal_load(
         &mut self,
         user_id: &str,
@@ -268,7 +356,9 @@ impl EmoteRegistry {
             Some(channel) if channel.is_twitch() && self.channels.contains_key(channel) => {
                 Some(channel.clone())
             }
-            None if self.active_account.as_deref() == Some(user_id) => None,
+            None if self.active_account.as_deref().is_some_and(|account| {
+                account == user_id || self.whisper_senders.contains(user_id)
+            }) => None,
             _ => return None,
         };
         self.next_generation = self.next_generation.wrapping_add(1);
@@ -350,6 +440,11 @@ impl EmoteRegistry {
         sender_user_id: &str,
         code: &str,
     ) -> Option<&EmoteInfo> {
+        if channel.is_twitch() && self.active_account.as_deref() == Some(sender_user_id) {
+            if let Some(emote) = lookup(&self.twitch_inventory, "twitch", code) {
+                return Some(emote);
+            }
+        }
         if let Some(personal) = self
             .personal
             .get(sender_user_id)
@@ -374,6 +469,13 @@ impl EmoteRegistry {
             }
         }
         None
+    }
+
+    pub(crate) fn twitch_for_user(&self, user_id: &str, code: &str) -> Option<&EmoteInfo> {
+        self.twitch_inventory.get("twitch")
+            .filter(|_| !user_id.is_empty() && self.active_account.as_deref() == Some(user_id))
+            .and_then(|emotes| emotes.get(code))
+            .or_else(|| self.twitch_global(code))
     }
 
     pub(crate) fn twitch_global(&self, code: &str) -> Option<&EmoteInfo> {
@@ -438,6 +540,9 @@ impl EmoteRegistry {
         for (user_id, emotes) in &self.personal {
             append(emotes, None, Some(user_id), None);
         }
+        if let Some(owner) = &self.active_account {
+            append(&self.twitch_inventory, None, Some(owner), None);
+        }
         catalog
     }
 }
@@ -468,6 +573,7 @@ mod tests {
                 Some(emotes.into_values().collect())
             ));
         }
+        assert!(registry.complete_channel_load(channel, generation));
     }
 
     #[test]
@@ -583,6 +689,9 @@ mod tests {
                 Some(vec![emote("7tv", "personal", "Same")])
             )
             .is_some());
+        let generation = registry.begin_twitch_inventory("42").unwrap();
+        assert!(registry.complete_twitch_inventory("42", generation,
+            Some(vec![emote("twitch", "subscription", "Same")])));
         for sender in ["42", "other", ""] {
             let catalog = registry.catalog();
             let selected = catalog
@@ -595,6 +704,36 @@ mod tests {
                 selected.url
             );
         }
+    }
+
+    #[test]
+    fn native_inventory_belongs_to_the_account_without_erasing_public_sender_sets() {
+        let mut registry = EmoteRegistry::default();
+        let channel = ChannelId::new("room");
+        registry.set_account(Some("alice"));
+        let generation = registry.begin_personal_load("alice", None).unwrap();
+        registry.complete_personal_load("alice", generation,
+            Some(vec![emote("7tv", "public", "PersonalWave")]));
+        let generation = registry.begin_twitch_inventory("alice").unwrap();
+        assert!(registry.complete_twitch_inventory("alice", generation,
+            Some(vec![emote("twitch", "subscription", "SubLove")])));
+        assert!(registry.resolve(&channel, "alice", "SubLove").is_some());
+        assert!(registry.resolve(&channel, "bob", "SubLove").is_none());
+        assert!(registry.resolve(&ChannelId::kick("room"), "alice", "SubLove").is_none());
+        let entry = registry.catalog().into_iter().find(|emote| emote.code == "SubLove").unwrap();
+        assert!(entry.is_available_for(&channel, "alice"));
+        assert!(!entry.is_available_for(&channel, "bob"));
+
+        let old_generation = registry.begin_twitch_inventory("alice").unwrap();
+        registry.set_account(Some("bob"));
+        assert!(registry.twitch_for_user("alice", "SubLove").is_none());
+        assert!(registry.resolve(&channel, "alice", "PersonalWave").is_some());
+        registry.set_account(Some("alice"));
+        assert!(!registry.complete_twitch_inventory("alice", old_generation,
+            Some(vec![emote("twitch", "stale", "SubLove")])));
+        registry.set_account(None);
+        assert!(registry.catalog().iter().all(|entry| entry.provider != "twitch"));
+        assert!(registry.resolve(&channel, "alice", "PersonalWave").is_some());
     }
 
     #[test]
@@ -630,6 +769,10 @@ mod tests {
         let third = registry.begin_channel_load(&channel, "room", true).unwrap();
         assert!(registry.replace_channel(&channel, third, "ffz", Some(vec![])));
         assert!(registry.resolve(&channel, "", "Same").is_none());
+        assert!(!registry.complete_channel_load(&channel, second));
+        assert!(registry.complete_channel_load(&channel, third));
+        assert!(!registry.complete_channel_load(&channel, third));
+        assert!(registry.begin_channel_load(&channel, "room", false).is_none());
     }
 
     #[test]
@@ -667,10 +810,12 @@ mod tests {
         );
         let generation = registry.begin_channel_load(&channel, "room", true).unwrap();
         assert!(registry.replace_channel(&channel, generation, "ffz", None));
+        assert!(registry.begin_channel_load(&channel, "room", false).is_none());
         assert!(registry.replace_channel(&channel, generation, "7tv", Some(vec![])));
         assert_eq!(registry.resolve(&channel, "", "Keep").unwrap().id, "keep");
         assert!(registry.resolve(&channel, "", "Remove").is_none());
         assert_eq!(registry.channel_emote_count(&channel), 1);
+        assert!(registry.complete_channel_load(&channel, generation));
         let next = registry
             .begin_channel_load(&channel, "room", false)
             .unwrap();
@@ -769,6 +914,34 @@ mod tests {
             registry.resolve(&channel, "alice-id", "Mine").unwrap().id,
             "personal"
         );
+    }
+
+    #[test]
+    fn whisper_sender_lookups_are_owned_bounded_and_cleared_when_accounts_change() {
+        let mut registry = EmoteRegistry::default();
+        assert!(!registry.queue_whisper_sender("account", "sender"));
+        registry.set_account(Some("account"));
+        assert!(!registry.queue_whisper_sender("other-account", "sender"));
+        assert!(!registry.queue_whisper_sender("account", ""));
+        assert!(registry.queue_whisper_sender("account", "sender"));
+        assert!(registry.queue_whisper_sender("account", "sender"));
+        assert_eq!(registry.deferred_users.len(), 1);
+        let (sender, channel) = registry.next_deferred_personal_load().unwrap();
+        assert_eq!(sender, "sender");
+        assert!(channel.is_none());
+        let pending = registry.begin_personal_load(&sender, None).unwrap();
+        for user in 0..MAX_CACHED_USERS {
+            registry.queue_whisper_sender("account", &user.to_string());
+        }
+        assert_eq!(registry.whisper_senders.len(), MAX_CACHED_USERS);
+        assert!(registry.deferred_users.len() <= MAX_CACHED_USERS);
+        assert!(!registry.queue_whisper_sender("account", "overflow"));
+        registry.set_account(Some("next-account"));
+        assert!(registry.whisper_senders.is_empty());
+        assert!(registry.next_deferred_personal_load().is_none());
+        assert!(registry.complete_personal_load(&sender, pending, Some(vec![])).is_none());
+        assert!(!registry.queue_whisper_sender("account", "old-replay"));
+        assert!(registry.queue_whisper_sender("next-account", "sender"));
     }
 
     #[test]

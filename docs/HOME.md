@@ -6,6 +6,7 @@
 - [Build, package, and run](./BUILDING.md)
 - [Chat behavior and performance audit](./AUDIT.md)
 - [Chat delivery, emotes, and history follow-up](./AUDIT_FOLLOWUP.md)
+- [Startup, private history, and navigation fixes](./AUDIT_STARTUP.md)
 
 ## Plugins
 
@@ -22,6 +23,7 @@
 
 ## Release notes
 
+- [v0.5.3](./releases/Release_v0.5.3.md)
 - [v0.5.2](./releases/Release_v0.5.2.md)
 - [v0.5.1](./releases/Release_v0.5.1.md)
 - [v0.5.0](./releases/Release_v0.5.0.md)

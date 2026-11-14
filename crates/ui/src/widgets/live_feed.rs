@@ -155,16 +155,19 @@ impl<'a> LiveFeed<'a> {
                     return;
                 }
 
-                ScrollArea::vertical()
-                    .auto_shrink([false; 2])
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 4.0 * s;
-                        for snap in self.snapshots {
-                            if let Some(act) = self.row(ui, snap) {
+                ui.spacing_mut().item_spacing.y = 4.0 * s;
+                ScrollArea::vertical().auto_shrink([false; 2]).show_rows(
+                    ui,
+                    RowMetrics::compute().row_height,
+                    self.snapshots.len(),
+                    |ui, rows| {
+                        for row in rows {
+                            if let Some(act) = self.row(ui, &self.snapshots[row]) {
                                 action = Some(act);
                             }
                         }
-                    });
+                    },
+                );
             });
 
         action
@@ -176,6 +179,9 @@ impl<'a> LiveFeed<'a> {
         let mut action: Option<LiveFeedAction> = None;
         let row_size = Vec2::new(ui.available_width(), m.row_height);
         let (rect, resp) = ui.allocate_exact_size(row_size, Sense::click());
+        if !ui.is_rect_visible(rect) {
+            return None;
+        }
 
         // Background: hover / default
         let bg = if resp.hovered() {
@@ -392,6 +398,56 @@ fn format_uptime(started_at: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_visible_live_rows_request_thumbnail_images() {
+        let ctx = egui::Context::default();
+        let mut images = UiImageCache::default();
+        let snapshots: Vec<_> = (0..100)
+            .map(|index| LiveChannelSnapshot {
+                user_id: index.to_string(),
+                user_login: format!("channel{index}"),
+                user_name: format!("Channel {index}"),
+                viewer_count: 1,
+                thumbnail_url: format!("https://example.test/{index}.png"),
+                started_at: String::new(),
+            })
+            .collect();
+        images.begin_frame(&ctx);
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 280.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    LiveFeed {
+                        snapshots: &snapshots,
+                        loaded: true,
+                        error: None,
+                        last_updated: None,
+                        joined_logins: &HashSet::new(),
+                        thumbnail_bytes: &images,
+                    }
+                    .show(ui);
+                });
+            },
+        );
+        let mut requested = Vec::new();
+        images.end_frame(&ctx, |command| {
+            let crust_core::events::AppCommand::FetchImage { url } = command else {
+                panic!("expected an image request");
+            };
+            requested.push(url);
+            true
+        });
+        assert!(!requested.is_empty());
+        assert!(requested.len() < 10, "offscreen thumbnails were requested");
+        assert!(!requested.contains(&snapshots.last().unwrap().thumbnail_url));
+    }
 
     #[test]
     fn format_viewers_under_1000_shows_full_number() {

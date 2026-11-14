@@ -147,8 +147,7 @@ pub struct SettingsPageState {
     /// Editable hotkey bindings (mirrors AppSettings.hotkey_bindings, merged with defaults).
     pub hotkey_bindings: crust_core::HotkeyBindings,
     /// Action currently awaiting key capture. `None` when no row is in
-    /// capture mode. The renderer polls egui input events to assign the
-    /// next key press to this action.
+    /// capture mode. Capture runs before app shortcuts and widget input.
     pub hotkey_capture_target: Option<crust_core::HotkeyAction>,
     /// Opt-in fetch of pronouns from alejo.io on user profile popup.
     pub show_pronouns_in_usercard: bool,
@@ -247,25 +246,6 @@ fn render_hotkeys_section(ui: &mut egui::Ui, state: &mut SettingsPageState, comp
     );
     ui.add_space(6.0);
 
-    // Poll for a captured key press if a row is in capture mode. Done
-    // *before* drawing rows so the newly-assigned label paints this frame.
-    if let Some(target) = state.hotkey_capture_target {
-        let captured = ui.ctx().input(|i| capture_keybinding(i));
-        if let Some(capture) = captured {
-            match capture {
-                CaptureOutcome::Cancel => {
-                    state.hotkey_capture_target = None;
-                }
-                CaptureOutcome::Binding(binding) => {
-                    state.hotkey_bindings.set(target, binding);
-                    state.hotkey_capture_target = None;
-                }
-            }
-        } else {
-            ui.ctx().request_repaint();
-        }
-    }
-
     let mut reset_all = false;
     ui.horizontal(|ui| {
         if ui
@@ -360,13 +340,26 @@ fn render_hotkeys_section(ui: &mut egui::Ui, state: &mut SettingsPageState, comp
                             .font(t::small())
                             .color(button_color),
                     );
+                    // The focus lock needs a prior focused frame. Establish it
+                    // on press so Tab is captured immediately after release.
+                    if btn.is_pointer_button_down_on() {
+                        btn.request_focus();
+                    }
                     if btn.clicked() {
                         state.hotkey_capture_target = if capture_active {
                             None
                         } else {
+                            btn.request_focus();
                             Some(action)
                         };
                     }
+                    ui.memory_mut(|memory| memory.set_focus_lock_filter(btn.id,
+                        if state.hotkey_capture_target == Some(action) {
+                            egui::EventFilter { tab: true, horizontal_arrows: true,
+                                vertical_arrows: true, escape: true }
+                        } else {
+                            egui::EventFilter::default()
+                        }));
 
                     if ui
                         .button(RichText::new("Clear").font(t::tiny()))
@@ -422,6 +415,30 @@ enum CaptureOutcome {
     Binding(crust_core::KeyBinding),
 }
 
+/// Give a pending binding capture the whole keyboard frame before shortcuts or
+/// widgets can act on it. The caller cancels capture when its settings page closes.
+pub(crate) fn handle_hotkey_capture(
+    ctx: &Context,
+    target: &mut Option<crust_core::HotkeyAction>,
+    bindings: &mut crust_core::HotkeyBindings,
+) -> bool {
+    let Some(action) = *target else { return false; };
+    let captured = ctx.input_mut(|input| {
+        let captured = capture_keybinding(input);
+        input.events.retain(|event| !matches!(event,
+            egui::Event::Key { .. } | egui::Event::Text(_) | egui::Event::Paste(_)
+                | egui::Event::Copy | egui::Event::Cut | egui::Event::Ime(_)));
+        captured
+    });
+    if let Some(captured) = captured {
+        if let CaptureOutcome::Binding(binding) = captured {
+            bindings.set(action, binding);
+        }
+        *target = None;
+    }
+    true
+}
+
 /// Inspect the current egui input frame for a fresh key-down event and
 /// translate it into a [`CaptureOutcome`]. Skips pure modifier presses so
 /// users can hold modifiers without prematurely committing the binding.
@@ -430,6 +447,7 @@ fn capture_keybinding(input: &egui::InputState) -> Option<CaptureOutcome> {
         if let egui::Event::Key {
             key,
             pressed: true,
+            repeat: false,
             modifiers,
             ..
         } = event
@@ -3019,6 +3037,10 @@ pub fn show_settings_page(
     plugin_ui_session: &mut PluginUiSessionState,
     stats: SettingsStats,
 ) {
+    if !*settings_open || *settings_section != SettingsSection::Hotkeys {
+        state.hotkey_capture_target = None;
+    }
+    handle_hotkey_capture(ctx, &mut state.hotkey_capture_target, &mut state.hotkey_bindings);
     let bounds = ctx.screen_rect().shrink(8.0);
     let style = ctx.style();
     let frame = egui::Frame::window(&style);
@@ -3117,6 +3139,10 @@ pub fn show_settings_page(
                 });
             }
         });
+
+    if !*settings_open || *settings_section != SettingsSection::Hotkeys {
+        state.hotkey_capture_target = None;
+    }
 
     // Render the shared advanced-expression modal (no-op when closed).
     // This is drawn above the settings window so the user can tweak the
@@ -3229,6 +3255,66 @@ mod responsive_tests {
             }
             None
         })
+    }
+
+    #[test]
+    fn hotkey_capture_keeps_tab_in_the_binding_and_restores_normal_focus_afterward() {
+        let mut harness = SettingsHarness::new();
+        harness.section = SettingsSection::Hotkeys;
+        let size = egui::vec2(1100.0, 800.0);
+        let action = crust_core::HotkeyAction::ZoomIn;
+        let label = harness.state.hotkey_bindings.get(action).display_label();
+        let mut output = egui::FullOutput::default();
+        for _ in 0..4 { output = harness.frame(size, Vec::new()); }
+        let bind = visible_text_rect(&output, &label).expect("binding button is visible");
+        harness.click(size, bind.center());
+        assert_eq!(harness.state.hotkey_capture_target, Some(action));
+        let focused = harness.ctx.memory(|memory| memory.focused()).unwrap();
+        let key = |pressed| egui::Event::Key {
+            key: egui::Key::Tab, physical_key: None, pressed, repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        harness.frame(size, vec![key(true)]);
+        assert_eq!(harness.state.hotkey_bindings.get(action), crust_core::KeyBinding::new("Tab"));
+        assert!(harness.state.hotkey_capture_target.is_none());
+        assert_eq!(harness.ctx.memory(|memory| memory.focused()), Some(focused));
+        harness.frame(size, vec![key(false)]);
+        harness.frame(size, vec![key(true)]);
+        assert_ne!(harness.ctx.memory(|memory| memory.focused()), Some(focused));
+    }
+
+    #[test]
+    fn leaving_hotkeys_or_closing_settings_cancels_pending_capture() {
+        for close_window in [false, true] {
+            let mut harness = SettingsHarness::new();
+            harness.section = SettingsSection::Hotkeys;
+            let size = egui::vec2(1100.0, 800.0);
+            let action = crust_core::HotkeyAction::ZoomIn;
+            let previous = harness.state.hotkey_bindings.clone();
+            let label = harness.state.hotkey_bindings.get(action).display_label();
+            let mut output = egui::FullOutput::default();
+            for _ in 0..4 { output = harness.frame(size, Vec::new()); }
+            harness.click(size, visible_text_rect(&output, &label).unwrap().center());
+            assert_eq!(harness.state.hotkey_capture_target, Some(action));
+            let target = if close_window {
+                let window = harness.window_rect();
+                let title_y = visible_text_rect(&output, "Settings").unwrap().center().y;
+                egui::pos2(window.right() - (title_y - window.top()), title_y)
+            } else {
+                visible_text_rect(&output, "Appearance").unwrap().center()
+            };
+            harness.click(size, target);
+            assert!(harness.state.hotkey_capture_target.is_none());
+            if close_window { assert!(!harness.open); }
+            else { assert_eq!(harness.section, SettingsSection::Appearance); }
+            harness.open = true;
+            harness.section = SettingsSection::Hotkeys;
+            harness.frame(size, vec![egui::Event::Key {
+                key: egui::Key::K, physical_key: None, pressed: true, repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            }]);
+            assert_eq!(harness.state.hotkey_bindings, previous);
+        }
     }
 
     #[test]

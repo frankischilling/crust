@@ -1,10 +1,8 @@
 use chrono::{DateTime, Utc};
 use crust_core::model::{ChannelId, ChatMessage, MessageFlags, MessageId, MsgKind, Sender, UserId};
 
-/// Extract echo info from an IRC `/msg` or `/privmsg` command that targets a
-/// channel (e.g. `/msg ##chat hello`). Returns `(target_channel_id, body_text)`
-/// so the caller can emit a local echo. Returns `None` for non-channel targets
-/// (e.g. NickServ) and non-msg commands.
+/// Resolve the conversation for an IRC `/msg` or `/privmsg` echo.
+/// Service commands stay out of saved chat history because they can contain credentials.
 pub(crate) fn extract_irc_msg_echo(
     text: &str,
     source_channel: &ChannelId,
@@ -26,17 +24,18 @@ pub(crate) fn extract_irc_msg_echo(
     let body = parts.next()?.trim_start();
     // Strip optional leading ':' (IRC protocol format).
     let body = body.strip_prefix(':').unwrap_or(body);
-    // Only echo for channel targets (starting with #).
-    if !target.starts_with('#') || body.is_empty() {
+    if body.is_empty() || target.is_empty()
+        || target.chars().any(|c| c.is_whitespace() || matches!(c, ':' | ',' | '\0' | '\r' | '\n'))
+        || matches!(target.to_ascii_lowercase().as_str(), "nickserv" | "chanserv" | "memoserv" | "operserv" | "hostserv")
+    {
         return None;
     }
     let irc_target = source_channel.irc_target()?;
-    // Strip first '#' for internal ChannelId form (##chat -> #chat).
-    let ch_name = target
-        .strip_prefix('#')
-        .unwrap_or(target)
-        .to_ascii_lowercase();
-    let echo_ch = ChannelId::irc(&irc_target.host, irc_target.port, irc_target.tls, &ch_name);
+    let echo_ch = if let Some(channel) = target.strip_prefix('#') {
+        ChannelId::irc(&irc_target.host, irc_target.port, irc_target.tls, channel)
+    } else {
+        ChannelId::irc_query(&irc_target.host, irc_target.port, irc_target.tls, target)
+    };
     Some((echo_ch, body.to_owned()))
 }
 
@@ -145,5 +144,24 @@ pub(crate) fn build_sub_text(display_name: &str, months: u32, plan: &str, is_gif
         format!("{display_name} subscribed with {plan}!")
     } else {
         format!("{display_name} resubscribed with {plan}! ({months} months)")
+    }
+}
+
+#[cfg(test)]
+mod echo_tests {
+    use super::*;
+
+    #[test]
+    fn private_echoes_use_queries_without_saving_service_credentials() {
+        let source = ChannelId::irc("irc.example", 6697, true, "room");
+        let (query, text) = extract_irc_msg_echo("/msg Alice hello", &source).unwrap();
+        assert_eq!(query.irc_query_nick(), Some("alice"));
+        assert_eq!(text, "hello");
+        let (channel, _) = extract_irc_msg_echo("/privmsg ##room :hello", &source).unwrap();
+        assert!(!channel.is_irc_query());
+        assert_eq!(channel.irc_name(), "##room");
+        for command in ["/msg NickServ IDENTIFY secret", "/msg ChanServ IDENTIFY secret", "/msg alice,bob hello", "/msg :alice hello"] {
+            assert!(extract_irc_msg_echo(command, &source).is_none());
+        }
     }
 }

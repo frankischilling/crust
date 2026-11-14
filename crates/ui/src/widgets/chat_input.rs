@@ -1776,6 +1776,9 @@ fn find_join_channel_matches(
     let mut channels: Vec<String> = known_channels
         .iter()
         .filter_map(|ch| {
+            if ch.is_irc_query() {
+                return None;
+            }
             let t = ch.irc_target()?;
             if t.host != current_target.host
                 || t.port != current_target.port
@@ -3055,5 +3058,13 @@ mod tests {
         let mut s = "abc🙂def".to_owned();
         truncate_to_max_chars(&mut s, 4);
         assert_eq!(s, "abc🙂");
+    }
+
+    #[test]
+    fn join_completion_does_not_offer_private_conversation_targets() {
+        let room = ChannelId::irc("irc.example.test", 6697, true, "rust");
+        let query = ChannelId::irc_query("irc.example.test", 6697, true, "alice");
+        let matches = find_join_channel_matches("/join ", &room, &[room.clone(), query]);
+        assert_eq!(matches, vec!["#rust"]);
     }
 }

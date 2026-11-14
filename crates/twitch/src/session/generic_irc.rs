@@ -11,7 +11,7 @@ use tracing::{debug, error, info, warn};
 
 use crust_core::model::{
     Badge, ChannelId, ChatMessage, MessageFlags, MessageId, MsgKind, Sender, SystemNotice, UserId,
-    IRC_SERVER_CONTROL_CHANNEL,
+    IRC_QUERY_CHANNEL_PREFIX, IRC_SERVER_CONTROL_CHANNEL,
 };
 
 use crate::irc::{parse_line, IrcMessage};
@@ -39,6 +39,10 @@ pub enum GenericIrcEvent {
         attempt: u32,
     },
     ChatMessage(ChatMessage),
+    /// A direct-message tab opened on this server; no channel JOIN is required.
+    PrivateConversationOpened {
+        channel: ChannelId,
+    },
     SystemNotice(SystemNotice),
     /// An IRC server redirected us from one channel to another (e.g. 470).
     ChannelRedirected {
@@ -523,7 +527,7 @@ impl ServerWorker {
         write_irc_line(&mut write_half, &format!("USER {user} 0 * :{realname}")).await?;
 
         for (ch, key) in &self.channels {
-            if ch != IRC_SERVER_CONTROL_CHANNEL {
+            if is_irc_room(ch) {
                 write_join_line(&mut write_half, ch, key.as_deref()).await?;
             }
         }
@@ -539,14 +543,14 @@ impl ServerWorker {
                         Some(ServerCommand::Join { channel, key }) => {
                             let previous = self.channels.insert(channel.clone(), key.clone());
                             if previous.is_none() || previous != Some(key.clone()) {
-                                if channel != IRC_SERVER_CONTROL_CHANNEL {
+                                if is_irc_room(&channel) {
                                     write_join_line(&mut write_half, &channel, key.as_deref()).await?;
                                 }
                             }
                         }
                         Some(ServerCommand::Leave(ch)) => {
                             if self.channels.remove(&ch).is_some() {
-                                if ch != IRC_SERVER_CONTROL_CHANNEL {
+                                if is_irc_room(&ch) {
                                     write_irc_line(&mut write_half, &format!("PART #{ch}")).await?;
                                 }
                                 if self.channels.is_empty() {
@@ -622,10 +626,24 @@ impl ServerWorker {
                             continue;
                         }
 
-                        if msg.command == "NICK" && msg.nick().is_some_and(|nick| nick.eq_ignore_ascii_case(self.active_nick())) {
-                            if let Some(nick) = msg.params.first().and_then(|nick| normalize_irc_nick(nick)) {
-                                self.nick = nick.clone();
-                                self.confirmed_nick = Some(nick);
+                        if msg.command == "NICK" {
+                            if let (Some(old_nick), Some(new_nick)) = (
+                                msg.nick(), msg.params.first().and_then(|nick| normalize_irc_nick(nick)),
+                            ) {
+                                if old_nick.eq_ignore_ascii_case(self.active_nick()) {
+                                    self.nick = new_nick.clone();
+                                    self.confirmed_nick = Some(new_nick);
+                                } else {
+                                    let old_channel = format!("{IRC_QUERY_CHANNEL_PREFIX}{}", old_nick.to_ascii_lowercase());
+                                    let new_channel = format!("{IRC_QUERY_CHANNEL_PREFIX}{}", new_nick.to_ascii_lowercase());
+                                    if old_channel != new_channel && self.channels.remove(&old_channel).is_some() {
+                                        self.channels.entry(new_channel.clone()).or_insert(None);
+                                        self.emit(GenericIrcEvent::ChannelRedirected {
+                                            server_key: (self.key.host.clone(), self.key.port, self.key.tls),
+                                            old_channel, new_channel,
+                                        }).await;
+                                    }
+                                }
                             }
                         }
 
@@ -671,6 +689,9 @@ impl ServerWorker {
 
                         if msg.command == "PRIVMSG" {
                             if let Some(chat) = parse_irc_privmsg(&msg, &self.key, self.active_nick()) {
+                                if let Some(peer) = chat.channel.irc_query_nick() {
+                                    self.open_private_conversation(peer).await;
+                                }
                                 self.emit(GenericIrcEvent::ChatMessage(chat)).await;
                             }
                             continue;
@@ -722,13 +743,24 @@ impl ServerWorker {
         }
     }
 
+    async fn open_private_conversation(&mut self, nick: &str) {
+        let channel = ChannelId::irc_query(&self.key.host, self.key.port, self.key.tls, nick);
+        let target = format!("{IRC_QUERY_CHANNEL_PREFIX}{}", nick.to_ascii_lowercase());
+        if self.channels.insert(target, None).is_none() {
+            self.emit(GenericIrcEvent::PrivateConversationOpened { channel }).await;
+        }
+    }
+
     fn command_context_channel(&self, source_channel: &str) -> Option<String> {
-        if source_channel != IRC_SERVER_CONTROL_CHANNEL {
+        if is_irc_room(source_channel) {
             return Some(source_channel.to_owned());
+        }
+        if source_channel.starts_with(IRC_QUERY_CHANNEL_PREFIX) {
+            return None;
         }
         self.channels
             .keys()
-            .find(|ch| ch.as_str() != IRC_SERVER_CONTROL_CHANNEL)
+            .find(|ch| is_irc_room(ch))
             .cloned()
     }
 
@@ -816,7 +848,8 @@ impl ServerWorker {
             if source_channel != IRC_SERVER_CONTROL_CHANNEL
                 && self.channels.contains_key(source_channel)
             {
-                write_irc_line(writer, &format!("PRIVMSG #{source_channel} :{trimmed}")).await?;
+                let target = irc_message_target(source_channel)?;
+                write_irc_line(writer, &format!("PRIVMSG {target} :{trimmed}")).await?;
             } else {
                 return Err(irc_invalid_input("Join a channel first (/join #channel) before sending messages.").into());
             }
@@ -841,7 +874,8 @@ impl ServerWorker {
                 if rest_raw.is_empty() {
                     return Err(irc_invalid_input("Usage: /me <action>").into());
                 }
-                write_irc_line(writer, &format!("PRIVMSG #{source_channel} :\u{0001}ACTION {rest_raw}\u{0001}")).await?;
+                let target = irc_message_target(source_channel)?;
+                write_irc_line(writer, &format!("PRIVMSG {target} :\u{0001}ACTION {rest_raw}\u{0001}")).await?;
             }
             "raw" => {
                 if rest_raw.is_empty() {
@@ -869,6 +903,11 @@ impl ServerWorker {
                 };
                 let target = normalize_irc_msg_target(target);
                 write_irc_line(writer, &format!("PRIVMSG {target} :{body}")).await?;
+                if !target.eq_ignore_ascii_case("nickserv") {
+                    if let Some(nick) = normalize_irc_nick(&target).filter(|nick| nick.len() == target.len()) {
+                        self.open_private_conversation(&nick).await;
+                    }
+                }
 
                 // When sending IDENTIFY to NickServ with an explicit account
                 // name, automatically attempt to change nick to that account
@@ -927,7 +966,7 @@ impl ServerWorker {
                     .filter(|s| !s.is_empty())
                     .map(str::to_owned);
                 self.channels.insert(channel.clone(), key.clone());
-                if channel != IRC_SERVER_CONTROL_CHANNEL {
+                if is_irc_room(&channel) {
                     write_join_line(writer, &channel, key.as_deref()).await?;
                 }
             }
@@ -942,7 +981,7 @@ impl ServerWorker {
                         .await;
                     return Ok(None);
                 };
-                if channel != IRC_SERVER_CONTROL_CHANNEL {
+                if is_irc_room(&channel) {
                     if let Some(reason) = reason {
                         write_irc_line(writer, &format!("PART #{channel} :{reason}")).await?;
                     } else {
@@ -1403,12 +1442,21 @@ fn parse_irc_privmsg(msg: &IrcMessage, key: &ServerKey, my_nick: &str) -> Option
         return None;
     }
 
-    // Channel targets may be prefixed with status markers (@#chan, +#chan, ...).
-    // If this is not a channel target, treat it as a direct-message target.
-    let target_name = normalize_irc_target_channel(target_raw)
-        .or_else(|| normalize_irc_nick(target_raw))
-        .unwrap_or_else(|| target_raw.to_ascii_lowercase());
-    let channel = ChannelId::irc(&key.host, key.port, key.tls, target_name);
+    // Direct messages belong to the other participant, not to our own nickname.
+    let channel = if let Some(target) = normalize_irc_target_channel(target_raw) {
+        ChannelId::irc(&key.host, key.port, key.tls, target)
+    } else {
+        let sender = msg.nick()?;
+        let peer = if target_raw.eq_ignore_ascii_case(my_nick) {
+            sender
+        } else if sender.eq_ignore_ascii_case(my_nick) {
+            target_raw
+        } else {
+            return None;
+        };
+        let peer = normalize_irc_nick(peer).filter(|nick| nick.len() == peer.len())?;
+        ChannelId::irc_query(&key.host, key.port, key.tls, peer)
+    };
     let raw_text = msg.params.get(1)?;
 
     let (text, is_action) = if raw_text.starts_with("\x01ACTION ") && raw_text.ends_with('\x01') {
@@ -1479,6 +1527,19 @@ fn parse_irc_privmsg(msg: &IrcMessage, key: &ServerKey, my_nick: &str) -> Option
         msg_kind: MsgKind::Chat,
         shared: None,
     })
+}
+
+fn is_irc_room(channel: &str) -> bool {
+    channel != IRC_SERVER_CONTROL_CHANNEL && !channel.starts_with(IRC_QUERY_CHANNEL_PREFIX)
+}
+
+fn irc_message_target(channel: &str) -> std::io::Result<String> {
+    if let Some(peer) = channel.strip_prefix(IRC_QUERY_CHANNEL_PREFIX) {
+        normalize_irc_nick(peer).filter(|nick| nick.len() == peer.len())
+            .ok_or_else(|| irc_invalid_input("The private-message recipient is invalid."))
+    } else {
+        Ok(format!("#{channel}"))
+    }
 }
 
 fn normalize_irc_channel_name(raw: &str) -> Option<String> {
@@ -1805,6 +1866,115 @@ mod tests {
             events, command_rx, "alice".into(), String::new(), String::new(),
         );
         (worker, commands, receiver)
+    }
+
+    #[test]
+    fn private_messages_route_to_the_other_participant_and_keep_rooms_separate() {
+        let key = ServerKey { host: "example.com".into(), port: 6697, tls: true };
+        let incoming = parse_line(":Bob!user@host PRIVMSG ALICE :hello").unwrap();
+        let received = parse_irc_privmsg(&incoming, &key, "alice").unwrap();
+        let query = ChannelId::irc_query("example.com", 6697, true, "bob");
+        assert_eq!(received.channel, query);
+        assert!(!received.flags.is_self);
+
+        let outgoing = parse_line(":ALICE!user@host PRIVMSG Bob :hello back").unwrap();
+        let echoed = parse_irc_privmsg(&outgoing, &key, "alice").unwrap();
+        assert_eq!(echoed.channel, query);
+        assert!(echoed.flags.is_self);
+
+        let room = parse_line(":Bob!user@host PRIVMSG @#bob :channel message").unwrap();
+        let room_message = parse_irc_privmsg(&room, &key, "alice").unwrap();
+        assert_eq!(room_message.channel, ChannelId::irc("example.com", 6697, true, "bob"));
+        assert_ne!(room_message.channel, query);
+
+        let unrelated = parse_line(":Bob!user@host PRIVMSG carol :not ours").unwrap();
+        assert!(parse_irc_privmsg(&unrelated, &key, "alice").is_none());
+    }
+
+    async fn read_test_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> String {
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(3), reader.read_line(&mut line))
+            .await.expect("IRC server did not receive a line").unwrap();
+        line
+    }
+
+    #[tokio::test]
+    async fn private_conversations_reply_without_joining_or_parting_a_room() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (mut worker, commands, mut events) = worker(port, false);
+        worker.channels.insert(format!("{IRC_QUERY_CHANNEL_PREFIX}saved"), None);
+        let task = tokio::spawn(async move { worker.connect_once().await });
+        let (peer, _) = listener.accept().await.unwrap();
+        let (read, mut write) = tokio::io::split(peer);
+        let mut reader = BufReader::new(read);
+        assert_eq!(read_test_line(&mut reader).await, "NICK alice\r\n");
+        assert_eq!(read_test_line(&mut reader).await, "USER alice 0 * :alice\r\n");
+        assert_eq!(read_test_line(&mut reader).await, "JOIN #room\r\n");
+        write.write_all(b":server 001 alice :Welcome\r\nPING :ready\r\n:Bob!user@host PRIVMSG ALICE :hello\r\n").await.unwrap();
+        assert_eq!(read_test_line(&mut reader).await, "PONG :ready\r\n");
+        assert!(matches!(events.recv().await, Some(GenericIrcEvent::Connected { .. })));
+        let query = ChannelId::irc_query("127.0.0.1", port, false, "bob");
+        assert!(matches!(events.recv().await, Some(GenericIrcEvent::PrivateConversationOpened { channel }) if channel == query));
+        assert!(matches!(events.recv().await, Some(GenericIrcEvent::ChatMessage(message)) if message.channel == query && message.raw_text == "hello"));
+
+        for (text, wire) in [
+            ("hello back", "PRIVMSG bob :hello back\r\n"),
+            ("/me waves", "PRIVMSG bob :\u{0001}ACTION waves\u{0001}\r\n"),
+        ] {
+            let (receipt, result) = oneshot::channel();
+            commands.send(ServerCommand::Send {
+                channel: query.irc_target().unwrap().channel, text: text.into(), receipt,
+            }).await.unwrap();
+            assert_eq!(read_test_line(&mut reader).await, wire);
+            assert_eq!(result.await.unwrap().unwrap(), "alice");
+        }
+
+        write.write_all(b":Bob!user@host NICK :Robert\r\n").await.unwrap();
+        assert!(matches!(events.recv().await, Some(GenericIrcEvent::ChannelRedirected { old_channel, new_channel, .. })
+            if old_channel == format!("{IRC_QUERY_CHANNEL_PREFIX}bob")
+                && new_channel == format!("{IRC_QUERY_CHANNEL_PREFIX}robert")));
+        let (receipt, result) = oneshot::channel();
+        commands.send(ServerCommand::Send {
+            channel: format!("{IRC_QUERY_CHANNEL_PREFIX}robert"), text: "new nickname".into(), receipt,
+        }).await.unwrap();
+        assert_eq!(read_test_line(&mut reader).await, "PRIVMSG robert :new nickname\r\n");
+        assert!(result.await.unwrap().is_ok());
+
+        for peer in ["saved", "robert"] {
+            commands.send(ServerCommand::Leave(format!("{IRC_QUERY_CHANNEL_PREFIX}{peer}"))).await.unwrap();
+        }
+        let (receipt, result) = oneshot::channel();
+        commands.send(ServerCommand::Send {
+            channel: "room".into(), text: "PING :after-query-close".into(), receipt,
+        }).await.unwrap();
+        assert_eq!(read_test_line(&mut reader).await, "PING :after-query-close\r\n");
+        assert!(result.await.unwrap().is_ok());
+        commands.send(ServerCommand::Shutdown).await.unwrap();
+        assert!(matches!(tokio::time::timeout(Duration::from_secs(3), task).await.unwrap().unwrap(), Ok(WorkerExit::Shutdown)));
+    }
+
+    #[tokio::test]
+    async fn private_msg_commands_open_a_query_only_after_a_successful_write() {
+        let (mut worker, _commands, mut events) = worker(1, false);
+        worker.registered = true;
+        worker.confirmed_nick = Some("alice".into());
+        let mut wire = Vec::new();
+        let (receipt, result) = oneshot::channel();
+        worker.send_with_receipt(&mut wire, "room", "/msg Bob :hello", receipt).await.unwrap();
+        assert_eq!(wire, b"PRIVMSG Bob :hello\r\n");
+        assert!(result.await.unwrap().is_ok());
+        assert!(matches!(events.recv().await, Some(GenericIrcEvent::PrivateConversationOpened { channel })
+            if channel.irc_query_nick() == Some("bob")));
+        assert_eq!(worker.command_context_channel(&format!("{IRC_QUERY_CHANNEL_PREFIX}bob")), None);
+
+        let (mut broken, peer) = tokio::io::duplex(1);
+        drop(peer);
+        let (receipt, result) = oneshot::channel();
+        assert!(worker.send_with_receipt(&mut broken, "room", "/msg Carol hello", receipt).await.is_err());
+        assert!(result.await.unwrap().is_err());
+        assert!(!worker.channels.contains_key(&format!("{IRC_QUERY_CHANNEL_PREFIX}carol")));
+        assert!(events.try_recv().is_err());
     }
 
     #[tokio::test]
