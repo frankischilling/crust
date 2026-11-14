@@ -1,4 +1,4 @@
-//! `crust-webview` - sidecar binary owning the embedded WebView2.
+//! `crust-webview` - sidecar binary owning the embedded system WebView.
 //!
 //! Runs in its own process, spawned by the main `crust.exe`. Reads JSON-
 //! line [`crust_webview::HostCommand`]s from stdin, writes JSON-line
@@ -14,15 +14,19 @@
 //!
 //! ```text
 //! crust-webview.exe <data-directory>
+//! crust-webview.exe --smoke-test <temporary-data-directory>
 //! ```
 //!
-//! The `<data-directory>` arg is the persistent WebView2 user-data dir
+//! The `<data-directory>` arg is the persistent WebView user-data dir
 //! (cookies, IndexedDB, cache). The parent creates it beforehand.
+//! The smoke test loads local HTML and exits after a JavaScript IPC reply.
 
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::mpsc as std_mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crust_webview::protocol::{
     decode_command, encode_event, HostCommand, HostEvent, LoginStateWire,
@@ -40,6 +44,39 @@ use wry::{WebContext, WebViewBuilder};
 /// user-visible latency of bonus-click to a known bound.
 const TICK_PERIOD: Duration = Duration::from_secs(30);
 
+const SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(20);
+const SMOKE_TEST_READY: &str = "crust-webview-smoke-ready";
+const SMOKE_TEST_HTML: &str = r#"<!doctype html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'">
+<title>Crust WebView smoke test</title></head><body>
+<script>window.ipc.postMessage("crust-webview-smoke-ready");</script>
+</body></html>"#;
+
+#[derive(Debug, PartialEq, Eq)]
+struct StartupOptions {
+    data_dir: PathBuf,
+    smoke_test: bool,
+}
+
+impl StartupOptions {
+    fn parse(mut args: impl Iterator<Item = OsString>) -> Option<Self> {
+        let first = args.next()?;
+        let smoke_test = first == "--smoke-test";
+        let data_dir = if smoke_test { args.next()? } else { first };
+        if data_dir.is_empty()
+            || data_dir.to_string_lossy().starts_with("--")
+            || args.next().is_some()
+        {
+            return None;
+        }
+        Some(Self {
+            data_dir: data_dir.into(),
+            smoke_test,
+        })
+    }
+}
+
 /// Internal user-event payload routed through the tao event loop.
 ///
 /// wry / tao require all window + webview API calls to happen on the
@@ -56,9 +93,11 @@ enum UserEvent {
     LoginChanged(LoginState),
     /// Stdin closed (parent exited or dropped us). Triggers graceful exit.
     StdinEof,
+    /// The offline smoke-test page executed JavaScript and reached the host.
+    SmokeTestReady,
 }
 
-fn main() {
+fn main() -> ExitCode {
     // Must be set BEFORE WebView2 initialises (which happens when the
     // first `WebViewBuilder::build` runs). These flags pass straight
     // through to the underlying Chromium/Edge process:
@@ -84,23 +123,27 @@ fn main() {
         .with_max_level(tracing::Level::INFO)
         .try_init();
 
-    let data_dir = std::env::args().nth(1).map(PathBuf::from);
-    let Some(data_dir) = data_dir else {
-        eprintln!("usage: crust-webview <data-directory>");
-        std::process::exit(2);
+    let Some(StartupOptions {
+        data_dir,
+        smoke_test,
+    }) = StartupOptions::parse(std::env::args_os().skip(1))
+    else {
+        eprintln!("usage: crust-webview [--smoke-test] <data-directory>");
+        return ExitCode::from(2);
     };
     if let Err(e) = std::fs::create_dir_all(&data_dir) {
-        warn!("failed to create data dir {data_dir:?}: {e}");
+        return startup_error("data_dir.create", e);
     }
 
     info!("crust-webview host starting; data_dir={data_dir:?}");
+    let mut smoke_deadline = smoke_test.then(|| Instant::now() + SMOKE_TEST_TIMEOUT);
 
     // tao EventLoop on the main thread - that's where we are.
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
     // Stdin reader: parse commands and forward via proxy.
-    {
+    if !smoke_test {
         let proxy = proxy.clone();
         std::thread::Builder::new()
             .name("crust-webview-stdin".into())
@@ -111,7 +154,7 @@ fn main() {
     // Tick timer: fire UserEvent::Tick every TICK_PERIOD, with a fast
     // first tick so login detection + first-navigation don't have to
     // wait the full 30 s after startup.
-    {
+    if !smoke_test {
         let proxy = proxy.clone();
         std::thread::Builder::new()
             .name("crust-webview-tick".into())
@@ -160,14 +203,7 @@ fn main() {
         .build(&event_loop)
     {
         Ok(w) => w,
-        Err(e) => {
-            emit(&HostEvent::ScriptError {
-                location: "window.build".into(),
-                message: format!("{e}"),
-            });
-            emit(&HostEvent::Exited);
-            return;
-        }
+        Err(e) => return startup_error("window.build", e),
     };
 
     let mut web_context = WebContext::new(Some(data_dir));
@@ -182,29 +218,37 @@ fn main() {
     // Additionally, `MUTE_BOOTSTRAP` is injected on every navigation as
     // defense-in-depth. If Twitch ever redirects us to a page with media
     // elements, they'll come up muted.
-    let webview = match WebViewBuilder::new_with_web_context(&mut web_context)
-        .with_url("https://www.twitch.tv/popout/twitch/chat")
+    let builder = WebViewBuilder::new_with_web_context(&mut web_context)
         .with_initialization_script(crust_webview::js::MUTE_BOOTSTRAP)
-        .with_ipc_handler(move |req| handle_ipc(req.body().as_str(), &ipc_event_tx_for_handler))
-        .build(&window)
-    {
-        Ok(wv) => wv,
-        Err(e) => {
-            emit(&HostEvent::ScriptError {
-                location: "webview.build".into(),
-                message: format!("{e}"),
-            });
-            emit(&HostEvent::Exited);
-            return;
-        }
+        .with_ipc_handler(move |req| {
+            handle_ipc(req.body().as_str(), &ipc_event_tx_for_handler, smoke_test)
+        });
+    let builder = if smoke_test {
+        builder.with_html(SMOKE_TEST_HTML)
+    } else {
+        builder.with_url("https://www.twitch.tv/popout/twitch/chat")
     };
+    let webview = match build_webview(builder, &window) {
+        Ok(wv) => wv,
+        Err(e) => return startup_error("webview.build", e),
+    };
+    info!("crust-webview host initialized");
 
     let mut state = WebviewState::new();
     let mut last_login = LoginState::Unknown;
     let mut enabled = true;
 
     event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
+        *control_flow = if let Some(deadline) = smoke_deadline {
+            if Instant::now() >= deadline {
+                warn!("crust-webview smoke test timed out waiting for JavaScript IPC");
+                *control_flow = ControlFlow::ExitWithCode(1);
+                return;
+            }
+            ControlFlow::WaitUntil(deadline)
+        } else {
+            ControlFlow::Wait
+        };
         match event {
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
@@ -214,7 +258,14 @@ fn main() {
                 window.set_visible(false);
             }
             Event::UserEvent(UserEvent::Command(cmd)) => {
-                handle_command(cmd, &mut state, &mut enabled, &window, &webview, control_flow);
+                handle_command(
+                    cmd,
+                    &mut state,
+                    &mut enabled,
+                    &window,
+                    &webview,
+                    control_flow,
+                );
             }
             Event::UserEvent(UserEvent::Tick) => {
                 // LOGIN_PROBE runs unconditionally so the UI's signed-in
@@ -266,9 +317,57 @@ fn main() {
                 info!("crust-webview: stdin closed; shutting down");
                 *control_flow = ControlFlow::Exit;
             }
+            Event::UserEvent(UserEvent::SmokeTestReady) if smoke_test => {
+                smoke_deadline = None;
+                info!("crust-webview smoke test passed: JavaScript IPC received");
+                *control_flow = ControlFlow::Exit;
+            }
             _ => {}
         }
+    })
+}
+
+fn startup_error(location: &str, error: impl std::fmt::Display) -> ExitCode {
+    emit(&HostEvent::ScriptError {
+        location: location.into(),
+        message: error.to_string(),
     });
+    emit(&HostEvent::Exited);
+    ExitCode::FAILURE
+}
+
+fn build_webview<'a>(
+    builder: WebViewBuilder<'a>,
+    window: &'a tao::window::Window,
+) -> wry::Result<wry::WebView> {
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+    ))]
+    {
+        use tao::platform::unix::WindowExtUnix;
+        use wry::WebViewBuilderExtUnix;
+
+        // Tao owns the GTK event loop and container on both X11 and Wayland.
+        // Wry's raw-handle build path requires its separate X11 feature.
+        let container = window
+            .default_vbox()
+            .ok_or_else(|| std::io::Error::other("the host window has no default GTK container"))?;
+        builder.build_gtk(container)
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+    )))]
+    {
+        builder.build(window)
+    }
 }
 
 fn handle_command(
@@ -338,7 +437,13 @@ fn stdin_reader(proxy: tao::event_loop::EventLoopProxy<UserEvent>) {
     let _ = proxy.send_event(UserEvent::StdinEof);
 }
 
-fn handle_ipc(body: &str, forward: &std_mpsc::Sender<UserEvent>) {
+fn handle_ipc(body: &str, forward: &std_mpsc::Sender<UserEvent>, smoke_test: bool) {
+    if smoke_test {
+        if body == SMOKE_TEST_READY {
+            let _ = forward.send(UserEvent::SmokeTestReady);
+        }
+        return;
+    }
     match crust_webview::IncomingMessage::parse(body) {
         Ok(crust_webview::IncomingMessage::Login { logged_in }) => {
             let state = if logged_in {
@@ -374,4 +479,68 @@ fn emit(evt: &HostEvent) {
         return;
     }
     let _ = handle.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options(args: &[&str]) -> Option<StartupOptions> {
+        StartupOptions::parse(args.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn parent_arguments_keep_normal_startup() {
+        assert_eq!(
+            options(&["profile dir"]),
+            Some(StartupOptions {
+                data_dir: "profile dir".into(),
+                smoke_test: false,
+            })
+        );
+    }
+
+    #[test]
+    fn smoke_test_requires_an_explicit_profile_directory() {
+        assert_eq!(
+            options(&["--smoke-test", "temporary profile"]),
+            Some(StartupOptions {
+                data_dir: "temporary profile".into(),
+                smoke_test: true,
+            })
+        );
+        for args in [
+            vec![],
+            vec!["--smoke-test"],
+            vec!["--smoke-test", ""],
+            vec!["--smoke-test", "--unknown"],
+            vec!["--unknown", "profile"],
+            vec!["profile", "extra"],
+            vec!["--smoke-test", "profile", "extra"],
+        ] {
+            assert_eq!(options(&args), None, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn smoke_test_ipc_requires_the_local_page_reply() {
+        let (sender, receiver) = std_mpsc::channel();
+        handle_ipc(r#"{"kind":"login","logged_in":true}"#, &sender, true);
+        handle_ipc("unexpected reply", &sender, true);
+        assert!(receiver.try_recv().is_err());
+        handle_ipc(SMOKE_TEST_READY, &sender, true);
+        assert!(matches!(receiver.try_recv(), Ok(UserEvent::SmokeTestReady)));
+    }
+
+    #[test]
+    fn normal_ipc_does_not_accept_smoke_test_success() {
+        let (sender, receiver) = std_mpsc::channel();
+        handle_ipc(SMOKE_TEST_READY, &sender, false);
+        assert!(receiver.try_recv().is_err());
+        handle_ipc(r#"{"kind":"login","logged_in":true}"#, &sender, false);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(UserEvent::LoginChanged(LoginState::LoggedIn))
+        ));
+    }
 }

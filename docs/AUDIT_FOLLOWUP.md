@@ -126,10 +126,14 @@ Checksums refer to filenames rather than build-machine paths.
 
 The Linux workflow runs release-profile workspace tests and correctness lints,
 builds a Debian package, and checks desktop startup under a virtual X11 display.
+The webview sidecar now attaches to the window's GTK container on Linux; its
+previous raw-window path returned an unsupported-handle error. An offline check
+loads a local page and waits for its JavaScript response. The desktop startup
+check also requires successful webview initialization and rejects build errors.
 Windows verification uses the workspace tests and an offline native UI fixture.
 The fixture runs the production widgets with synthetic messages and images.
 
-The final Windows workspace run passed 905 tests, with 11 benchmark and soak
+The full Windows workspace run passed 909 tests, with 11 benchmark and soak
 tests ignored by the normal run. The two isolated comparisons above ran
 separately. Clippy passed with correctness errors enabled; existing large-enum,
 large-error, and Windows-unused Linux-helper warnings remain. Native screenshots were inspected for chat, the picker, and detached

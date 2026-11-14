@@ -53,6 +53,9 @@ runtime image cache, and adds Linux build and package checks.
 - Generic IRC has bounded input lines, registration and write deadlines, and
   cancellable reconnect waits. Nick collisions and channel redirects update the
   connection's actual state.
+- Fixed a Linux initialization failure that prevented the embedded sign-in
+  window from opening. An offline startup check now verifies communication
+  between the webview's JavaScript and its host process.
 - Windows packaging stops on build errors. Debian packaging derives ABI
   requirements from both binaries and includes the dynamically loaded X11
   keyboard library. Both packages include portable SHA256 checksum files.

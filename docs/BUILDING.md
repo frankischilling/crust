@@ -72,8 +72,10 @@ WebKitGTK 4.1, and the X11 keyboard library loaded at runtime. Build on the olde
 distribution you intend to support.
 
 The Linux workflow uses Ubuntu 24.04. It runs workspace tests and correctness
-lints before packaging and checks startup under a virtual X11 display. It keeps
-the package and checksum as a workflow artifact for seven days.
+lints before packaging. Under a virtual X11 display, it checks the webview with
+a local page and JavaScript response, then checks desktop startup and webview
+initialization. It keeps the package and checksum as a workflow artifact for
+seven days.
 
 ### Running on WSL
 

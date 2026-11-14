@@ -51,15 +51,41 @@ jobs:
         run: cargo clippy --workspace --all-targets --release --locked -- -A clippy::style -A clippy::complexity -D clippy::correctness
       - name: Build the Debian package
         run: bash scripts/build_debian_release.sh
+      - name: Check embedded webview under X11
+        env:
+          LIBGL_ALWAYS_SOFTWARE: 'true'
+        run: |
+          profile_dir="$(mktemp -d)"
+          trap 'rm -rf -- "$profile_dir"' EXIT
+          status=0
+          timeout 30s xvfb-run --auto-servernum target/release/crust-webview --smoke-test "$profile_dir" > /tmp/crust-webview-smoke.log 2>&1 || status=$?
+          cat /tmp/crust-webview-smoke.log
+          if [ "$status" -ne 0 ]; then
+            echo "The embedded webview check failed (status $status)"
+            exit 1
+          fi
+          if ! grep -Fq 'crust-webview smoke test passed: JavaScript IPC received' /tmp/crust-webview-smoke.log; then
+            echo "The embedded webview did not report a JavaScript response"
+            exit 1
+          fi
       - name: Check desktop startup under X11
         env:
           LIBGL_ALWAYS_SOFTWARE: 'true'
+          RUST_LOG: info
         run: |
           status=0
           timeout 15s xvfb-run --auto-servernum target/release/crust > /tmp/crust-startup.log 2>&1 || status=$?
           cat /tmp/crust-startup.log
           if [ "$status" -ne 124 ]; then
             echo "Crust exited before the startup check finished (status $status)"
+            exit 1
+          fi
+          if ! grep -Fq 'crust-webview host initialized' /tmp/crust-startup.log; then
+            echo "The embedded webview did not initialize"
+            exit 1
+          fi
+          if grep -Eq 'webview: script error \[(window|webview)\.build\]' /tmp/crust-startup.log; then
+            echo "The embedded webview reported an initialization failure"
             exit 1
           fi
       - name: Upload the tested package
