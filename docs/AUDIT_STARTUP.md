@@ -85,6 +85,34 @@ and catalog refreshes retokenize each thread with its original sender IDs.
 Observed senders share the existing bounded lookup queue. Missing IDs and old
 login placeholders stay unidentified.
 
+## Live channel emotes
+
+Joined Twitch channels receive BTTV and 7TV set changes over provider sockets.
+The 7TV path also supports joined Kick channels. Additions, renames, and removals
+update the channel catalog used by the picker, autocomplete, and message
+refreshes without downloading images for hidden entries. Changing a channel's
+active 7TV set replaces only that provider's definitions.
+
+Each provider has one socket worker, with up to 64 joined channels and at most
+four metadata requests in flight. The 7TV service's subscription limit can
+reduce the number of watched channels. Desired subscriptions replace the
+previous list. Room lifetimes, provider binding generations, and socket epochs
+reject old work. A binding change starts a new socket connection so buffered
+updates and acknowledgments from the old subscription cannot enter the
+replacement set.
+
+7TV reconnects subscribe first, wait for acknowledgments, then fetch a fresh
+snapshot and replay changes received during that request. BTTV's public snapshot
+endpoint is cached. Edits received while connected apply immediately. Observed
+edits survive cached snapshots for 30 minutes; an offline change that contradicts
+one of those observations may not appear until that window expires and the next
+five-minute refresh runs. Later snapshots can then replace old observations,
+including removals and re-adds that happened offline. Failed snapshots retry
+after 30 seconds.
+
+Global sets and personal 7TV sets keep their existing refresh paths. This change
+does not add live subscriptions for those scopes or an FFZ event feed.
+
 ## Username paints
 
 The provider's selected paint now reaches the renderer, including gradients,
@@ -147,11 +175,17 @@ tokenization tests cover Unicode text and malformed native-emote ranges.
 Headless UI tests exercise the production widgets with keyboard, pointer, wheel,
 and resize input, including chat input while startup is active.
 
-An earlier workspace gate passed 1,000 tests, with 11 ignored. The latest app and
-UI gate passed 208 app tests and 300 UI tests, with one ignored. Correctness
-Clippy checks passed. Native captures confirmed that the search title, actions,
-and fields fit at wide, narrow, and enlarged-text sizes. Live provider updates
-still need integration; the final workspace and release checks follow that work.
+The combined workspace gate passed 1,038 tests, with 11 ignored and no failures.
+Correctness Clippy checks passed. Loopback WebSocket and HTTP tests cover provider
+subscription acknowledgments, delayed snapshots, live removals, active-set
+changes, and fresh subscriptions after reconnect. Reconciliation tests cover
+offline edits, repeated events, overflow, and obsolete room or set lifetimes.
 
-Channel-specific follower inventory and live provider updates remain tracked in
+Offline native captures confirmed that chat, settings, and search controls fit
+at wide, narrow, and enlarged-text sizes. The saved-account desktop run, Windows
+packaging, and final Linux checks are still in progress. Follow
+[PR #16](https://github.com/frankischilling/crust/pull/16) for those results.
+
+Channel-specific follower inventory and live updates for the remaining emote
+scopes remain tracked in
 [issue #9](https://github.com/frankischilling/crust/issues/9).

@@ -58,6 +58,7 @@ use runtime::history::{
     load_recent_messages, WhisperAccount, WhisperHistory,
 };
 use runtime::link_preview::fetch_link_preview;
+use runtime::live_emotes::LiveEmoteUpdates;
 use runtime::outgoing::{chat_echo_body, complete_whisper_send, twitch_message_error, ChatSendPublisher, OutgoingChat};
 use runtime::plugins::init_plugins;
 use runtime::profiles::{
@@ -747,6 +748,7 @@ async fn reducer_loop(
     // Limit concurrent 7TV user-style lookups to avoid overwhelming the API.
     let stv_lookup_sem = Arc::new(tokio::sync::Semaphore::new(20));
     let mut personal_catalog_dirty = false;
+    let (live_emotes, mut live_emote_updates) = LiveEmoteUpdates::spawn(emote_index.clone());
     let mut personal_catalog_tick = tokio::time::interval(Duration::from_millis(250));
     personal_catalog_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -1224,6 +1226,7 @@ async fn reducer_loop(
 
     loop {
         tokio::select! {
+            Some(()) = live_emote_updates.recv() => { personal_catalog_dirty = true; }
             () = badge_requests.complete_next(), if badge_requests.has_pending() => {}
             changed = twitch_inventory.complete_next(&emote_index), if twitch_inventory.has_pending() => {
                 if changed { send_emote_catalog(&emote_index, &evt_tx).await; }
@@ -3105,8 +3108,9 @@ async fn reducer_loop(
                 }
             }
 
-            // Coalesce personal-set arrivals before rebuilding the shared UI catalog.
+            // Coalesce live channel and personal-set changes before publishing the catalog.
             _ = personal_catalog_tick.tick() => {
+                live_emotes.sync(&emote_index);
                 drain_7tv_user_lookups(&emote_index, &stv_http_client, &stv_lookup_sem, &stv_update_tx);
                 personal_catalog_dirty |= twitch_inventory.sync(auth_user_id.as_deref(),
                     helix_client_id.as_deref(), &settings.oauth_token, &auth_scopes, &emote_index);

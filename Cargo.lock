@@ -1060,6 +1060,7 @@ dependencies = [
  "sha2",
  "smallvec",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
  "url",

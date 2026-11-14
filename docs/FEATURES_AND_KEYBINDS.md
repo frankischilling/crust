@@ -104,9 +104,13 @@ commands. Kick and generic IRC support remain beta features.
   - favorites menus that stay open while the pointer moves from an emote to an action
 - Emote image caching in memory and on disk
 - Images load as they become visible; provider catalogs become available independently
+- Live channel-set additions, renames, and removals from BTTV and 7TV on Twitch,
+  with 7TV channel-set updates also available on Kick
+- Active 7TV channel-set changes and reconnect reconciliation, with stale
+  subscription and snapshot checks
 
-Chat works without `user:read:emotes`. Follower emotes that require a channel
-query and live provider updates remain follow-up work in
+Chat works without `user:read:emotes`. Twitch follower emotes that require a
+channel query and live updates for global and personal sets remain follow-ups in
 [issue #9](https://github.com/frankischilling/crust/issues/9).
 
 ### Whispers

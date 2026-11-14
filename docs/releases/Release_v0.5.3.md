@@ -1,7 +1,8 @@
 # Crust v0.5.3
 
 This patch keeps chat usable during startup, reduces image downloads for hidden
-content, separates saved whispers by account, and fixes chat navigation and focus.
+content, and adds live channel-emote updates. It also separates saved whispers
+by account and fixes chat navigation and focus.
 
 ## Startup and images
 
@@ -24,6 +25,10 @@ content, separates saved whispers by account, and fixes chat navigation and focu
 - Badge-cache saves no longer block the chat event loop.
 - Selected 7TV username paints reach chat and recent mentions. Removing a paint
   clears it, while failed or obsolete responses preserve the current style.
+- Joined Twitch channels receive live BTTV and 7TV additions, renames, and
+  removals. 7TV also supports joined Kick channels and active-set changes.
+  Reconnect snapshots preserve updates received during loading, and obsolete
+  subscriptions cannot replace the current set.
 
 ## Private messages and connections
 
@@ -72,5 +77,9 @@ content, separates saved whispers by account, and fixes chat navigation and focu
 - Expired-token guidance points to the account button in the top bar and
   Add Account.
 
-Channel-specific follower emotes and live provider updates remain tracked in
+BTTV's cached snapshot service can delay updates missed while disconnected.
+Global and personal sets retain their existing refresh paths.
+
+Channel-specific Twitch follower emotes and live updates for global and personal
+sets remain follow-ups in
 [issue #9](https://github.com/frankischilling/crust/issues/9).

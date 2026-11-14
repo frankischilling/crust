@@ -8,9 +8,58 @@ use crust_emotes::{
 use futures_util::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use tokio::sync::mpsc;
 
+use super::live_emotes::{LiveBinding, LiveSource, Provider};
 use crate::seventv::{load_7tv_user_for_twitch, SevenTvCosmeticUpdate};
 
 type ProviderLoad<'a> = BoxFuture<'a, (&'static str, Option<Vec<EmoteInfo>>)>;
+type ChannelProviderLoad<'a> = BoxFuture<'a, ChannelProviderResult>;
+
+struct ChannelProviderResult {
+    provider: &'static str,
+    emotes: Option<Vec<EmoteInfo>>,
+    source: Option<LiveSource>,
+    expected_source: Option<LiveBinding>,
+}
+
+impl From<(&'static str, Option<Vec<EmoteInfo>>)> for ChannelProviderResult {
+    fn from((provider, emotes): (&'static str, Option<Vec<EmoteInfo>>)) -> Self {
+        Self {
+            provider,
+            emotes,
+            source: None,
+            expected_source: None,
+        }
+    }
+}
+
+async fn load_seven_tv_channel(
+    provider: &SevenTvProvider,
+    platform: &str,
+    room_id: &str,
+    expected_source: Option<LiveBinding>,
+) -> ChannelProviderResult {
+    match provider.load_channel_state(platform, room_id).await {
+        Some(state) => ChannelProviderResult {
+            provider: "7tv",
+            emotes: Some(state.emotes),
+            source: Some(LiveSource {
+                provider: Provider::SevenTv,
+                platform: platform.into(),
+                room_id: room_id.into(),
+                user_id: state.user_id,
+                set_id: state.set_id,
+                connection_index: state.connection_index,
+            }),
+            expected_source,
+        },
+        None => ChannelProviderResult {
+            provider: "7tv",
+            emotes: None,
+            source: None,
+            expected_source,
+        },
+    }
+}
 
 /// Publish built-in globals immediately and load remote provider sets in the background.
 pub(crate) async fn load_global_emotes(index: &crate::EmoteIndex, evt_tx: &mpsc::Sender<AppEvent>) {
@@ -123,10 +172,33 @@ pub(crate) async fn load_channel_emotes(
     let bttv = BttvProvider::new();
     let ffz = FfzProvider::new();
     let seven_tv = SevenTvProvider::new();
-    let providers: FuturesUnordered<ProviderLoad<'_>> = [
-        async { ("bttv", bttv.load_channel(room_id).await) }.boxed(),
-        async { ("ffz", ffz.load_channel(room_id).await) }.boxed(),
-        async { ("7tv", seven_tv.load_channel(room_id).await) }.boxed(),
+    let bttv_source = index
+        .read()
+        .unwrap()
+        .live_binding(channel, generation, "bttv");
+    let seven_tv_source = index
+        .read()
+        .unwrap()
+        .live_binding(channel, generation, "7tv");
+    let providers: FuturesUnordered<ChannelProviderLoad<'_>> = [
+        async {
+            ChannelProviderResult {
+                provider: "bttv",
+                emotes: bttv.load_channel(room_id).await,
+                source: Some(LiveSource {
+                    provider: Provider::Bttv,
+                    platform: "TWITCH".into(),
+                    room_id: room_id.into(),
+                    user_id: None,
+                    set_id: None,
+                    connection_index: None,
+                }),
+                expected_source: bttv_source,
+            }
+        }
+        .boxed(),
+        async { ChannelProviderResult::from(("ffz", ffz.load_channel(room_id).await)) }.boxed(),
+        load_seven_tv_channel(&seven_tv, "TWITCH", room_id, seven_tv_source).boxed(),
     ]
     .into_iter()
     .collect();
@@ -142,15 +214,22 @@ pub(crate) async fn load_kick_channel_emotes(
 ) {
     let kick = KickProvider::new();
     let seven_tv = SevenTvProvider::new();
-    let providers: FuturesUnordered<ProviderLoad<'_>> = [
-        async { ("kick", kick.load_channel(channel.display_name()).await) }.boxed(),
+    let seven_tv_source = index
+        .read()
+        .unwrap()
+        .live_binding(channel, generation, "7tv");
+    let room_id = kick_user_id.to_string();
+    let providers: FuturesUnordered<ChannelProviderLoad<'_>> = [
         async {
-            let emotes = if kick_user_id == 0 {
-                Some(Vec::new())
+            ChannelProviderResult::from(("kick", kick.load_channel(channel.display_name()).await))
+        }
+        .boxed(),
+        async {
+            if kick_user_id == 0 {
+                ChannelProviderResult::from(("7tv", Some(Vec::new())))
             } else {
-                seven_tv.load_kick_channel(&kick_user_id.to_string()).await
-            };
-            ("7tv", emotes)
+                load_seven_tv_channel(&seven_tv, "KICK", &room_id, seven_tv_source).await
+            }
         }
         .boxed(),
     ]
@@ -159,22 +238,35 @@ pub(crate) async fn load_kick_channel_emotes(
     publish_channel_loads(channel, generation, providers, index, evt_tx).await;
 }
 
-async fn publish_channel_loads(
+async fn publish_channel_loads<F, R>(
     channel: &ChannelId,
     generation: u64,
-    mut providers: FuturesUnordered<ProviderLoad<'_>>,
+    mut providers: FuturesUnordered<F>,
     index: &crate::EmoteIndex,
     evt_tx: &mpsc::Sender<AppEvent>,
-) {
+) where
+    F: std::future::Future<Output = R>,
+    R: Into<ChannelProviderResult>,
+{
     // Each completed provider becomes available immediately. A slow response
     // cannot hold the other catalogs back, and images load when a widget uses them.
-    while let Some((provider, emotes)) = providers.next().await {
+    while let Some(result) = providers.next().await {
+        let ChannelProviderResult {
+            provider,
+            emotes,
+            source,
+            expected_source,
+        } = result.into();
         let succeeded = emotes.is_some();
         if evt_tx.is_closed()
-            || !index
-                .write()
-                .unwrap()
-                .replace_channel(channel, generation, provider, emotes)
+            || !index.write().unwrap().replace_channel_with_source(
+                channel,
+                generation,
+                provider,
+                emotes,
+                source,
+                expected_source,
+            )
         {
             return;
         }
@@ -428,7 +520,7 @@ mod tests {
         let mut publish = Box::pin(publish_channel_loads(
             &channel,
             generation,
-            FuturesUnordered::new(),
+            FuturesUnordered::<ChannelProviderLoad<'static>>::new(),
             &index,
             &events,
         ));

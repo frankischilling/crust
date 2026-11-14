@@ -4,6 +4,9 @@ use std::time::{Duration, Instant};
 use crust_core::model::{ChannelId, EmoteCatalogEntry, UserId};
 use crust_emotes::EmoteInfo;
 
+use super::live_emotes::reconcile::{ApplyResult, LiveState, SnapshotTicket};
+use super::live_emotes::{EmoteDelta, LiveBinding, LiveSource, LiveTarget};
+
 type ProviderEmotes = HashMap<String, HashMap<String, EmoteInfo>>;
 
 const MAX_PENDING_USERS: usize = 64;
@@ -32,6 +35,10 @@ struct ChannelEmotes {
     emotes: ProviderEmotes,
     /// Definitions carried by incoming messages survive older fetched snapshots.
     inline_emotes: ProviderEmotes,
+    live: HashMap<String, LiveState>,
+    live_enabled: bool,
+    live_generation: u64,
+    live_room_id: Option<String>,
 }
 
 /// Emote definitions remain scoped to the channel or sender that owns them.
@@ -102,6 +109,8 @@ impl EmoteRegistry {
         scope.generation = self.next_generation;
         scope.loading = false;
         scope.load_failed = false;
+        scope.live_enabled = false;
+        scope.live_generation = self.next_generation;
     }
 
     /// Reserve a generation before spawning a load, rejecting mode-only refreshes.
@@ -120,6 +129,14 @@ impl EmoteRegistry {
         scope.source_id = Some(source_id.to_owned());
         scope.loading = true;
         scope.load_failed = false;
+        scope.live_enabled = true;
+        if scope.live_room_id.as_deref() != Some(source_id) || scope.live_generation == 0 {
+            scope.live_generation = self.next_generation;
+            scope.live_room_id = Some(source_id.to_owned());
+        }
+        scope
+            .live
+            .retain(|_, state| state.source.room_id == source_id);
         Some(scope.generation)
     }
 
@@ -138,12 +155,33 @@ impl EmoteRegistry {
         true
     }
 
+    #[cfg(test)]
     pub(crate) fn replace_channel(
         &mut self,
         channel: &ChannelId,
         generation: u64,
         provider: &str,
         emotes: Option<Vec<EmoteInfo>>,
+    ) -> bool {
+        let expected_source = self.live_binding(channel, generation, provider);
+        self.replace_channel_with_source(
+            channel,
+            generation,
+            provider,
+            emotes,
+            None,
+            expected_source,
+        )
+    }
+
+    pub(crate) fn replace_channel_with_source(
+        &mut self,
+        channel: &ChannelId,
+        generation: u64,
+        provider: &str,
+        emotes: Option<Vec<EmoteInfo>>,
+        source: Option<LiveSource>,
+        expected_source: Option<LiveBinding>,
     ) -> bool {
         let Some(scope) = self.channels.get_mut(channel) else {
             return false;
@@ -152,16 +190,202 @@ impl EmoteRegistry {
             return false;
         }
         if let Some(emotes) = emotes {
-            scope.emotes.insert(
-                provider.to_owned(),
-                emotes
+            // A set switch observed after this HTTP request began wins over it.
+            if scope.live.get(provider).map(LiveState::binding) != expected_source {
+                return true;
+            }
+            if let Some(source) = source.filter(|source| source.provider.name() == provider) {
+                match scope.live.get_mut(provider) {
+                    Some(state) if state.source.same_catalog(&source) => state.rebind(source),
+                    _ => {
+                        scope
+                            .live
+                            .insert(provider.to_owned(), LiveState::new(source));
+                    }
+                }
+            }
+            let next = match scope.live.get(provider) {
+                Some(state) => state.overlay_snapshot(emotes),
+                None => emotes
                     .into_iter()
                     .map(|emote| (emote.code.clone(), emote))
                     .collect(),
-            );
+            };
+            scope.emotes.insert(provider.to_owned(), next);
         } else {
             // Keep the last usable set while other providers finish this generation.
             scope.load_failed = true;
+        }
+        true
+    }
+
+    pub(crate) fn live_binding(
+        &self,
+        channel: &ChannelId,
+        generation: u64,
+        provider: &str,
+    ) -> Option<LiveBinding> {
+        self.channels
+            .get(channel)
+            .filter(|scope| scope.generation == generation)?
+            .live
+            .get(provider)
+            .map(LiveState::binding)
+    }
+
+    pub(crate) fn live_targets(&self) -> Vec<LiveTarget> {
+        self.channels
+            .iter()
+            .filter(|(_, scope)| scope.live_enabled)
+            .flat_map(|(channel, scope)| {
+                scope
+                    .live
+                    .values()
+                    .filter(|state| {
+                        state.source.provider.name() != "7tv"
+                            || state.source.user_id.is_some()
+                            || state.source.set_id.is_some()
+                    })
+                    .map(move |state| LiveTarget {
+                        channel: channel.clone(),
+                        generation: scope.live_generation,
+                        binding_generation: state.binding_generation,
+                        source: state.source.clone(),
+                    })
+            })
+            .collect()
+    }
+
+    pub(crate) fn begin_live_epoch(&mut self, target: &LiveTarget, epoch: u64) -> bool {
+        let Some(scope) = self
+            .channels
+            .get_mut(&target.channel)
+            .filter(|scope| scope.live_enabled && scope.live_generation == target.generation)
+        else {
+            return false;
+        };
+        let Some(state) = scope
+            .live
+            .get_mut(target.source.provider.name())
+            .filter(|state| {
+                state.binding_generation == target.binding_generation
+                    && state.source == target.source
+            })
+        else {
+            return false;
+        };
+        state.begin_epoch(epoch)
+    }
+
+    pub(crate) fn live_snapshot_ticket(
+        &self,
+        target: &LiveTarget,
+        epoch: u64,
+    ) -> Option<SnapshotTicket> {
+        let scope = self
+            .channels
+            .get(&target.channel)
+            .filter(|scope| scope.live_enabled && scope.live_generation == target.generation)?;
+        scope
+            .live
+            .get(target.source.provider.name())
+            .filter(|state| {
+                state.binding_generation == target.binding_generation
+                    && state.source == target.source
+            })?
+            .ticket(epoch)
+    }
+
+    pub(crate) fn apply_live_delta(
+        &mut self,
+        target: &LiveTarget,
+        epoch: u64,
+        delta: EmoteDelta,
+    ) -> ApplyResult {
+        let Some(scope) = self
+            .channels
+            .get_mut(&target.channel)
+            .filter(|scope| scope.live_enabled && scope.live_generation == target.generation)
+        else {
+            return ApplyResult::default();
+        };
+        let provider = target.source.provider.name();
+        let Some(state) = scope.live.get_mut(provider).filter(|state| {
+            state.binding_generation == target.binding_generation && state.source == target.source
+        }) else {
+            return ApplyResult::default();
+        };
+        state.observe(
+            scope.emotes.entry(provider.into()).or_default(),
+            epoch,
+            delta,
+            Instant::now(),
+        )
+    }
+
+    pub(crate) fn apply_live_snapshot(
+        &mut self,
+        target: &LiveTarget,
+        ticket: SnapshotTicket,
+        emotes: Vec<EmoteInfo>,
+        fresh: bool,
+    ) -> ApplyResult {
+        let Some(scope) = self
+            .channels
+            .get_mut(&target.channel)
+            .filter(|scope| scope.live_enabled && scope.live_generation == target.generation)
+        else {
+            return ApplyResult::default();
+        };
+        let provider = target.source.provider.name();
+        let Some(state) = scope.live.get_mut(provider).filter(|state| {
+            state.binding_generation == target.binding_generation && state.source == target.source
+        }) else {
+            return ApplyResult::default();
+        };
+        state.replace_snapshot(
+            scope.emotes.entry(provider.into()).or_default(),
+            ticket,
+            emotes,
+            fresh,
+            Instant::now(),
+        )
+    }
+
+    pub(crate) fn switch_live_source(
+        &mut self,
+        target: &LiveTarget,
+        epoch: u64,
+        source: LiveSource,
+    ) -> bool {
+        let Some(scope) = self
+            .channels
+            .get_mut(&target.channel)
+            .filter(|scope| scope.live_enabled && scope.live_generation == target.generation)
+        else {
+            return false;
+        };
+        let provider = target.source.provider.name();
+        let Some(state) = scope.live.get_mut(provider).filter(|state| {
+            state.binding_generation == target.binding_generation
+                && state.source == target.source
+                && state.ticket(epoch).is_some()
+        }) else {
+            return false;
+        };
+        if source.provider != target.source.provider
+            || source.room_id != target.source.room_id
+            || source.platform != target.source.platform
+            || source == state.source
+        {
+            return false;
+        }
+        if state.source.same_catalog(&source) {
+            state.rebind(source);
+        } else {
+            *state = LiveState::new(source);
+            scope.emotes.remove(provider);
+            scope.inline_emotes.remove(provider);
         }
         true
     }
@@ -211,7 +435,8 @@ impl EmoteRegistry {
         self.pending_users.clear();
         self.deferred_users.retain(|_, channel| channel.is_some());
         let deferred = &self.deferred_users;
-        self.deferred_user_order.retain(|user| deferred.contains_key(user));
+        self.deferred_user_order
+            .retain(|user| deferred.contains_key(user));
     }
 
     pub(crate) fn begin_twitch_inventory(&mut self, user_id: &str) -> Option<u64> {
@@ -236,7 +461,9 @@ impl EmoteRegistry {
             return false;
         }
         self.twitch_inventory_generation = None;
-        let Some(emotes) = emotes else { return false; };
+        let Some(emotes) = emotes else {
+            return false;
+        };
         let inventory = provider_maps(emotes);
         let changed = self.twitch_inventory != inventory;
         self.twitch_inventory = inventory;
@@ -254,14 +481,21 @@ impl EmoteRegistry {
     }
 
     /// Schedule a known whisper sender through the same bounded queue as chat senders.
-    pub(crate) fn queue_whisper_sender(&mut self, account_user_id: &str, sender_user_id: &str) -> bool {
-        if account_user_id.is_empty() || self.active_account.as_deref() != Some(account_user_id)
+    pub(crate) fn queue_whisper_sender(
+        &mut self,
+        account_user_id: &str,
+        sender_user_id: &str,
+    ) -> bool {
+        if account_user_id.is_empty()
+            || self.active_account.as_deref() != Some(account_user_id)
             || sender_user_id.is_empty()
         {
             return false;
         }
         if sender_user_id != account_user_id {
-            if self.whisper_senders.len() >= MAX_CACHED_USERS && !self.whisper_senders.contains(sender_user_id) {
+            if self.whisper_senders.len() >= MAX_CACHED_USERS
+                && !self.whisper_senders.contains(sender_user_id)
+            {
                 return false;
             }
             self.whisper_senders.insert(sender_user_id.to_owned());
@@ -358,7 +592,10 @@ impl EmoteRegistry {
             }
             None if self.active_account.as_deref().is_some_and(|account| {
                 account == user_id || self.whisper_senders.contains(user_id)
-            }) => None,
+            }) =>
+            {
+                None
+            }
             _ => return None,
         };
         self.next_generation = self.next_generation.wrapping_add(1);
@@ -472,7 +709,8 @@ impl EmoteRegistry {
     }
 
     pub(crate) fn twitch_for_user(&self, user_id: &str, code: &str) -> Option<&EmoteInfo> {
-        self.twitch_inventory.get("twitch")
+        self.twitch_inventory
+            .get("twitch")
             .filter(|_| !user_id.is_empty() && self.active_account.as_deref() == Some(user_id))
             .and_then(|emotes| emotes.get(code))
             .or_else(|| self.twitch_global(code))
@@ -489,7 +727,16 @@ impl EmoteRegistry {
             channels: self
                 .channels
                 .get(channel)
-                .map(|scope| HashMap::from([(channel.clone(), scope.clone())]))
+                .map(|scope| {
+                    HashMap::from([(
+                        channel.clone(),
+                        ChannelEmotes {
+                            emotes: scope.emotes.clone(),
+                            inline_emotes: scope.inline_emotes.clone(),
+                            ..ChannelEmotes::default()
+                        },
+                    )])
+                })
                 .unwrap_or_default(),
             personal: self.personal.clone(),
             ..Self::default()
@@ -574,6 +821,208 @@ mod tests {
             ));
         }
         assert!(registry.complete_channel_load(channel, generation));
+    }
+
+    fn live_source(set_id: &str) -> LiveSource {
+        LiveSource {
+            provider: crate::runtime::live_emotes::Provider::SevenTv,
+            room_id: "123".into(),
+            platform: "TWITCH".into(),
+            user_id: Some("user".into()),
+            set_id: Some(set_id.into()),
+            connection_index: Some(0),
+        }
+    }
+
+    #[test]
+    fn live_set_switch_rejects_old_socket_and_inflight_manual_snapshot() {
+        let mut registry = EmoteRegistry::default();
+        let channel = ChannelId::new("room");
+        registry.open_channel(&channel);
+        let first = registry.begin_channel_load(&channel, "123", false).unwrap();
+        let old_source = live_source("old-set");
+        assert!(registry.replace_channel_with_source(
+            &channel,
+            first,
+            "7tv",
+            Some(vec![emote("7tv", "old", "Old")]),
+            Some(old_source.clone()),
+            None
+        ));
+        registry.complete_channel_load(&channel, first);
+
+        let refresh = registry.begin_channel_load(&channel, "123", true).unwrap();
+        let request_source = registry.live_binding(&channel, refresh, "7tv");
+        let old_target = registry.live_targets().pop().unwrap();
+        assert!(registry.begin_live_epoch(&old_target, 1));
+        let old_ticket = registry.live_snapshot_ticket(&old_target, 1).unwrap();
+        let new_source = live_source("new-set");
+        assert!(registry.switch_live_source(&old_target, 1, new_source.clone()));
+        assert!(registry.resolve(&channel, "", "Old").is_none());
+
+        assert!(registry.replace_channel_with_source(
+            &channel,
+            refresh,
+            "7tv",
+            Some(vec![emote("7tv", "old", "Old")]),
+            Some(old_source),
+            request_source
+        ));
+        assert!(registry.resolve(&channel, "", "Old").is_none());
+        assert_eq!(
+            registry
+                .live_binding(&channel, refresh, "7tv")
+                .map(|binding| binding.source),
+            Some(new_source)
+        );
+        assert!(
+            !registry
+                .apply_live_snapshot(
+                    &old_target,
+                    old_ticket,
+                    vec![emote("7tv", "stale", "Stale")],
+                    true
+                )
+                .changed
+        );
+        assert!(
+            !registry
+                .apply_live_delta(
+                    &old_target,
+                    1,
+                    EmoteDelta::Upsert {
+                        emote: emote("7tv", "stale", "Stale"),
+                        old_code: None
+                    }
+                )
+                .changed
+        );
+
+        let current = registry.live_targets().pop().unwrap();
+        assert!(registry.begin_live_epoch(&current, 1));
+        let ticket = registry.live_snapshot_ticket(&current, 1).unwrap();
+        assert!(
+            registry
+                .apply_live_snapshot(&current, ticket, vec![emote("7tv", "new", "New")], true)
+                .changed
+        );
+        assert_eq!(registry.resolve(&channel, "", "New").unwrap().id, "new");
+        // Returning to the same set is a new lifetime, even on the same socket.
+        assert!(registry.switch_live_source(&current, 1, old_target.source.clone()));
+        let returned = registry.live_targets().pop().unwrap();
+        assert_eq!(returned.source, old_target.source);
+        assert_ne!(returned.binding_generation, old_target.binding_generation);
+        assert!(registry.begin_live_epoch(&returned, 1));
+        assert!(
+            !registry
+                .apply_live_snapshot(
+                    &old_target,
+                    old_ticket,
+                    vec![emote("7tv", "late", "Late")],
+                    true
+                )
+                .changed
+        );
+        registry.replace_channel_with_source(
+            &channel,
+            refresh,
+            "7tv",
+            Some(vec![emote("7tv", "late", "Late")]),
+            Some(old_target.source.clone()),
+            Some(LiveBinding {
+                generation: old_target.binding_generation,
+                source: old_target.source.clone(),
+            }),
+        );
+        assert!(registry.resolve(&channel, "", "Late").is_none());
+        registry.close_channel(&channel);
+        registry.open_channel(&channel);
+        let rejoined = registry.begin_channel_load(&channel, "123", false).unwrap();
+        assert_ne!(rejoined, refresh);
+        assert!(
+            !registry
+                .apply_live_snapshot(&current, ticket, vec![emote("7tv", "late", "Late")], true)
+                .changed
+        );
+        assert!(registry.resolve(&channel, "", "Late").is_none());
+    }
+
+    #[test]
+    fn same_source_manual_reload_keeps_removals_and_reconnect_pauses_delivery() {
+        let mut registry = EmoteRegistry::default();
+        let channel = ChannelId::new("room");
+        registry.open_channel(&channel);
+        let first = registry.begin_channel_load(&channel, "123", false).unwrap();
+        let source = live_source("set");
+        registry.replace_channel_with_source(
+            &channel,
+            first,
+            "7tv",
+            Some(vec![emote("7tv", "id", "Gone")]),
+            Some(source.clone()),
+            None,
+        );
+        registry.complete_channel_load(&channel, first);
+        let target = registry.live_targets().pop().unwrap();
+        registry.begin_live_epoch(&target, 1);
+        assert!(
+            registry
+                .apply_live_delta(
+                    &target,
+                    1,
+                    EmoteDelta::Remove {
+                        id: "id".into(),
+                        code: Some("Gone".into())
+                    }
+                )
+                .changed
+        );
+        registry.reconnect_channel(&channel);
+        assert!(registry.live_targets().is_empty());
+        assert!(
+            !registry
+                .apply_live_delta(
+                    &target,
+                    1,
+                    EmoteDelta::Upsert {
+                        emote: emote("7tv", "old", "Old"),
+                        old_code: None
+                    }
+                )
+                .changed
+        );
+        let refresh = registry.begin_channel_load(&channel, "123", false).unwrap();
+        let expected = registry.live_binding(&channel, refresh, "7tv");
+        registry.replace_channel_with_source(
+            &channel,
+            refresh,
+            "7tv",
+            Some(vec![emote("7tv", "id", "Gone")]),
+            Some(source),
+            expected,
+        );
+        assert!(registry.resolve(&channel, "", "Gone").is_none());
+    }
+
+    #[test]
+    fn manual_metadata_refresh_keeps_the_live_room_lifetime() {
+        let mut registry = EmoteRegistry::default();
+        let channel = ChannelId::new("room");
+        registry.open_channel(&channel);
+        let first = registry.begin_channel_load(&channel, "123", false).unwrap();
+        registry.replace_channel_with_source(
+            &channel,
+            first,
+            "7tv",
+            Some(Vec::new()),
+            Some(live_source("set")),
+            None,
+        );
+        registry.complete_channel_load(&channel, first);
+        let before = registry.live_targets().pop().unwrap();
+        let refresh = registry.begin_channel_load(&channel, "123", true).unwrap();
+        assert_ne!(first, refresh);
+        assert_eq!(registry.live_targets().pop().unwrap(), before);
     }
 
     #[test]
@@ -690,8 +1139,11 @@ mod tests {
             )
             .is_some());
         let generation = registry.begin_twitch_inventory("42").unwrap();
-        assert!(registry.complete_twitch_inventory("42", generation,
-            Some(vec![emote("twitch", "subscription", "Same")])));
+        assert!(registry.complete_twitch_inventory(
+            "42",
+            generation,
+            Some(vec![emote("twitch", "subscription", "Same")])
+        ));
         for sender in ["42", "other", ""] {
             let catalog = registry.catalog();
             let selected = catalog
@@ -712,28 +1164,50 @@ mod tests {
         let channel = ChannelId::new("room");
         registry.set_account(Some("alice"));
         let generation = registry.begin_personal_load("alice", None).unwrap();
-        registry.complete_personal_load("alice", generation,
-            Some(vec![emote("7tv", "public", "PersonalWave")]));
+        registry.complete_personal_load(
+            "alice",
+            generation,
+            Some(vec![emote("7tv", "public", "PersonalWave")]),
+        );
         let generation = registry.begin_twitch_inventory("alice").unwrap();
-        assert!(registry.complete_twitch_inventory("alice", generation,
-            Some(vec![emote("twitch", "subscription", "SubLove")])));
+        assert!(registry.complete_twitch_inventory(
+            "alice",
+            generation,
+            Some(vec![emote("twitch", "subscription", "SubLove")])
+        ));
         assert!(registry.resolve(&channel, "alice", "SubLove").is_some());
         assert!(registry.resolve(&channel, "bob", "SubLove").is_none());
-        assert!(registry.resolve(&ChannelId::kick("room"), "alice", "SubLove").is_none());
-        let entry = registry.catalog().into_iter().find(|emote| emote.code == "SubLove").unwrap();
+        assert!(registry
+            .resolve(&ChannelId::kick("room"), "alice", "SubLove")
+            .is_none());
+        let entry = registry
+            .catalog()
+            .into_iter()
+            .find(|emote| emote.code == "SubLove")
+            .unwrap();
         assert!(entry.is_available_for(&channel, "alice"));
         assert!(!entry.is_available_for(&channel, "bob"));
 
         let old_generation = registry.begin_twitch_inventory("alice").unwrap();
         registry.set_account(Some("bob"));
         assert!(registry.twitch_for_user("alice", "SubLove").is_none());
-        assert!(registry.resolve(&channel, "alice", "PersonalWave").is_some());
+        assert!(registry
+            .resolve(&channel, "alice", "PersonalWave")
+            .is_some());
         registry.set_account(Some("alice"));
-        assert!(!registry.complete_twitch_inventory("alice", old_generation,
-            Some(vec![emote("twitch", "stale", "SubLove")])));
+        assert!(!registry.complete_twitch_inventory(
+            "alice",
+            old_generation,
+            Some(vec![emote("twitch", "stale", "SubLove")])
+        ));
         registry.set_account(None);
-        assert!(registry.catalog().iter().all(|entry| entry.provider != "twitch"));
-        assert!(registry.resolve(&channel, "alice", "PersonalWave").is_some());
+        assert!(registry
+            .catalog()
+            .iter()
+            .all(|entry| entry.provider != "twitch"));
+        assert!(registry
+            .resolve(&channel, "alice", "PersonalWave")
+            .is_some());
     }
 
     #[test]
@@ -772,7 +1246,9 @@ mod tests {
         assert!(!registry.complete_channel_load(&channel, second));
         assert!(registry.complete_channel_load(&channel, third));
         assert!(!registry.complete_channel_load(&channel, third));
-        assert!(registry.begin_channel_load(&channel, "room", false).is_none());
+        assert!(registry
+            .begin_channel_load(&channel, "room", false)
+            .is_none());
     }
 
     #[test]
@@ -810,7 +1286,9 @@ mod tests {
         );
         let generation = registry.begin_channel_load(&channel, "room", true).unwrap();
         assert!(registry.replace_channel(&channel, generation, "ffz", None));
-        assert!(registry.begin_channel_load(&channel, "room", false).is_none());
+        assert!(registry
+            .begin_channel_load(&channel, "room", false)
+            .is_none());
         assert!(registry.replace_channel(&channel, generation, "7tv", Some(vec![])));
         assert_eq!(registry.resolve(&channel, "", "Keep").unwrap().id, "keep");
         assert!(registry.resolve(&channel, "", "Remove").is_none());
@@ -939,7 +1417,9 @@ mod tests {
         registry.set_account(Some("next-account"));
         assert!(registry.whisper_senders.is_empty());
         assert!(registry.next_deferred_personal_load().is_none());
-        assert!(registry.complete_personal_load(&sender, pending, Some(vec![])).is_none());
+        assert!(registry
+            .complete_personal_load(&sender, pending, Some(vec![]))
+            .is_none());
         assert!(!registry.queue_whisper_sender("account", "old-replay"));
         assert!(registry.queue_whisper_sender("next-account", "sender"));
     }
