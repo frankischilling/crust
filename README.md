@@ -45,33 +45,21 @@ packaging, WSL setup, and the workspace layout.
 - Multiple accounts are supported; switch accounts without restarting.
 - Tokens use the OS keyring when available, with a settings-file fallback.
 
-## Screenshots
+## Screenshot
 
 ![Chat view](img/demo.png)
 
-![Emote picker](img/demo2.png)
-
-![User profile popup](img/demo4.png)
-
-![Multi-channel tabs](img/demo5.png)
-
-![Mod tabs](img/demo8.png)
+See the [interface audit](docs/AUDIT_UI_PERFORMANCE.md#native-interface-captures)
+for current settings and account-dialog captures.
 
 ## Documentation
 
 - [Documentation index](docs/HOME.md)
 - [Features and keybinds](docs/FEATURES_AND_KEYBINDS.md)
-- [Chat behavior and performance audit](docs/AUDIT.md)
-- [Chat delivery, emotes, and history follow-up](docs/AUDIT_FOLLOWUP.md)
-- [Startup, private history, and navigation fixes](docs/AUDIT_STARTUP.md)
+- [UI, chat, and performance audit](docs/AUDIT_UI_PERFORMANCE.md)
 - [Plugin API reference](docs/API.md)
 - [Example plugins](plugins/)
-- [Release notes v0.5.3](docs/releases/Release_v0.5.3.md)
-- [Release notes v0.5.2](docs/releases/Release_v0.5.2.md)
-- [Release notes v0.5.1](docs/releases/Release_v0.5.1.md)
-- [Release notes v0.5.0](docs/releases/Release_v0.5.0.md)
-- [Release notes v0.4.9](docs/releases/Release_v0.4.9.md)
-- [Release notes v0.4.5](docs/releases/Release_v0.4.5.md)
+- [Release notes v0.5.4](docs/releases/Release_v0.5.4.md)
 
 ## Data paths
 

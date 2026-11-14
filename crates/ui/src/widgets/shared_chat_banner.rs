@@ -193,8 +193,7 @@ fn draw_avatar_fallback(ui: &mut Ui, label: &str, color: Color32) {
 }
 
 /// Format an unsigned integer as a human-readable viewer count: `251`,
-/// `4,787`, `28.4K`, `1.2M`. Chatterino doesn't have an equivalent, but
-/// Twitch's web UI collapses to K/M once counts cross 10k / 1M.
+/// `4,787`, `28.4K`, `1.2M`. Counts use K/M above 10,000 and 1,000,000.
 pub(crate) fn fmt_u64(n: u64) -> String {
     if n >= 1_000_000 {
         let v = (n as f64) / 1_000_000.0;

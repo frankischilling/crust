@@ -1,8 +1,7 @@
 //! AST for the filter expression language.
 //!
 //! Each node carries a [`Span`] pointing back into the source string for
-//! error reporting. The AST is intentionally small and close to the
-//! Chatterino layout:
+//! error reporting. The tree contains these node types:
 //!
 //! - [`Expression::Literal`] wraps a pre-parsed [`crate::filters::Value`]
 //!   (int, string, regex).
@@ -62,7 +61,7 @@ impl Span {
     }
 }
 
-/// Unary operators. Chatterino only has logical negation.
+/// Supported unary operators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnOp {
     Not,

@@ -36,7 +36,7 @@ impl Default for FilterAction {
 ///
 /// `Substring` is the historical default (plain text substring). `Regex`
 /// treats `pattern` as a [`regex::Regex`]. `Expression` treats `pattern` as
-/// a Chatterino-style filter DSL expression (see [`crate::filters`]).
+/// a message filter expression (see [`crate::filters`]).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum FilterMode {
     #[default]

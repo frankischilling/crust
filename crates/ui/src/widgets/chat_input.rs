@@ -16,6 +16,86 @@ const SLASH_AUTOCOMPLETE_MATCH_LIMIT: usize = usize::MAX;
 const USERNAME_AUTOCOMPLETE_MAX: usize = 10;
 /// Maximum number of Tab-completion matches to cycle through.
 const TAB_COMPLETE_MAX: usize = 50;
+const TWITCH_MAX_CHARS: usize = 500;
+
+struct ComposerLayout {
+    picker_width: f32,
+    send_width: f32,
+    counter_inline: bool,
+    show_send: bool,
+    controls_width: f32,
+    minimum_text_width: f32,
+}
+
+impl ComposerLayout {
+    fn new(width: f32, has_counter: bool) -> Self {
+        let picker_width = (t::chat_font_size() + 16.0).max(t::bar_h());
+        let send_width = (58.0 * t::font_scale()).max(58.0);
+        let minimum_text_width = 96.0 * t::font_scale();
+        let gap = t::TOOLBAR_SPACING.x;
+        let counter_width = 70.0 * t::font_scale();
+        let counter_inline =
+            has_counter && width >= minimum_text_width + picker_width + counter_width + gap * 2.0;
+        let controls_width = picker_width
+            + gap
+            + if counter_inline {
+                counter_width + gap
+            } else {
+                0.0
+            };
+        let show_send =
+            width > 250.0 && width >= minimum_text_width + controls_width + send_width + gap;
+        Self {
+            picker_width,
+            send_width,
+            counter_inline,
+            show_send,
+            controls_width: controls_width + if show_send { send_width + gap } else { 0.0 },
+            minimum_text_width,
+        }
+    }
+}
+
+/// Extra tray height when a Twitch draft's counter needs its own row.
+pub(crate) fn chat_input_counter_height(
+    ctx: &egui::Context,
+    outer_width: f32,
+    channel: &ChannelId,
+    text: &str,
+) -> f32 {
+    if text.is_empty() || channel.is_irc() || channel.is_kick() {
+        return 0.0;
+    }
+    let inner_width = outer_width - (t::INPUT_MARGIN.left + t::INPUT_MARGIN.right) as f32;
+    if ComposerLayout::new(inner_width, true).counter_inline {
+        return 0.0;
+    }
+    ctx.fonts(|fonts| fonts.row_height(&t::tiny())) + ctx.style().spacing.item_spacing.y
+}
+
+fn show_character_counter(ui: &mut Ui, count: usize) {
+    let color = if count > TWITCH_MAX_CHARS {
+        t::red()
+    } else if count > 400 {
+        t::yellow()
+    } else {
+        t::text_muted()
+    };
+    let hint = if count > TWITCH_MAX_CHARS {
+        format!(
+            "{} characters over Twitch's {TWITCH_MAX_CHARS}-character limit",
+            count - TWITCH_MAX_CHARS
+        )
+    } else {
+        format!("Twitch messages are limited to {TWITCH_MAX_CHARS} characters")
+    };
+    ui.label(
+        RichText::new(format!("{count}/{TWITCH_MAX_CHARS}"))
+            .font(t::tiny())
+            .color(color),
+    )
+    .on_hover_text(hint);
+}
 
 // Persistent state stored in egui temp data
 
@@ -274,18 +354,35 @@ impl<'a> ChatInput<'a> {
             .fill(t::bg_surface())
             .inner_margin(t::INPUT_MARGIN)
             .show(ui, |ui| {
-                ui.horizontal_centered(|ui| {
+                let mut counter_below = None;
+                ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing = t::TOOLBAR_SPACING;
                     let input_width = ui.available_width();
-                    // Username label - hide at narrow widths
+                    let is_twitch_channel = !self.channel.is_irc() && !self.channel.is_kick();
+                    let show_counter = is_twitch_channel && !buf.is_empty();
+                    let layout = ComposerLayout::new(input_width, show_counter);
                     if input_width > 300.0 {
                         if let Some(name) = self.username {
-                            ui.label(
-                                RichText::new(format!("{name}:"))
-                                    .color(t::accent())
-                                    .strong()
-                                    .font(t::small()),
-                            );
+                            let label = format!("{name}:");
+                            let label_width = ui.fonts(|fonts| {
+                                fonts
+                                    .layout_no_wrap(label.clone(), t::small(), t::accent())
+                                    .size()
+                                    .x
+                            });
+                            if input_width
+                                - layout.controls_width
+                                - label_width
+                                - t::TOOLBAR_SPACING.x
+                                >= layout.minimum_text_width
+                            {
+                                ui.label(
+                                    RichText::new(label)
+                                        .color(t::accent())
+                                        .strong()
+                                        .font(t::small()),
+                                );
+                            }
                         }
                     }
 
@@ -365,22 +462,6 @@ impl<'a> ChatInput<'a> {
                     retain_keyboard_focus |=
                         consumed_tab || consumed_enter || consumed_up || consumed_down;
 
-                    // Text input - reserve space for emote button + Send button + gaps
-                    // At narrow widths, hide Send button and emote picker to maximise input
-                    let show_send_btn = input_width > 250.0;
-                    let show_emote_btn = input_width > 200.0;
-                    let is_twitch_channel = !self.channel.is_irc() && !self.channel.is_kick();
-                    let show_counter = is_twitch_channel && !buf.is_empty();
-                    let counter_reserve = if show_counter { 70.0 } else { 0.0 };
-                    let btn_square = (t::chat_font_size() + 16.0).max(t::bar_h());
-                    let send_btn_w = (58.0 * t::font_scale()).max(58.0);
-                    let reserve = if show_send_btn && show_emote_btn {
-                        btn_square + send_btn_w + t::TOOLBAR_SPACING.x * 2.0 + counter_reserve
-                    } else if show_emote_btn {
-                        btn_square + t::TOOLBAR_SPACING.x + counter_reserve
-                    } else {
-                        counter_reserve
-                    };
                     let hint_text = if self.logged_in {
                         if let Some(name) = self.username.filter(|n| !n.trim().is_empty()) {
                             format!("Send messages as {name}...")
@@ -392,7 +473,7 @@ impl<'a> ChatInput<'a> {
                     } else {
                         "Log in to send messages (/help for local commands)".to_owned()
                     };
-                    let text_width = (ui.available_width() - reserve).max(40.0);
+                    let text_width = (ui.available_width() - layout.controls_width).max(40.0);
                     // Input box grows with chat font so text never clips.
                     let input_h = (t::chat_font_size() + 16.0).max(t::bar_h());
                     let te_output = ui
@@ -760,7 +841,6 @@ impl<'a> ChatInput<'a> {
 
                     ui.ctx().data_mut(|d| d.insert_temp(ac_id, ac_sel));
 
-                    const TWITCH_MAX_CHARS: usize = 500;
                     let mut twitch_char_count = if is_twitch_channel {
                         buf.chars().count()
                     } else {
@@ -798,27 +878,23 @@ impl<'a> ChatInput<'a> {
                         }
                     }
 
-                    // Emote picker button - hidden at very narrow widths
-                    let btn_h = (t::chat_font_size() + 16.0).max(t::bar_h());
-                    if show_emote_btn {
-                        if ui
-                            .add_sized(
-                                [btn_h, btn_h],
-                                egui::Button::new(RichText::new(":)").font(t::body())),
-                            )
-                            .on_hover_text("Emote picker")
-                            .clicked()
-                        {
-                            result.toggle_emote_picker = true;
-                        }
+                    if ui
+                        .add_sized(
+                            [layout.picker_width, layout.picker_width],
+                            egui::Button::new(RichText::new(":)").font(t::body())),
+                        )
+                        .on_hover_text("Emote picker")
+                        .clicked()
+                    {
+                        result.toggle_emote_picker = true;
                     }
 
                     // Send button - hidden at very narrow widths
-                    if show_send_btn {
+                    if layout.show_send {
                         let send_btn = ui.add_enabled(
                             can_submit,
                             egui::Button::new(RichText::new("Send").font(t::body()))
-                                .min_size(egui::vec2((58.0 * t::font_scale()).max(58.0), btn_h)),
+                                .min_size(egui::vec2(layout.send_width, layout.picker_width)),
                         );
                         let send_btn = if twitch_over_limit && is_twitch_channel {
                             send_btn.on_hover_text("Twitch messages are limited to 500 characters")
@@ -837,32 +913,11 @@ impl<'a> ChatInput<'a> {
                         }
                     }
 
-                    // Character count - Twitch has a 500-char limit.
-                    // Show only for Twitch channels when the user has typed something.
-                    if !buf.is_empty() && is_twitch_channel {
-                        let compact_counter = ui.available_width() < 110.0;
-                        let color = if twitch_char_count > TWITCH_MAX_CHARS {
-                            t::red()
-                        } else if twitch_char_count > 400 {
-                            t::yellow()
+                    if show_counter && !buf.is_empty() {
+                        if layout.counter_inline {
+                            show_character_counter(ui, twitch_char_count);
                         } else {
-                            t::text_muted()
-                        };
-                        ui.label(
-                            RichText::new(format!("{twitch_char_count}/{TWITCH_MAX_CHARS}"))
-                                .font(t::tiny())
-                                .color(color),
-                        );
-                        if twitch_over_limit
-                            && !self.prevent_overlong_twitch_messages
-                            && !compact_counter
-                        {
-                            let over_by = twitch_char_count - TWITCH_MAX_CHARS;
-                            ui.label(
-                                RichText::new(format!("Over by {over_by} chars"))
-                                    .font(t::tiny())
-                                    .color(t::red()),
-                            );
+                            counter_below = Some(twitch_char_count);
                         }
                     }
 
@@ -1186,6 +1241,9 @@ impl<'a> ChatInput<'a> {
                         result.add_to_dictionary = Some(word);
                     }
                 });
+                if let Some(count) = counter_below {
+                    show_character_counter(ui, count);
+                }
             });
 
         // request_focus resets egui's key filter. Reapply it after every child
@@ -2386,6 +2444,157 @@ mod tests {
             accept_dropped_files,
         }
         .show(ui, buf)
+    }
+
+    fn narrow_composer_frame(
+        ctx: &egui::Context,
+        buf: &mut String,
+        width: f32,
+        events: Vec<egui::Event>,
+        focus: bool,
+    ) -> (egui::FullOutput, ChatInputResult, egui::Rect, egui::Rect) {
+        let mut result = None;
+        let mut field = egui::Rect::NOTHING;
+        let mut tray = egui::Rect::NOTHING;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    Pos2::ZERO,
+                    egui::vec2(width, 200.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        let height = (t::chat_font_size() + 16.0).max(t::bar_h())
+                            + (t::INPUT_MARGIN.top + t::INPUT_MARGIN.bottom) as f32
+                            + chat_input_counter_height(
+                                ctx,
+                                width,
+                                &ChannelId::new("example"),
+                                buf,
+                            );
+                        egui::TopBottomPanel::bottom("test_composer_tray")
+                            .exact_height(height)
+                            .frame(egui::Frame::NONE)
+                            .show_inside(ui, |ui| {
+                                tray = ui.max_rect();
+                                ui.set_clip_rect(tray);
+                                let id = ui.id().with("chat_input");
+                                result = Some(show_test_input(ui, buf, &[], focus, false));
+                                field = ctx.read_response(id).unwrap().rect;
+                            });
+                    });
+            },
+        );
+        (output, result.unwrap(), field, tray)
+    }
+
+    fn visible_input_text(output: &egui::FullOutput, label: &str) -> Option<egui::Rect> {
+        output.shapes.iter().find_map(|shape| {
+            let egui::Shape::Text(text) = &shape.shape else {
+                return None;
+            };
+            let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+            (text.galley.text() == label && shape.clip_rect.contains_rect(rect)).then_some(rect)
+        })
+    }
+
+    #[test]
+    fn narrow_composer_keeps_the_picker_clickable_and_counters_inside_the_tray() {
+        for width in [150.0, 200.0, 250.0, 360.0] {
+            for initial in [
+                String::new(),
+                "hello".to_owned(),
+                "é".repeat(400),
+                "🙂".repeat(501),
+            ] {
+                let ctx = egui::Context::default();
+                let mut buf = initial.clone();
+                let mut output = egui::FullOutput::default();
+                for _ in 0..3 {
+                    let frame = narrow_composer_frame(&ctx, &mut buf, width, Vec::new(), false);
+                    output = frame.0;
+                    assert!(
+                        frame.3.contains_rect(frame.2),
+                        "text field {:?} must fit tray {:?} at {width}",
+                        frame.2,
+                        frame.3
+                    );
+                }
+                let picker = visible_input_text(&output, ":)")
+                    .expect("the picker remains visible at every supported pane width");
+                if !initial.is_empty() {
+                    let counter_label = format!("{}/500", initial.chars().count());
+                    let counter =
+                        visible_input_text(&output, &counter_label).unwrap_or_else(|| {
+                            panic!("counter {counter_label} must be fully visible at width {width}")
+                        });
+                    if width <= 200.0 {
+                        assert!(
+                            counter.top() > picker.bottom(),
+                            "narrow counters belong below the input row"
+                        );
+                    }
+                }
+                if width <= 200.0 {
+                    assert!(visible_input_text(&output, "Send").is_none());
+                }
+                let mut toggled = false;
+                for pressed in [true, false] {
+                    let frame = narrow_composer_frame(
+                        &ctx,
+                        &mut buf,
+                        width,
+                        vec![
+                            egui::Event::PointerMoved(picker.center()),
+                            egui::Event::PointerButton {
+                                pos: picker.center(),
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                        false,
+                    );
+                    toggled |= frame.1.toggle_emote_picker;
+                    assert!(frame.1.send.is_none());
+                }
+                assert!(toggled, "picker should open at width {width}");
+                assert_eq!(
+                    buf, initial,
+                    "opening the picker preserves the complete draft"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_composer_enter_submits_valid_text_and_preserves_over_limit_drafts() {
+        for initial in ["hello".to_owned(), "🙂".repeat(501)] {
+            let ctx = egui::Context::default();
+            let mut buf = initial.clone();
+            for _ in 0..3 {
+                narrow_composer_frame(&ctx, &mut buf, 150.0, Vec::new(), true);
+            }
+            let (_, result, _, _) = narrow_composer_frame(
+                &ctx,
+                &mut buf,
+                150.0,
+                vec![key(Key::Enter, true, egui::Modifiers::NONE)],
+                true,
+            );
+            if initial.chars().count() <= TWITCH_MAX_CHARS {
+                assert_eq!(result.send, Some(initial));
+                assert!(buf.is_empty());
+            } else {
+                assert!(result.send.is_none());
+                assert_eq!(buf, initial);
+            }
+        }
     }
 
     #[test]

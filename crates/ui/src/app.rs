@@ -108,6 +108,7 @@ const QUICK_SWITCH_MAX_ROWS: usize = 10;
 const MAX_DEFERRED_COMMANDS: usize = 128;
 const MAX_DEFERRED_UPLOAD_BYTES: usize = 32 * 1024 * 1024;
 const MAX_COMMANDS_PER_FRAME: usize = 64;
+const MAX_EVENTS_PER_FRAME: u32 = 200;
 const EMOTE_REFRESH_ROWS_PER_FRAME: usize = 400;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -390,6 +391,50 @@ struct WhisperLine {
     is_self: bool,
 }
 
+#[derive(Default)]
+struct WhisperComposer {
+    text: String,
+    pending: Vec<String>,
+    failed: VecDeque<FailedWhisper>,
+}
+
+struct FailedWhisper {
+    text: String,
+    message: String,
+}
+
+impl WhisperComposer {
+    fn fail_attempt(&mut self, text: &str, message: &str) -> bool {
+        let Some(index) = self.pending.iter().position(|pending| pending == text) else {
+            return false;
+        };
+        let text = self.pending.remove(index);
+        if self.text.is_empty() {
+            self.text.clone_from(&text);
+        }
+        self.failed.push_back(FailedWhisper {
+            text,
+            message: message.to_owned(),
+        });
+        true
+    }
+
+    fn acknowledge(&mut self, text: &str) {
+        let Some(index) = self
+            .pending
+            .iter()
+            .position(|pending| pending.trim() == text.trim())
+        else {
+            return;
+        };
+        let sent = self.pending.remove(index);
+        if self.text == sent {
+            self.text.clear();
+        }
+        self.failed.retain(|failed| failed.text != sent);
+    }
+}
+
 enum EmoteRefreshJob {
     Channel(ChannelId, MessageId),
     Mentions(MessageId),
@@ -514,7 +559,6 @@ impl SplitPanes {
             self.focused = index;
         } else if let Some(pane) = self.panes.get_mut(self.focused) {
             pane.channel = channel.clone();
-            pane.input_buf.clear();
         }
     }
 
@@ -778,7 +822,6 @@ struct ToolbarVisibility {
     show_irc_in_overflow: bool,
     show_mod_button: bool,
     show_mod_in_overflow: bool,
-    show_emote_count: bool,
 }
 
 const TOOLBAR_ROW_PADDING_W: f32 = 28.0;
@@ -790,12 +833,10 @@ const TOOLBAR_CONN_LABEL_W: f32 = 92.0;
 const TOOLBAR_JOIN_LABEL_W: f32 = 32.0;
 const TOOLBAR_ACCOUNT_PILL_W: f32 = 118.0;
 const TOOLBAR_OVERFLOW_W: f32 = 30.0;
-const TOOLBAR_EMOTE_LABEL_W: f32 = 94.0;
 const TOOLBAR_MOD_BUTTON_W: f32 = 42.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ToolbarDegradeStep {
-    HideEmoteCount,
     HideJoinText,
     HideConnectionLabel,
     HideLogo,
@@ -858,20 +899,13 @@ fn estimate_toolbar_required_width(visibility: &ToolbarVisibility) -> f32 {
     };
     width += 8.0 + account_width;
 
-    if !visibility.compact_controls || visibility.show_emote_count || visibility.show_overflow_menu
+    if !visibility.compact_controls || visibility.show_overflow_menu
     {
         width += TOOLBAR_SEPARATOR_W;
     }
 
     if visibility.show_overflow_menu {
         width += TOOLBAR_OVERFLOW_W;
-        if visibility.show_emote_count {
-            width += TOOLBAR_SEPARATOR_W;
-        }
-    }
-
-    if visibility.show_emote_count {
-        width += TOOLBAR_EMOTE_LABEL_W + TOOLBAR_SEPARATOR_W;
     }
 
     let mut icon_count = 1; // settings
@@ -895,7 +929,6 @@ fn estimate_toolbar_required_width(visibility: &ToolbarVisibility) -> f32 {
 
 fn apply_toolbar_degrade_step(visibility: &mut ToolbarVisibility, step: ToolbarDegradeStep) {
     match step {
-        ToolbarDegradeStep::HideEmoteCount => visibility.show_emote_count = false,
         ToolbarDegradeStep::HideJoinText => visibility.show_join_text = false,
         ToolbarDegradeStep::HideConnectionLabel => visibility.show_connection_label = false,
         ToolbarDegradeStep::HideLogo => visibility.show_logo = false,
@@ -977,11 +1010,9 @@ fn toolbar_visibility(
         show_irc_in_overflow: false,
         show_mod_button: moderation_available,
         show_mod_in_overflow: false,
-        show_emote_count: true,
     };
 
-    const STEPS: [ToolbarDegradeStep; 14] = [
-        ToolbarDegradeStep::HideEmoteCount,
+    const STEPS: [ToolbarDegradeStep; 13] = [
         ToolbarDegradeStep::HideJoinText,
         ToolbarDegradeStep::HideConnectionLabel,
         ToolbarDegradeStep::HideLogo,
@@ -1144,6 +1175,9 @@ pub struct CrustApp {
     whisper_unread_mentions: HashMap<String, u32>,
     /// Currently selected whisper thread login.
     active_whisper_login: Option<String>,
+    /// Drafts and pending sends belong to the signed-in account and recipient.
+    whisper_composers: HashMap<String, WhisperComposer>,
+    focus_whisper_composer: Option<String>,
     /// Startup loading overlay (shown until initial emotes + history are ready).
     loading_screen: LoadingScreen,
     /// Cached stream status per channel (key = channel login, lowercase).
@@ -1713,6 +1747,8 @@ impl CrustApp {
             whisper_unread: HashMap::new(),
             whisper_unread_mentions: HashMap::new(),
             active_whisper_login: None,
+            whisper_composers: HashMap::new(),
+            focus_whisper_composer: None,
             loading_screen: LoadingScreen::default(),
             stream_statuses: HashMap::new(),
             stream_status_fetched: HashMap::new(),
@@ -2400,16 +2436,49 @@ exit 1
         format!("{}::{request_id}", channel.as_str())
     }
 
-    /// Drain at most one moderation hotkey trigger per frame. Gated to the
-    /// mod-tools window being open and no text-edit currently focused so
-    /// single-letter binds (A/D/J/K) do not steal global keypresses.
+    fn mod_tools_owns_keyboard(&self, ctx: &Context) -> bool {
+        let window_id = egui::Id::new("Moderation Tools");
+        let layer = egui::LayerId::new(egui::Order::Middle, window_id);
+        let active_id = window_id.with("keyboard_active");
+        let expanded = egui::collapsing_header::CollapsingState::load(
+            ctx, window_id.with("collapsing"),
+        ).is_some_and(|state| state.is_open());
+        if !self.mod_tools_open || !expanded
+            || self.settings_filter_editor_modal.open
+            || ctx.is_context_menu_open()
+            || !ctx.data(|data| data.get_temp::<bool>(active_id).unwrap_or(false))
+        {
+            return false;
+        }
+        if ctx.memory(|m| m.focused().is_some()) {
+            // A widget (filter input, unban draft) has focus -- let it consume keys.
+            return false;
+        }
+        let layers: Vec<_> = ctx.memory(|memory| memory.layer_ids()
+            .filter(|layer| matches!(layer.order, egui::Order::Middle | egui::Order::Foreground)
+                && memory.areas().is_visible(layer))
+            .collect());
+        let top = layers.into_iter().rev().find(|layer| {
+            egui::AreaState::load(ctx, layer.id).is_some_and(|state| state.interactable)
+        });
+        top == Some(layer)
+    }
+
+    /// Capture before other widgets apply Tab traversal. Queue actions are
+    /// checked again after the moderation window is rendered.
     fn consume_mod_hotkey_input(&self, ctx: &Context) -> ModHotkey {
         use crust_core::HotkeyAction;
         if !self.mod_tools_open {
             return ModHotkey::None;
         }
-        if ctx.memory(|m| m.focused().is_some()) {
-            // A widget (filter input, unban draft) has focus -- let it consume keys.
+        let window_id = egui::Id::new("Moderation Tools");
+        let layer = egui::LayerId::new(egui::Order::Middle, window_id);
+        if ctx.input(|input| input.pointer.any_pressed()) {
+            let activated = ctx.pointer_interact_pos()
+                .is_some_and(|pos| ctx.layer_id_at(pos) == Some(layer));
+            ctx.data_mut(|data| data.insert_temp(window_id.with("keyboard_active"), activated));
+        }
+        if !self.mod_tools_owns_keyboard(ctx) {
             return ModHotkey::None;
         }
         let candidates = [
@@ -2455,11 +2524,29 @@ exit 1
         }
     }
 
+    fn filtered_mod_tab_len(&self, tab: ModToolsTab, channel: &ChannelId) -> usize {
+        let filter = self.mod_tools_filter.trim().to_ascii_lowercase();
+        match tab {
+            ModToolsTab::AutoMod => self.automod_queue.get(channel).map_or(0, |items| {
+                items.iter().filter(|item| Self::automod_matches_filter(item, &filter)).count()
+            }),
+            ModToolsTab::UnbanRequests => self.unban_requests.get(channel).map_or(0, |items| {
+                items.iter().filter(|item| Self::unban_matches_filter(item, &filter)).count()
+            }),
+            ModToolsTab::LowTrust => self.state.channels.get(channel).map_or(0, |state| {
+                state.low_trust_users.iter()
+                    .filter(|(login, entry)| Self::low_trust_matches_filter(login, entry, &filter))
+                    .count()
+            }),
+        }
+    }
+
     /// Render the tabbed moderation tools window.
     fn render_mod_tools_window(
         &mut self,
         ctx: &Context,
         moderation_channel: Option<ChannelId>,
+        mut hotkey: ModHotkey,
     ) {
         let mut window_open = self.mod_tools_open;
         let mut refresh_channel: Option<ChannelId> = None;
@@ -2469,11 +2556,12 @@ exit 1
         let mut unban_bulk_action: Option<bool> = None;
         let mut low_trust_actions: Vec<LowTrustAction> = Vec::new();
 
-        let hotkey = self.consume_mod_hotkey_input(ctx);
-
         // Apply tab-switching / focus-nav hotkeys before rendering so the tab
         // strip and focus highlight reflect the new state this frame.
         if let Some(channel) = moderation_channel.as_ref() {
+            let visible_count = self.filtered_mod_tab_len(self.mod_tools_active_tab, channel);
+            self.mod_tools_focused_index = self.mod_tools_focused_index
+                .min(visible_count.saturating_sub(1));
             match hotkey {
                 ModHotkey::NextTab => {
                     self.mod_tools_active_tab = self.mod_tools_active_tab.next();
@@ -2484,16 +2572,14 @@ exit 1
                     self.mod_tools_focused_index = 0;
                 }
                 ModHotkey::FocusNext => {
-                    let len = self.mod_tab_len(self.mod_tools_active_tab, channel);
-                    if len > 0 {
-                        self.mod_tools_focused_index = (self.mod_tools_focused_index + 1) % len;
+                    if visible_count > 0 {
+                        self.mod_tools_focused_index = (self.mod_tools_focused_index + 1) % visible_count;
                     }
                 }
                 ModHotkey::FocusPrev => {
-                    let len = self.mod_tab_len(self.mod_tools_active_tab, channel);
-                    if len > 0 {
+                    if visible_count > 0 {
                         self.mod_tools_focused_index = if self.mod_tools_focused_index == 0 {
-                            len - 1
+                            visible_count - 1
                         } else {
                             self.mod_tools_focused_index - 1
                         };
@@ -2503,7 +2589,7 @@ exit 1
             }
         }
 
-        egui::Window::new("Moderation Tools")
+        let window_response = egui::Window::new("Moderation Tools")
             .open(&mut window_open)
             .default_size(egui::vec2(580.0, 540.0))
             .show(ctx, |ui| {
@@ -2564,6 +2650,7 @@ exit 1
                     ui.label(RichText::new("Filter:").font(t::small()));
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut self.mod_tools_filter)
+                            .id(egui::Id::new("moderation_filter"))
                             .hint_text("login or message text")
                             .desired_width(220.0),
                     );
@@ -2647,6 +2734,21 @@ exit 1
             });
 
         self.mod_tools_open = window_open;
+        if matches!(hotkey, ModHotkey::NextTab | ModHotkey::PrevTab) {
+            // egui computes traversal at begin_pass even when its Tab event is
+            // consumed before widgets render. Keep the window's keyboard owner.
+            ctx.memory_mut(|memory| memory.stop_text_input());
+        }
+        let expanded = egui::collapsing_header::CollapsingState::load(
+            ctx, egui::Id::new("Moderation Tools").with("collapsing"),
+        ).is_some_and(|state| state.is_open());
+        if !window_open || !expanded || window_response.as_ref().is_none_or(|window| window.inner.is_none()) {
+            hotkey = ModHotkey::None;
+            ctx.data_mut(|data| data.remove::<bool>(egui::Id::new("Moderation Tools").with("keyboard_active")));
+        }
+        if !self.mod_tools_owns_keyboard(ctx) {
+            hotkey = ModHotkey::None;
+        }
 
         // Apply approve/deny/bulk hotkeys after the render loop sees the
         // current focus index for this frame.
@@ -3300,6 +3402,8 @@ exit 1
         self.whisper_unread.clear();
         self.whisper_unread_mentions.clear();
         self.active_whisper_login = None;
+        self.whisper_composers.clear();
+        self.focus_whisper_composer = None;
     }
 
     fn invalidate_input_emote_catalogs(&mut self, ctx: &Context) {
@@ -3363,7 +3467,7 @@ exit 1
         }
     }
 
-    fn refresh_emote_messages(&mut self, ctx: &Context) {
+    fn refresh_emote_messages(&mut self, ctx: &Context) -> usize {
         let mut remaining = EMOTE_REFRESH_ROWS_PER_FRAME;
         let mut jobs = 0;
         while remaining > 0 && jobs < 16 {
@@ -3411,6 +3515,7 @@ exit 1
         if !self.pending_emote_refresh.is_empty() {
             ctx.request_repaint();
         }
+        EMOTE_REFRESH_ROWS_PER_FRAME - remaining
     }
 
     fn render_whisper_line_body(
@@ -3569,36 +3674,150 @@ exit 1
     }
 
     fn open_whisper_compose(&mut self, partner_login: &str) {
-        if let Some(channel) = self
-            .state
-            .active_channel
-            .as_ref()
-            .filter(|channel| channel.is_twitch())
-            .cloned()
-            .or_else(|| {
-                self.state
-                    .channel_order
-                    .iter()
-                    .find(|channel| channel.is_twitch())
-                    .cloned()
-            })
-        {
-            self.activate_channel(channel);
-            let draft = if self.split_panes.panes.len() > 1 {
-                &mut self.split_panes.panes[self.split_panes.focused].input_buf
-            } else {
-                &mut self.chat_input_buf
-            };
-            if draft.trim().is_empty() {
-                *draft = format!("/w {partner_login} ");
-            } else {
-                self.push_event_toast(
-                    "Your current draft was kept. Finish or clear it before replying to the whisper.".to_owned(),
-                    t::text_secondary(),
-                    false,
-                );
+        let Some(partner_login) = Self::normalize_whisper_login(partner_login) else {
+            return;
+        };
+        self.whisper_threads
+            .entry(partner_login.clone())
+            .or_default();
+        if !self.whisper_order.contains(&partner_login) {
+            self.touch_whisper_thread_order(&partner_login);
+        }
+        self.whisper_composers
+            .entry(partner_login.clone())
+            .or_default();
+        self.activate_whisper_thread(&partner_login);
+        self.focus_whisper_composer = Some(partner_login);
+    }
+
+    fn whisper_composer_id(&self, partner_login: &str) -> egui::Id {
+        egui::Id::new((
+            "whisper_composer",
+            self.state.auth.user_id.as_deref(),
+            partner_login,
+        ))
+    }
+
+    fn fail_pending_whispers(&mut self, message: &str) {
+        let mut failed_recipients = Vec::new();
+        for (recipient, composer) in &mut self.whisper_composers {
+            if !composer.pending.is_empty() {
+                failed_recipients.push(recipient.clone());
+            }
+            for text in composer.pending.clone() {
+                composer.fail_attempt(&text, message);
             }
         }
+        for recipient in failed_recipients {
+            self.show_failed_whisper(&recipient);
+        }
+    }
+
+    fn show_failed_whisper(&mut self, recipient: &str) {
+        self.whisper_threads
+            .entry(recipient.to_owned())
+            .or_default();
+        if !self.whisper_order.iter().any(|thread| thread == recipient) {
+            self.touch_whisper_thread_order(recipient);
+        }
+        if !self.whispers_visible {
+            self.activate_whisper_thread(recipient);
+        }
+    }
+
+    fn render_whisper_composer(&mut self, ui: &mut egui::Ui, partner_login: &str) {
+        let mut composer = self
+            .whisper_composers
+            .remove(partner_login)
+            .unwrap_or_default();
+        let signed_in = self.state.auth.logged_in
+            && self
+                .state
+                .auth
+                .user_id
+                .as_ref()
+                .is_some_and(|id| !id.is_empty());
+        let ready = signed_in && self.pending_auth.is_none();
+        let editor = ui.add_enabled(
+            ready,
+            egui::TextEdit::singleline(&mut composer.text)
+                .id(self.whisper_composer_id(partner_login))
+                .desired_width(ui.available_width())
+                .hint_text(format!("Whisper to @{partner_login}")),
+        );
+        if self.focus_whisper_composer.as_deref() == Some(partner_login) && ready {
+            self.focus_whisper_composer = None;
+            editor.request_focus();
+        }
+        let enter = editor.lost_focus()
+            && ui.input(|input| input.key_pressed(egui::Key::Enter) && input.modifiers.is_none());
+        let count = composer.text.trim().chars().count();
+        let can_send = ready && composer.pending.is_empty() && (1..=500).contains(&count);
+        let mut send = enter && can_send;
+        ui.horizontal(|ui| {
+            send |= ui
+                .add_enabled(can_send, egui::Button::new("Send"))
+                .clicked();
+            if !signed_in {
+                if ui.button("Sign in").clicked() && !self.login_dialog.open {
+                    self.login_dialog.toggle();
+                }
+            } else if self.pending_auth.is_some() {
+                ui.label(RichText::new("Signing in…").font(t::tiny()));
+            } else if !composer.pending.is_empty() {
+                ui.label(RichText::new("Sending…").font(t::tiny()));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new(format!("{count}/500")).font(t::tiny()).color(
+                    if count > 500 {
+                        t::red()
+                    } else {
+                        t::text_muted()
+                    },
+                ))
+                .on_hover_text("Whispers are limited to 500 characters.");
+            });
+        });
+        if let Some(failed) = composer.failed.front() {
+            let mut dismiss = false;
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Send failed").font(t::tiny()).color(t::red()))
+                    .on_hover_text(&failed.message);
+                if composer.text == failed.text {
+                    dismiss = ui.small_button("Dismiss").clicked();
+                } else if ui
+                    .small_button("Copy text")
+                    .on_hover_text(&failed.message)
+                    .clicked()
+                {
+                    ui.ctx().copy_text(failed.text.clone());
+                    dismiss = true;
+                }
+            });
+            if dismiss {
+                composer.failed.pop_front();
+            }
+        }
+        if enter && ready {
+            editor.request_focus();
+        }
+        if send {
+            let text = composer.text.clone();
+            if self.try_send_cmd(AppCommand::SendWhisper {
+                target_login: partner_login.to_owned(),
+                text: text.clone(),
+            }) {
+                composer.pending.push(text);
+            } else {
+                composer.failed.push_back(FailedWhisper {
+                    text,
+                    message: "The message could not be queued. Your draft was kept.".to_owned(),
+                });
+            }
+            editor.request_focus();
+        }
+        self.whisper_composers
+            .insert(partner_login.to_owned(), composer);
     }
 
     fn render_whisper_thread_list(
@@ -3781,38 +4000,58 @@ exit 1
         let other_text = t::text_primary();
         let other_meta = t::text_secondary();
 
-        egui::Frame::new()
-            .fill(t::bg_surface())
-            .stroke(t::stroke_subtle())
-            .corner_radius(t::RADIUS)
-            .inner_margin(Margin::symmetric(10, 8))
-            .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        RichText::new(format!("@{display_name}"))
-                            .font(t::small())
-                            .strong(),
-                    );
-                    ui.label(
-                        RichText::new(format!("{} messages", lines.len()))
-                            .font(t::tiny())
-                            .color(t::text_secondary()),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button(RichText::new("Reply").font(t::small())).clicked() {
-                            *compose_thread = Some(current_thread.to_owned());
-                        }
-                        if ui
-                            .button(RichText::new("Mark read").font(t::small()))
-                            .clicked()
-                        {
-                            *mark_read_thread = Some(current_thread.to_owned());
-                        }
+        if !compact_layout {
+            egui::Frame::new()
+                .fill(t::bg_surface())
+                .stroke(t::stroke_subtle())
+                .corner_radius(t::RADIUS)
+                .inner_margin(Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(format!("@{display_name}"))
+                                .font(t::small())
+                                .strong(),
+                        );
+                        ui.label(
+                            RichText::new(format!("{} messages", lines.len()))
+                                .font(t::tiny())
+                                .color(t::text_secondary()),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button(RichText::new("Reply").font(t::small())).clicked() {
+                                *compose_thread = Some(current_thread.to_owned());
+                            }
+                            if ui
+                                .button(RichText::new("Mark read").font(t::small()))
+                                .clicked()
+                            {
+                                *mark_read_thread = Some(current_thread.to_owned());
+                            }
+                        });
                     });
                 });
-            });
 
-        ui.add_space(6.0);
+            ui.add_space(6.0);
+        }
+
+        let row_height = ui.spacing().interact_size.y.max(
+            ui.text_style_height(&egui::TextStyle::Body) + ui.spacing().button_padding.y * 2.0,
+        );
+        let has_failure = self.whisper_composers
+            .get(current_thread)
+            .is_some_and(|composer| !composer.failed.is_empty());
+        let composer_height = row_height * 2.0
+            + ui.spacing().item_spacing.y
+            + if has_failure {
+                row_height + ui.spacing().item_spacing.y
+            } else {
+                0.0
+            };
+        egui::TopBottomPanel::bottom(egui::Id::new(("whisper_footer", current_thread)))
+            .frame(egui::Frame::NONE)
+            .exact_height(composer_height)
+            .show_inside(ui, |ui| self.render_whisper_composer(ui, current_thread));
 
         let messages_height = ui.available_height();
         if messages_height <= 0.0 {
@@ -3830,7 +4069,7 @@ exit 1
                     .inner_margin(Margin::symmetric(8, 8))
                     .show(ui, |ui| {
                         egui::ScrollArea::vertical()
-                            .id_salt(("whisper_messages", compact_layout))
+                            .id_salt(("whisper_messages", current_thread, compact_layout))
                             .auto_shrink([false, false])
                             .stick_to_bottom(true)
                             .show(ui, |ui| {
@@ -3848,7 +4087,7 @@ exit 1
                                         (ui.available_width() * 0.9).max(140.0)
                                     } else {
                                         (ui.available_width() * 0.76).max(220.0)
-                                    };
+                                    }.min(ui.available_width());
                                     if line.is_self {
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::TOP),
@@ -3959,10 +4198,23 @@ exit 1
         let mut mark_read_thread: Option<String> = None;
         let mut compose_thread: Option<String> = None;
 
+        let bounds = ctx.screen_rect().shrink(8.0);
+        let style = ctx.style();
+        let frame = egui::Frame::window(&style);
+        let title_height = ctx
+            .fonts(|fonts| fonts.row_height(&egui::TextStyle::Heading.resolve(&style)))
+            .max(style.spacing.interact_size.y)
+            + frame.inner_margin.sum().y
+            + frame.stroke.width;
+        let max_size = (bounds.size() - frame.total_margin().sum() - egui::vec2(0.0, title_height))
+            .max(egui::Vec2::splat(1.0));
         egui::Window::new("Whispers")
             .open(&mut window_open)
-            .default_size(egui::vec2(760.0, 500.0))
-            .min_width(340.0)
+            .default_size(egui::vec2(760.0, 500.0).min(max_size))
+            .min_size(egui::vec2(240.0, 180.0).min(max_size))
+            .max_size(max_size)
+            .constrain_to(bounds)
+            .collapsible(false)
             .show(ctx, |ui| {
                 if thread_order.is_empty() {
                     ui.label(
@@ -3991,23 +4243,25 @@ exit 1
 
                 let compact_layout = ui.available_width() < 680.0;
                 if compact_layout {
-                    let thread_area_height = (ui.available_height() * 0.35).clamp(84.0, 180.0);
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(ui.available_width(), thread_area_height),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            chrome::card_frame().show(ui, |ui| {
-                                self.render_whisper_thread_list(
-                                    ui,
-                                    &thread_order,
-                                    &mut current_thread,
-                                    &mut select_thread,
-                                    true,
-                                );
-                            });
-                        },
-                    );
-                    ui.add_space(8.0);
+                    let display_name = self.whisper_display_names.get(&current_thread)
+                        .map(String::as_str).unwrap_or(&current_thread);
+                    egui::ComboBox::from_id_salt("whisper_thread_selector")
+                        .width(ui.available_width())
+                        .selected_text(format!("@{display_name}"))
+                        .truncate()
+                        .show_ui(ui, |ui| {
+                            for thread in &thread_order {
+                                let display = self.whisper_display_names.get(thread)
+                                    .map(String::as_str).unwrap_or(thread);
+                                let unread = self.whisper_unread.get(thread).copied().unwrap_or(0);
+                                let label = if unread > 0 { format!("@{display} ({unread})") }
+                                    else { format!("@{display}") };
+                                if ui.selectable_label(current_thread == *thread, label).clicked() {
+                                    current_thread.clone_from(thread);
+                                    select_thread = Some(thread.clone());
+                                }
+                            }
+                        });
                     self.render_whisper_conversation_panel(
                         ui,
                         &current_thread,
@@ -4016,7 +4270,8 @@ exit 1
                         true,
                     );
                 } else {
-                    ui.horizontal(|ui| {
+                    ui.allocate_ui_with_layout(ui.available_size(),
+                        egui::Layout::left_to_right(egui::Align::Min), |ui| {
                         let pane_height = ui.available_height();
                         let thread_pane_width = (ui.available_width() * 0.30).clamp(160.0, 280.0);
 
@@ -4094,7 +4349,6 @@ exit 1
     }
 
     fn drain_events(&mut self, ctx: &Context) -> u32 {
-        const MAX_EVENTS_PER_FRAME: u32 = 200;
         let mut count = 0u32;
         while let Ok(evt) = self.event_rx.try_recv() {
             self.apply_event(evt, ctx);
@@ -4613,6 +4867,12 @@ exit 1
                     return;
                 };
 
+                if is_self && !is_history {
+                    if let Some(composer) = self.whisper_composers.get_mut(&partner_login) {
+                        composer.acknowledge(&text);
+                    }
+                }
+
                 let display_name = if is_self {
                     if target_login.trim().is_empty() {
                         partner_login.clone()
@@ -4794,11 +5054,18 @@ exit 1
                     host.update_auth_snapshot(PluginAuthSnapshot::default());
                 }
             }
-            AppEvent::WhisperSendFailed { owner_user_id, message } => {
+            AppEvent::WhisperSendFailed { owner_user_id, target_login, text, message } => {
                 if !self.state.auth.logged_in || owner_user_id.is_empty()
                     || self.state.auth.user_id.as_deref() != Some(owner_user_id.as_str())
                 {
                     return;
+                }
+                if let Some(partner) = Self::normalize_whisper_login(&target_login) {
+                    let matched = self.whisper_composers.get_mut(&partner)
+                        .is_some_and(|composer| composer.fail_attempt(&text, &message));
+                    if matched {
+                        self.show_failed_whisper(&partner);
+                    }
                 }
                 self.enqueue_event_toast(EventToast {
                     text: message,
@@ -4814,6 +5081,23 @@ exit 1
                 }
                 if context == "RefreshAuth" {
                     self.auth_refresh_inflight = false;
+                }
+                if context == "SendWhisper" {
+                    let had_pending = self.whisper_composers.values()
+                        .any(|composer| !composer.pending.is_empty());
+                    self.fail_pending_whispers(&message);
+                    if had_pending && self.state.auth.logged_in {
+                        if let Some(owner) = self.state.auth.user_id.as_ref().filter(|id| !id.is_empty()) {
+                            self.enqueue_event_toast(EventToast {
+                                text: message,
+                                owner_user_id: Some(owner.clone()),
+                                hue: t::red(),
+                                confetti: false,
+                                born: std::time::Instant::now(),
+                            });
+                        }
+                    }
+                    return;
                 }
                 tracing::error!("[{context}] {message}");
                 // Inject a visible error notice into the active channel so the
@@ -5988,7 +6272,13 @@ exit 1
         // Events can enqueue more commands. Drain events first so a runtime
         // waiting to publish one can resume and consume its command channel.
         let events = self.drain_events(ctx);
+        if self.cmd_tx.sender.is_closed() {
+            self.fail_pending_whispers(CommandQueueError::Closed.message());
+        }
         if let Some(error) = self.cmd_tx.flush(ctx) {
+            if error == CommandQueueError::Closed {
+                self.fail_pending_whispers(error.message());
+            }
             warn!("{}", error.message());
             self.push_event_toast(error.message().to_owned(), t::red(), false);
         }
@@ -6105,6 +6395,10 @@ exit 1
             AppCommand::ShowUserCard { login, channel } => Some((login.clone(), channel.clone())),
             _ => None,
         };
+        let whisper = match &command {
+            AppCommand::SendWhisper { target_login, text } => Some((target_login.clone(), text.clone())),
+            _ => None,
+        };
         if !self.try_send_cmd(command) {
             if let Some(pane) = input_pane {
                 self.split_panes.panes[pane].input_buf = draft;
@@ -6114,6 +6408,11 @@ exit 1
             return false;
         }
 
+        if let Some((recipient, text)) = whisper {
+            if let Some(recipient) = Self::normalize_whisper_login(&recipient) {
+                self.whisper_composers.entry(recipient).or_default().pending.push(text);
+            }
+        }
         if reply.is_some() {
             self.pending_reply = None;
         }
@@ -6594,6 +6893,8 @@ exit 1
         }
         if let Some(search) = self.message_search.get_mut(&channel) {
             if search.open
+                && search.owns_keyboard(ctx)
+                && !ctx.is_context_menu_open()
                 && ctx.input_mut(|i| consume_exact_key(i, egui::Modifiers::NONE, egui::Key::Escape))
             {
                 search.close();
@@ -7424,9 +7725,8 @@ exit 1
             self.hotkey_bindings.get(HotkeyAction::SelectTab9),
         ];
 
-        // Legacy aliases: users who haven't rebound get the full Chatterino
-        // Ctrl+Tab / Ctrl+PageDown / Alt+Right set for free.  Once they
-        // customize the binding, only their chosen shortcut fires.
+        // Default tab bindings also accept Ctrl+PageDown and Alt+Right.
+        // A customized binding disables those aliases.
         let defaults = crust_core::HotkeyBindings::defaults();
         let next_legacy = next_b == defaults.get(HotkeyAction::NextTab);
         let prev_legacy = prev_b == defaults.get(HotkeyAction::PrevTab);
@@ -7640,13 +7940,17 @@ impl eframe::App for CrustApp {
 
 impl CrustApp {
     fn update_ui(&mut self, ctx: &Context) {
-        // Slow-frame tracing: start a timer for every update() call and warn
-        // loudly when a single frame takes longer than the threshold so we
-        // can pinpoint hitches when users report them.  Set
-        // `CRUST_SLOW_FRAME_MS` to an integer (default 100ms) to tune, or a
-        // value over 10000 to disable.
         let frame_start = std::time::Instant::now();
+        let image_work_before = self.emote_bytes.work_stats(ctx);
+        let mut phase_start = frame_start;
+        let mut finish_phase = || {
+            let now = std::time::Instant::now();
+            let elapsed_ms = now.duration_since(phase_start).as_secs_f64() * 1000.0;
+            phase_start = now;
+            elapsed_ms
+        };
         self.emote_bytes.begin_frame(ctx);
+        let image_begin_ms = finish_phase();
 
         // Keep a cloned ctx handle so non-UI code paths (e.g. activate_channel
         // when triggered by events) can write to egui temp storage and
@@ -7728,7 +8032,10 @@ impl CrustApp {
             });
         }
 
-        if !self.handle_settings_hotkey_capture(ctx) {
+        if !self.settings_open {
+            self.settings_filter_editor_modal.close();
+        }
+        if !self.handle_settings_hotkey_capture(ctx) && !self.settings_filter_editor_modal.open {
             let picker_was_open = self.emote_picker.open;
             self.emote_picker.handle_shortcuts(ctx);
             if picker_was_open && !self.emote_picker.open {
@@ -7742,8 +8049,12 @@ impl CrustApp {
             }
         }
 
+        let moderation_hotkey = self.consume_mod_hotkey_input(ctx);
+        let setup_ms = finish_phase();
         let events = self.service_runtime_channels(ctx);
-        self.refresh_emote_messages(ctx);
+        let events_ms = finish_phase();
+        let emote_rows = self.refresh_emote_messages(ctx);
+        let emote_backfill_ms = finish_phase();
         let had_events = events > 0;
 
         // Repaint policy:
@@ -7881,6 +8192,8 @@ impl CrustApp {
                 self.request_stream_status_refresh(&login);
             }
         }
+
+        let maintenance_ms = finish_phase();
 
         // Render profile popup and dispatch any actions.
         for action in self.user_profile_popup.show(
@@ -8502,12 +8815,13 @@ impl CrustApp {
         let moderation_channel = self.active_moderation_channel();
 
         if self.mod_tools_open {
-            self.render_mod_tools_window(ctx, moderation_channel);
+            self.render_mod_tools_window(ctx, moderation_channel, moderation_hotkey);
         }
 
         show_plugin_windows(ctx, &plugin_ui_snapshot, &mut self.plugin_ui_session);
 
         self.show_whispers_window(ctx);
+        let dialogs_ms = finish_phase();
 
         // Top bar
         // Auto-collapse sidebar into top tabs when window is very narrow so
@@ -8647,7 +8961,6 @@ impl CrustApp {
                                 visibility.ultra_compact_account,
                             );
                             if !visibility.compact_controls
-                                || visibility.show_emote_count
                                 || visibility.show_overflow_menu
                             {
                                 let sep_gap = (t::topbar_font_size() * 0.4).max(6.0);
@@ -8736,7 +9049,7 @@ impl CrustApp {
                                     if visibility.show_perf_in_overflow
                                         && ui
                                             .button(
-                                                RichText::new("Perf overlay")
+                                                RichText::new("Performance")
                                                     .font(t::topbar_font()),
                                             )
                                             .clicked()
@@ -8801,16 +9114,15 @@ impl CrustApp {
                                 }
                             }
 
-                            if visibility.show_emote_count {
-                                ui.label(
-                                    RichText::new(format!("{} emotes", self.emote_bytes.len()))
-                                        .font(t::topbar_font())
-                                        .color(t::text_muted()),
-                                );
-                                ui.separator();
-                            }
-
                             chrome::toolbar_group_frame().show(ui, |ui| {
+                                let action_count = 1 + usize::from(visibility.show_perf_toggle)
+                                    + usize::from(visibility.show_stats_toggle)
+                                    + usize::from(visibility.show_whispers_toggle)
+                                    + usize::from(visibility.show_irc_toggle);
+                                let action_width = estimate_toolbar_group_width(action_count, 4.0,
+                                    visibility.compact_controls) - TOOLBAR_GROUP_FRAME_W
+                                    + if visibility.show_mod_button { TOOLBAR_MOD_BUTTON_W + 4.0 } else { 0.0 };
+                                ui.set_width(action_width.min(ui.available_width()));
                                 ui.with_layout(
                                     egui::Layout::left_to_right(egui::Align::Center),
                                     |ui| {
@@ -9861,6 +10173,8 @@ impl CrustApp {
             }
         }
 
+        let navigation_ms = finish_phase();
+
         // Central area: messages + input
         CentralPanel::default()
             .frame(Frame::new().fill(t::bg_base()).inner_margin(Margin::ZERO))
@@ -10097,6 +10411,10 @@ impl CrustApp {
                             + (t::INPUT_MARGIN.top + t::INPUT_MARGIN.bottom)
                                 as f32
                             + pane_inner_pad
+                            + crate::widgets::chat_input::chat_input_counter_height(
+                                ctx, pane_rect.width() - 2.0 * pane_inner_pad,
+                                &ch, &self.split_panes.panes[pi].input_buf,
+                            )
                             + if pane_reply.is_some() { 36.0 } else { 0.0 };
                         let input_rect = egui::Rect::from_min_max(
                             egui::pos2(
@@ -10443,6 +10761,10 @@ impl CrustApp {
                     } else {
                         input_box_h + (t::INPUT_MARGIN.top + t::INPUT_MARGIN.bottom) as f32
                     };
+                    let input_panel_h = input_panel_h
+                        + crate::widgets::chat_input::chat_input_counter_height(
+                            ctx, ui.available_width(), &active_ch, &self.chat_input_buf,
+                        );
                     TopBottomPanel::bottom("chat_input_panel")
                         .resizable(false)
                         .exact_height(input_panel_h)
@@ -10668,6 +10990,7 @@ impl CrustApp {
                 }
             });
 
+        let chat_ms = finish_phase();
         let picker_prefs = self.emote_picker.preferences();
         if self.emote_picker_prefs_last_saved.as_ref() != Some(&picker_prefs) {
             self.send_cmd(AppCommand::SetEmotePickerPreferences {
@@ -10824,44 +11147,11 @@ impl CrustApp {
             self.apply_global_search_output(output);
         }
 
-        self.perf.set_chat_stats(frame_chat_stats);
+        self.perf.set_chat_stats(frame_chat_stats.clone());
         self.perf.show(ctx);
+        let overlays_ms = finish_phase();
         self.emote_bytes.end_frame(ctx, |command| self.cmd_tx.try_send_background(command));
-
-        // Slow-frame warning - emit once per slow frame with context so we
-        // can diagnose UI-thread hitches from user reports.
-        let frame_ms = frame_start.elapsed().as_millis() as u64;
-        let slow_threshold_ms: u64 = std::env::var("CRUST_SLOW_FRAME_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(100);
-        if frame_ms >= slow_threshold_ms {
-            let active = self
-                .state
-                .active_channel
-                .as_ref()
-                .map(|c| c.display_name().to_owned())
-                .unwrap_or_default();
-            let msg_count = self
-                .state
-                .active_channel
-                .as_ref()
-                .and_then(|c| self.state.channels.get(c))
-                .map(|s| s.messages.len())
-                .unwrap_or(0);
-            let chatter_count = self
-                .state
-                .active_channel
-                .as_ref()
-                .and_then(|c| self.state.channels.get(c))
-                .map(|s| s.chatters.len())
-                .unwrap_or(0);
-            tracing::warn!(
-                "slow frame: {frame_ms} ms (channel={active} msgs={msg_count} \
-                 chatters={chatter_count} channels={})",
-                self.state.channels.len()
-            );
-        }
+        let image_finish_ms = finish_phase();
 
         if self.irc_status_visible {
             self.irc_status_visible = self.irc_status_panel.show(
@@ -10876,6 +11166,53 @@ impl CrustApp {
                 self.irc_status_visible = false;
             }
             self.send_appearance_settings();
+        }
+
+        let finalization_ms = finish_phase();
+        let frame_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
+        self.perf.record_update(frame_ms as f32);
+        let image_work = self.emote_bytes.work_stats(ctx);
+        static SLOW_THRESHOLD_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let slow_threshold_ms = *SLOW_THRESHOLD_MS.get_or_init(|| {
+            std::env::var("CRUST_SLOW_FRAME_MS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(100)
+        });
+        // These phases measure elapsed time inside update_ui, excluding GPU
+        // presentation and event-loop waits. Enable crust_ui::timing=debug to
+        // compare ordinary updates with warnings from the same workload.
+        macro_rules! record_update {
+            ($level:ident) => {
+                tracing::$level!(target: "crust_ui::timing",
+                    frame_ms, image_begin_ms, setup_ms, events_ms,
+                    emote_backfill_ms, maintenance_ms, dialogs_ms, navigation_ms,
+                    chat_ms, overlays_ms, image_finish_ms, finalization_ms,
+                    events, event_limit_reached = events >= MAX_EVENTS_PER_FRAME,
+                    events_pending = self.event_rx.len(), emote_rows,
+                    emote_jobs_pending = self.pending_emote_refresh.len(),
+                    retained_rows = frame_chat_stats.retained_rows,
+                    eligible_rows = frame_chat_stats.eligible_rows,
+                    active_rows = frame_chat_stats.active_rows,
+                    rendered_rows = frame_chat_stats.rendered_rows,
+                    hidden_rows = frame_chat_stats.boundary_hidden_rows,
+                    prefix_rebuilds = frame_chat_stats.prefix_rebuilds,
+                    height_cache_misses = frame_chat_stats.height_cache_misses,
+                    animation_bytes = image_work.animation_bytes,
+                    pending_decodes = image_work.pending_decodes,
+                    completed_decodes = image_work.completed_decodes.saturating_sub(image_work_before.completed_decodes),
+                    background_decode_us = image_work.decode_micros.saturating_sub(image_work_before.decode_micros),
+                    texture_uploads = image_work.texture_uploads.saturating_sub(image_work_before.texture_uploads),
+                    texture_upload_us = image_work.texture_upload_micros.saturating_sub(image_work_before.texture_upload_micros),
+                    channels = self.state.channels.len(),
+                    "UI update"
+                );
+            };
+        }
+        if frame_ms >= slow_threshold_ms as f64 {
+            record_update!(warn);
+        } else {
+            record_update!(debug);
         }
     }
 }
@@ -12961,6 +13298,37 @@ mod tests {
     }
 
     #[test]
+    fn follower_catalog_entries_require_the_account_and_channel_in_picker_and_chat() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("followed");
+        let other = ChannelId::new("other");
+        app.apply_event(crust_core::AppEvent::Authenticated {
+            username: "owner".into(), user_id: "owner".into(),
+        }, &ctx);
+        let mut follower = scoped_emote("follower", Some(channel.clone()), Some("owner"));
+        follower.provider = "twitch".into();
+        let mut account = scoped_emote("subscription", None, Some("owner"));
+        account.provider = "twitch".into();
+        app.apply_event(crust_core::AppEvent::EmoteCatalogUpdated {
+            emotes: vec![follower, account],
+        }, &ctx);
+        app.ensure_input_emote_catalog(&channel);
+        app.ensure_input_emote_catalog(&other);
+        assert_eq!(app.input_emote_catalogs[&channel][0].url, "follower");
+        assert_eq!(app.input_emote_catalogs[&other][0].url, "subscription");
+        let resolve = |channel: &ChannelId, owner: &str| super::resolve_catalog_emote(
+            &app.emote_catalog, &app.emote_catalog_index, channel, owner, "SharedCode",
+        ).map(|entry| entry.url.as_str());
+        assert_eq!(resolve(&channel, "owner"), Some("follower"));
+        assert_eq!(resolve(&other, "owner"), Some("subscription"));
+        assert_eq!(resolve(&channel, "someone_else"), None);
+        app.apply_event(crust_core::AppEvent::LoggedOut, &ctx);
+        app.ensure_input_emote_catalog(&channel);
+        assert!(app.input_emote_catalogs[&channel].is_empty());
+    }
+
+    #[test]
     fn same_count_catalog_updates_replace_metadata_and_remove_old_emotes() {
         let (mut app, _commands) = test_app();
         let ctx = egui::Context::default();
@@ -13677,6 +14045,45 @@ mod tests {
     }
 
     #[test]
+    fn expression_editor_owns_shortcuts_and_escape_before_chat_popups() {
+        let (mut app, mut commands) = test_app();
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("channel");
+        app.state.join_channel(channel.clone());
+        app.settings_open = true;
+        app.settings_section = super::SettingsSection::Highlights;
+        app.settings_filter_editor_modal.open_highlight(0, "message.length > 10");
+        app.emote_picker.open = true;
+        app.message_search_mut(&channel).request_open();
+        app.chat_input_buf = "draft stays here".into();
+        for _ in 0..3 {
+            production_ui_frame(&ctx, &mut app, Vec::new());
+        }
+        for key in [egui::Key::K, egui::Key::W] {
+            production_ui_frame(&ctx, &mut app, shortcut_input(key, egui::Modifiers::CTRL).events);
+            assert!(app.settings_filter_editor_modal.open);
+            assert!(!app.quick_switch.open);
+            assert!(app.state.channels.contains_key(&channel));
+        }
+        production_ui_frame(&ctx, &mut app,
+            shortcut_input(egui::Key::Escape, egui::Modifiers::NONE).events);
+        assert!(!app.settings_filter_editor_modal.open);
+        assert!(app.settings_filter_editor_modal.draft.is_empty());
+        assert!(app.settings_open);
+        assert!(app.emote_picker.open);
+        assert!(app.message_search.get(&channel).unwrap().open);
+        assert_eq!(app.chat_input_buf, "draft stays here");
+        assert!(!std::iter::from_fn(|| commands.try_recv().ok())
+            .any(|command| matches!(command, AppCommand::SendMessage { .. })));
+
+        app.settings_filter_editor_modal.open_highlight(0, "unsaved draft");
+        app.settings_open = false;
+        production_ui_frame(&ctx, &mut app, Vec::new());
+        assert!(!app.settings_filter_editor_modal.open);
+        assert!(app.settings_filter_editor_modal.draft.is_empty());
+    }
+
+    #[test]
     fn quick_switch_leaves_another_composers_navigation_keys_alone() {
         let (mut app, mut commands) = test_app();
         app.state.join_channel(ChannelId::new("first"));
@@ -13704,6 +14111,89 @@ mod tests {
             matches!(command, AppCommand::SendMessage { channel, text, .. }
                 if channel == ChannelId::new("second") && text == "message for second")
         }));
+    }
+
+    #[test]
+    fn message_search_escape_respects_dialog_and_composer_focus() {
+        fn frame(ctx: &egui::Context, app: &mut super::CrustApp, width: f32,
+            events: Vec<egui::Event>) {
+            let _ = ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 800.0))),
+                time: Some(ctx.cumulative_pass_nr() as f64 * 0.1),
+                events,
+                ..Default::default()
+            }, |ctx| app.update_ui(ctx));
+        }
+
+        for width in [1100.0, 620.0] {
+            for dialog in ["accounts", "join", "settings"] {
+                let ctx = egui::Context::default();
+                let (mut app, _commands) = test_app();
+                let channel = ChannelId::new("channel");
+                app.state.join_channel(channel.clone());
+                app.message_search_mut(&channel).request_open();
+                for _ in 0..3 {
+                    frame(&ctx, &mut app, width, Vec::new());
+                }
+                let dialog_input = match dialog {
+                    "accounts" => {
+                        app.login_dialog.toggle();
+                        egui::Id::new("login_token_input")
+                    }
+                    "join" => {
+                        app.join_dialog.toggle();
+                        egui::Id::new("join_channel_input")
+                    }
+                    _ => {
+                        app.settings_open = true;
+                        app.settings_section = super::SettingsSection::Appearance;
+                        egui::Id::new("settings_search")
+                    }
+                };
+                for _ in 0..3 {
+                    frame(&ctx, &mut app, width, Vec::new());
+                }
+                ctx.memory_mut(|memory| memory.request_focus(dialog_input));
+                frame(&ctx, &mut app, width, if dialog == "settings" {
+                    vec![egui::Event::Text("updates".to_owned())]
+                } else { Vec::new() });
+                assert!(ctx.memory(|memory| memory.has_focus(dialog_input)),
+                    "{dialog} owns its field at width {width}");
+                if dialog == "settings" {
+                    assert!(app.settings_section == super::SettingsSection::Updates);
+                }
+                frame(&ctx, &mut app, width,
+                    shortcut_input(egui::Key::Escape, egui::Modifiers::NONE).events);
+                assert!(app.message_search[&channel].open,
+                    "Escape in {dialog} must leave background search open at width {width}");
+                match dialog {
+                    "accounts" => assert!(!app.login_dialog.open),
+                    "join" => assert!(!app.join_dialog.open),
+                    _ => {
+                        assert!(app.settings_open);
+                        assert!(app.settings_section == super::SettingsSection::Appearance);
+                        app.settings_open = false;
+                    }
+                }
+
+                ctx.memory_mut(|memory| memory.request_focus(super::chat_composer_id(None)));
+                frame(&ctx, &mut app, width, Vec::new());
+                frame(&ctx, &mut app, width,
+                    shortcut_input(egui::Key::Escape, egui::Modifiers::NONE).events);
+                assert!(app.message_search[&channel].open,
+                    "Escape in the composer must not dismiss an unfocused search");
+
+                let keyword = egui::Id::new("message_search_field")
+                    .with(channel.as_str()).with("keyword");
+                ctx.memory_mut(|memory| memory.request_focus(keyword));
+                frame(&ctx, &mut app, width, Vec::new());
+                assert!(ctx.memory(|memory| memory.has_focus(keyword)));
+                frame(&ctx, &mut app, width,
+                    shortcut_input(egui::Key::Escape, egui::Modifiers::NONE).events);
+                assert!(!app.message_search[&channel].open,
+                    "the focused search still closes on Escape at width {width}");
+            }
+        }
     }
 
     #[test]
@@ -14005,7 +14495,8 @@ mod tests {
             username: "alice".into(), user_id: id.into(),
         };
         let failed = |owner: &str| crust_core::AppEvent::WhisperSendFailed {
-            owner_user_id: owner.into(), message: "Could not send whisper to bob: unavailable".into(),
+            owner_user_id: owner.into(), target_login: "bob".into(), text: "hello".into(),
+            message: "Could not send whisper to bob: unavailable".into(),
         };
         app.apply_event(auth("1"), &ctx);
         app.apply_event(crust_core::AppEvent::LoggedOut, &ctx);
@@ -14092,7 +14583,7 @@ mod tests {
     }
 
     #[test]
-    fn whisper_reply_uses_the_visible_split_and_preserves_existing_drafts() {
+    fn whisper_reply_keeps_channel_and_recipient_drafts_separate() {
         let (mut app, _commands) = test_app();
         let channel = ChannelId::new("rustlang");
         app.state.join_channel(channel.clone());
@@ -14103,13 +14594,339 @@ mod tests {
         app.state.active_channel = Some(channel);
         app.chat_input_buf = "hidden draft".to_owned();
         app.split_panes.panes[0].input_buf = "other draft".to_owned();
+        app.split_panes.panes[1].input_buf = "current draft".to_owned();
         app.open_whisper_compose("friend");
-        assert_eq!(app.split_panes.panes[1].input_buf, "/w friend ");
+        app.whisper_composers.get_mut("friend").unwrap().text = "private draft".to_owned();
+        assert_eq!(app.split_panes.panes[1].input_buf, "current draft");
         assert_eq!(app.chat_input_buf, "hidden draft");
         assert_eq!(app.split_panes.panes[0].input_buf, "other draft");
-        app.split_panes.panes[1].input_buf = "current draft".to_owned();
         app.open_whisper_compose("someoneelse");
         assert_eq!(app.split_panes.panes[1].input_buf, "current draft");
+        assert_eq!(app.active_whisper_login.as_deref(), Some("someoneelse"));
+        assert_eq!(app.whisper_composers["friend"].text, "private draft");
+        assert!(app.whisper_composers["someoneelse"].text.is_empty());
+        app.open_whisper_compose("@FRIEND");
+        assert_eq!(app.active_whisper_login.as_deref(), Some("friend"));
+        assert_eq!(app.whisper_composers["friend"].text, "private draft");
+    }
+
+    fn whisper_ui_frame(
+        ctx: &egui::Context,
+        app: &mut super::CrustApp,
+        size: egui::Vec2,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                time: Some(ctx.cumulative_pass_nr() as f64 * 0.1),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.update_ui(ctx),
+        )
+    }
+
+    #[test]
+    fn whisper_reply_sends_from_the_account_without_a_joined_channel() {
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(64);
+        let (events, event_receiver) = tokio::sync::mpsc::channel(64);
+        let mut app = super::CrustApp::with_event_channels(commands, event_receiver);
+        let ctx = egui::Context::default();
+        events
+            .try_send(crust_core::AppEvent::Authenticated {
+                username: "alice".into(),
+                user_id: "10".into(),
+            })
+            .unwrap();
+        events
+            .try_send(whisper_event("10", "friend", "alice", false, false))
+            .unwrap();
+        production_ui_frame(&ctx, &mut app, Vec::new());
+        app.whispers_visible = true;
+        app.chat_input_buf = "public draft to keep".into();
+        let mut output = egui::FullOutput::default();
+        for _ in 0..3 {
+            output = production_ui_frame(&ctx, &mut app, Vec::new());
+        }
+        let reply = visible_text_rect(&output, "Reply").expect("reply action must be visible");
+        click_production_ui(&ctx, &mut app, reply.center());
+        production_ui_frame(&ctx, &mut app, Vec::new());
+        assert!(ctx.memory(|memory| memory.has_focus(app.whisper_composer_id("friend"))));
+        production_ui_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::Text("  account reply  ".into())],
+        );
+        production_ui_frame(
+            &ctx,
+            &mut app,
+            shortcut_input(egui::Key::Enter, egui::Modifiers::NONE).events,
+        );
+        let mut sends = Vec::new();
+        while let Ok(command) = receiver.try_recv() {
+            match command {
+                AppCommand::SendWhisper { target_login, text } => sends.push((target_login, text)),
+                AppCommand::SendMessage { .. } | AppCommand::JoinChannel { .. } => {
+                    panic!("a whisper must not join or send to a channel")
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            sends,
+            vec![("friend".to_owned(), "  account reply  ".to_owned())]
+        );
+        assert!(app.state.channel_order.is_empty());
+        assert!(app.state.active_channel.is_none());
+        assert_eq!(app.chat_input_buf, "public draft to keep");
+        assert_eq!(app.whisper_composers["friend"].text, "  account reply  ");
+        assert_eq!(app.whisper_composers["friend"].pending.len(), 1);
+        let mut sent = whisper_event("10", "alice", "friend", true, false);
+        if let crust_core::AppEvent::WhisperReceived { text, .. } = &mut sent {
+            *text = "account reply".into();
+        }
+        events.try_send(sent).unwrap();
+        production_ui_frame(&ctx, &mut app, Vec::new());
+        assert!(app.whisper_composers["friend"].text.is_empty());
+        assert!(app.whisper_composers["friend"].pending.is_empty());
+    }
+
+    #[test]
+    fn whisper_failures_preserve_newer_drafts_and_reject_cleared_attempts() {
+        let (mut app, mut commands) = test_app();
+        let ctx = egui::Context::default();
+        let auth = |user: &str| crust_core::AppEvent::Authenticated {
+            username: user.into(),
+            user_id: user.into(),
+        };
+        let failure = |owner: &str, text: &str| crust_core::AppEvent::WhisperSendFailed {
+            owner_user_id: owner.into(),
+            target_login: "friend".into(),
+            text: text.into(),
+            message: "The recipient cannot receive this whisper.".into(),
+        };
+        app.apply_event(auth("alice"), &ctx);
+        let channel = ChannelId::new("room");
+        assert!(app.submit_chat_input(&channel, "/w friend original message".into(), None, None));
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(AppCommand::SendWhisper { .. })
+        ));
+        app.whisper_composers.get_mut("friend").unwrap().text = "newer draft".into();
+        app.apply_event(failure("alice", "original message"), &ctx);
+        let composer = &app.whisper_composers["friend"];
+        assert_eq!(composer.text, "newer draft");
+        assert!(composer.pending.is_empty());
+        assert_eq!(composer.failed.front().unwrap().text, "original message");
+        assert!(app.whispers_visible);
+        assert_eq!(app.active_whisper_login.as_deref(), Some("friend"));
+
+        app.state.join_channel(channel.clone());
+        app.state.active_channel = Some(channel.clone());
+        assert!(app.submit_chat_input(&channel, "/w friend another attempt".into(), None, None));
+        app.apply_event(
+            crust_core::AppEvent::Error {
+                context: "SendWhisper".into(),
+                message: "Account switching is in progress.".into(),
+            },
+            &ctx,
+        );
+        assert_eq!(app.whisper_composers["friend"].text, "newer draft");
+        assert!(app.whisper_composers["friend"].pending.is_empty());
+        assert_eq!(app.whisper_composers["friend"].failed.len(), 2);
+        while let Ok(command) = commands.try_recv() {
+            assert!(
+                !matches!(command, AppCommand::InjectLocalMessage { .. }),
+                "private send errors must stay out of public channel history"
+            );
+        }
+        assert!(app.state.channels[&channel].messages.is_empty());
+        assert!(app
+            .event_toasts
+            .iter()
+            .chain(&app.event_toast_queue)
+            .all(|toast| toast.owner_user_id.as_deref() == Some("alice")));
+
+        assert!(app.submit_chat_input(&channel, "/w friend delayed attempt".into(), None, None));
+        app.apply_event(auth("bob"), &ctx);
+        assert!(app.whisper_composers.is_empty());
+        assert!(app.focus_whisper_composer.is_none());
+        app.apply_event(auth("alice"), &ctx);
+        app.apply_event(failure("alice", "delayed attempt"), &ctx);
+        assert!(app.whisper_composers.is_empty());
+        assert!(app.whisper_threads.is_empty());
+        assert!(!app.whispers_visible);
+
+        assert!(app.submit_chat_input(&channel, "/w friend recover this".into(), None, None));
+        app.apply_event(failure("alice", "recover this"), &ctx);
+        assert_eq!(app.whisper_composers["friend"].text, "recover this");
+        app.apply_event(crust_core::AppEvent::LoggedOut, &ctx);
+        assert!(app.whisper_composers.is_empty());
+    }
+
+    #[test]
+    fn whisper_window_keeps_the_composer_visible_and_validates_unicode_at_narrow_sizes() {
+        let (mut app, mut commands) = test_app();
+        let ctx = egui::Context::default();
+        app.apply_event(
+            crust_core::AppEvent::Authenticated {
+                username: "alice".into(),
+                user_id: "10".into(),
+            },
+            &ctx,
+        );
+        app.apply_event(
+            whisper_event("10", "long_recipient_name", "alice", false, false),
+            &ctx,
+        );
+        app.open_whisper_compose("long_recipient_name");
+        for size in [
+            egui::vec2(1100.0, 800.0),
+            egui::vec2(320.0, 360.0),
+            egui::vec2(220.0, 200.0),
+        ] {
+            let mut output = egui::FullOutput::default();
+            for _ in 0..4 {
+                output = whisper_ui_frame(&ctx, &mut app, size, Vec::new());
+            }
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            let window = ctx
+                .memory(|memory| memory.area_rect(egui::Id::new("Whispers")))
+                .unwrap();
+            assert!(
+                screen.contains_rect(window),
+                "whisper window {window:?} exceeds {screen:?}"
+            );
+            let editor = ctx
+                .read_response(app.whisper_composer_id("long_recipient_name"))
+                .unwrap();
+            assert!(
+                screen.contains_rect(editor.rect),
+                "composer {:?} exceeds {screen:?}",
+                editor.rect
+            );
+            assert!(window.contains_rect(editor.rect));
+            assert!(
+                visible_text_rect(&output, "Send").is_some(),
+                "Send must remain visible at {size:?}"
+            );
+            for pressed in [true, false] {
+                whisper_ui_frame(
+                    &ctx,
+                    &mut app,
+                    size,
+                    vec![
+                        egui::Event::PointerMoved(editor.rect.center()),
+                        egui::Event::PointerButton {
+                            pos: editor.rect.center(),
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+            assert!(ctx.memory(|memory| memory.has_focus(editor.id)),
+                "whisper editor {:?} at {size:?} did not receive its click; focused={:?}, layer={:?}, hit={:?}, after={:?}",
+                editor.rect, ctx.memory(|memory| memory.focused()), editor.layer_id,
+                ctx.layer_id_at(editor.rect.center()), ctx.read_response(editor.id).map(|response| response.rect));
+        }
+        let size = egui::vec2(220.0, 200.0);
+        whisper_ui_frame(
+            &ctx,
+            &mut app,
+            size,
+            vec![egui::Event::Text("界".repeat(501))],
+        );
+        let output = whisper_ui_frame(
+            &ctx,
+            &mut app,
+            size,
+            shortcut_input(egui::Key::Enter, egui::Modifiers::NONE).events,
+        );
+        assert!(visible_text_rect(&output, "501/500").is_some());
+        while let Ok(command) = commands.try_recv() {
+            assert!(!matches!(command, AppCommand::SendWhisper { .. }));
+        }
+        assert_eq!(
+            app.whisper_composers["long_recipient_name"]
+                .text
+                .chars()
+                .count(),
+            501
+        );
+        whisper_ui_frame(
+            &ctx,
+            &mut app,
+            size,
+            shortcut_input(egui::Key::Backspace, egui::Modifiers::NONE).events,
+        );
+        let output = whisper_ui_frame(&ctx, &mut app, size, Vec::new());
+        assert!(visible_text_rect(&output, "500/500").is_some());
+        let send = visible_text_rect(&output, "Send").unwrap();
+        for pressed in [true, false] {
+            whisper_ui_frame(
+                &ctx,
+                &mut app,
+                size,
+                vec![
+                    egui::Event::PointerMoved(send.center()),
+                    egui::Event::PointerButton {
+                        pos: send.center(),
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        let sent: Vec<_> = std::iter::from_fn(|| commands.try_recv().ok())
+            .filter_map(|command| match command {
+                AppCommand::SendWhisper { target_login, text } => Some((target_login, text)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sent,
+            vec![("long_recipient_name".to_owned(), "界".repeat(500))]
+        );
+        drop(commands);
+        whisper_ui_frame(&ctx, &mut app, size, Vec::new());
+        assert!(app.whisper_composers["long_recipient_name"]
+            .pending
+            .is_empty());
+        assert_eq!(
+            app.whisper_composers["long_recipient_name"].text,
+            "界".repeat(500)
+        );
+    }
+
+    #[test]
+    fn whisper_success_keeps_edits_made_while_the_previous_message_was_sending() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        app.apply_event(
+            crust_core::AppEvent::Authenticated {
+                username: "alice".into(),
+                user_id: "10".into(),
+            },
+            &ctx,
+        );
+        app.submit_chat_input(
+            &ChannelId::new("room"),
+            "/w friend previous message".into(),
+            None,
+            None,
+        );
+        app.whisper_composers.get_mut("friend").unwrap().text = "next message".into();
+        let mut sent = whisper_event("10", "alice", "friend", true, false);
+        if let crust_core::AppEvent::WhisperReceived { text, .. } = &mut sent {
+            *text = "previous message".into();
+        }
+        app.apply_event(sent, &ctx);
+        assert_eq!(app.whisper_composers["friend"].text, "next message");
+        assert!(app.whisper_composers["friend"].pending.is_empty());
     }
 
     fn search_message(channel: ChannelId) -> crust_core::ChatMessage {
@@ -14239,6 +15056,50 @@ mod tests {
     }
 
     #[test]
+    fn replacing_a_split_channel_keeps_its_draft_selection_and_reply_scope() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        for name in ["first", "second", "third"] {
+            app.state.join_channel(ChannelId::new(name));
+        }
+        app.split_panes.add_pane(ChannelId::new("first"), None);
+        app.split_panes.add_pane(ChannelId::new("second"), None);
+        app.split_panes.panes[0].input_buf = "other draft".to_owned();
+        app.split_panes.panes[1].input_buf = "keep 🙂 text".to_owned();
+        app.activate_channel(ChannelId::new("second"));
+        let id = super::chat_composer_id(Some(app.split_panes.panes[1].id));
+        for _ in 0..3 {
+            production_ui_frame(&ctx, &mut app, Vec::new());
+        }
+        let mut editor = egui::TextEdit::load_state(&ctx, id).expect("split editor state");
+        editor.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(0), egui::text::CCursor::new(4),
+        )));
+        egui::TextEdit::store_state(&ctx, id, editor);
+        app.pending_reply = Some(super::PendingReply {
+            channel: ChannelId::new("second"),
+            info: crust_core::ReplyInfo {
+                parent_msg_id: "second-parent".into(),
+                parent_user_login: "sender".into(),
+                parent_display_name: "Sender".into(),
+                parent_msg_body: "original message".into(),
+            },
+        });
+
+        app.activate_channel(ChannelId::new("third"));
+        assert_eq!(app.split_panes.panes[1].input_buf, "keep 🙂 text");
+        assert!(app.reply_for_composer(&ChannelId::new("third"), Some(1)).is_none());
+        production_ui_frame(&ctx, &mut app, vec![egui::Event::Text("kept".to_owned())]);
+        assert_eq!(app.split_panes.panes[1].input_buf, "kept 🙂 text");
+        assert_eq!(app.split_panes.panes[0].input_buf, "other draft");
+        assert!(ctx.memory(|memory| memory.has_focus(id)));
+        app.activate_channel(ChannelId::new("second"));
+        assert_eq!(app.split_panes.panes[1].input_buf, "kept 🙂 text");
+        assert_eq!(app.reply_for_composer(&ChannelId::new("second"), Some(1))
+            .unwrap().parent_msg_id, "second-parent");
+    }
+
+    #[test]
     fn closing_splits_routes_typing_to_the_surviving_draft() {
         for (pane_count, focused, close, keep, expected, remaining) in [
             (3, 1, Some(1), None, "third", 2),
@@ -14353,18 +15214,195 @@ mod tests {
 
     #[test]
     fn shifted_moderation_shortcuts_keep_their_distinct_actions() {
-        let (mut app, _commands) = test_app();
-        app.mod_tools_open = true;
         let ctx = egui::Context::default();
-        let _ = ctx.run(shortcut_input(egui::Key::A, egui::Modifiers::SHIFT), |ctx| {
-            assert!(matches!(app.consume_mod_hotkey_input(ctx), super::ModHotkey::BulkApprove));
-        });
-        let _ = ctx.run(shortcut_input(egui::Key::D, egui::Modifiers::SHIFT), |ctx| {
-            assert!(matches!(app.consume_mod_hotkey_input(ctx), super::ModHotkey::BulkDeny));
-        });
-        let _ = ctx.run(shortcut_input(egui::Key::Tab, egui::Modifiers::SHIFT), |ctx| {
-            assert!(matches!(app.consume_mod_hotkey_input(ctx), super::ModHotkey::PrevTab));
-        });
+        let (mut app, mut commands) = moderation_test_app();
+        activate_moderation_window(&ctx, &mut app);
+        for (key, modifiers, expected, action) in [
+            (egui::Key::A, egui::Modifiers::NONE, 1, "ALLOW"),
+            (egui::Key::A, egui::Modifiers::SHIFT, 2, "ALLOW"),
+            (egui::Key::D, egui::Modifiers::SHIFT, 2, "DENY"),
+        ] {
+            production_ui_frame(&ctx, &mut app, shortcut_input(key, modifiers).events);
+            let resolved = moderation_commands(&mut commands);
+            assert_eq!(resolved.len(), expected);
+            assert!(resolved.iter().all(|(_, actual)| actual == action));
+        }
+        production_ui_frame(&ctx, &mut app,
+            shortcut_input(egui::Key::Tab, egui::Modifiers::SHIFT).events);
+        assert_eq!(app.mod_tools_active_tab, super::ModToolsTab::UnbanRequests,
+            "focus {:?}, top {:?}", ctx.memory(|memory| memory.focused()), ctx.top_layer_id());
+        production_ui_frame(&ctx, &mut app, Vec::new());
+        assert!(ctx.memory(|memory| memory.focused().is_none()));
+        production_ui_frame(&ctx, &mut app,
+            shortcut_input(egui::Key::Tab, egui::Modifiers::NONE).events);
+        assert_eq!(app.mod_tools_active_tab, super::ModToolsTab::AutoMod);
+        production_ui_frame(&ctx, &mut app, Vec::new());
+        let filter = ctx.read_response(egui::Id::new("moderation_filter")).unwrap().rect;
+        click_production_ui(&ctx, &mut app, filter.center());
+        production_ui_frame(&ctx, &mut app, vec![
+            shortcut_input(egui::Key::A, egui::Modifiers::NONE).events.remove(0),
+            egui::Event::Text("a".to_owned()),
+        ]);
+        assert_eq!(app.mod_tools_filter, "a");
+        assert!(moderation_commands(&mut commands).is_empty());
+        production_ui_frame(&ctx, &mut app,
+            shortcut_input(egui::Key::Tab, egui::Modifiers::SHIFT).events);
+        assert_eq!(app.mod_tools_active_tab, super::ModToolsTab::AutoMod,
+            "Tab from a real editor keeps normal focus traversal");
+    }
+
+    fn moderation_test_app() -> (super::CrustApp, tokio::sync::mpsc::Receiver<AppCommand>) {
+        let (mut app, commands) = test_app();
+        let channel = ChannelId::new("channel");
+        app.state.join_channel(channel.clone());
+        app.state.channels.get_mut(&channel).unwrap().is_mod = true;
+        app.mod_tools_open = true;
+        app.automod_queue.insert(channel, (0..2).map(|index| super::AutoModQueueItem {
+            message_id: format!("held-{index}"),
+            sender_user_id: format!("user-{index}"),
+            sender_login: format!("chatter{index}"),
+            text: "Held message".to_owned(),
+            reason: None,
+        }).collect());
+        (app, commands)
+    }
+
+    fn moderation_commands(commands: &mut tokio::sync::mpsc::Receiver<AppCommand>) -> Vec<(String, String)> {
+        std::iter::from_fn(|| commands.try_recv().ok()).filter_map(|command| match command {
+            AppCommand::ResolveAutoModMessage { message_id, action, .. } => Some((message_id, action)),
+            _ => None,
+        }).collect()
+    }
+
+    fn click_production_ui(ctx: &egui::Context, app: &mut super::CrustApp, pos: egui::Pos2) {
+        for pressed in [true, false] {
+            production_ui_frame(ctx, app, vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos, button: egui::PointerButton::Primary, pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+        }
+    }
+
+    fn activate_moderation_window(ctx: &egui::Context, app: &mut super::CrustApp) {
+        let mut output = egui::FullOutput::default();
+        for _ in 0..3 {
+            output = production_ui_frame(ctx, app, Vec::new());
+        }
+        let channel_label = visible_text_rect(&output, "Channel: #channel")
+            .unwrap_or_else(|| panic!("moderation channel must be visible (open {}, expanded {:?}, whispers {})",
+                app.mod_tools_open, egui::collapsing_header::CollapsingState::load(
+                    ctx, egui::Id::new("Moderation Tools").with("collapsing"),
+                ).map(|state| state.is_open()), app.whispers_visible));
+        click_production_ui(ctx, app, channel_label.center());
+        assert!(ctx.memory(|memory| memory.focused().is_none()));
+    }
+
+    #[test]
+    fn moderation_bulk_shortcuts_ignore_collapsed_covered_and_inactive_windows() {
+        let ctx = egui::Context::default();
+        let (mut app, mut commands) = moderation_test_app();
+        activate_moderation_window(&ctx, &mut app);
+        moderation_commands(&mut commands);
+
+        let window_id = egui::Id::new("Moderation Tools");
+        let rect = ctx.memory(|memory| memory.area_rect(window_id)).unwrap();
+        let output = production_ui_frame(&ctx, &mut app, Vec::new());
+        let title = visible_text_rect(&output, "Moderation Tools").unwrap();
+        let collapse = egui::pos2(rect.left() + 13.0, title.center().y);
+        click_production_ui(&ctx, &mut app, collapse);
+        for _ in 0..3 {
+            production_ui_frame(&ctx, &mut app, Vec::new());
+        }
+        assert!(!egui::collapsing_header::CollapsingState::load(
+            &ctx, window_id.with("collapsing"),
+        ).unwrap().is_open());
+        for key in [egui::Key::A, egui::Key::D] {
+            production_ui_frame(&ctx, &mut app, shortcut_input(key, egui::Modifiers::SHIFT).events);
+            assert!(moderation_commands(&mut commands).is_empty(), "collapsed moderation must not act");
+        }
+
+        let output = production_ui_frame(&ctx, &mut app, Vec::new());
+        let rect = ctx.memory(|memory| memory.area_rect(window_id)).unwrap();
+        let title = visible_text_rect(&output, "Moderation Tools").unwrap();
+        click_production_ui(&ctx, &mut app, egui::pos2(rect.left() + 13.0, title.center().y));
+        activate_moderation_window(&ctx, &mut app);
+        app.whispers_visible = true;
+        for _ in 0..3 {
+            production_ui_frame(&ctx, &mut app, Vec::new());
+        }
+        assert!(ctx.memory(|memory| memory.focused().is_none()));
+        for key in [egui::Key::A, egui::Key::D] {
+            production_ui_frame(&ctx, &mut app, shortcut_input(key, egui::Modifiers::SHIFT).events);
+            assert!(moderation_commands(&mut commands).is_empty(), "a covered moderation window must not act");
+        }
+
+        app.whispers_visible = false;
+        activate_moderation_window(&ctx, &mut app);
+        let outside = egui::pos2(1090.0, 650.0);
+        assert_eq!(ctx.layer_id_at(outside).unwrap().order, egui::Order::Background);
+        click_production_ui(&ctx, &mut app, outside);
+        production_ui_frame(&ctx, &mut app,
+            shortcut_input(egui::Key::A, egui::Modifiers::SHIFT).events);
+        assert!(moderation_commands(&mut commands).is_empty(), "clicking chat relinquishes moderation keys");
+
+        activate_moderation_window(&ctx, &mut app);
+        production_ui_frame(&ctx, &mut app,
+            shortcut_input(egui::Key::A, egui::Modifiers::SHIFT).events);
+        assert_eq!(moderation_commands(&mut commands).len(), 2,
+            "activating the expanded window restores its shortcuts");
+    }
+
+    #[test]
+    fn moderation_navigation_and_approval_stay_with_filtered_entries() {
+        for (tab, expected) in [
+            (super::ModToolsTab::AutoMod, "held-1"),
+            (super::ModToolsTab::UnbanRequests, "request-1"),
+            (super::ModToolsTab::LowTrust, "chatter1"),
+        ] {
+            let ctx = egui::Context::default();
+            let (mut app, mut commands) = moderation_test_app();
+            let channel = ChannelId::new("channel");
+            app.unban_requests.insert(channel.clone(), (0..2).map(|index| super::UnbanRequestItem {
+                request_id: format!("request-{index}"),
+                user_id: format!("user-{index}"),
+                user_login: format!("chatter{index}"),
+                text: Some("Please review".to_owned()),
+                created_at: None,
+                status: None,
+            }).collect());
+            for index in 0..2 {
+                app.state.channels.get_mut(&channel).unwrap().low_trust_users.insert(
+                    format!("chatter{index}"), crust_core::model::LowTrustEntry {
+                        status: crust_core::model::LowTrustStatus::Monitored,
+                        user_id: format!("user-{index}"),
+                        display_name: format!("Chatter{index}"),
+                    },
+                );
+            }
+            app.mod_tools_active_tab = tab;
+            app.mod_tools_filter = " ChAtTeR1 ".to_owned();
+            app.mod_tools_focused_index = 9;
+            activate_moderation_window(&ctx, &mut app);
+            moderation_commands(&mut commands);
+            for navigation in [egui::Key::J, egui::Key::K, egui::Key::J, egui::Key::K] {
+                production_ui_frame(&ctx, &mut app,
+                    shortcut_input(navigation, egui::Modifiers::NONE).events);
+                production_ui_frame(&ctx, &mut app,
+                    shortcut_input(egui::Key::A, egui::Modifiers::NONE).events);
+                let targets: Vec<_> = std::iter::from_fn(|| commands.try_recv().ok())
+                    .filter_map(|command| match command {
+                        AppCommand::ResolveAutoModMessage { message_id, action, .. } if action == "ALLOW" => Some(message_id),
+                        AppCommand::ResolveUnbanRequest { request_id, approve: true, .. } => Some(request_id),
+                        AppCommand::ClearSuspiciousUser { login, .. } => Some(login),
+                        _ => None,
+                    }).collect();
+                assert_eq!(targets, [expected], "{tab:?} navigation must keep a visible target");
+                assert_eq!(app.mod_tools_focused_index, 0);
+            }
+        }
     }
 
     #[test]
@@ -14945,7 +15983,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_poll_chatterino_flags_map_to_create_poll() {
+    fn slash_poll_long_flags_map_to_create_poll() {
         let channel = ChannelId::new("somechannel");
         let parsed = parse_slash_command(
             "/poll --title \"Best fruit\" --choice \"Apple\" --choice \"Pear\" --duration 2m --points 100",

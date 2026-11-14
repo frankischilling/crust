@@ -202,6 +202,6 @@ at wide, narrow, and enlarged-text sizes. Saved-account desktop observations and
 Windows and Linux release checks are recorded in
 [PR #16](https://github.com/frankischilling/crust/pull/16).
 
-Channel-specific follower inventory and live updates for the remaining emote
-scopes remain tracked in
-[issue #9](https://github.com/frankischilling/crust/issues/9).
+The [v0.5.4 interface and performance audit](AUDIT_UI_PERFORMANCE.md) continues
+this work with channel-specific follower inventory, global and personal live
+updates, background animation decoding, and further chat interaction fixes.

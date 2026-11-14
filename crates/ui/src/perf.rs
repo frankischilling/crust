@@ -1,7 +1,7 @@
-//! Real-time performance overlay for debug builds.
+//! UI work and repaint statistics for the performance overlay.
 //!
 //! Tracks:
-//!   - Frame time & FPS (rolling 120-frame window)
+//!   - UI update time and repaint rate (rolling 120-sample windows)
 //!   - Events processed per frame
 //!   - Repaint efficiency (event-driven repaints vs. total frames)
 //!   - Emote cache size (entries + estimated RAM)
@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use crate::theme as t;
 use crate::widgets::message_list::MessageListPerfStats;
-use egui::{Color32, Context, RichText, Window};
+use egui::{Context, RichText, Window};
 
 const WINDOW: usize = 120; // frames to average over
 const TIMELINE_WINDOW: usize = 600;
@@ -20,6 +20,7 @@ const TIMELINE_WINDOW: usize = 600;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ChatPerfStats {
     pub retained_rows: usize,
+    pub eligible_rows: usize,
     pub active_rows: usize,
     pub rendered_rows: usize,
     pub boundary_hidden_rows: usize,
@@ -30,6 +31,7 @@ pub struct ChatPerfStats {
 impl ChatPerfStats {
     pub fn accumulate(&mut self, stats: &MessageListPerfStats) {
         self.retained_rows += stats.retained_rows;
+        self.eligible_rows += stats.eligible_rows;
         self.active_rows += stats.active_rows;
         self.rendered_rows += stats.rendered_rows;
         self.boundary_hidden_rows += stats.boundary_hidden_rows;
@@ -45,6 +47,7 @@ pub struct PerfOverlay {
     // Frame timing
     last_frame: Instant,
     frame_ms: VecDeque<f32>, // rolling frame durations (ms)
+    update_ms: VecDeque<f32>,
     fps_timeline: VecDeque<f32>,
 
     // Event throughput
@@ -67,6 +70,7 @@ impl Default for PerfOverlay {
             visible: false,
             last_frame: Instant::now(),
             frame_ms: VecDeque::with_capacity(WINDOW),
+            update_ms: VecDeque::with_capacity(WINDOW),
             fps_timeline: VecDeque::with_capacity(TIMELINE_WINDOW),
             events_per_frame: VecDeque::with_capacity(WINDOW),
             total_events: 0,
@@ -104,6 +108,10 @@ impl PerfOverlay {
         self.chat_stats = stats;
     }
 
+    pub fn record_update(&mut self, elapsed_ms: f32) {
+        push_ring(&mut self.update_ms, elapsed_ms, WINDOW);
+    }
+
     /// Render the overlay window.  Call this anywhere inside `update()`.
     pub fn show(&self, ctx: &Context) {
         if !self.visible {
@@ -111,8 +119,8 @@ impl PerfOverlay {
         }
 
         let avg_ms = avg_f32(&self.frame_ms);
-        let worst_ms = self.frame_ms.iter().cloned().fold(0.0_f32, f32::max);
-        let best_ms = self.frame_ms.iter().cloned().fold(f32::MAX, f32::min);
+        let update_avg_ms = avg_f32(&self.update_ms);
+        let worst_ms = self.update_ms.iter().cloned().fold(0.0_f32, f32::max);
         let fps = if avg_ms > 0.0 { 1000.0 / avg_ms } else { 0.0 };
 
         let avg_events = avg_u32(&self.events_per_frame);
@@ -122,7 +130,7 @@ impl PerfOverlay {
             0.0
         };
 
-        Window::new("⚡ Performance")
+        Window::new("Performance")
             .collapsible(true)
             .resizable(false)
             .default_pos([8.0, 40.0])
@@ -131,21 +139,19 @@ impl PerfOverlay {
                     .num_columns(2)
                     .spacing([16.0, 4.0])
                     .show(ui, |ui| {
-                        // FPS
-                        ui.label(RichText::new("FPS").color(t::text_muted()));
+                        ui.label(RichText::new("Repaints/sec").color(t::text_muted()));
                         ui.label(
                             RichText::new(format!("{fps:.1}"))
-                                .color(fps_color(fps))
+                                .color(t::text_primary())
                                 .strong(),
                         );
                         ui.end_row();
 
-                        // Frame time
-                        ui.label(RichText::new("Frame (avg)").color(t::text_muted()));
-                        ui.label(format!("{avg_ms:.2} ms"));
+                        ui.label(RichText::new("UI update (avg)").color(t::text_muted()));
+                        ui.label(format!("{update_avg_ms:.2} ms"));
                         ui.end_row();
 
-                        ui.label(RichText::new("Frame (worst)").color(t::text_muted()));
+                        ui.label(RichText::new("UI update (worst)").color(t::text_muted()));
                         ui.label(RichText::new(format!("{worst_ms:.2} ms")).color(
                             if worst_ms > 33.0 {
                                 t::yellow()
@@ -155,11 +161,11 @@ impl PerfOverlay {
                         ));
                         ui.end_row();
 
-                        ui.label(RichText::new("Frame (best)").color(t::text_muted()));
-                        ui.label(format!("{best_ms:.2} ms"));
+                        ui.label(RichText::new("Repaint interval").color(t::text_muted()));
+                        ui.label(format!("{avg_ms:.2} ms"));
                         ui.end_row();
 
-                        ui.label(RichText::new("FPS trend").color(t::text_muted()));
+                        ui.label(RichText::new("Repaint trend").color(t::text_muted()));
                         draw_sparkline(ui, &self.fps_timeline, 180.0, 36.0);
                         ui.end_row();
 
@@ -181,7 +187,7 @@ impl PerfOverlay {
                         ui.end_row();
 
                         // Repaint efficiency
-                        ui.label(RichText::new("Repaint efficiency").color(t::text_muted()));
+                        ui.label(RichText::new("Event-triggered updates").color(t::text_muted()));
                         ui.label(
                             RichText::new(format!("{repaint_pct:.1}% event-driven")).color(
                                 if repaint_pct < 5.0 {
@@ -213,6 +219,10 @@ impl PerfOverlay {
 
                         ui.label(RichText::new("Rows retained").color(t::text_muted()));
                         ui.label(format!("{}", self.chat_stats.retained_rows));
+                        ui.end_row();
+
+                        ui.label(RichText::new("Rows after filters/pause").color(t::text_muted()));
+                        ui.label(format!("{}", self.chat_stats.eligible_rows));
                         ui.end_row();
 
                         ui.label(RichText::new("Rows active").color(t::text_muted()));
@@ -260,16 +270,6 @@ fn avg_u32(buf: &VecDeque<u32>) -> f32 {
         return 0.0;
     }
     buf.iter().map(|&x| x as f32).sum::<f32>() / buf.len() as f32
-}
-
-fn fps_color(fps: f32) -> Color32 {
-    if fps >= 55.0 {
-        t::green()
-    } else if fps >= 30.0 {
-        t::yellow()
-    } else {
-        t::red()
-    }
 }
 
 fn sparkline_points(samples: &VecDeque<f32>, width: f32, height: f32) -> Vec<egui::Pos2> {
@@ -349,25 +349,28 @@ mod tests {
         let mut stats = ChatPerfStats::default();
         stats.accumulate(&MessageListPerfStats {
             retained_rows: 1_500,
+            eligible_rows: 1_300,
             active_rows: 400,
             rendered_rows: 36,
-            boundary_hidden_rows: 1_100,
+            boundary_hidden_rows: 900,
             prefix_rebuilt: true,
             height_cache_misses: 8,
         });
         stats.accumulate(&MessageListPerfStats {
             retained_rows: 700,
+            eligible_rows: 600,
             active_rows: 300,
             rendered_rows: 28,
-            boundary_hidden_rows: 400,
+            boundary_hidden_rows: 300,
             prefix_rebuilt: false,
             height_cache_misses: 3,
         });
 
         assert_eq!(stats.retained_rows, 2_200);
+        assert_eq!(stats.eligible_rows, 1_900);
         assert_eq!(stats.active_rows, 700);
         assert_eq!(stats.rendered_rows, 64);
-        assert_eq!(stats.boundary_hidden_rows, 1_500);
+        assert_eq!(stats.boundary_hidden_rows, 1_200);
         assert_eq!(stats.prefix_rebuilds, 1);
         assert_eq!(stats.height_cache_misses, 11);
 

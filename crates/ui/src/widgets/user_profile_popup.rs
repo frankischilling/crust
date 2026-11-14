@@ -176,6 +176,14 @@ impl UserProfilePopup {
         self.follow_age_resolved = None;
     }
 
+    fn close(&mut self) {
+        self.open = false;
+        self.loading = false;
+        self.loading_login.clear();
+        self.ivr_logs_loading = false;
+        self.ban_confirm = false;
+    }
+
     /// Apply a silent Helix follow-age lookup result to the popup. Only
     /// applied when the popup is still showing the same login + channel.
     pub fn set_follow_age_resolved(
@@ -184,11 +192,7 @@ impl UserProfilePopup {
         channel: &ChannelId,
         followed_at: Option<String>,
     ) {
-        let channel_matches = self
-            .channel
-            .as_ref()
-            .map(|c| c == channel)
-            .unwrap_or(false);
+        let channel_matches = self.channel.as_ref().map(|c| c == channel).unwrap_or(false);
         if !channel_matches {
             return;
         }
@@ -247,6 +251,9 @@ impl UserProfilePopup {
 
     /// Called when `AppEvent::UserProfileLoaded` arrives.
     pub fn set_profile(&mut self, mut profile: UserProfile) {
+        if !self.accepts_profile(&profile.login) {
+            return;
+        }
         // If a UserPronounsLoaded event arrived *before* the profile did
         // (alejo.io is usually faster than IVR/Helix), apply the stashed
         // pronouns here so the usercard shows them on the first paint.
@@ -263,7 +270,6 @@ impl UserProfilePopup {
             }
         }
         self.loading = false;
-        self.open = true;
         self.original_profile_display_name = Some(profile.display_name.clone());
         self.profile = Some(profile);
     }
@@ -327,8 +333,10 @@ impl UserProfilePopup {
 
     /// Called when a profile request completes without data.
     pub fn set_unavailable(&mut self, login: &str) {
+        if !self.accepts_profile(login) {
+            return;
+        }
         self.loading = false;
-        self.open = true;
         self.loading_login = login.to_owned();
         self.profile = None;
         self.original_profile_display_name = None;
@@ -337,15 +345,15 @@ impl UserProfilePopup {
     /// Returns true when this popup is currently expecting a profile for
     /// `login` (either while loading or while refreshing an already-open card).
     pub fn accepts_profile(&self, login: &str) -> bool {
+        if !self.open {
+            return false;
+        }
         if self.loading {
             return self.loading_login.eq_ignore_ascii_case(login);
         }
-        self.open
-            && self
-                .profile
-                .as_ref()
-                .map(|p| p.login.eq_ignore_ascii_case(login))
-                .unwrap_or(false)
+        self.profile
+            .as_ref()
+            .is_some_and(|p| p.login.eq_ignore_ascii_case(login))
     }
 
     /// The Twitch user-id of the currently displayed profile (if loaded).
@@ -451,43 +459,47 @@ impl UserProfilePopup {
             }
 
             ui.vertical(|ui| {
+                ui.set_max_width(ui.available_width());
                 ui.add_space(2.0);
 
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
-                    ui.add(egui::Label::new(
-                        RichText::new(&profile.display_name)
-                            .strong()
-                            .size((t::usercard_font_size() * 0.57).max(10.0))
-                            .color(t::text_primary()),
-                    ));
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&profile.display_name)
+                                .strong()
+                                .size((t::usercard_font_size() * 0.57).max(10.0))
+                                .color(t::text_primary()),
+                        )
+                        .wrap(),
+                    );
                     if profile.is_live {
-                        egui::Frame::new()
+                        let frame = egui::Frame::new()
                             .fill(t::danger_strong_bg())
                             .corner_radius(t::RADIUS_SM)
-                            .inner_margin(egui::Margin::symmetric(5, 2))
-                            .show(ui, |ui| {
-                                ui.add(egui::Label::new(
-                                    RichText::new("● LIVE")
-                                        .color(t::text_on_accent())
-                                        .size((t::usercard_font_size() * 0.36).max(8.0))
-                                        .strong(),
-                                ));
-                            });
+                            .inner_margin(egui::Margin::symmetric(5, 2));
+                        wrapped_text_frame(
+                            ui,
+                            frame,
+                            RichText::new("● LIVE")
+                                .color(t::text_on_accent())
+                                .size((t::usercard_font_size() * 0.36).max(8.0))
+                                .strong(),
+                        );
                     }
                     if profile.is_banned {
-                        egui::Frame::new()
+                        let frame = egui::Frame::new()
                             .fill(t::danger_strong_bg().gamma_multiply(0.9))
                             .corner_radius(t::RADIUS_SM)
-                            .inner_margin(egui::Margin::symmetric(5, 2))
-                            .show(ui, |ui| {
-                                ui.add(egui::Label::new(
-                                    RichText::new("BANNED")
-                                        .color(t::text_on_accent())
-                                        .size((t::usercard_font_size() * 0.36).max(8.0))
-                                        .strong(),
-                                ));
-                            });
+                            .inner_margin(egui::Margin::symmetric(5, 2));
+                        wrapped_text_frame(
+                            ui,
+                            frame,
+                            RichText::new("BANNED")
+                                .color(t::text_on_accent())
+                                .size((t::usercard_font_size() * 0.36).max(8.0))
+                                .strong(),
+                        );
                     }
                 });
 
@@ -509,16 +521,16 @@ impl UserProfilePopup {
                     }
                     if let Some(ref hex) = profile.chat_color {
                         if let Some(c) = parse_hex_color(hex) {
-                            egui::Frame::new()
+                            let frame = egui::Frame::new()
                                 .fill(t::alpha(c, 35))
                                 .corner_radius(t::RADIUS_SM)
                                 .inner_margin(egui::Margin::symmetric(5, 2))
-                                .stroke(egui::Stroke::new(1.0_f32, c))
-                                .show(ui, |ui| {
-                                    ui.add(egui::Label::new(
-                                        RichText::new("● Chat color").color(c).small(),
-                                    ));
-                                });
+                                .stroke(egui::Stroke::new(1.0_f32, c));
+                            wrapped_text_frame(
+                                ui,
+                                frame,
+                                RichText::new("● Chat color").color(c).small(),
+                            );
                         }
                     }
                     for role in badge_role_labels(&self.badges) {
@@ -625,7 +637,7 @@ impl UserProfilePopup {
                         .wrap(),
                     );
                 }
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     if let Some(ref game) = profile.stream_game {
                         ui.add(egui::Label::new(
@@ -669,7 +681,7 @@ impl UserProfilePopup {
         }
         tabs.push(("IVR Logs", ProfileTab::IvrLogs));
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             for (tab_label, tab_val) in &tabs {
                 let active = self.active_tab == *tab_val;
@@ -683,7 +695,7 @@ impl UserProfilePopup {
                 } else {
                     Color32::TRANSPARENT
                 };
-                let resp = egui::Frame::new()
+                let frame = egui::Frame::new()
                     .fill(bg)
                     .corner_radius(CornerRadius::same(4))
                     .stroke(if active {
@@ -691,13 +703,12 @@ impl UserProfilePopup {
                     } else {
                         egui::Stroke::NONE
                     })
-                    .inner_margin(egui::Margin::symmetric(10, 4))
-                    .show(ui, |ui| {
-                        ui.add(egui::Label::new(
-                            RichText::new(*tab_label).color(fg).small().strong(),
-                        ));
-                    })
-                    .response;
+                    .inner_margin(egui::Margin::symmetric(10, 4));
+                let resp = wrapped_text_frame(
+                    ui,
+                    frame,
+                    RichText::new(*tab_label).color(fg).small().strong(),
+                );
                 if resp.interact(egui::Sense::click()).clicked() {
                     self.active_tab = *tab_val;
                     self.ban_confirm = false;
@@ -870,13 +881,21 @@ impl UserProfilePopup {
             .inner_margin(egui::Margin::symmetric(8, 6))
             .show(ui, |ui| {
                 let mut add_row = |label: &str, value: String| {
-                    ui.horizontal(|ui| {
-                        ui.set_width(ui.available_width());
-                        ui.label(RichText::new(label).color(t::text_secondary()).small());
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(RichText::new(value).color(t::text_primary()).small());
+                    let label = RichText::new(label).color(t::text_secondary()).small();
+                    let value =
+                        egui::Label::new(RichText::new(value).color(t::text_primary()).small())
+                            .wrap();
+                    if ui.available_width() < 300.0 {
+                        ui.label(label);
+                        ui.add(value);
+                    } else {
+                        ui.horizontal_top(|ui| {
+                            ui.label(label);
+                            ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
+                                ui.add(value);
+                            });
                         });
-                    });
+                    }
                     ui.add_space(2.0);
                 };
 
@@ -1106,7 +1125,7 @@ impl UserProfilePopup {
         section_label(ui, "Local cleanup");
         ui.add_space(3.0);
         if ui
-            .button("Hide this user's messages locally")
+            .add(egui::Button::new("Hide this user's messages locally").wrap())
             .on_hover_text("Removes visible messages from this user in the current channel only.")
             .clicked()
         {
@@ -1201,7 +1220,7 @@ impl UserProfilePopup {
         section_label(ui, "Permanent ban");
         ui.add_space(3.0);
         if self.ban_confirm {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 let confirm = ui.add(
                     egui::Button::new(
@@ -1253,7 +1272,7 @@ impl UserProfilePopup {
             profile.login,
         );
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .add(
                     egui::Button::new(RichText::new("Open in Browser").small().color(t::accent()))
@@ -1397,7 +1416,7 @@ impl UserProfilePopup {
     }
 
     fn render_footer(&self, ui: &mut egui::Ui, profile: &UserProfile) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 14.0;
             let (primary_label, primary_url) =
                 if self.channel.as_ref().map(|c| c.is_kick()).unwrap_or(false) {
@@ -1438,10 +1457,14 @@ impl UserProfilePopup {
         presets: &[crust_core::model::mod_actions::ModActionPreset],
     ) -> Vec<PopupAction> {
         if !self.open {
+            self.close();
             return Vec::new();
         }
 
         let title = self.popup_title();
+        let screen = ctx.screen_rect();
+        let content_width = (screen.width() - 40.0).clamp(0.0, 430.0);
+        let content_height = (screen.height() - 56.0).max(32.0);
 
         let mut actions: Vec<PopupAction> = Vec::new();
         let mut open = self.open;
@@ -1450,61 +1473,71 @@ impl UserProfilePopup {
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .min_width((ctx.screen_rect().width() - 40.0).min(360.0))
-            .max_width((ctx.screen_rect().width() - 20.0).min(430.0))
+            .min_width(0.0)
+            .max_width(content_width)
+            .default_width(content_width)
+            .max_height(content_height)
             .open(&mut open)
             .show(ctx, |ui| {
+                ui.set_width(content_width);
                 ui.style_mut().spacing.item_spacing = egui::vec2(4.0, 3.0);
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
 
-                if self.loading {
-                    Self::render_loading_state(ui);
-                    return;
-                }
+                egui::ScrollArea::vertical()
+                    .id_salt("user_profile_body")
+                    .max_height(content_height)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        if self.loading {
+                            Self::render_loading_state(ui);
+                            return;
+                        }
 
-                let Some(profile) = self.profile.clone() else {
-                    Self::render_unavailable_state(ui);
-                    return;
-                };
+                        let Some(profile) = self.profile.clone() else {
+                            Self::render_unavailable_state(ui);
+                            return;
+                        };
 
-                let profile_subtitle = format!("@{}", profile.login);
-                chrome::dialog_header(
-                    ui,
-                    profile.display_name.as_str(),
-                    Some(profile_subtitle.as_str()),
-                );
-                ui.add_space(6.0);
+                        let profile_subtitle = format!("@{}", profile.login);
+                        chrome::dialog_header(
+                            ui,
+                            profile.display_name.as_str(),
+                            Some(profile_subtitle.as_str()),
+                        );
+                        ui.add_space(6.0);
 
-                self.render_profile_header(ui, &profile, emote_bytes, stv_avatars);
-                ui.add_space(4.0);
-                self.render_quick_actions(ui, &profile, &mut actions);
-                self.render_live_info(ui, &profile);
+                        self.render_profile_header(ui, &profile, emote_bytes, stv_avatars);
+                        ui.add_space(4.0);
+                        self.render_quick_actions(ui, &profile, &mut actions);
+                        self.render_live_info(ui, &profile);
 
-                ui.add_space(6.0);
-                ui.separator();
-                ui.add_space(2.0);
-                self.render_tab_bar(ui, &profile, &mut actions);
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.add_space(2.0);
+                        self.render_tab_bar(ui, &profile, &mut actions);
 
-                match self.active_tab {
-                    ProfileTab::Profile => self.render_profile_tab(ui, &profile),
-                    ProfileTab::Moderation if self.is_mod => {
-                        self.render_moderation_tab(ui, &profile, &mut actions, presets)
-                    }
-                    ProfileTab::ModLogs if self.is_mod => self.render_mod_logs_tab(ui),
-                    ProfileTab::Logs => self.render_logs_tab(ui),
-                    ProfileTab::IvrLogs => self.render_ivr_logs_tab(ui, &profile, &mut actions),
-                    _ => {}
-                }
+                        match self.active_tab {
+                            ProfileTab::Profile => self.render_profile_tab(ui, &profile),
+                            ProfileTab::Moderation if self.is_mod => {
+                                self.render_moderation_tab(ui, &profile, &mut actions, presets)
+                            }
+                            ProfileTab::ModLogs if self.is_mod => self.render_mod_logs_tab(ui),
+                            ProfileTab::Logs => self.render_logs_tab(ui),
+                            ProfileTab::IvrLogs => {
+                                self.render_ivr_logs_tab(ui, &profile, &mut actions)
+                            }
+                            _ => {}
+                        }
 
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(3.0);
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(3.0);
 
-                self.render_footer(ui, &profile);
+                        self.render_footer(ui, &profile);
 
-                ui.add_space(4.0);
+                        ui.add_space(4.0);
+                    });
             });
-
-        self.open = open;
 
         // Close the popup after a mod action so the user doesn't have to.
         let has_mod_action = actions.iter().any(|a| {
@@ -1522,8 +1555,8 @@ impl UserProfilePopup {
                     | PopupAction::ExecuteCommand { .. }
             )
         });
-        if has_mod_action {
-            self.open = false;
+        if !open || has_mod_action {
+            self.close();
         }
         actions
     }
@@ -1546,17 +1579,34 @@ fn fmt_ivr_timestamp(ts: &str) -> String {
     }
 }
 
+/// Allocate the complete frame before painting so horizontal rows can wrap it.
+fn wrapped_text_frame(ui: &mut egui::Ui, frame: egui::Frame, text: RichText) -> egui::Response {
+    let margin = frame.total_margin().sum();
+    let galley = egui::WidgetText::from(text).into_galley(
+        ui,
+        Some(egui::TextWrapMode::Wrap),
+        (ui.available_width() - margin.x).max(1.0),
+        egui::TextStyle::Body,
+    );
+    ui.allocate_ui_with_layout(
+        galley.size() + margin,
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            frame
+                .show(ui, |ui| ui.add(egui::Label::new(galley)))
+                .response
+        },
+    )
+    .inner
+}
+
 /// Render a small inline role pill using egui Frame.
 fn role_pill(ui: &mut egui::Ui, text: &str, color: Color32) {
-    egui::Frame::new()
+    let frame = egui::Frame::new()
         .fill(t::alpha(color, 40))
         .corner_radius(t::RADIUS_SM)
-        .inner_margin(egui::Margin::symmetric(5, 2))
-        .show(ui, |ui| {
-            ui.add(egui::Label::new(
-                RichText::new(text).color(color).small().strong(),
-            ));
-        });
+        .inner_margin(egui::Margin::symmetric(5, 2));
+    wrapped_text_frame(ui, frame, RichText::new(text).color(color).small().strong());
 }
 
 /// Render a small text badge pill (fallback when image is unavailable).
@@ -1566,17 +1616,17 @@ fn badge_text_pill(ui: &mut egui::Ui, name: &str) {
     } else {
         (t::pill_bg(), t::text_primary())
     };
-    egui::Frame::new()
+    let frame = egui::Frame::new()
         .fill(fill)
         .corner_radius(t::RADIUS_SM)
-        .inner_margin(egui::Margin::symmetric(4, 1))
-        .show(ui, |ui| {
-            ui.add(egui::Label::new(
-                RichText::new(name)
-                    .color(text_col)
-                    .size((t::usercard_font_size() * 0.36).max(8.0)),
-            ));
-        });
+        .inner_margin(egui::Margin::symmetric(4, 1));
+    wrapped_text_frame(
+        ui,
+        frame,
+        RichText::new(name)
+            .color(text_col)
+            .size((t::usercard_font_size() * 0.36).max(8.0)),
+    );
 }
 
 /// Section heading inside the mod panel.
@@ -1866,10 +1916,282 @@ mod tests {
         }
     }
 
+    fn profile_frame(
+        ctx: &egui::Context,
+        popup: &mut UserProfilePopup,
+        size: egui::Vec2,
+        events: Vec<egui::Event>,
+        presets: &[crust_core::model::mod_actions::ModActionPreset],
+    ) -> (egui::FullOutput, Vec<PopupAction>) {
+        let mut actions = Vec::new();
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |_| {});
+                actions = popup.show(ctx, &UiImageCache::default(), &HashMap::new(), presets);
+            },
+        );
+        (output, actions)
+    }
+
+    fn visible_profile_text(
+        output: &egui::FullOutput,
+        size: egui::Vec2,
+        label: &str,
+    ) -> Option<egui::Rect> {
+        fn find(shape: &egui::epaint::Shape, clip: egui::Rect, label: &str) -> Option<egui::Rect> {
+            match shape {
+                egui::epaint::Shape::Vec(shapes) => {
+                    shapes.iter().find_map(|shape| find(shape, clip, label))
+                }
+                egui::epaint::Shape::Text(text) if text.galley.text() == label => {
+                    let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+                    clip.contains_rect(rect).then_some(rect)
+                }
+                _ => None,
+            }
+        }
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| find(&shape.shape, shape.clip_rect.intersect(screen), label))
+    }
+
+    fn profile_bounds(ctx: &egui::Context, size: egui::Vec2) -> egui::Rect {
+        let bounds = ctx
+            .memory(|memory| memory.area_rect(egui::Id::new("@alice")))
+            .unwrap();
+        assert!(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, size)
+                .expand(1.0)
+                .contains_rect(bounds),
+            "profile window {bounds:?} exceeds {size:?}"
+        );
+        bounds
+    }
+
+    fn scroll_profile_to_bottom(
+        ctx: &egui::Context,
+        popup: &mut UserProfilePopup,
+        size: egui::Vec2,
+        presets: &[crust_core::model::mod_actions::ModActionPreset],
+    ) -> egui::FullOutput {
+        let pointer = profile_bounds(ctx, size).center();
+        let mut output = egui::FullOutput::default();
+        for _ in 0..2 {
+            profile_frame(
+                ctx,
+                popup,
+                size,
+                vec![
+                    egui::Event::PointerMoved(pointer),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -4000.0),
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                presets,
+            );
+            for _ in 0..8 {
+                output = profile_frame(ctx, popup, size, Vec::new(), presets).0;
+            }
+        }
+        profile_bounds(ctx, size);
+        output
+    }
+
+    fn click_profile(
+        ctx: &egui::Context,
+        popup: &mut UserProfilePopup,
+        size: egui::Vec2,
+        point: egui::Pos2,
+        presets: &[crust_core::model::mod_actions::ModActionPreset],
+    ) -> Vec<PopupAction> {
+        let mut actions = Vec::new();
+        for pressed in [true, false] {
+            actions.extend(
+                profile_frame(
+                    ctx,
+                    popup,
+                    size,
+                    vec![
+                        egui::Event::PointerMoved(point),
+                        egui::Event::PointerButton {
+                            pos: point,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    presets,
+                )
+                .1,
+            );
+        }
+        actions
+    }
+
+    #[test]
+    fn long_profile_scrolls_in_short_viewports_and_keeps_footer_and_close_reachable() {
+        for size in [
+            egui::vec2(220.0, 260.0),
+            egui::vec2(320.0, 260.0),
+            egui::vec2(640.0, 320.0),
+        ] {
+            let ctx = egui::Context::default();
+            let mut popup = UserProfilePopup::default();
+            popup.set_loading("alice", Vec::new(), Some(ChannelId::new("room")), true);
+            let mut data = profile("Alice with a longer display name");
+            data.description =
+                "A profile with several lines of descriptive text and links to read. ".repeat(5);
+            data.created_at = Some("2015-01-01T00:00:00Z".into());
+            data.followers = Some(1000);
+            data.is_partner = true;
+            data.chat_color = Some("#4AA8FF".into());
+            data.is_live = true;
+            data.stream_title = Some("A stream with a longer descriptive title".into());
+            data.stream_game = Some("A category with a longer name".into());
+            data.stream_viewers = Some(123456);
+            popup.set_profile(data);
+            popup.set_shared_channels(
+                (0..32)
+                    .map(|n| format!("#a_very_long_shared_channel_{n:02}"))
+                    .collect(),
+            );
+            let mut output = egui::FullOutput::default();
+            for _ in 0..4 {
+                output = profile_frame(&ctx, &mut popup, size, Vec::new(), &[]).0;
+            }
+            profile_bounds(&ctx, size);
+            assert!(visible_profile_text(&output, size, "@alice").is_some());
+            assert!(visible_profile_text(&output, size, "Lookup logs").is_none());
+            let output = scroll_profile_to_bottom(&ctx, &mut popup, size, &[]);
+            assert!(
+                visible_profile_text(&output, size, "View on Twitch").is_some(),
+                "profile footer remains clipped at {size:?}"
+            );
+            assert!(visible_profile_text(&output, size, "Lookup logs").is_some());
+            assert!(visible_profile_text(&output, size, "@alice").is_some());
+            let bounds = profile_bounds(&ctx, size);
+            assert!(click_profile(
+                &ctx,
+                &mut popup,
+                size,
+                egui::pos2(bounds.right() - 14.0, bounds.top() + 14.0),
+                &[]
+            )
+            .is_empty());
+            assert!(
+                !popup.open,
+                "title-bar close remains usable after scrolling"
+            );
+        }
+    }
+
+    #[test]
+    fn full_moderation_scrolls_to_ban_confirmation_and_cancel_in_short_viewports() {
+        let presets: Vec<_> = (0..24)
+            .map(|n| crust_core::model::mod_actions::ModActionPreset {
+                label: format!("Action {n:02}"),
+                command_template: "/timeout {user} 60".into(),
+                icon_url: None,
+            })
+            .collect();
+        for size in [
+            egui::vec2(220.0, 260.0),
+            egui::vec2(320.0, 260.0),
+            egui::vec2(640.0, 320.0),
+        ] {
+            let ctx = egui::Context::default();
+            let mut popup = UserProfilePopup::default();
+            popup.set_loading("alice", Vec::new(), Some(ChannelId::new("room")), true);
+            popup.set_profile(profile("Alice"));
+            popup.active_tab = ProfileTab::Moderation;
+            for _ in 0..4 {
+                profile_frame(&ctx, &mut popup, size, Vec::new(), &presets);
+            }
+            let output = scroll_profile_to_bottom(&ctx, &mut popup, size, &presets);
+            let ban = visible_profile_text(&output, size, "Ban user")
+                .expect("ban action is reachable by scrolling");
+            assert!(click_profile(&ctx, &mut popup, size, ban.center(), &presets).is_empty());
+            assert!(popup.ban_confirm);
+            let output = scroll_profile_to_bottom(&ctx, &mut popup, size, &presets);
+            assert!(visible_profile_text(&output, size, "Confirm ban").is_some());
+            let cancel = visible_profile_text(&output, size, "Cancel")
+                .expect("cancel remains visible beside confirmation");
+            assert!(click_profile(&ctx, &mut popup, size, cancel.center(), &presets).is_empty());
+            assert!(!popup.ban_confirm);
+            assert!(popup.open);
+            profile_bounds(&ctx, size);
+        }
+    }
+
+    #[test]
+    fn closing_a_loading_profile_rejects_late_success_and_failure() {
+        let mut popup = UserProfilePopup::default();
+        popup.set_loading("alice", vec![], Some(ChannelId::new("room")), false);
+        popup.open = false;
+        assert!(!popup.accepts_profile("Alice"));
+        popup.set_profile(profile("Alice"));
+        popup.set_unavailable("alice");
+        assert!(!popup.open);
+        assert!(popup.profile.is_none());
+
+        popup.set_loading("alice", vec![], Some(ChannelId::new("room")), false);
+        popup.close();
+        assert!(!popup.loading);
+        assert!(popup.loading_login.is_empty());
+        assert!(!popup.accepts_profile("alice"));
+        popup.set_profile(profile("Alice"));
+        assert!(!popup.open);
+        assert!(popup.profile.is_none());
+    }
+
+    #[test]
+    fn only_the_explicitly_opened_profile_accepts_completion_and_refresh() {
+        let mut popup = UserProfilePopup::default();
+        popup.set_profile(profile("Unrequested"));
+        popup.set_unavailable("alice");
+        assert!(!popup.open);
+        assert!(popup.profile.is_none());
+
+        popup.set_loading("alice", vec![], Some(ChannelId::new("first")), false);
+        popup.set_loading("bob", vec![], Some(ChannelId::new("second")), false);
+        popup.set_profile(profile("Old request"));
+        popup.set_unavailable("alice");
+        assert!(popup.loading);
+        assert!(popup.profile.is_none());
+        assert!(popup.accepts_profile("BOB"));
+
+        let mut bob = profile("Bob");
+        bob.login = "bob".to_owned();
+        popup.set_profile(bob.clone());
+        assert!(popup.open);
+        assert!(!popup.loading);
+        assert_eq!(popup.profile.as_ref().unwrap().display_name, "Bob");
+        bob.display_name = "Updated Bob".to_owned();
+        popup.set_profile(bob);
+        assert_eq!(popup.profile.as_ref().unwrap().display_name, "Updated Bob");
+        assert_eq!(popup.channel, Some(ChannelId::new("second")));
+
+        popup.close();
+        popup.set_loading("alice", vec![], Some(ChannelId::new("first")), false);
+        popup.set_unavailable("ALICE");
+        assert!(popup.open);
+        assert!(!popup.loading);
+        assert!(popup.profile.is_none());
+    }
+
     #[test]
     fn open_profile_restores_the_server_name_after_alias_changes() {
         let mut popup = UserProfilePopup::default();
-        popup.channel = Some(ChannelId::new("first"));
+        popup.set_loading("alice", vec![], Some(ChannelId::new("first")), false);
         popup.set_profile(profile("Alice"));
         popup.apply_nicknames(&[crust_core::model::Nickname::new("alice", "Custom")]);
         assert_eq!(popup.profile.as_ref().unwrap().display_name, "Custom");
@@ -1883,7 +2205,10 @@ mod tests {
         popup.set_profile(profile("New server name"));
         popup.apply_nicknames(&[crust_core::model::Nickname::new("alice", "Custom")]);
         popup.apply_nicknames(&[]);
-        assert_eq!(popup.profile.as_ref().unwrap().display_name, "New server name");
+        assert_eq!(
+            popup.profile.as_ref().unwrap().display_name,
+            "New server name"
+        );
     }
 
     #[test]

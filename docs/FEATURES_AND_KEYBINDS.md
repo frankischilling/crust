@@ -40,6 +40,8 @@ commands. Kick and generic IRC support remain beta features.
 - Optional analytics side panel
 - Optional IRC status diagnostics panel
 - Optional performance overlay for chat rendering stats
+- Searchable settings with per-page scroll positions and responsive rule editors
+- Account removal confirmation and a scrolling account list with a visible Close control
 - Compact startup status while chat, settings, and navigation remain available
 - Icon controls with visible keyboard focus and labels for accessibility tools
 - Layout controls that show the active layout and disable the sidebar when the
@@ -72,6 +74,7 @@ commands. Kick and generic IRC support remain beta features.
 ### Input and command UX
 
 - Message input history recall (arrow keys)
+- Emote picker access in narrow panes, with the character count below the input when needed
 - Rejected sends keep their original draft and reply context for recovery
 - `:` emote autocomplete and Tab completion
 - Slash command handling for chat, moderation, and creator workflows
@@ -91,15 +94,16 @@ commands. Kick and generic IRC support remain beta features.
 - Channel emotes stay in their channel; personal emotes resolve for their owner
 - Paginated Twitch account inventory for the picker, autocomplete, and outgoing
   emote ranges, with the optional `user:read:emotes` scope
+- Follower emotes restricted to their channel and the account that can use them
 - Provider and scope precedence is consistent between chat, autocomplete, and the picker
-- Animated emote support (GIF/WebP)
+- Animated emote support (GIF/WebP), with bounded background decoding
 - Emoji tokenization/rendering via Twemoji URLs
 - Badge rendering from global/channel badge sources
 - 7TV sender colors, selected username paints, badges, and avatars
 - Emote picker features:
   - favorites
   - recents
-  - provider preference boost
+  - provider order preferences
   - focused search, Ctrl+Tab / Ctrl+Shift+Tab navigation, and insertion at the caret
   - favorites menus that stay open while the pointer moves from an emote to an action
 - Emote image caching in memory and on disk
@@ -108,10 +112,12 @@ commands. Kick and generic IRC support remain beta features.
   with 7TV channel-set updates also available on Kick
 - Active 7TV channel-set changes and reconnect reconciliation, with stale
   subscription and snapshot checks
+- Live global and one selected personal 7TV set per sender, with ownership and membership refreshes
+- Coalesced channel refreshes and five-minute global metadata refreshes that retain usable catalogs on failure
 
-Chat works without `user:read:emotes`. Twitch follower emotes that require a
-channel query and live updates for global and personal sets remain follow-ups in
-[issue #9](https://github.com/frankischilling/crust/issues/9).
+Chat works without `user:read:emotes`. FFZ uses metadata refreshes. The
+[UI and performance audit](AUDIT_UI_PERFORMANCE.md) explains provider limits,
+cached-snapshot behavior, and the measured rendering workloads.
 
 ### Whispers
 
@@ -125,7 +131,9 @@ channel query and live updates for global and personal sets remain follow-ups in
 - Legacy rows with no owner or only a login-based owner stay stored but are not
   assigned to a current account
 - Sender IDs survive saved history, allowing personal emotes to resolve for their owner
-- Reply uses the visible composer and preserves an existing draft
+- Reply opens the whisper composer without requiring a joined channel
+- Per-recipient drafts remain available until a successful send response;
+  failed attempts can be recovered without replacing newer text
 - Temporary send-failure notices visible only to the owning account, cleared on
   account changes or logout
 
@@ -149,6 +157,8 @@ channel query and live updates for global and personal sets remain follow-ups in
   - shared filter strip (login or message text)
   - per-row approve / deny actions and bulk approve / bulk deny
   - keyboard nav: `J` / `K` focus, `A` / `D` approve / deny, `Shift+A` / `Shift+D` bulk, `Tab` / `Shift+Tab` switch tab
+  - shortcuts require the active, expanded window; text editors keep ordinary
+    typing and Tab behavior, and navigation follows the filtered queue
 - Creator tools:
   - polls (create/end/cancel)
   - predictions (create/lock/resolve/cancel)
@@ -271,7 +281,7 @@ cancels an unfinished capture.
 | Ctrl+K | Open quick switch palette |
 | Ctrl+F | Open message search on active channel/pane |
 | Ctrl+Shift+F | Open cross-channel search popup (predicate DSL) |
-| Escape | Close quick switch or close search (when open) |
+| Escape | Close quick switch or the focused search controls |
 | Ctrl+Tab, Ctrl+PageDown, Alt+Right | Next channel (prioritizes mentions/unread) |
 | Ctrl+Shift+Tab, Ctrl+PageUp, Alt+Left | Previous channel (prioritizes mentions/unread) |
 | Ctrl+1 .. Ctrl+9 | Jump directly to channel tab index 1..9 |

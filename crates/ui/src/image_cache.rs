@@ -25,6 +25,17 @@ const REQUESTS_PER_FRAME: usize = 24;
 const RETRY_DELAY: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Cumulative decoder and upload work; decode time runs on background workers.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ImageWorkStats {
+    pub animation_bytes: usize,
+    pub pending_decodes: usize,
+    pub completed_decodes: u64,
+    pub decode_micros: u64,
+    pub texture_uploads: u64,
+    pub texture_upload_micros: u64,
+}
+
 struct Entry {
     image: ImageBytes,
     used_frame: AtomicU64,
@@ -125,6 +136,10 @@ impl Default for UiImageCache {
 }
 
 impl UiImageCache {
+    pub(crate) fn work_stats(&self, ctx: &egui::Context) -> ImageWorkStats {
+        loaders::work_stats(ctx)
+    }
+
     pub(crate) fn begin_frame(&mut self, ctx: &egui::Context) {
         if !self.loaders_installed {
             // Native construction installs these eagerly; headless construction

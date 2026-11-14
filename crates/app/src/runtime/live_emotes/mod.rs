@@ -21,7 +21,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use reconcile::{ApplyResult, SnapshotTicket};
 
-const MAX_CHANNELS: usize = 64;
+const MAX_TARGETS: usize = 128;
 const MAX_SNAPSHOTS: usize = 4;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -82,10 +82,17 @@ impl LiveSource {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LiveTarget {
-    pub(crate) channel: ChannelId,
+    pub(crate) scope: LiveScope,
     pub(crate) generation: u64,
     pub(crate) binding_generation: u64,
     pub(crate) source: LiveSource,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum LiveScope {
+    Channel(ChannelId),
+    Global,
+    Personal(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,8 +136,7 @@ impl LiveEmoteUpdates {
 
     /// Called on the existing catalog tick. This only copies source metadata.
     pub(crate) fn sync(&self, index: &crate::EmoteIndex) {
-        let mut targets = index.read().unwrap().live_targets();
-        targets.sort_by(|left, right| left.channel.as_str().cmp(right.channel.as_str()));
+        let targets = index.read().unwrap().live_targets();
         for (provider, sender) in [
             (Provider::Bttv, &self.bttv),
             (Provider::SevenTv, &self.seven_tv),
@@ -138,7 +144,7 @@ impl LiveEmoteUpdates {
             let next: Vec<_> = targets
                 .iter()
                 .filter(|target| target.source.provider == provider)
-                .take(MAX_CHANNELS)
+                .take(MAX_TARGETS)
                 .cloned()
                 .collect();
             sender.send_if_modified(|current| {
@@ -276,6 +282,7 @@ struct Watched {
     target: LiveTarget,
     next_snapshot: Instant,
     in_flight: bool,
+    refresh_after_load: bool,
 }
 
 struct Loaded {
@@ -304,7 +311,7 @@ async fn run_connected(
         index,
         dirty,
     } = context;
-    let mut watched = HashMap::<ChannelId, Watched>::new();
+    let mut watched = HashMap::<LiveScope, Watched>::new();
     let mut topics = HashSet::<seventv::Topic>::new();
     let mut acknowledged = HashSet::<seventv::Topic>::new();
     let mut rooms = HashSet::<String>::new();
@@ -330,7 +337,7 @@ async fn run_connected(
                     break;
                 }
                 if next.iter().any(|target| {
-                    watched.get(&target.channel).is_some_and(|old| {
+                    watched.get(&target.scope).is_some_and(|old| {
                         old.target.generation != target.generation
                             || old.target.binding_generation != target.binding_generation
                     })
@@ -391,18 +398,19 @@ async fn run_connected(
                 }
                 watched.retain(|_, old| next.iter().any(|target| target == &old.target));
                 for target in next {
-                    watched.entry(target.channel.clone()).or_insert_with(|| {
+                    watched.entry(target.scope.clone()).or_insert_with(|| {
                         index.write().unwrap().begin_live_epoch(&target, epoch);
                         Watched {
                             target,
                             next_snapshot: Instant::now(),
                             in_flight: false,
+                            refresh_after_load: false,
                         }
                     });
                 }
                 tracing::debug!(
                     provider = provider.name(),
-                    channels = watched.len(),
+                    scopes = watched.len(),
                     subscriptions = if provider == Provider::SevenTv {
                         topics.len()
                     } else {
@@ -444,7 +452,7 @@ async fn run_connected(
                 endpoints.seven_tv_gql.clone()
             };
             jobs.spawn(async move {
-                let result = fetch_snapshot(&client, &endpoint, &target.source).await;
+                let result = fetch_snapshot(&client, &endpoint, &target).await;
                 Loaded {
                     target,
                     ticket,
@@ -460,9 +468,11 @@ async fn run_connected(
             }
             Some(completed) = jobs.join_next(), if !jobs.is_empty() => {
                 let Ok(loaded) = completed else { break; };
-                let Some(entry) = watched.get_mut(&loaded.target.channel).filter(|entry| entry.target == loaded.target) else { continue; };
+                let Some(entry) = watched.get_mut(&loaded.target.scope).filter(|entry| entry.target == loaded.target) else { continue; };
                 entry.in_flight = false;
-                entry.next_snapshot = Instant::now() + if loaded.result.is_some() { REFRESH_INTERVAL } else { RETRY_INTERVAL };
+                entry.next_snapshot = Instant::now() + if std::mem::take(&mut entry.refresh_after_load) {
+                    Duration::ZERO
+                } else if loaded.result.is_some() { REFRESH_INTERVAL } else { RETRY_INTERVAL };
                 tracing::debug!(provider = provider.name(), room_id = %loaded.target.source.room_id,
                     succeeded = loaded.result.is_some(), "Live emote snapshot finished");
                 let result = match loaded.result {
@@ -535,6 +545,15 @@ async fn run_connected(
                                             }
                                         }
                                     }
+                                    seventv::Update::PersonalSetsChanged(user_id) => {
+                                        for entry in watched.values_mut() {
+                                            if matches!(entry.target.scope, LiveScope::Personal(_))
+                                                && entry.target.source.user_id.as_deref() == Some(user_id.as_str()) {
+                                                entry.next_snapshot = Instant::now();
+                                                entry.refresh_after_load |= entry.in_flight;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -567,7 +586,7 @@ fn select_targets(
     for target in wanted
         .iter()
         .filter(|target| target.source.provider == provider)
-        .take(MAX_CHANNELS)
+        .take(MAX_TARGETS)
     {
         if provider == Provider::SevenTv {
             let needed = seventv::topics(&target.source);
@@ -588,7 +607,7 @@ fn select_targets(
 fn apply_deltas(
     index: &crate::EmoteIndex,
     dirty: &mpsc::Sender<()>,
-    watched: &mut HashMap<ChannelId, Watched>,
+    watched: &mut HashMap<LiveScope, Watched>,
     targets: &[LiveTarget],
     epoch: u64,
     deltas: &[EmoteDelta],
@@ -602,7 +621,7 @@ fn apply_deltas(
                 .apply_live_delta(target, epoch, delta.clone());
             changed |= result.changed;
             if result.needs_snapshot {
-                if let Some(entry) = watched.get_mut(&target.channel) {
+                if let Some(entry) = watched.get_mut(&target.scope) {
                     // A full journal pauses deltas until a bounded resync can reconcile it.
                     entry.next_snapshot = entry.next_snapshot.min(Instant::now() + RETRY_INTERVAL);
                 }
@@ -617,10 +636,11 @@ fn apply_deltas(
 async fn fetch_snapshot(
     client: &reqwest::Client,
     endpoint: &str,
-    source: &LiveSource,
+    target: &LiveTarget,
 ) -> Option<Snapshot> {
+    let source = &target.source;
     if source.provider == Provider::SevenTv {
-        return seventv::snapshot_at(client, endpoint, source).await;
+        return seventv::snapshot_at(client, endpoint, &target.scope, source).await;
     }
     let response = client
         .get(format!("{endpoint}/{}", source.room_id))

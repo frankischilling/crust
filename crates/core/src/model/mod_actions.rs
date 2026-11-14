@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// A saved moderation action preset (mirrors chatterino's `ModerationAction`).
+/// A saved moderation action preset.
 ///
 /// The `command_template` may contain `{user}` and `{channel}` placeholders
 /// which are substituted at invocation time.
@@ -81,8 +81,6 @@ impl ModActionPreset {
     }
 
     /// Returns the default set of presets used when none are configured.
-    ///
-    /// Mirrors chatterino's built-in quick-mod buttons.
     pub fn defaults() -> Vec<Self> {
         vec![
             ModActionPreset {

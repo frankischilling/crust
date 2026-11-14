@@ -71,6 +71,7 @@ impl Tab {
 
 #[derive(Serialize, Deserialize)]
 struct ChannelStats {
+    channel: ChannelId,
     computed_at: DateTime<Utc>,
     window_label: String,
     total_msgs: u32,
@@ -227,6 +228,7 @@ fn compute_stats(
         .unwrap_or_else(|| "all time".to_owned());
 
     ChannelStats {
+        channel: channel.id.clone(),
         computed_at: now,
         window_label,
         total_msgs,
@@ -302,7 +304,7 @@ pub struct AnalyticsPanel {
     cached: Option<ChannelStats>,
     last_recompute: Option<Instant>,
     cached_window: Option<TimeWindow>,
-    wipe_time: Option<DateTime<Utc>>,
+    wipe_times: HashMap<ChannelId, DateTime<Utc>>,
     toast: Option<(String, Instant)>,
     bonus_claims: HashMap<ChannelId, VecDeque<BonusClaimEntry>>,
 }
@@ -315,7 +317,7 @@ impl Default for AnalyticsPanel {
             cached: None,
             last_recompute: None,
             cached_window: None,
-            wipe_time: None,
+            wipe_times: HashMap::new(),
             toast: None,
             bonus_claims: HashMap::new(),
         }
@@ -341,16 +343,30 @@ impl AnalyticsPanel {
     }
 
     pub fn tick(&mut self, channel: &ChannelState) {
+        let channel_changed = self
+            .cached
+            .as_ref()
+            .is_none_or(|stats| stats.channel != channel.id);
         let window_changed = self.cached_window != Some(self.time_window);
         let stale = self
             .last_recompute
             .map(|t| t.elapsed() >= REFRESH_INTERVAL)
             .unwrap_or(true);
-        if window_changed || stale || self.cached.is_none() {
-            self.cached = Some(compute_stats(channel, self.time_window, self.wipe_time));
+        if channel_changed || window_changed || stale {
+            self.cached = Some(compute_stats(
+                channel,
+                self.time_window,
+                self.wipe_times.get(&channel.id).copied(),
+            ));
             self.last_recompute = Some(Instant::now());
             self.cached_window = Some(self.time_window);
         }
+    }
+
+    fn reset_stats(&mut self, channel: &ChannelId) {
+        self.wipe_times.insert(channel.clone(), Utc::now());
+        self.cached = None;
+        self.last_recompute = None;
     }
 
     pub fn show(&mut self, ui: &mut Ui, channel: &ChannelState) {
@@ -373,7 +389,7 @@ impl AnalyticsPanel {
                     )
                     .on_hover_text("Save snapshot to file");
                 if save_btn.clicked() {
-                    let msg = self.save_snapshot(channel.id.as_str());
+                    let msg = self.save_snapshot();
                     self.toast = Some((msg, Instant::now()));
                 }
                 let wipe_btn = ui
@@ -384,9 +400,7 @@ impl AnalyticsPanel {
                     )
                     .on_hover_text("Reset stats from now");
                 if wipe_btn.clicked() {
-                    self.wipe_time = Some(Utc::now());
-                    self.cached = None;
-                    self.last_recompute = None;
+                    self.reset_stats(&channel.id);
                     self.toast = Some(("Stats reset".to_owned(), Instant::now()));
                 }
             });
@@ -442,7 +456,9 @@ impl AnalyticsPanel {
             }
         });
 
-        if let Some(wt) = self.wipe_time {
+        self.tick(channel);
+
+        if let Some(wt) = self.wipe_times.get(&channel.id) {
             let local = wt.with_timezone(&chrono::Local);
             ui.label(
                 RichText::new(format!("Since {}", local.format("%H:%M:%S")))
@@ -519,7 +535,7 @@ impl AnalyticsPanel {
         }
     }
 
-    fn save_snapshot(&self, channel: &str) -> String {
+    fn save_snapshot(&self) -> String {
         let Some(stats) = &self.cached else {
             return "No data to save".to_owned();
         };
@@ -531,6 +547,18 @@ impl AnalyticsPanel {
             return format!("Save failed: {e}");
         }
         let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        let channel: String = stats
+            .channel
+            .as_str()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
         let filename = format!("{channel}_{ts}.json");
         let path = dir.join(&filename);
         match serde_json::to_string_pretty(stats) {
@@ -848,6 +876,111 @@ mod tests {
             msg_kind,
             shared: None,
         }
+    }
+
+    fn channel_with_messages(id: ChannelId, count: u64, login: &str) -> ChannelState {
+        let mut channel = ChannelState::new(id.clone());
+        for message_id in 0..count {
+            let mut message = make_message(
+                message_id,
+                Utc::now() - chrono::Duration::seconds(5),
+                login,
+                "hello",
+                MsgKind::Chat,
+                vec![],
+                vec![],
+            );
+            message.channel = id.clone();
+            channel.push_message(message);
+        }
+        channel
+    }
+
+    #[test]
+    fn switching_channels_refreshes_cached_stats_and_export_identity_immediately() {
+        let first = channel_with_messages(ChannelId::new("shared"), 2, "alice");
+        let second = channel_with_messages(ChannelId::kick("shared"), 1, "bob");
+        let mut panel = AnalyticsPanel::default();
+
+        panel.tick(&first);
+        assert_eq!(panel.cached.as_ref().unwrap().total_msgs, 2);
+        panel.tick(&second);
+        let exported = serde_json::to_value(panel.cached.as_ref().unwrap()).unwrap();
+        assert_eq!(exported["channel"], second.id.as_str());
+        assert_eq!(exported["total_msgs"], 1);
+        assert_eq!(exported["top_chatters"][0][0], "bob");
+
+        panel.tick(&first);
+        let stats = panel.cached.as_ref().unwrap();
+        assert_eq!(stats.channel, first.id);
+        assert_eq!(stats.total_msgs, 2);
+        assert_eq!(stats.top_chatters[0].0, "alice");
+    }
+
+    #[test]
+    fn resetting_stats_only_affects_the_selected_channel() {
+        let first = channel_with_messages(ChannelId::new("first"), 2, "alice");
+        let second = channel_with_messages(ChannelId::new("second"), 1, "bob");
+        let mut panel = AnalyticsPanel::default();
+        panel.tick(&first);
+        panel.reset_stats(&first.id);
+        panel.tick(&first);
+        assert_eq!(panel.cached.as_ref().unwrap().total_msgs, 0);
+        panel.tick(&second);
+        assert_eq!(panel.cached.as_ref().unwrap().total_msgs, 1);
+        assert!(!panel.wipe_times.contains_key(&second.id));
+        panel.tick(&first);
+        assert_eq!(panel.cached.as_ref().unwrap().total_msgs, 0);
+    }
+
+    #[test]
+    fn reset_button_refreshes_the_stats_before_the_same_frame_renders() {
+        let ctx = egui::Context::default();
+        let channel = channel_with_messages(ChannelId::new("first"), 2, "alice");
+        let mut panel = AnalyticsPanel::default();
+        let render = |panel: &mut AnalyticsPanel, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(480.0, 720.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| panel.show(ui, &channel));
+                },
+            )
+        };
+        render(&mut panel, vec![]);
+        let output = render(&mut panel, vec![]);
+        let point = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.text() == "🗑" => {
+                    Some(egui::Rect::from_min_size(text.pos, text.galley.size()).center())
+                }
+                _ => None,
+            })
+            .expect("reset button is rendered");
+        for pressed in [true, false] {
+            render(
+                &mut panel,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert!(panel.wipe_times.contains_key(&channel.id));
+        assert_eq!(panel.cached.as_ref().unwrap().total_msgs, 0);
     }
 
     #[test]

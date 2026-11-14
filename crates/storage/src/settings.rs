@@ -57,7 +57,7 @@ pub struct AccountEntry {
 // ExternalToolsConfig: Streamlink + custom-player integration
 
 /// Config for external tool launches (Streamlink, custom player) from the
-/// channel context menu. Mirrors Chatterino's ExternalToolsPage fields.
+/// channel context menu.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ExternalToolsConfig {
@@ -251,7 +251,7 @@ pub struct AppSettings {
     /// Whether split headers show viewer counts when available.
     #[serde(default = "bool_true")]
     pub split_header_show_viewer_count: bool,
-    // Highlight rules (chatterino-style per-rule config)
+    // Highlight rules
     /// Structured highlight rules (replaces the flat `highlights` string list).
     /// When empty on load and `highlights` is non-empty, a migration populates it.
     #[serde(default)]
@@ -330,8 +330,7 @@ pub struct AppSettings {
     // Per-tab visibility rules
     /// Per-channel tab visibility rules, keyed by the serialised
     /// `ChannelId` string and mapped to a `TabVisibilityRule` key
-    /// (`always`, `hide_when_offline`). Mirrors Chatterino's per-tab
-    /// "hide when offline" / "hide muted" options.
+    /// (`always`, `hide_when_offline`).
     #[serde(default)]
     pub tab_visibility_rules: BTreeMap<String, String>,
     // Custom command aliases
@@ -348,7 +347,7 @@ pub struct AppSettings {
     pub hotkey_bindings: BTreeMap<String, KeyBinding>,
     // Spell check
     /// Whether to underline misspelled words in the chat input and show
-    /// right-click suggestions. Mirrors Chatterino's input spellcheck toggle.
+    /// right-click suggestions.
     #[serde(default = "bool_true")]
     pub spellcheck_enabled: bool,
     /// User-managed custom dictionary - words added via the chat input's

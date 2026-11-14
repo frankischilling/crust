@@ -1,7 +1,6 @@
 //! Append-only JSON log of successful uploads.
 //!
-//! Format matches Chatterino's `ImageUploader.json`: a single JSON array of
-//! entries, rewritten in full on each successful upload.
+//! Entries form a single JSON array, rewritten on each successful upload.
 
 use std::path::{Path, PathBuf};
 

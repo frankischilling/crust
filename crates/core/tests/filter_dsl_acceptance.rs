@@ -1,4 +1,4 @@
-//! Integration acceptance tests for the Chatterino-style filter DSL (C3).
+//! Integration tests for message filter expressions.
 //!
 //! These cover the exact acceptance criteria on the ticket:
 //!  * `author.subscriber && message.content contains "gg"` parses, type-

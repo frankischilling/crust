@@ -5385,7 +5385,7 @@ unsafe fn make_event_table(L: *mut lua_State, event: &AppEvent) -> c_int {
             set_field_string(L, -1, "context", context);
             set_field_string(L, -1, "message", message);
         }
-        AppEvent::WhisperSendFailed { owner_user_id, message } => {
+        AppEvent::WhisperSendFailed { owner_user_id, message, .. } => {
             set_field_string(L, -1, "context", "Whisper");
             set_field_string(L, -1, "message", message);
             set_field_string(L, -1, "owner_user_id", owner_user_id);
@@ -6354,7 +6354,8 @@ mod tests {
         let _guard = test_scope();
         let lua = LuaStateGuard::new();
         let event = AppEvent::WhisperSendFailed {
-            owner_user_id: "123".into(), message: "Could not send whisper to bob: unavailable".into(),
+            owner_user_id: "123".into(), target_login: "bob".into(), text: "private draft".into(),
+            message: "Could not send whisper to bob: unavailable".into(),
         };
         assert_eq!(event_kind(&event), Some(PluginEventKind::Error));
         let idx = unsafe { make_event_table(lua.ptr(), &event) };
@@ -6362,6 +6363,13 @@ mod tests {
         assert_eq!(lua_get_string_field(lua.ptr(), idx, "context").as_deref(), Some("Whisper"));
         assert_eq!(lua_get_string_field(lua.ptr(), idx, "owner_user_id").as_deref(), Some("123"));
         assert_eq!(lua_get_string_field(lua.ptr(), idx, "message").as_deref(), Some("Could not send whisper to bob: unavailable"));
+        for field in ["target_login", "text"] {
+            unsafe {
+                lua_getfield(lua.ptr(), idx, cstring(field).as_ptr());
+                assert_eq!(lua_type(lua.ptr(), -1), LUA_TNIL);
+                lua_pop(lua.ptr(), 1);
+            }
+        }
     }
 
     #[test]

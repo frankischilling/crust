@@ -14,6 +14,9 @@ use crate::seventv::{load_7tv_user_for_twitch, SevenTvCosmeticUpdate};
 type ProviderLoad<'a> = BoxFuture<'a, (&'static str, Option<Vec<EmoteInfo>>)>;
 type ChannelProviderLoad<'a> = BoxFuture<'a, ChannelProviderResult>;
 
+const MAX_CHANNEL_LOADS: usize = 4;
+static CHANNEL_LOADS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CHANNEL_LOADS);
+
 struct ChannelProviderResult {
     provider: &'static str,
     emotes: Option<Vec<EmoteInfo>>,
@@ -63,9 +66,20 @@ async fn load_seven_tv_channel(
 
 /// Publish built-in globals immediately and load remote provider sets in the background.
 pub(crate) async fn load_global_emotes(index: &crate::EmoteIndex, evt_tx: &mpsc::Sender<AppEvent>) {
+    static LOADS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+    let Ok(permit) = LOADS.try_acquire() else {
+        return;
+    };
     let twitch = TwitchGlobalProvider::new().load_global().await;
-    index.write().unwrap().replace_global("twitch", twitch);
-    send_emote_catalog(index, evt_tx).await;
+    let (generation, expected_source, changed) = {
+        let mut registry = index.write().unwrap();
+        let generation = registry.begin_global_load();
+        let changed = registry.replace_global_result(generation, "twitch", Some(twitch));
+        (generation, registry.global_live_binding(), changed)
+    };
+    if changed {
+        send_emote_catalog(index, evt_tx).await;
+    }
 
     let bttv = BttvProvider::new();
     let ffz = FfzProvider::new();
@@ -73,18 +87,64 @@ pub(crate) async fn load_global_emotes(index: &crate::EmoteIndex, evt_tx: &mpsc:
     let index = index.clone();
     let evt_tx = evt_tx.clone();
     tokio::spawn(async move {
+        let _permit = permit;
         let providers: FuturesUnordered<ProviderLoad<'_>> = [
-            async { ("bttv", Some(bttv.load_global().await)) }.boxed(),
-            async { ("ffz", Some(ffz.load_global().await)) }.boxed(),
-            async { ("7tv", Some(seven_tv.load_global().await)) }.boxed(),
+            async { ("bttv", bttv.try_load_global().await) }.boxed(),
+            async { ("ffz", ffz.try_load_global().await) }.boxed(),
         ]
         .into_iter()
         .collect();
-        publish_global_loads(providers, &index, &evt_tx).await;
+        tokio::join!(
+            publish_global_loads(generation, providers, &index, &evt_tx),
+            async {
+                let Some(set) = seven_tv.load_global_state().await else {
+                    return;
+                };
+                let changed = {
+                    let mut registry = index.write().unwrap();
+                    registry.is_current_global_load(generation)
+                        && registry.replace_global_live(
+                            LiveSource {
+                                provider: Provider::SevenTv,
+                                room_id: "global".into(),
+                                platform: "GLOBAL".into(),
+                                user_id: None,
+                                set_id: Some(set.id),
+                                connection_index: None,
+                            },
+                            set.emotes,
+                            expected_source,
+                        )
+                };
+                if changed {
+                    send_emote_catalog(&index, &evt_tx).await;
+                }
+            }
+        );
     });
 }
 
+/// Refresh global metadata without overlapping manual loads or requesting images.
+pub(crate) fn spawn_global_refresh(
+    index: &crate::EmoteIndex,
+    evt_tx: &mpsc::Sender<AppEvent>,
+) -> tokio::task::JoinHandle<()> {
+    let index = index.clone();
+    let evt_tx = evt_tx.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = evt_tx.closed() => break,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5 * 60)) => {
+                    load_global_emotes(&index, &evt_tx).await;
+                }
+            }
+        }
+    })
+}
+
 async fn publish_global_loads(
+    generation: u64,
     mut providers: FuturesUnordered<ProviderLoad<'_>>,
     index: &crate::EmoteIndex,
     evt_tx: &mpsc::Sender<AppEvent>,
@@ -93,8 +153,11 @@ async fn publish_global_loads(
         if evt_tx.is_closed() {
             return;
         }
-        if let Some(emotes) = emotes {
-            index.write().unwrap().replace_global(provider, emotes);
+        let changed = index
+            .write()
+            .unwrap()
+            .replace_global_result(generation, provider, emotes);
+        if changed {
             send_emote_catalog(index, evt_tx).await;
         }
     }
@@ -241,13 +304,59 @@ pub(crate) async fn load_kick_channel_emotes(
 async fn publish_channel_loads<F, R>(
     channel: &ChannelId,
     generation: u64,
-    mut providers: FuturesUnordered<F>,
+    providers: FuturesUnordered<F>,
     index: &crate::EmoteIndex,
     evt_tx: &mpsc::Sender<AppEvent>,
 ) where
     F: std::future::Future<Output = R>,
     R: Into<ChannelProviderResult>,
 {
+    publish_channel_loads_with_limit(
+        channel,
+        generation,
+        providers,
+        index,
+        evt_tx,
+        &CHANNEL_LOADS,
+    )
+    .await;
+}
+
+async fn publish_channel_loads_with_limit<F, R>(
+    channel: &ChannelId,
+    generation: u64,
+    mut providers: FuturesUnordered<F>,
+    index: &crate::EmoteIndex,
+    evt_tx: &mpsc::Sender<AppEvent>,
+    limit: &tokio::sync::Semaphore,
+) where
+    F: std::future::Future<Output = R>,
+    R: Into<ChannelProviderResult>,
+{
+    if evt_tx.is_closed()
+        || !index
+            .read()
+            .unwrap()
+            .is_current_channel_load(channel, generation)
+    {
+        return;
+    }
+    let Ok(_permit) = (tokio::select! {
+        _ = evt_tx.closed() => return,
+        permit = limit.acquire() => permit,
+    }) else {
+        return;
+    };
+    // Provider futures have not been polled yet. Departed or superseded scopes
+    // leave the queue without starting network requests.
+    if evt_tx.is_closed()
+        || !index
+            .read()
+            .unwrap()
+            .is_current_channel_load(channel, generation)
+    {
+        return;
+    }
     // Each completed provider becomes available immediately. A slow response
     // cannot hold the other catalogs back, and images load when a widget uses them.
     while let Some(result) = providers.next().await {
@@ -366,7 +475,8 @@ mod tests {
         .into_iter()
         .collect();
         let task = tokio::spawn(async move {
-            publish_global_loads(providers, &index, &events).await;
+            let generation = index.write().unwrap().begin_global_load();
+            publish_global_loads(generation, providers, &index, &events).await;
         });
 
         assert_eq!(codes(receive(&mut received).await), ["Fast"]);
@@ -476,6 +586,130 @@ mod tests {
             .unwrap()
             .begin_channel_load(&channel, "42", false)
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn channel_loads_share_a_budget_coalesce_refreshes_and_skip_obsolete_queued_work() {
+        use std::collections::HashSet;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let index = index();
+        let limit = Arc::new(tokio::sync::Semaphore::new(MAX_CHANNEL_LOADS));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (started, mut starts) = mpsc::unbounded_channel();
+        let (events, _received) = mpsc::channel(64);
+        let mut tasks = Vec::new();
+        let mut releases = Vec::new();
+        let mut channels = Vec::new();
+        for n in 0..MAX_CHANNEL_LOADS + 2 {
+            let channel = if n % 2 == 0 {
+                ChannelId::new(&format!("room{n}"))
+            } else {
+                ChannelId::kick(&format!("room{n}"))
+            };
+            let generation = {
+                let mut registry = index.write().unwrap();
+                registry.open_channel(&channel);
+                registry.begin_channel_load(&channel, "42", false).unwrap()
+            };
+            let (release, pending) = tokio::sync::oneshot::channel();
+            releases.push(Some(release));
+            channels.push(channel.clone());
+            let started = started.clone();
+            let active = active.clone();
+            let peak = peak.clone();
+            let providers: FuturesUnordered<ProviderLoad<'static>> = [async move {
+                let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(count, Ordering::SeqCst);
+                started.send(n).unwrap();
+                pending.await.unwrap();
+                active.fetch_sub(1, Ordering::SeqCst);
+                ("ffz", None)
+            }
+            .boxed()]
+            .into_iter()
+            .collect();
+            let task_index = index.clone();
+            let events = events.clone();
+            let limit = limit.clone();
+            tasks.push(Some(tokio::spawn(async move {
+                publish_channel_loads_with_limit(
+                    &channel,
+                    generation,
+                    providers,
+                    &task_index,
+                    &events,
+                    &limit,
+                )
+                .await;
+            })));
+        }
+
+        let mut running = HashSet::new();
+        for _ in 0..MAX_CHANNEL_LOADS {
+            running.insert(
+                tokio::time::timeout(Duration::from_secs(3), starts.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        tokio::task::yield_now().await;
+        assert!(starts.try_recv().is_err());
+        assert_eq!(active.load(Ordering::SeqCst), MAX_CHANNEL_LOADS);
+        for channel in &channels {
+            for _ in 0..64 {
+                assert!(index
+                    .write()
+                    .unwrap()
+                    .begin_channel_load(channel, "42", true)
+                    .is_none());
+            }
+        }
+
+        let queued: Vec<_> = (0..channels.len())
+            .filter(|n| !running.contains(n))
+            .collect();
+        assert_eq!(queued.len(), 2);
+        index.write().unwrap().close_channel(&channels[queued[0]]);
+        index
+            .write()
+            .unwrap()
+            .reconnect_channel(&channels[queued[1]]);
+        let first = *running.iter().next().unwrap();
+        releases[first].take().unwrap().send(()).unwrap();
+        for n in &queued {
+            tokio::time::timeout(Duration::from_secs(3), tasks[*n].take().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert!(
+            starts.try_recv().is_err(),
+            "an obsolete queued provider started a request"
+        );
+        for n in running {
+            if let Some(release) = releases[n].take() {
+                release.send(()).unwrap();
+            }
+        }
+        for task in tasks.into_iter().flatten() {
+            tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(peak.load(Ordering::SeqCst), MAX_CHANNEL_LOADS);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert!(
+            index
+                .write()
+                .unwrap()
+                .begin_channel_load(&channels[first], "42", false)
+                .is_some(),
+            "failed loads must remain retryable"
+        );
     }
 
     #[tokio::test]

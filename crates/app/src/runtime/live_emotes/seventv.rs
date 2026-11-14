@@ -1,9 +1,11 @@
 use std::time::Duration;
 
-use crust_emotes::providers::{parse_7tv_emote, parse_7tv_emote_set, read_bounded_json};
+use crust_emotes::providers::{
+    parse_7tv_emote, parse_7tv_emote_set, personal_emote_set_id, read_bounded_json,
+};
 use serde_json::{json, Value};
 
-use super::{EmoteDelta, LiveSource, Snapshot};
+use super::{EmoteDelta, LiveScope, LiveSource, Snapshot};
 
 pub(super) const URL: &str = "wss://events.7tv.io/v3";
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -68,6 +70,7 @@ pub(super) enum Update {
         set_id: Option<String>,
     },
     DeletedSet(String),
+    PersonalSetsChanged(String),
 }
 
 fn id(value: &Value) -> Option<String> {
@@ -196,7 +199,13 @@ fn decode_dispatch(dispatch: &Value) -> Option<Frame> {
         "emote_set.delete" => Some(Frame::Updates(vec![Update::DeletedSet(object_id)])),
         "user.update" => {
             let mut changes = Vec::new();
-            for connection in body.get("updated")?.as_array()?.iter().take(128) {
+            for connection in body
+                .get("updated")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .take(128)
+            {
                 if connection.get("key").and_then(Value::as_str) != Some("connections") {
                     continue;
                 }
@@ -246,6 +255,16 @@ fn decode_dispatch(dispatch: &Value) -> Option<Frame> {
                     set_id,
                 });
             }
+            if ["updated", "pushed", "pulled"].into_iter().any(|field| {
+                body.get(field)
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .take(128)
+                    .any(|change| change.get("key").and_then(Value::as_str) == Some("emote_sets"))
+            }) {
+                changes.push(Update::PersonalSetsChanged(object_id));
+            }
             (!changes.is_empty()).then_some(Frame::Updates(changes))
         }
         _ => None,
@@ -257,10 +276,15 @@ fn decode_dispatch(dispatch: &Value) -> Option<Frame> {
 pub(super) async fn snapshot_at(
     client: &reqwest::Client,
     endpoint: &str,
+    scope: &LiveScope,
     source: &LiveSource,
 ) -> Option<Snapshot> {
-    if !matches!(source.platform.as_str(), "TWITCH" | "KICK") {
+    if !matches!(scope, LiveScope::Global) && !matches!(source.platform.as_str(), "TWITCH" | "KICK")
+    {
         return None;
+    }
+    if matches!(scope, LiveScope::Global) && source.set_id.is_none() {
+        return Some(Snapshot::Emotes(Vec::new()));
     }
     let set_var = if source.set_id.is_some() {
         ", $set: ObjectID!"
@@ -272,7 +296,11 @@ pub(super) async fn snapshot_at(
     } else {
         ""
     };
-    let query = format!("query($room: String!{set_var}) {{ userByConnection(platform: {}, id: $room) {{ id connections {{ id platform emote_set_id }} }} {set_query} }}", source.platform);
+    let query = match scope {
+        LiveScope::Channel(_) => format!("query($room: String!{set_var}) {{ userByConnection(platform: {}, id: $room) {{ id connections {{ id platform emote_set_id }} }} {set_query} }}", source.platform),
+        LiveScope::Personal(_) => format!("query($room: String!{set_var}) {{ userByConnection(platform: TWITCH, id: $room) {{ id emote_sets {{ id flags }} }} {set_query} }}"),
+        LiveScope::Global => format!("query($set: ObjectID!) {{ {set_query} }}"),
+    };
     let response = client
         .post(endpoint)
         .json(&json!({"query": query,
@@ -291,31 +319,47 @@ pub(super) async fn snapshot_at(
         return None;
     }
     let data = value.get("data")?;
-    let user = data.get("userByConnection")?;
     let mut selected = source.clone();
-    if user.is_null() {
-        selected.user_id = None;
-        selected.set_id = None;
-        selected.connection_index = None;
-    } else {
-        selected.user_id = Some(id(user.get("id")?)?);
-        let (index, connection) = user
-            .get("connections")?
-            .as_array()?
-            .iter()
-            .enumerate()
-            .find(|(_, connection)| {
-                connection.get("id").and_then(Value::as_str) == Some(source.room_id.as_str())
-                    && connection.get("platform").and_then(Value::as_str)
-                        == Some(source.platform.as_str())
-            })?;
-        selected.connection_index = Some(index);
-        let value = connection.get("emote_set_id")?;
-        selected.set_id = if value.is_null() {
-            None
+    if !matches!(scope, LiveScope::Global) {
+        let user = data.get("userByConnection")?;
+        if user.is_null() {
+            selected.user_id = None;
+            selected.set_id = None;
+            selected.connection_index = None;
         } else {
-            Some(id(value)?)
-        };
+            selected.user_id = Some(id(user.get("id")?)?);
+            if matches!(scope, LiveScope::Personal(_)) {
+                let sets = user.get("emote_sets")?.as_array()?;
+                if sets.len() > 64
+                    || sets.iter().any(|set| {
+                        set.get("id").and_then(id).is_none()
+                            || set.get("flags").and_then(Value::as_u64).is_none()
+                    })
+                {
+                    return None;
+                }
+                selected.set_id = personal_emote_set_id(user).map(str::to_owned);
+                selected.connection_index = None;
+            } else {
+                let (index, connection) = user
+                    .get("connections")?
+                    .as_array()?
+                    .iter()
+                    .enumerate()
+                    .find(|(_, connection)| {
+                    connection.get("id").and_then(Value::as_str) == Some(source.room_id.as_str())
+                        && connection.get("platform").and_then(Value::as_str)
+                            == Some(source.platform.as_str())
+                })?;
+                selected.connection_index = Some(index);
+                let value = connection.get("emote_set_id")?;
+                selected.set_id = if value.is_null() {
+                    None
+                } else {
+                    Some(id(value)?)
+                };
+            }
+        }
     }
     if &selected != source {
         return Some(Snapshot::Source(selected));

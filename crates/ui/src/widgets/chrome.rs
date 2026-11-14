@@ -47,9 +47,14 @@ pub fn icon_button(
         t::icon_btn()
     };
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), Sense::click());
-    resp.widget_info(|| egui::WidgetInfo::selected(
-        egui::WidgetType::Button, ui.is_enabled(), state.selected, tooltip,
-    ));
+    resp.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            state.selected,
+            tooltip,
+        )
+    });
     let hovered = resp.hovered();
     let focused = resp.has_focus();
     let fill = if state.danger {
@@ -175,26 +180,38 @@ fn paint_icon(ui: &Ui, rect: egui::Rect, icon: ChromeIcon, state: IconButtonStat
             );
         }
         ChromeIcon::Tabs => {
-            let h = rect.height() * 0.34;
-            for idx in 0..2 {
-                let y = rect.top() + idx as f32 * (h + 2.0);
-                let r = egui::Rect::from_min_size(
-                    egui::pos2(rect.left() + 1.0 + idx as f32 * 2.0, y + idx as f32 * 2.0),
-                    egui::vec2(rect.width() - 4.0, h),
+            painter.rect_stroke(
+                rect,
+                CornerRadius::same(3),
+                stroke,
+                egui::StrokeKind::Outside,
+            );
+            let tab_bottom = rect.top() + rect.height() * 0.36;
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left(), tab_bottom),
+                    egui::pos2(rect.right(), tab_bottom),
+                ],
+                stroke,
+            );
+            for fraction in [0.36, 0.7] {
+                let x = rect.left() + rect.width() * fraction;
+                painter.line_segment(
+                    [egui::pos2(x, rect.top()), egui::pos2(x, tab_bottom)],
+                    stroke,
                 );
-                painter.rect_stroke(r, CornerRadius::same(2), stroke, egui::StrokeKind::Outside);
             }
         }
         ChromeIcon::Settings => {
-            painter.circle_stroke(rect.center(), rect.width() * 0.22, stroke);
-            for idx in 0..8 {
-                let angle = idx as f32 * std::f32::consts::TAU / 8.0;
-                let inner =
-                    rect.center() + egui::vec2(angle.cos(), angle.sin()) * rect.width() * 0.28;
-                let outer =
-                    rect.center() + egui::vec2(angle.cos(), angle.sin()) * rect.width() * 0.42;
-                painter.line_segment([inner, outer], stroke);
-            }
+            let teeth = (0..32)
+                .map(|index| {
+                    let angle = index as f32 * std::f32::consts::TAU / 32.0;
+                    let radius = if index % 4 < 2 { 0.46 } else { 0.34 };
+                    rect.center() + egui::vec2(angle.cos(), angle.sin()) * rect.width() * radius
+                })
+                .collect();
+            painter.add(egui::Shape::closed_line(teeth, stroke));
+            painter.circle_stroke(rect.center(), rect.width() * 0.16, stroke);
         }
         ChromeIcon::Analytics => {
             let widths = [0.2, 0.45, 0.7];
@@ -341,8 +358,18 @@ mod tests {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         responses = Some([
-                            icon_button(ui, ChromeIcon::Settings, "Open application settings", IconButtonState::default()),
-                            icon_button(ui, ChromeIcon::Account, "Open accounts", IconButtonState::default()),
+                            icon_button(
+                                ui,
+                                ChromeIcon::Settings,
+                                "Open application settings",
+                                IconButtonState::default(),
+                            ),
+                            icon_button(
+                                ui,
+                                ChromeIcon::Account,
+                                "Open accounts",
+                                IconButtonState::default(),
+                            ),
                         ]);
                     });
                 });
@@ -368,25 +395,35 @@ mod tests {
         let (_, buttons) = frame(&ctx, vec![key(egui::Key::Tab, true)]);
         assert!(ctx.memory(|memory| memory.has_focus(buttons[0].id)));
 
-        let (output, buttons) = frame(&ctx, vec![
-            key(egui::Key::Tab, false), key(egui::Key::Tab, true),
-        ]);
+        let (output, buttons) = frame(
+            &ctx,
+            vec![key(egui::Key::Tab, false), key(egui::Key::Tab, true)],
+        );
         assert!(buttons[1].has_focus());
         assert!(!buttons[0].has_focus());
         assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
             egui::epaint::Shape::Rect(rect) if rect.rect == buttons[1].rect
                 && rect.stroke.width == 2.0 && rect.stroke.color == t::accent())));
-        assert!(output.platform_output.events.iter().any(|event| matches!(event,
+        assert!(output
+            .platform_output
+            .events
+            .iter()
+            .any(|event| matches!(event,
             egui::output::OutputEvent::FocusGained(info)
                 if info.typ == egui::WidgetType::Button && info.enabled
                     && info.label.as_deref() == Some("Open accounts"))));
 
-        let (output, buttons) = frame(&ctx, vec![
-            key(egui::Key::Tab, false), key(egui::Key::Enter, true),
-        ]);
+        let (output, buttons) = frame(
+            &ctx,
+            vec![key(egui::Key::Tab, false), key(egui::Key::Enter, true)],
+        );
         assert!(buttons[1].clicked());
         assert!(!buttons[0].clicked());
-        assert!(output.platform_output.events.iter().any(|event| matches!(event,
+        assert!(output
+            .platform_output
+            .events
+            .iter()
+            .any(|event| matches!(event,
             egui::output::OutputEvent::Clicked(info)
                 if info.typ == egui::WidgetType::Button
                     && info.label.as_deref() == Some("Open accounts"))));

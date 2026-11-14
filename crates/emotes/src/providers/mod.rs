@@ -90,6 +90,20 @@ impl BttvProvider {
             client: provider_client(),
         }
     }
+
+    pub async fn try_load_global(&self) -> Option<Vec<EmoteInfo>> {
+        let emotes = fetch_channel_json::<Vec<BttvEmote>>(
+            self.client
+                .get("https://api.betterttv.net/3/cached/emotes/global"),
+        )
+        .await??;
+        Some(
+            emotes
+                .into_iter()
+                .map(|emote| emote.into_info("bttv"))
+                .collect(),
+        )
+    }
 }
 
 #[derive(Deserialize)]
@@ -125,20 +139,7 @@ impl EmoteProvider for BttvProvider {
     }
 
     async fn load_global(&self) -> Vec<EmoteInfo> {
-        let url = "https://api.betterttv.net/3/cached/emotes/global";
-        match self.client.get(url).send().await {
-            Ok(resp) => resp
-                .json::<Vec<BttvEmote>>()
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|e| e.into_info("bttv"))
-                .collect(),
-            Err(e) => {
-                tracing::warn!("BTTV global fetch failed: {e}");
-                vec![]
-            }
-        }
+        self.try_load_global().await.unwrap_or_default()
     }
 
     async fn load_channel(&self, channel_id: &str) -> Option<Vec<EmoteInfo>> {
@@ -175,16 +176,8 @@ impl FfzProvider {
             client: provider_client(),
         }
     }
-}
 
-#[async_trait::async_trait]
-impl EmoteProvider for FfzProvider {
-    fn name(&self) -> &'static str {
-        "ffz"
-    }
-
-    async fn load_global(&self) -> Vec<EmoteInfo> {
-        // FFZ global sets: https://api.frankerfacez.com/v1/set/global
+    pub async fn try_load_global(&self) -> Option<Vec<EmoteInfo>> {
         #[derive(Deserialize)]
         struct FfzEmote {
             id: u64,
@@ -199,33 +192,37 @@ impl EmoteProvider for FfzProvider {
         struct FfzGlobal {
             sets: HashMap<String, FfzSet>,
         }
+        let global = fetch_channel_json::<FfzGlobal>(
+            self.client
+                .get("https://api.frankerfacez.com/v1/set/global"),
+        )
+        .await??;
+        Some(
+            global
+                .sets
+                .into_values()
+                .flat_map(|set| set.emoticons)
+                .map(|emote| EmoteInfo {
+                    id: emote.id.to_string(),
+                    code: emote.name,
+                    url_1x: ffz_fix_url(emote.urls.get("1").cloned().unwrap_or_default()),
+                    url_2x: emote.urls.get("2").cloned().map(ffz_fix_url),
+                    url_4x: emote.urls.get("4").cloned().map(ffz_fix_url),
+                    provider: "ffz".into(),
+                })
+                .collect(),
+        )
+    }
+}
 
-        let url = "https://api.frankerfacez.com/v1/set/global";
-        match self.client.get(url).send().await {
-            Ok(resp) => match resp.json::<FfzGlobal>().await {
-                Ok(g) => g
-                    .sets
-                    .into_values()
-                    .flat_map(|s| s.emoticons)
-                    .map(|e| EmoteInfo {
-                        id: e.id.to_string(),
-                        code: e.name.clone(),
-                        url_1x: ffz_fix_url(e.urls.get("1").cloned().unwrap_or_default()),
-                        url_2x: e.urls.get("2").cloned().map(ffz_fix_url),
-                        url_4x: e.urls.get("4").cloned().map(ffz_fix_url),
-                        provider: "ffz".to_owned(),
-                    })
-                    .collect(),
-                Err(e) => {
-                    tracing::warn!("FFZ global parse failed: {e}");
-                    vec![]
-                }
-            },
-            Err(e) => {
-                tracing::warn!("FFZ global fetch failed: {e}");
-                vec![]
-            }
-        }
+#[async_trait::async_trait]
+impl EmoteProvider for FfzProvider {
+    fn name(&self) -> &'static str {
+        "ffz"
+    }
+
+    async fn load_global(&self) -> Vec<EmoteInfo> {
+        self.try_load_global().await.unwrap_or_default()
     }
 
     async fn load_channel(&self, channel_id: &str) -> Option<Vec<EmoteInfo>> {
@@ -280,6 +277,12 @@ pub struct SevenTvChannel {
     pub connection_index: Option<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SevenTvSet {
+    pub id: String,
+    pub emotes: Vec<EmoteInfo>,
+}
+
 impl SevenTvProvider {
     pub fn new() -> Self {
         Self {
@@ -299,8 +302,10 @@ impl EmoteProvider for SevenTvProvider {
     }
 
     async fn load_global(&self) -> Vec<EmoteInfo> {
-        let url = "https://7tv.io/v3/emote-sets/global";
-        self.fetch_emote_set(url).await
+        self.load_global_state()
+            .await
+            .map(|set| set.emotes)
+            .unwrap_or_default()
     }
 
     async fn load_channel(&self, channel_id: &str) -> Option<Vec<EmoteInfo>> {
@@ -640,7 +645,7 @@ fn choose_7tv_smallest_file(files: &[EmoteFile]) -> Option<&EmoteFile> {
         .or_else(|| files.first())
 }
 
-fn personal_emote_set_id(user: &serde_json::Value) -> Option<&str> {
+pub fn personal_emote_set_id(user: &serde_json::Value) -> Option<&str> {
     user.get("user")
         .unwrap_or(user)
         .get("emote_sets")?
@@ -659,6 +664,29 @@ fn personal_emote_set_id(user: &serde_json::Value) -> Option<&str> {
 }
 
 impl SevenTvProvider {
+    pub async fn load_global_state(&self) -> Option<SevenTvSet> {
+        self.fetch_global_state("https://7tv.io/v3/emote-sets/global")
+            .await
+    }
+
+    async fn fetch_global_state(&self, url: &str) -> Option<SevenTvSet> {
+        let value = fetch_channel_json::<serde_json::Value>(self.client.get(url)).await??;
+        let id = value.get("id")?.as_str()?;
+        if id.is_empty()
+            || id.len() > 128
+            || !id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return None;
+        }
+        let id = id.to_owned();
+        Some(SevenTvSet {
+            id,
+            emotes: parse_7tv_emote_set(value)?,
+        })
+    }
+
     /// Reuse the user lookup already made for cosmetics; only a personal set needs another request.
     pub async fn load_personal_from_user(
         &self,
@@ -708,17 +736,6 @@ impl SevenTvProvider {
         match fetch_channel_json::<serde_json::Value>(self.client.get(url)).await? {
             Some(value) => parse_7tv_channel(value, platform, room_id),
             None => Some(SevenTvChannel::default()),
-        }
-    }
-
-    async fn fetch_emote_set(&self, url: &str) -> Vec<EmoteInfo> {
-        match fetch_channel_json::<serde_json::Value>(self.client.get(url)).await {
-            Some(Some(value)) => parse_7tv_emote_set(value).unwrap_or_default(),
-            Some(None) => Vec::new(),
-            None => {
-                tracing::warn!("7tv emote set fetch failed");
-                Vec::new()
-            }
         }
     }
 
@@ -965,6 +982,42 @@ mod tests {
             "https://user:secret@example.test/emote",
         ] {
             assert!(parse_7tv_emote(active_emote(host)).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn global_set_fetch_retains_its_identity_and_distinguishes_failure_from_empty() {
+        use tokio::io::AsyncWriteExt;
+        let provider = SevenTvProvider::with_client(
+            reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()
+                .unwrap(),
+        );
+        for (status, body, succeeded) in [
+            (404, "", false),
+            (503, "{}", false),
+            (200, "{}", false),
+            (200, "{\"id\":\"../invalid\",\"emotes\":[]}", false),
+            (200, "{\"id\":\"global-set\",\"emotes\":[]}", true),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_http_headers(&mut stream).await;
+                stream.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            });
+            let state = provider
+                .fetch_global_state(&format!("http://{address}/global"))
+                .await;
+            assert_eq!(state.is_some(), succeeded);
+            if let Some(state) = state {
+                assert_eq!(state.id, "global-set");
+                assert!(state.emotes.is_empty());
+            }
+            server.await.unwrap();
         }
     }
 
