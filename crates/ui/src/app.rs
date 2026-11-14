@@ -13251,7 +13251,11 @@ mod tests {
     fn test_app() -> (super::CrustApp, tokio::sync::mpsc::Receiver<AppCommand>) {
         let (commands, receiver) = tokio::sync::mpsc::channel(64);
         let (_, events) = tokio::sync::mpsc::channel(64);
-        (super::CrustApp::with_event_channels(commands, events), receiver)
+        let mut app = super::CrustApp::with_event_channels(commands, events);
+        // Other tests may be changing the process-wide theme while this fixture is created.
+        app.chat_font_size = t::DEFAULT_CHAT_FONT_SIZE;
+        app.ui_font_size = t::DEFAULT_UI_FONT_SIZE;
+        (app, receiver)
     }
 
     #[test]
@@ -14115,12 +14119,25 @@ mod tests {
 
     fn production_ui_frame(ctx: &egui::Context, app: &mut super::CrustApp,
         events: Vec<egui::Event>) -> egui::FullOutput {
-        ctx.run(egui::RawInput {
+        production_ui_frame_with_response(ctx, app, events, None).0
+    }
+
+    fn production_ui_frame_with_response(ctx: &egui::Context, app: &mut super::CrustApp,
+        events: Vec<egui::Event>, response_id: Option<egui::Id>)
+        -> (egui::FullOutput, Option<egui::Response>) {
+        let mut response = None;
+        let output = ctx.run(egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 800.0))),
             time: Some(ctx.cumulative_pass_nr() as f64 * 0.1),
             events,
             ..Default::default()
-        }, |ctx| app.update_ui(ctx))
+        }, |ctx| {
+            app.update_ui(ctx);
+            // After ctx.run returns, read_response can prefer the preceding pass.
+            // Replace this on every pass so it matches the final paint output.
+            response = response_id.and_then(|id| ctx.read_response(id));
+        });
+        (output, response)
     }
 
     #[test]
@@ -15132,6 +15149,10 @@ mod tests {
             }
             assert!((ctx.zoom_factor() - zoom).abs() < 0.001);
             assert!((ctx.pixels_per_point() - native_density * zoom).abs() < 0.001);
+            let (fresh, _receiver) = test_app();
+            assert_eq!(fresh.chat_font_size, t::DEFAULT_CHAT_FONT_SIZE);
+            assert_eq!(fresh.ui_font_size, t::DEFAULT_UI_FONT_SIZE,
+                "a fresh fixture inherited another app's zoom {zoom}");
         }
         t::set_ui_font_size(original_ui_size);
     }
@@ -15322,9 +15343,14 @@ mod tests {
 
     #[test]
     fn virtual_split_close_buttons_preserve_the_other_chat_and_draft() {
-        for virtual_channel in [ChannelId::live_feed(), ChannelId::mentions()] {
+        for (virtual_channel, zoom) in [ChannelId::live_feed(), ChannelId::mentions()]
+            .into_iter()
+            .flat_map(|channel| [0.75, 1.0, 1.25, 1.75].into_iter()
+                .map(move |zoom| (channel.clone(), zoom)))
+        {
             for virtual_index in 0..2 {
                 let (mut app, _commands) = test_app();
+                app.ui_font_size = zoom;
                 let ctx = egui::Context::default();
                 let room = ChannelId::new("room");
                 app.state.join_channel(room.clone());
@@ -15334,11 +15360,13 @@ mod tests {
                 app.split_panes.focused = virtual_index;
                 app.state.active_channel = Some(virtual_channel.clone());
                 let pane_id = app.split_panes.panes[virtual_index].id;
+                let response_id = egui::Id::new("split_pane_bg").with(pane_id);
+                let mut pane = None;
                 for _ in 0..3 {
-                    production_ui_frame(&ctx, &mut app, Vec::new());
+                    pane = production_ui_frame_with_response(
+                        &ctx, &mut app, Vec::new(), Some(response_id)).1;
                 }
-                let pane = ctx.read_response(egui::Id::new("split_pane_bg").with(pane_id))
-                    .expect("virtual pane is visible").rect;
+                let pane = pane.expect("virtual pane is visible in the current pass").rect;
                 let close = egui::pos2(
                     pane.right() - 6.0 - t::icon_btn_sm() / 2.0,
                     pane.top() + crate::widgets::split_header::split_header_height() / 2.0,
@@ -15354,7 +15382,9 @@ mod tests {
                         },
                     ]);
                 }
-                assert!(app.split_panes.panes.is_empty(), "virtual split close did not respond");
+                assert!(app.split_panes.panes.is_empty(),
+                    "virtual split close did not respond at zoom {zoom}; channel={virtual_channel:?}, index={virtual_index}, pane={pane:?}, close={close:?}, screen={:?}, pixels_per_point={}",
+                    ctx.screen_rect(), ctx.pixels_per_point());
                 assert_eq!(app.state.active_channel.as_ref(), Some(&room));
                 assert_eq!(app.chat_input_buf, "kept draft");
                 assert!(app.state.channels.contains_key(&room));
@@ -15367,8 +15397,13 @@ mod tests {
 
     #[test]
     fn virtual_split_menus_can_close_other_panes_without_offering_search() {
-        for virtual_channel in [ChannelId::live_feed(), ChannelId::mentions()] {
+        for (virtual_channel, zoom) in [ChannelId::live_feed(), ChannelId::mentions()]
+            .into_iter()
+            .flat_map(|channel| [0.75, 1.0, 1.25, 1.75].into_iter()
+                .map(move |zoom| (channel.clone(), zoom)))
+        {
             let (mut app, _commands) = test_app();
+            app.ui_font_size = zoom;
             let ctx = egui::Context::default();
             let room = ChannelId::new("room");
             app.state.join_channel(room.clone());
@@ -15378,17 +15413,27 @@ mod tests {
             app.split_panes.focused = 1;
             app.split_panes.panes[0].input_buf = "retained pane draft".to_owned();
             let pane_id = app.split_panes.panes[0].id;
+            let response_id = egui::Id::new("split_pane_bg").with(pane_id);
             let mut output = egui::FullOutput::default();
+            let mut pane = None;
             for _ in 0..3 {
-                output = production_ui_frame(&ctx, &mut app, Vec::new());
+                (output, pane) = production_ui_frame_with_response(
+                    &ctx, &mut app, Vec::new(), Some(response_id));
             }
-            let pane = ctx.read_response(egui::Id::new("split_pane_bg").with(pane_id))
-                .expect("virtual pane is visible").rect;
+            let pane = pane.expect("virtual pane is visible in the current pass").rect;
             let menu = output.shapes.iter().find_map(|shape| {
                 let egui::epaint::Shape::Text(text) = &shape.shape else { return None };
                 let rect = text.galley.rect.translate(text.pos.to_vec2());
                 (text.galley.text() == "..." && pane.contains_rect(rect)).then_some(rect.center())
-            }).expect("virtual split has a menu");
+            }).unwrap_or_else(|| {
+                let menus: Vec<_> = output.shapes.iter().filter_map(|shape| {
+                    let egui::epaint::Shape::Text(text) = &shape.shape else { return None };
+                    (text.galley.text() == "...")
+                        .then_some(text.galley.rect.translate(text.pos.to_vec2()))
+                }).collect();
+                panic!("virtual split has no menu at zoom {zoom}; channel={virtual_channel:?}, pane={pane:?}, menus={menus:?}, screen={:?}, pixels_per_point={}",
+                    ctx.screen_rect(), ctx.pixels_per_point())
+            });
             for pressed in [true, false] {
                 production_ui_frame(&ctx, &mut app, vec![
                     egui::Event::PointerMoved(menu),
@@ -15412,7 +15457,7 @@ mod tests {
                             None
                         }
                     }).collect();
-                    panic!("virtual split offers Close other splits; rendered labels: {labels:?}")
+                    panic!("virtual split offers Close other splits at zoom {zoom}; pane={pane:?}, menu={menu:?}, rendered labels: {labels:?}")
                 }).center();
             for pressed in [true, false] {
                 production_ui_frame(&ctx, &mut app, vec![
@@ -15425,7 +15470,8 @@ mod tests {
                     },
                 ]);
             }
-            assert!(app.split_panes.panes.is_empty());
+            assert!(app.split_panes.panes.is_empty(),
+                "Close other splits did not respond at zoom {zoom}; channel={virtual_channel:?}, pane={pane:?}, menu={menu:?}, keep={keep:?}");
             assert_eq!(app.state.active_channel.as_ref(), Some(&virtual_channel));
             assert_eq!(app.chat_input_buf, "retained pane draft");
             assert!(app.state.channels.contains_key(&room));
