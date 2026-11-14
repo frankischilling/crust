@@ -210,7 +210,7 @@ fn group_results_by_channel(hits: &mut [SearchHit]) {
 }
 
 use egui::{
-    Align, Button, CentralPanel, Context, Frame, Id, Key, Layout, RichText, ScrollArea, Stroke, Ui,
+    Align, Button, CentralPanel, Context, Frame, Id, Key, RichText, ScrollArea, Stroke, Ui,
     ViewportBuilder, ViewportClass, ViewportCommand, ViewportId,
 };
 
@@ -338,10 +338,15 @@ fn render_body(
 
 fn render_header(ui: &mut Ui, state: &mut GlobalSearchState, output: &mut GlobalSearchOutput) {
     chrome::dialog_header(ui, "Search all channels", None);
-    ui.label(
-        RichText::new("Predicates: from: in: has: is: regex: badge: subtier:  |  !pred negates")
+    ui.add(
+        egui::Label::new(
+            RichText::new(
+                "Predicates: from: in: has: is: regex: badge: subtier:  |  !pred negates",
+            )
             .font(t::small())
             .color(t::text_muted()),
+        )
+        .wrap(),
     );
     ui.horizontal_wrapped(|ui| {
         if ui
@@ -458,20 +463,36 @@ fn render_group_header(
     if !pending {
         load_older_pending.remove(channel);
     }
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(format!("#{}  ({} hits)", channel.display_name(), hit_count))
-                .font(t::small())
-                .color(t::text_secondary()),
+    ui.horizontal_top(|ui| {
+        let label = if pending { "Loading..." } else { "Load older" };
+        let button_width = ui.fonts(|fonts| {
+            fonts
+                .layout_no_wrap(label.to_owned(), t::tiny(), t::text_primary())
+                .size()
+                .x
+        }) + 2.0 * ui.spacing().button_padding.x;
+        let heading_width =
+            (ui.available_width() - button_width - ui.spacing().item_spacing.x).max(0.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(heading_width, 0.0),
+            egui::Layout::top_down(Align::Min),
+            |ui| {
+                ui.set_width(heading_width);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("#{}  ({} hits)", channel.display_name(), hit_count))
+                            .font(t::small())
+                            .color(t::text_secondary()),
+                    )
+                    .wrap(),
+                );
+            },
         );
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let label = if pending { "Loading..." } else { "Load older" };
-            let btn = ui.add_enabled(!pending, Button::new(RichText::new(label).font(t::tiny())));
-            if btn.clicked() {
-                load_older_pending.insert(channel.clone(), std::time::Instant::now());
-                output.load_older_requests.push(channel.clone());
-            }
-        });
+        let btn = ui.add_enabled(!pending, Button::new(RichText::new(label).font(t::tiny())));
+        if btn.clicked() {
+            load_older_pending.insert(channel.clone(), std::time::Instant::now());
+            output.load_older_requests.push(channel.clone());
+        }
     });
 }
 
@@ -492,25 +513,43 @@ fn render_hit_row(
         .inner_margin(egui::Margin::symmetric(6, 3));
     let resp = frame
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let ts = hit.message.timestamp.format("%H:%M").to_string();
-                ui.label(RichText::new(ts).font(t::tiny()).color(t::text_muted()));
-                let color = hit
-                    .message
-                    .sender
-                    .color
-                    .as_deref()
-                    .and_then(parse_hex_color)
-                    .unwrap_or_else(t::text_secondary);
-                ui.label(
-                    RichText::new(&hit.message.sender.login)
-                        .font(t::small())
-                        .color(color),
-                );
-                let body = hit.message.raw_text.trim();
-                let body = truncate(body, 160);
-                ui.label(RichText::new(body).font(t::small()));
-            });
+            ui.set_width(ui.available_width());
+            let mut row = egui::text::LayoutJob::default();
+            row.append(
+                &hit.message.timestamp.format("%H:%M ").to_string(),
+                0.0,
+                egui::TextFormat {
+                    font_id: t::tiny(),
+                    color: t::text_muted(),
+                    ..Default::default()
+                },
+            );
+            let color = hit
+                .message
+                .sender
+                .color
+                .as_deref()
+                .and_then(parse_hex_color)
+                .unwrap_or_else(t::text_secondary);
+            row.append(
+                &hit.message.sender.login,
+                0.0,
+                egui::TextFormat {
+                    font_id: t::small(),
+                    color,
+                    ..Default::default()
+                },
+            );
+            row.append(
+                &format!(" {}", truncate(hit.message.raw_text.trim(), 160)),
+                0.0,
+                egui::TextFormat {
+                    font_id: t::small(),
+                    color: t::text_primary(),
+                    ..Default::default()
+                },
+            );
+            ui.add(egui::Label::new(row).wrap());
         })
         .response
         .interact(egui::Sense::click());
@@ -630,6 +669,164 @@ mod tests {
             reply: None,
             msg_kind: MsgKind::Chat,
             shared: None,
+        }
+    }
+
+    #[test]
+    fn narrow_results_wrap_and_the_last_line_remains_clickable() {
+        for width in [240.0, 360.0, 480.0] {
+            let ctx = Context::default();
+            let hit = SearchHit {
+                channel: ChannelId::new("channel"),
+                message: mk_msg(9, "a_long_viewer_name", "A narrow result must preserve readable text, including café and a long URL: https://example.com/a/very/long/path/that/still/belongs/to/the/same/message", 0),
+            };
+            let mut clicked = false;
+            let mut row_rect = egui::Rect::NOTHING;
+            let mut shapes = Vec::new();
+            for _ in 0..3 {
+                shapes = ctx
+                    .run(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(width, 400.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                let available = ui.available_rect_before_wrap();
+                                row_rect = render_hit_row(ui, &hit, true, |_| clicked = true).rect;
+                                assert!(
+                                    row_rect.right() <= available.right() + 0.5,
+                                    "{row_rect:?} exceeds {available:?}"
+                                );
+                            });
+                        },
+                    )
+                    .shapes;
+            }
+            let text = shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text)
+                        if text.galley.text().contains("A narrow result") =>
+                    {
+                        Some(text)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert!(text.galley.rows.len() > 1);
+            assert!(text.pos.x + text.galley.size().x <= row_rect.right() + 0.5);
+            let position = egui::pos2(row_rect.center().x, row_rect.bottom() - 5.0);
+            for pressed in [true, false] {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 400.0),
+                        )),
+                        events: vec![
+                            egui::Event::PointerMoved(position),
+                            egui::Event::PointerButton {
+                                pos: position,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            render_hit_row(ui, &hit, true, |_| clicked = true);
+                        });
+                    },
+                );
+            }
+            assert!(
+                clicked,
+                "The wrapped row should remain clickable at width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_search_header_keeps_help_and_load_older_inside_the_viewport() {
+        for width in [240.0, 320.0, 480.0] {
+            let ctx = Context::default();
+            let mut search = GlobalSearchState::default();
+            let channel = ChannelId::new("a_very_long_channel_name");
+            let mut output = GlobalSearchOutput::default();
+            let mut pending = HashMap::new();
+            let mut shapes = Vec::new();
+            for _ in 0..3 {
+                shapes = ctx
+                    .run(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(width, 400.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                render_header(ui, &mut search, &mut output);
+                                render_group_header(ui, &channel, 1500, &mut pending, &mut output);
+                            });
+                        },
+                    )
+                    .shapes;
+            }
+            let mut load_position = None;
+            for shape in &shapes {
+                if let egui::epaint::Shape::Text(text) = &shape.shape {
+                    assert!(
+                        text.pos.x + text.galley.size().x <= width - 7.0,
+                        "Text at width {width} escaped the viewport: {}",
+                        text.galley.text()
+                    );
+                    if text.galley.text() == "Load older" {
+                        load_position = Some(text.pos + text.galley.size() * 0.5);
+                    }
+                    if text.galley.text().starts_with("#a_very_long_channel_name") {
+                        assert!(
+                            text.pos.x <= 9.0,
+                            "Channel headings should stay left-aligned"
+                        );
+                    }
+                }
+            }
+            let position = load_position.expect("The history button should remain visible");
+            for pressed in [true, false] {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 400.0),
+                        )),
+                        events: vec![
+                            egui::Event::PointerMoved(position),
+                            egui::Event::PointerButton {
+                                pos: position,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            render_header(ui, &mut search, &mut output);
+                            render_group_header(ui, &channel, 1500, &mut pending, &mut output);
+                        });
+                    },
+                );
+            }
+            assert_eq!(output.load_older_requests, [channel]);
         }
     }
 

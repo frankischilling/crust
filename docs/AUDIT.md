@@ -164,6 +164,16 @@ Header and sidebar labels leave room for their controls. The split Close button
 stays at the right edge at the tested widths of 150, 210, and 360 pixels. Composer
 tray height follows its controls and font scale.
 
+Search previews wrap at the current width, and each group leaves room for its
+Load older button. Settings keeps its title and Close control inside the viewport
+after resizing or zooming. Its navigation and content scroll separately; wide
+layouts give most of the width to the settings fields. Oversized controls remain
+accessible through the content area's horizontal scrollbar.
+
+Wheel input pauses chat only when the pointer reaches the chat panel's own UI
+layer. Scrolling Settings or another overlapping window no longer pauses the
+chat behind it.
+
 Historical messages, suppressed mirrors, and background-channel activity do not
 generate active-channel event toasts. Moderation rows keep their detailed text
 when rendered.
@@ -182,7 +192,9 @@ scale with an absolute pixel density.
 The Windows Yu Gothic fallback has a baseline adjustment for mixed Japanese and
 Latin/Greek text. Its larger line gap previously placed glyphs above their row
 and into the preceding line. A geometry regression covers two font families,
-four sizes, and three display densities; native screenshots confirm the spacing.
+four sizes, and three display densities when the optional font is installed on
+Windows; it skips when that font is unavailable. Native screenshots confirm the
+spacing on the tested system.
 
 The UI never waits for capacity in the runtime command channel. A shared FIFO
 keeps account changes, chat, and widget actions in submission order, with at most
@@ -208,10 +220,10 @@ request owner releases its waiters. The application retries transient failures
 with bounded backoff, queues one request during cooldown, and limits concurrent
 downloads across loaders to 20. Retry sleeps do not occupy download slots.
 
-Successful downloads retain their slot until the UI event queue accepts the
-image. This also covers avatar/profile fetches, preventing completed image
-buffers from accumulating behind a full queue. Cancelling delivery or closing
-the receiver releases the slot and leaves the URL retryable.
+Active downloads and completed images waiting for UI event admission share those
+20 slots, including avatar/profile fetches. Successfully delivered images use
+the event queue's separate capacity. Cancelling delivery or closing the receiver
+releases the slot and leaves the URL retryable.
 
 The failure state is published before the empty completion event, allowing a UI
 caller to request another attempt immediately without losing it to an obsolete
@@ -311,7 +323,7 @@ synthetic chat events, and headless egui interaction/layout checks. They cover
 malformed input, repeated events, cancellation, logout during requests, image
 failures, history boundaries, and narrow controls.
 
-The final Windows workspace run passed 804 tests, with nine benchmark/soak tests
+The final Windows workspace run passed 809 tests, with nine benchmark/soak tests
 ignored by the normal run. The isolated measurements above were run separately.
 Both application binaries built successfully, and Clippy passed with correctness
 errors enabled. Nonblocking lints remain for large enum/error layouts, plus two
@@ -334,11 +346,12 @@ were not exercised. These reads use the web client's schema, which can change
 independently of Helix.
 
 A native Windows fixture runs the production interface with synthetic channels,
-messages, static images, and animations. Screenshots were inspected at 1,200 × 950
-and 600 × 800 pixels, using the display's 1.25 native density and UI zoom factors
-of 1.0 and 1.5. The checks covered toolbar and channel controls, narrow chat
-wrapping, mixed Japanese text, emote rendering, and the unsent-message panel.
-The fixture uses local data and does not sign in or send chat.
+messages, static images, and animations. Screenshots were inspected at 600 × 800,
+1,125 × 875, and 1,200 × 950 pixels, using the display's 1.25 native density and
+UI zoom factors of 1.0 and 1.5. The checks covered toolbar and channel controls,
+chat and search wrapping, mixed Japanese text, emote rendering, the unsent-message
+panel, and Settings bounds and lower controls after scrolling. The fixture uses
+local data and does not sign in or send chat.
 
 Real-account sign-in, switching, and moderation, Linux packaging, and release
 performance profiling remain unverified. Automated account-transition tests

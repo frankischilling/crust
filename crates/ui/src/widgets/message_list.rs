@@ -595,16 +595,10 @@ impl<'a> MessageList<'a> {
         let n = visible_indices.len();
         let paused_snapshot_new_rows = live_visible_count.saturating_sub(n);
 
-        // If the user scrolls over the message panel, immediately pause
-        // stick-to-bottom so upward wheel input can take effect this frame.
-        let wheel_over_panel = ui.ctx().input(|i| {
-            let over_panel = i
-                .pointer
-                .hover_pos()
-                .map(|p| panel_rect.contains(p))
-                .unwrap_or(false);
-            over_panel && i.raw_scroll_delta.y.abs() > 0.0
-        });
+        // Pause before applying a wheel gesture over chat. A window covering
+        // the panel owns its input and must not pause the conversation beneath it.
+        let wheel_over_panel = ui.rect_contains_pointer(panel_rect)
+            && ui.input(|input| input.raw_scroll_delta.y.abs() > 0.0);
         // Store whether the wheel was used this frame, so show_resume_button
         // doesn't immediately clear the paused flag before the delta is applied.
         let wheel_key = egui::Id::new("scroll_wheel_this_frame").with(self.channel.as_str());
@@ -4967,6 +4961,30 @@ mod tests {
         width: f32,
         configure: impl FnOnce(&mut MessageList<'_>),
     ) -> MessageListPerfStats {
+        render_test_message_frame(
+            ctx,
+            messages,
+            filters,
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 400.0),
+                )),
+                ..Default::default()
+            },
+            configure,
+            |_| {},
+        )
+    }
+
+    fn render_test_message_frame(
+        ctx: &egui::Context,
+        messages: &VecDeque<ChatMessage>,
+        filters: &[crust_core::model::filters::CompiledFilter],
+        input: egui::RawInput,
+        configure: impl FnOnce(&mut MessageList<'_>),
+        mut after_chat: impl FnMut(&egui::Context),
+    ) -> MessageListPerfStats {
         let channel = ChannelId::new("rustlang");
         let images = UiImageCache::default();
         let previews = HashMap::new();
@@ -4976,25 +4994,34 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let tx = UiCommandSender::new(tx);
         let mut list = MessageList::new(
-            messages, &images, &tx, &channel, &previews, None,
-            false, 3, false, false, false, true, false,
-            &ignored_logins, &ignored_users, &[], filters, &[], &low_trust,
+            messages,
+            &images,
+            &tx,
+            &channel,
+            &previews,
+            None,
+            false,
+            3,
+            false,
+            false,
+            false,
+            true,
+            false,
+            &ignored_logins,
+            &ignored_users,
+            &[],
+            filters,
+            &[],
+            &low_trust,
         );
         configure(&mut list);
         let mut stats = MessageListPerfStats::default();
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO, egui::vec2(width, 400.0),
-                )),
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    stats = list.show(ui).perf_stats;
-                });
-            },
-        );
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                stats = list.show(ui).perf_stats;
+            });
+            after_chat(ctx);
+        });
         stats
     }
 
@@ -5006,6 +5033,93 @@ mod tests {
                 message
             })
             .collect()
+    }
+
+    #[test]
+    fn wheel_over_an_overlapping_window_keeps_chat_live_but_uncovered_chat_pauses() {
+        let ctx = egui::Context::default();
+        let messages = test_buffer(1, 100);
+        let paused_key = Id::new("scroll_paused").with("rustlang");
+        let offset_key = Id::new("scroll_prev_offset").with("rustlang");
+        let frame = |events| {
+            render_test_message_frame(
+                &ctx,
+                &messages,
+                &[],
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(500.0, 400.0),
+                    )),
+                    focused: true,
+                    events,
+                    ..Default::default()
+                },
+                |_| {},
+                |ctx| {
+                    egui::Window::new("Overlapping settings")
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(egui::pos2(100.0, 60.0))
+                        .fixed_size(egui::vec2(240.0, 250.0))
+                        .collapsible(false)
+                        .show(ctx, |ui| {
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                for row in 0..50 {
+                                    ui.label(format!("Setting {row}"));
+                                }
+                            });
+                        });
+                },
+            );
+        };
+        for _ in 0..6 {
+            frame(Vec::new());
+        }
+        assert_eq!(
+            ctx.data(|data| data.get_temp::<bool>(paused_key)),
+            Some(false)
+        );
+        let offset_before = ctx.data(|data| data.get_temp::<f32>(offset_key).unwrap());
+        assert!(
+            offset_before > 0.0,
+            "The chat fixture must have scrollable history"
+        );
+
+        let wheel_at = |point| {
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, 80.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        let covered = egui::pos2(180.0, 180.0);
+        frame(wheel_at(covered));
+        assert_eq!(
+            ctx.layer_id_at(covered).unwrap().order,
+            egui::Order::Foreground
+        );
+        assert_eq!(
+            ctx.data(|data| data.get_temp::<bool>(paused_key)),
+            Some(false)
+        );
+        assert_eq!(
+            ctx.data(|data| data.get_temp::<f32>(offset_key)),
+            Some(offset_before)
+        );
+
+        let uncovered = egui::pos2(450.0, 180.0);
+        frame(wheel_at(uncovered));
+        assert_eq!(
+            ctx.layer_id_at(uncovered),
+            Some(egui::LayerId::background())
+        );
+        assert_eq!(
+            ctx.data(|data| data.get_temp::<bool>(paused_key)),
+            Some(true)
+        );
     }
 
     #[test]
