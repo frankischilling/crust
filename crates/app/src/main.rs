@@ -29,7 +29,7 @@ use crust_twitch::{
 use crust_ui::CrustApp;
 use crust_uploader::{upload_image as uploader_upload, RawImage, UploaderConfig};
 use seventv::{
-    apply_7tv_cosmetics_to_sender, load_7tv_cosmetics_catalog, load_7tv_user_style_for_twitch,
+    apply_7tv_cosmetics_to_sender, load_7tv_cosmetics_catalog,
     resolve_7tv_user_style, SevenTvBadgeMeta, SevenTvCosmeticUpdate, SevenTvPaintMeta,
     SevenTvResolvedStyle, SevenTvUserStyleRaw,
 };
@@ -43,7 +43,8 @@ use runtime::badges::{
     load_badge_map_cache_into, load_channel_badges, load_global_badges, resolve_badge_url, BadgeMap,
 };
 use runtime::emote_loading::{
-    load_channel_emotes, load_global_emotes, load_kick_channel_emotes, load_personal_7tv_emotes,
+    clear_personal_emotes, drain_7tv_user_lookups, load_channel_emotes, load_global_emotes, load_kick_channel_emotes,
+    queue_7tv_user_lookup, send_emote_catalog,
 };
 #[cfg(test)]
 use runtime::eventsub_notices::format_eventsub_notice_text;
@@ -57,6 +58,7 @@ use runtime::history::{
     load_local_recent_whispers, load_recent_messages,
 };
 use runtime::link_preview::fetch_link_preview;
+use runtime::outgoing::{chat_echo_body, complete_whisper_send, twitch_message_error, ChatSendPublisher, OutgoingChat};
 use runtime::plugins::init_plugins;
 use runtime::profiles::{
     fetch_ivr_logs, fetch_self_avatar, fetch_shared_channel_profile, fetch_shared_chat_session,
@@ -141,35 +143,16 @@ fn crust_icon_data() -> egui::IconData {
 static HISTORY_MSG_ID: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(u64::MAX / 2);
 
-/// Shared emote index: "provider:code" -> EmoteInfo.
-/// Keyed by compound key so that emotes with the same code from different
-/// providers are all preserved (important for the emote picker catalog).
-type EmoteIndex = Arc<RwLock<std::collections::HashMap<String, EmoteInfo>>>;
+type EmoteIndex = Arc<RwLock<runtime::emote_registry::EmoteRegistry>>;
 
-/// Track which emote codes are global (vs channel-specific).
-type GlobalCodes = Arc<RwLock<std::collections::HashSet<String>>>;
-
-/// Build the compound key used in [`EmoteIndex`].
-#[inline]
-fn emote_key(provider: &str, code: &str) -> String {
-    format!("{provider}:{code}")
-}
-
-/// Resolve an emote by code across all providers.
-/// Priority: 7TV > BTTV > FFZ > Kick (matches visual override order).
+/// Resolve a code using the message's channel and sender.
 fn resolve_emote<'a>(
-    idx: &'a std::collections::HashMap<String, EmoteInfo>,
+    idx: &'a runtime::emote_registry::EmoteRegistry,
+    channel: &ChannelId,
+    sender_user_id: &str,
     code: &str,
 ) -> Option<&'a EmoteInfo> {
-    // "twitch" is checked last so third-party overrides take precedence,
-    // but it ensures Twitch-native globals (e.g. LUL, Kappa) are still
-    // resolved for local-echo messages that lack IRC emote-position tags.
-    for provider in &["7tv", "bttv", "ffz", "kick", "twitch"] {
-        if let Some(info) = idx.get(&emote_key(provider, code)) {
-            return Some(info);
-        }
-    }
-    None
+    idx.resolve(channel, sender_user_id, code)
 }
 
 fn main() -> Result<()> {
@@ -284,11 +267,7 @@ fn main() -> Result<()> {
     let authed_helix = std::sync::Arc::new(crust_twitch::helix::AuthedHelix::new());
 
     // Emote index shared between loaders and reducer
-    let emote_index: EmoteIndex = Arc::new(RwLock::new(std::collections::HashMap::new()));
-
-    // Track which emote codes are global (vs channel-specific)
-    let global_emote_codes: Arc<RwLock<std::collections::HashSet<String>>> =
-        Arc::new(RwLock::new(std::collections::HashSet::new()));
+    let emote_index: EmoteIndex = Arc::new(RwLock::new(runtime::emote_registry::EmoteRegistry::default()));
 
     // Emote cache for disk/network
     let emote_cache = EmoteCache::new().ok();
@@ -506,11 +485,10 @@ fn main() -> Result<()> {
         let idx = emote_index.clone();
         let cache = emote_cache.clone();
         let etx = evt_tx.clone();
-        let gc = global_emote_codes.clone();
         let bm = badge_map.clone();
         let token = saved_token.clone();
         rt.block_on(async move {
-            load_global_emotes(&idx, &cache, &etx, &gc).await;
+            load_global_emotes(&idx, &cache, &etx).await;
             load_global_badges(&bm, &cache, &etx, token).await;
         });
     }
@@ -520,7 +498,6 @@ fn main() -> Result<()> {
         let idx = emote_index.clone();
         let cache = emote_cache.clone();
         let bm = badge_map.clone();
-        let gc = global_emote_codes.clone();
         reducer_loop(
             cmd_rx,
             tw_evt_rx,
@@ -543,7 +520,6 @@ fn main() -> Result<()> {
             idx,
             cache,
             bm,
-            gc,
             settings_store,
             chat_logs,
             saved_token,
@@ -734,7 +710,6 @@ async fn reducer_loop(
     emote_index: EmoteIndex,
     emote_cache: Option<EmoteCache>,
     badge_map: BadgeMap,
-    global_emote_codes: GlobalCodes,
     settings_store: Option<SettingsStore>,
     chat_logs: Option<LogStore>,
     saved_token: Option<String>,
@@ -758,7 +733,6 @@ async fn reducer_loop(
     let mut stv_paints: HashMap<String, SevenTvPaintMeta> = HashMap::new();
     let mut stv_user_styles_raw: HashMap<String, SevenTvUserStyleRaw> = HashMap::new();
     let mut stv_user_styles_resolved: HashMap<String, SevenTvResolvedStyle> = HashMap::new();
-    let mut stv_pending_user_lookups: HashSet<String> = HashSet::new();
 
     // Shared HTTP client for all 7TV API calls (connection pooling + HTTP/2).
     let stv_http_client: reqwest::Client = reqwest::Client::builder()
@@ -767,6 +741,9 @@ async fn reducer_loop(
         .unwrap_or_else(|_| reqwest::Client::new());
     // Limit concurrent 7TV user-style lookups to avoid overwhelming the API.
     let stv_lookup_sem = Arc::new(tokio::sync::Semaphore::new(20));
+    let mut personal_catalog_dirty = false;
+    let mut personal_catalog_tick = tokio::time::interval(Duration::from_millis(250));
+    personal_catalog_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     {
         let tx = stv_update_tx.clone();
@@ -786,6 +763,7 @@ async fn reducer_loop(
     let mut auth_scopes: Vec<String> = Vec::new();
     let mut whisper_history_loaded_for: Option<String> = None;
     let mut local_msg_id: u64 = 1_000_000; // offset to avoid collisions with session IDs
+    let mut chat_publisher = ChatSendPublisher::default();
                                            // Helix API credentials extracted from the validate response.
                                            // Required for moderation calls (timeout / ban) via POST /helix/moderation/bans.
     let mut helix_client_id: Option<String> = None;
@@ -880,6 +858,12 @@ async fn reducer_loop(
     }
 
     let mut joined_channels: HashSet<String> = canonical_auto_join.into_iter().collect();
+    {
+        let mut registry = emote_index.write().unwrap();
+        for channel in &parsed_initial_channels {
+            registry.open_channel(channel);
+        }
+    }
 
     let mut auth_requests = AuthValidationRequests::default();
     let mut expected_irc_identity: Option<(u64, String)> = None;
@@ -1310,6 +1294,7 @@ async fn reducer_loop(
                             info!("Restoring {} Twitch channels from auto-join", twitch_restore.len());
                         }
                         for id in twitch_restore {
+                            emote_index.write().unwrap().reconnect_channel(&id);
                             let _ = evt_tx.send(AppEvent::ChannelJoined { channel: id.clone() }).await;
                             let _ = sess_tx.send(SessionCommand::JoinChannel(id)).await;
                         }
@@ -1342,6 +1327,7 @@ async fn reducer_loop(
                         expected_irc_identity = None;
                         auth_username = None;
                         auth_user_id = None;
+                        clear_personal_emotes(&emote_index, &evt_tx).await;
                         auth_scopes.clear();
                         helix_client_id = None;
                         whisper_history_loaded_for = None;
@@ -1389,12 +1375,14 @@ async fn reducer_loop(
                         let idx = emote_index.clone();
                         let cache_clone = emote_cache.clone();
                         let rid = room_id.clone();
-                        let ch = channel.to_string();
+                        let ch = channel.clone();
                         let etx = evt_tx.clone();
-                        let gc = global_emote_codes.clone();
-                        tokio::spawn(async move {
-                            load_channel_emotes(&ch, &rid, &idx, &cache_clone, &etx, &gc).await;
-                        });
+                        let generation = idx.write().unwrap().begin_channel_load(&ch, &rid, false);
+                        if let Some(generation) = generation {
+                            tokio::spawn(async move {
+                                load_channel_emotes(&ch, &rid, generation, &idx, &cache_clone, &etx).await;
+                            });
+                        }
                         // Load channel-specific badges
                         let bm = badge_map.clone();
                         let etx = evt_tx.clone();
@@ -1542,34 +1530,10 @@ async fn reducer_loop(
                             }
                         }
 
-                        // Load the authenticated user's personal 7TV emote set
-                        let uid = user_id.clone();
-                        let idx2 = emote_index.clone();
-                        let cache2 = emote_cache.clone();
-                        let etx2 = evt_tx.clone();
-                        let gc2 = global_emote_codes.clone();
-                        tokio::spawn(async move {
-                            load_personal_7tv_emotes(&uid, &idx2, &cache2, &etx2, &gc2).await;
-                        });
-
-                        // Prime cosmetics cache for the logged-in user.
-                        if !user_id.trim().is_empty()
-                            && stv_pending_user_lookups.insert(user_id.clone())
-                        {
-                            let tx = stv_update_tx.clone();
-                            let client = stv_http_client.clone();
-                            let sem = stv_lookup_sem.clone();
-                            tokio::spawn(async move {
-                                let _permit = sem.acquire().await;
-                                let style = load_7tv_user_style_for_twitch(&client, &user_id).await;
-                                let _ = tx
-                                    .send(SevenTvCosmeticUpdate::UserStyle {
-                                        twitch_user_id: user_id,
-                                        style,
-                                    })
-                                    .await;
-                            });
-                        }
+                        // The shared user response supplies cosmetics and personal emotes.
+                        emote_index.write().unwrap().set_account(Some(&user_id));
+                        queue_7tv_user_lookup(&user_id, None, &emote_index, &stv_http_client,
+                            &stv_lookup_sem, &stv_update_tx);
                         // Fetch the user's own avatar for the top-bar profile pill.
                         {
                             let login = auth_username.clone().unwrap_or_default().to_lowercase();
@@ -1719,7 +1683,7 @@ async fn reducer_loop(
                                 msg.flags.is_action,
                                 &msg.twitch_emotes,
                                 &|code| {
-                                    resolve_emote(&emote_guard, code).map(|info| {
+                                    resolve_emote(&emote_guard, &msg.channel, &msg.sender.user_id.0, code).map(|info| {
                                         (
                                             info.id.clone(),
                                             info.code.clone(),
@@ -1815,23 +1779,9 @@ async fn reducer_loop(
                                 if let Some(style) = stv_user_styles_resolved.get(&twitch_user_id)
                                 {
                                     apply_7tv_cosmetics_to_sender(&mut msg.sender, style);
-                                } else if stv_pending_user_lookups.insert(twitch_user_id.clone())
-                                {
-                                    let tx = stv_update_tx.clone();
-                                    let client = stv_http_client.clone();
-                                    let sem = stv_lookup_sem.clone();
-                                    tokio::spawn(async move {
-                                        let _permit = sem.acquire().await;
-                                        let style =
-                                            load_7tv_user_style_for_twitch(&client, &twitch_user_id).await;
-                                        let _ = tx
-                                            .send(SevenTvCosmeticUpdate::UserStyle {
-                                                twitch_user_id,
-                                                style,
-                                            })
-                                            .await;
-                                    });
                                 }
+                                queue_7tv_user_lookup(&twitch_user_id, Some(&msg.channel), &emote_index,
+                                    &stv_http_client, &stv_lookup_sem, &stv_update_tx);
                             }
                         }
 
@@ -2086,6 +2036,7 @@ async fn reducer_loop(
                             info!("Restoring {} Kick channels from auto-join", kick_restore.len());
                         }
                         for id in kick_restore {
+                            emote_index.write().unwrap().reconnect_channel(&id);
                             let _ = evt_tx.send(AppEvent::ChannelJoined { channel: id.clone() }).await;
                             let _ = kick_tx.send(KickSessionCommand::JoinChannel(id)).await;
                         }
@@ -2109,11 +2060,13 @@ async fn reducer_loop(
                         let idx = emote_index.clone();
                         let cache_clone = emote_cache.clone();
                         let etx = evt_tx.clone();
-                        let gc = global_emote_codes.clone();
                         let ch = channel.clone();
-                        tokio::spawn(async move {
-                            load_kick_channel_emotes(&ch, user_id, &idx, &cache_clone, &etx, &gc).await;
-                        });
+                        let generation = idx.write().unwrap().begin_channel_load(&ch, &user_id.to_string(), false);
+                        if let Some(generation) = generation {
+                            tokio::spawn(async move {
+                                load_kick_channel_emotes(&ch, user_id, generation, &idx, &cache_clone, &etx).await;
+                            });
+                        }
                     }
                     KickEvent::ChatMessage(mut msg) => {
                         let (normalized_text, inline_emotes) =
@@ -2132,24 +2085,13 @@ async fn reducer_loop(
                                         url_4x: None,
                                         provider: "kick".to_owned(),
                                     };
-                                    let key = emote_key("kick", &code);
-                                    let replace = idx
-                                        .get(&key)
-                                        .map(|e| e.provider != "kick" || e.id != id)
-                                        .unwrap_or(true);
-                                    if replace {
-                                        idx.insert(key, info);
+                                    if idx.insert_channel_emote(&msg.channel, info) {
                                         inserted += 1;
                                     }
                                 }
                             }
                             if inserted > 0 {
-                                if let Some(cache) = emote_cache.as_ref() {
-                                    let idx = emote_index.read().unwrap();
-                                    let emotes: Vec<EmoteInfo> = idx.values().cloned().collect();
-                                    drop(idx);
-                                    cache.register(emotes);
-                                }
+                                send_emote_catalog(&emote_index, &evt_tx).await;
                             }
                         }
 
@@ -2161,7 +2103,7 @@ async fn reducer_loop(
                                 msg.flags.is_action,
                                 &msg.twitch_emotes,
                                 &|code| {
-                                    resolve_emote(&emote_guard, code).map(|info| {
+                                    resolve_emote(&emote_guard, &msg.channel, &msg.sender.user_id.0, code).map(|info| {
                                         (
                                             info.id.clone(),
                                             info.code.clone(),
@@ -2338,6 +2280,16 @@ async fn reducer_loop(
                         let old_id = ChannelId::irc(&host, port, tls, &old_channel);
                         let new_id = ChannelId::irc(&host, port, tls, &new_channel);
 
+                        {
+                            let mut registry = emote_index.write().unwrap();
+                            registry.close_channel(&old_id);
+                            registry.open_channel(&new_id);
+                        }
+
+                        let _ = irc_tx.send(GenericIrcSessionCommand::RedirectChannel {
+                            old: old_id.clone(), new: new_id.clone(),
+                        }).await;
+
                         // Update persisted channel set
                         joined_channels.remove(&old_id.as_str().to_lowercase());
                         joined_channels.insert(new_id.as_str().to_lowercase());
@@ -2397,7 +2349,7 @@ async fn reducer_loop(
                                 msg.flags.is_action,
                                 &msg.twitch_emotes,
                                 &|code| {
-                                    resolve_emote(&emote_guard, code).map(|info| {
+                                    resolve_emote(&emote_guard, &msg.channel, &msg.sender.user_id.0, code).map(|info| {
                                         (
                                             info.id.clone(),
                                             info.code.clone(),
@@ -3136,9 +3088,21 @@ async fn reducer_loop(
                     }
                     SevenTvCosmeticUpdate::UserStyle {
                         twitch_user_id,
-                        style,
+                        generation,
+                        profile,
                     } => {
-                        stv_pending_user_lookups.remove(&twitch_user_id);
+                        let (style, emotes) = profile.map(|profile| (Some(profile.style), profile.personal_emotes))
+                            .unwrap_or_default();
+                        let update = emote_index.write().unwrap()
+                            .complete_personal_load(&twitch_user_id, generation, emotes);
+                        let Some(update) = update else { continue; };
+                        for user_id in update.evicted_users {
+                            stv_user_styles_raw.remove(&user_id);
+                            stv_user_styles_resolved.remove(&user_id);
+                        }
+                        if update.catalog_changed {
+                            personal_catalog_dirty = true;
+                        }
                         if let Some(raw) = style {
                             let resolved = resolve_7tv_user_style(&raw, &stv_badges, &stv_paints);
                             stv_user_styles_raw.insert(twitch_user_id.clone(), raw);
@@ -3158,34 +3122,29 @@ async fn reducer_loop(
                             }
                         }
                     }
-                    SevenTvCosmeticUpdate::BatchUserLookup { user_ids } => {
+                    SevenTvCosmeticUpdate::BatchUserLookup { channel, user_ids } => {
                         // Triggered by history loading - queue lookups for
                         // users we haven't seen yet.
                         let mut queued = 0u32;
                         for uid in user_ids {
-                            if uid.is_empty() { continue; }
-                            if stv_user_styles_resolved.contains_key(&uid) { continue; }
-                            if !stv_pending_user_lookups.insert(uid.clone()) { continue; }
-                            queued += 1;
-                            let tx = stv_update_tx.clone();
-                            let client = stv_http_client.clone();
-                            let sem = stv_lookup_sem.clone();
-                            tokio::spawn(async move {
-                                let _permit = sem.acquire().await;
-                                let style =
-                                    load_7tv_user_style_for_twitch(&client, &uid).await;
-                                let _ = tx
-                                    .send(SevenTvCosmeticUpdate::UserStyle {
-                                        twitch_user_id: uid,
-                                        style,
-                                    })
-                                    .await;
-                            });
+                            if queue_7tv_user_lookup(&uid, Some(&channel), &emote_index, &stv_http_client,
+                                &stv_lookup_sem, &stv_update_tx) {
+                                queued += 1;
+                            }
                         }
                         if queued > 0 {
                             info!("7TV: queued {queued} user-style lookups from history");
                         }
                     }
+                }
+            }
+
+            // Coalesce personal-set arrivals before rebuilding the shared UI catalog.
+            _ = personal_catalog_tick.tick() => {
+                drain_7tv_user_lookups(&emote_index, &stv_http_client, &stv_lookup_sem, &stv_update_tx);
+                if personal_catalog_dirty {
+                    personal_catalog_dirty = false;
+                    send_emote_catalog(&emote_index, &evt_tx).await;
                 }
             }
 
@@ -3208,6 +3167,7 @@ async fn reducer_loop(
                         &mut settings, &mut auth_username, &mut auth_user_id,
                         &mut auth_scopes, &mut helix_client_id, &mut expected_irc_identity,
                     );
+                    clear_personal_emotes(&emote_index, &evt_tx).await;
                     whisper_history_loaded_for = None;
                     let _ = sess_tx.send(SessionCommand::LogoutAndReconnect).await;
                     clear_account_channel_state(&mut channel_mod_status, &mut self_badges, &mut self_color, &evt_tx).await;
@@ -3264,6 +3224,7 @@ async fn reducer_loop(
                             let _ = sess_tx.send(SessionCommand::JoinChannel(channel.clone())).await;
                         }
                         // Emit ChannelJoined immediately for UI responsiveness.
+                        emote_index.write().unwrap().open_channel(&channel);
                         let _ = evt_tx.send(AppEvent::ChannelJoined {
                             channel: channel.clone(),
                         }).await;
@@ -3329,6 +3290,7 @@ async fn reducer_loop(
                                 key: key.clone(),
                             })
                             .await;
+                        emote_index.write().unwrap().open_channel(&channel);
                         let _ = evt_tx
                             .send(AppEvent::ChannelJoined {
                                 channel: channel.clone(),
@@ -3369,6 +3331,8 @@ async fn reducer_loop(
                             info!("Leaving #{channel}");
                             let _ = sess_tx.send(SessionCommand::LeaveChannel(channel.clone())).await;
                         }
+                        emote_index.write().unwrap().close_channel(&channel);
+                        send_emote_catalog(&emote_index, &evt_tx).await;
                         let _ = evt_tx.send(AppEvent::ChannelParted { channel: channel.clone() }).await;
                         if let Some(broadcaster_id) = channel_room_ids.remove(&channel) {
                             channel_mod_status.remove(&channel);
@@ -3381,18 +3345,23 @@ async fn reducer_loop(
                         save_channels(&settings_store, &mut settings, &joined_channels);
                     }
                     AppCommand::LoadChannelEmotes { channel_twitch_id } => {
+                        let channel = channel_room_ids.iter()
+                            .find(|(_, room_id)| **room_id == channel_twitch_id)
+                            .map(|(channel, _)| channel.clone());
+                        let Some(channel) = channel else { continue; };
                         let idx = emote_index.clone();
                         let cache_clone = emote_cache.clone();
                         let etx = evt_tx.clone();
-                        let gc = global_emote_codes.clone();
+                        let generation = idx.write().unwrap().begin_channel_load(&channel, &channel_twitch_id, true);
+                        let Some(generation) = generation else { continue; };
                         tokio::spawn(async move {
                             load_channel_emotes(
-                                "manual",
+                                &channel,
                                 &channel_twitch_id,
+                                generation,
                                 &idx,
                                 &cache_clone,
                                 &etx,
-                                &gc,
                             )
                             .await;
                         });
@@ -3431,6 +3400,7 @@ async fn reducer_loop(
                         }
                         auth_username = None;
                         auth_user_id = None;
+                        clear_personal_emotes(&emote_index, &evt_tx).await;
                         auth_scopes.clear();
                         helix_client_id = None;
                         whisper_history_loaded_for = None;
@@ -3486,6 +3456,7 @@ async fn reducer_loop(
                                 &mut settings, &mut auth_username, &mut auth_user_id,
                                 &mut auth_scopes, &mut helix_client_id, &mut expected_irc_identity,
                             );
+                            clear_personal_emotes(&emote_index, &evt_tx).await;
                             whisper_history_loaded_for = None;
                             clear_account_channel_state(&mut channel_mod_status, &mut self_badges, &mut self_color, &evt_tx).await;
                             let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
@@ -4437,28 +4408,11 @@ async fn reducer_loop(
                                         &whisper_text,
                                     )
                                 };
-                                if settings.local_log_indexing_enabled {
-                                    if let Some(store) = chat_logs.as_ref() {
-                                        if let Some(sender_login) = from_login
-                                            .as_deref()
-                                            .and_then(normalize_whisper_login)
-                                        {
-                                            if let Err(e) = persist_whisper_message(
-                                                store,
-                                                Some(sender_login.as_str()),
-                                                &sender_login,
-                                                &sender_login,
-                                                &target_login,
-                                                &whisper_text,
-                                                &whisper_twitch_emotes,
-                                                true,
-                                                Utc::now(),
-                                            ) {
-                                                warn!("whisper-history: failed to persist sent whisper: {e}");
-                                            }
-                                        }
-                                    }
-                                }
+                                let whisper_log_store = if settings.local_log_indexing_enabled {
+                                    chat_logs.clone()
+                                } else {
+                                    None
+                                };
                                 let evt_tx2 = evt_tx.clone();
                                 tokio::spawn(async move {
                                     helix_send_whisper(
@@ -4469,6 +4423,7 @@ async fn reducer_loop(
                                         &target_login,
                                         &whisper_text,
                                         whisper_twitch_emotes,
+                                        whisper_log_store.as_ref(),
                                         evt_tx2,
                                     )
                                     .await;
@@ -4487,20 +4442,15 @@ async fn reducer_loop(
                         // Twitch hard-limit: reject overlong messages before
                         // they hit the IRC layer (and before local-echo).
                         if channel.is_twitch() {
-                            let char_count = text.chars().count();
-                            if char_count > TWITCH_MAX_MESSAGE_CHARS {
-                                let _ = evt_tx
-                                    .send(AppEvent::Error {
-                                        context: "Twitch".into(),
-                                        message: format!(
-                                            "Message too long ({char_count}/{TWITCH_MAX_MESSAGE_CHARS}). Twitch allows up to {TWITCH_MAX_MESSAGE_CHARS} characters.",
-                                        ),
-                                    })
-                                    .await;
+                            if let Some(reason) = twitch_message_error(&text) {
+                                let draft = OutgoingChat { channel, text, reply_to_msg_id, reply };
+                                let _ = evt_tx.send(draft.rejected(reason)).await;
                                 continue;
                             }
                         }
 
+                        let mut twitch_submission = None;
+                        let mut irc_submission = None;
                         if channel.is_irc_server_tab() {
                             if !irc_beta_enabled || !irc_runtime_enabled {
                                 let _ = evt_tx.send(AppEvent::Error {
@@ -4515,12 +4465,7 @@ async fn reducer_loop(
                                 // Allow IRC protocol slash commands (e.g. /list, /whois, /raw)
                                 // and raw lines (e.g. PRIVMSG #chan :text) directly from
                                 // the server tab.
-                                let _ = irc_tx
-                                    .send(GenericIrcSessionCommand::SendMessage(
-                                        channel.clone(),
-                                        text.clone(),
-                                    ))
-                                    .await;
+                                irc_submission = Some(tokio::sync::oneshot::channel());
                             } else {
                                 let msg = make_system_message(
                                     local_msg_id,
@@ -4556,15 +4501,16 @@ async fn reducer_loop(
                                 }).await;
                                 continue;
                             }
-                            let _ = irc_tx.send(GenericIrcSessionCommand::SendMessage(channel.clone(), text.clone())).await;
+                            irc_submission = Some(tokio::sync::oneshot::channel());
                         } else {
-                            let _ = sess_tx.send(SessionCommand::SendMessage(channel.clone(), text.clone(), reply_to_msg_id)).await;
+                            twitch_submission = Some(tokio::sync::oneshot::channel());
                         }
 
-                        // Local echo: show the sent message immediately (Twitch only).
-                        if let (Some(uname), Some(uid)) = (&auth_username, &auth_user_id) {
+                        // Capture the sender now; publish the echo after its socket write.
+                        if let (Some(uname), Some(uid), Some((receipt, receiver))) = (&auth_username, &auth_user_id, twitch_submission) {
                         if channel.is_twitch() {
                             local_msg_id += 1;
+                            let (echo_body, is_action) = chat_echo_body(&text);
                             let mut echo = ChatMessage {
                                 id: MessageId(local_msg_id),
                                 server_id: None,
@@ -4579,11 +4525,11 @@ async fn reducer_loop(
                                     name_paint: None,
                                     badges: self_badges.get(&channel).cloned().unwrap_or_default(),
                                 },
-                                raw_text: text.clone(),
+                                raw_text: echo_body.to_owned(),
                                 spans: smallvec::SmallVec::new(),
                                 twitch_emotes: Vec::new(),
                                 flags: MessageFlags {
-                                    is_action: false,
+                                    is_action,
                                     is_highlighted: false,
                                     is_deleted: false,
                                     is_first_msg: false,
@@ -4608,10 +4554,10 @@ async fn reducer_loop(
                                 let emote_guard = emote_index.read().unwrap();
                                 echo.spans = crust_core::format::tokenize(
                                     &echo.raw_text,
-                                    false,
+                                    echo.flags.is_action,
                                     &echo.twitch_emotes,
                                     &|code| {
-                                        resolve_emote(&emote_guard, code).map(|info| {
+                                        resolve_emote(&emote_guard, &echo.channel, &echo.sender.user_id.0, code).map(|info| {
                                             (
                                                 info.id.clone(),
                                                 info.code.clone(),
@@ -4636,18 +4582,25 @@ async fn reducer_loop(
                                 }
                             }
 
-                            let _ = evt_tx.send(AppEvent::MessageReceived {
+                            let draft = OutgoingChat {
                                 channel: channel.clone(),
-                                message: echo,
-                            }).await;
+                                text: text.clone(),
+                                reply_to_msg_id: reply_to_msg_id.clone(),
+                                reply: reply.clone(),
+                            };
+                            let echo_log_store = if settings.local_log_indexing_enabled { chat_logs.clone() } else { None };
+                            if chat_publisher.submit(receiver, draft, echo, echo_log_store, evt_tx.clone()).await {
+                                let _ = sess_tx.send(SessionCommand::SendMessage(channel.clone(), text.clone(), reply_to_msg_id.clone(), receipt)).await;
+                            }
                         }
                         }
 
-                        // Local echo for generic IRC channels (servers may not echo PRIVMSG).
-                        // Handles plain text -> echo to current channel, and
-                        // /msg or /privmsg #chan text -> echo body to target channel.
-                        // Also works from the server tab for /msg and /privmsg.
-                        if channel.is_irc() {
+                        // Keep IRC drafts recoverable until the write completes.
+                        if let Some((receipt, receiver)) = irc_submission {
+                            let mut outgoing_echo = None;
+                            let action_body = text.trim().split_once(char::is_whitespace)
+                                .filter(|(command, body)| command.eq_ignore_ascii_case("/me") && !body.trim().is_empty())
+                                .map(|(_, body)| body.trim_start());
                             let irc_echo = if channel.is_irc_server_tab() {
                                 // From the server tab, only echo /msg or /privmsg targeting a channel.
                                 extract_irc_msg_echo(&text, &channel)
@@ -4655,13 +4608,20 @@ async fn reducer_loop(
                                 && !is_raw_irc_protocol_line(&text)
                             {
                                 // Plain text: echo to current channel.
-                                Some((channel.clone(), text.clone()))
+                                Some((channel.clone(), text.trim().to_owned()))
+                            } else if let Some(body) = action_body {
+                                Some((channel.clone(), format!("\u{0001}ACTION {body}\u{0001}")))
                             } else {
                                 // Check for /msg or /privmsg targeting a channel.
                                 extract_irc_msg_echo(&text, &channel)
                             };
                             if let Some((echo_channel, echo_text)) = irc_echo {
                                 local_msg_id += 1;
+                                let (echo_body, is_action) = if echo_text.starts_with('\u{0001}') {
+                                    chat_echo_body(&echo_text)
+                                } else {
+                                    (echo_text.as_str(), false)
+                                };
                                 let irc_nick = settings.irc_nick.trim();
                                 let display = if irc_nick.is_empty() { "you" } else { irc_nick };
                                 let mut echo = ChatMessage {
@@ -4678,11 +4638,11 @@ async fn reducer_loop(
                                         name_paint: None,
                                         badges: Vec::new(),
                                     },
-                                    raw_text: echo_text,
+                                    raw_text: echo_body.to_owned(),
                                     spans: smallvec::SmallVec::new(),
                                     twitch_emotes: Vec::new(),
                                     flags: MessageFlags {
-                                        is_action: false,
+                                        is_action,
                                         is_highlighted: false,
                                         is_deleted: false,
                                         is_first_msg: false,
@@ -4702,10 +4662,10 @@ async fn reducer_loop(
                                     let emote_guard = emote_index.read().unwrap();
                                     echo.spans = crust_core::format::tokenize(
                                         &echo.raw_text,
-                                        false,
+                                        echo.flags.is_action,
                                         &echo.twitch_emotes,
                                         &|code| {
-                                            resolve_emote(&emote_guard, code).map(|info| {
+                                            resolve_emote(&emote_guard, &echo.channel, &echo.sender.user_id.0, code).map(|info| {
                                                 (
                                                     info.id.clone(),
                                                     info.code.clone(),
@@ -4729,12 +4689,15 @@ async fn reducer_loop(
                                     }
                                 }
 
-                                let _ = evt_tx
-                                    .send(AppEvent::MessageReceived {
-                                        channel: echo_channel,
-                                        message: echo,
-                                    })
-                                    .await;
+                                outgoing_echo = Some(echo);
+                            }
+                            let draft = OutgoingChat {
+                                channel: channel.clone(), text: text.clone(),
+                                reply_to_msg_id: reply_to_msg_id.clone(), reply: reply.clone(),
+                            };
+                            let echo_log_store = if settings.local_log_indexing_enabled { chat_logs.clone() } else { None };
+                            if chat_publisher.submit_irc(receiver, draft, outgoing_echo, echo_log_store, evt_tx.clone()).await {
+                                let _ = irc_tx.send(GenericIrcSessionCommand::SendMessage(channel.clone(), text.clone(), receipt)).await;
                             }
                         }
                     }
@@ -4748,30 +4711,11 @@ async fn reducer_loop(
                             let emote_guard = emote_index.read().unwrap();
                             infer_twitch_emote_positions_from_text(&emote_guard, &whisper_text)
                         };
-                        if settings.local_log_indexing_enabled {
-                            if let Some(store) = chat_logs.as_ref() {
-                                if !whisper_text.is_empty() {
-                                    if let Some(sender_login) = from_login
-                                        .as_deref()
-                                        .and_then(normalize_whisper_login)
-                                    {
-                                        if let Err(e) = persist_whisper_message(
-                                            store,
-                                            Some(sender_login.as_str()),
-                                            &sender_login,
-                                            &sender_login,
-                                            &target_login,
-                                            &whisper_text,
-                                            &whisper_twitch_emotes,
-                                            true,
-                                            Utc::now(),
-                                        ) {
-                                            warn!("whisper-history: failed to persist sent whisper: {e}");
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        let whisper_log_store = if settings.local_log_indexing_enabled {
+                            chat_logs.clone()
+                        } else {
+                            None
+                        };
                         let evt_tx2 = evt_tx.clone();
                         tokio::spawn(async move {
                             helix_send_whisper(
@@ -4782,6 +4726,7 @@ async fn reducer_loop(
                                 &target_login,
                                 &whisper_text,
                                 whisper_twitch_emotes,
+                                whisper_log_store.as_ref(),
                                 evt_tx2,
                             )
                             .await;
@@ -5774,6 +5719,7 @@ async fn reducer_loop(
                     AppCommand::LoadOlderLocalHistory {
                         channel,
                         before_ts_ms,
+                        before_row_id,
                         limit,
                     } => {
                         if !settings.local_log_indexing_enabled {
@@ -5797,9 +5743,18 @@ async fn reducer_loop(
                         };
                         let etx = evt_tx.clone();
                         tokio::spawn(async move {
-                            load_local_older_messages(channel, before_ts_ms, limit, store, etx)
+                            load_local_older_messages(channel, before_ts_ms, before_row_id, limit, store, etx)
                                 .await;
                         });
+                    }
+                    AppCommand::PersistMessageHighlight { channel, server_id, message_id, timestamp_ms } => {
+                        if settings.local_log_indexing_enabled {
+                            if let Some(store) = &chat_logs {
+                                if let Err(error) = store.mark_highlighted(&channel, server_id.as_deref(), message_id, timestamp_ms) {
+                                    warn!("chat-log: failed to save custom highlight: {error}");
+                                }
+                            }
+                        }
                     }
                     AppCommand::LiveFeedRefresh => {
                         let _ = live_feed_tx
@@ -5986,6 +5941,7 @@ async fn reducer_loop(
                             expected_irc_identity = Some((request.id, info.user_id.clone()));
                             auth_username = None;
                             auth_user_id = None;
+                            clear_personal_emotes(&emote_index, &evt_tx).await;
                             whisper_history_loaded_for = None;
                             clear_account_channel_state(
                                 &mut channel_mod_status,
@@ -6041,6 +5997,7 @@ async fn reducer_loop(
                             expected_irc_identity = None;
                             auth_username = None;
                             auth_user_id = None;
+                            clear_personal_emotes(&emote_index, &evt_tx).await;
                             auth_scopes.clear();
                             helix_client_id = None;
                             whisper_history_loaded_for = None;
@@ -7461,7 +7418,7 @@ fn whisper_thread_channel_id(partner_login: &str) -> ChannelId {
 }
 
 fn infer_twitch_emote_positions_from_text(
-    idx: &std::collections::HashMap<String, EmoteInfo>,
+    idx: &runtime::emote_registry::EmoteRegistry,
     text: &str,
 ) -> Vec<TwitchEmotePos> {
     let mut out = Vec::new();
@@ -7474,7 +7431,7 @@ fn infer_twitch_emote_positions_from_text(
             let leading_ws = word.chars().take_while(|c| c.is_whitespace()).count();
             let trimmed_len = trimmed.chars().count();
             if trimmed_len > 0 {
-                if let Some(info) = idx.get(&emote_key("twitch", trimmed)) {
+                if let Some(info) = idx.twitch_global(trimmed) {
                     let start = cursor_chars + leading_ws;
                     let end = start + trimmed_len - 1;
                     out.push(TwitchEmotePos {
@@ -7582,6 +7539,7 @@ async fn helix_user_id_by_login(
         .get(url)
         .header("Authorization", format!("Bearer {bare_token}"))
         .header("Client-Id", client_id)
+        .timeout(Duration::from_secs(10))
         .send()
         .await
         .map_err(|e| format!("Lookup user '{login}' failed: {e}"))?;
@@ -7613,6 +7571,7 @@ async fn helix_send_whisper(
     target_login: &str,
     text: &str,
     twitch_emotes: Vec<TwitchEmotePos>,
+    log_store: Option<&LogStore>,
     evt_tx: mpsc::Sender<AppEvent>,
 ) {
     info!("Whisper send requested to {}", target_login.trim());
@@ -7730,6 +7689,7 @@ async fn helix_send_whisper(
         .json(&WhisperBody {
             message: trimmed_text,
         })
+        .timeout(Duration::from_secs(10))
         .send()
         .await
     {
@@ -7747,42 +7707,20 @@ async fn helix_send_whisper(
 
     let status = resp.status();
     let body_text = resp.text().await.unwrap_or_default();
-    if status.is_success() {
-        let sender_login = from_login
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .unwrap_or_else(|| sender_id.to_owned());
-        let now = Utc::now();
-        info!("Whisper send succeeded to {login}");
-        let _ = evt_tx
-            .send(AppEvent::WhisperReceived {
-                from_login: sender_login.clone(),
-                from_display_name: sender_login,
-                target_login: login,
-                text: trimmed_text.to_owned(),
-                twitch_emotes,
-                is_self: true,
-                timestamp: now,
-                is_history: false,
-            })
-            .await;
-        return;
-    }
-
-    let mut msg = helix_error_message(status, &body_text);
-    if body_text.contains("MISSING_REQUIRED_SCOPE")
-        || msg.to_ascii_lowercase().contains("missing required scope")
-    {
-        msg.push_str(" Re-login with a token that includes user:manage:whispers.");
-    }
-    warn!("Whisper send failed to {login}: {msg}");
-    let _ = evt_tx
-        .send(AppEvent::Error {
-            context: "Whisper".into(),
-            message: format!("Could not send whisper to {login}: {msg}"),
-        })
-        .await;
+    let sender_login = from_login
+        .map(str::trim)
+        .filter(|login| !login.is_empty())
+        .unwrap_or(sender_id);
+    let event = complete_whisper_send(
+        status,
+        &body_text,
+        sender_login,
+        &login,
+        trimmed_text,
+        twitch_emotes,
+        log_store,
+    );
+    let _ = evt_tx.send(event).await;
 }
 
 async fn helix_send_announcement(

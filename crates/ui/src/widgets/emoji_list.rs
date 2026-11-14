@@ -11,10 +11,14 @@ pub fn emoji_catalog_entries() -> Vec<EmoteCatalogEntry> {
         .map(|&(ch, _name)| {
             let codepoints: Vec<u32> = ch.chars().map(|c| c as u32).collect();
             EmoteCatalogEntry {
+                id: ch.to_owned(),
+                url_hd: None,
                 code: ch.to_owned(),
                 provider: "emoji".to_owned(),
                 url: twemoji_url(&codepoints),
                 scope: "global".to_owned(),
+                channel: None,
+                user_id: None,
             }
         })
         .collect()

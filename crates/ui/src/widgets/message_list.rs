@@ -37,23 +37,43 @@ pub struct MessageListPerfStats {
     pub height_cache_misses: usize,
 }
 
+/// Discard measurements for messages whose rendered content changed in place.
+pub fn invalidate_message_layouts(ctx: &egui::Context, channel: &ChannelId, ids: &[MessageId]) {
+    if ids.is_empty() {
+        return;
+    }
+    let heights_key = Id::new("msg_row_h").with(channel.as_str());
+    let dirty_key = Id::new("msg_prefix_dirty").with(channel.as_str());
+    ctx.data_mut(|data| {
+        if let Some(mut heights) = data.remove_temp::<HashMap<u64, f32>>(heights_key) {
+            for id in ids {
+                heights.remove(&id.0);
+            }
+            data.insert_temp(heights_key, heights);
+        }
+        data.insert_temp(dirty_key, true);
+    });
+}
+
 // Zero-allocation visible-index abstraction
 // When no search filter is active, `VisibleIndices::All(n)` avoids
 // allocating a Vec<usize> with one entry per message every frame.
 
-enum VisibleIndices {
+enum VisibleIndices<'a> {
     /// No filter - visible index `i` maps directly to message index `i`.
     All(usize),
     /// Search filter active - sparse set of matching message indices.
     Filtered(Vec<usize>),
+    Cached(&'a [usize]),
 }
 
-impl VisibleIndices {
+impl VisibleIndices<'_> {
     #[inline]
     fn len(&self) -> usize {
         match self {
             Self::All(n) => *n,
             Self::Filtered(v) => v.len(),
+            Self::Cached(v) => v.len(),
         }
     }
 
@@ -63,6 +83,7 @@ impl VisibleIndices {
         match self {
             Self::All(_) => i,
             Self::Filtered(v) => v[i],
+            Self::Cached(v) => v[i],
         }
     }
 
@@ -71,19 +92,15 @@ impl VisibleIndices {
         match self {
             Self::All(n) => (0..*n).position(|i| pred(i)),
             Self::Filtered(v) => v.iter().position(|&idx| pred(idx)),
+            Self::Cached(v) => v.iter().position(|&idx| pred(idx)),
         }
-    }
-
-    fn collect_ids(&self, messages: &VecDeque<ChatMessage>) -> Vec<u64> {
-        (0..self.len())
-            .map(|i| messages[self.get(i)].id.0)
-            .collect()
     }
 
     fn contains_index(&self, index: usize) -> bool {
         match self {
             Self::All(n) => index < *n,
             Self::Filtered(indices) => indices.binary_search(&index).is_ok(),
+            Self::Cached(indices) => indices.contains(&index),
         }
     }
 }
@@ -314,6 +331,30 @@ fn map_snapshot_ids_to_indices(snapshot_ids: &[u64], live_ids: &[u64]) -> Vec<us
         .iter()
         .filter_map(|id| id_to_index.get(id).copied())
         .collect()
+}
+
+#[derive(Clone, Default)]
+struct PausedIndexCache {
+    snapshot_ids: Vec<u64>,
+    live_ids: Vec<u64>,
+    indices: Vec<usize>,
+}
+
+impl PausedIndexCache {
+    fn refresh(&mut self, snapshot_ids: &[u64], messages: &VecDeque<ChatMessage>) -> bool {
+        if self.snapshot_ids == snapshot_ids
+            && self.live_ids.len() == messages.len()
+            && self.live_ids.iter().zip(messages).all(|(id, message)| *id == message.id.0)
+        {
+            return false;
+        }
+        self.snapshot_ids.clear();
+        self.snapshot_ids.extend_from_slice(snapshot_ids);
+        self.live_ids.clear();
+        self.live_ids.extend(messages.iter().map(|message| message.id.0));
+        self.indices = map_snapshot_ids_to_indices(snapshot_ids, &self.live_ids);
+        true
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -566,30 +607,29 @@ impl<'a> MessageList<'a> {
         // Paused snapshot behavior:
         // freeze the rendered message-id set while paused so incoming chat does
         // not keep shifting the lines the user is reading.
-        let visible_indices: VisibleIndices = if paused_before_show
+        let paused_index_key = Id::new("paused_snapshot_indices").with(self.channel.as_str());
+        let (mut snapshot_ids, mut paused_indices): (Vec<u64>, PausedIndexCache) = ui.ctx().data_mut(|data| {
+            (data.remove_temp(paused_snapshot_key).unwrap_or_default(),
+             data.remove_temp(paused_index_key).unwrap_or_default())
+        });
+        let use_snapshot = paused_before_show
             && !search_filtering
-            && self.scroll_to.is_none()
-        {
-            let mut snapshot_ids: Vec<u64> = ui
-                .ctx()
-                .data_mut(|d| d.get_temp(paused_snapshot_key).unwrap_or_default());
+            && self.scroll_to.is_none();
+        let visible_indices: VisibleIndices = if use_snapshot {
             if snapshot_ids.is_empty() {
-                snapshot_ids = live_visible_indices.collect_ids(self.messages);
+                snapshot_ids = self.messages.iter().map(|message| message.id.0).collect();
             }
-            let live_ids: Vec<u64> = self.messages.iter().map(|m| m.id.0).collect();
-            let mut mapped = map_snapshot_ids_to_indices(&snapshot_ids, &live_ids);
-            mapped.retain(|&idx| live_visible_indices.contains_index(idx));
-            let persisted_ids: Vec<u64> = mapped.iter().map(|&idx| live_ids[idx]).collect();
-            ui.ctx()
-                .data_mut(|d| d.insert_temp(paused_snapshot_key, persisted_ids));
-            if mapped.is_empty() {
+            paused_indices.refresh(&snapshot_ids, self.messages);
+            if paused_indices.indices.is_empty() {
+                snapshot_ids.clear();
                 live_visible_indices
+            } else if matches!(live_visible_indices, VisibleIndices::All(_)) {
+                VisibleIndices::Cached(&paused_indices.indices)
             } else {
-                VisibleIndices::Filtered(mapped)
+                VisibleIndices::Filtered(paused_indices.indices.iter().copied()
+                    .filter(|&index| live_visible_indices.contains_index(index)).collect())
             }
         } else {
-            ui.ctx()
-                .data_mut(|d| d.remove_temp::<Vec<u64>>(paused_snapshot_key));
             live_visible_indices
         };
         let n = visible_indices.len();
@@ -890,6 +930,10 @@ impl<'a> MessageList<'a> {
                 d.insert_temp(user_color_cache_key, user_color_cache);
                 d.insert_temp(active_ids_key, active_ids);
                 d.remove_temp::<ScrollAnchor>(anchor_key);
+                if use_snapshot {
+                    d.insert_temp(paused_snapshot_key, snapshot_ids);
+                    d.insert_temp(paused_index_key, paused_indices);
+                }
             });
             self.show_resume_button(ui, &output, panel_rect, paused_snapshot_new_rows);
             self.apply_snap(ui, &output);
@@ -980,6 +1024,10 @@ impl<'a> MessageList<'a> {
                 d.insert_temp(hot_state_key, HotWindowState { active_rows: 0 });
                 d.insert_temp(user_color_cache_key, user_color_cache);
                 d.insert_temp(active_ids_key, active_ids);
+                if use_snapshot {
+                    d.insert_temp(paused_snapshot_key, snapshot_ids);
+                    d.insert_temp(paused_index_key, paused_indices);
+                }
             });
             perf_stats.rendered_rows = hot_plan.active_len;
             return MessageListResult {
@@ -1193,6 +1241,10 @@ impl<'a> MessageList<'a> {
             d.insert_temp(ps_id, prefix);
             d.insert_temp(user_color_cache_key, user_color_cache);
             d.insert_temp(active_ids_key, active_ids);
+            if use_snapshot {
+                d.insert_temp(paused_snapshot_key, snapshot_ids);
+                d.insert_temp(paused_index_key, paused_indices);
+            }
         });
         MessageListResult {
             reply: self.take_reply(ui, rctx.reply_key),
@@ -5299,6 +5351,78 @@ mod tests {
             }
             assert_eq!(render_test_messages(&ctx, &messages, &filters).retained_rows, 1);
         }
+    }
+
+    #[test]
+    fn paused_filters_can_reveal_messages_again_without_admitting_new_rows() {
+        use crust_core::model::filters::{compile_filters, FilterRecord, FilterScope};
+        let ctx = egui::Context::default();
+        let mut messages = test_buffer(1, 80);
+        messages[10].raw_text = "hidden-marker".to_owned();
+        render_test_messages(&ctx, &messages, &[]);
+        let paused = Id::new("scroll_paused").with("rustlang");
+        let snapshot = Id::new("paused_snapshot_ids").with("rustlang");
+        ctx.data_mut(|data| {
+            data.insert_temp(paused, true);
+            data.insert_temp(snapshot, messages.iter().map(|message| message.id.0).collect::<Vec<_>>());
+        });
+        let filters = compile_filters(&[FilterRecord::new("hidden", "hidden-marker", FilterScope::Global)]);
+        assert_eq!(render_test_messages(&ctx, &messages, &filters).retained_rows, 79);
+        messages.push_back(test_buffer(81, 1).pop_front().unwrap());
+        ctx.data_mut(|data| data.insert_temp(paused, true));
+        assert_eq!(render_test_messages(&ctx, &messages, &[]).retained_rows, 80);
+        assert!(ctx.data_mut(|data| data.get_temp::<Vec<u64>>(snapshot).unwrap()).contains(&11));
+    }
+
+    #[test]
+    fn paused_index_cache_reuses_storage_and_detects_interior_changes() {
+        let mut messages = test_buffer(1, 80);
+        let ids: Vec<_> = messages.iter().map(|message| message.id.0).collect();
+        let mut cache = PausedIndexCache::default();
+        assert!(cache.refresh(&ids, &messages));
+        let pointer = cache.indices.as_ptr();
+        assert!(!cache.refresh(&ids, &messages));
+        assert_eq!(pointer, cache.indices.as_ptr());
+        messages.swap(2, 3);
+        assert!(cache.refresh(&ids, &messages));
+        assert_eq!(&cache.indices[..4], &[0, 1, 3, 2]);
+        messages.pop_front();
+        assert!(cache.refresh(&ids, &messages));
+        assert_eq!(cache.indices.len(), 79);
+    }
+
+    #[test]
+    #[ignore = "isolated timing comparison"]
+    fn perf_paused_message_indices() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let messages = test_buffer(1, 1500);
+        let ids: Vec<_> = messages.iter().map(|message| message.id.0).collect();
+        let mut cache = PausedIndexCache::default();
+        cache.refresh(&ids, &messages);
+        let mut old_times = Vec::new();
+        let mut new_times = Vec::new();
+        for round in 0..5 {
+            for old in if round % 2 == 0 { [true, false] } else { [false, true] } {
+                let start = Instant::now();
+                for _ in 0..5000 {
+                    if old {
+                        let snapshot = black_box(&ids).clone();
+                        let live: Vec<_> = messages.iter().map(|message| message.id.0).collect();
+                        let mapped = map_snapshot_ids_to_indices(&snapshot, &live);
+                        assert_eq!(mapped.len(), 1500);
+                        black_box(mapped);
+                    } else {
+                        assert!(!cache.refresh(black_box(&ids), black_box(&messages)));
+                        black_box(&cache.indices);
+                    }
+                }
+                if old { old_times.push(start.elapsed()); } else { new_times.push(start.elapsed()); }
+            }
+        }
+        old_times.sort();
+        new_times.sort();
+        eprintln!("5000 paused frames, 1500 rows: rebuild {:?}; cached {:?}", old_times[2], new_times[2]);
     }
 
     #[test]

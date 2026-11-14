@@ -29,6 +29,7 @@ commands. Kick and generic IRC support remain beta features.
   - focused-pane tracking
   - split header controls and per-pane search toggle
   - split keyboard navigation and pane reordering shortcuts
+  - independent drafts and stable composer focus when panes are added, moved, or closed
 
 ### Desktop UI shell
 
@@ -65,6 +66,7 @@ commands. Kick and generic IRC support remain beta features.
 ### Input and command UX
 
 - Message input history recall (arrow keys)
+- Rejected sends keep their original draft and reply context for recovery
 - `:` emote autocomplete and Tab completion
 - Slash command handling for chat, moderation, and creator workflows
 - Command usage tracking for ranking/autocomplete improvements
@@ -80,15 +82,18 @@ commands. Kick and generic IRC support remain beta features.
   - FFZ
   - 7TV
   - Kick
-- Emote resolution by provider and configured priority
+- Channel emotes stay in their channel; personal emotes resolve for their owner
+- Provider and scope precedence is consistent between chat, autocomplete, and the picker
 - Animated emote support (GIF/WebP)
 - Emoji tokenization/rendering via Twemoji URLs
 - Badge rendering from global/channel badge sources
-- 7TV sender cosmetics support (name paints/badge updates)
+- 7TV sender colors, badges, and avatars
 - Emote picker features:
   - favorites
   - recents
   - provider preference boost
+  - focused search, Ctrl+Tab / Ctrl+Shift+Tab navigation, and insertion at the caret
+  - favorites menus that stay open while the pointer moves from an emote to an action
 - Emote image caching in memory and on disk
 
 ### Whispers
@@ -178,11 +183,18 @@ them visible with reduced emphasis.
 ### Search, history, and local data
 
 - Recent-message history load on join (recent-messages API with IVR fallback)
-- Per-channel local append-only log indexing (SQLite)
-- Older local history paging support
+- Per-channel local message logging and indexing (SQLite)
+- Older local history paging, including messages with identical timestamps and rows without server IDs
 - Per-channel message search/filter UI
 - Cross-channel search with predicates such as `from:<user>`, `has:link`, `in:<channel>`, and `regex:"<pattern>"`
+- Case-insensitive search regexes by default; inline regex flags can request case-sensitive matching
+- Subscriber-tier searches distinguish tier from subscription length; comma-separated `is:` values match any listed flag
 - Data directories via `directories::ProjectDirs` for config/cache/logs
+
+Local history loads in pages. Search can request older logs even when the current
+buffer has no matches, and shows "No older logs" after the saved history is
+exhausted. Explicit older-history loads can expand a channel buffer to 50,000
+messages; ordinary live chat keeps its 1,500-message limit.
 
 ### Plugin platform (Lua)
 
@@ -281,7 +293,7 @@ Notes:
   after a new draft was started, the unsent message remains available to copy or
   restore without replacing that draft.
 - The Twitch character count and message limit behavior depend on the configured overflow mode.
-- Pasting an image from the clipboard or dropping an image file onto the chat input triggers the configured uploader; the returned URL is inserted at the caret.
+- Pasting an image from the clipboard or dropping an image file onto the chat input triggers the configured uploader; the returned URL is appended to that channel's draft.
 
 ## Common mouse and context actions
 
@@ -389,6 +401,7 @@ User-defined command aliases (Settings -> Commands) dispatch after the built-in 
 - [UI API](API_UI.md)
 - [Events API](API_Events.md)
 - [Plugin API reference](API.md)
+- [Release notes v0.5.2](releases/Release_v0.5.2.md)
 - [Release notes v0.5.1](releases/Release_v0.5.1.md)
 - [Release notes v0.5.0](releases/Release_v0.5.0.md)
 - [Release notes v0.4.9](releases/Release_v0.4.9.md)

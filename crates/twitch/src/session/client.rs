@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{TimeZone as _, Utc};
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
@@ -18,7 +18,7 @@ use crate::{
 };
 
 use super::{
-    outbound::OutboundQueue,
+    outbound::{OutboundLine, OutboundQueue},
     ratelimit::{ChatRateLimiter, RateLimiter},
 };
 
@@ -141,7 +141,8 @@ pub enum SessionCommand {
     JoinChannel(ChannelId),
     LeaveChannel(ChannelId),
     /// Send a PRIVMSG to a channel (requires auth).
-    SendMessage(ChannelId, String, Option<String>), // channel, text, reply_parent_msg_id
+    /// The receipt reports a socket write, not server acceptance.
+    SendMessage(ChannelId, String, Option<String>, oneshot::Sender<Result<(), String>>),
     /// Re-connect with authentication credentials.
     Authenticate {
         token: String,
@@ -383,8 +384,8 @@ impl TwitchSession {
                 self.pending_joins.leave(&ChannelId::new(channel.as_str()));
                 RetryAction::Wait
             }
-            Some(SessionCommand::SendMessage(channel, _, _)) => {
-                self.outbound_notice(channel, "Message not sent: chat is reconnecting. Try again once connected.").await;
+            Some(SessionCommand::SendMessage(_, _, _, receipt)) => {
+                let _ = receipt.send(Err("Chat is reconnecting. Try again once connected.".into()));
                 RetryAction::Wait
             }
         }
@@ -573,18 +574,16 @@ impl TwitchSession {
                                 }
                             }
                         }
-                        Some(SessionCommand::SendMessage(ch, text, reply_id)) => {
+                        Some(SessionCommand::SendMessage(ch, text, reply_id, receipt)) => {
                             let ch = ChannelId::new(ch.as_str());
                             if self.auth_token.is_some() {
                                 if let Some(line) = format_privmsg(&ch, &text, reply_id.as_deref()) {
-                                    if !outbound.message(ch.clone(), line) {
-                                        self.outbound_notice(ch, "Message not sent: outgoing queue is full. Wait for pending messages to send, then try again.").await;
-                                    }
+                                    outbound.message(ch, line, Some(receipt));
                                 } else {
-                                    self.outbound_notice(ch, "Message not sent: invalid channel, reply ID, or line break.").await;
+                                    let _ = receipt.send(Err("The channel, reply ID, or message contains invalid characters.".into()));
                                 }
                             } else {
-                                warn!("Cannot send message: not authenticated");
+                                let _ = receipt.send(Err("You are signed out. Select an account, then try again.".into()));
                             }
                         }
                         Some(SessionCommand::Authenticate { token, nick, generation }) => {
@@ -611,13 +610,16 @@ impl TwitchSession {
                 }
 
                 _ = tokio::time::sleep_until(send_deadline), if next_send.is_some() => {
-                    if let Some(line) = outbound.pop_ready(
+                    if let Some(OutboundLine { line, receipt }) = outbound.pop_ready(
                         &mut self.chat_limiter,
                         &mut self.join_limiter,
                         &self.elevated_channels,
                         Instant::now(),
                     ) {
                         send_raw!(line);
+                        if let Some(receipt) = receipt {
+                            let _ = receipt.send(Ok(()));
+                        }
                     }
                 }
                 _ = tokio::time::sleep_until(registration_deadline), if !self.registered => {
@@ -1597,20 +1599,18 @@ mod tests {
                 server_text(&mut socket).await;
             }
             for text in ["first", "second", "third"] {
+                let (receipt, receiver) = oneshot::channel();
                 cmd_tx
                     .send(SessionCommand::SendMessage(
                         ChannelId::new("room"),
                         text.to_owned(),
                         None,
+                        receipt,
                     ))
                     .await
                     .unwrap();
-            }
-            for text in ["first", "second", "third"] {
-                assert_eq!(
-                    server_text(&mut socket).await,
-                    format!("PRIVMSG #room :{text}")
-                );
+                assert_eq!(server_text(&mut socket).await, format!("PRIVMSG #room :{text}"));
+                assert_eq!(receiver.await.unwrap(), Ok(()));
             }
             cmd_tx.send(SessionCommand::Disconnect).await.unwrap();
             assert_eq!(server_text(&mut socket).await, "QUIT");
@@ -1645,15 +1645,19 @@ mod tests {
                 .send(SessionCommand::JoinChannel(ChannelId::new("room")))
                 .await
                 .unwrap();
+            let mut receipts = Vec::new();
             for text in ["old first", "old second"] {
+                let (receipt, receiver) = oneshot::channel();
                 cmd_tx
                     .send(SessionCommand::SendMessage(
                         ChannelId::new("room"),
                         text.to_owned(),
                         None,
+                        receipt,
                     ))
                     .await
                     .unwrap();
+                receipts.push(receiver);
             }
 
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1689,6 +1693,9 @@ mod tests {
                     .unwrap()
             );
             server.await.unwrap();
+            for receiver in receipts {
+                assert!(!matches!(receiver.await, Ok(Ok(()))), "queued message cannot be reported as written");
+            }
             assert_eq!(
                 session.auth_nick.as_deref(),
                 switch_account.then_some("bob")
@@ -1842,13 +1849,14 @@ mod tests {
         let (event_tx, mut events) = mpsc::channel(8);
         let (commands, command_rx) = mpsc::channel(8);
         let mut session = TwitchSession::new(event_tx, command_rx);
+        let (receipt, receiver) = oneshot::channel();
         let producer = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(5)).await;
             for command in [
                 SessionCommand::JoinChannel(ChannelId::new("removed")),
                 SessionCommand::JoinChannel(ChannelId::new("kept")),
                 SessionCommand::LeaveChannel(ChannelId::new("removed")),
-                SessionCommand::SendMessage(ChannelId::new("kept"), "offline".into(), None),
+                SessionCommand::SendMessage(ChannelId::new("kept"), "offline".into(), None, receipt),
                 SessionCommand::Authenticate { token: "new-token".into(), nick: "bob".into(), generation: 7 },
             ] {
                 commands.send(command).await.unwrap();
@@ -1862,12 +1870,13 @@ mod tests {
         assert_eq!(session.pending_joins.pop_ready(
             &mut session.chat_limiter, &mut session.join_limiter,
             &session.elevated_channels, Instant::now(),
-        ).as_deref(), Some("JOIN #kept"));
+        ).as_ref().map(|line| line.line.as_str()), Some("JOIN #kept"));
         assert!(session.pending_joins.next_send_at(
             &mut session.chat_limiter, &mut session.join_limiter,
             &session.elevated_channels, Instant::now(),
         ).is_none());
-        assert!(matches!(events.try_recv(), Ok(TwitchEvent::SystemNotice(notice)) if notice.text.contains("Message not sent")));
+        assert!(events.try_recv().is_err());
+        assert!(receiver.await.unwrap().unwrap_err().contains("reconnecting"));
         producer.await.unwrap();
     }
 

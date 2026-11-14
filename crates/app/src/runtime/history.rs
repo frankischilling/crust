@@ -2,9 +2,9 @@ use std::collections::{HashMap, HashSet};
 
 use crust_core::{
     events::AppEvent,
-    model::{ChannelId, ChatMessage, MessageId},
+    model::{ChannelId, ChatMessage, HistoryCursor, LocalHistoryMessageIdentity, LocalHistoryPageInfo, MessageId},
 };
-use crust_emotes::{cache::EmoteCache, providers::EmoteInfo};
+use crust_emotes::cache::EmoteCache;
 use crust_storage::LogStore;
 use crust_twitch::{parse_line, parse_privmsg_irc};
 use tokio::sync::mpsc;
@@ -24,49 +24,7 @@ pub(crate) async fn load_local_recent_messages(
     log_store: LogStore,
     evt_tx: mpsc::Sender<AppEvent>,
 ) {
-    let channel_for_query = channel.clone();
-    let loaded = tokio::task::spawn_blocking(move || {
-        log_store.recent_messages(&channel_for_query, LogStore::default_recent_limit())
-    })
-    .await;
-
-    let mut messages = match loaded {
-        Ok(Ok(rows)) => rows,
-        Ok(Err(e)) => {
-            warn!(
-                "chat-history: local SQLite load failed for #{}: {e}",
-                channel.display_name()
-            );
-            return;
-        }
-        Err(e) => {
-            warn!(
-                "chat-history: local SQLite task failed for #{}: {e}",
-                channel.display_name()
-            );
-            return;
-        }
-    };
-
-    if messages.is_empty() {
-        return;
-    }
-
-    for msg in &mut messages {
-        msg.id =
-            MessageId(crate::HISTORY_MSG_ID.fetch_sub(1, std::sync::atomic::Ordering::Relaxed));
-        msg.flags.is_history = true;
-        msg.channel = channel.clone();
-    }
-
-    info!(
-        "chat-history: loaded {} local SQLite messages for #{}",
-        messages.len(),
-        channel.display_name()
-    );
-    let _ = evt_tx
-        .send(AppEvent::HistoryLoaded { channel, messages })
-        .await;
+    load_local_history_page(channel, None, LogStore::default_recent_limit(), log_store, evt_tx).await;
 }
 
 /// Load older locally persisted chat history rows before `before_ts_ms` and
@@ -74,23 +32,42 @@ pub(crate) async fn load_local_recent_messages(
 pub(crate) async fn load_local_older_messages(
     channel: ChannelId,
     before_ts_ms: i64,
+    before_row_id: Option<i64>,
+    limit: usize,
+    log_store: LogStore,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
+    let before = HistoryCursor {
+        timestamp_ms: before_ts_ms,
+        row_id: before_row_id.unwrap_or(i64::MIN),
+    };
+    load_local_history_page(channel, Some(before), limit, log_store, evt_tx).await;
+}
+
+async fn load_local_history_page(
+    channel: ChannelId,
+    before: Option<HistoryCursor>,
     limit: usize,
     log_store: LogStore,
     evt_tx: mpsc::Sender<AppEvent>,
 ) {
     let channel_for_query = channel.clone();
     let loaded = tokio::task::spawn_blocking(move || {
-        log_store.older_messages(&channel_for_query, before_ts_ms, limit)
+        log_store.history_page(&channel_for_query, before, limit)
     })
     .await;
 
-    let mut messages = match loaded {
-        Ok(Ok(rows)) => rows,
+    let page = match loaded {
+        Ok(Ok(page)) => page,
         Ok(Err(e)) => {
             warn!(
                 "chat-history: local older SQLite load failed for #{}: {e}",
                 channel.display_name()
             );
+            let _ = evt_tx.send(AppEvent::Error {
+                context: "History".into(),
+                message: format!("Could not load local history for #{}: {e}", channel.display_name()),
+            }).await;
             return;
         }
         Err(e) => {
@@ -98,19 +75,25 @@ pub(crate) async fn load_local_older_messages(
                 "chat-history: local older SQLite task failed for #{}: {e}",
                 channel.display_name()
             );
+            let _ = evt_tx.send(AppEvent::Error {
+                context: "History".into(),
+                message: format!("Could not load local history for #{}: {e}", channel.display_name()),
+            }).await;
             return;
         }
     };
 
-    if messages.is_empty() {
-        return;
-    }
-
-    for msg in &mut messages {
-        msg.id =
-            MessageId(crate::HISTORY_MSG_ID.fetch_sub(1, std::sync::atomic::Ordering::Relaxed));
+    let mut messages = Vec::with_capacity(page.messages.len());
+    let mut identities = Vec::with_capacity(page.messages.len());
+    for (mut msg, row_id) in page.messages.into_iter().zip(page.row_ids) {
+        let Some(replay_id) = MessageId::from_local_history_row(row_id) else {
+            continue;
+        };
+        identities.push(LocalHistoryMessageIdentity { replay_id, original_id: msg.id });
+        msg.id = replay_id;
         msg.flags.is_history = true;
         msg.channel = channel.clone();
+        messages.push(msg);
     }
 
     info!(
@@ -119,8 +102,53 @@ pub(crate) async fn load_local_older_messages(
         channel.display_name()
     );
     let _ = evt_tx
-        .send(AppEvent::HistoryLoaded { channel, messages })
+        .send(AppEvent::HistoryLoaded {
+            channel,
+            messages,
+            local: Some(LocalHistoryPageInfo { before, next: page.next, has_more: page.has_more, identities }),
+        })
         .await;
+}
+
+#[cfg(test)]
+mod local_history_identity_tests {
+    use super::*;
+    use crust_core::model::{ChannelState, MsgKind};
+
+    #[tokio::test]
+    async fn local_replays_keep_storage_ids_and_match_live_rows_after_reload() {
+        let store = LogStore::with_db_path(std::path::PathBuf::from(":memory:")).unwrap();
+        let channel = ChannelId::new("room");
+        let mut room = ChannelState::new(channel.clone());
+        for id in [17, 18, 19] {
+            let message = super::super::system_messages::make_system_message(
+                id, channel.clone(), "same text".into(),
+                chrono::DateTime::from_timestamp_millis(1000).unwrap(), MsgKind::Chat,
+            );
+            store.append_message(&message).unwrap();
+            if id == 19 {
+                room.push_message(message);
+            }
+        }
+        let (events, mut received) = mpsc::channel(4);
+        let mut previous_ids = None;
+        for _ in 0..3 {
+            load_local_recent_messages(channel.clone(), store.clone(), events.clone()).await;
+            let AppEvent::HistoryLoaded { messages, local: Some(page), .. } = received.recv().await.unwrap() else {
+                panic!("expected a local history page");
+            };
+            let ids: Vec<_> = messages.iter().map(|message| message.id).collect();
+            assert!(ids.iter().all(|id| id.is_local_history()));
+            assert_eq!(page.identities.iter().map(|identity| identity.original_id.0).collect::<Vec<_>>(), [17, 18, 19]);
+            if let Some(previous) = &previous_ids {
+                assert_eq!(&ids, previous);
+            }
+            previous_ids = Some(ids);
+            room.prepend_local_history(messages, &page);
+            assert_eq!(room.messages.len(), 3);
+            assert_eq!(room.messages.iter().filter(|message| message.id == MessageId(19)).count(), 1);
+        }
+    }
 }
 
 /// Load cross-channel mention-matching messages from SQLite and dispatch as
@@ -395,6 +423,7 @@ pub(crate) async fn load_recent_messages(
             .send(AppEvent::HistoryLoaded {
                 channel: channel_id,
                 messages: Vec::new(),
+                local: None,
             })
             .await;
         return;
@@ -403,9 +432,9 @@ pub(crate) async fn load_recent_messages(
     let raw_line_count = raw_lines.len();
 
     // Snapshot shared state once before the parse loop.
-    let emote_snapshot: HashMap<String, EmoteInfo> = {
+    let emote_snapshot = {
         let guard = emote_index.read().unwrap();
-        guard.clone()
+        guard.snapshot_for(&channel_id)
     };
     let badge_snapshot: HashMap<(String, String, String), String> = {
         let bm = badge_map.read().unwrap();
@@ -442,7 +471,7 @@ pub(crate) async fn load_recent_messages(
                 msg.flags.is_action,
                 &msg.twitch_emotes,
                 &|code| {
-                    crate::resolve_emote(&emote_snapshot, code).map(|info| {
+                    crate::resolve_emote(&emote_snapshot, &msg.channel, &msg.sender.user_id.0, code).map(|info| {
                         (
                             info.id.clone(),
                             info.code.clone(),
@@ -511,6 +540,7 @@ pub(crate) async fn load_recent_messages(
             .send(AppEvent::HistoryLoaded {
                 channel: channel_id,
                 messages,
+                local: None,
             })
             .await;
         return;
@@ -532,6 +562,7 @@ pub(crate) async fn load_recent_messages(
         if !history_user_ids.is_empty() {
             let _ = stv_update_tx
                 .send(SevenTvCosmeticUpdate::BatchUserLookup {
+                    channel: channel_id.clone(),
                     user_ids: history_user_ids,
                 })
                 .await;
@@ -547,6 +578,7 @@ pub(crate) async fn load_recent_messages(
         .send(AppEvent::HistoryLoaded {
             channel: channel_id,
             messages,
+            local: None,
         })
         .await;
 }

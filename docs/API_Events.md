@@ -68,7 +68,7 @@ Each `stops` entry includes:
 
 The shared `message` table includes:
 
-- `id`
+- `id`: opaque local identifier; saved-history identifiers can be negative in Lua
 - `server_id`: omitted when the message has no server-assigned id
 - `timestamp`
 - `channel`
@@ -244,10 +244,17 @@ Fields:
 
 Each `emotes` entry includes:
 
+- `id`: provider-specific emote identifier
 - `code`
 - `provider`
 - `url`
-- `scope`
+- `url_hd`: omitted when a larger image is unavailable
+- `scope`: `global`, `channel`, or `personal`
+- `channel`: channel table, present for channel-owned entries
+- `user_id`: sender ID, present for personal entries
+
+Codes can appear more than once when different channels or senders own them.
+Match the owner before using an entry in a channel or a sender's message.
 
 ### `c2.EventType.ImagePrefetchQueued`
 
@@ -461,9 +468,15 @@ Fields:
 
 - `channel`
 - `messages`
+- `has_more`: present for local history pages, including empty pages
+- `next_ts_ms`: timestamp for the next local history request, when a cursor exists
+- `next_row_id`: row ID paired with `next_ts_ms`
 
 Each `messages` entry uses the same `message` table shape documented under
 `c2.EventType.MessageReceived`.
+
+Remote history does not include the local paging fields. Treat message IDs as
+opaque values and use the cursor pair for pagination.
 
 ### `c2.EventType.UserProfileLoaded`
 
@@ -533,8 +546,8 @@ Fields:
 - `thumbnail_url`
 - `site_name`
 
-These fields are omitted when the upstream metadata source does not provide
-them.
+`url` is always included. `title`, `description`, `thumbnail_url`, and `site_name`
+are omitted when the upstream metadata source does not provide them.
 
 ## Settings and moderation events
 

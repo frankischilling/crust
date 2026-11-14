@@ -311,13 +311,41 @@ impl std::fmt::Display for ChannelId {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct UserId(pub String);
 
-/// Local monotonic message id.
+/// Message identity. The high bit is reserved for rows replayed from local logs;
+/// live and remote-history counters use the lower half of the range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MessageId(pub u64);
+
+impl MessageId {
+    const LOCAL_HISTORY_BIT: u64 = 1 << 63;
+
+    pub fn from_local_history_row(row_id: i64) -> Option<Self> {
+        (row_id > 0).then_some(Self(Self::LOCAL_HISTORY_BIT | row_id as u64))
+    }
+
+    pub fn is_local_history(self) -> bool {
+        self.0 & Self::LOCAL_HISTORY_BIT != 0
+    }
+}
 
 #[cfg(test)]
 mod live_feed_sentinel_tests {
     use super::*;
+
+    #[test]
+    fn local_history_ids_are_stable_and_disjoint_from_other_counters() {
+        assert_eq!(MessageId::from_local_history_row(0), None);
+        assert_eq!(MessageId::from_local_history_row(-1), None);
+        for row_id in [1, 20_000_000_000, i64::MAX] {
+            let id = MessageId::from_local_history_row(row_id).unwrap();
+            assert!(id.is_local_history());
+            assert_eq!(id.0 & (u64::MAX / 2), row_id as u64);
+            assert_eq!(Some(id), MessageId::from_local_history_row(row_id));
+        }
+        for id in [1, 1_000_000, 20_000_000_000, u64::MAX / 2] {
+            assert!(!MessageId(id).is_local_history());
+        }
+    }
 
     #[test]
     fn sentinel_constant_value() {

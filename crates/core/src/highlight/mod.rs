@@ -2,9 +2,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::filters::{
-    self as dsl, build_message_context, parse as parse_expression, Expression,
-};
+use crate::filters::{self as dsl, build_message_context, parse as parse_expression, Expression};
 use crate::model::ChatMessage;
 
 /// RGB highlight tint color (red, green, blue).
@@ -13,7 +11,7 @@ pub type HighlightColor = [u8; 3];
 /// How the `pattern` field should be interpreted.
 ///
 /// `Substring` matches plain text; `Regex` treats `pattern` as a
-/// [`regex::Regex`]; `Expression` parses `pattern` as a Chatterino-style
+/// [`regex::Regex`]; `Expression` parses `pattern` as a
 /// filter DSL expression that must evaluate to truthy for the highlight to
 /// fire (see [`crate::filters`]).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -24,7 +22,7 @@ pub enum HighlightRuleMode {
     Expression,
 }
 
-/// A single highlight rule, mirroring chatterino's `HighlightPhrase` semantics.
+/// A highlight rule with its match pattern and notification settings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HighlightRule {
     /// The pattern string (plain substring, regex, or expression - see `mode`).
@@ -98,7 +96,7 @@ impl HighlightRule {
         }
     }
 
-    /// Create a rule that evaluates a Chatterino-style filter expression.
+    /// Create a rule that evaluates a filter expression.
     pub fn expression(pattern: impl Into<String>) -> Self {
         Self {
             pattern: pattern.into(),
@@ -143,8 +141,11 @@ impl HighlightRule {
     /// Regex rules must be evaluated via [`HighlightMatch`]; this path is
     /// kept for simple substring lookups in unit tests and internal helpers.
     pub fn matches_substring(&self, text: &str) -> bool {
-        if self.is_regex {
-            return false; // use HighlightMatch for regex
+        if !self.enabled
+            || self.pattern.is_empty()
+            || self.effective_mode() != HighlightRuleMode::Substring
+        {
+            return false;
         }
         if self.case_sensitive {
             text.contains(&self.pattern)
@@ -169,32 +170,63 @@ pub enum CompiledMatcher {
 pub struct HighlightMatch {
     pub rule: HighlightRule,
     pub matcher: CompiledMatcher,
+    context_matcher: ContextMatcher,
+}
+
+enum ContextMatcher {
+    Text,
+    Mention,
+    Regex(regex::Regex),
+    Scoped {
+        scope: ScopedRule,
+        value: ScopeMatcher,
+        content: Option<CompiledMatcher>,
+    },
+}
+
+enum ScopeMatcher {
+    Exact(String),
+    Regex(regex::Regex),
+}
+
+impl ScopeMatcher {
+    fn is_match(&self, text: &str, case_sensitive: bool) -> bool {
+        match self {
+            Self::Exact(value) if case_sensitive => text == value,
+            Self::Exact(value) if text.is_ascii() && value.is_ascii() => {
+                text.eq_ignore_ascii_case(value)
+            }
+            Self::Exact(value) => text.to_lowercase() == *value,
+            Self::Regex(regex) => regex.is_match(text),
+        }
+    }
+}
+
+impl CompiledMatcher {
+    fn matches_text(&self, text: &str, case_sensitive: bool) -> bool {
+        match self {
+            Self::Substring(s) => {
+                if case_sensitive {
+                    text.contains(s.as_str())
+                } else if s.is_ascii() && text.is_ascii() {
+                    contains_ascii_case_insensitive(text, s)
+                } else {
+                    text.to_lowercase().contains(s.as_str())
+                }
+            }
+            Self::Regex(re) => re.is_match(text),
+            Self::Expression(_) => false,
+        }
+    }
 }
 
 impl HighlightMatch {
     /// Test whether this match fires for the given message text.
     ///
-    /// Expression-mode rules cannot be evaluated from a bare `text`
-    /// argument (they need a full [`ChatMessage`] context) and always
-    /// return `false` here. Use [`first_match_context_rule_message`] for
-    /// expression-aware matching.
+    /// Expression-mode rules need a full [`ChatMessage`] and return `false`
+    /// here. Use [`first_match_context_rule_message`] for those rules.
     pub fn is_match(&self, text: &str) -> bool {
-        if !self.rule.enabled {
-            return false;
-        }
-        match &self.matcher {
-            CompiledMatcher::Substring(s) => {
-                if self.rule.case_sensitive {
-                    text.contains(s.as_str())
-                } else if s.is_ascii() && text.is_ascii() {
-                    contains_ascii_case_insensitive(text, s)
-                } else {
-                    text.to_lowercase().contains(s.to_lowercase().as_str())
-                }
-            }
-            CompiledMatcher::Regex(re) => re.is_match(text),
-            CompiledMatcher::Expression(_) => false,
-        }
+        self.rule.enabled && self.matcher.matches_text(text, self.rule.case_sensitive)
     }
 
     /// Test this highlight against a full message context.
@@ -222,70 +254,27 @@ impl HighlightMatch {
             return false;
         }
 
-        let pattern = self.rule.pattern.trim();
-        if pattern.is_empty() {
-            return false;
-        }
-
-        if pattern.eq_ignore_ascii_case("mention") {
-            return is_mention;
-        }
-
-        if let Some((scope, value, rest)) = parse_scoped_pattern(pattern) {
-            let scope_matches = match scope {
-                ScopedRule::Sender => {
-                    self.match_scope_value(sender_login, sender_display_name, value, rest.is_none())
-                }
-                ScopedRule::Channel => {
-                    self.match_scope_value(channel_login, channel_login, value, rest.is_none())
-                }
-            };
-
-            if !scope_matches {
-                return false;
+        match &self.context_matcher {
+            ContextMatcher::Text => self.is_match(text),
+            ContextMatcher::Mention => is_mention,
+            ContextMatcher::Regex(regex) => regex.is_match(text),
+            ContextMatcher::Scoped {
+                scope,
+                value,
+                content,
+            } => {
+                let scope_matches = match scope {
+                    ScopedRule::Sender => {
+                        value.is_match(sender_login, self.rule.case_sensitive)
+                            || value.is_match(sender_display_name, self.rule.case_sensitive)
+                    }
+                    ScopedRule::Channel => value.is_match(channel_login, self.rule.case_sensitive),
+                };
+                scope_matches
+                    && content
+                        .as_ref()
+                        .is_none_or(|matcher| matcher.matches_text(text, self.rule.case_sensitive))
             }
-
-            if let Some(remaining) = rest {
-                return match_text_expression(
-                    remaining,
-                    text,
-                    self.rule.case_sensitive,
-                    self.rule.is_regex,
-                );
-            }
-
-            return true;
-        }
-
-        if !self.rule.is_regex {
-            if let Some(re_expr) = pattern.strip_prefix("re:") {
-                return match_text_expression(re_expr, text, self.rule.case_sensitive, true);
-            }
-        }
-
-        self.is_match(text)
-    }
-
-    fn match_scope_value(
-        &self,
-        primary: &str,
-        secondary: &str,
-        value: &str,
-        treat_as_regex_when_terminal: bool,
-    ) -> bool {
-        if value.trim().is_empty() {
-            return false;
-        }
-
-        if self.rule.is_regex && treat_as_regex_when_terminal {
-            return regex_match(value, primary, !self.rule.case_sensitive)
-                || regex_match(value, secondary, !self.rule.case_sensitive);
-        }
-
-        if self.rule.case_sensitive {
-            primary.eq(value) || secondary.eq(value)
-        } else {
-            primary.eq_ignore_ascii_case(value) || secondary.eq_ignore_ascii_case(value)
         }
     }
 }
@@ -297,18 +286,24 @@ enum ScopedRule {
 
 fn parse_scoped_pattern(pattern: &str) -> Option<(ScopedRule, &str, Option<&str>)> {
     for key in ["from=", "from:", "user=", "user:"] {
-        if let Some(rest) = pattern.strip_prefix(key) {
+        if let Some(rest) = strip_prefix_ascii_case_insensitive(pattern, key) {
             let (value, trailing) = split_first_token(rest.trim());
             return Some((ScopedRule::Sender, value, trailing));
         }
     }
     for key in ["channel=", "channel:"] {
-        if let Some(rest) = pattern.strip_prefix(key) {
+        if let Some(rest) = strip_prefix_ascii_case_insensitive(pattern, key) {
             let (value, trailing) = split_first_token(rest.trim());
             return Some((ScopedRule::Channel, value, trailing));
         }
     }
     None
+}
+
+fn strip_prefix_ascii_case_insensitive<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    text.get(..prefix.len())
+        .filter(|start| start.eq_ignore_ascii_case(prefix))
+        .map(|_| &text[prefix.len()..])
 }
 
 fn split_first_token(input: &str) -> (&str, Option<&str>) {
@@ -325,32 +320,81 @@ fn split_first_token(input: &str) -> (&str, Option<&str>) {
     }
 }
 
-fn match_text_expression(pattern: &str, text: &str, case_sensitive: bool, is_regex: bool) -> bool {
+fn compile_text_matcher(
+    pattern: &str,
+    case_sensitive: bool,
+    is_regex: bool,
+) -> Option<CompiledMatcher> {
     if pattern.is_empty() {
-        return false;
+        return None;
     }
 
     if is_regex {
-        return regex_match(pattern, text, !case_sensitive);
-    }
-
-    if case_sensitive {
-        text.contains(pattern)
-    } else if pattern.is_ascii() && text.is_ascii() {
-        contains_ascii_case_insensitive(text, pattern)
+        compile_regex(pattern, case_sensitive).map(CompiledMatcher::Regex)
     } else {
-        text.to_lowercase()
-            .contains(pattern.to_lowercase().as_str())
+        Some(CompiledMatcher::Substring(if case_sensitive {
+            pattern.to_owned()
+        } else {
+            pattern.to_lowercase()
+        }))
     }
 }
 
-fn regex_match(pattern: &str, text: &str, case_insensitive: bool) -> bool {
-    let mut builder = regex::RegexBuilder::new(pattern);
-    builder.case_insensitive(case_insensitive);
-    match builder.build() {
-        Ok(re) => re.is_match(text),
-        Err(_) => false,
+fn compile_context_matcher(rule: &HighlightRule) -> Option<ContextMatcher> {
+    if rule.effective_mode() == HighlightRuleMode::Expression {
+        return Some(ContextMatcher::Text);
     }
+    let pattern = rule.pattern.trim();
+    if pattern.is_empty() {
+        return None;
+    }
+    if pattern.eq_ignore_ascii_case("mention") {
+        return Some(ContextMatcher::Mention);
+    }
+    let is_regex = rule.effective_mode() == HighlightRuleMode::Regex;
+    if let Some((scope, value, rest)) = parse_scoped_pattern(pattern) {
+        if value.is_empty() {
+            return None;
+        }
+        let value = if is_regex && rest.is_none() {
+            ScopeMatcher::Regex(compile_regex(value, rule.case_sensitive)?)
+        } else {
+            ScopeMatcher::Exact(if rule.case_sensitive {
+                value.to_owned()
+            } else {
+                value.to_lowercase()
+            })
+        };
+        let content = match rest {
+            Some(pattern) => Some(compile_text_matcher(
+                pattern,
+                rule.case_sensitive,
+                is_regex,
+            )?),
+            None => None,
+        };
+        return Some(ContextMatcher::Scoped {
+            scope,
+            value,
+            content,
+        });
+    }
+    if !is_regex {
+        if let Some(pattern) = strip_prefix_ascii_case_insensitive(pattern, "re:") {
+            return compile_regex(pattern, rule.case_sensitive).map(ContextMatcher::Regex);
+        }
+    }
+    Some(ContextMatcher::Text)
+}
+
+fn compile_regex(pattern: &str, case_sensitive: bool) -> Option<regex::Regex> {
+    if pattern.is_empty() {
+        return None;
+    }
+    regex::RegexBuilder::new(pattern)
+        .case_insensitive(!case_sensitive)
+        .build()
+        .ok()
 }
 
 /// Compile a slice of [`HighlightRule`]s into a vec of [`HighlightMatch`]
@@ -361,6 +405,7 @@ pub fn compile_rules(rules: &[HighlightRule]) -> Vec<HighlightMatch> {
         .iter()
         .filter(|r| r.enabled && !r.pattern.is_empty())
         .filter_map(|rule| {
+            let context_matcher = compile_context_matcher(rule)?;
             let matcher = match rule.effective_mode() {
                 HighlightRuleMode::Expression => match parse_expression(&rule.pattern) {
                     Ok(expr) => CompiledMatcher::Expression(Arc::new(expr)),
@@ -375,19 +420,16 @@ pub fn compile_rules(rules: &[HighlightRule]) -> Vec<HighlightMatch> {
                         return None;
                     }
                 },
-                HighlightRuleMode::Regex => {
-                    let mut builder = regex::RegexBuilder::new(&rule.pattern);
-                    builder.case_insensitive(!rule.case_sensitive);
-                    match builder.build() {
-                        Ok(re) => CompiledMatcher::Regex(re),
-                        Err(_) => return None, // skip invalid regex
-                    }
-                }
-                HighlightRuleMode::Substring => CompiledMatcher::Substring(rule.pattern.clone()),
+                mode => compile_text_matcher(
+                    &rule.pattern,
+                    rule.case_sensitive,
+                    mode == HighlightRuleMode::Regex,
+                )?,
             };
             Some(HighlightMatch {
                 rule: rule.clone(),
                 matcher,
+                context_matcher,
             })
         })
         .collect()
@@ -533,21 +575,15 @@ pub fn first_match_context_message(
     channel_live: Option<bool>,
     watching: bool,
 ) -> Option<(Option<HighlightColor>, bool, bool, bool)> {
-    first_match_context_rule_message(
-        compiled,
-        msg,
-        channel_display_name,
-        channel_live,
-        watching,
-    )
-    .map(|rule| {
-        (
-            rule.color,
-            rule.show_in_mentions,
-            rule.has_alert,
-            rule.has_sound,
-        )
-    })
+    first_match_context_rule_message(compiled, msg, channel_display_name, channel_live, watching)
+        .map(|rule| {
+            (
+                rule.color,
+                rule.show_in_mentions,
+                rule.has_alert,
+                rule.has_sound,
+            )
+        })
 }
 
 // ASCII case-insensitive search
@@ -720,6 +756,128 @@ mod tests {
         assert!(matched.is_some());
     }
 
+    #[test]
+    fn scoped_regex_rules_use_explicit_and_legacy_modes_consistently() {
+        for legacy in [false, true] {
+            let mut rule = make_rule(r"from:alice ^hello\s+\d+$");
+            if legacy {
+                rule.is_regex = true;
+            } else {
+                rule.mode = HighlightRuleMode::Regex;
+            }
+            let compiled = compile_rules(&[rule]);
+            assert_eq!(compiled.len(), 1);
+            let matcher = &compiled[0];
+            assert!(matcher.is_match_context("HELLO 42", "alice", "Alice", "room", false));
+            assert!(!matcher.is_match_context("hello 42", "bob", "Bob", "room", false));
+            assert!(!matcher.is_match_context("hello world", "alice", "Alice", "room", false));
+        }
+    }
+
+    #[test]
+    fn terminal_scope_regex_matches_the_sender_or_channel() {
+        for pattern in [r"from:^ali.e$", r"user=^ali.e$"] {
+            let compiled = compile_rules(&[HighlightRule::regex(pattern)]);
+            assert!(compiled[0].is_match_context("irrelevant", "alice", "Alice", "room", false));
+            assert!(!compiled[0].is_match_context("alice", "bob", "Bob", "room", false));
+        }
+        let compiled = compile_rules(&[HighlightRule::regex(r"channel=^room\d+$")]);
+        assert!(compiled[0].is_match_context("hello", "alice", "Alice", "room42", false));
+        assert!(!compiled[0].is_match_context("room42", "alice", "Alice", "other", false));
+    }
+
+    #[test]
+    fn scope_keywords_ignore_case_but_values_and_content_follow_the_rule() {
+        for prefix in ["FROM=", "From:", "USER=", "User:"] {
+            let mut rule = make_rule(&format!("{prefix}Alice Hello"));
+            rule.case_sensitive = true;
+            let compiled = compile_rules(&[rule]);
+            let matcher = &compiled[0];
+            assert!(matcher.is_match_context("Hello", "alice", "Alice", "room", false));
+            assert!(!matcher.is_match_context("hello", "alice", "Alice", "room", false));
+            assert!(!matcher.is_match_context("Hello", "alice", "ALICE", "room", false));
+        }
+        let compiled = compile_rules(&[make_rule("CHANNEL:Room hello")]);
+        assert!(compiled[0].is_match_context("HELLO", "alice", "Alice", "room", false));
+        let compiled = compile_rules(&[make_rule("RE:^hello$")]);
+        assert!(compiled[0].is_match_context("HELLO", "alice", "Alice", "room", false));
+    }
+
+    #[test]
+    fn scoped_plain_content_stays_literal_and_unicode_names_fold_once() {
+        let compiled = compile_rules(&[make_rule("from:ÉLODIE a+b")]);
+        assert!(compiled[0].is_match_context("A+B", "elodie", "Élodie", "room", false));
+        assert!(!compiled[0].is_match_context("aaab", "elodie", "Élodie", "room", false));
+        let compiled = compile_rules(&[make_rule("ÉLODIE")]);
+        assert!(compiled[0].is_match("bonjour Élodie"));
+    }
+
+    #[test]
+    fn invalid_context_rules_are_rejected_during_compilation() {
+        for rule in [
+            make_rule("re:["),
+            make_rule("re:"),
+            make_rule("from:"),
+            make_rule("   "),
+            HighlightRule::regex("from:alice ["),
+        ] {
+            assert!(compile_rules(&[rule]).is_empty());
+        }
+    }
+
+    #[test]
+    #[ignore = "isolated scoped highlight benchmark"]
+    fn perf_scoped_highlight_matching() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let pattern = r"^hello\s+\d+$";
+        let compiled = compile_rules(&[HighlightRule::regex(format!("from:alice {pattern}"))]);
+        let iterations = 10_000;
+        let mut previous = Vec::new();
+        let mut revised = Vec::new();
+        for round in 0..5 {
+            for old_path in if round % 2 == 0 {
+                [true, false]
+            } else {
+                [false, true]
+            } {
+                let started = Instant::now();
+                let mut matches = 0;
+                for index in 0..iterations {
+                    let text = black_box(if index % 2 == 0 {
+                        "hello 42"
+                    } else {
+                        "hello world"
+                    });
+                    let matched = if old_path {
+                        regex::RegexBuilder::new(black_box(pattern))
+                            .case_insensitive(true)
+                            .build()
+                            .unwrap()
+                            .is_match(text)
+                    } else {
+                        compiled[0].is_match_context(text, "alice", "Alice", "room", false)
+                    };
+                    matches += usize::from(matched);
+                }
+                assert_eq!(matches, iterations / 2);
+                if old_path {
+                    previous.push(started.elapsed());
+                } else {
+                    revised.push(started.elapsed());
+                }
+            }
+        }
+        previous.sort_unstable();
+        revised.sort_unstable();
+        eprintln!(
+            "{iterations} scoped highlight checks: per-message compilation {:?}; compiled matching {:?}",
+            previous[previous.len() / 2],
+            revised[revised.len() / 2]
+        );
+    }
+
     // expression mode
 
     fn fake_subbed_message(text: &str) -> crate::model::ChatMessage {
@@ -761,9 +919,8 @@ mod tests {
 
     #[test]
     fn expression_mode_highlight_fires_for_subscriber_gg() {
-        let mut rule = HighlightRule::expression(
-            "author.subscriber && message.content contains \"gg\"",
-        );
+        let mut rule =
+            HighlightRule::expression("author.subscriber && message.content contains \"gg\"");
         rule.color = Some([255, 200, 100]);
         let compiled = compile_rules(&[rule]);
         let msg = fake_subbed_message("gg ez");
@@ -774,9 +931,8 @@ mod tests {
 
     #[test]
     fn expression_mode_highlight_skips_non_subscribers() {
-        let rule = HighlightRule::expression(
-            "author.subscriber && message.content contains \"gg\"",
-        );
+        let rule =
+            HighlightRule::expression("author.subscriber && message.content contains \"gg\"");
         let compiled = compile_rules(&[rule]);
         let mut msg = fake_subbed_message("gg ez");
         msg.sender.badges.clear();

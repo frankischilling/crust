@@ -24,6 +24,7 @@ pub struct MessageSearchState {
     pub username: String,
     pub keyword: String,
     pub regex: String,
+    pub local_history_exhausted: bool,
     request_load_more_local: bool,
     compiled_regex: Option<Regex>,
     compiled_pattern: String,
@@ -299,10 +300,10 @@ fn show_message_search_contents(
                 }
             }
             if ui
-                .add(Button::new(
-                    RichText::new("Load older logs").font(t::small()),
+                .add_enabled(!search.local_history_exhausted, Button::new(
+                    RichText::new(if search.local_history_exhausted { "No older logs" } else { "Load older logs" }).font(t::small()),
                 ))
-                .on_hover_text("Load older local SQLite logs before the oldest visible message")
+                .on_hover_text("Search earlier messages saved on this computer")
                 .clicked()
             {
                 search.request_load_more_local();

@@ -21,7 +21,7 @@ On Windows, the default location is:
 - [`api_tour_plugin`](./api_tour_plugin) - a guided tour of the Lua API surface
 - [`event_callback_demo_plugin`](./event_callback_demo_plugin) - callbacks for profile, link-preview, and stream-status requests
 - [`loader_progress_demo_plugin`](./loader_progress_demo_plugin) - image/emote loader notifications and progress tracking
-- [`stateful_counter_plugin`](./stateful_counter_plugin) - persistence with `plugin_data_dir()`
+- [`stateful_counter_plugin`](./stateful_counter_plugin) - persistence with `c2.plugin_data_dir()`
 - [`channel_toolbox_plugin`](./channel_toolbox_plugin) - channel lookup and message helpers
 - [`ui_window_showcase_plugin`](./ui_window_showcase_plugin) - a floating window with form fields, submit handling, and a `link_button`
 - [`ui_settings_demo_plugin`](./ui_settings_demo_plugin) - a settings page with form submission
