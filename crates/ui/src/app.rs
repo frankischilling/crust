@@ -31,7 +31,7 @@ use crate::widgets::{
     analytics::AnalyticsPanel,
     bytes_uri,
     channel_list::ChannelList,
-    chat_input::ChatInput,
+    chat_input::{insert_picker_emote, invalidate_emote_completions, ChatInput},
     chrome::{self, ChromeIcon, IconButtonState},
     crash_viewer::{CrashReportMeta, CrashViewer},
     emote_picker::EmotePicker,
@@ -107,6 +107,7 @@ const QUICK_SWITCH_MAX_ROWS: usize = 10;
 const MAX_DEFERRED_COMMANDS: usize = 128;
 const MAX_DEFERRED_UPLOAD_BYTES: usize = 32 * 1024 * 1024;
 const MAX_COMMANDS_PER_FRAME: usize = 64;
+const EMOTE_REFRESH_ROWS_PER_FRAME: usize = 400;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommandQueueError {
@@ -381,11 +382,29 @@ struct WhisperLine {
     is_self: bool,
 }
 
+enum EmoteRefreshJob {
+    Channel(ChannelId, MessageId),
+    Mentions(MessageId),
+    Whispers(String),
+}
+
 // Split-pane state
+
+fn chat_composer_id(pane: Option<u64>) -> egui::Id {
+    egui::Id::new(("chat_composer", pane))
+}
+
+fn pane_pointer_pressed(ctx: &Context, rect: egui::Rect, layer: egui::LayerId) -> bool {
+    let pointer = ctx.input(|input| {
+        input.pointer.any_pressed().then(|| input.pointer.interact_pos()).flatten()
+    });
+    pointer.is_some_and(|pos| rect.contains(pos) && ctx.layer_id_at(pos) == Some(layer))
+}
 
 /// One pane in the split view.
 #[derive(Clone)]
 struct Pane {
+    id: u64,
     channel: ChannelId,
     input_buf: String,
     /// Width fraction (0.0-1.0) of available space; all panes sum to ~1.0.
@@ -531,12 +550,21 @@ impl SplitPanes {
             p.frac *= scale;
         }
         let pane = Pane {
+            id: {
+                static NEXT_PANE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                NEXT_PANE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
             channel,
             input_buf: String::new(),
             frac: new_frac,
         };
         match insert_at {
-            Some(i) if i <= self.panes.len() => self.panes.insert(i, pane),
+            Some(i) if i <= self.panes.len() => {
+                if !self.panes.is_empty() && i <= self.focused {
+                    self.focused += 1;
+                }
+                self.panes.insert(i, pane);
+            }
             _ => self.panes.push(pane),
         }
         self.normalize_fractions();
@@ -547,6 +575,9 @@ impl SplitPanes {
     fn remove_pane(&mut self, idx: usize) {
         if idx < self.panes.len() {
             self.panes.remove(idx);
+            if idx < self.focused {
+                self.focused -= 1;
+            }
             self.normalize_fractions();
             self.clamp_focus();
         }
@@ -1022,6 +1053,12 @@ pub struct CrustApp {
     emote_picker: EmotePicker,
     chat_input_buf: String,
     emote_catalog: Vec<EmoteCatalogEntry>,
+    emote_catalog_initialized: bool,
+    emote_catalog_index: HashMap<String, Vec<usize>>,
+    input_emote_catalogs: HashMap<ChannelId, Vec<EmoteCatalogEntry>>,
+    emote_picker_channel: Option<ChannelId>,
+    pending_emote_refresh: VecDeque<EmoteRefreshJob>,
+    emote_refresh_followup: bool,
     perf: PerfOverlay,
     /// Reply pending for the next send (set by right-click -> Reply).
     pending_reply: Option<PendingReply>,
@@ -1610,6 +1647,12 @@ impl CrustApp {
             emote_picker: EmotePicker::default(),
             chat_input_buf: String::new(),
             emote_catalog: Vec::new(),
+            emote_catalog_initialized: false,
+            emote_catalog_index: HashMap::new(),
+            input_emote_catalogs: HashMap::new(),
+            emote_picker_channel: None,
+            pending_emote_refresh: VecDeque::new(),
+            emote_refresh_followup: false,
             perf: PerfOverlay::default(),
             pending_reply: None,
             user_profile_popup: UserProfilePopup::default(),
@@ -3181,9 +3224,119 @@ exit 1
         }
     }
 
-    fn tokenize_whisper_text(&self, text: &str, twitch_emotes: &[TwitchEmotePos]) -> Vec<Span> {
-        let emote_map = build_emote_lookup(&self.emote_catalog);
-        tokenize_whisper_text(text, twitch_emotes, &emote_map)
+    fn invalidate_input_emote_catalogs(&mut self, ctx: &Context) {
+        self.input_emote_catalogs.clear();
+        self.emote_picker.invalidate_catalog();
+        invalidate_emote_completions(ctx, chat_composer_id(None));
+        for pane in &self.split_panes.panes {
+            invalidate_emote_completions(ctx, chat_composer_id(Some(pane.id)));
+        }
+    }
+
+    fn ensure_input_emote_catalog(&mut self, channel: &ChannelId) {
+        if self.input_emote_catalogs.contains_key(channel) {
+            return;
+        }
+        let sender = self.state.auth.user_id.as_deref().unwrap_or_default();
+        let mut entries: Vec<_> = self.emote_catalog_index.keys().filter_map(|code| {
+            resolve_catalog_emote(&self.emote_catalog, &self.emote_catalog_index,
+                channel, sender, code).cloned()
+        }).collect();
+        entries.sort_by_cached_key(|entry| entry.code.to_ascii_lowercase());
+        self.input_emote_catalogs.insert(channel.clone(), entries);
+    }
+
+    fn prepare_emote_picker(&mut self, channel: &ChannelId) {
+        self.ensure_input_emote_catalog(channel);
+        if self.emote_picker_channel.as_ref() != Some(channel) {
+            self.emote_picker.invalidate_catalog();
+            self.emote_picker_channel = Some(channel.clone());
+        }
+    }
+
+    fn tokenize_whisper_text(&self, text: &str, twitch_emotes: &[TwitchEmotePos], is_self: bool) -> Vec<Span> {
+        let sender = if is_self { self.state.auth.user_id.as_deref().unwrap_or_default() } else { "" };
+        tokenize_whisper_text(text, twitch_emotes, &self.emote_catalog, &self.emote_catalog_index, sender)
+    }
+
+    fn queue_emote_refresh(&mut self) {
+        if !self.pending_emote_refresh.is_empty() {
+            // Keep reaching older rows while catalogs change. The queued work
+            // reads the latest catalog, then one follow-up pass revisits rows
+            // that were processed before the newest snapshot arrived.
+            self.emote_refresh_followup = true;
+            return;
+        }
+        self.emote_refresh_followup = false;
+        let mut seen = HashSet::new();
+        for channel in self.state.active_channel.iter().chain(self.state.channel_order.iter()) {
+            if seen.insert(channel) {
+                if let Some(message) = self.state.channels.get(channel).and_then(|state| state.messages.back()) {
+                    self.pending_emote_refresh.push_back(EmoteRefreshJob::Channel(channel.clone(), message.id));
+                }
+            }
+        }
+        if let Some(message) = self.state.mentions.back() {
+            self.pending_emote_refresh.push_back(EmoteRefreshJob::Mentions(message.id));
+        }
+        for (login, lines) in &self.whisper_threads {
+            if !lines.is_empty() {
+                self.pending_emote_refresh.push_back(EmoteRefreshJob::Whispers(login.clone()));
+            }
+        }
+    }
+
+    fn refresh_emote_messages(&mut self, ctx: &Context) {
+        let mut remaining = EMOTE_REFRESH_ROWS_PER_FRAME;
+        let mut jobs = 0;
+        while remaining > 0 && jobs < 16 {
+            let Some(job) = self.pending_emote_refresh.pop_front() else { break };
+            jobs += 1;
+            match job {
+                EmoteRefreshJob::Channel(channel, through) => {
+                    let Some(state) = self.state.channels.get_mut(&channel) else { continue };
+                    let (examined, next, changed) = refresh_message_emotes(&mut state.messages,
+                        through, remaining, &self.emote_catalog, &self.emote_catalog_index);
+                    remaining -= examined;
+                    if !changed.is_empty() {
+                        crate::widgets::message_list::invalidate_message_layouts(ctx, &channel, &changed);
+                        self.global_search.invalidate();
+                    }
+                    if let Some(next) = next {
+                        self.pending_emote_refresh.push_back(EmoteRefreshJob::Channel(channel, next));
+                    }
+                }
+                EmoteRefreshJob::Mentions(through) => {
+                    let (examined, next, _) = refresh_message_emotes(&mut self.state.mentions,
+                        through, remaining, &self.emote_catalog, &self.emote_catalog_index);
+                    remaining -= examined;
+                    if let Some(next) = next {
+                        self.pending_emote_refresh.push_back(EmoteRefreshJob::Mentions(next));
+                    }
+                }
+                EmoteRefreshJob::Whispers(login) => {
+                    let Some(lines) = self.whisper_threads.get_mut(&login) else { continue };
+                    if lines.len() > remaining {
+                        self.pending_emote_refresh.push_front(EmoteRefreshJob::Whispers(login));
+                        break;
+                    }
+                    remaining -= lines.len();
+                    for line in lines {
+                        let sender = if line.is_self {
+                            self.state.auth.user_id.as_deref().unwrap_or_default()
+                        } else { "" };
+                        line.spans = tokenize_whisper_text(&line.text, &line.twitch_emotes,
+                            &self.emote_catalog, &self.emote_catalog_index, sender);
+                    }
+                }
+            }
+        }
+        if self.pending_emote_refresh.is_empty() && self.emote_refresh_followup {
+            self.queue_emote_refresh();
+        }
+        if !self.pending_emote_refresh.is_empty() {
+            ctx.request_repaint();
+        }
     }
 
     fn queue_whisper_span_images(&mut self, spans: &[Span]) {
@@ -3934,7 +4087,7 @@ exit 1
                     count: emotes.len(),
                 })
             }
-            AppEvent::HistoryLoaded { channel, messages } => {
+            AppEvent::HistoryLoaded { channel, messages, .. } => {
                 self.loading_screen.on_event(LoadEvent::HistoryLoaded {
                     channel: channel.as_str().to_owned(),
                     count: messages.len(),
@@ -3985,6 +4138,7 @@ exit 1
             }
             AppEvent::ChannelParted { channel } => {
                 self.state.leave_channel(&channel);
+                self.input_emote_catalogs.remove(&channel);
                 self.sorted_chatters.remove(&channel);
                 self.automod_queue.remove(&channel);
                 self.unban_requests.remove(&channel);
@@ -4157,8 +4311,16 @@ exit 1
                     is_watching_channel,
                 )
                 .cloned();
-                if highlight_rule.is_some() {
+                if highlight_rule.is_some() && !message.flags.is_highlighted {
                     message.flags.is_highlighted = true;
+                    if !message.flags.is_history {
+                        self.send_cmd(AppCommand::PersistMessageHighlight {
+                            channel: channel.clone(),
+                            server_id: message.server_id.clone(),
+                            message_id: message.id,
+                            timestamp_ms: message.timestamp.timestamp_millis(),
+                        });
+                    }
                 }
                 let (highlight_mentions, _highlight_alert, highlight_sound, highlight_sound_url) =
                     highlight_rule
@@ -4391,7 +4553,7 @@ exit 1
                     .insert(partner_login.clone(), display_name.clone());
 
                 let text = text.to_owned();
-                let spans = self.tokenize_whisper_text(&text, &twitch_emotes);
+                let spans = self.tokenize_whisper_text(&text, &twitch_emotes, is_self);
                 let mentions_current_user =
                     self.whisper_message_mentions_current_user(&spans, &text);
                 self.queue_whisper_span_images(&spans);
@@ -4483,93 +4645,23 @@ exit 1
                 self.emote_bytes.complete(ctx, uri, width, height, raw_bytes);
             }
             AppEvent::EmoteCatalogUpdated { mut emotes } => {
-                // `sort_by_cached_key` evaluates the key once per element (O(n))
-                // instead of ~O(n log n) lowercase allocations in `sort_by`.
-                emotes.sort_by_cached_key(|e| e.code.to_ascii_lowercase());
-                self.emote_catalog = emotes;
-
-                // Re-tokenize existing messages across ALL channels so that
-                // emotes that loaded after the messages arrived (e.g. global
-                // BTTV/FFZ/7TV emotes like LUL) get resolved.
-                let emote_map = build_emote_lookup(&self.emote_catalog);
-                if !emote_map.is_empty() {
-                    let mut whisper_urls_to_fetch: HashSet<String> = HashSet::new();
-
-                    // Re-tokenize only the tail window per channel so a
-                    // mid-session emote-catalog update (BTTV/FFZ/7TV arriving
-                    // after messages did) doesn't stall the UI thread for
-                    // thousands of older off-screen rows.
-                    const RETOKENIZE_TAIL: usize = 400;
-                    for ch in self.state.channels.values_mut() {
-                        let len = ch.messages.len();
-                        let start = len.saturating_sub(RETOKENIZE_TAIL);
-                        for msg in ch.messages.iter_mut().skip(start) {
-                            if !matches!(msg.msg_kind, MsgKind::Chat | MsgKind::Bits { .. }) {
-                                continue;
-                            }
-                            let new_spans = crust_core::format::tokenize(
-                                &msg.raw_text,
-                                msg.flags.is_action,
-                                &msg.twitch_emotes,
-                                &|code| {
-                                    emote_map.get(code).map(|e| {
-                                        (
-                                            e.code.clone(),
-                                            e.code.clone(),
-                                            e.url.clone(),
-                                            e.provider.clone(),
-                                            None,
-                                        )
-                                    })
-                                },
-                            );
-
-                            let old_emote_count = msg
-                                .spans
-                                .iter()
-                                .filter(|s| matches!(s, crust_core::Span::Emote { .. }))
-                                .count();
-                            let new_emote_count = new_spans
-                                .iter()
-                                .filter(|s| matches!(s, crust_core::Span::Emote { .. }))
-                                .count();
-
-                            if new_emote_count > old_emote_count {
-                                for span in &new_spans {
-                                    if let crust_core::Span::Emote { url, .. } = span {
-                                        if !self.emote_bytes.contains_key(url.as_str()) {
-                                            let _ = self.cmd_tx.try_send(AppCommand::FetchImage {
-                                                url: url.clone(),
-                                            });
-                                        }
-                                    }
-                                }
-                                msg.spans = new_spans;
-                            }
-                        }
-                    }
-
-                    for thread in self.whisper_threads.values_mut() {
-                        for line in thread.iter_mut() {
-                            let new_spans =
-                                tokenize_whisper_text(&line.text, &line.twitch_emotes, &emote_map);
-                            for span in &new_spans {
-                                if let Span::Emote { url, .. } | Span::Emoji { url, .. } = span {
-                                    if !self.emote_bytes.contains_key(url.as_str()) {
-                                        whisper_urls_to_fetch.insert(url.clone());
-                                    }
-                                }
-                            }
-                            line.spans = new_spans;
-                        }
-                    }
-
-                    for url in whisper_urls_to_fetch {
-                        if self.whisper_pending_images.insert(url.clone()) {
-                            self.send_cmd(AppCommand::FetchImage { url });
-                        }
-                    }
+                emotes.sort_by(|left, right| left.code.cmp(&right.code)
+                    .then_with(|| left.provider.cmp(&right.provider))
+                    .then_with(|| left.channel.as_ref().map(ChannelId::as_str).cmp(&right.channel.as_ref().map(ChannelId::as_str)))
+                    .then_with(|| left.user_id.as_ref().map(|id| id.0.as_str()).cmp(&right.user_id.as_ref().map(|id| id.0.as_str())))
+                    .then_with(|| left.url.cmp(&right.url))
+                    .then_with(|| left.id.cmp(&right.id))
+                    .then_with(|| left.url_hd.cmp(&right.url_hd))
+                    .then_with(|| left.scope.cmp(&right.scope)));
+                if self.emote_catalog_initialized && self.emote_catalog == emotes {
+                    return;
                 }
+                self.emote_catalog_initialized = true;
+                self.emote_catalog = emotes;
+                self.emote_catalog_index = build_emote_catalog_index(&self.emote_catalog);
+                self.invalidate_input_emote_catalogs(ctx);
+
+                self.queue_emote_refresh();
             }
             AppEvent::AuthenticationPending { username } => {
                 self.pending_auth = Some(username.unwrap_or_default());
@@ -4599,6 +4691,7 @@ exit 1
                 self.state.auth.logged_in = true;
                 self.state.auth.username = Some(username);
                 self.state.auth.user_id = Some(user_id);
+                self.invalidate_input_emote_catalogs(ctx);
                 if let Some(host) = plugin_host() {
                     host.update_auth_snapshot(PluginAuthSnapshot {
                         logged_in: true,
@@ -4614,6 +4707,7 @@ exit 1
                 self.state.auth.logged_in = false;
                 self.state.auth.username = None;
                 self.state.auth.user_id = None;
+                self.invalidate_input_emote_catalogs(ctx);
                 self.state.auth.avatar_url = None;
                 self.whispers_visible = false;
                 self.whisper_threads.clear();
@@ -4741,9 +4835,17 @@ exit 1
                         &mut message.sender,
                     );
                 }
+                let refresh_ids: HashSet<_> = messages.iter().map(|message| message.id).collect();
                 self.state.prepend_mentions_history(messages);
+                if self.emote_catalog_initialized {
+                    if let Some(message) = self.state.mentions.iter().rev()
+                        .find(|message| refresh_ids.contains(&message.id))
+                    {
+                        self.pending_emote_refresh.push_back(EmoteRefreshJob::Mentions(message.id));
+                    }
+                }
             }
-            AppEvent::HistoryLoaded { channel, mut messages } => {
+            AppEvent::HistoryLoaded { channel, mut messages, local } => {
                 for message in &mut messages {
                     crust_core::model::apply_sender_nickname(
                         &self.nicknames,
@@ -4752,6 +4854,19 @@ exit 1
                     );
                 }
                 if let Some(ch) = self.state.channels.get_mut(&channel) {
+                    if let Some(page) = &local {
+                        let stale = match (page.before, ch.local_history_cursor) {
+                            (None, Some(_)) => true,
+                            (Some(before), Some(current)) => before != current,
+                            _ => false,
+                        };
+                        if stale {
+                            return;
+                        }
+                        ch.local_history_cursor = page.next.or(ch.local_history_cursor);
+                        ch.local_history_exhausted = !page.has_more;
+                        self.global_search.load_older_pending.remove(&channel);
+                    }
                     // Scroll to the seam between history and live chat so the
                     // user sees context instead of waking up at the bottom.
                     // Only scroll when there is a real seami.e. live chat
@@ -4769,7 +4884,20 @@ exit 1
                         None
                     };
 
-                    ch.prepend_history(messages);
+                    let refresh_ids: HashSet<_> = messages.iter().map(|message| message.id).collect();
+                    if let Some(page) = &local {
+                        ch.prepend_local_history(messages, page);
+                    } else {
+                        ch.prepend_history(messages);
+                    }
+                    if self.emote_catalog_initialized {
+                        if let Some(message) = ch.messages.iter().rev()
+                            .find(|message| refresh_ids.contains(&message.id))
+                        {
+                            self.pending_emote_refresh.push_back(
+                                EmoteRefreshJob::Channel(channel.clone(), message.id));
+                        }
+                    }
 
                     if let Some(sid) = seam_id {
                         let scroll_key = egui::Id::new("ml_scroll_to").with(channel.as_str());
@@ -5951,9 +6079,19 @@ exit 1
     }
 
     fn request_older_local_history(&self, channel: &ChannelId, oldest_loaded_ts_ms: i64) {
+        let state = self.state.channels.get(channel);
+        if state.is_some_and(|state| state.local_history_exhausted) {
+            return;
+        }
+        let cursor = state.and_then(|state| state.local_history_cursor)
+            .unwrap_or(crust_core::model::HistoryCursor {
+                timestamp_ms: oldest_loaded_ts_ms,
+                row_id: i64::MAX,
+            });
         self.send_cmd(AppCommand::LoadOlderLocalHistory {
             channel: channel.clone(),
-            before_ts_ms: oldest_loaded_ts_ms,
+            before_ts_ms: cursor.timestamp_ms,
+            before_row_id: Some(cursor.row_id),
             limit: LOCAL_HISTORY_SEARCH_PAGE,
         });
     }
@@ -6743,6 +6881,90 @@ exit 1
         self.split_panes.activate_channel(&channel);
         self.state.active_channel = Some(channel.clone());
         self.persist_active_channel(&channel);
+        if let Some(ctx) = self.egui_ctx.as_ref() {
+            self.focus_chat_composer(ctx);
+        }
+    }
+
+    fn focus_chat_composer(&self, ctx: &Context) {
+        if self.state.active_channel.as_ref().is_some_and(ChannelId::is_virtual) {
+            ctx.memory_mut(|memory| {
+                if let Some(id) = memory.focused() {
+                    memory.surrender_focus(id);
+                }
+            });
+            return;
+        }
+        let pane = if self.split_panes.panes.len() > 1 {
+            self.split_panes.panes.get(self.split_panes.focused).map(|pane| pane.id)
+        } else {
+            None
+        };
+        ctx.memory_mut(|memory| memory.request_focus(chat_composer_id(pane)));
+    }
+
+    fn sync_split_focus(&mut self, ctx: &Context) {
+        if let Some(channel) = self.split_panes.focused_channel().cloned() {
+            self.state.active_channel = Some(channel);
+            self.focus_chat_composer(ctx);
+        }
+    }
+
+    fn keep_split_pane(&mut self, index: usize, ctx: &Context) {
+        if index >= self.split_panes.panes.len() {
+            return;
+        }
+        let pane = self.split_panes.panes.remove(index);
+        if let Some(state) = egui::TextEdit::load_state(ctx, chat_composer_id(Some(pane.id))) {
+            egui::TextEdit::store_state(ctx, chat_composer_id(None), state);
+        }
+        self.state.active_channel = Some(pane.channel);
+        self.chat_input_buf = pane.input_buf;
+        self.split_panes.panes.clear();
+        self.split_panes.focused = 0;
+        self.focus_chat_composer(ctx);
+    }
+
+    fn close_split_pane(&mut self, index: usize, ctx: &Context) {
+        if index >= self.split_panes.panes.len() {
+            return;
+        }
+        self.split_panes.remove_pane(index);
+        if self.split_panes.panes.len() == 1 {
+            self.keep_split_pane(0, ctx);
+        } else {
+            self.sync_split_focus(ctx);
+        }
+    }
+
+    fn close_channel_tab(&mut self, channel: ChannelId, ctx: &Context) {
+        if self.pending_reply.as_ref().is_some_and(|reply| reply.channel == channel) {
+            self.pending_reply = None;
+        }
+        let mut removed_pane = false;
+        for index in (0..self.split_panes.panes.len()).rev() {
+            if self.split_panes.panes[index].channel == channel {
+                self.split_panes.remove_pane(index);
+                removed_pane = true;
+            }
+        }
+        self.send_cmd(AppCommand::LeaveChannel { channel: channel.clone() });
+        self.state.leave_channel(&channel);
+        self.sorted_chatters.remove(&channel);
+        self.message_search.remove(&channel);
+
+        if removed_pane {
+            // Redirects can leave multiple drafts for one channel. Remove all
+            // of its panes before choosing the surviving layout and focus.
+            match self.split_panes.panes.len() {
+                0 if self.state.active_channel.is_none() => {
+                    ctx.memory_mut(|memory| memory.stop_text_input());
+                }
+                0 => self.focus_chat_composer(ctx),
+                1 => self.keep_split_pane(0, ctx),
+                _ => self.sync_split_focus(ctx),
+            }
+        }
     }
 
     /// Persist the currently-focused channel so it can be restored next launch.
@@ -7117,9 +7339,7 @@ exit 1
         if move_left {
             if split_mode {
                 self.split_panes.move_focused(-1);
-                if let Some(ch) = self.split_panes.focused_channel().cloned() {
-                    self.state.active_channel = Some(ch);
-                }
+                self.sync_split_focus(ctx);
             } else if let Some(active) = self.state.active_channel.clone() {
                 if let Some(idx) = self.state.channel_order.iter().position(|ch| ch == &active) {
                     if idx > 0 {
@@ -7131,9 +7351,7 @@ exit 1
         if move_right {
             if split_mode {
                 self.split_panes.move_focused(1);
-                if let Some(ch) = self.split_panes.focused_channel().cloned() {
-                    self.state.active_channel = Some(ch);
-                }
+                self.sync_split_focus(ctx);
             } else if let Some(active) = self.state.active_channel.clone() {
                 if let Some(idx) = self.state.channel_order.iter().position(|ch| ch == &active) {
                     if idx + 1 < self.state.channel_order.len() {
@@ -7145,9 +7363,7 @@ exit 1
         if first {
             if split_mode {
                 self.split_panes.focus_first();
-                if let Some(ch) = self.split_panes.focused_channel().cloned() {
-                    self.state.active_channel = Some(ch);
-                }
+                self.sync_split_focus(ctx);
             } else if let Some(target) = self.state.channel_order.first().cloned() {
                 self.activate_channel(target);
             }
@@ -7156,9 +7372,7 @@ exit 1
         if last {
             if split_mode {
                 self.split_panes.focus_last();
-                if let Some(ch) = self.split_panes.focused_channel().cloned() {
-                    self.state.active_channel = Some(ch);
-                }
+                self.sync_split_focus(ctx);
             } else if let Some(target) = self.state.channel_order.last().cloned() {
                 self.activate_channel(target);
             }
@@ -7168,36 +7382,28 @@ exit 1
         if split_prev {
             if split_mode {
                 self.split_panes.focus_prev();
-                if let Some(ch) = self.split_panes.focused_channel().cloned() {
-                    self.state.active_channel = Some(ch);
-                }
+                self.sync_split_focus(ctx);
             }
             return;
         }
         if split_next {
             if split_mode {
                 self.split_panes.focus_next();
-                if let Some(ch) = self.split_panes.focused_channel().cloned() {
-                    self.state.active_channel = Some(ch);
-                }
+                self.sync_split_focus(ctx);
             }
             return;
         }
         if split_move_left {
             if split_mode {
                 self.split_panes.move_focused(-1);
-                if let Some(ch) = self.split_panes.focused_channel().cloned() {
-                    self.state.active_channel = Some(ch);
-                }
+                self.sync_split_focus(ctx);
             }
             return;
         }
         if split_move_right {
             if split_mode {
                 self.split_panes.move_focused(1);
-                if let Some(ch) = self.split_panes.focused_channel().cloned() {
-                    self.state.active_channel = Some(ch);
-                }
+                self.sync_split_focus(ctx);
             }
             return;
         }
@@ -7382,6 +7588,11 @@ impl eframe::App for CrustApp {
             });
         }
 
+        let picker_was_open = self.emote_picker.open;
+        self.emote_picker.handle_shortcuts(ctx);
+        if picker_was_open && !self.emote_picker.open {
+            self.focus_chat_composer(ctx);
+        }
         let quick_switch_consumed = self.handle_quick_switch_shortcuts(ctx);
         if !quick_switch_consumed {
             self.handle_channel_shortcuts(ctx);
@@ -7390,6 +7601,7 @@ impl eframe::App for CrustApp {
         }
 
         let events = self.service_runtime_channels(ctx);
+        self.refresh_emote_messages(ctx);
         let had_events = events > 0;
 
         // Repaint policy:
@@ -9481,35 +9693,7 @@ impl eframe::App for CrustApp {
             self.activate_channel(ch);
         }
         if let Some(ch) = ch_closed {
-            if self
-                .pending_reply
-                .as_ref()
-                .map(|r| r.channel == ch)
-                .unwrap_or(false)
-            {
-                self.pending_reply = None;
-            }
-            // Remove any split pane showing this channel.
-            if let Some(idx) = self.split_panes.panes.iter().position(|p| p.channel == ch) {
-                self.split_panes.remove_pane(idx);
-                if self.split_panes.panes.len() <= 1 {
-                    if let Some(p) = self.split_panes.panes.first() {
-                        self.state.active_channel = Some(p.channel.clone());
-                        self.chat_input_buf =
-                            std::mem::take(&mut self.split_panes.panes[0].input_buf);
-                    }
-                    self.split_panes.panes.clear();
-                    self.split_panes.focused = 0;
-                } else {
-                    self.split_panes.clamp_focus();
-                }
-            }
-            self.send_cmd(AppCommand::LeaveChannel {
-                channel: ch.clone(),
-            });
-            self.state.leave_channel(&ch);
-            self.sorted_chatters.remove(&ch);
-            self.message_search.remove(&ch);
+            self.close_channel_tab(ch, ctx);
         }
         if let Some(new_order) = ch_reordered {
             self.state.channel_order = new_order;
@@ -9565,6 +9749,8 @@ impl eframe::App for CrustApp {
                     if let Some(ref active) = self.state.active_channel {
                         if active != &ch {
                             self.split_panes.add_pane(active.clone(), None);
+                            self.split_panes.panes[0].input_buf =
+                                std::mem::take(&mut self.chat_input_buf);
                         }
                     }
                 }
@@ -9572,6 +9758,7 @@ impl eframe::App for CrustApp {
                 self.split_panes.focused = self.split_panes.panes.len().saturating_sub(1);
                 self.state.active_channel = Some(ch);
             }
+            self.focus_chat_composer(ctx);
         }
 
         // Analytics right panel
@@ -9667,7 +9854,6 @@ impl eframe::App for CrustApp {
 
                     for pi in 0..n {
                         let ch = self.split_panes.panes[pi].channel.clone();
-                        let is_focused = pi == self.split_panes.focused;
 
                         // Compute left edge from cumulative fractions so
                         // panes tile perfectly with no float-rounding gaps.
@@ -9708,15 +9894,19 @@ impl eframe::App for CrustApp {
                             );
                         }
 
-                        // Click-to-focus
+                        // Child controls also select their pane before dispatching actions.
+                        if pane_pointer_pressed(ctx, pane_rect, ui.layer_id()) {
+                            self.split_panes.focused = pi;
+                            self.state.active_channel = Some(ch.clone());
+                        }
+                        let is_focused = pi == self.split_panes.focused;
                         let bg_resp = ui.interact(
                             pane_rect,
                             egui::Id::new("split_pane_bg").with(pi),
                             egui::Sense::click(),
                         );
-                        if bg_resp.clicked() && !is_focused {
-                            self.split_panes.focused = pi;
-                            self.state.active_channel = Some(ch.clone());
+                        if bg_resp.clicked() {
+                            self.focus_chat_composer(ctx);
                         }
 
                         let mut pane_ui = ui.new_child(
@@ -9859,12 +10049,14 @@ impl eframe::App for CrustApp {
                                 .layout(egui::Layout::top_down(egui::Align::Min)),
                         );
                         inp_ui.set_clip_rect(input_rect);
+                            self.ensure_input_emote_catalog(&ch);
                             let chatters_sorted: &[String] = self
                                 .sorted_chatters
                                 .get(&ch)
                                 .map(Vec::as_slice)
                                 .unwrap_or(&[]);
                             let chat = ChatInput {
+                                id: Some(chat_composer_id(Some(self.split_panes.panes[pi].id))),
                                 channel: &ch,
                                 logged_in: self.state.auth.logged_in,
                                 username: self
@@ -9872,7 +10064,7 @@ impl eframe::App for CrustApp {
                                     .auth
                                     .username
                                     .as_deref(),
-                                emote_catalog: &self.emote_catalog,
+                                emote_catalog: self.input_emote_catalogs.get(&ch).map(Vec::as_slice).unwrap_or(&[]),
                                 emote_bytes: &self.emote_bytes,
                                 pending_reply: pane_reply.as_ref(),
                                 message_history: &self.message_history,
@@ -9926,6 +10118,7 @@ impl eframe::App for CrustApp {
                                 .unwrap_or(false);
                             if search_open {
                                 if let Some(search) = self.message_search.get_mut(&ch) {
+                                    search.local_history_exhausted = ch_state.local_history_exhausted;
                                     if should_use_search_window(pane_w) {
                                         show_message_search_window(
                                             ctx,
@@ -10074,44 +10267,22 @@ impl eframe::App for CrustApp {
 
                     // Close-pane actions
                     if let Some(keep_idx) = close_other_panes {
-                        if let Some(pane) = self.split_panes.panes.get_mut(keep_idx) {
-                            let keep_channel = pane.channel.clone();
-                            let keep_input = std::mem::take(&mut pane.input_buf);
-                            self.state.active_channel = Some(keep_channel);
-                            self.chat_input_buf = keep_input;
-                            self.split_panes.panes.clear();
-                            self.split_panes.focused = 0;
-                        }
+                        self.keep_split_pane(keep_idx, ctx);
                     } else if let Some(idx) = close_pane {
-                        self.split_panes.remove_pane(idx);
-                        if self.split_panes.panes.len() <= 1 {
-                            if let Some(p) =
-                                self.split_panes.panes.first()
-                            {
-                                self.state.active_channel =
-                                    Some(p.channel.clone());
-                                self.chat_input_buf = std::mem::take(
-                                    &mut self.split_panes.panes[0]
-                                        .input_buf,
-                                );
-                            }
-                            self.split_panes.panes.clear();
-                            self.split_panes.focused = 0;
-                        } else {
-                            self.split_panes.clamp_focus();
-                            if let Some(ch) =
-                                self.split_panes.focused_channel()
-                            {
-                                self.state.active_channel =
-                                    Some(ch.clone());
-                            }
-                        }
+                        self.close_split_pane(idx, ctx);
                     }
 
                     // Emote picker -> focused pane
+                    let picker_channel = self.split_panes.focused_channel().cloned()
+                        .or_else(|| self.state.active_channel.clone());
+                    if let Some(channel) = picker_channel.as_ref() {
+                        self.prepare_emote_picker(channel);
+                    }
+                    let picker_was_open = self.emote_picker.open;
                     if let Some(code) = self.emote_picker.show(
                         ctx,
-                        &self.emote_catalog,
+                        picker_channel.as_ref().and_then(|channel| self.input_emote_catalogs.get(channel))
+                            .map(Vec::as_slice).unwrap_or(&[]),
                         &self.emote_bytes,
                         &self.cmd_tx,
                         animations_allowed,
@@ -10121,14 +10292,16 @@ impl eframe::App for CrustApp {
                             .panes
                             .get_mut(self.split_panes.focused)
                         {
-                            if !pane.input_buf.is_empty()
-                                && !pane.input_buf.ends_with(' ')
-                            {
-                                pane.input_buf.push(' ');
-                            }
-                            pane.input_buf.push_str(&code);
-                            pane.input_buf.push(' ');
+                            insert_picker_emote(
+                                ctx, chat_composer_id(Some(pane.id)),
+                                &mut pane.input_buf, &code,
+                            );
+                        } else {
+                            insert_picker_emote(ctx, chat_composer_id(None), &mut self.chat_input_buf, &code);
                         }
+                        self.focus_chat_composer(ctx);
+                    } else if picker_was_open && !self.emote_picker.open {
+                        self.focus_chat_composer(ctx);
                     }
                 // Classic single-channel mode
                 } else if let Some(active_ch) = self.state.active_channel.clone() {
@@ -10198,16 +10371,18 @@ impl eframe::App for CrustApp {
                         )
                         .show_inside(ui, |ui| {
                             // Collect sorted chatters for @username autocomplete
+                            self.ensure_input_emote_catalog(&active_ch);
                             let chatters_sorted: &[String] = self
                                 .sorted_chatters
                                 .get(&active_ch)
                                 .map(Vec::as_slice)
                                 .unwrap_or(&[]);
                             let chat = ChatInput {
+                                id: Some(chat_composer_id(None)),
                                 channel: &active_ch,
                                 logged_in: self.state.auth.logged_in,
                                 username: self.state.auth.username.as_deref(),
-                                emote_catalog: &self.emote_catalog,
+                                emote_catalog: self.input_emote_catalogs.get(&active_ch).map(Vec::as_slice).unwrap_or(&[]),
                                 emote_bytes: &self.emote_bytes,
                                 pending_reply: active_reply.as_ref(),
                                 message_history: &self.message_history,
@@ -10245,18 +10420,19 @@ impl eframe::App for CrustApp {
                         });
 
                     // Emote picker floating window
+                    self.prepare_emote_picker(&active_ch);
+                    let picker_was_open = self.emote_picker.open;
                     if let Some(code) = self.emote_picker.show(
                         ctx,
-                        &self.emote_catalog,
+                        self.input_emote_catalogs.get(&active_ch).map(Vec::as_slice).unwrap_or(&[]),
                         &self.emote_bytes,
                         &self.cmd_tx,
                         animations_allowed,
                     ) {
-                        if !self.chat_input_buf.is_empty() && !self.chat_input_buf.ends_with(' ') {
-                            self.chat_input_buf.push(' ');
-                        }
-                        self.chat_input_buf.push_str(&code);
-                        self.chat_input_buf.push(' ');
+                        insert_picker_emote(ctx, chat_composer_id(None), &mut self.chat_input_buf, &code);
+                        self.focus_chat_composer(ctx);
+                    } else if picker_was_open && !self.emote_picker.open {
+                        self.focus_chat_composer(ctx);
                     }
 
                     // Messages above the input
@@ -10273,6 +10449,7 @@ impl eframe::App for CrustApp {
                             .unwrap_or(false)
                         {
                             if let Some(search) = self.message_search.get_mut(&active_ch) {
+                                search.local_history_exhausted = state.local_history_exhausted;
                                 if should_use_search_window(ui.available_width()) {
                                     show_message_search_window(
                                         ctx,
@@ -12543,43 +12720,73 @@ fn parse_irc_server_arg(raw: &str) -> Option<ChannelId> {
     Some(ChannelId::irc(host, port, tls, IRC_SERVER_CONTROL_CHANNEL))
 }
 
-/// Build an emote code -> catalog entry lookup with provider priority
-/// 7TV > BTTV > FFZ > Kick (same order as the backend `resolve_emote`).
-fn build_emote_lookup(catalog: &[EmoteCatalogEntry]) -> HashMap<&str, &EmoteCatalogEntry> {
-    fn priority(provider: &str) -> u8 {
-        match provider {
-            "7tv" => 4,
-            "bttv" => 3,
-            "ffz" => 2,
-            "kick" => 1,
-            _ => 0,
+fn build_emote_catalog_index(catalog: &[EmoteCatalogEntry]) -> HashMap<String, Vec<usize>> {
+    let mut index: HashMap<String, Vec<usize>> = HashMap::new();
+    for (position, entry) in catalog.iter().enumerate() {
+        index.entry(entry.code.clone()).or_default().push(position);
+    }
+    for candidates in index.values_mut() {
+        candidates.sort_by_key(|&position| std::cmp::Reverse(catalog[position].resolution_priority()));
+    }
+    index
+}
+
+fn resolve_catalog_emote<'a>(
+    catalog: &'a [EmoteCatalogEntry],
+    index: &HashMap<String, Vec<usize>>,
+    channel: &ChannelId,
+    sender_user_id: &str,
+    code: &str,
+) -> Option<&'a EmoteCatalogEntry> {
+    index.get(code)?.iter().map(|&position| &catalog[position])
+        .find(|entry| entry.is_available_for(channel, sender_user_id))
+}
+
+fn catalog_emote_data(entry: &EmoteCatalogEntry) -> (String, String, String, String, Option<String>) {
+    (
+        if entry.id.is_empty() { entry.code.clone() } else { entry.id.clone() },
+        entry.code.clone(), entry.url.clone(), entry.provider.clone(), entry.url_hd.clone(),
+    )
+}
+
+fn refresh_message_emotes(
+    messages: &mut VecDeque<ChatMessage>,
+    through: MessageId,
+    limit: usize,
+    catalog: &[EmoteCatalogEntry],
+    index: &HashMap<String, Vec<usize>>,
+) -> (usize, Option<MessageId>, Vec<MessageId>) {
+    let Some(end) = messages.iter().rposition(|message| message.id == through).map(|position| position + 1) else {
+        return (0, None, Vec::new());
+    };
+    let start = end.saturating_sub(limit);
+    let next = start.checked_sub(1).map(|position| messages[position].id);
+    let mut changed = Vec::new();
+    for message in messages.range_mut(start..end) {
+        if !matches!(message.msg_kind, MsgKind::Chat | MsgKind::Bits { .. } | MsgKind::SuspiciousUserMessage) {
+            continue;
+        }
+        let spans = crust_core::format::tokenize(&message.raw_text, message.flags.is_action,
+            &message.twitch_emotes, &|code| resolve_catalog_emote(catalog, index,
+                &message.channel, &message.sender.user_id.0, code).map(catalog_emote_data));
+        if message.spans != spans {
+            message.spans = spans;
+            changed.push(message.id);
         }
     }
-    let mut map: HashMap<&str, &EmoteCatalogEntry> = HashMap::with_capacity(catalog.len());
-    // Insert lowest-priority first so higher-priority overwrites.
-    let mut sorted: Vec<&EmoteCatalogEntry> = catalog.iter().collect();
-    sorted.sort_by_key(|e| priority(&e.provider));
-    for e in sorted {
-        map.insert(&e.code, e);
-    }
-    map
+    (end - start, next, changed)
 }
 
 fn tokenize_whisper_text(
     text: &str,
     twitch_emotes: &[TwitchEmotePos],
-    emote_map: &HashMap<&str, &EmoteCatalogEntry>,
+    catalog: &[EmoteCatalogEntry],
+    index: &HashMap<String, Vec<usize>>,
+    sender_user_id: &str,
 ) -> Vec<Span> {
+    let channel = ChannelId::mentions();
     crust_core::format::tokenize(text, false, twitch_emotes, &|code| {
-        emote_map.get(code).map(|e| {
-            (
-                e.code.clone(),
-                e.code.clone(),
-                e.url.clone(),
-                e.provider.clone(),
-                None,
-            )
-        })
+        resolve_catalog_emote(catalog, index, &channel, sender_user_id, code).map(catalog_emote_data)
     })
     .into_vec()
 }
@@ -12607,6 +12814,210 @@ mod tests {
         let (commands, receiver) = tokio::sync::mpsc::channel(64);
         let (_, events) = tokio::sync::mpsc::channel(64);
         (super::CrustApp::with_event_channels(commands, events), receiver)
+    }
+
+    fn scoped_emote(url: &str, channel: Option<ChannelId>, user: Option<&str>) -> crust_core::EmoteCatalogEntry {
+        crust_core::EmoteCatalogEntry {
+            id: url.to_owned(),
+            code: "SharedCode".to_owned(),
+            provider: "7tv".to_owned(),
+            url: url.to_owned(),
+            url_hd: Some(format!("{url}/hd")),
+            scope: if user.is_some() { "personal" } else if channel.is_some() { "channel" } else { "global" }.to_owned(),
+            channel,
+            user_id: user.map(|user| crust_core::UserId(user.to_owned())),
+        }
+    }
+
+    fn emote_url(message: &crust_core::ChatMessage) -> Option<&str> {
+        message.spans.iter().find_map(|span| match span {
+            crust_core::Span::Emote { url, .. } => Some(url.as_str()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn emote_catalogs_respect_channels_and_the_message_sender() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        let first = ChannelId::new("first");
+        let second = ChannelId::new("second");
+        for channel in [&first, &second] {
+            app.state.join_channel(channel.clone());
+            for (id, user) in [(1, "owner"), (2, "other")] {
+                let mut message = search_message(channel.clone());
+                message.id = crust_core::MessageId(id);
+                message.sender.user_id = crust_core::UserId(user.to_owned());
+                message.raw_text = "SharedCode".to_owned();
+                app.state.channels.get_mut(channel).unwrap().messages.push_back(message);
+            }
+        }
+        app.apply_event(crust_core::AppEvent::EmoteCatalogUpdated { emotes: vec![
+            scoped_emote("global", None, None),
+            scoped_emote("channel", Some(first.clone()), None),
+            scoped_emote("personal", None, Some("owner")),
+        ] }, &ctx);
+        app.refresh_emote_messages(&ctx);
+        let messages = &app.state.channels[&first].messages;
+        assert_eq!(emote_url(&messages[0]), Some("personal"));
+        assert_eq!(emote_url(&messages[1]), Some("channel"));
+        let messages = &app.state.channels[&second].messages;
+        assert_eq!(emote_url(&messages[0]), Some("personal"));
+        assert_eq!(emote_url(&messages[1]), Some("global"));
+
+        app.apply_event(crust_core::AppEvent::Authenticated {
+            username: "owner".to_owned(), user_id: "owner".to_owned(),
+        }, &ctx);
+        app.ensure_input_emote_catalog(&first);
+        assert_eq!(app.input_emote_catalogs[&first][0].url, "personal");
+        app.apply_event(crust_core::AppEvent::LoggedOut, &ctx);
+        app.ensure_input_emote_catalog(&first);
+        app.ensure_input_emote_catalog(&second);
+        assert_eq!(app.input_emote_catalogs[&first][0].url, "channel");
+        assert_eq!(app.input_emote_catalogs[&second][0].url, "global");
+    }
+
+    #[test]
+    fn same_count_catalog_updates_replace_metadata_and_remove_old_emotes() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("channel");
+        app.state.join_channel(channel.clone());
+        let mut message = search_message(channel.clone());
+        message.raw_text = "SharedCode".to_owned();
+        app.state.mentions.push_back(message.clone());
+        app.state.channels.get_mut(&channel).unwrap().messages.push_back(message);
+        for url in ["first", "replacement"] {
+            app.apply_event(crust_core::AppEvent::EmoteCatalogUpdated {
+                emotes: vec![scoped_emote(url, Some(channel.clone()), None)],
+            }, &ctx);
+            app.refresh_emote_messages(&ctx);
+            app.ensure_input_emote_catalog(&channel);
+            let message = &app.state.channels[&channel].messages[0];
+            assert_eq!(emote_url(message), Some(url));
+            assert_eq!(emote_url(&app.state.mentions[0]), Some(url));
+            assert_eq!(app.input_emote_catalogs[&channel][0].url, url);
+            assert!(matches!(&message.spans[0], crust_core::Span::Emote { id, url_hd, .. }
+                if id == url && url_hd.as_deref() == Some(format!("{url}/hd").as_str())));
+        }
+        app.apply_event(crust_core::AppEvent::EmoteCatalogUpdated { emotes: Vec::new() }, &ctx);
+        app.refresh_emote_messages(&ctx);
+        assert_eq!(emote_url(&app.state.channels[&channel].messages[0]), None);
+        assert_eq!(emote_url(&app.state.mentions[0]), None);
+        app.ensure_input_emote_catalog(&channel);
+        assert!(app.input_emote_catalogs[&channel].is_empty());
+    }
+
+    fn fill_emote_refresh_history(app: &mut super::CrustApp, channel: &ChannelId, count: u64) {
+        app.state.join_channel(channel.clone());
+        for id in 0..count {
+            let mut message = search_message(channel.clone());
+            message.id = crust_core::MessageId(id);
+            if id % 10 == 0 {
+                message.msg_kind = crust_core::model::MsgKind::SuspiciousUserMessage;
+            }
+            message.raw_text = "SharedCode".to_owned();
+            app.state.channels.get_mut(channel).unwrap().messages.push_back(message);
+        }
+    }
+
+    #[test]
+    fn emote_refresh_covers_older_rows_in_bounded_passes_and_replaces_queued_catalogs() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("channel");
+        fill_emote_refresh_history(&mut app, &channel, 900);
+        app.apply_event(crust_core::AppEvent::EmoteCatalogUpdated {
+            emotes: vec![scoped_emote("first", None, None)],
+        }, &ctx);
+        app.refresh_emote_messages(&ctx);
+        assert_eq!(app.state.channels[&channel].messages.iter().filter(|message| emote_url(message).is_some()).count(),
+            super::EMOTE_REFRESH_ROWS_PER_FRAME);
+        assert_eq!(emote_url(&app.state.channels[&channel].messages[0]), None);
+
+        app.apply_event(crust_core::AppEvent::EmoteCatalogUpdated {
+            emotes: vec![scoped_emote("replacement", None, None)],
+        }, &ctx);
+        for _ in 0..5 {
+            app.refresh_emote_messages(&ctx);
+        }
+        assert!(app.pending_emote_refresh.is_empty());
+        assert!(app.state.channels[&channel].messages.iter().all(|message| emote_url(message) == Some("replacement")));
+    }
+
+    #[test]
+    fn repeated_catalog_snapshots_do_not_starve_older_message_rows() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("channel");
+        fill_emote_refresh_history(&mut app, &channel, 900);
+        for revision in 0..9 {
+            app.apply_event(crust_core::AppEvent::EmoteCatalogUpdated {
+                emotes: vec![scoped_emote(&format!("revision-{revision}"), None, None)],
+            }, &ctx);
+            app.refresh_emote_messages(&ctx);
+            assert!(app.pending_emote_refresh.len() <= 1);
+            if revision == 2 {
+                assert_eq!(emote_url(&app.state.channels[&channel].messages[0]), Some("revision-2"));
+            }
+        }
+        for _ in 0..6 {
+            app.refresh_emote_messages(&ctx);
+        }
+        assert!(app.pending_emote_refresh.is_empty());
+        assert!(app.state.channels[&channel].messages.iter()
+            .all(|message| emote_url(message) == Some("revision-8")));
+    }
+
+    #[test]
+    fn history_loaded_after_the_catalog_refreshes_saved_emotes_in_bounded_passes() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("channel");
+        app.state.join_channel(channel.clone());
+        app.apply_event(crust_core::AppEvent::EmoteCatalogUpdated { emotes: Vec::new() }, &ctx);
+        assert!(app.pending_emote_refresh.is_empty());
+        let stale_emote = scoped_emote("removed", None, None);
+        let messages: Vec<_> = (0..900).map(|id| {
+            let mut message = search_message(channel.clone());
+            message.id = crust_core::MessageId(id);
+            message.server_id = Some(format!("saved-{id}"));
+            message.raw_text = "SharedCode".to_owned();
+            message.flags.is_history = true;
+            message.spans = crust_core::format::tokenize(&message.raw_text, false, &[],
+                &|_| Some(super::catalog_emote_data(&stale_emote)));
+            message
+        }).collect();
+        app.apply_event(crust_core::AppEvent::HistoryLoaded {
+            channel: channel.clone(), messages: messages.clone(), local: None,
+        }, &ctx);
+        app.apply_event(crust_core::AppEvent::MentionsLoaded { messages }, &ctx);
+        app.refresh_emote_messages(&ctx);
+        assert_eq!(app.state.channels[&channel].messages.iter()
+            .chain(app.state.mentions.iter()).filter(|message| emote_url(message).is_none()).count(),
+            super::EMOTE_REFRESH_ROWS_PER_FRAME);
+        for _ in 0..5 {
+            app.refresh_emote_messages(&ctx);
+        }
+        assert!(app.pending_emote_refresh.is_empty());
+        assert!(app.state.channels[&channel].messages.iter().chain(app.state.mentions.iter())
+            .all(|message| emote_url(message).is_none()));
+    }
+
+    #[test]
+    fn emote_refresh_discards_work_when_its_remaining_rows_are_evicted() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("channel");
+        fill_emote_refresh_history(&mut app, &channel, 900);
+        app.apply_event(crust_core::AppEvent::EmoteCatalogUpdated {
+            emotes: vec![scoped_emote("current", None, None)],
+        }, &ctx);
+        app.refresh_emote_messages(&ctx);
+        app.state.channels.get_mut(&channel).unwrap().messages.drain(..550);
+        app.refresh_emote_messages(&ctx);
+        assert!(app.pending_emote_refresh.is_empty());
+        assert!(app.state.channels[&channel].messages.iter().all(|message| emote_url(message) == Some("current")));
     }
 
     fn saturated_app() -> (super::CrustApp, tokio::sync::mpsc::Receiver<AppCommand>) {
@@ -13133,6 +13544,162 @@ mod tests {
     }
 
     #[test]
+    fn split_navigation_moves_text_input_to_the_selected_pane() {
+        let (mut app, _commands) = test_app();
+        let first = ChannelId::new("first");
+        let second = ChannelId::new("second");
+        app.split_panes.add_pane(first, None);
+        app.split_panes.add_pane(second.clone(), None);
+        let ctx = egui::Context::default();
+        let mut input = shortcut_input(egui::Key::PageDown, egui::Modifiers::CTRL | egui::Modifiers::ALT);
+        input.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 200.0)));
+        input.events.push(egui::Event::Text("selected pane".to_owned()));
+        let _ = ctx.run(input, |ctx| {
+            ctx.memory_mut(|memory| memory.request_focus(super::chat_composer_id(Some(app.split_panes.panes[0].id))));
+            app.handle_channel_shortcuts(ctx);
+            egui::CentralPanel::default().show(ctx, |ui| {
+                for pane in &mut app.split_panes.panes {
+                    ui.add(egui::TextEdit::singleline(&mut pane.input_buf)
+                        .id(super::chat_composer_id(Some(pane.id))));
+                }
+            });
+        });
+        assert_eq!(app.state.active_channel, Some(second));
+        assert!(app.split_panes.panes[0].input_buf.is_empty());
+        assert_eq!(app.split_panes.panes[1].input_buf, "selected pane");
+    }
+
+    #[test]
+    fn removing_and_reordering_other_splits_keeps_the_selected_composer() {
+        let mut splits = SplitPanes::default();
+        for channel in ["first", "selected", "last"] {
+            splits.add_pane(ChannelId::new(channel), None);
+        }
+        splits.focused = 1;
+        let id = splits.panes[1].id;
+        splits.remove_pane(0);
+        assert_eq!(splits.panes[splits.focused].id, id);
+        splits.add_pane(ChannelId::new("new"), Some(0));
+        assert_eq!(splits.panes[splits.focused].id, id);
+        splits.move_focused(1);
+        assert_eq!(splits.panes[splits.focused].id, id);
+        assert_eq!(splits.focused_channel(), Some(&ChannelId::new("selected")));
+    }
+
+    #[test]
+    fn closing_splits_routes_typing_to_the_surviving_draft() {
+        for (pane_count, focused, close, keep, expected, remaining) in [
+            (3, 1, Some(1), None, "third", 2),
+            (2, 0, Some(0), None, "second", 0),
+            (3, 0, None, Some(1), "second", 0),
+            (3, 2, Some(0), None, "third", 2),
+        ] {
+            let (mut app, _commands) = test_app();
+            let ctx = egui::Context::default();
+            for name in ["first", "second", "third"].into_iter().take(pane_count) {
+                app.split_panes.add_pane(ChannelId::new(name), None);
+                app.split_panes.panes.last_mut().unwrap().input_buf = format!("{name} draft");
+            }
+            app.split_panes.focused = focused;
+            let render = |app: &mut super::CrustApp, ctx: &egui::Context| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if app.split_panes.panes.is_empty() {
+                        ui.add(egui::TextEdit::singleline(&mut app.chat_input_buf)
+                            .id(super::chat_composer_id(None)));
+                    } else {
+                        for pane in &mut app.split_panes.panes {
+                            ui.add(egui::TextEdit::singleline(&mut pane.input_buf)
+                                .id(super::chat_composer_id(Some(pane.id))));
+                        }
+                    }
+                });
+            };
+            let _ = ctx.run(Default::default(), |ctx| {
+                app.sync_split_focus(ctx);
+                render(&mut app, ctx);
+                if let Some(index) = keep {
+                    app.keep_split_pane(index, ctx);
+                } else if let Some(index) = close {
+                    app.close_split_pane(index, ctx);
+                }
+            });
+            let input = egui::RawInput {
+                events: vec![egui::Event::Text(" continued".to_owned())],
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| render(&mut app, ctx));
+            assert_eq!(app.state.active_channel, Some(ChannelId::new(expected)));
+            assert_eq!(app.split_panes.panes.len(), remaining);
+            if remaining == 0 {
+                assert_eq!(app.chat_input_buf, format!("{expected} draft continued"));
+                assert!(ctx.memory(|memory| memory.has_focus(super::chat_composer_id(None))));
+            } else {
+                for (index, pane) in app.split_panes.panes.iter().enumerate() {
+                    let suffix = if index == app.split_panes.focused { " continued" } else { "" };
+                    assert_eq!(pane.input_buf, format!("{} draft{suffix}", pane.channel.display_name()));
+                }
+                let pane = &app.split_panes.panes[app.split_panes.focused];
+                assert!(ctx.memory(|memory| memory.has_focus(super::chat_composer_id(Some(pane.id)))));
+            }
+        }
+    }
+
+    #[test]
+    fn closing_a_redirected_channel_removes_all_its_panes_and_keeps_the_other_draft() {
+        for focused in 0..3 {
+            let (mut app, mut commands) = test_app();
+            let ctx = egui::Context::default();
+            let old = ChannelId::new("old");
+            let redirected = ChannelId::new("redirected");
+            let other = ChannelId::new("other");
+            for channel in [&old, &redirected, &other] {
+                app.state.join_channel(channel.clone());
+                app.split_panes.add_pane(channel.clone(), None);
+                app.split_panes.panes.last_mut().unwrap().input_buf = format!("{} draft", channel.display_name());
+            }
+            app.apply_event(crust_core::AppEvent::ChannelRedirected {
+                old_channel: old, new_channel: redirected.clone(),
+            }, &ctx);
+            assert_eq!(app.split_panes.panes.iter().filter(|pane| pane.channel == redirected).count(), 2);
+            app.split_panes.focused = focused;
+            let _ = ctx.run(Default::default(), |ctx| {
+                app.sync_split_focus(ctx);
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    for pane in &mut app.split_panes.panes {
+                        ui.add(egui::TextEdit::singleline(&mut pane.input_buf)
+                            .id(super::chat_composer_id(Some(pane.id))));
+                    }
+                });
+                app.close_channel_tab(redirected.clone(), ctx);
+            });
+            assert!(app.split_panes.panes.is_empty());
+            assert_eq!(app.state.active_channel, Some(other.clone()));
+            assert!(!app.state.channels.contains_key(&redirected));
+            assert!(app.state.channels.contains_key(&other));
+            assert_eq!(app.chat_input_buf, "other draft");
+            let input = egui::RawInput {
+                events: vec![egui::Event::Text(" continued".to_owned())],
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut app.chat_input_buf)
+                        .id(super::chat_composer_id(None)));
+                });
+            });
+            assert_eq!(app.chat_input_buf, "other draft continued");
+            assert!(ctx.memory(|memory| memory.has_focus(super::chat_composer_id(None))));
+            let mut leave_count = 0;
+            while let Ok(command) = commands.try_recv() {
+                if matches!(command, AppCommand::LeaveChannel { channel } if channel == redirected) {
+                    leave_count += 1;
+                }
+            }
+            assert_eq!(leave_count, 1);
+        }
+    }
+
+    #[test]
     fn shifted_moderation_shortcuts_keep_their_distinct_actions() {
         let (mut app, _commands) = test_app();
         app.mod_tools_open = true;
@@ -13268,10 +13835,75 @@ mod tests {
         app.apply_event(crust_core::events::AppEvent::HistoryLoaded {
             channel: channel.clone(),
             messages: vec![message.clone()],
+            local: None,
         }, &ctx);
         app.apply_event(crust_core::events::AppEvent::MentionsLoaded { messages: vec![message] }, &ctx);
         assert_eq!(app.state.channels[&channel].messages[0].sender.display_name, "Alice");
         assert_eq!(app.state.mentions[0].sender.display_name, "Alice");
+    }
+
+    #[test]
+    fn local_history_keeps_its_row_cursor_and_ignores_repeated_page_results() {
+        use crust_core::model::{HistoryCursor, LocalHistoryPageInfo};
+        let (mut app, mut commands) = test_app();
+        let channel = ChannelId::new("first");
+        app.state.join_channel(channel.clone());
+        let ctx = egui::Context::default();
+        let first = HistoryCursor { timestamp_ms: 1000, row_id: 20 };
+        let next = HistoryCursor { timestamp_ms: 1000, row_id: 10 };
+        app.apply_event(crust_core::events::AppEvent::HistoryLoaded {
+            channel: channel.clone(), messages: vec![],
+            local: Some(LocalHistoryPageInfo { before: None, next: Some(first), has_more: true, identities: Vec::new() }),
+        }, &ctx);
+        app.request_older_local_history(&channel, 2000);
+        assert!(matches!(commands.try_recv().unwrap(), AppCommand::LoadOlderLocalHistory {
+            before_ts_ms: 1000, before_row_id: Some(20), ..
+        }));
+        let mut message = search_message(channel.clone());
+        message.server_id = None;
+        let page = crust_core::events::AppEvent::HistoryLoaded {
+            channel: channel.clone(), messages: vec![message],
+            local: Some(LocalHistoryPageInfo { before: Some(first), next: Some(next), has_more: false, identities: Vec::new() }),
+        };
+        app.apply_event(page.clone(), &ctx);
+        app.apply_event(page, &ctx);
+        let state = &app.state.channels[&channel];
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.local_history_cursor, Some(next));
+        assert!(state.local_history_exhausted);
+        app.request_older_local_history(&channel, 1000);
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn newly_matched_live_highlights_are_persisted_with_the_original_message_identity() {
+        let (mut app, mut commands) = test_app();
+        let channel = ChannelId::new("first");
+        app.state.join_channel(channel.clone());
+        let message = search_message(channel.clone());
+        let ctx = egui::Context::default();
+        app.apply_event(crust_core::events::AppEvent::HighlightRulesUpdated {
+            rules: vec![crust_core::highlight::HighlightRule::new(message.raw_text.clone())],
+        }, &ctx);
+        app.apply_event(crust_core::events::AppEvent::MessageReceived {
+            channel: channel.clone(), message: message.clone(),
+        }, &ctx);
+        match commands.try_recv().unwrap() {
+            AppCommand::PersistMessageHighlight { channel: actual, server_id, message_id, timestamp_ms } => {
+                assert_eq!(actual, channel);
+                assert_eq!(server_id, message.server_id);
+                assert_eq!(message_id, message.id);
+                assert_eq!(timestamp_ms, message.timestamp.timestamp_millis());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert!(app.state.channels[&channel].messages[0].flags.is_highlighted);
+        let mut history = message;
+        history.id = crust_core::MessageId(999);
+        history.server_id = Some("older-highlight".to_owned());
+        history.flags.is_history = true;
+        app.apply_event(crust_core::events::AppEvent::MessageReceived { channel, message: history }, &ctx);
+        assert!(commands.try_recv().is_err());
     }
 
     #[test]

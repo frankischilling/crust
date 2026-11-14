@@ -2849,6 +2849,7 @@ unsafe extern "C" fn native_load_older_local_history(L: *mut lua_State) -> c_int
     send_lua_command(AppCommand::LoadOlderLocalHistory {
         channel,
         before_ts_ms,
+        before_row_id: if lua_gettop(L) >= 4 { lua_value_int(L, 4) } else { None },
         limit,
     });
     0
@@ -3963,10 +3964,21 @@ fn push_twitch_emote_table(L: *mut lua_State, emote: &TwitchEmotePos) {
 fn push_emote_catalog_entry_table(L: *mut lua_State, emote: &EmoteCatalogEntry) {
     unsafe {
         lua_createtable(L, 0, 0);
+        set_field_string(L, -1, "id", &emote.id);
         set_field_string(L, -1, "code", &emote.code);
         set_field_string(L, -1, "provider", &emote.provider);
         set_field_string(L, -1, "url", &emote.url);
         set_field_string(L, -1, "scope", &emote.scope);
+        if let Some(url) = &emote.url_hd {
+            set_field_string(L, -1, "url_hd", url);
+        }
+        if let Some(channel) = &emote.channel {
+            push_channel_table(L, channel);
+            lua_setfield(L, -2, cstring("channel").as_ptr());
+        }
+        if let Some(user_id) = &emote.user_id {
+            set_field_string(L, -1, "user_id", &user_id.0);
+        }
     }
 }
 
@@ -5374,7 +5386,7 @@ unsafe fn make_event_table(L: *mut lua_State, event: &AppEvent) -> c_int {
             set_field_string(L, -1, "message", reason);
         }
         AppEvent::AuthenticationPending { .. } => {}
-        AppEvent::HistoryLoaded { channel, messages } => {
+        AppEvent::HistoryLoaded { channel, messages, local } => {
             push_channel_table(L, channel);
             lua_setfield(L, -2, cstring("channel").as_ptr());
             lua_createtable(L, messages.len() as c_int, 0);
@@ -5383,6 +5395,13 @@ unsafe fn make_event_table(L: *mut lua_State, event: &AppEvent) -> c_int {
                 lua_seti(L, -2, (idx + 1) as lua_Integer);
             }
             lua_setfield(L, -2, cstring("messages").as_ptr());
+            if let Some(page) = local {
+                set_field_bool(L, -1, "has_more", page.has_more);
+                if let Some(cursor) = page.next {
+                    set_field_int(L, -1, "next_ts_ms", cursor.timestamp_ms);
+                    set_field_int(L, -1, "next_row_id", cursor.row_id);
+                }
+            }
         }
         AppEvent::UserProfileLoaded { profile } => {
             push_user_profile_table(L, profile);
@@ -6437,16 +6456,24 @@ mod tests {
         let event = AppEvent::EmoteCatalogUpdated {
             emotes: vec![
                 EmoteCatalogEntry {
+                    id: "25".to_owned(),
                     code: "Kappa".to_owned(),
                     provider: "twitch".to_owned(),
                     url: "https://example.invalid/kappa.png".to_owned(),
+                    url_hd: None,
                     scope: "global".to_owned(),
+                    channel: None,
+                    user_id: None,
                 },
                 EmoteCatalogEntry {
+                    id: "pog".to_owned(),
                     code: "Pog".to_owned(),
                     provider: "7tv".to_owned(),
                     url: "https://example.invalid/pog.png".to_owned(),
+                    url_hd: None,
                     scope: "channel".to_owned(),
+                    channel: Some(ChannelId::new("some_channel")),
+                    user_id: None,
                 },
             ],
         };
@@ -6457,6 +6484,28 @@ mod tests {
             Some("EmoteCatalogUpdated")
         );
         assert_eq!(lua_get_table_len_field(lua.ptr(), idx, "emotes"), 2);
+        unsafe {
+            lua_getfield(lua.ptr(), idx, cstring("emotes").as_ptr());
+            lua_geti(lua.ptr(), -1, 2);
+            assert_eq!(lua_get_string_field(lua.ptr(), -1, "id").as_deref(), Some("pog"));
+            lua_getfield(lua.ptr(), -1, cstring("channel").as_ptr());
+            assert_eq!(lua_get_string_field(lua.ptr(), -1, "name").as_deref(), Some("some_channel"));
+            lua_pop(lua.ptr(), 3);
+        }
+
+        let personal = EmoteCatalogEntry {
+            id: "personal".into(),
+            code: "Hello".into(),
+            provider: "7tv".into(),
+            url: "https://example.invalid/hello.webp".into(),
+            url_hd: Some("https://example.invalid/hello-4x.webp".into()),
+            scope: "personal".into(),
+            channel: None,
+            user_id: Some(crust_core::model::UserId("42".into())),
+        };
+        push_emote_catalog_entry_table(lua.ptr(), &personal);
+        assert_eq!(lua_get_string_field(lua.ptr(), -1, "user_id").as_deref(), Some("42"));
+        assert_eq!(lua_get_string_field(lua.ptr(), -1, "url_hd").as_deref(), personal.url_hd.as_deref());
     }
 
     #[test]

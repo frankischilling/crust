@@ -1,6 +1,10 @@
 use std::collections::HashMap;
 
 use crust_core::model::{Badge, Sender, SenderNamePaintShadow, SenderNamePaintStop};
+use crust_emotes::{
+    providers::{read_bounded_json, SevenTvProvider},
+    EmoteInfo,
+};
 use tracing::{debug, info, warn};
 
 const SEVENTV_GQL_URL: &str = "https://api.7tv.app/v3/gql";
@@ -10,6 +14,11 @@ pub(crate) struct SevenTvUserStyleRaw {
     pub(crate) color: Option<i32>,
     pub(crate) badge_id: Option<String>,
     pub(crate) avatar_url: Option<String>,
+}
+
+pub(crate) struct SevenTvUserProfile {
+    pub(crate) style: SevenTvUserStyleRaw,
+    pub(crate) personal_emotes: Option<Vec<EmoteInfo>>,
 }
 
 #[derive(Debug, Clone)]
@@ -43,11 +52,15 @@ pub(crate) enum SevenTvCosmeticUpdate {
     },
     UserStyle {
         twitch_user_id: String,
-        style: Option<SevenTvUserStyleRaw>,
+        generation: u64,
+        profile: Option<SevenTvUserProfile>,
     },
     /// Batch of Twitch user-ids discovered in history messages that need
     /// their 7TV styles resolved.
-    BatchUserLookup { user_ids: Vec<String> },
+    BatchUserLookup {
+        channel: crust_core::ChannelId,
+        user_ids: Vec<String>,
+    },
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -321,190 +334,88 @@ pub(crate) async fn load_7tv_cosmetics_catalog(
     Some((badges, paints))
 }
 
-pub(crate) async fn load_7tv_user_style_for_twitch(
+pub(crate) async fn load_7tv_user_for_twitch(
     client: &reqwest::Client,
     twitch_user_id: &str,
-) -> Option<SevenTvUserStyleRaw> {
-    #[derive(serde::Deserialize)]
-    struct RespData {
-        #[serde(rename = "userByConnection")]
-        user_by_connection: Option<UserNode>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct UserNode {
-        style: Option<StyleNode>,
-        avatar_url: Option<String>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct StyleNode {
-        color: i32,
-        badge_id: Option<String>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct StyleNodeV2 {
-        color: i32,
-        badge: Option<BadgeIdNode>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct BadgeIdNode {
-        id: Option<String>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct RespDataV2 {
-        #[serde(rename = "userByConnection")]
-        user_by_connection: Option<UserNodeV2>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct UserNodeV2 {
-        style: Option<StyleNodeV2>,
-        avatar_url: Option<String>,
-    }
-
-    if twitch_user_id.trim().is_empty() {
+) -> Option<SevenTvUserProfile> {
+    if twitch_user_id.is_empty() {
         return None;
     }
-
     let query = r#"
         query($id: String!) {
             userByConnection(platform: TWITCH, id: $id) {
                 avatar_url
-                style {
-                    color
-                    badge_id
-                }
+                style { color badge_id }
+                emote_sets { id flags }
             }
         }
     "#;
-
-    let resp = match client
+    let response = match client
         .post(SEVENTV_GQL_URL)
-        .json(&serde_json::json!({
-            "query": query,
-            "variables": { "id": twitch_user_id }
-        }))
+        .json(&serde_json::json!({"query": query, "variables": {"id": twitch_user_id}}))
         .send()
         .await
+        .and_then(reqwest::Response::error_for_status)
     {
-        Ok(r) => r,
-        Err(e) => {
-            debug!("7TV user style fetch failed for {twitch_user_id}: {e}");
+        Ok(response) => response,
+        Err(error) => {
+            debug!("7TV user lookup failed for {twitch_user_id}: {error}");
             return None;
         }
     };
-
-    let payload = match resp.json::<SevenTvGraphQlResponse<RespData>>().await {
-        Ok(p) => p,
-        Err(e) => {
-            debug!("7TV user style parse failed for {twitch_user_id}: {e}");
-            return None;
-        }
-    };
-
-    if !payload.errors.is_empty() {
-        let messages = payload
-            .errors
-            .iter()
-            .map(|e| e.message.as_str())
-            .collect::<Vec<_>>()
-            .join(" | ");
-        debug!("7TV user style GraphQL errors for {twitch_user_id}: {messages}");
+    let response = read_bounded_json::<serde_json::Value>(response, 2 * 1024 * 1024).await?;
+    if response
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|errors| !errors.is_empty())
+    {
+        debug!("7TV user lookup returned GraphQL errors for {twitch_user_id}");
+        return None;
     }
-
-    let user_node = payload.data.and_then(|d| d.user_by_connection);
-
-    let avatar_url = user_node
-        .as_ref()
-        .and_then(|u| u.avatar_url.clone())
-        .filter(|s| !s.is_empty())
-        .map(|u| {
-            // 7TV sometimes returns protocol-relative URLs (//cdn.7tv.app/...)
-            if u.starts_with("//") {
-                format!("https:{u}")
-            } else {
-                u
-            }
+    let user = response.get("data")?.get("userByConnection")?;
+    if user.is_null() {
+        return Some(SevenTvUserProfile {
+            style: SevenTvUserStyleRaw::default(),
+            personal_emotes: Some(Vec::new()),
         });
-
-    let style = user_node.and_then(|u| u.style).unwrap_or(StyleNode {
-        color: 0,
-        badge_id: None,
-    });
-
-    let mut out = SevenTvUserStyleRaw {
-        color: if style.color == 0 {
-            None
-        } else {
-            Some(style.color)
-        },
-        badge_id: style.badge_id.filter(|s| !s.is_empty()),
-        avatar_url,
-    };
-
-    // Some 7TV schemas expose badge id under style.badge.id instead of
-    // style.badge_id. When missing, try a compatible fallback query.
-    if out.badge_id.is_none() {
-        let query_v2 = r#"
-            query($id: String!) {
-                userByConnection(platform: TWITCH, id: $id) {
-                    avatar_url
-                    style {
-                        color
-                        badge {
-                            id
-                        }
-                    }
-                }
-            }
-        "#;
-
-        if let Ok(resp2) = client
-            .post(SEVENTV_GQL_URL)
-            .json(&serde_json::json!({
-                "query": query_v2,
-                "variables": { "id": twitch_user_id }
-            }))
-            .send()
-            .await
-        {
-            if let Ok(payload2) = resp2.json::<SevenTvGraphQlResponse<RespDataV2>>().await {
-                if let Some(user2) = payload2.data.and_then(|d| d.user_by_connection) {
-                    if out.avatar_url.is_none() {
-                        out.avatar_url = user2.avatar_url.filter(|s| !s.is_empty()).map(|u| {
-                            if u.starts_with("//") {
-                                format!("https:{u}")
-                            } else {
-                                u
-                            }
-                        });
-                    }
-                    if out.color.is_none() {
-                        out.color = user2.style.as_ref().and_then(|s| {
-                            if s.color == 0 {
-                                None
-                            } else {
-                                Some(s.color)
-                            }
-                        });
-                    }
-                    out.badge_id = user2
-                        .style
-                        .and_then(|s| s.badge)
-                        .and_then(|b| b.id)
-                        .filter(|s| !s.is_empty());
-                }
-            }
-        }
     }
-
-    Some(out)
+    let style = parse_7tv_user_style(user)?;
+    let personal_emotes = SevenTvProvider::with_client(client.clone())
+        .load_personal_from_user(user)
+        .await;
+    Some(SevenTvUserProfile {
+        style,
+        personal_emotes,
+    })
 }
 
+fn parse_7tv_user_style(response: &serde_json::Value) -> Option<SevenTvUserStyleRaw> {
+    let user = response.get("user").unwrap_or(response).as_object()?;
+    let style = user.get("style");
+    let color = style
+        .and_then(|style| style.get("color"))
+        .and_then(serde_json::Value::as_i64)
+        .map(|color| color as i32)
+        .filter(|color| *color != 0);
+    let badge_id = style
+        .and_then(|style| {
+            style
+                .get("badge_id")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| style.get("badge")?.get("id")?.as_str())
+        })
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned);
+    let avatar_url = user
+        .get("avatar_url")
+        .and_then(serde_json::Value::as_str)
+        .and_then(normalize_external_url);
+    Some(SevenTvUserStyleRaw {
+        color,
+        badge_id,
+        avatar_url,
+    })
+}
 fn seven_tv_color_to_rgba(color: i32) -> (u8, u8, u8, u8) {
     let raw = color as u32;
     let r = ((raw >> 24) & 0xFF) as u8;
@@ -607,7 +518,30 @@ fn normalize_7tv_paint_stops(
 
 #[cfg(test)]
 mod tests {
-    use super::{seven_tv_color_to_hex, seven_tv_color_to_hex_with_alpha};
+    use super::{parse_7tv_user_style, seven_tv_color_to_hex, seven_tv_color_to_hex_with_alpha};
+
+    #[test]
+    fn user_response_supplies_cosmetics_alongside_personal_set_metadata() {
+        let profile = serde_json::json!({
+            "style": {"color": 0x11223300u32, "badge_id": "supporter"},
+            "avatar_url": "//cdn.7tv.app/avatar/example/1x.webp",
+            "emote_sets": [{"id": "personal", "flags": 4}]
+        });
+        let style = parse_7tv_user_style(&profile).unwrap();
+        assert_eq!(style.color, Some(0x11223300));
+        assert_eq!(style.badge_id.as_deref(), Some("supporter"));
+        assert_eq!(
+            style.avatar_url.as_deref(),
+            Some("https://cdn.7tv.app/avatar/example/1x.webp")
+        );
+        let fallback = parse_7tv_user_style(&serde_json::json!({"user": {
+            "style": {"color": 0, "badge": {"id": "fallback"}}
+        }}))
+        .unwrap();
+        assert!(fallback.color.is_none());
+        assert_eq!(fallback.badge_id.as_deref(), Some("fallback"));
+        assert!(parse_7tv_user_style(&serde_json::json!({"user": null})).is_none());
+    }
 
     #[test]
     fn seven_tv_color_zero_is_treated_as_absent() {

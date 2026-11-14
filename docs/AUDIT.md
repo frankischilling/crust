@@ -4,6 +4,9 @@ Audit date: 2026-11-14. Starting revision: `2555d6a` (v0.5.1).
 
 The changes are tracked in [pull request #6](https://github.com/frankischilling/crust/pull/6).
 
+The [follow-up audit](AUDIT_FOLLOWUP.md) covers the later send, emote, history,
+input, and packaging changes in v0.5.2. The results below describe this earlier pass.
+
 This pass covers the Rust workspace, chat transport and moderation behavior, message
 history, image loading, egui controls, plugin callbacks, and project documentation.
 The fixes below address reproduced failures and code paths with a clear failure

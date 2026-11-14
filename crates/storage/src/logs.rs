@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, NaiveDate, Utc};
-use crust_core::model::{ChannelId, ChatMessage, MessageFlags, MessageId, MsgKind, Sender, UserId};
+use crust_core::model::{ChannelId, ChatMessage, HistoryCursor, MessageFlags, MessageId, MsgKind, Sender, UserId};
 use directories::ProjectDirs;
 use rusqlite::{params, Connection, TransactionBehavior};
 
@@ -11,6 +11,14 @@ use crate::StorageError;
 const SQLITE_LOG_FILENAME: &str = "chat_logs.sqlite3";
 const DEFAULT_RECENT_LIMIT: usize = 800;
 const MAX_ROWS_PER_CHANNEL: i64 = 50_000;
+
+pub struct HistoryPage {
+    pub messages: Vec<ChatMessage>,
+    /// SQLite row IDs in the same order as the decoded messages.
+    pub row_ids: Vec<i64>,
+    pub next: Option<HistoryCursor>,
+    pub has_more: bool,
+}
 
 /// SQLite chat history with indexed reads and a per-channel retention limit.
 #[derive(Clone)]
@@ -139,37 +147,43 @@ impl LogStore {
         Ok(())
     }
 
+    /// Update the existing row after context-dependent highlight evaluation.
+    pub fn mark_highlighted(
+        &self,
+        channel: &ChannelId,
+        server_id: Option<&str>,
+        message_id: MessageId,
+        timestamp_ms: i64,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn.lock()
+            .map_err(|_| StorageError::Io(std::io::Error::other("chat log DB mutex poisoned")))?;
+        if let Some(server_id) = server_id.filter(|id| !id.is_empty()) {
+            conn.execute(
+                "UPDATE chat_messages
+                 SET payload_json = json_set(payload_json, '$.flags.is_highlighted', json('true'))
+                 WHERE channel = ?1 AND server_id = ?2 AND json_valid(payload_json)",
+                params![channel.as_str(), server_id],
+            )?;
+        } else if let Ok(local_id) = i64::try_from(message_id.0) {
+            conn.execute(
+                "UPDATE chat_messages
+                 SET payload_json = json_set(payload_json, '$.flags.is_highlighted', json('true'))
+                 WHERE channel = ?1 AND ts_ms = ?2
+                   AND CASE WHEN json_valid(payload_json)
+                       THEN json_extract(payload_json, '$.id') = ?3 ELSE 0 END",
+                params![channel.as_str(), timestamp_ms, local_id],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Load recent messages for a channel, oldest -> newest.
     pub fn recent_messages(
         &self,
         channel: &ChannelId,
         limit: usize,
     ) -> Result<Vec<ChatMessage>, StorageError> {
-        let safe_limit = limit.clamp(1, 5_000) as i64;
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| StorageError::Io(std::io::Error::other("chat log DB mutex poisoned")))?;
-        let mut stmt = conn.prepare(
-            "SELECT payload_json
-             FROM chat_messages
-             WHERE channel = ?1
-             ORDER BY ts_ms DESC, id DESC
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![channel.as_str(), safe_limit], |row| {
-            row.get::<_, String>(0)
-        })?;
-
-        let mut out: Vec<ChatMessage> = Vec::new();
-        for row in rows {
-            let payload = row?;
-            if let Ok(msg) = serde_json::from_str::<ChatMessage>(&payload) {
-                out.push(msg);
-            }
-        }
-        out.reverse(); // oldest first for prepend behavior
-        Ok(out)
+        Ok(self.history_page(channel, None, limit)?.messages)
     }
 
     /// Load the most-recent cross-channel *mention-matching* messages, oldest
@@ -233,31 +247,62 @@ impl LogStore {
         before_ts_ms: i64,
         limit: usize,
     ) -> Result<Vec<ChatMessage>, StorageError> {
-        let safe_limit = limit.clamp(1, 5_000) as i64;
+        Ok(self.history_page(channel, Some(HistoryCursor {
+            timestamp_ms: before_ts_ms,
+            row_id: i64::MIN,
+        }), limit)?.messages)
+    }
+
+    /// Read an indexed page and advance past corrupt payloads as well as valid rows.
+    pub fn history_page(
+        &self,
+        channel: &ChannelId,
+        before: Option<HistoryCursor>,
+        limit: usize,
+    ) -> Result<HistoryPage, StorageError> {
+        let safe_limit = limit.clamp(1, 5_000);
+        let boundary = before.unwrap_or(HistoryCursor {
+            timestamp_ms: i64::MAX,
+            row_id: i64::MAX,
+        });
         let conn = self
             .conn
             .lock()
             .map_err(|_| StorageError::Io(std::io::Error::other("chat log DB mutex poisoned")))?;
         let mut stmt = conn.prepare(
-            "SELECT payload_json
+            "SELECT ts_ms, id, payload_json
              FROM chat_messages
-             WHERE channel = ?1 AND ts_ms < ?2
+             WHERE channel = ?1 AND (ts_ms, id) < (?2, ?3)
              ORDER BY ts_ms DESC, id DESC
-             LIMIT ?3",
+             LIMIT ?4",
         )?;
-        let rows = stmt.query_map(params![channel.as_str(), before_ts_ms, safe_limit], |row| {
-            row.get::<_, String>(0)
-        })?;
+        let rows = stmt.query_map(
+            params![channel.as_str(), boundary.timestamp_ms, boundary.row_id, (safe_limit + 1) as i64],
+            |row| Ok((HistoryCursor { timestamp_ms: row.get(0)?, row_id: row.get(1)? }, row.get::<_, String>(2)?)),
+        )?;
 
-        let mut out: Vec<ChatMessage> = Vec::new();
-        for row in rows {
-            let payload = row?;
+        let mut out = Vec::new();
+        let mut row_ids = Vec::new();
+        let mut next = before;
+        let mut has_more = false;
+        for (index, row) in rows.enumerate() {
+            let (cursor, payload) = row?;
+            if index == safe_limit {
+                has_more = true;
+                break;
+            }
+            next = Some(cursor);
+            if cursor.row_id <= 0 {
+                continue;
+            }
             if let Ok(msg) = serde_json::from_str::<ChatMessage>(&payload) {
                 out.push(msg);
+                row_ids.push(cursor.row_id);
             }
         }
-        out.reverse(); // oldest first for prepend behavior
-        Ok(out)
+        out.reverse();
+        row_ids.reverse();
+        Ok(HistoryPage { messages: out, row_ids, next, has_more })
     }
 
     /// List distinct channel ids that begin with `prefix`, ordered by most
@@ -424,6 +469,101 @@ mod tests {
             msg_kind: MsgKind::Chat,
             shared: None,
         }
+    }
+
+    #[test]
+    fn custom_highlights_are_available_after_reopening_saved_history() {
+        let path = temp_db_path("saved-highlight");
+        let channel = ChannelId::new("first");
+        {
+            let store = LogStore::with_db_path(path.clone()).unwrap();
+            let first = message(1, 1000, "first");
+            let mut second = message(2, 1000, "first");
+            second.server_id = None;
+            store.append_message(&first).unwrap();
+            store.append_message(&second).unwrap();
+            store.append_message(&message(3, 1000, "first")).unwrap();
+            store.append_message(&message(1, 1000, "second")).unwrap();
+            store.mark_highlighted(&channel, first.server_id.as_deref(), first.id, 1000).unwrap();
+            store.mark_highlighted(&channel, None, second.id, 1000).unwrap();
+        }
+        {
+            let store = LogStore::with_db_path(path.clone()).unwrap();
+            let mentions = store.recent_mentions(10).unwrap();
+            assert_eq!(mentions.iter().map(|row| row.id.0).collect::<Vec<_>>(), [1, 2]);
+            assert!(mentions.iter().all(|row| row.flags.is_highlighted && row.channel == channel));
+            assert_eq!(mentions[0].raw_text, "message 1");
+            assert!(!store.recent_messages(&channel, 3).unwrap()[2].flags.is_highlighted);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn history_pages_keep_every_row_at_equal_timestamps() {
+        let store = LogStore::with_db_path(PathBuf::from(":memory:")).unwrap();
+        let channel = ChannelId::new("first");
+        for id in 1..=11 {
+            let mut row = message(id, if id == 1 { 999 } else { 1000 }, "first");
+            row.server_id = None;
+            store.append_message(&row).unwrap();
+        }
+        store.append_message(&message(90, 1000, "second")).unwrap();
+        let mut cursor = None;
+        let mut ids = Vec::new();
+        loop {
+            let page = store.history_page(&channel, cursor, 3).unwrap();
+            if let (Some(before), Some(after)) = (cursor, page.next) {
+                assert!(after < before);
+            }
+            ids.extend(page.messages.iter().rev().map(|message| message.id.0));
+            cursor = page.next;
+            if !page.has_more { break; }
+        }
+        assert_eq!(ids, (1..=11).rev().collect::<Vec<_>>());
+        assert!(store.history_page(&channel, cursor, 3).unwrap().messages.is_empty());
+    }
+
+    #[test]
+    fn history_pages_retain_storage_identity_without_rewriting_original_ids() {
+        let store = LogStore::with_db_path(PathBuf::from(":memory:")).unwrap();
+        let channel = ChannelId::new("first");
+        for id in [17, 17, 18] {
+            let mut row = message(id, 1000, "first");
+            row.server_id = None;
+            row.raw_text = "same text".into();
+            store.append_message(&row).unwrap();
+        }
+        let first = store.history_page(&channel, None, 2).unwrap();
+        assert_eq!(first.row_ids, [2, 3]);
+        assert_eq!(first.messages.iter().map(|row| row.id.0).collect::<Vec<_>>(), [17, 18]);
+        let older = store.history_page(&channel, first.next, 2).unwrap();
+        assert_eq!(older.row_ids, [1]);
+        assert_eq!(older.messages[0].id, MessageId(17));
+        for _ in 0..3 {
+            let replay = store.history_page(&channel, None, 2).unwrap();
+            assert_eq!(replay.row_ids, first.row_ids);
+            assert_eq!(replay.next, first.next);
+        }
+    }
+
+    #[test]
+    fn history_cursor_advances_past_corrupt_payloads() {
+        let store = LogStore::with_db_path(PathBuf::from(":memory:")).unwrap();
+        let channel = ChannelId::new("first");
+        for id in 1..=5 {
+            store.append_message(&message(id, 1000, "first")).unwrap();
+        }
+        store.conn.lock().unwrap().execute(
+            "UPDATE chat_messages SET payload_json = 'invalid' WHERE id >= 4", [],
+        ).unwrap();
+        let first = store.history_page(&channel, None, 2).unwrap();
+        assert!(first.messages.is_empty());
+        assert!(first.row_ids.is_empty());
+        assert!(first.has_more);
+        let next = store.history_page(&channel, first.next, 3).unwrap();
+        assert_eq!(next.messages.iter().map(|row| row.id.0).collect::<Vec<_>>(), [1, 2, 3]);
+        assert_eq!(next.row_ids, [1, 2, 3]);
+        assert!(!next.has_more);
     }
 
     #[test]

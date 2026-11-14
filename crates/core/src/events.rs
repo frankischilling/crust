@@ -401,8 +401,17 @@ pub enum AppCommand {
         channel: ChannelId,
         /// Exclusive upper timestamp bound (Unix ms).
         before_ts_ms: i64,
+        /// Storage row at the boundary; absent for a timestamp-only request.
+        before_row_id: Option<i64>,
         /// Maximum number of rows to load.
         limit: usize,
+    },
+    /// Save a custom highlight after the UI evaluates its channel context.
+    PersistMessageHighlight {
+        channel: ChannelId,
+        server_id: Option<String>,
+        message_id: crate::model::MessageId,
+        timestamp_ms: i64,
     },
     /// Create a Twitch poll via Helix (`POST /helix/polls`).
     CreatePoll {
@@ -645,6 +654,8 @@ pub enum AppEvent {
     HistoryLoaded {
         channel: ChannelId,
         messages: Vec<ChatMessage>,
+        /// Local paging position; external history does not change this cursor.
+        local: Option<crate::model::LocalHistoryPageInfo>,
     },
     /// Mention-matching messages replayed from the local SQLite log on
     /// startup. Populates the cross-channel Mentions pseudo-tab buffer.

@@ -415,6 +415,13 @@ fn render_results(
                     .font(t::small())
                     .color(t::text_muted()),
                 );
+                if !state.input.trim().is_empty() {
+                    let mut ordered: Vec<_> = channels.keys().collect();
+                    ordered.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+                    for channel in ordered {
+                        render_group_header(ui, channel, 0, channels[channel].local_history_exhausted, &mut state.load_older_pending, output);
+                    }
+                }
                 return;
             }
 
@@ -426,6 +433,7 @@ fn render_results(
                     ui,
                     channel,
                     group_len,
+                    channels.get(channel).is_some_and(|state| state.local_history_exhausted),
                     &mut state.load_older_pending,
                     output,
                 );
@@ -446,13 +454,13 @@ fn render_results(
     if hit_count > 0 && state.selected_idx >= hit_count {
         state.selected_idx = hit_count - 1;
     }
-    let _ = channels;
 }
 
 fn render_group_header(
     ui: &mut Ui,
     channel: &ChannelId,
     hit_count: usize,
+    exhausted: bool,
     load_older_pending: &mut HashMap<ChannelId, std::time::Instant>,
     output: &mut GlobalSearchOutput,
 ) {
@@ -464,7 +472,7 @@ fn render_group_header(
         load_older_pending.remove(channel);
     }
     ui.horizontal_top(|ui| {
-        let label = if pending { "Loading..." } else { "Load older" };
+        let label = if exhausted { "No older logs" } else if pending { "Loading..." } else { "Load older" };
         let button_width = ui.fonts(|fonts| {
             fonts
                 .layout_no_wrap(label.to_owned(), t::tiny(), t::text_primary())
@@ -488,7 +496,7 @@ fn render_group_header(
                 );
             },
         );
-        let btn = ui.add_enabled(!pending, Button::new(RichText::new(label).font(t::tiny())));
+        let btn = ui.add_enabled(!pending && !exhausted, Button::new(RichText::new(label).font(t::tiny())));
         if btn.clicked() {
             load_older_pending.insert(channel.clone(), std::time::Instant::now());
             output.load_older_requests.push(channel.clone());
@@ -774,7 +782,7 @@ mod tests {
                         |ctx| {
                             egui::CentralPanel::default().show(ctx, |ui| {
                                 render_header(ui, &mut search, &mut output);
-                                render_group_header(ui, &channel, 1500, &mut pending, &mut output);
+                                render_group_header(ui, &channel, 1500, false, &mut pending, &mut output);
                             });
                         },
                     )
@@ -821,7 +829,7 @@ mod tests {
                     |ctx| {
                         egui::CentralPanel::default().show(ctx, |ui| {
                             render_header(ui, &mut search, &mut output);
-                            render_group_header(ui, &channel, 1500, &mut pending, &mut output);
+                            render_group_header(ui, &channel, 1500, false, &mut pending, &mut output);
                         });
                     },
                 );

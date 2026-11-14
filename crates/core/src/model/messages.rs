@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 /// A pre-parsed chunk of a chat message.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Span {
     Text {
         text: String,
@@ -205,13 +205,49 @@ pub struct ChatMessage {
 }
 
 /// Lightweight emote entry for the UI catalog (autocomplete / picker).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmoteCatalogEntry {
+    #[serde(default)]
+    pub id: String,
     pub code: String,
     pub provider: String,
     pub url: String,
-    /// "global" or "channel".
+    #[serde(default)]
+    pub url_hd: Option<String>,
+    /// "global", "channel", or "personal".
     pub scope: String,
+    /// Channel that owns this entry; absent for global and personal entries.
+    #[serde(default)]
+    pub channel: Option<super::ChannelId>,
+    /// Sender who may use this personal emote.
+    #[serde(default)]
+    pub user_id: Option<super::UserId>,
+}
+
+impl EmoteCatalogEntry {
+    pub fn is_available_for(&self, channel: &super::ChannelId, sender_user_id: &str) -> bool {
+        self.channel.as_ref().is_none_or(|owner| owner == channel)
+            && self.user_id.as_ref().is_none_or(|owner| {
+                channel.is_twitch() && !sender_user_id.is_empty() && owner.0 == sender_user_id
+            })
+    }
+
+    /// Larger values win when several available entries use the same code.
+    pub fn resolution_priority(&self) -> u8 {
+        if self.user_id.is_some() {
+            return 80;
+        }
+        match (self.channel.is_some(), self.provider.as_str()) {
+            (true, "kick") => 70,
+            (true, "ffz") => 60,
+            (true, "bttv") => 50,
+            (true, "7tv") => 40,
+            (false, "ffz") => 30,
+            (false, "bttv") => 20,
+            (false, "7tv") => 10,
+            _ => 0,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -221,7 +257,8 @@ mod tests {
     #[test]
     fn raid_deserializes_without_source_login() {
         let msg_kind: MsgKind =
-            serde_json::from_str(r#"{"Raid":{"display_name":"Raider","viewer_count":42}}"#).unwrap();
+            serde_json::from_str(r#"{"Raid":{"display_name":"Raider","viewer_count":42}}"#)
+                .unwrap();
 
         match msg_kind {
             MsgKind::Raid {

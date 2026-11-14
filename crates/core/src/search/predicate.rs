@@ -12,6 +12,10 @@ pub enum FlagKind {
     Deleted,
     SelfMsg,
     System,
+    Timeout,
+    Cheer,
+    Redemption,
+    Shared,
 }
 
 /// A single compiled predicate in a search query.
@@ -35,10 +39,12 @@ pub enum Predicate {
     Regex(regex::Regex),
     /// Sender badge `name` matches any entry (case-insensitive).
     Badge(Vec<String>),
-    /// First char of `subscriber` badge `version` matches any entry.
+    /// Subscriber tier matches any entry; plain month counts indicate tier 1.
     Subtier(Vec<char>),
     /// Message-flags / kind predicate.
     Flag(FlagKind),
+    /// Any one of the listed message flags or kinds matches.
+    AnyFlag(Vec<FlagKind>),
     /// Negates the inner predicate.
     Negated(Box<Predicate>),
 }
@@ -89,6 +95,9 @@ impl Predicate {
             }),
             Self::Regex(re) => re.is_match(&msg.raw_text),
             Self::Negated(inner) => !inner.matches(msg, channel),
+            Self::AnyFlag(flags) => flags
+                .iter()
+                .any(|flag| Self::Flag(*flag).matches(msg, channel)),
             Self::Badge(names) => msg.sender.badges.iter().any(|b| {
                 let b_name = b.name.to_lowercase();
                 names.iter().any(|n| n.to_lowercase() == b_name)
@@ -98,7 +107,13 @@ impl Predicate {
                 .badges
                 .iter()
                 .find(|b| b.name.eq_ignore_ascii_case("subscriber"))
-                .and_then(|b| b.version.chars().next())
+                .map(|b| {
+                    if b.version.len() > 3 {
+                        b.version.chars().next().unwrap_or('1')
+                    } else {
+                        '1'
+                    }
+                })
                 .map(|c| tiers.contains(&c))
                 .unwrap_or(false),
             Self::Flag(kind) => match kind {
@@ -113,10 +128,23 @@ impl Predicate {
                 FlagKind::System => matches!(
                     msg.msg_kind,
                     crate::model::MsgKind::SystemInfo
-                        | crate::model::MsgKind::Timeout { .. }
-                        | crate::model::MsgKind::Ban { .. }
                         | crate::model::MsgKind::ChatCleared
+                        | crate::model::MsgKind::Raid { .. }
+                        | crate::model::MsgKind::HypeTrain { .. }
                 ),
+                FlagKind::Timeout => matches!(
+                    msg.msg_kind,
+                    crate::model::MsgKind::Timeout { .. } | crate::model::MsgKind::Ban { .. }
+                ),
+                FlagKind::Cheer => matches!(msg.msg_kind, crate::model::MsgKind::Bits { .. }),
+                FlagKind::Redemption => {
+                    msg.flags.custom_reward_id.is_some()
+                        || matches!(
+                            msg.msg_kind,
+                            crate::model::MsgKind::ChannelPointsReward { .. }
+                        )
+                }
+                FlagKind::Shared => msg.shared.is_some(),
             },
         }
     }
@@ -305,6 +333,130 @@ mod tests {
         assert!(!Predicate::Subtier(vec!['1']).matches(&tier3, &ch));
         assert!(Predicate::Subtier(vec!['1']).matches(&tier1, &ch));
         assert!(!Predicate::Subtier(vec!['1']).matches(&no_sub, &ch));
+    }
+
+    #[test]
+    fn ordinary_subscriber_badges_always_match_tier_one() {
+        let channel = make_channel("foo");
+        let mut msg = make_msg("alice", "Alice", "hello");
+        for version in ["0", "1", "2", "3", "6", "24", "36", "999"] {
+            msg.sender.badges = vec![Badge {
+                name: "subscriber".into(),
+                version: version.into(),
+                url: None,
+            }];
+            for tier in ['1', '2', '3'] {
+                assert_eq!(
+                    Predicate::Subtier(vec![tier]).matches(&msg, &channel),
+                    tier == '1',
+                    "badge {version}, tier {tier}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parsed_literal_commands_do_not_match_messages_without_the_prefix() {
+        let channel = make_channel("foo");
+        for literal in ["!uptime", "-42", "!foo:bar"] {
+            let parsed = crate::search::parse(literal);
+            assert!(matches(
+                &parsed.predicates,
+                &make_msg("alice", "Alice", literal),
+                &channel
+            ));
+            assert!(!matches(
+                &parsed.predicates,
+                &make_msg("alice", "Alice", &literal[1..]),
+                &channel
+            ));
+        }
+    }
+
+    #[test]
+    fn parsed_flag_groups_use_or_and_negate_the_complete_group() {
+        let channel = make_channel("foo");
+        let mut msg = make_msg("alice", "Alice", "hello");
+        let positive = crate::search::parse("is:deleted,highlighted");
+        let negative = crate::search::parse("!is:deleted,highlighted");
+        for (deleted, highlighted) in [(false, false), (true, false), (false, true), (true, true)] {
+            msg.flags.is_deleted = deleted;
+            msg.flags.is_highlighted = highlighted;
+            assert_eq!(
+                matches(&positive.predicates, &msg, &channel),
+                deleted || highlighted
+            );
+            assert_eq!(
+                matches(&negative.predicates, &msg, &channel),
+                !(deleted || highlighted)
+            );
+        }
+    }
+
+    #[test]
+    fn system_search_excludes_timeouts_unless_requested() {
+        let channel = make_channel("foo");
+        let mut msg = make_msg("alice", "Alice", "alice timed out");
+        msg.msg_kind = MsgKind::Timeout {
+            login: "alice".into(),
+            seconds: 60,
+        };
+        assert!(!matches(
+            &crate::search::parse("is:system").predicates,
+            &msg,
+            &channel
+        ));
+        assert!(matches(
+            &crate::search::parse("is:system,timeout").predicates,
+            &msg,
+            &channel
+        ));
+        msg.msg_kind = MsgKind::SystemInfo;
+        assert!(matches(
+            &crate::search::parse("is:system,timeout").predicates,
+            &msg,
+            &channel
+        ));
+        assert!(!matches(
+            &crate::search::parse("is:timeout").predicates,
+            &msg,
+            &channel
+        ));
+    }
+
+    #[test]
+    fn supported_event_flags_and_aliases_match_message_metadata() {
+        let channel = make_channel("foo");
+        let mut msg = make_msg("alice", "Alice", "hello");
+        for query in [
+            "is:cheer-msg",
+            "is:redemption",
+            "is:shared",
+            "is:first-msg",
+            "is:disabled",
+        ] {
+            assert!(
+                !matches(&crate::search::parse(query).predicates, &msg, &channel),
+                "{query}"
+            );
+        }
+        msg.msg_kind = MsgKind::Bits { amount: 100 };
+        msg.flags.custom_reward_id = Some("reward".into());
+        msg.shared = Some(Default::default());
+        msg.flags.is_first_msg = true;
+        msg.flags.is_deleted = true;
+        for query in [
+            "is:cheer-msg",
+            "is:redemption",
+            "is:shared",
+            "is:first-msg",
+            "is:disabled",
+        ] {
+            assert!(
+                matches(&crate::search::parse(query).predicates, &msg, &channel),
+                "{query}"
+            );
+        }
     }
 
     #[test]

@@ -25,6 +25,7 @@ const TABS: &[(&str, &str)] = &[
     ("7tv", "7TV"),
     ("bttv", "BTTV"),
     ("ffz", "FFZ"),
+    ("kick", "Kick"),
     ("emoji", "Emoji"),
 ];
 
@@ -94,6 +95,9 @@ pub struct EmotePicker {
     provider_boost: Option<String>,
     /// Bumped whenever ranking inputs change (favorites/recent/usage).
     rank_revision: u64,
+    focus_search: bool,
+    accept_search: bool,
+    restore_search_focus_after: Option<u64>,
 }
 
 impl Default for EmotePicker {
@@ -111,6 +115,9 @@ impl Default for EmotePicker {
             usage_by_url: HashMap::new(),
             provider_boost: None,
             rank_revision: 0,
+            focus_search: false,
+            accept_search: false,
+            restore_search_focus_after: None,
         }
     }
 }
@@ -118,13 +125,108 @@ impl Default for EmotePicker {
 impl EmotePicker {
     pub fn toggle(&mut self) {
         self.open = !self.open;
+        self.accept_search = false;
+        self.restore_search_focus_after = None;
         if self.open {
             self.filter.clear();
             self.cache = None;
             self.display_cache = None;
             self.active_view = PickerView::All;
             self.last_logged_size = None;
+            self.focus_search = true;
         }
+    }
+
+    pub fn invalidate_catalog(&mut self) {
+        self.cache = None;
+        self.display_cache = None;
+    }
+
+    fn search_id() -> egui::Id {
+        egui::Id::new("emote_picker_search")
+    }
+
+    /// Run before the application's shortcuts so this window owns its focused keys.
+    pub fn handle_shortcuts(&mut self, ctx: &Context) {
+        if !self.open {
+            return;
+        }
+        let pass = ctx.cumulative_pass_nr();
+        if self
+            .restore_search_focus_after
+            .is_some_and(|previous| previous < pass)
+        {
+            self.restore_search_focus_after = None;
+            ctx.memory_mut(|memory| memory.request_focus(Self::search_id()));
+        }
+        let search_owns_keys = ctx.memory(|memory| {
+            memory.has_focus(Self::search_id())
+                || (memory.focused().is_none() && memory.had_focus_last_frame(Self::search_id()))
+        });
+        if ctx.is_context_menu_open() || !search_owns_keys {
+            return;
+        }
+        let (close, next, previous, direct, accept) = ctx.input_mut(|input| {
+            use crate::app::consume_exact_key;
+            use egui::{Key, Modifiers};
+
+            let close = consume_exact_key(input, Modifiers::NONE, Key::Escape);
+            let previous = consume_exact_key(input, Modifiers::CTRL | Modifiers::SHIFT, Key::Tab)
+                || consume_exact_key(input, Modifiers::CTRL, Key::PageUp);
+            let next = consume_exact_key(input, Modifiers::CTRL, Key::Tab)
+                || consume_exact_key(input, Modifiers::CTRL, Key::PageDown);
+            let direct = [
+                Key::Num1,
+                Key::Num2,
+                Key::Num3,
+                Key::Num4,
+                Key::Num5,
+                Key::Num6,
+                Key::Num7,
+                Key::Num8,
+                Key::Num9,
+            ]
+            .iter()
+            .position(|key| consume_exact_key(input, Modifiers::ALT | Modifiers::CTRL, *key));
+            let accept = consume_exact_key(input, Modifiers::NONE, Key::Enter);
+            (close, next, previous, direct, accept)
+        });
+        if close {
+            self.open = false;
+            self.accept_search = false;
+            self.restore_search_focus_after = None;
+            return;
+        }
+        if previous || next {
+            // egui decides Tab focus traversal before shortcuts are consumed,
+            // and Shift+Tab applies its target at the start of the next pass.
+            self.focus_search = true;
+            self.restore_search_focus_after = Some(pass);
+            ctx.request_repaint();
+        }
+        let current = match self.active_view {
+            PickerView::All => 0,
+            PickerView::Favorites => 1,
+            PickerView::Recent => 2,
+            PickerView::Provider(index) => index + 3,
+        };
+        let count = TABS.len() + 3;
+        let selected = direct.unwrap_or_else(|| {
+            if previous {
+                (current + count - 1) % count
+            } else if next {
+                (current + 1) % count
+            } else {
+                current
+            }
+        });
+        self.active_view = match selected {
+            0 => PickerView::All,
+            1 => PickerView::Favorites,
+            2 => PickerView::Recent,
+            index => PickerView::Provider(index - 3),
+        };
+        self.accept_search |= accept;
     }
 
     fn bump_rank_revision(&mut self) {
@@ -191,7 +293,12 @@ impl EmotePicker {
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .map(str::to_ascii_lowercase)
-            .filter(|v| matches!(v.as_str(), "twitch" | "7tv" | "bttv" | "ffz" | "emoji"));
+            .filter(|v| {
+                matches!(
+                    v.as_str(),
+                    "twitch" | "7tv" | "bttv" | "ffz" | "kick" | "emoji"
+                )
+            });
 
         self.bump_rank_revision();
     }
@@ -447,58 +554,11 @@ impl EmotePicker {
         if !self.open {
             return None;
         }
-
-        let (close_requested, next_tab, prev_tab, direct_tab) = ctx.input_mut(|i| {
-            let close_requested = i.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
-            let next_tab = i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab)
-                || i.consume_key(egui::Modifiers::CTRL, egui::Key::PageDown);
-            let prev_tab = i.consume_key(
-                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
-                egui::Key::Tab,
-            ) || i.consume_key(egui::Modifiers::CTRL, egui::Key::PageUp);
-            let direct_tab = [
-                egui::Key::Num1,
-                egui::Key::Num2,
-                egui::Key::Num3,
-                egui::Key::Num4,
-                egui::Key::Num5,
-            ]
-            .iter()
-            .position(|key| i.consume_key(egui::Modifiers::ALT | egui::Modifiers::CTRL, *key));
-            (close_requested, next_tab, prev_tab, direct_tab)
-        });
-
-        if close_requested {
-            self.open = false;
+        self.handle_shortcuts(ctx);
+        if !self.open {
             return None;
         }
-
-        if let Some(idx) = direct_tab {
-            self.active_view = match idx {
-                0 => PickerView::All,
-                1 => PickerView::Favorites,
-                2 => PickerView::Recent,
-                3 => PickerView::Provider(0),
-                4 => PickerView::Provider(1),
-                _ => PickerView::All,
-            };
-        } else if next_tab {
-            self.active_view = match self.active_view {
-                PickerView::All => PickerView::Favorites,
-                PickerView::Favorites => PickerView::Recent,
-                PickerView::Recent => PickerView::Provider(0),
-                PickerView::Provider(i) if i + 1 < TABS.len() => PickerView::Provider(i + 1),
-                _ => PickerView::All,
-            };
-        } else if prev_tab {
-            self.active_view = match self.active_view {
-                PickerView::All => PickerView::Provider(TABS.len() - 1),
-                PickerView::Favorites => PickerView::All,
-                PickerView::Recent => PickerView::Favorites,
-                PickerView::Provider(0) => PickerView::Recent,
-                PickerView::Provider(i) => PickerView::Provider(i - 1),
-            };
-        }
+        let accept_search = std::mem::take(&mut self.accept_search);
 
         let mut picked: Option<String> = None;
         let mut picked_entry: Option<EmoteCatalogEntry> = None;
@@ -515,21 +575,21 @@ impl EmotePicker {
             .collapsible(true)
             .scroll(false)
             .show(ctx, |ui| {
-                chrome::dialog_header(
-                    ui,
-                    "Emotes",
-                    Some("Browse Twitch, 7TV, BTTV, FFZ, and emoji."),
-                );
+                chrome::dialog_header(ui, "Emotes", Some("Browse channel emotes and emoji."));
                 ui.add_space(6.0);
 
                 // Search bar
                 ui.horizontal(|ui| {
                     ui.label("🔍");
-                    ui.add(
+                    let search = ui.add(
                         egui::TextEdit::singleline(&mut self.filter)
+                            .id(Self::search_id())
                             .hint_text("Search emotes...")
                             .desired_width(ui.available_width()),
                     );
+                    if std::mem::take(&mut self.focus_search) {
+                        search.request_focus();
+                    }
                 });
                 ui.add_space(2.0);
 
@@ -627,7 +687,6 @@ impl EmotePicker {
                 let available_h = ui.available_height();
                 let cols = ((available_w / CELL_SIZE) as usize).max(1);
                 let num_rows = (display_indices.len() + cols - 1) / cols;
-                let pointer_pos = ui.input(|i| i.pointer.hover_pos());
                 let mut has_animated_visible = false;
                 let view = self.cache.as_ref().expect("cache initialized");
 
@@ -653,7 +712,7 @@ impl EmotePicker {
                         let last_row =
                             ((vis_bottom / ROW_H).ceil().max(0.0) as usize).min(num_rows);
 
-                        let mut hovered_entry: Option<(usize, egui::Rect)> = None;
+                        let mut hovered_entry: Option<(usize, egui::Rect, egui::Response)> = None;
 
                         for row in first_row..last_row {
                             let start = row * cols;
@@ -671,18 +730,40 @@ impl EmotePicker {
                                     egui::vec2(EMOTE_SIZE, EMOTE_SIZE),
                                 );
 
-                                let is_hovered = pointer_pos
-                                    .map(|pos| cell_rect.contains(pos))
-                                    .unwrap_or(false);
+                                let cell_response = ui.interact(
+                                    cell_rect,
+                                    egui::Id::new("emote_picker_cell")
+                                        .with((entry.url.as_str(), cat_idx)),
+                                    egui::Sense::click(),
+                                );
+                                let is_hovered = cell_response.hovered();
+                                if cell_response.clicked() {
+                                    picked = Some(entry.code.clone());
+                                    picked_entry = Some(entry.clone());
+                                }
+                                cell_response.context_menu(|ui| {
+                                    let label = if self.favorite_urls.contains(&entry.url) {
+                                        "Remove from favorites"
+                                    } else {
+                                        "Add to favorites"
+                                    };
+                                    if ui.button(label).clicked() {
+                                        pending_favorite_toggle = Some(entry.url.clone());
+                                        ui.close_menu();
+                                    }
+                                });
 
-                                if let Some(&(w, h, ref raw)) = emote_bytes.get(entry.url.as_str()) {
+                                if let Some(&(w, h, ref raw)) = emote_bytes.get(entry.url.as_str())
+                                {
                                     let animated = is_likely_animated_url(&entry.url);
                                     // Keep 7TV animation hover-only to avoid repaint storms in dense lists.
                                     let animate_in_grid = animated
                                         && animate_emotes
                                         && (entry.provider != "7tv" || is_hovered);
                                     if animated && !animate_in_grid {
-                                        if let Some(tex) = emote_bytes.static_texture(ui.ctx(), &entry.url) {
+                                        if let Some(tex) =
+                                            emote_bytes.static_texture(ui.ctx(), &entry.url)
+                                        {
                                             let size = fit_size(w, h, EMOTE_SIZE);
                                             let image_rect = egui::Rect::from_center_size(
                                                 cell_rect.center(),
@@ -740,33 +821,13 @@ impl EmotePicker {
                                 }
 
                                 if is_hovered {
-                                    hovered_entry = Some((cat_idx, cell_rect));
+                                    hovered_entry = Some((cat_idx, cell_rect, cell_response));
                                 }
                             }
                         }
 
-                        if let Some((cat_idx, rect)) = hovered_entry {
+                        if let Some((cat_idx, rect, click_resp)) = hovered_entry {
                             let entry = &view.combined[cat_idx];
-                            let entry_url = entry.url.clone();
-                            let click_resp =
-                                ui.interact(rect, egui::Id::new("ep_hover"), egui::Sense::click());
-                            if click_resp.clicked() {
-                                picked = Some(entry.code.clone());
-                                picked_entry = Some(entry.clone());
-                            }
-
-                            click_resp.context_menu(|ui| {
-                                let is_favorite = self.favorite_urls.contains(entry_url.as_str());
-                                let label = if is_favorite {
-                                    "Remove from favorites"
-                                } else {
-                                    "Add to favorites"
-                                };
-                                if ui.button(label).clicked() {
-                                    pending_favorite_toggle = Some(entry_url.clone());
-                                    ui.close_menu();
-                                }
-                            });
 
                             ui.painter().rect_stroke(
                                 rect.expand(2.0),
@@ -808,9 +869,15 @@ impl EmotePicker {
                 }
             });
 
-        if picked.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-            let active_view = self.active_view;
-            let provider_boost = self.provider_boost.clone();
+        if picked.is_none()
+            && accept_search
+            && window_resp
+                .as_ref()
+                .is_some_and(|window| window.inner.is_some())
+            && self.cache.is_some()
+        {
+            let active_view = next_active_view;
+            let provider_boost = next_provider_boost.clone();
             let first_idx = {
                 let provider_boost = provider_boost.as_deref();
                 self.display_indices_for(active_view, provider_boost)
@@ -857,6 +924,11 @@ impl EmotePicker {
         if picked.is_some() {
             self.open = false;
         }
+        if self.open && self.restore_search_focus_after == Some(ctx.cumulative_pass_nr()) {
+            // Forward Tab gives focus to the next button while laying out the
+            // window, so restore it after those controls have been registered.
+            ctx.memory_mut(|memory| memory.request_focus(Self::search_id()));
+        }
         picked
     }
 }
@@ -875,4 +947,267 @@ fn fit_size(w: u32, h: u32, max_side: f32) -> Vec2 {
 fn is_likely_animated_url(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
     lower.contains(".gif") || lower.contains(".webp")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(code: &str, provider: &str, url: &str) -> EmoteCatalogEntry {
+        EmoteCatalogEntry {
+            id: code.to_owned(),
+            url_hd: None,
+            code: code.to_owned(),
+            provider: provider.to_owned(),
+            url: url.to_owned(),
+            scope: "channel".to_owned(),
+            channel: None,
+            user_id: None,
+        }
+    }
+
+    fn key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    fn frame(
+        ctx: &Context,
+        picker: &mut EmotePicker,
+        catalog: &[EmoteCatalogEntry],
+        events: Vec<egui::Event>,
+        other_focus: bool,
+    ) -> (Option<String>, egui::FullOutput) {
+        let (sender, _receiver) = tokio::sync::mpsc::channel(4);
+        let sender = UiCommandSender::new(sender);
+        let images = UiImageCache::default();
+        let mut picked = None;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                picker.handle_shortcuts(ctx);
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let id = egui::Id::new("other_composer");
+                    if other_focus {
+                        ui.memory_mut(|memory| memory.request_focus(id));
+                    }
+                    ui.add(egui::TextEdit::singleline(&mut String::new()).id(id));
+                });
+                picked = picker.show(ctx, catalog, &images, &sender, false);
+            },
+        );
+        (picked, output)
+    }
+
+    #[test]
+    fn catalog_invalidation_refreshes_equal_length_provider_and_url_changes() {
+        let mut picker = EmotePicker::default();
+        picker.emoji_entries.clear();
+        let first = entry("First", "twitch", "https://example.test/first.png");
+        let second = entry("Second", "7tv", "https://example.test/second.png");
+        picker.ensure_cache(&[first]);
+        let _ = picker.display_indices_for(PickerView::All, None);
+        picker.invalidate_catalog();
+        picker.ensure_cache(&[second]);
+        let indices = picker.display_indices_for(PickerView::Provider(1), None);
+        assert_eq!(indices.as_ref(), &[0]);
+        let cached = picker.cache.as_ref().unwrap();
+        assert!(cached.tabs[0].indices.is_empty());
+        assert_eq!(cached.combined[0].code, "Second");
+        assert!(cached
+            .index_by_url
+            .contains_key("https://example.test/second.png"));
+        assert!(!cached
+            .index_by_url
+            .contains_key("https://example.test/first.png"));
+    }
+
+    #[test]
+    fn open_picker_does_not_accept_enter_from_another_composer() {
+        let ctx = Context::default();
+        let mut picker = EmotePicker::default();
+        picker.emoji_entries.clear();
+        picker.toggle();
+        let catalog = [entry("Kappa", "twitch", "https://example.test/kappa.png")];
+        frame(&ctx, &mut picker, &catalog, Vec::new(), false);
+        frame(&ctx, &mut picker, &catalog, Vec::new(), true);
+        assert!(ctx.memory(|memory| memory.has_focus(egui::Id::new("other_composer"))));
+        let (picked, _) = frame(
+            &ctx,
+            &mut picker,
+            &catalog,
+            vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+            false,
+        );
+        assert!(picked.is_none());
+        assert!(picker.open);
+    }
+
+    #[test]
+    fn search_owns_reverse_tab_and_enter_and_opens_with_focus() {
+        let ctx = Context::default();
+        let mut picker = EmotePicker::default();
+        picker.emoji_entries.clear();
+        picker.toggle();
+        let catalog = [entry("Kappa", "twitch", "https://example.test/kappa.png")];
+        frame(&ctx, &mut picker, &catalog, Vec::new(), false);
+        assert!(ctx.memory(|memory| memory.has_focus(EmotePicker::search_id())));
+        frame(
+            &ctx,
+            &mut picker,
+            &catalog,
+            vec![key(
+                egui::Key::Tab,
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            )],
+            false,
+        );
+        assert!(picker.active_view == PickerView::Provider(TABS.len() - 1));
+        frame(
+            &ctx,
+            &mut picker,
+            &catalog,
+            vec![key(egui::Key::Tab, egui::Modifiers::CTRL)],
+            false,
+        );
+        assert!(picker.active_view == PickerView::All);
+        assert!(ctx.memory(|memory| memory.has_focus(EmotePicker::search_id())));
+        let (picked, _) = frame(
+            &ctx,
+            &mut picker,
+            &catalog,
+            vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+            false,
+        );
+        assert_eq!(picked.as_deref(), Some("Kappa"));
+        assert!(!picker.open);
+    }
+
+    #[test]
+    fn plain_tab_can_move_keyboard_focus_out_of_search() {
+        let ctx = Context::default();
+        let mut picker = EmotePicker::default();
+        picker.toggle();
+        frame(&ctx, &mut picker, &[], Vec::new(), false);
+        frame(
+            &ctx,
+            &mut picker,
+            &[],
+            vec![key(egui::Key::Tab, egui::Modifiers::NONE)],
+            false,
+        );
+        assert!(!ctx.memory(|memory| memory.has_focus(EmotePicker::search_id())));
+        assert!(picker.active_view == PickerView::All);
+        assert!(picker.open);
+    }
+
+    #[test]
+    fn escape_closes_the_picker_after_search_loses_egui_focus() {
+        let ctx = Context::default();
+        let mut picker = EmotePicker::default();
+        picker.toggle();
+        frame(&ctx, &mut picker, &[], Vec::new(), false);
+        let (picked, _) = frame(
+            &ctx,
+            &mut picker,
+            &[],
+            vec![key(egui::Key::Escape, egui::Modifiers::NONE)],
+            false,
+        );
+        assert!(picked.is_none());
+        assert!(!picker.open);
+    }
+
+    fn pointer(pos: egui::Pos2, button: egui::PointerButton, pressed: bool) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    #[test]
+    fn favorite_menu_stays_open_when_pointer_leaves_its_cell() {
+        let ctx = Context::default();
+        let mut picker = EmotePicker::default();
+        picker.emoji_entries.clear();
+        picker.toggle();
+        let catalog = [entry("Kappa", "twitch", "https://example.test/kappa.png")];
+        frame(&ctx, &mut picker, &catalog, Vec::new(), false);
+        frame(&ctx, &mut picker, &catalog, Vec::new(), false);
+        let cell = ctx
+            .read_response(
+                egui::Id::new("emote_picker_cell").with((catalog[0].url.as_str(), 0usize)),
+            )
+            .unwrap()
+            .rect;
+        frame(
+            &ctx,
+            &mut picker,
+            &catalog,
+            pointer(cell.center(), egui::PointerButton::Secondary, true),
+            false,
+        );
+        frame(
+            &ctx,
+            &mut picker,
+            &catalog,
+            pointer(cell.center(), egui::PointerButton::Secondary, false),
+            false,
+        );
+        assert!(ctx.is_context_menu_open());
+        // A new egui popup is measured on its first pass before it is painted.
+        let (_, output) = frame(&ctx, &mut picker, &catalog, Vec::new(), false);
+        let menu_pos = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "Add to favorites" => {
+                    Some(text.pos + text.galley.size() / 2.0)
+                }
+                _ => None,
+            })
+            .expect("favorite action is visible");
+        assert!(!cell.contains(menu_pos));
+        frame(
+            &ctx,
+            &mut picker,
+            &catalog,
+            vec![egui::Event::PointerMoved(menu_pos)],
+            false,
+        );
+        assert!(ctx.is_context_menu_open());
+        frame(
+            &ctx,
+            &mut picker,
+            &catalog,
+            pointer(menu_pos, egui::PointerButton::Primary, true),
+            false,
+        );
+        let (picked, _) = frame(
+            &ctx,
+            &mut picker,
+            &catalog,
+            pointer(menu_pos, egui::PointerButton::Primary, false),
+            false,
+        );
+        assert!(picked.is_none());
+        assert_eq!(picker.preferences().favorites, vec![catalog[0].url.clone()]);
+    }
 }

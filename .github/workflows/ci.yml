@@ -1,0 +1,97 @@
+name: Linux checks and package
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install desktop build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config dpkg-dev python3 libgtk-3-dev libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev libasound2-dev libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libssl-dev libgl1-mesa-dri xvfb xauth
+      - name: Select the stable Rust toolchain
+        id: rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add clippy
+          echo "version=$(rustc --version)" >> "$GITHUB_OUTPUT"
+      - name: Restore Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-${{ steps.rust.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            linux-${{ steps.rust.outputs.version }}-
+      - name: Run workspace tests
+        run: cargo test --workspace --all-targets --release --locked --no-fail-fast
+      - name: Check correctness lints
+        run: cargo clippy --workspace --all-targets --release --locked -- -A clippy::style -A clippy::complexity -D clippy::correctness
+      - name: Build the Debian package
+        run: bash scripts/build_debian_release.sh
+      - name: Check embedded webview under X11
+        env:
+          LIBGL_ALWAYS_SOFTWARE: 'true'
+        run: |
+          profile_dir="$(mktemp -d)"
+          trap 'rm -rf -- "$profile_dir"' EXIT
+          status=0
+          timeout 30s xvfb-run --auto-servernum target/release/crust-webview --smoke-test "$profile_dir" > /tmp/crust-webview-smoke.log 2>&1 || status=$?
+          cat /tmp/crust-webview-smoke.log
+          if [ "$status" -ne 0 ]; then
+            echo "The embedded webview check failed (status $status)"
+            exit 1
+          fi
+          if ! grep -Fq 'crust-webview smoke test passed: JavaScript IPC received' /tmp/crust-webview-smoke.log; then
+            echo "The embedded webview did not report a JavaScript response"
+            exit 1
+          fi
+      - name: Check desktop startup under X11
+        env:
+          LIBGL_ALWAYS_SOFTWARE: 'true'
+          RUST_LOG: info
+        run: |
+          status=0
+          timeout 15s xvfb-run --auto-servernum target/release/crust > /tmp/crust-startup.log 2>&1 || status=$?
+          cat /tmp/crust-startup.log
+          if [ "$status" -ne 124 ]; then
+            echo "Crust exited before the startup check finished (status $status)"
+            exit 1
+          fi
+          if ! grep -Fq 'crust-webview host initialized' /tmp/crust-startup.log; then
+            echo "The embedded webview did not initialize"
+            exit 1
+          fi
+          if grep -Eq 'webview: script error \[(window|webview)\.build\]' /tmp/crust-startup.log; then
+            echo "The embedded webview reported an initialization failure"
+            exit 1
+          fi
+      - name: Upload the tested package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: crust-linux-package
+          path: dist/debian/*.deb*
+          if-no-files-found: error
+          retention-days: 7

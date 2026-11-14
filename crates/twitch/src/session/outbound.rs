@@ -2,12 +2,18 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use crust_core::model::ChannelId;
+use tokio::sync::oneshot;
 
 use super::ratelimit::{ChatRateLimiter, RateLimiter};
 
 const MAX_PENDING_CHAT: usize = 256;
 const MAX_PENDING_CHAT_BYTES: usize = 256 * 1024;
 const MAX_PENDING_JOINS: usize = 512;
+
+pub(super) struct OutboundLine {
+    pub(super) line: String,
+    pub(super) receipt: Option<oneshot::Sender<Result<(), String>>>,
+}
 
 /// Pending output belongs to one connection. Dropping it on reconnect also
 /// prevents unsent chat from crossing an account switch.
@@ -16,7 +22,7 @@ pub(super) struct OutboundQueue {
     joins: VecDeque<ChannelId>,
     pending_joins: HashSet<ChannelId>,
     joined: HashSet<ChannelId>,
-    chats: HashMap<ChannelId, VecDeque<String>>,
+    chats: HashMap<ChannelId, VecDeque<OutboundLine>>,
     chat_order: VecDeque<ChannelId>,
     chat_count: usize,
     chat_bytes: usize,
@@ -44,16 +50,29 @@ impl OutboundQueue {
         }
         if let Some(messages) = self.chats.remove(channel) {
             self.chat_count -= messages.len();
-            self.chat_bytes -= messages.iter().map(String::len).sum::<usize>();
+            self.chat_bytes -= messages.iter().map(|message| message.line.len()).sum::<usize>();
             self.chat_order.retain(|pending| pending != channel);
+            for message in messages {
+                if let Some(receipt) = message.receipt {
+                    let _ = receipt.send(Err("The channel was closed before the message could be sent.".into()));
+                }
+            }
         }
         self.joined.remove(channel)
     }
 
-    pub(super) fn message(&mut self, channel: ChannelId, line: String) -> bool {
+    pub(super) fn message(
+        &mut self,
+        channel: ChannelId,
+        line: String,
+        receipt: Option<oneshot::Sender<Result<(), String>>>,
+    ) -> bool {
         if self.chat_count >= MAX_PENDING_CHAT
             || line.len() > MAX_PENDING_CHAT_BYTES.saturating_sub(self.chat_bytes)
         {
+            if let Some(receipt) = receipt {
+                let _ = receipt.send(Err("The outgoing queue is full. Wait for pending messages to send, then try again.".into()));
+            }
             return false;
         }
         self.chat_count += 1;
@@ -62,7 +81,7 @@ impl OutboundQueue {
             self.chat_order.push_back(channel);
             VecDeque::new()
         });
-        messages.push_back(line);
+        messages.push_back(OutboundLine { line, receipt });
         true
     }
 
@@ -96,12 +115,15 @@ impl OutboundQueue {
         join_limiter: &mut RateLimiter,
         elevated_channels: &HashSet<ChannelId>,
         now: Instant,
-    ) -> Option<String> {
+    ) -> Option<OutboundLine> {
         if !self.joins.is_empty() && join_limiter.try_consume_at(now) {
             let channel = self.joins.pop_front().expect("queued JOIN");
             self.pending_joins.remove(&channel);
             self.joined.insert(channel.clone());
-            return Some(format!("JOIN {}", channel.irc_name()));
+            return Some(OutboundLine {
+                line: format!("JOIN {}", channel.irc_name()),
+                receipt: None,
+            });
         }
         for index in 0..self.chat_order.len() {
             let channel = &self.chat_order[index];
@@ -114,7 +136,7 @@ impl OutboundQueue {
             let messages = self.chats.get_mut(&channel).expect("queued chat messages");
             let line = messages.pop_front().expect("nonempty chat queue");
             self.chat_count -= 1;
-            self.chat_bytes -= line.len();
+            self.chat_bytes -= line.line.len();
             if messages.is_empty() {
                 self.chats.remove(&channel);
             } else {
@@ -142,7 +164,7 @@ mod tests {
 
         assert_eq!(queue.join(channel.clone()), Ok(true));
         assert_eq!(queue.join(channel.clone()), Ok(false));
-        assert!(queue.message(channel.clone(), "queued message".to_owned()));
+        assert!(queue.message(channel.clone(), "queued message".to_owned(), None));
         assert!(!queue.leave(&channel));
         assert!(queue
             .next_send_at(&mut chat, &mut joins, &elevated, now)
@@ -150,7 +172,7 @@ mod tests {
 
         assert_eq!(queue.join(channel.clone()), Ok(true));
         assert_eq!(
-            queue.pop_ready(&mut chat, &mut joins, &elevated, now),
+            queue.pop_ready(&mut chat, &mut joins, &elevated, now).map(|message| message.line),
             Some("JOIN #room".to_owned())
         );
         assert_eq!(queue.join(channel.clone()), Ok(false));
@@ -169,12 +191,12 @@ mod tests {
         let mut joins = RateLimiter::join();
         let elevated = HashSet::new();
         assert!(chat.try_consume_at(&first, false, now));
-        assert!(queue.message(first.clone(), "first 1".to_owned()));
-        assert!(queue.message(first, "first 2".to_owned()));
-        assert!(queue.message(second, "second 1".to_owned()));
+        assert!(queue.message(first.clone(), "first 1".to_owned(), None));
+        assert!(queue.message(first, "first 2".to_owned(), None));
+        assert!(queue.message(second, "second 1".to_owned(), None));
 
         assert_eq!(
-            queue.pop_ready(&mut chat, &mut joins, &elevated, now),
+            queue.pop_ready(&mut chat, &mut joins, &elevated, now).map(|message| message.line),
             Some("second 1".to_owned())
         );
         assert!(queue
@@ -187,7 +209,7 @@ mod tests {
                     &mut joins,
                     &elevated,
                     now + Duration::from_secs(seconds),
-                ),
+                ).map(|message| message.line),
                 Some(expected.to_owned())
             );
         }
@@ -197,16 +219,35 @@ mod tests {
     fn pending_chat_has_count_and_byte_bounds_and_leave_releases_both() {
         let mut queue = OutboundQueue::default();
         let channel = ChannelId::new("room");
-        assert!(!queue.message(channel.clone(), "x".repeat(MAX_PENDING_CHAT_BYTES + 1)));
+        assert!(!queue.message(channel.clone(), "x".repeat(MAX_PENDING_CHAT_BYTES + 1), None));
         for _ in 0..MAX_PENDING_CHAT {
-            assert!(queue.message(channel.clone(), "line".to_owned()));
+            assert!(queue.message(channel.clone(), "line".to_owned(), None));
         }
-        assert!(!queue.message(channel.clone(), "overflow".to_owned()));
+        assert!(!queue.message(channel.clone(), "overflow".to_owned(), None));
         queue.leave(&channel);
-        assert!(queue.message(channel.clone(), "x".repeat(MAX_PENDING_CHAT_BYTES)));
-        assert!(!queue.message(channel.clone(), "x".to_owned()));
+        assert!(queue.message(channel.clone(), "x".repeat(MAX_PENDING_CHAT_BYTES), None));
+        assert!(!queue.message(channel.clone(), "x".to_owned(), None));
         queue.leave(&channel);
-        assert!(queue.message(channel, "available again".to_owned()));
+        assert!(queue.message(channel, "available again".to_owned(), None));
+    }
+
+    #[tokio::test]
+    async fn rejected_canceled_and_dropped_output_complete_receipts() {
+        let channel = ChannelId::new("room");
+        let mut queue = OutboundQueue::default();
+        let (sender, receiver) = oneshot::channel();
+        assert!(!queue.message(channel.clone(), "x".repeat(MAX_PENDING_CHAT_BYTES + 1), Some(sender)));
+        assert!(receiver.await.unwrap().unwrap_err().contains("queue is full"));
+
+        let (sender, receiver) = oneshot::channel();
+        assert!(queue.message(channel.clone(), "pending".into(), Some(sender)));
+        queue.leave(&channel);
+        assert!(receiver.await.unwrap().unwrap_err().contains("channel was closed"));
+
+        let (sender, receiver) = oneshot::channel();
+        assert!(queue.message(channel, "pending".into(), Some(sender)));
+        drop(queue);
+        assert!(receiver.await.is_err());
     }
 
     #[test]

@@ -1,6 +1,46 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+
+fn provider_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("create emote provider HTTP client")
+}
+
+/// Bound metadata responses before parsing JSON, including chunked responses.
+pub async fn read_bounded_json<T: serde::de::DeserializeOwned>(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Option<T> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return None;
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if body.len().checked_add(chunk.len())? > max_bytes {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).ok()
+}
+
+async fn fetch_channel_json<T: serde::de::DeserializeOwned>(
+    request: reqwest::RequestBuilder,
+) -> Option<Option<T>> {
+    let response = request.send().await.ok()?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Some(None);
+    }
+    let response = response.error_for_status().ok()?;
+    read_bounded_json(response, 8 * 1024 * 1024).await.map(Some)
+}
 /// Fix FFZ protocol-relative URLs ("//cdn.frankerfacez.com/...") by prepending "https:".
 pub fn ffz_fix_url(url: String) -> String {
     if url.starts_with("//") {
@@ -11,7 +51,7 @@ pub fn ffz_fix_url(url: String) -> String {
 }
 // EmoteInfo: structure for emote metadata
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmoteInfo {
     /// Provider-scoped opaque id.
     pub id: String,
@@ -34,7 +74,8 @@ pub struct EmoteInfo {
 pub trait EmoteProvider: Send + Sync {
     fn name(&self) -> &'static str;
     async fn load_global(&self) -> Vec<EmoteInfo>;
-    async fn load_channel(&self, channel_id: &str) -> Vec<EmoteInfo>;
+    /// `None` is a failed refresh; `Some([])` is a successfully empty set.
+    async fn load_channel(&self, channel_id: &str) -> Option<Vec<EmoteInfo>>;
 }
 
 // BTTV: BetterTTV emote provider implementation
@@ -46,7 +87,7 @@ pub struct BttvProvider {
 impl BttvProvider {
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: provider_client(),
         }
     }
 }
@@ -100,7 +141,7 @@ impl EmoteProvider for BttvProvider {
         }
     }
 
-    async fn load_channel(&self, channel_id: &str) -> Vec<EmoteInfo> {
+    async fn load_channel(&self, channel_id: &str) -> Option<Vec<EmoteInfo>> {
         let url = format!("https://api.betterttv.net/3/cached/users/twitch/{channel_id}");
         #[derive(Deserialize)]
         struct BttvChannel {
@@ -109,31 +150,16 @@ impl EmoteProvider for BttvProvider {
             #[serde(rename = "sharedEmotes")]
             shared_emotes: Vec<BttvEmote>,
         }
-        match self.client.get(&url).send().await {
-            Ok(resp) if !resp.status().is_success() => {
-                tracing::debug!(
-                    "BTTV channel returned HTTP {} for {channel_id}",
-                    resp.status()
-                );
-                vec![]
-            }
-            Ok(resp) => match resp.json::<BttvChannel>().await {
-                Ok(ch) => ch
-                    .channel_emotes
-                    .into_iter()
-                    .chain(ch.shared_emotes)
-                    .map(|e| e.into_info("bttv"))
-                    .collect(),
-                Err(e) => {
-                    tracing::warn!("BTTV channel parse failed: {e}");
-                    vec![]
-                }
-            },
-            Err(e) => {
-                tracing::warn!("BTTV channel fetch failed: {e}");
-                vec![]
-            }
-        }
+        let Some(ch) = fetch_channel_json::<BttvChannel>(self.client.get(&url)).await? else {
+            return Some(Vec::new());
+        };
+        Some(
+            ch.channel_emotes
+                .into_iter()
+                .chain(ch.shared_emotes)
+                .map(|emote| emote.into_info("bttv"))
+                .collect(),
+        )
     }
 }
 
@@ -146,7 +172,7 @@ pub struct FfzProvider {
 impl FfzProvider {
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: provider_client(),
         }
     }
 }
@@ -202,7 +228,7 @@ impl EmoteProvider for FfzProvider {
         }
     }
 
-    async fn load_channel(&self, channel_id: &str) -> Vec<EmoteInfo> {
+    async fn load_channel(&self, channel_id: &str) -> Option<Vec<EmoteInfo>> {
         // FFZ room by Twitch user-id: https://api.frankerfacez.com/v1/room/id/<id>
         #[derive(Deserialize)]
         struct FfzEmote {
@@ -220,38 +246,23 @@ impl EmoteProvider for FfzProvider {
         }
 
         let url = format!("https://api.frankerfacez.com/v1/room/id/{channel_id}");
-        match self.client.get(&url).send().await {
-            Ok(resp) if !resp.status().is_success() => {
-                tracing::debug!(
-                    "FFZ channel returned HTTP {} for {channel_id}",
-                    resp.status()
-                );
-                vec![]
-            }
-            Ok(resp) => match resp.json::<FfzRoom>().await {
-                Ok(r) => r
-                    .sets
-                    .into_values()
-                    .flat_map(|s| s.emoticons)
-                    .map(|e| EmoteInfo {
-                        id: e.id.to_string(),
-                        code: e.name.clone(),
-                        url_1x: ffz_fix_url(e.urls.get("1").cloned().unwrap_or_default()),
-                        url_2x: e.urls.get("2").cloned().map(ffz_fix_url),
-                        url_4x: e.urls.get("4").cloned().map(ffz_fix_url),
-                        provider: "ffz".to_owned(),
-                    })
-                    .collect(),
-                Err(e) => {
-                    tracing::warn!("FFZ channel parse failed: {e}");
-                    vec![]
-                }
-            },
-            Err(e) => {
-                tracing::warn!("FFZ channel fetch failed: {e}");
-                vec![]
-            }
-        }
+        let Some(room) = fetch_channel_json::<FfzRoom>(self.client.get(&url)).await? else {
+            return Some(Vec::new());
+        };
+        Some(
+            room.sets
+                .into_values()
+                .flat_map(|set| set.emoticons)
+                .map(|emote| EmoteInfo {
+                    id: emote.id.to_string(),
+                    code: emote.name,
+                    url_1x: ffz_fix_url(emote.urls.get("1").cloned().unwrap_or_default()),
+                    url_2x: emote.urls.get("2").cloned().map(ffz_fix_url),
+                    url_4x: emote.urls.get("4").cloned().map(ffz_fix_url),
+                    provider: "ffz".to_owned(),
+                })
+                .collect(),
+        )
     }
 }
 
@@ -264,8 +275,12 @@ pub struct SevenTvProvider {
 impl SevenTvProvider {
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: provider_client(),
         }
+    }
+
+    pub fn with_client(client: reqwest::Client) -> Self {
+        Self { client }
     }
 }
 
@@ -280,9 +295,9 @@ impl EmoteProvider for SevenTvProvider {
         self.fetch_emote_set(url).await
     }
 
-    async fn load_channel(&self, channel_id: &str) -> Vec<EmoteInfo> {
+    async fn load_channel(&self, channel_id: &str) -> Option<Vec<EmoteInfo>> {
         let url = format!("https://7tv.io/v3/users/twitch/{channel_id}");
-        self.fetch_user_emote_set(&url, "7tv channel").await
+        self.fetch_user_emote_set(&url).await
     }
 }
 
@@ -309,8 +324,8 @@ impl EmoteProvider for TwitchGlobalProvider {
         twitch_global_emotes()
     }
 
-    async fn load_channel(&self, _channel_id: &str) -> Vec<EmoteInfo> {
-        vec![]
+    async fn load_channel(&self, _channel_id: &str) -> Option<Vec<EmoteInfo>> {
+        Some(vec![])
     }
 }
 
@@ -370,7 +385,7 @@ pub struct KickProvider {
 impl KickProvider {
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: provider_client(),
         }
     }
 }
@@ -386,35 +401,19 @@ impl EmoteProvider for KickProvider {
         vec![]
     }
 
-    async fn load_channel(&self, channel_id: &str) -> Vec<EmoteInfo> {
+    async fn load_channel(&self, channel_id: &str) -> Option<Vec<EmoteInfo>> {
         let url = format!("https://kick.com/emotes/{channel_id}");
-        match self
+        let request = self
             .client
             .get(&url)
             .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-            .header(reqwest::header::ACCEPT, "application/json")
-            .send()
-            .await
-        {
-            Ok(resp) if !resp.status().is_success() => {
-                tracing::debug!(
-                    "Kick channel emotes returned HTTP {} for {channel_id}",
-                    resp.status()
-                );
-                vec![]
-            }
-            Ok(resp) => match resp.json::<serde_json::Value>().await {
-                Ok(v) => parse_kick_emotes(v),
-                Err(e) => {
-                    tracing::warn!("Kick channel emotes parse failed: {e}");
-                    vec![]
-                }
-            },
-            Err(e) => {
-                tracing::warn!("Kick channel emotes fetch failed: {e}");
-                vec![]
-            }
-        }
+            .header(reqwest::header::ACCEPT, "application/json");
+        Some(
+            fetch_channel_json::<serde_json::Value>(request)
+                .await?
+                .map(parse_kick_emotes)
+                .unwrap_or_default(),
+        )
     }
 }
 
@@ -483,35 +482,57 @@ fn choose_7tv_smallest_file(files: &[EmoteFile]) -> Option<&EmoteFile> {
         .or_else(|| files.first())
 }
 
+fn personal_emote_set_id(user: &serde_json::Value) -> Option<&str> {
+    user.get("user")
+        .unwrap_or(user)
+        .get("emote_sets")?
+        .as_array()?
+        .iter()
+        .find_map(|set| {
+            let flags = set.get("flags")?.as_u64()?;
+            let id = set.get("id")?.as_str()?;
+            (flags & (1 << 2) != 0
+                && !id.is_empty()
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'))
+            .then_some(id)
+        })
+}
+
 impl SevenTvProvider {
-    async fn fetch_user_emote_set(&self, url: &str, label: &str) -> Vec<EmoteInfo> {
+    /// Reuse the user lookup already made for cosmetics; only a personal set needs another request.
+    pub async fn load_personal_from_user(
+        &self,
+        user: &serde_json::Value,
+    ) -> Option<Vec<EmoteInfo>> {
+        let Some(set_id) = personal_emote_set_id(user) else {
+            return Some(Vec::new());
+        };
+        let response = self
+            .client
+            .get(format!("https://7tv.io/v3/emote-sets/{set_id}"))
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?;
+        let set = read_bounded_json::<EmoteSetResp>(response, 8 * 1024 * 1024).await?;
+        Some(Self::parse_emote_set(set))
+    }
+
+    async fn fetch_user_emote_set(&self, url: &str) -> Option<Vec<EmoteInfo>> {
         #[derive(Deserialize)]
         struct UserResp {
             emote_set: Option<EmoteSetResp>,
         }
-        match self.client.get(url).send().await {
-            Ok(r) if !r.status().is_success() => {
-                tracing::debug!("{label} returned HTTP {}", r.status());
-                vec![]
-            }
-            Ok(r) => match r.json::<UserResp>().await {
-                Ok(u) => {
-                    if let Some(set) = u.emote_set {
-                        Self::parse_emote_set(set)
-                    } else {
-                        vec![]
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("{label} parse failed: {e}");
-                    vec![]
-                }
-            },
-            Err(e) => {
-                tracing::warn!("{label} fetch failed: {e}");
-                vec![]
-            }
-        }
+        Some(
+            fetch_channel_json::<UserResp>(self.client.get(url))
+                .await?
+                .and_then(|user| user.emote_set)
+                .map(Self::parse_emote_set)
+                .unwrap_or_default(),
+        )
     }
 
     async fn fetch_emote_set(&self, url: &str) -> Vec<EmoteInfo> {
@@ -531,9 +552,9 @@ impl SevenTvProvider {
     }
 
     /// Load 7TV emotes for a Kick user-id.
-    pub async fn load_kick_channel(&self, kick_user_id: &str) -> Vec<EmoteInfo> {
+    pub async fn load_kick_channel(&self, kick_user_id: &str) -> Option<Vec<EmoteInfo>> {
         let url = format!("https://7tv.io/v3/users/kick/{kick_user_id}");
-        self.fetch_user_emote_set(&url, "7tv kick channel").await
+        self.fetch_user_emote_set(&url).await
     }
 
     fn parse_emote_set(set: EmoteSetResp) -> Vec<EmoteInfo> {
@@ -674,9 +695,114 @@ fn normalize_kick_url(url: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn personal_sets_are_selected_by_the_personal_flag_not_the_channel_set() {
+        let response = serde_json::json!({
+            "emote_set": { "id": "channel" },
+            "user": { "emote_sets": [
+                { "id": "regular", "flags": 0 },
+                { "id": "personal", "flags": 4 }
+            ]}
+        });
+        assert_eq!(personal_emote_set_id(&response), Some("personal"));
+        assert_eq!(personal_emote_set_id(&response["user"]), Some("personal"));
+        assert!(personal_emote_set_id(&serde_json::json!({
+            "emote_set": { "id": "channel" },
+            "user": { "emote_sets": [{ "id": "regular", "flags": 0 }] }
+        }))
+        .is_none());
+    }
+
+    async fn read_http_headers(stream: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt;
+        let mut request = Vec::new();
+        let mut chunk = [0; 512];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let received = stream.read(&mut chunk).await.unwrap();
+            assert!(received > 0, "client closed before sending HTTP headers");
+            request.extend_from_slice(&chunk[..received]);
+            assert!(request.len() <= 8192, "unexpectedly large test request");
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_reads_reject_oversized_bodies_with_or_without_content_length() {
+        use tokio::io::AsyncWriteExt;
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        for (chunked, limit, accepted) in [(false, 16, false), (true, 16, false), (true, 128, true)]
+        {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_http_headers(&mut stream).await;
+                let body = br#"{"data":"metadata longer than the configured limit"}"#;
+                let response = if chunked {
+                    format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                        body.len(), std::str::from_utf8(body).unwrap())
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        std::str::from_utf8(body).unwrap()
+                    )
+                };
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+            let response = client
+                .get(format!("http://{address}/user"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                read_bounded_json::<serde_json::Value>(response, limit)
+                    .await
+                    .is_some(),
+                accepted
+            );
+            server.await.unwrap();
+        }
+    }
+
     fn parse_7tv_set(value: serde_json::Value) -> Vec<EmoteInfo> {
         let set: EmoteSetResp = serde_json::from_value(value).expect("valid emote set json");
         SevenTvProvider::parse_emote_set(set)
+    }
+
+    #[tokio::test]
+    async fn channel_json_distinguishes_missing_sets_from_failed_refreshes() {
+        use tokio::io::AsyncWriteExt;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        for (status, body, succeeded, absent) in [
+            (404, "", true, true),
+            (503, "{}", false, false),
+            (200, "invalid", false, false),
+            (200, "{\"emotes\":[]}", true, false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_http_headers(&mut stream).await;
+                let response = format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+            let result =
+                fetch_channel_json::<EmoteSetResp>(client.get(format!("http://{address}/set")))
+                    .await;
+            assert_eq!(result.is_some(), succeeded);
+            assert_eq!(matches!(result, Some(None)), absent);
+            server.await.unwrap();
+        }
     }
 
     #[test]

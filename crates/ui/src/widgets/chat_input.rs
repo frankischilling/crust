@@ -5,9 +5,7 @@ use std::sync::Arc;
 
 use egui::{Color32, Id, Key, LayerId, Order, Pos2, RichText, Stroke, Ui, Vec2};
 
-use crate::commands::{
-    extract_slash_query, slash_command_matches_ranked, SlashCommandSuggestion,
-};
+use crate::commands::{extract_slash_query, slash_command_matches_ranked, SlashCommandSuggestion};
 use crate::theme as t;
 use crust_core::model::{ChannelId, EmoteCatalogEntry, ReplyInfo, IRC_SERVER_CONTROL_CHANNEL};
 
@@ -52,8 +50,12 @@ impl TabState {
         let word = &self.matches[self.index];
         let separator = if self.suffix.is_empty() { " " } else { "" };
         *buf = format!("{}{}{}{}", self.prefix, word, separator, self.suffix);
-        let following_space = self.suffix.chars().next()
-            .filter(|ch| ch.is_whitespace()).map_or(separator.len(), char::len_utf8);
+        let following_space = self
+            .suffix
+            .chars()
+            .next()
+            .filter(|ch| ch.is_whitespace())
+            .map_or(separator.len(), char::len_utf8);
         let cursor = self.prefix.len() + word.len() + following_space;
         self.expected_buf.clone_from(buf);
         self.expected_cursor = buf[..cursor].chars().count();
@@ -84,13 +86,15 @@ impl Default for HistState {
 
 /// Chat input bar shown at the bottom of the message area.
 pub struct ChatInput<'a> {
+    /// Explicit identity keeps keyboard focus independent of the pane's layout.
+    pub id: Option<Id>,
     /// The active channel to send messages to.
     pub channel: &'a ChannelId,
     /// Whether the user is authenticated (can send).
     pub logged_in: bool,
     /// The current username (for display).
     pub username: Option<&'a str>,
-    /// Full emote catalog for autocomplete.
+    /// Emotes available in this channel to the current account.
     pub emote_catalog: &'a [EmoteCatalogEntry],
     /// Loaded emote image bytes for rendering previews.
     pub emote_bytes: &'a UiImageCache,
@@ -151,7 +155,20 @@ impl<'a> ChatInput<'a> {
             add_to_dictionary: None,
         };
 
-        let text_edit_id = ui.id().with("chat_input");
+        let text_edit_id = self.id.unwrap_or_else(|| ui.id().with("chat_input"));
+        let scope_id = text_edit_id.with("completion_channel");
+        let channel_scope = Id::new(self.channel);
+        let channel_changed = ui.data_mut(|data| {
+            let changed = data.get_temp::<Id>(scope_id) != Some(channel_scope);
+            if changed {
+                data.insert_temp(scope_id, channel_scope);
+            }
+            changed
+        });
+        if channel_changed {
+            invalidate_emote_completions(ui.ctx(), text_edit_id);
+            ui.data_mut(|data| data.remove::<HistState>(text_edit_id.with("msg_history_state")));
+        }
         let input_had_focus = ui.memory(|m| m.has_focus(text_edit_id));
         let mut retain_keyboard_focus = false;
 
@@ -228,45 +245,8 @@ impl<'a> ChatInput<'a> {
                 .inner_margin(egui::Margin::symmetric(12, 4))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        // Left accent stripe
-                        let (rect, _) =
-                            ui.allocate_exact_size(egui::vec2(2.0, 14.0), egui::Sense::hover());
-                        ui.painter().rect_filled(rect, 0.0, t::accent());
-
-                        ui.label(
-                            RichText::new(format!("↩  Replying to @{}", rep.parent_display_name))
-                                .font(t::small())
-                                .color(t::accent())
-                                .strong(),
-                        );
-                        let body = if rep.parent_msg_body.chars().count() > 60 {
-                            let cut = rep
-                                .parent_msg_body
-                                .char_indices()
-                                .nth(60)
-                                .map(|(i, _)| i)
-                                .unwrap_or(rep.parent_msg_body.len());
-                            format!("\"{}\u{2026}\"", &rep.parent_msg_body[..cut])
-                        } else {
-                            format!("\"{}\"", rep.parent_msg_body)
-                        };
-
-                        // Reserve 24px for the dismiss button; shrink body
-                        // with truncation at narrow widths.
-                        let btn_reserve = 24.0;
-                        let body_max_w = (ui.available_width() - btn_reserve).max(0.0);
-                        ui.allocate_ui(egui::vec2(body_max_w, ui.available_height()), |ui| {
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(body).font(t::small()).color(t::text_muted()),
-                                )
-                                .truncate(),
-                            );
-                        });
-
-                        // Dismiss button - right-aligned, always reachable.
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
                             if ui
                                 .small_button("✕")
                                 .on_hover_text("Dismiss reply")
@@ -274,6 +254,17 @@ impl<'a> ChatInput<'a> {
                             {
                                 result.dismiss_reply = true;
                             }
+                            let preview = format!(
+                                "↩ Replying to @{}: {}",
+                                rep.parent_display_name, rep.parent_msg_body
+                            );
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&preview).font(t::small()).color(t::accent()),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(preview);
                         });
                     });
                 });
@@ -344,16 +335,35 @@ impl<'a> ChatInput<'a> {
 
                     if input_had_focus {
                         ui.input_mut(|i| {
-                            reverse_tab = crate::app::consume_exact_key(i, egui::Modifiers::SHIFT, Key::Tab);
-                            consumed_tab = reverse_tab || crate::app::consume_exact_key(i, egui::Modifiers::NONE, Key::Tab);
-                            consumed_up = crate::app::consume_exact_key(i, egui::Modifiers::NONE, Key::ArrowUp);
-                            consumed_down = crate::app::consume_exact_key(i, egui::Modifiers::NONE, Key::ArrowDown);
+                            reverse_tab =
+                                crate::app::consume_exact_key(i, egui::Modifiers::SHIFT, Key::Tab);
+                            consumed_tab = reverse_tab
+                                || crate::app::consume_exact_key(
+                                    i,
+                                    egui::Modifiers::NONE,
+                                    Key::Tab,
+                                );
+                            consumed_up = crate::app::consume_exact_key(
+                                i,
+                                egui::Modifiers::NONE,
+                                Key::ArrowUp,
+                            );
+                            consumed_down = crate::app::consume_exact_key(
+                                i,
+                                egui::Modifiers::NONE,
+                                Key::ArrowDown,
+                            );
                             if autocomplete_active {
-                                consumed_enter = crate::app::consume_exact_key(i, egui::Modifiers::NONE, Key::Enter);
+                                consumed_enter = crate::app::consume_exact_key(
+                                    i,
+                                    egui::Modifiers::NONE,
+                                    Key::Enter,
+                                );
                             }
                         });
                     }
-                    retain_keyboard_focus |= consumed_tab || consumed_enter || consumed_up || consumed_down;
+                    retain_keyboard_focus |=
+                        consumed_tab || consumed_enter || consumed_up || consumed_down;
 
                     // Text input - reserve space for emote button + Send button + gaps
                     // At narrow widths, hide Send button and emote picker to maximise input
@@ -437,7 +447,8 @@ impl<'a> ChatInput<'a> {
                     let input_active = resp.has_focus() || input_had_focus;
                     let cursor_byte = cursor_byte_index(ui.ctx(), text_edit_id, buf);
                     let query = &buf[..cursor_byte];
-                    let reuse_matches = input_had_focus && !resp.changed() && cursor_byte == pre_cursor;
+                    let reuse_matches =
+                        input_had_focus && !resp.changed() && cursor_byte == pre_cursor;
                     let matches = if !input_active {
                         Vec::new()
                     } else if reuse_matches {
@@ -570,7 +581,8 @@ impl<'a> ChatInput<'a> {
 
                         // Bare-word Tab completion (emotes + usernames)
                         if consumed_tab {
-                            let mut session: TabState = ui.ctx()
+                            let mut session: TabState = ui
+                                .ctx()
                                 .data(|data| data.get_temp(tab_id).unwrap_or_default());
                             let cursor = buf[..cursor_byte].chars().count();
                             let continuing = !session.matches.is_empty()
@@ -578,7 +590,8 @@ impl<'a> ChatInput<'a> {
                                 && session.expected_cursor == cursor;
                             if continuing {
                                 session.index = if reverse_tab {
-                                    (session.index + session.matches.len() - 1) % session.matches.len()
+                                    (session.index + session.matches.len() - 1)
+                                        % session.matches.len()
                                 } else {
                                     (session.index + 1) % session.matches.len()
                                 };
@@ -588,18 +601,37 @@ impl<'a> ChatInput<'a> {
                             } else {
                                 let range = completion_token_range(buf, cursor_byte);
                                 let word = &buf[range.start..cursor_byte];
-                                let choices = bare_completion_matches(word, self.emote_catalog, self.chatters);
+                                let choices = bare_completion_matches(
+                                    word,
+                                    self.emote_catalog,
+                                    self.chatters,
+                                );
                                 if choices.is_empty() {
-                                    ui.ctx().data_mut(|data| data.insert_temp(tab_id, TabState::default()));
+                                    ui.ctx().data_mut(|data| {
+                                        data.insert_temp(tab_id, TabState::default())
+                                    });
                                 } else {
                                     let selected = if reverse_tab { choices.len() - 1 } else { 0 };
-                                    apply_completion(ui.ctx(), text_edit_id, buf, cursor_byte, choices, selected, true);
+                                    apply_completion(
+                                        ui.ctx(),
+                                        text_edit_id,
+                                        buf,
+                                        cursor_byte,
+                                        choices,
+                                        selected,
+                                        true,
+                                    );
                                 }
                             }
-                            ui.ctx().memory_mut(|memory| memory.request_focus(text_edit_id));
+                            ui.ctx()
+                                .memory_mut(|memory| memory.request_focus(text_edit_id));
                         } else {
                             // Any non-Tab keystroke invalidates the tab session
-                            if consumed_up || consumed_down || resp.changed() || cursor_byte != pre_cursor {
+                            if consumed_up
+                                || consumed_down
+                                || resp.changed()
+                                || cursor_byte != pre_cursor
+                            {
                                 ui.ctx()
                                     .data_mut(|d| d.insert_temp(tab_id, TabState::default()));
                             }
@@ -648,29 +680,80 @@ impl<'a> ChatInput<'a> {
 
                     // Replace the :query token with the accepted emote
                     if let Some(ref code) = accepted_emote {
-                        let choices: Vec<String> = matches.iter().map(|entry| entry.code.clone()).collect();
-                        let selected = choices.iter().position(|candidate| candidate == code).unwrap_or(0);
-                        apply_completion(ui.ctx(), text_edit_id, buf, cursor_byte, choices, selected, consumed_tab);
+                        let choices: Vec<String> =
+                            matches.iter().map(|entry| entry.code.clone()).collect();
+                        let selected = choices
+                            .iter()
+                            .position(|candidate| candidate == code)
+                            .unwrap_or(0);
+                        apply_completion(
+                            ui.ctx(),
+                            text_edit_id,
+                            buf,
+                            cursor_byte,
+                            choices,
+                            selected,
+                            consumed_tab,
+                        );
                         ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                         ac_sel = 0;
                     }
                     if let Some(ref username) = accepted_username {
-                        let choices: Vec<String> = username_matches.iter().map(|name| format!("@{name}")).collect();
-                        let selected = username_matches.iter().position(|candidate| candidate == username).unwrap_or(0);
-                        apply_completion(ui.ctx(), text_edit_id, buf, cursor_byte, choices, selected, consumed_tab);
+                        let choices: Vec<String> = username_matches
+                            .iter()
+                            .map(|name| format!("@{name}"))
+                            .collect();
+                        let selected = username_matches
+                            .iter()
+                            .position(|candidate| candidate == username)
+                            .unwrap_or(0);
+                        apply_completion(
+                            ui.ctx(),
+                            text_edit_id,
+                            buf,
+                            cursor_byte,
+                            choices,
+                            selected,
+                            consumed_tab,
+                        );
                         ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                         ac_sel = 0;
                     }
                     if let Some(ref command) = accepted_slash_cmd {
-                        let choices: Vec<String> = slash_matches.iter().map(|entry| format!("/{}", entry.name)).collect();
-                        let selected = slash_matches.iter().position(|candidate| &candidate.name == command).unwrap_or(0);
-                        apply_completion(ui.ctx(), text_edit_id, buf, cursor_byte, choices, selected, consumed_tab);
+                        let choices: Vec<String> = slash_matches
+                            .iter()
+                            .map(|entry| format!("/{}", entry.name))
+                            .collect();
+                        let selected = slash_matches
+                            .iter()
+                            .position(|candidate| &candidate.name == command)
+                            .unwrap_or(0);
+                        apply_completion(
+                            ui.ctx(),
+                            text_edit_id,
+                            buf,
+                            cursor_byte,
+                            choices,
+                            selected,
+                            consumed_tab,
+                        );
                         ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                         ac_sel = 0;
                     }
                     if let Some(ref channel_name) = accepted_join_channel {
-                        let selected = join_matches.iter().position(|candidate| candidate == channel_name).unwrap_or(0);
-                        apply_completion(ui.ctx(), text_edit_id, buf, cursor_byte, join_matches.clone(), selected, consumed_tab);
+                        let selected = join_matches
+                            .iter()
+                            .position(|candidate| candidate == channel_name)
+                            .unwrap_or(0);
+                        apply_completion(
+                            ui.ctx(),
+                            text_edit_id,
+                            buf,
+                            cursor_byte,
+                            join_matches.clone(),
+                            selected,
+                            consumed_tab,
+                        );
                         ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                         ac_sel = 0;
                     }
@@ -807,7 +890,15 @@ impl<'a> ChatInput<'a> {
                             if let Some(clicked) =
                                 self.show_autocomplete_popup(ui, &resp, &matches, ac_sel)
                             {
-                                apply_completion(ui.ctx(), text_edit_id, buf, cursor_byte, vec![clicked], 0, false);
+                                apply_completion(
+                                    ui.ctx(),
+                                    text_edit_id,
+                                    buf,
+                                    cursor_byte,
+                                    vec![clicked],
+                                    0,
+                                    false,
+                                );
                                 ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                                 ui.ctx().data_mut(|d| d.insert_temp(ac_id, 0i32));
                             }
@@ -818,20 +909,44 @@ impl<'a> ChatInput<'a> {
                                 &username_matches,
                                 ac_sel,
                             ) {
-                                apply_completion(ui.ctx(), text_edit_id, buf, cursor_byte, vec![format!("@{clicked}")], 0, false);
+                                apply_completion(
+                                    ui.ctx(),
+                                    text_edit_id,
+                                    buf,
+                                    cursor_byte,
+                                    vec![format!("@{clicked}")],
+                                    0,
+                                    false,
+                                );
                                 ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                                 ui.ctx().data_mut(|d| d.insert_temp(ac_id, 0i32));
                             }
                         } else if let Some(clicked) =
                             self.show_slash_autocomplete_popup(ui, &resp, &slash_matches, ac_sel)
                         {
-                            apply_completion(ui.ctx(), text_edit_id, buf, cursor_byte, vec![format!("/{clicked}")], 0, false);
+                            apply_completion(
+                                ui.ctx(),
+                                text_edit_id,
+                                buf,
+                                cursor_byte,
+                                vec![format!("/{clicked}")],
+                                0,
+                                false,
+                            );
                             ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                             ui.ctx().data_mut(|d| d.insert_temp(ac_id, 0i32));
                         } else if let Some(clicked) =
                             self.show_join_autocomplete_popup(ui, &resp, &join_matches, ac_sel)
                         {
-                            apply_completion(ui.ctx(), text_edit_id, buf, cursor_byte, vec![clicked], 0, false);
+                            apply_completion(
+                                ui.ctx(),
+                                text_edit_id,
+                                buf,
+                                cursor_byte,
+                                vec![clicked],
+                                0,
+                                false,
+                            );
                             ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                             ui.ctx().data_mut(|d| d.insert_temp(ac_id, 0i32));
                         }
@@ -1080,12 +1195,15 @@ impl<'a> ChatInput<'a> {
                 memory.request_focus(text_edit_id);
             }
             if memory.has_focus(text_edit_id) {
-                memory.set_focus_lock_filter(text_edit_id, egui::EventFilter {
-                    tab: true,
-                    horizontal_arrows: true,
-                    vertical_arrows: true,
-                    ..Default::default()
-                });
+                memory.set_focus_lock_filter(
+                    text_edit_id,
+                    egui::EventFilter {
+                        tab: true,
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        ..Default::default()
+                    },
+                );
             }
         });
 
@@ -1172,7 +1290,9 @@ impl<'a> ChatInput<'a> {
                                     );
 
                                     if animated && !should_animate {
-                                        if let Some(tex) = self.emote_bytes.static_texture(ui.ctx(), &entry.url) {
+                                        if let Some(tex) =
+                                            self.emote_bytes.static_texture(ui.ctx(), &entry.url)
+                                        {
                                             let size = fit_size(w, h, AUTOCOMPLETE_EMOTE_SIZE);
                                             let image_rect = egui::Rect::from_center_size(
                                                 slot_rect.center(),
@@ -1856,12 +1976,7 @@ fn selected_input_range(
     (!selection.is_empty()).then_some(selection)
 }
 
-fn copy_or_cut_selection(
-    ctx: &egui::Context,
-    id: egui::Id,
-    text: &mut String,
-    cut: bool,
-) {
+fn copy_or_cut_selection(ctx: &egui::Context, id: egui::Id, text: &mut String, cut: bool) {
     let Some(selection) = selected_input_range(ctx, id, text) else {
         return;
     };
@@ -1878,16 +1993,57 @@ fn cursor_byte_index(ctx: &egui::Context, id: Id, buf: &str) -> usize {
     let cursor = egui::TextEdit::load_state(ctx, id)
         .and_then(|state| state.cursor.char_range())
         .map(|range| range.primary.index);
-    cursor.and_then(|cursor| buf.char_indices().nth(cursor).map(|(index, _)| index))
+    cursor
+        .and_then(|cursor| buf.char_indices().nth(cursor).map(|(index, _)| index))
         .unwrap_or(buf.len())
+}
+
+pub fn invalidate_emote_completions(ctx: &egui::Context, id: Id) {
+    ctx.data_mut(|data| {
+        data.remove::<TabState>(id.with("tab_complete_state"));
+        data.remove::<i32>(id.with("autocomplete_selection"));
+    });
+}
+
+pub fn insert_picker_emote(ctx: &egui::Context, id: Id, buf: &mut String, code: &str) {
+    let cursor = cursor_byte_index(ctx, id, buf);
+    let range = selected_input_range(ctx, id, buf).unwrap_or(cursor..cursor);
+    let leading_space = buf[..range.start]
+        .chars()
+        .next_back()
+        .is_some_and(|ch| !ch.is_whitespace());
+    let next = buf[range.end..].chars().next();
+    let trailing_space = next.is_none_or(|ch| !ch.is_whitespace());
+    let inserted = format!(
+        "{}{}{}",
+        if leading_space { " " } else { "" },
+        code,
+        if trailing_space { " " } else { "" }
+    );
+    let end = range.start
+        + inserted.len()
+        + next
+            .filter(|ch| ch.is_whitespace())
+            .map_or(0, char::len_utf8);
+    buf.replace_range(range, &inserted);
+    move_cursor_to_end(ctx, id, buf[..end].chars().count());
+    ctx.data_mut(|data| {
+        data.insert_temp(id.with("tab_complete_state"), TabState::default());
+        data.insert_temp(id.with("msg_history_state"), HistState::default());
+    });
+    ctx.memory_mut(|memory| memory.request_focus(id));
 }
 
 /// The word containing the caret; all offsets are valid UTF-8 byte boundaries.
 fn completion_token_range(buf: &str, caret: usize) -> std::ops::Range<usize> {
-    let start = buf[..caret].char_indices().rev()
+    let start = buf[..caret]
+        .char_indices()
+        .rev()
         .find(|(_, ch)| ch.is_whitespace())
         .map_or(0, |(index, ch)| index + ch.len_utf8());
-    let end = buf[caret..].find(char::is_whitespace).map_or(buf.len(), |index| caret + index);
+    let end = buf[caret..]
+        .find(char::is_whitespace)
+        .map_or(buf.len(), |index| caret + index);
     start..end
 }
 
@@ -1910,10 +2066,16 @@ fn apply_completion(
     };
     let cursor = session.apply(buf);
     move_cursor_to_end(ctx, id, cursor);
-    ctx.data_mut(|data| data.insert_temp(
-        id.with("tab_complete_state"),
-        if keep_cycle { session } else { TabState::default() },
-    ));
+    ctx.data_mut(|data| {
+        data.insert_temp(
+            id.with("tab_complete_state"),
+            if keep_cycle {
+                session
+            } else {
+                TabState::default()
+            },
+        )
+    });
 }
 
 fn bare_completion_matches(
@@ -1924,18 +2086,37 @@ fn bare_completion_matches(
     if word.is_empty() {
         return Vec::new();
     }
-    let (mention, query) = word.strip_prefix('@').map_or((false, word), |query| (true, query));
+    let (mention, query) = word
+        .strip_prefix('@')
+        .map_or((false, word), |query| (true, query));
     let query = query.to_ascii_lowercase();
-    let starts_with = |candidate: &str| candidate.as_bytes().get(..query.len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(query.as_bytes()));
+    let starts_with = |candidate: &str| {
+        candidate
+            .as_bytes()
+            .get(..query.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(query.as_bytes()))
+    };
     let mut matches: Vec<String> = if mention {
         Vec::new()
     } else {
-        catalog.iter().filter(|entry| starts_with(&entry.code)).map(|entry| entry.code.clone()).collect()
+        catalog
+            .iter()
+            .filter(|entry| starts_with(&entry.code))
+            .map(|entry| entry.code.clone())
+            .collect()
     };
-    matches.extend(chatters.iter().filter(|name| starts_with(name)).map(|name| {
-        if mention { format!("@{name}") } else { name.clone() }
-    }));
+    matches.extend(
+        chatters
+            .iter()
+            .filter(|name| starts_with(name))
+            .map(|name| {
+                if mention {
+                    format!("@{name}")
+                } else {
+                    name.clone()
+                }
+            }),
+    );
     matches.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
     matches.dedup();
     matches.truncate(TAB_COMPLETE_MAX);
@@ -2186,6 +2367,7 @@ mod tests {
             ui.memory_mut(|m| m.request_focus(id));
         }
         ChatInput {
+            id: None,
             channel: &ChannelId::new("example"),
             logged_in: true,
             username: None,
@@ -2204,6 +2386,118 @@ mod tests {
     }
 
     #[test]
+    fn long_reply_names_leave_the_dismiss_button_reachable() {
+        for width in [150.0, 210.0, 360.0] {
+            let ctx = egui::Context::default();
+            let reply = ReplyInfo {
+                parent_msg_id: "parent".to_owned(),
+                parent_user_login: "long_sender".to_owned(),
+                parent_display_name: "A very long display name with 日本語".repeat(3),
+                parent_msg_body: "A reply preview that must fit beside its dismiss control"
+                    .repeat(3),
+            };
+            let render = |events: Vec<egui::Event>| {
+                let mut dismissed = false;
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            Pos2::ZERO,
+                            egui::vec2(width, 180.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            dismissed = ChatInput {
+                                id: None,
+                                channel: &ChannelId::new("example"),
+                                logged_in: true,
+                                username: None,
+                                emote_catalog: &[],
+                                emote_bytes: &UiImageCache::default(),
+                                pending_reply: Some(&reply),
+                                message_history: &[],
+                                slash_usage_counts: &HashMap::new(),
+                                known_channels: &[],
+                                chatters: &[],
+                                prevent_overlong_twitch_messages: false,
+                                animate_emotes: false,
+                                accept_dropped_files: false,
+                            }
+                            .show(ui, &mut String::new())
+                            .dismiss_reply;
+                        });
+                    },
+                );
+                let position = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.text() == "✕" => {
+                            let position = text.pos + text.galley.size() / 2.0;
+                            assert!(shape.clip_rect.contains(position));
+                            Some(position)
+                        }
+                        _ => None,
+                    })
+                    .expect("reply dismiss control is visible");
+                assert!(position.x < width);
+                (dismissed, position)
+            };
+            let (_, pos) = render(Vec::new());
+            render(vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+            let (dismissed, _) = render(vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+            assert!(dismissed, "reply dismiss failed at width {width}");
+        }
+    }
+
+    #[test]
+    fn picker_emotes_replace_unicode_selections_and_keep_the_following_text() {
+        let ctx = egui::Context::default();
+        let mut buf = "hé old tail🙂".to_owned();
+        let id = completion_frame(&ctx, &mut buf, Vec::new(), Some(3));
+        let mut state = egui::TextEdit::load_state(&ctx, id).unwrap();
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(3),
+                egui::text::CCursor::new(6),
+            )));
+        state.store(&ctx, id);
+        insert_picker_emote(&ctx, id, &mut buf, "Kappa");
+        assert_eq!(buf, "hé Kappa tail🙂");
+        let state = egui::TextEdit::load_state(&ctx, id).unwrap();
+        assert_eq!(
+            state.cursor.char_range().unwrap().primary.index,
+            "hé Kappa ".chars().count()
+        );
+        assert!(ctx.memory(|memory| memory.has_focus(id)));
+    }
+
+    #[test]
+    fn picker_emotes_insert_at_the_caret_and_separate_adjacent_words() {
+        let ctx = egui::Context::default();
+        let mut buf = "hello🙂world".to_owned();
+        let id = completion_frame(&ctx, &mut buf, Vec::new(), Some(6));
+        insert_picker_emote(&ctx, id, &mut buf, "Kappa");
+        assert_eq!(buf, "hello🙂 Kappa world");
+    }
+
+    #[test]
     fn completion_cycles_at_the_unicode_caret_and_preserves_the_suffix() {
         let ctx = egui::Context::default();
         let mut buf = "é🙂 kaXYZ  tail🙂".to_owned();
@@ -2216,9 +2510,24 @@ mod tests {
         ] {
             assert!(ctx.memory(|memory| memory.has_focus(id)), "before {word}: completion must keep the composer focused; expected={id:?}, focused={:?}", ctx.memory(|memory| memory.focused()));
             completion_frame(&ctx, &mut buf, vec![key(Key::Tab, true, modifiers)], None);
-            let cursor = egui::TextEdit::load_state(&ctx, id).unwrap().cursor.char_range().unwrap();
-            let session: TabState = ctx.data(|data| data.get_temp(id.with("tab_complete_state")).unwrap_or_default());
-            assert_eq!(buf, format!("é🙂 {word}  tail🙂"), "modifiers={modifiers:?}, cursor={}, expected_cursor={}, index={}, matches={:?}", cursor.primary.index, session.expected_cursor, session.index, session.matches);
+            let cursor = egui::TextEdit::load_state(&ctx, id)
+                .unwrap()
+                .cursor
+                .char_range()
+                .unwrap();
+            let session: TabState = ctx.data(|data| {
+                data.get_temp(id.with("tab_complete_state"))
+                    .unwrap_or_default()
+            });
+            assert_eq!(
+                buf,
+                format!("é🙂 {word}  tail🙂"),
+                "modifiers={modifiers:?}, cursor={}, expected_cursor={}, index={}, matches={:?}",
+                cursor.primary.index,
+                session.expected_cursor,
+                session.index,
+                session.matches
+            );
             assert_eq!(cursor.primary.index, format!("é🙂 {word} ").chars().count());
             assert_eq!(cursor.primary.index, cursor.secondary.index);
         }
@@ -2229,8 +2538,85 @@ mod tests {
         let ctx = egui::Context::default();
         let mut buf = "ka tail".to_owned();
         completion_frame(&ctx, &mut buf, Vec::new(), Some(2));
-        completion_frame(&ctx, &mut buf, vec![key(Key::Tab, true, egui::Modifiers::SHIFT)], None);
+        completion_frame(
+            &ctx,
+            &mut buf,
+            vec![key(Key::Tab, true, egui::Modifiers::SHIFT)],
+            None,
+        );
         assert_eq!(buf, "KappaHD tail");
+    }
+
+    #[test]
+    fn catalog_and_channel_changes_end_active_completion_cycles() {
+        for change_channel in [false, true] {
+            let ctx = egui::Context::default();
+            let mut buf = "ka".to_owned();
+            let id = Id::new("scoped_composer");
+            let first_channel = ChannelId::new("first");
+            let second_channel = ChannelId::new("second");
+            let catalog: Vec<_> = ["Kappa", "KappaHD"]
+                .into_iter()
+                .map(|code| EmoteCatalogEntry {
+                    id: code.to_owned(),
+                    code: code.to_owned(),
+                    provider: "7tv".to_owned(),
+                    url: code.to_owned(),
+                    url_hd: None,
+                    scope: "channel".to_owned(),
+                    channel: Some(first_channel.clone()),
+                    user_id: None,
+                })
+                .collect();
+            let render = |buf: &mut String,
+                          channel: &ChannelId,
+                          catalog: &[EmoteCatalogEntry],
+                          tab: bool| {
+                let events = if tab {
+                    vec![
+                        key(Key::Tab, true, egui::Modifiers::NONE),
+                        key(Key::Tab, false, egui::Modifiers::NONE),
+                    ]
+                } else {
+                    Vec::new()
+                };
+                let _ = ctx.run(raw_input(events), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.memory_mut(|memory| memory.request_focus(id));
+                        ChatInput {
+                            id: Some(id),
+                            channel,
+                            logged_in: true,
+                            username: None,
+                            emote_catalog: catalog,
+                            emote_bytes: &UiImageCache::default(),
+                            pending_reply: None,
+                            message_history: &[],
+                            slash_usage_counts: &HashMap::new(),
+                            known_channels: &[],
+                            chatters: &[],
+                            prevent_overlong_twitch_messages: false,
+                            animate_emotes: false,
+                            accept_dropped_files: false,
+                        }
+                        .show(ui, buf);
+                    });
+                });
+            };
+            render(&mut buf, &first_channel, &catalog, false);
+            render(&mut buf, &first_channel, &catalog, true);
+            assert_eq!(buf, "Kappa ");
+            if !change_channel {
+                invalidate_emote_completions(&ctx, id);
+            }
+            let channel = if change_channel {
+                &second_channel
+            } else {
+                &first_channel
+            };
+            render(&mut buf, channel, &catalog[..1], true);
+            assert_eq!(buf, "Kappa ", "removed emotes must leave the active cycle");
+        }
     }
 
     #[test]
@@ -2238,11 +2624,21 @@ mod tests {
         let ctx = egui::Context::default();
         let mut buf = "ka tail".to_owned();
         completion_frame(&ctx, &mut buf, Vec::new(), Some(2));
-        completion_frame(&ctx, &mut buf, vec![key(Key::Tab, true, egui::Modifiers::NONE)], None);
+        completion_frame(
+            &ctx,
+            &mut buf,
+            vec![key(Key::Tab, true, egui::Modifiers::NONE)],
+            None,
+        );
         assert_eq!(buf, "Kappa tail");
         let end = buf.chars().count();
         completion_frame(&ctx, &mut buf, Vec::new(), Some(end));
-        completion_frame(&ctx, &mut buf, vec![key(Key::Tab, true, egui::Modifiers::NONE)], None);
+        completion_frame(
+            &ctx,
+            &mut buf,
+            vec![key(Key::Tab, true, egui::Modifiers::NONE)],
+            None,
+        );
         assert_eq!(buf, "Kappa TailEmote ");
     }
 
@@ -2256,7 +2652,12 @@ mod tests {
             let ctx = egui::Context::default();
             let mut buf = initial.to_owned();
             completion_frame(&ctx, &mut buf, Vec::new(), Some(prefix.chars().count()));
-            completion_frame(&ctx, &mut buf, vec![key(Key::Tab, true, egui::Modifiers::NONE)], None);
+            completion_frame(
+                &ctx,
+                &mut buf,
+                vec![key(Key::Tab, true, egui::Modifiers::NONE)],
+                None,
+            );
             assert_eq!(buf, expected);
         }
     }
@@ -2267,25 +2668,46 @@ mod tests {
         mut events: Vec<egui::Event>,
         caret: Option<usize>,
     ) -> Id {
-        let releases: Vec<_> = events.iter().filter_map(|event| match event {
-            egui::Event::Key { key: Key::Tab, pressed: true, modifiers, .. } => {
-                Some(key(Key::Tab, false, *modifiers))
-            }
-            _ => None,
-        }).collect();
+        let releases: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                egui::Event::Key {
+                    key: Key::Tab,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => Some(key(Key::Tab, false, *modifiers)),
+                _ => None,
+            })
+            .collect();
         events.extend(releases);
-        let catalog: Vec<EmoteCatalogEntry> = ["Kappa", "KappaHD", "TailEmote"].into_iter().map(|code| EmoteCatalogEntry {
-            code: code.to_owned(),
-            provider: "test".to_owned(),
-            url: format!("https://example.test/{code}.png"),
-            scope: "global".to_owned(),
-        }).collect();
+        let catalog: Vec<EmoteCatalogEntry> = ["Kappa", "KappaHD", "TailEmote"]
+            .into_iter()
+            .map(|code| EmoteCatalogEntry {
+                id: code.to_owned(),
+                url_hd: None,
+                channel: None,
+                user_id: None,
+                code: code.to_owned(),
+                provider: "test".to_owned(),
+                url: format!("https://example.test/{code}.png"),
+                scope: "global".to_owned(),
+            })
+            .collect();
         let chatters = ["alice".to_owned(), "alexander".to_owned()];
         let mut id = Id::NULL;
         let _ = ctx.run(raw_input(events), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 id = ui.id().with("chat_input");
-                show_test_input_with_completions(ui, buf, &[], caret.is_some(), false, &catalog, &chatters);
+                show_test_input_with_completions(
+                    ui,
+                    buf,
+                    &[],
+                    caret.is_some(),
+                    false,
+                    &catalog,
+                    &chatters,
+                );
                 if let Some(caret) = caret {
                     move_cursor_to_end(ctx, id, caret);
                 }
@@ -2387,11 +2809,16 @@ mod tests {
                     show_test_input(ui, &mut buf, &[], true, false);
                 });
             });
-            let _ = ctx.run(raw_input(vec![key(Key::Enter, true, egui::Modifiers::NONE)]), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    assert!(show_test_input(ui, &mut buf, &[], false, false).send.is_none());
-                });
-            });
+            let _ = ctx.run(
+                raw_input(vec![key(Key::Enter, true, egui::Modifiers::NONE)]),
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        assert!(show_test_input(ui, &mut buf, &[], false, false)
+                            .send
+                            .is_none());
+                    });
+                },
+            );
             assert_eq!(buf, initial);
             assert!(ctx.memory(|memory| memory.has_focus(input_id)));
         }
@@ -2408,11 +2835,14 @@ mod tests {
             });
         });
         let mut submitted = None;
-        let _ = ctx.run(raw_input(vec![key(Key::Enter, true, egui::Modifiers::NONE)]), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                submitted = show_test_input(ui, &mut buf, &[], false, false).send;
-            });
-        });
+        let _ = ctx.run(
+            raw_input(vec![key(Key::Enter, true, egui::Modifiers::NONE)]),
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    submitted = show_test_input(ui, &mut buf, &[], false, false).send;
+                });
+            },
+        );
         assert_eq!(submitted.as_deref(), Some(original));
         assert!(buf.is_empty());
     }
@@ -2430,46 +2860,63 @@ mod tests {
                 input_rect = ctx.read_response(id).unwrap().rect;
             });
         });
-        let pointer_event = |position, button, pressed| vec![
-            egui::Event::PointerMoved(position),
-            egui::Event::PointerButton {
-                pos: position,
-                button,
-                pressed,
-                modifiers: egui::Modifiers::NONE,
-            },
-        ];
+        let pointer_event = |position, button, pressed| {
+            vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
         for pressed in [true, false] {
-            let _ = ctx.run(raw_input(pointer_event(
-                input_rect.center(), egui::PointerButton::Secondary, pressed,
-            )), |ctx| {
+            let _ = ctx.run(
+                raw_input(pointer_event(
+                    input_rect.center(),
+                    egui::PointerButton::Secondary,
+                    pressed,
+                )),
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        show_test_input(ui, &mut buf, &[], false, false);
+                    });
+                },
+            );
+        }
+        let shapes = ctx
+            .run(raw_input(Vec::new()), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     show_test_input(ui, &mut buf, &[], false, false);
                 });
-            });
-        }
-        let shapes = ctx.run(raw_input(Vec::new()), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                show_test_input(ui, &mut buf, &[], false, false);
-            });
-        }).shapes;
-        let position = shapes.iter().find_map(|shape| match &shape.shape {
-            egui::epaint::Shape::Text(text) if text.galley.text() == "Send now" => {
-                Some(text.pos + text.galley.size() * 0.5)
-            }
-            _ => None,
-        }).expect("context menu should offer Send now");
+            })
+            .shapes;
+        let position = shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.text() == "Send now" => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .expect("context menu should offer Send now");
         let mut submitted = None;
         for pressed in [true, false] {
-            let _ = ctx.run(raw_input(pointer_event(
-                position, egui::PointerButton::Primary, pressed,
-            )), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    if let Some(text) = show_test_input(ui, &mut buf, &[], false, false).send {
-                        submitted = Some(text);
-                    }
-                });
-            });
+            let _ = ctx.run(
+                raw_input(pointer_event(
+                    position,
+                    egui::PointerButton::Primary,
+                    pressed,
+                )),
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        if let Some(text) = show_test_input(ui, &mut buf, &[], false, false).send {
+                            submitted = Some(text);
+                        }
+                    });
+                },
+            );
         }
         assert_eq!(submitted.as_deref(), Some(original));
         assert!(buf.is_empty());
@@ -2485,23 +2932,37 @@ mod tests {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     egui::TextEdit::singleline(&mut buf).id(id).show(ui);
                     let mut state = egui::TextEdit::load_state(ctx, id).unwrap();
-                    state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
-                        egui::text::CCursor::new(primary),
-                        egui::text::CCursor::new(secondary),
-                    )));
+                    state
+                        .cursor
+                        .set_char_range(Some(egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(primary),
+                            egui::text::CCursor::new(secondary),
+                        )));
                     egui::TextEdit::store_state(ctx, id, state);
                     copy_or_cut_selection(ctx, id, &mut buf, false);
                     assert_eq!(buf, "Aé🙂Z tail");
                     copy_or_cut_selection(ctx, id, &mut buf, true);
                     assert_eq!(buf, "AZ tail");
-                    let cursor = egui::TextEdit::load_state(ctx, id).unwrap().cursor.char_range().unwrap();
+                    let cursor = egui::TextEdit::load_state(ctx, id)
+                        .unwrap()
+                        .cursor
+                        .char_range()
+                        .unwrap();
                     assert_eq!(cursor.primary.index, 1);
                     assert_eq!(cursor.secondary.index, 1);
                 });
             });
-            assert_eq!(output.platform_output.commands.iter().filter(|command| {
-                matches!(command, egui::OutputCommand::CopyText(text) if text == "é🙂")
-            }).count(), 2);
+            assert_eq!(
+                output
+                    .platform_output
+                    .commands
+                    .iter()
+                    .filter(|command| {
+                        matches!(command, egui::OutputCommand::CopyText(text) if text == "é🙂")
+                    })
+                    .count(),
+                2
+            );
         }
     }
 

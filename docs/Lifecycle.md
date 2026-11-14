@@ -26,8 +26,8 @@ Notes:
 
 - `entry` defaults to `init.lua`.
 - `permissions` are metadata only for now.
-- A reload replaces the plugin's whole directory.
-- Use `plugin_data_dir()` for writable state.
+- Reloading recreates each plugin's Lua VM and registers its commands and callbacks again.
+- Use `c2.plugin_data_dir()` for writable state.
 
 Directory layout:
 

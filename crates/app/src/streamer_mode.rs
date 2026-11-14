@@ -13,11 +13,12 @@ use crust_core::events::AppEvent;
 use tokio::sync::{mpsc, watch};
 #[cfg(unix)]
 use tracing::debug;
+#[cfg(windows)]
 use tracing::warn;
 
 /// Process names recognised as broadcasting software (case-insensitive match).
-#[cfg(windows)]
-const BROADCASTING_BINARIES: &[&str] = &[
+#[cfg(any(windows, test))]
+const WINDOWS_BROADCASTING_BINARIES: &[&str] = &[
     "obs.exe",
     "obs64.exe",
     "PRISMLiveStudio.exe",
@@ -27,8 +28,8 @@ const BROADCASTING_BINARIES: &[&str] = &[
     "Streamlabs OBS.exe",
 ];
 
-#[cfg(not(windows))]
-const BROADCASTING_BINARIES: &[&str] = &["obs", "Twitch Studio", "Streamlabs Desktop"];
+#[cfg(unix)]
+const UNIX_BROADCASTING_BINARIES: &[&str] = &["obs", "Twitch Studio", "Streamlabs Desktop"];
 
 /// Poll interval matches Chatterino (~20 seconds).
 const POLL_INTERVAL: Duration = Duration::from_secs(20);
@@ -150,7 +151,7 @@ fn is_broadcaster_software_active() -> bool {
 
 #[cfg(unix)]
 fn is_broadcaster_software_active() -> bool {
-    let pattern = BROADCASTING_BINARIES.join("|");
+    let pattern = UNIX_BROADCASTING_BINARIES.join("|");
     let output = Command::new("pgrep").args(["-xi", &pattern]).output();
     match output {
         Ok(o) => o.status.success(),
@@ -168,6 +169,7 @@ fn is_broadcaster_software_active() -> bool {
 
 /// Returns true if the tasklist CSV output contains any broadcasting binary.
 /// Each CSV row's first field is the image name in quotes.
+#[cfg(any(windows, test))]
 fn matches_any_binary(csv_stdout: &str) -> bool {
     for line in csv_stdout.lines() {
         let trimmed = line.trim();
@@ -179,7 +181,7 @@ fn matches_any_binary(csv_stdout: &str) -> bool {
             continue;
         };
         let name = &after[..end];
-        for bin in BROADCASTING_BINARIES {
+        for bin in WINDOWS_BROADCASTING_BINARIES {
             if name.eq_ignore_ascii_case(bin) {
                 return true;
             }

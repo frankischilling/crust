@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use tokio::io::AsyncReadExt;
 use tokio::sync::broadcast;
 
 use bytes::Bytes;
@@ -13,9 +14,10 @@ use directories::ProjectDirs;
 use lru::LruCache;
 use tracing::debug;
 
-use crate::{read_image_response, EmoteError, EmoteInfo};
+use crate::{read_image_response, EmoteError, EmoteInfo, MAX_IMAGE_DOWNLOAD_BYTES};
 
 const IN_MEMORY_CAPACITY: usize = 256;
+const IN_MEMORY_BYTE_LIMIT: usize = 128 * 1024 * 1024;
 const DISK_TTL: Duration = Duration::from_secs(24 * 3600); // 24 h for global
 
 // AssetKey: identifies emote assets by provider, id, and scale
@@ -41,12 +43,73 @@ pub struct EmoteCache {
 }
 
 struct CacheInner {
-    bytes: LruCache<AssetKey, (Bytes, Instant)>,
+    bytes: MemoryCache,
     index: HashMap<String, EmoteInfo>, // code -> info
     /// In-flight request coalescing: URL -> broadcast sender.
     /// While a network fetch is in progress for a URL, subsequent callers
     /// subscribe to the same broadcast instead of issuing a duplicate request.
     in_flight: HashMap<String, broadcast::Sender<Result<(u32, u32, Vec<u8>), String>>>,
+}
+
+struct MemoryCache {
+    entries: LruCache<AssetKey, (Bytes, Instant)>,
+    retained_bytes: usize,
+    byte_limit: usize,
+}
+
+impl MemoryCache {
+    fn new(capacity: usize, byte_limit: usize) -> Self {
+        Self {
+            entries: LruCache::new(std::num::NonZeroUsize::new(capacity).unwrap()),
+            retained_bytes: 0,
+            byte_limit,
+        }
+    }
+
+    fn get(&mut self, key: &AssetKey) -> Option<Bytes> {
+        if self
+            .entries
+            .peek(key)
+            .is_some_and(|(_, fetched_at)| fetched_at.elapsed() >= DISK_TTL)
+        {
+            if let Some((bytes, _)) = self.entries.pop(key) {
+                self.retained_bytes -= bytes.len();
+            }
+            return None;
+        }
+        self.entries.get(key).map(|(bytes, _)| bytes.clone())
+    }
+
+    fn put(&mut self, key: AssetKey, value: (Bytes, Instant)) {
+        if let Some((previous, _)) = self.entries.pop(&key) {
+            self.retained_bytes -= previous.len();
+        }
+        if value.0.len() > self.byte_limit {
+            return;
+        }
+        while self.entries.len() == self.entries.cap().get()
+            || value.0.len() > self.byte_limit - self.retained_bytes
+        {
+            if let Some((_, (bytes, _))) = self.entries.pop_lru() {
+                self.retained_bytes -= bytes.len();
+            } else {
+                break;
+            }
+        }
+        self.retained_bytes += value.0.len();
+        self.entries.put(key, value);
+    }
+
+    #[cfg(test)]
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.retained_bytes = 0;
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 /// Releases waiters even when the task owning a request is cancelled.
@@ -90,7 +153,7 @@ impl EmoteCache {
 
         Ok(Self {
             inner: Arc::new(Mutex::new(CacheInner {
-                bytes: LruCache::new(std::num::NonZeroUsize::new(IN_MEMORY_CAPACITY).unwrap()),
+                bytes: MemoryCache::new(IN_MEMORY_CAPACITY, IN_MEMORY_BYTE_LIMIT),
                 index: HashMap::new(),
                 in_flight: HashMap::new(),
             })),
@@ -120,10 +183,8 @@ impl EmoteCache {
         // 1. Memory
         {
             let mut guard = self.inner.lock().unwrap();
-            if let Some((bytes, ts)) = guard.bytes.get(key) {
-                if ts.elapsed() < DISK_TTL {
-                    return Ok(bytes.clone());
-                }
+            if let Some(bytes) = guard.bytes.get(key) {
+                return Ok(bytes);
             }
         }
 
@@ -184,11 +245,7 @@ impl EmoteCache {
         };
         let cached = {
             let mut guard = self.inner.lock().unwrap();
-            guard
-                .bytes
-                .get(&mem_key)
-                .filter(|(_, ts)| ts.elapsed() < DISK_TTL)
-                .map(|(bytes, _)| bytes.clone())
+            guard.bytes.get(&mem_key)
         };
         if let Some(bytes) = cached {
             let (w, h) = read_header_dims(&bytes)?;
@@ -281,12 +338,22 @@ fn url_hash(url: &str) -> u64 {
 }
 
 async fn read_disk_cache(path: &std::path::Path) -> Option<(Bytes, Instant)> {
-    let modified = tokio::fs::metadata(path).await.ok()?.modified().ok()?;
-    let age = modified.elapsed().ok()?;
-    if age >= DISK_TTL {
-        return None;
-    }
-    let bytes: Bytes = tokio::fs::read(path).await.ok()?.into();
+    let (bytes, age) = {
+        let file = tokio::fs::File::open(path).await.ok()?;
+        let metadata = file.metadata().await.ok()?;
+        let age = metadata.modified().ok()?.elapsed().ok()?;
+        if age >= DISK_TTL || metadata.len() > MAX_IMAGE_DOWNLOAD_BYTES as u64 {
+            return None;
+        }
+        // A bounded read also covers files that grow after the metadata check.
+        let mut reader = file.take(MAX_IMAGE_DOWNLOAD_BYTES as u64 + 1);
+        let mut bytes = Vec::with_capacity(metadata.len().min(64 * 1024) as usize);
+        reader.read_to_end(&mut bytes).await.ok()?;
+        if bytes.len() > MAX_IMAGE_DOWNLOAD_BYTES {
+            return None;
+        }
+        (Bytes::from(bytes), age)
+    };
     if validate_image(bytes.clone()).await.is_err() {
         let _ = tokio::fs::remove_file(path).await;
         return None;
@@ -365,7 +432,12 @@ mod tests {
         respond_with_length(stream, status, bytes, bytes.len()).await;
     }
 
-    async fn respond_with_length(stream: &mut TcpStream, status: &str, bytes: &[u8], length: usize) {
+    async fn respond_with_length(
+        stream: &mut TcpStream,
+        status: &str,
+        bytes: &[u8],
+        length: usize,
+    ) {
         let mut request = Vec::new();
         while !request.windows(4).any(|part| part == b"\r\n\r\n") {
             let mut chunk = [0; 1024];
@@ -374,9 +446,8 @@ mod tests {
             request.extend_from_slice(&chunk[..count]);
             assert!(request.len() <= 16 * 1024, "request headers too large");
         }
-        let headers = format!(
-            "HTTP/1.1 {status}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
-        );
+        let headers =
+            format!("HTTP/1.1 {status}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n");
         stream.write_all(headers.as_bytes()).await.unwrap();
         stream.write_all(bytes).await.unwrap();
         stream.shutdown().await.unwrap();
@@ -394,6 +465,140 @@ mod tests {
             }
         });
         (url, task)
+    }
+
+    fn asset_key(id: &str) -> AssetKey {
+        AssetKey {
+            provider: "test".to_owned(),
+            id: id.to_owned(),
+            scale: 1,
+        }
+    }
+
+    #[test]
+    fn byte_budget_evicts_the_least_recently_used_image() {
+        let mut cache = MemoryCache::new(3, 8);
+        let a = asset_key("a");
+        let b = asset_key("b");
+        let c = asset_key("c");
+        cache.put(a.clone(), (Bytes::from_static(b"aaaa"), Instant::now()));
+        cache.put(b.clone(), (Bytes::from_static(b"bbbb"), Instant::now()));
+        assert!(cache.get(&a).is_some());
+        cache.put(c.clone(), (Bytes::from_static(b"cccc"), Instant::now()));
+        assert!(cache.get(&b).is_none());
+        assert!(cache.get(&a).is_some());
+        assert!(cache.get(&c).is_some());
+        assert_eq!(cache.retained_bytes, 8);
+        assert_eq!(cache.entries.len(), 2);
+    }
+
+    #[test]
+    fn byte_accounting_covers_replacement_expiration_and_oversized_images() {
+        let mut cache = MemoryCache::new(3, 8);
+        let key = asset_key("a");
+        cache.put(key.clone(), (Bytes::from_static(b"aaaa"), Instant::now()));
+        cache.put(key.clone(), (Bytes::from_static(b"aa"), Instant::now()));
+        assert_eq!(cache.retained_bytes, 2);
+        cache.put(
+            asset_key("too-large"),
+            (Bytes::from_static(b"123456789"), Instant::now()),
+        );
+        assert_eq!(cache.retained_bytes, 2);
+        assert_eq!(cache.entries.len(), 1);
+        cache.put(
+            key.clone(),
+            (Bytes::from_static(b"expired"), Instant::now() - DISK_TTL),
+        );
+        assert!(cache.get(&key).is_none());
+        assert_eq!(cache.retained_bytes, 0);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn entry_budget_still_bounds_tiny_images() {
+        let mut cache = MemoryCache::new(2, 64);
+        for id in ["a", "b", "c"] {
+            cache.put(asset_key(id), (Bytes::from_static(b"x"), Instant::now()));
+        }
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.retained_bytes, 2);
+        assert!(cache.get(&asset_key("a")).is_none());
+    }
+
+    #[tokio::test]
+    async fn url_and_asset_requests_share_the_byte_budget_and_reload_from_disk() {
+        let cache = TestCache::new();
+        let first = png(1);
+        let second = png(2);
+        let byte_limit = first.len().max(second.len());
+        cache.0.inner.lock().unwrap().bytes = MemoryCache::new(256, byte_limit);
+        let (url, task) = server(vec![("200 OK", first.clone()), ("200 OK", second.clone())]).await;
+        assert_eq!(
+            cache.0.fetch_and_decode(&url).await.unwrap(),
+            (1, 1, first.clone())
+        );
+        let key = asset_key("second");
+        assert_eq!(
+            cache
+                .0
+                .get_bytes(&key, &format!("{url}?second"))
+                .await
+                .unwrap()
+                .as_ref(),
+            second.as_slice()
+        );
+        task.await.unwrap();
+        {
+            let inner = cache.0.inner.lock().unwrap();
+            assert_eq!(inner.bytes.entries.len(), 1);
+            assert_eq!(inner.bytes.retained_bytes, second.len());
+        }
+        // The server is gone; the evicted image must reload from its disk entry.
+        assert_eq!(
+            cache.0.fetch_and_decode(&url).await.unwrap(),
+            (1, 1, first.clone())
+        );
+        let inner = cache.0.inner.lock().unwrap();
+        assert_eq!(inner.bytes.entries.len(), 1);
+        assert_eq!(inner.bytes.retained_bytes, first.len());
+        assert!(inner.bytes.retained_bytes <= byte_limit);
+    }
+
+    #[tokio::test]
+    async fn oversized_disk_images_are_refetched_through_both_entry_points() {
+        for by_asset_key in [false, true] {
+            let cache = TestCache::new();
+            let replacement = png(2);
+            let (url, task) = server(vec![("200 OK", replacement.clone())]).await;
+            let key = asset_key("oversized-disk");
+            let path = if by_asset_key {
+                cache.0.disk_dir.join("test/oversized-disk_1.bin")
+            } else {
+                cache.url_path(&url)
+            };
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            {
+                let mut file = std::fs::File::create(&path).unwrap();
+                std::io::Write::write_all(&mut file, &png(1)).unwrap();
+                file.set_len(MAX_IMAGE_DOWNLOAD_BYTES as u64 + 1).unwrap();
+            }
+            if by_asset_key {
+                assert_eq!(
+                    cache.0.get_bytes(&key, &url).await.unwrap().as_ref(),
+                    replacement.as_slice()
+                );
+            } else {
+                assert_eq!(
+                    cache.0.fetch_and_decode(&url).await.unwrap(),
+                    (2, 1, replacement.clone())
+                );
+            }
+            task.await.unwrap();
+            assert_eq!(
+                std::fs::metadata(path).unwrap().len(),
+                replacement.len() as u64
+            );
+        }
     }
 
     #[tokio::test]
@@ -426,34 +631,57 @@ mod tests {
             let (mut first, _) = listener.accept().await.unwrap();
             accepted_tx.send(()).unwrap();
             release_rx.await.unwrap();
-            respond_with_length(&mut first, "200 OK", &[], crate::MAX_IMAGE_DOWNLOAD_BYTES + 1).await;
+            respond_with_length(
+                &mut first,
+                "200 OK",
+                &[],
+                crate::MAX_IMAGE_DOWNLOAD_BYTES + 1,
+            )
+            .await;
             let (mut retry, _) = listener.accept().await.unwrap();
             respond(&mut retry, "200 OK", &png(2)).await;
         });
         let leader_cache = cache.0.clone();
         let leader_url = url.clone();
         let leader = tokio::spawn(async move { leader_cache.fetch_and_decode(&leader_url).await });
-        tokio::time::timeout(Duration::from_secs(3), accepted_rx).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(3), accepted_rx)
+            .await
+            .unwrap()
+            .unwrap();
         let waiter_cache = cache.0.clone();
         let waiter_url = url.clone();
         let waiter = tokio::spawn(async move { waiter_cache.fetch_and_decode(&waiter_url).await });
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
-                if cache.0.inner.lock().unwrap().in_flight.get(&url)
+                if cache
+                    .0
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .in_flight
+                    .get(&url)
                     .is_some_and(|tx| tx.receiver_count() > 0)
                 {
                     break;
                 }
                 tokio::task::yield_now().await;
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         release_tx.send(()).unwrap();
-        assert!(matches!(leader.await.unwrap(), Err(EmoteError::ImageTooLarge { .. })));
+        assert!(matches!(
+            leader.await.unwrap(),
+            Err(EmoteError::ImageTooLarge { .. })
+        ));
         assert!(waiter.await.unwrap().is_err());
         assert!(!cache.url_path(&url).exists());
         assert!(cache.0.inner.lock().unwrap().bytes.is_empty());
         assert!(cache.0.inner.lock().unwrap().in_flight.is_empty());
-        assert_eq!(cache.0.fetch_and_decode(&url).await.unwrap(), (2, 1, png(2)));
+        assert_eq!(
+            cache.0.fetch_and_decode(&url).await.unwrap(),
+            (2, 1, png(2))
+        );
         task.await.unwrap();
     }
 
@@ -464,10 +692,23 @@ mod tests {
         let url = format!("http://{}/emote", listener.local_addr().unwrap());
         let task = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            respond_with_length(&mut stream, "200 OK", &[], crate::MAX_IMAGE_DOWNLOAD_BYTES + 1).await;
+            respond_with_length(
+                &mut stream,
+                "200 OK",
+                &[],
+                crate::MAX_IMAGE_DOWNLOAD_BYTES + 1,
+            )
+            .await;
         });
-        let key = AssetKey { provider: "test".into(), id: "large".into(), scale: 1 };
-        assert!(matches!(cache.0.get_bytes(&key, &url).await, Err(EmoteError::ImageTooLarge { .. })));
+        let key = AssetKey {
+            provider: "test".into(),
+            id: "large".into(),
+            scale: 1,
+        };
+        assert!(matches!(
+            cache.0.get_bytes(&key, &url).await,
+            Err(EmoteError::ImageTooLarge { .. })
+        ));
         assert!(cache.0.inner.lock().unwrap().bytes.is_empty());
         assert!(!cache.0.disk_dir.join("test/large_1.bin").exists());
         task.await.unwrap();
@@ -547,6 +788,7 @@ mod tests {
         let inner = cache.0.inner.lock().unwrap();
         assert!(inner
             .bytes
+            .entries
             .iter()
             .all(|(_, (_, fetched_at))| fetched_at.elapsed() >= age));
     }

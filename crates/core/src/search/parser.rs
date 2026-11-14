@@ -1,5 +1,5 @@
 use once_cell::sync::Lazy;
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 
 #[allow(unused_imports)]
 use super::predicate::{FlagKind, Predicate};
@@ -16,9 +16,8 @@ pub struct ParseOutcome {
 }
 
 static TOKEN_RE: Lazy<Regex> = Lazy::new(|| {
-    // Mirrors chatterino's SearchPopup::parsePredicates regex. Captures an
-    // optional negation, then either a `name:value` tag (value may be quoted)
-    // OR a bare non-whitespace run used as a substring.
+    // Capture an optional negation and a tag, or a literal non-whitespace run.
+    // Quoted tag values may contain spaces.
     Regex::new(r#"(?P<neg>[!\-])?(?:(?P<name>\w+):(?P<value>"[^"]*"|\S+))|\S+"#).unwrap()
 });
 
@@ -38,9 +37,10 @@ pub fn parse(input: &str) -> ParseOutcome {
             (Some(tag), Some(val)) => {
                 let val = strip_quotes(val);
                 match dispatch_tag(tag, val) {
+                    Ok(Some(p)) if negated => Predicate::Negated(Box::new(p)),
                     Ok(Some(p)) => p,
                     Ok(None) => {
-                        // Unknown tagwhole match falls back to substring.
+                        // Unknown tags remain literal, including any punctuation.
                         let raw = cap.get(0).unwrap().as_str();
                         Predicate::Substring(raw.to_string())
                     }
@@ -52,19 +52,10 @@ pub fn parse(input: &str) -> ParseOutcome {
             }
             _ => {
                 let text = cap.get(0).unwrap().as_str();
-                let text = text.trim_start_matches(['!', '-']);
-                if text.is_empty() {
-                    continue;
-                }
                 Predicate::Substring(text.to_string())
             }
         };
 
-        let predicate = if negated && name.is_some() {
-            Predicate::Negated(Box::new(predicate))
-        } else {
-            predicate
-        };
         outcome.predicates.push(predicate);
     }
 
@@ -81,7 +72,7 @@ fn strip_quotes(v: &str) -> &str {
 
 /// Dispatches a single `name:value` tag.
 ///
-/// - `Ok(Some(p))`tag recognised.
+/// - `Ok(Some(p))` tag recognised.
 /// - `Ok(None)`   unknown tag (caller falls back to substring).
 /// - `Err(msg)`   recognised tag but value invalid (e.g. bad regex).
 fn dispatch_tag(name: &str, value: &str) -> Result<Option<Predicate>, String> {
@@ -95,8 +86,18 @@ fn dispatch_tag(name: &str, value: &str) -> Result<Option<Predicate>, String> {
             "emote" => Ok(Some(Predicate::Emote)),
             _ => Ok(None),
         },
-        "is" => Ok(flag_kind(value).map(Predicate::Flag)),
-        "regex" => match Regex::new(value) {
+        "is" => {
+            let mut flags: Vec<_> = value
+                .split(',')
+                .filter_map(|value| flag_kind(value.trim()))
+                .collect();
+            Ok(match flags.len() {
+                0 => None,
+                1 => Some(Predicate::Flag(flags.remove(0))),
+                _ => Some(Predicate::AnyFlag(flags)),
+            })
+        }
+        "regex" => match RegexBuilder::new(value).case_insensitive(true).build() {
             Ok(re) => Ok(Some(Predicate::Regex(re))),
             Err(e) => Err(format!("regex error: {e}")),
         },
@@ -130,7 +131,12 @@ fn split_badges(v: &str) -> Vec<String> {
 fn split_subtiers(v: &str) -> Vec<char> {
     v.split(',')
         .map(str::trim)
-        .filter_map(|s| s.chars().next())
+        .filter_map(|s| match s {
+            "1" => Some('1'),
+            "2" => Some('2'),
+            "3" => Some('3'),
+            _ => None,
+        })
         .collect()
 }
 
@@ -140,11 +146,15 @@ fn flag_kind(v: &str) -> Option<FlagKind> {
         "sub" | "subscription" => Some(FlagKind::Sub),
         "reply" => Some(FlagKind::Reply),
         "action" | "me" => Some(FlagKind::Action),
-        "first" | "firstmsg" => Some(FlagKind::FirstMsg),
+        "first" | "firstmsg" | "first-msg" => Some(FlagKind::FirstMsg),
         "pinned" | "pin" => Some(FlagKind::Pinned),
-        "deleted" => Some(FlagKind::Deleted),
+        "deleted" | "disabled" => Some(FlagKind::Deleted),
         "self" => Some(FlagKind::SelfMsg),
         "system" => Some(FlagKind::System),
+        "timeout" | "ban" => Some(FlagKind::Timeout),
+        "cheer" | "cheer-msg" => Some(FlagKind::Cheer),
+        "redemption" => Some(FlagKind::Redemption),
+        "shared" => Some(FlagKind::Shared),
         _ => None,
     }
 }
@@ -176,6 +186,24 @@ mod tests {
         assert_eq!(out.predicates.len(), 2);
         assert!(matches!(&out.predicates[0], Predicate::Substring(s) if s == "hello"));
         assert!(matches!(&out.predicates[1], Predicate::Substring(s) if s == "world"));
+    }
+
+    #[test]
+    fn literal_search_preserves_command_and_negative_number_prefixes() {
+        for literal in ["!uptime", "-42", "!", "--", "!!hello"] {
+            let out = parse(literal);
+            assert_eq!(out.predicates.len(), 1, "{literal}");
+            assert!(matches!(&out.predicates[0], Predicate::Substring(s) if s == literal));
+        }
+    }
+
+    #[test]
+    fn unknown_and_unrecognized_tags_remain_literal_when_prefixed() {
+        for literal in ["!foo:bar", "-has:unknown", "!is:unknown"] {
+            let out = parse(literal);
+            assert_eq!(out.predicates.len(), 1, "{literal}");
+            assert!(matches!(&out.predicates[0], Predicate::Substring(s) if s == literal));
+        }
     }
 
     #[test]
@@ -251,6 +279,31 @@ mod tests {
     }
 
     #[test]
+    fn regex_search_defaults_to_insensitive_with_an_explicit_sensitive_override() {
+        let parsed = parse("regex:^hello$");
+        let Predicate::Regex(regex) = &parsed.predicates[0] else {
+            panic!("expected regex search");
+        };
+        assert!(regex.is_match("HELLO"));
+        let parsed = parse("regex:(?-i)^hello$");
+        let Predicate::Regex(regex) = &parsed.predicates[0] else {
+            panic!("expected regex search");
+        };
+        assert!(regex.is_match("hello"));
+        assert!(!regex.is_match("HELLO"));
+    }
+
+    #[test]
+    fn flag_lists_keep_any_supported_flag_and_apply_negation_to_the_group() {
+        let parsed = parse("!is:deleted,highlighted,unknown");
+        let Predicate::Negated(inner) = &parsed.predicates[0] else {
+            panic!("expected negated flag group");
+        };
+        assert!(matches!(inner.as_ref(), Predicate::AnyFlag(flags)
+            if flags == &vec![FlagKind::Deleted, FlagKind::Highlighted]));
+    }
+
+    #[test]
     fn regex_tag_with_bad_pattern_captures_error() {
         let out = parse(r#"regex:[bad("#);
         assert!(out.predicates.is_empty());
@@ -280,6 +333,15 @@ mod tests {
             panic!()
         };
         assert_eq!(tiers, &vec!['1', '3']);
+    }
+
+    #[test]
+    fn subtier_tag_rejects_partial_and_invalid_numbers() {
+        let out = parse("subtier:12,2x,0,4,3");
+        let Predicate::Subtier(tiers) = &out.predicates[0] else {
+            panic!("expected subscription tiers");
+        };
+        assert_eq!(tiers, &vec!['3']);
     }
 
     #[test]

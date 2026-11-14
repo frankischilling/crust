@@ -56,12 +56,29 @@ pub struct ChannelListResult {
 /// Persistent-per-frame drag tracking stored in egui temp storage.
 #[derive(Clone)]
 struct DragState {
-    /// Index of the channel being dragged.
-    dragging_idx: usize,
+    /// Channel identity survives live filtering and tab-order changes.
+    channel: ChannelId,
     /// Index *before* which the dragged item will be inserted (0 = top).
     insert_before: usize,
     /// True when the pointer has left the sidebar (split-drop mode).
     outside_sidebar: bool,
+}
+
+impl DragState {
+    fn reordered(&self, channels: &[ChannelId]) -> Option<Vec<ChannelId>> {
+        let from = channels
+            .iter()
+            .position(|channel| channel == &self.channel)?;
+        let before = self.insert_before.min(channels.len());
+        let insert = if before > from { before - 1 } else { before };
+        if insert == from {
+            return None;
+        }
+        let mut reordered = channels.to_vec();
+        let channel = reordered.remove(from);
+        reordered.insert(insert, channel);
+        Some(reordered)
+    }
 }
 
 impl<'a> ChannelList<'a> {
@@ -91,7 +108,18 @@ impl<'a> ChannelList<'a> {
                 ui.spacing_mut().item_spacing.y = t::CHANNEL_ROW_GAP;
 
                 // Snapshot drag state at the start of the frame.
-                let drag: Option<DragState> = ui.data(|d| d.get_temp(drag_id));
+                let drag: Option<DragState> = ui.data_mut(|data| {
+                    let drag = data.get_temp::<DragState>(drag_id);
+                    if drag
+                        .as_ref()
+                        .is_some_and(|drag| !self.channels.contains(&drag.channel))
+                    {
+                        data.remove::<DragState>(drag_id);
+                        None
+                    } else {
+                        drag
+                    }
+                });
 
                 if self.show_live_feed_pin {
                     let live_id = crust_core::ChannelId::live_feed();
@@ -255,7 +283,7 @@ impl<'a> ChannelList<'a> {
 
                     // Draw insert-indicator line above this row when dragging.
                     if let Some(ref ds) = drag {
-                        if ds.dragging_idx != idx && ds.insert_before == idx {
+                        if &ds.channel != ch && ds.insert_before == idx {
                             let y = ui.cursor().min.y - t::CHANNEL_ROW_GAP * 0.5;
                             let x_range = ui.max_rect().x_range();
                             ui.painter()
@@ -279,7 +307,7 @@ impl<'a> ChannelList<'a> {
                             d.insert_temp(
                                 drag_id,
                                 DragState {
-                                    dragging_idx: idx,
+                                    channel: ch.clone(),
                                     insert_before: idx,
                                     outside_sidebar: false,
                                 },
@@ -296,7 +324,7 @@ impl<'a> ChannelList<'a> {
                             let new_insert = ((rel_y / stride + 0.5) as usize).min(n);
                             ui.data_mut(|d| {
                                 let mut ds: DragState = d.get_temp(drag_id).unwrap_or(DragState {
-                                    dragging_idx: idx,
+                                    channel: ch.clone(),
                                     insert_before: idx,
                                     outside_sidebar: false,
                                 });
@@ -317,18 +345,11 @@ impl<'a> ChannelList<'a> {
                                 .pointer_latest_pos()
                                 .map(|p| p.x > sidebar_rect.right() + 30.0)
                                 .unwrap_or(false);
-                            if outside {
+                            if outside && self.channels.contains(&ds.channel) {
                                 // Pointer released outside sidebar -> split pane
-                                result.drag_split = Some(self.channels[ds.dragging_idx].clone());
+                                result.drag_split = Some(ds.channel.clone());
                             } else {
-                                let raw = ds.insert_before;
-                                let insert = if raw > ds.dragging_idx { raw - 1 } else { raw };
-                                if insert != ds.dragging_idx {
-                                    let mut new_order: Vec<ChannelId> = self.channels.to_vec();
-                                    let moved = new_order.remove(ds.dragging_idx);
-                                    new_order.insert(insert, moved);
-                                    result.reordered = Some(new_order);
-                                }
+                                result.reordered = ds.reordered(self.channels);
                             }
                         }
                         ui.data_mut(|d| d.remove::<DragState>(drag_id));
@@ -417,10 +438,8 @@ impl<'a> ChannelList<'a> {
                         }
                     });
 
-                    let is_dragging_this = drag
-                        .as_ref()
-                        .map(|ds| ds.dragging_idx == idx)
-                        .unwrap_or(false);
+                    let is_dragging_this =
+                        drag.as_ref().map(|ds| &ds.channel == ch).unwrap_or(false);
                     // Suppress hover style while a drag is in progress.
                     let is_hovered = row_resp.contains_pointer() && drag.is_none();
 
@@ -638,7 +657,7 @@ impl<'a> ChannelList<'a> {
                 // Rendered on a foreground layer, follows the cursor.
                 if let Some(ref ds) = drag {
                     if let Some(pos) = ui.ctx().pointer_latest_pos() {
-                        let dragged_ch = &self.channels[ds.dragging_idx];
+                        let dragged_ch = &ds.channel;
                         let label_text = format!("# {}", dragged_ch.display_name());
                         let is_outside = ds.outside_sidebar;
 
@@ -701,6 +720,49 @@ impl<'a> ChannelList<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drag_reorders_the_same_channel_after_visible_tabs_change() {
+        let first = ChannelId::new("first");
+        let dragged = ChannelId::new("dragged");
+        let last = ChannelId::new("last");
+        let drag = DragState {
+            channel: dragged.clone(),
+            insert_before: usize::MAX,
+            outside_sidebar: false,
+        };
+        assert_eq!(
+            drag.reordered(&[dragged.clone(), last.clone()]),
+            Some(vec![last, dragged.clone()])
+        );
+        assert!(drag.reordered(&[first]).is_none());
+    }
+
+    #[test]
+    fn hiding_the_dragged_channel_cancels_the_drag_without_indexing_another_tab() {
+        let ctx = egui::Context::default();
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                Id::new("channel_list_drag"),
+                DragState {
+                    channel: ChannelId::new("removed"),
+                    insert_before: 8,
+                    outside_sidebar: true,
+                },
+            )
+        });
+        let (result, _) = sidebar_frame(
+            &ctx,
+            0,
+            vec![egui::Event::PointerMoved(egui::pos2(40.0, 40.0))],
+        );
+        assert!(result.reordered.is_none());
+        assert!(result.drag_split.is_none());
+        assert!(!result.dragging_outside);
+        assert!(ctx
+            .data(|data| data.get_temp::<DragState>(Id::new("channel_list_drag")))
+            .is_none());
+    }
 
     fn sidebar_frame(
         ctx: &egui::Context,
@@ -781,7 +843,10 @@ mod tests {
                     modifiers: egui::Modifiers::NONE,
                 }],
             );
-            assert!(result.closed.is_some(), "Close was not clickable with {mentions} mentions");
+            assert!(
+                result.closed.is_some(),
+                "Close was not clickable with {mentions} mentions"
+            );
         }
     }
 }

@@ -145,13 +145,21 @@ The matching callbacks are:
 - `c2.EventType.IvrLogsLoaded`
 - `c2.EventType.IvrLogsFailed`
 
-## `c2.load_older_local_history(channel, before_ts_ms, limit)`
+## `c2.load_older_local_history(channel, before_ts_ms, limit, before_row_id?)`
 
 Load older locally indexed messages for a channel.
 
 - `channel`: channel name string or channel table
-- `before_ts_ms`: inclusive history cutoff in Unix milliseconds
-- `limit`: maximum number of messages to request
+- `before_ts_ms`: history cutoff in Unix milliseconds
+- `limit`: maximum number of messages to request, capped at 5,000
+- `before_row_id`: optional SQLite row cursor from the previous `HistoryLoaded` event
+
+When `before_row_id` is omitted, the cutoff timestamp is exclusive. For later
+pages, pass both `next_ts_ms` and `next_row_id` from the previous event. The pair
+selects rows strictly before that cursor, including
+other messages with the same millisecond timestamp. Stop when `has_more` is
+`false`. A page can be empty when saved rows are unreadable; use its cursor and
+`has_more` value to decide whether to continue.
 
 This helper reads locally indexed history. It does not fetch remote history
 from Twitch.

@@ -11,11 +11,33 @@ pub struct RoomState {
 }
 
 const MAX_MESSAGES: usize = 1500;
+const MAX_LOADED_HISTORY: usize = 50_000;
 const MODERATION_DEDUP_ROWS: usize = 20;
 const MODERATION_DEDUP_MILLIS: u64 = 5000;
 
 pub const IRC_MODERATION_ID_PREFIX: &str = "irc:moderation:";
 pub const EVENTSUB_MODERATION_ID_PREFIX: &str = "eventsub:moderation:";
+
+/// Stable position in locally stored history, including equal timestamps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct HistoryCursor {
+    pub timestamp_ms: i64,
+    pub row_id: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalHistoryMessageIdentity {
+    pub replay_id: super::MessageId,
+    pub original_id: super::MessageId,
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalHistoryPageInfo {
+    pub before: Option<HistoryCursor>,
+    pub next: Option<HistoryCursor>,
+    pub has_more: bool,
+    pub identities: Vec<LocalHistoryMessageIdentity>,
+}
 
 /// Twitch low-trust / suspicious-user treatment for a single user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -38,8 +60,15 @@ pub struct LowTrustEntry {
 #[derive(Debug)]
 pub struct ChannelState {
     pub id: super::ChannelId,
-    /// Ring-buffer of messages, capped at MAX_MESSAGES.
+    /// Live buffer, expanded within a fixed limit when older logs are requested.
     pub messages: std::collections::VecDeque<super::ChatMessage>,
+    pub local_history_cursor: Option<HistoryCursor>,
+    pub local_history_exhausted: bool,
+    local_history_aliases: std::collections::HashMap<
+        super::MessageId,
+        (super::MessageId, chrono::DateTime<chrono::Utc>),
+    >,
+    message_limit: usize,
     pub room_state: RoomState,
     /// Chatters currently in the channel (from NAMES / JOIN / PART).
     pub chatters: std::collections::HashSet<String>,
@@ -64,6 +93,10 @@ impl ChannelState {
         Self {
             id,
             messages: std::collections::VecDeque::with_capacity(MAX_MESSAGES),
+            local_history_cursor: None,
+            local_history_exhausted: false,
+            local_history_aliases: Default::default(),
+            message_limit: MAX_MESSAGES,
             room_state: RoomState::default(),
             chatters: std::collections::HashSet::new(),
             unread_count: 0,
@@ -115,8 +148,10 @@ impl ChannelState {
     }
 
     pub fn push_message(&mut self, msg: super::ChatMessage) {
-        if self.messages.len() >= MAX_MESSAGES {
+        if self.messages.len() >= self.message_limit {
             self.messages.pop_front();
+            self.local_history_cursor = None;
+            self.local_history_exhausted = false;
         }
         self.messages.push_back(msg);
     }
@@ -335,7 +370,68 @@ impl ChannelState {
 
     /// Merge history in timestamp order, skipping repeated server IDs both
     /// within the incoming batch and against the current buffer.
-    pub fn prepend_history(&mut self, mut msgs: Vec<super::ChatMessage>) {
+    pub fn prepend_history(&mut self, msgs: Vec<super::ChatMessage>) {
+        self.merge_history(msgs, false);
+    }
+
+    /// Keep explicitly requested older logs available for search and navigation.
+    pub fn prepend_older_history(&mut self, msgs: Vec<super::ChatMessage>) {
+        self.merge_history(msgs, true);
+    }
+
+    /// Merge stored rows without duplicating either prior replays or live rows
+    /// that are still in the buffer. Keep the live IDs used by selection and layout.
+    pub fn prepend_local_history(
+        &mut self,
+        mut msgs: Vec<super::ChatMessage>,
+        page: &LocalHistoryPageInfo,
+    ) {
+        let live_ids: std::collections::HashSet<_> = self.messages.iter()
+            .filter(|message| !message.flags.is_history && message.channel == self.id)
+            .map(|message| (message.id, message.timestamp))
+            .collect();
+        self.local_history_aliases.retain(|_, live| live_ids.contains(live));
+        let matched_live_ids: std::collections::HashSet<_> =
+            self.local_history_aliases.values().copied().collect();
+        let mut unmatched_live_rows: std::collections::HashMap<_, _> = self.messages.iter()
+            .filter(|message| !message.flags.is_history
+                && message.channel == self.id
+                && !matched_live_ids.contains(&(message.id, message.timestamp)))
+            .map(|message| ((message.id, message.timestamp), message))
+            .collect();
+        let mut existing_rows: std::collections::HashSet<_> = self.messages.iter()
+            .filter(|message| message.id.is_local_history())
+            .map(|message| message.id)
+            .chain(self.local_history_aliases.keys().copied())
+            .collect();
+        let original_ids: std::collections::HashMap<_, _> = page.identities.iter()
+            .map(|identity| (identity.replay_id, identity.original_id))
+            .collect();
+        msgs.retain(|message| {
+            if message.channel != self.id {
+                return false;
+            }
+            if message.id.is_local_history() && !existing_rows.insert(message.id) {
+                return false;
+            }
+            let Some(original_id) = original_ids.get(&message.id).copied() else {
+                return true;
+            };
+            let live_key = (original_id, message.timestamp);
+            let matches_live = unmatched_live_rows.get(&live_key).is_some_and(|live|
+                live.sender.login == message.sender.login && live.raw_text == message.raw_text);
+            if matches_live {
+                unmatched_live_rows.remove(&live_key);
+                self.local_history_aliases.insert(message.id, (original_id, message.timestamp));
+                false
+            } else {
+                true
+            }
+        });
+        self.merge_history(msgs, page.before.is_some());
+    }
+
+    fn merge_history(&mut self, mut msgs: Vec<super::ChatMessage>, expand: bool) {
         // Drop duplicates by server_id against what's already in the buffer.
         let mut existing_ids: std::collections::HashSet<String> = self
             .messages
@@ -353,18 +449,22 @@ impl ChannelState {
             return;
         }
 
+        if expand {
+            self.message_limit = MAX_LOADED_HISTORY;
+        }
+
         // Merge into a single Vec and sort chronologically (stable, so rows
         // within the same millisecond keep their arrival order).
-        let total_cap = (msgs.len() + self.messages.len()).min(MAX_MESSAGES);
+        let total_cap = (msgs.len() + self.messages.len()).min(self.message_limit);
         let mut merged: Vec<super::ChatMessage> =
             Vec::with_capacity(msgs.len() + self.messages.len());
-        merged.extend(self.messages.drain(..));
         merged.extend(msgs);
+        merged.extend(self.messages.drain(..));
         merged.sort_by_key(|m| m.timestamp);
 
         // Keep the most recent messages when the merged buffer exceeds its cap.
-        if merged.len() > MAX_MESSAGES {
-            let excess = merged.len() - MAX_MESSAGES;
+        if merged.len() > self.message_limit {
+            let excess = merged.len() - self.message_limit;
             merged.drain(0..excess);
         }
 
@@ -452,6 +552,141 @@ mod tests {
         let mut ch = ChannelState::new(super::super::ChannelId::new("rustlang"));
         ch.set_low_trust("   ", "99", "ghost", LowTrustStatus::Monitored);
         assert!(ch.low_trust_users.is_empty());
+    }
+
+    #[test]
+    fn requested_older_history_survives_a_full_live_buffer_and_new_messages() {
+        let mut room = ChannelState::new(super::super::ChannelId::new("rustlang"));
+        let make = |id: u64| {
+            let mut message = test_hype_message("train", "begin", 1, 0, 1);
+            message.id = super::super::MessageId(id);
+            message.server_id = Some(format!("message-{id}"));
+            message.timestamp = Utc.timestamp_opt(id as i64, 0).unwrap();
+            message
+        };
+        for id in 1000..2500 { room.push_message(make(id)); }
+        room.prepend_older_history((200..1000).map(make).collect());
+        assert_eq!(room.messages.len(), 2300);
+        room.push_message(make(2500));
+        assert_eq!(room.messages.front().unwrap().id.0, 200);
+        assert_eq!(room.messages.back().unwrap().id.0, 2500);
+        assert_eq!(room.message_limit, MAX_LOADED_HISTORY);
+    }
+
+    #[test]
+    fn older_history_precedes_live_rows_at_equal_timestamps() {
+        let mut room = ChannelState::new(super::super::ChannelId::new("rustlang"));
+        let mut newer = test_hype_message("train", "begin", 1, 0, 1);
+        newer.id = super::super::MessageId(2);
+        newer.server_id = Some("newer".to_owned());
+        let mut older = newer.clone();
+        older.id = super::super::MessageId(1);
+        older.server_id = Some("older".to_owned());
+        room.push_message(newer);
+        room.prepend_older_history(vec![older]);
+        assert_eq!(room.messages.iter().map(|message| message.id.0).collect::<Vec<_>>(), [1, 2]);
+    }
+
+    #[test]
+    fn ordinary_history_keeps_the_live_limit_and_eviction_reopens_local_paging() {
+        let mut room = ChannelState::new(super::super::ChannelId::new("rustlang"));
+        let message = test_hype_message("train", "begin", 1, 0, 1);
+        for _ in 0..MAX_MESSAGES { room.push_message(message.clone()); }
+        room.local_history_exhausted = true;
+        room.local_history_cursor = Some(HistoryCursor { timestamp_ms: 1000, row_id: 1 });
+        room.push_message(message);
+        assert_eq!(room.messages.len(), MAX_MESSAGES);
+        assert!(!room.local_history_exhausted);
+        assert_eq!(room.local_history_cursor, None);
+    }
+
+    fn local_history_test_message(id: u64) -> super::super::ChatMessage {
+        let mut message = test_hype_message("train", "begin", 1, 0, 1);
+        message.id = super::super::MessageId(id);
+        message.server_id = None;
+        message.raw_text = "same text".into();
+        message.timestamp = Utc.timestamp_millis_opt(1000).unwrap();
+        message.msg_kind = super::super::MsgKind::Chat;
+        message
+    }
+
+    fn local_history_test_page(
+        rows: &[(i64, u64)],
+        older: bool,
+    ) -> (Vec<super::super::ChatMessage>, LocalHistoryPageInfo) {
+        let mut identities = Vec::new();
+        let messages = rows.iter().map(|&(row_id, original_id)| {
+            let mut message = local_history_test_message(original_id);
+            let replay_id = super::super::MessageId::from_local_history_row(row_id).unwrap();
+            identities.push(LocalHistoryMessageIdentity { replay_id, original_id: message.id });
+            message.id = replay_id;
+            message.flags.is_history = true;
+            message
+        }).collect();
+        (messages, LocalHistoryPageInfo {
+            before: older.then_some(HistoryCursor { timestamp_ms: 1000, row_id: i64::MAX }),
+            next: rows.first().map(|&(row_id, _)| HistoryCursor { timestamp_ms: 1000, row_id }),
+            has_more: true,
+            identities,
+        })
+    }
+
+    #[test]
+    fn local_history_keeps_distinct_rows_and_live_ids_across_reloads() {
+        let mut room = ChannelState::new(super::super::ChannelId::new("rustlang"));
+        room.push_message(local_history_test_message(9));
+        // A non-local history row is not a known copy of this SQLite row.
+        let mut remote = local_history_test_message(10);
+        remote.flags.is_history = true;
+        room.push_message(remote);
+        let (messages, page) = local_history_test_page(&[(101, 9), (102, 10), (103, 10)], false);
+        for _ in 0..3 {
+            room.prepend_local_history(messages.clone(), &page);
+            assert_eq!(room.messages.len(), 4);
+            assert_eq!(room.messages.iter().filter(|message| message.id == super::super::MessageId(9)).count(), 1);
+        }
+        // Even the same persisted original ID and timestamp can belong to a
+        // different row. The first replay already matched the retained live row.
+        let (next_messages, next_page) = local_history_test_page(&[(104, 9)], true);
+        for _ in 0..3 {
+            room.prepend_local_history(next_messages.clone(), &next_page);
+            room.prepend_local_history(messages.clone(), &page);
+            assert_eq!(room.messages.len(), 5);
+        }
+        assert!(room.messages.iter().all(|message| message.raw_text == "same text"));
+        assert_eq!(room.messages.iter().filter(|message| message.id.is_local_history()).count(), 3);
+    }
+
+    #[test]
+    fn local_history_fallback_after_eviction_does_not_duplicate_boundary_rows() {
+        let mut room = ChannelState::new(super::super::ChannelId::new("rustlang"));
+        for id in 1..=MAX_MESSAGES as u64 {
+            room.push_message(local_history_test_message(id));
+        }
+        room.local_history_cursor = Some(HistoryCursor { timestamp_ms: 1000, row_id: 1 });
+        room.push_message(local_history_test_message(MAX_MESSAGES as u64 + 1));
+        assert_eq!(room.local_history_cursor, None);
+        assert_eq!(room.messages.front().unwrap().id, super::super::MessageId(2));
+
+        let (messages, page) = local_history_test_page(&[(1, 1), (2, 2), (3, 3)], true);
+        for _ in 0..3 {
+            room.prepend_local_history(messages.clone(), &page);
+            assert_eq!(room.messages.len(), MAX_MESSAGES + 1);
+            assert_eq!(room.messages.iter().filter(|message| message.id == super::super::MessageId(2)).count(), 1);
+            assert_eq!(room.messages.iter().filter(|message| message.id == super::super::MessageId(3)).count(), 1);
+        }
+        assert_eq!(room.messages.front().unwrap().id,
+            super::super::MessageId::from_local_history_row(1).unwrap());
+
+        // Forget aliases as soon as their live rows have left the buffer.
+        room.messages.pop_front();
+        room.messages.pop_front();
+        room.prepend_local_history(messages, &page);
+        assert_eq!(room.messages.len(), MAX_MESSAGES + 1);
+        assert!(room.messages.iter().any(|message|
+            Some(message.id) == super::super::MessageId::from_local_history_row(2)));
+        assert!(!room.local_history_aliases.contains_key(
+            &super::super::MessageId::from_local_history_row(2).unwrap()));
     }
 
     #[test]

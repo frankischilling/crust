@@ -5,6 +5,7 @@
 - [Features and keybinds](./FEATURES_AND_KEYBINDS.md)
 - [Build, package, and run](./BUILDING.md)
 - [Chat behavior and performance audit](./AUDIT.md)
+- [Chat delivery, emotes, and history follow-up](./AUDIT_FOLLOWUP.md)
 
 ## Plugins
 
@@ -21,6 +22,7 @@
 
 ## Release notes
 
+- [v0.5.2](./releases/Release_v0.5.2.md)
 - [v0.5.1](./releases/Release_v0.5.1.md)
 - [v0.5.0](./releases/Release_v0.5.0.md)
 - [v0.4.9](./releases/Release_v0.4.9.md)
