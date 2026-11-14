@@ -1,28 +1,35 @@
-# Crust v0.4.9 Release Notes
+# Crust v0.4.9 release notes
 
 Date: 2026-04-22
 
-v0.4.9 works on the Chatterino parity: nicknames, unified ignores, pronouns on user cards, cross-channel search with predicates, per-section font sizes, low-trust moderation surface, streamer mode, and a batch of new slash commands. It also lands rendering-performance work for long chat buffers.
+v0.4.9 adds nicknames, separate user and phrase ignores, pronouns on user cards,
+cross-channel search, font controls, suspicious-user moderation, streamer mode,
+and new slash commands. It also reduces rendering work for long chat buffers.
 
 ## Highlights
 
 ### New features
 
-- **Nicknames / user aliases (A1).** Per-user display-name overrides applied across chat rendering, user cards, and mention detection. Edited from a new "Nicknames" settings tab. Persists across restarts.
-- **Unified ignores (A2).** Separate lists for ignored users (full-user block) and ignored phrases (plain or regex) with per-entry actions: block message, replace with `***`, highlight only, mention only. Regex validation surfaces invalid patterns inline. Ignored users do not render and do not trigger mention highlights.
-- **Pronouns on user cards (A3).** Opt-in fetch from the alejo.io pronouns provider when a user card opens. In-memory caching to avoid repeat hits. Off by default.
-- **Cross-channel search (A4).** Ctrl+F gains a "search all channels" scope plus a lightweight predicate DSL: `from:<user>`, `has:link`, `in:<channel>`, `regex:"<pattern>"`. Invalid predicates show inline errors. Keyboard nav between hits.
-- **Font size + zoom controls (A5).** Separate persistent sizes for chat body, UI scale, top toolbar, tabs, timestamps, and room-state pills. Sliders in the Appearance settings tab; `Ctrl+=`, `Ctrl+-`, `Ctrl+0` adjust chat font on the focused split.
-- **Low-trust moderation surface (A6).** `/monitor`, `/unmonitor`, `/restrict`, `/unrestrict` backed by the Helix suspicious-users endpoint. Messages from monitored/restricted users render with a visual badge.
-- **Streamer mode (A7).** Detects running broadcasting software (OBS, Streamlabs, PRISM, XSplit, Twitch Studio, vMix) and, while active, hides link-preview tooltips, suppresses viewer counts in split headers, and silences sound notifications. Modes: `off`, `auto`, `on`. Per-feature toggles under the new "Streamer mode" settings tab.
-- **Extra slash commands (A8).** Added `/logs`, `/live`, `/shield`, `/setgame`, `/settitle`, `/follow-age`, `/account-age`. Each is registered for autocomplete, documented in `docs/FEATURES_AND_KEYBINDS.md`, and either executes or reports a specific error for permission or argument issues.
+- Nicknames / user aliases. Per-user display-name overrides applied across chat rendering, user cards, and mention detection. Edited from a new "Nicknames" settings tab. Persists across restarts.
+- Unified ignores. Separate lists for ignored users (full-user block) and ignored phrases (plain or regex) with per-entry actions: block message, replace with `***`, highlight only, mention only. Regex validation surfaces invalid patterns inline. Ignored users do not render and do not trigger mention highlights.
+- Pronouns on user cards. Opt-in fetch from the alejo.io pronouns provider when a user card opens. In-memory caching to avoid repeat hits. Off by default.
+- Cross-channel search. Ctrl+F gains a "search all channels" scope plus a lightweight predicate DSL: `from:<user>`, `has:link`, `in:<channel>`, `regex:"<pattern>"`. Invalid predicates show inline errors. Keyboard nav between hits.
+- Font size + zoom controls. Separate persistent sizes for chat body, UI scale, top toolbar, tabs, timestamps, and room-state pills. Sliders in the Appearance settings tab; `Ctrl+=`, `Ctrl+-`, `Ctrl+0` adjust chat font on the focused split.
+- Low-trust moderation surface. `/monitor`, `/unmonitor`, `/restrict`, `/unrestrict` backed by the Helix suspicious-users endpoint. Messages from monitored/restricted users render with a visual badge.
+- Streamer mode. Detects running broadcasting software (OBS, Streamlabs, PRISM, XSplit, Twitch Studio, vMix) and, while active, hides link-preview tooltips, suppresses viewer counts in split headers, and silences sound notifications. Modes: `off`, `auto`, `on`. Per-feature toggles under the new "Streamer mode" settings tab.
+- Extra slash commands. Added `/logs`, `/live`, `/shield`, `/setgame`, `/settitle`, `/follow-age`, `/account-age`. Each is registered for autocomplete, documented in `docs/FEATURES_AND_KEYBINDS.md`, and either executes or reports a specific error for permission or argument issues.
 
 ### Performance
 
-- **Hot-window rendering for long chat buffers.** Very long scrollback now renders through a sliding active window with a boundary marker so frame cost no longer scales linearly with buffer length when the user is following the tail.
-- **Focus-gated animation loop.** Animated emote repainting runs only while the window is focused by default, cutting idle-background CPU.
-- **Throttled chatter-list rebuilds.** Sorted-chatter recomputation is coalesced per channel and throttled so busy channels no longer pay the O(n log n) cost on every new-chatter event.
-- **Incremental emote RAM accounting.** Running total of raw emote bytes is maintained on `EmoteImageReady` rather than walked every frame, removing a per-frame hash-map scan.
+- Long chat buffers use a sliding render window with a boundary marker. When
+  following the newest messages, the renderer visits this window instead of the
+  full scrollback.
+- Animated emotes repaint only while the window is focused by default, reducing
+  background CPU use.
+- Chatter-list updates are batched per channel. Busy channels no longer sort
+  the list after every new chatter.
+- The raw emote byte count is updated on `EmoteImageReady`, removing a hash-map
+  scan from each frame.
 
 ## Slash command reference
 

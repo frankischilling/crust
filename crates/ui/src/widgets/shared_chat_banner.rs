@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use crate::image_cache::UiImageCache;
 
 use egui::{Color32, CornerRadius, Label, Margin, RichText, Stroke, Ui};
 
@@ -36,7 +35,7 @@ const PARTICIPANT_AVATAR_PX: f32 = 20.0;
 pub fn show_shared_chat_banner(
     ui: &mut Ui,
     session: &SharedChatSessionState,
-    emote_bytes: &HashMap<String, (u32, u32, Arc<[u8]>)>,
+    emote_bytes: &UiImageCache,
 ) {
     let accent = Color32::from_rgb(155, 102, 214);
     let fill = t::alpha(accent, 24);
@@ -46,7 +45,7 @@ pub fn show_shared_chat_banner(
 
     egui::Frame::new()
         .fill(fill)
-        .stroke(Stroke::new(1.0, border))
+        .stroke(Stroke::new(1.0_f32, border))
         .corner_radius(CornerRadius::same(6))
         .inner_margin(BANNER_INNER_PAD)
         .outer_margin(BANNER_OUTER_PAD)
@@ -102,7 +101,7 @@ pub fn show_shared_chat_banner(
 fn render_participant_chip(
     ui: &mut Ui,
     p: &crust_core::state::SharedChatParticipant,
-    emote_bytes: &HashMap<String, (u32, u32, Arc<[u8]>)>,
+    emote_bytes: &UiImageCache,
 ) {
     let text_color = if p.live {
         t::text_primary()

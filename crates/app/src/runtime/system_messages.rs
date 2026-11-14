@@ -54,6 +54,7 @@ pub(crate) fn make_system_message(
         text,
         timestamp,
         Sender {
+            original_display_name: None,
             user_id: UserId(String::new()),
             login: String::new(),
             display_name: String::new(),

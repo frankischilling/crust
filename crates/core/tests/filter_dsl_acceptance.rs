@@ -39,6 +39,7 @@ fn make_message(text: &str, subscriber: bool) -> ChatMessage {
         timestamp: Utc::now(),
         channel: ChannelId("acceptance".into()),
         sender: Sender {
+            original_display_name: None,
             user_id: UserId("1".into()),
             login: "alice".into(),
             display_name: "Alice".into(),

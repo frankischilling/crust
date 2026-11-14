@@ -23,6 +23,7 @@ pub mod settings_page;
 pub mod shared_chat_banner;
 pub mod split_header;
 pub mod user_profile_popup;
+pub(crate) mod unsent_messages;
 
 /// Build a `bytes://` URI for egui image loading.
 ///

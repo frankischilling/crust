@@ -1,10 +1,9 @@
-# Crust v0.4.3 Release Notes
+# Crust v0.4.3 release notes
 
 Date: 2026-04-06
 
-v0.4.3 is a feature release focused on quick navigation and moderation ergonomics.
-
-This release also bumps workspace and internal crate version metadata to 0.4.3.
+v0.4.3 adds whisper threads and unread ordering to quick switch, plus message
+moderation shortcuts. Workspace and internal crate versions are now 0.4.3.
 
 ## Highlights
 
@@ -13,13 +12,7 @@ This release also bumps workspace and internal crate version metadata to 0.4.3.
 - Whisper threads now surface unread and mention badges in both thread lists and quick switch.
 - Message row right-click menus now include one-click moderation shortcuts.
 
-## Implemented In v0.4.3
-
-- Mention-first ordering inside quick switch lists (mentions, then unread, then others).
-- Row-level right-click moderator quick actions in message menus.
-- Whisper thread unread and mention badges integrated into the same quick-switch palette.
-
-## Quick Switch Upgrades
+## Quick switch
 
 The quick-switch palette (Ctrl+K) now combines channels and whisper threads in one list.
 
@@ -40,16 +33,14 @@ Behavior updates:
    - selecting a whisper thread opens/focuses the whisper panel
    - that thread is marked read when selected
 
-## Whisper Badge Improvements
+## Whisper badges
 
 Whisper thread lists now distinguish:
 
 - unread whispers
 - unread mentions of the active account
 
-This makes whisper attention state consistent with channel attention indicators.
-
-## Row-Level Moderator Quick Actions
+## Message moderation shortcuts
 
 Right-clicking a message row now exposes immediate actions under Mod actions:
 

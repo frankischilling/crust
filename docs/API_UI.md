@@ -121,11 +121,11 @@ Registers or replaces one floating plugin-owned window.
 
 ### `c2.ui.update_window(id, spec)`
 
-Replaces the retained window with id `id`. The first argument is the source of
-truth for the window id. The current open/closed state is preserved the
-`open` field in `spec` is ignored for existing windows so tick-driven content
-refreshes can never fight the user clicking the window's close (X) button.
-Use `c2.ui.open_window` / `c2.ui.close_window` to change visibility.
+Replaces the retained window identified by the first argument, `id`.
+An existing window keeps its open or closed state; its `spec.open` field is
+ignored during updates. This lets a plugin refresh content without reopening a
+window the user closed. Use `c2.ui.open_window` or `c2.ui.close_window` to change
+visibility.
 
 ### `c2.ui.open_window(id)`
 
@@ -145,8 +145,7 @@ Registers or replaces one plugin-owned settings page.
 
 ### `c2.ui.update_settings_page(id, spec)`
 
-Replaces the retained settings page with id `id`. The first argument is the
-source of truth for the settings-page id.
+Replaces the retained settings page identified by the first argument, `id`.
 
 ### `c2.ui.unregister_settings_page(id)`
 
@@ -158,14 +157,13 @@ Registers or replaces one plugin-owned host panel in a named Crust UI slot.
 
 ### `c2.ui.update_host_panel(id, spec)`
 
-Replaces the retained host panel with id `id`. The first argument is the source
-of truth for the host-panel id.
+Replaces the retained host panel identified by the first argument, `id`.
 
 ### `c2.ui.unregister_host_panel(id)`
 
 Removes a retained host panel.
 
-## Widget Schema
+## Widget schema
 
 Every widget is a plain Lua table. `type` is required; the rest of the common
 fields are optional unless a widget-specific note says otherwise.
@@ -265,7 +263,7 @@ Input widget notes:
 - `list`: uses `items`
 - `table`: uses `columns` and `rows`
 
-## Nested Value Tables
+## Nested value tables
 
 ### `options`
 
@@ -310,7 +308,7 @@ Full form:
 `table.rows` is an array of arrays. Each cell may be a string, boolean,
 number, or array of strings.
 
-## Style Table
+## Style table
 
 `style` is accepted by surfaces and widgets. All style fields are optional.
 
@@ -352,9 +350,9 @@ Current host behavior:
 - `fill_color` / `severity` currently affect grouped containers,
   settings-page frames, badges, and styled text
 - `text_role` / `emphasis` affect text rendering
-- unsupported hints are ignored safely
+- unsupported hints are ignored
 
-## State Model
+## State model
 
 ### Controlled mode
 
@@ -377,9 +375,9 @@ When `host_form = true`:
 - only host-form fields are included in `form_values`
 - transient host-form state is cleaned up when the surface disappears
 
-## UI Events
+## UI events
 
-See [API_Events.md](./API_Events) for the callback payload reference.  
+See [API_Events.md](./API_Events.md) for the callback payload reference.
 
 Plugin UI callback payloads use `surface_kind`, `surface_id`, `widget_id`, and
 `form_values` consistently across action, change, and submit events.
@@ -442,7 +440,7 @@ and
 plus
 [`plugins/ui_host_panels_demo_plugin/init.lua`](../plugins/ui_host_panels_demo_plugin/init.lua).
 
-## Related Docs
+## Related docs
 
-1. [Events](./API_Events)
-2. [Examples](./Examples)
+1. [Events](./API_Events.md)
+2. [Examples](./Examples.md)

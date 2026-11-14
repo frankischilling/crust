@@ -4,7 +4,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crust_core::format::tokenize;
-use crust_core::highlight::{is_highlighted, HighlightRule};
+use crust_core::highlight::{compile_rules, is_highlighted, HighlightRule};
 use crust_twitch::{parse_line, parse_privmsg_irc};
 
 const FRAME_HZ: u64 = 60;
@@ -67,12 +67,12 @@ fn replay_soak_maintains_headroom() {
     let frame_budget = Duration::from_secs_f64(1.0 / FRAME_HZ as f64);
     let soak_duration = Duration::from_secs(soak_secs);
 
-    let highlight_rules = vec![
+    let highlight_rules = compile_rules(&[
         HighlightRule::new("raid"),
         HighlightRule::new("giveaway"),
         HighlightRule::new("@rustfan"),
         HighlightRule::new("PogChamp"),
-    ];
+    ]);
 
     let mut queue: VecDeque<usize> = VecDeque::new();
 

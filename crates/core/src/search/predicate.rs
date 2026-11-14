@@ -140,6 +140,7 @@ mod tests {
             timestamp: Utc::now(),
             channel: ChannelId::new("testchannel"),
             sender: Sender {
+                original_display_name: None,
                 user_id: UserId("1".to_string()),
                 login: login.to_string(),
                 display_name: display.to_string(),

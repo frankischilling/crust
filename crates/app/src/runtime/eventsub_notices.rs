@@ -251,20 +251,31 @@ pub(crate) fn format_eventsub_notice_text(kind: &EventSubNoticeKind) -> String {
             action,
             target_login,
             target_message_id: _,
+            reason,
             source_channel_login,
         } => {
-            let action_label = action.replace('_', " ").replace('.', " ").trim().to_owned();
+            let action_label = action.replace(['_', '.'], " ").trim().to_owned();
             let source_suffix = source_channel_login
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(|s| format!(" in #{}", s.trim_start_matches('#')))
                 .unwrap_or_default();
-            if let Some(target) = target_login.as_deref().filter(|s| !s.trim().is_empty()) {
+            let mut text = if let Some(target) =
+                target_login.as_deref().filter(|s| !s.trim().is_empty())
+            {
                 format!("{moderator_login} performed {action_label} on {target}{source_suffix}.")
             } else {
                 format!("{moderator_login} performed {action_label}{source_suffix}.")
+            };
+            if let Some(reason) = reason
+                .as_deref()
+                .map(str::trim)
+                .filter(|reason| !reason.is_empty())
+            {
+                text.push_str(&format!(" Reason: {reason}"));
             }
+            text
         }
         EventSubNoticeKind::StreamOnline => "Stream is now live.".to_owned(),
         EventSubNoticeKind::StreamOffline => "Stream is now offline.".to_owned(),
@@ -402,13 +413,48 @@ pub(crate) fn eventsub_notice_to_message(kind: &EventSubNoticeKind) -> (MsgKind,
                 )
             }
         }
+        EventSubNoticeKind::ModerationAction {
+            action,
+            target_login,
+            source_channel_login,
+            ..
+        } if source_channel_login
+            .as_deref()
+            .is_none_or(|source| source.trim().is_empty()) =>
+        {
+            let action = action.trim().to_ascii_lowercase();
+            let login = target_login
+                .as_deref()
+                .map(str::trim)
+                .filter(|login| !login.is_empty());
+            let msg_kind = match (action.as_str(), login) {
+                ("ban", Some(login)) => MsgKind::Ban {
+                    login: login.to_owned(),
+                },
+                ("timeout", Some(login)) => MsgKind::Timeout {
+                    login: login.to_owned(),
+                    seconds: 0,
+                },
+                ("clear", _) => MsgKind::ChatCleared,
+                (_, Some(login)) if action.starts_with("timeout_") => MsgKind::Timeout {
+                    login: login.to_owned(),
+                    seconds: action
+                        .strip_prefix("timeout_")
+                        .and_then(|value| value.strip_suffix('s'))
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(0),
+                },
+                _ => MsgKind::SystemInfo,
+            };
+            (msg_kind, format_eventsub_notice_text(kind))
+        }
         _ => (MsgKind::SystemInfo, format_eventsub_notice_text(kind)),
     }
 }
 
 pub(crate) fn should_emit_eventsub_notice_message(kind: &EventSubNoticeKind) -> bool {
     match kind {
-        // IRC moderation events already emit equivalent ban/unban lines.
+        // The broader moderation topic carries these actions with moderator details.
         EventSubNoticeKind::ChannelBan { .. }
         | EventSubNoticeKind::ChannelUnban { .. }
         | EventSubNoticeKind::AutoModMessageHold { .. }

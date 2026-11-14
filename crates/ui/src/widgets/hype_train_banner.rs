@@ -39,7 +39,7 @@ pub fn show_hype_train_banner(ui: &mut Ui, state: &HypeTrainState) {
 
     egui::Frame::new()
         .fill(fill)
-        .stroke(Stroke::new(1.0, t::alpha(accent, 90)))
+        .stroke(Stroke::new(1.0_f32, t::alpha(accent, 90)))
         .corner_radius(CornerRadius::same(6))
         .inner_margin(BANNER_INNER_PAD)
         .outer_margin(BANNER_OUTER_PAD)
@@ -149,7 +149,7 @@ pub fn show_raid_banner(ui: &mut Ui, state: &RaidBannerState) -> bool {
     let avail_w = ui.available_width();
     egui::Frame::new()
         .fill(t::alpha(accent, 28))
-        .stroke(Stroke::new(1.0, t::alpha(accent, 110)))
+        .stroke(Stroke::new(1.0_f32, t::alpha(accent, 110)))
         .corner_radius(CornerRadius::same(6))
         .inner_margin(BANNER_INNER_PAD)
         .outer_margin(BANNER_OUTER_PAD)

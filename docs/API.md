@@ -1,20 +1,19 @@
-# Lua API Reference
+# Lua API reference
 
-This is the exhaustive reference for the Lua API currently emitted and accepted
-by the Rust host. The pages are split by category for navigation, but the goal
-of this wiki is parity with the Lua surface that exists today.
+This reference describes the Lua functions, UI definitions, and callback payloads
+exposed by Crust's Rust host. The pages are grouped by task.
 
 ## Pages
 
-- [Core and callbacks](./API_Core)
-- [UI](./API_UI)
-- [Chat and channels](./API_Chat)
-- [Accounts and settings](./API_Accounts_Settings)
-- [Moderation and creator tools](./API_Moderation)
-- [Events](./API_Events)
-- [Examples](./Examples)
+- [Core and callbacks](./API_Core.md)
+- [UI](./API_UI.md)
+- [Chat and channels](./API_Chat.md)
+- [Accounts and settings](./API_Accounts_Settings.md)
+- [Moderation and creator tools](./API_Moderation.md)
+- [Events](./API_Events.md)
+- [Examples](./Examples.md)
 
-## Global Tables And Namespaces
+## Global tables and namespaces
 
 ### `c2.LogLevel`
 
@@ -39,26 +38,23 @@ The current Lua bridge includes:
 - moderation and settings events
 - loader and emote/image events, including `ImagePrefetchQueued`
 
-The event surface now matches the user-facing `AppEvent` variants used by the
-runtime.
+Plugins receive the events exported by the Lua bridge. Some runtime events are
+internal and are not forwarded to plugins.
 
-The command surface also matches the non-internal `AppCommand` variants that
-the runtime exposes to plugins. Internal host plumbing, such as
-`RunPluginCommand` and `RunPluginCallback`, is intentionally not documented as
-public Lua API.
+The command reference covers actions exposed to plugins. `RunPluginCommand`
+and `RunPluginCallback` are internal host commands.
 
-The event reference also documents shared nested payload tables, optional-field
-omission rules, and concrete string/value domains already enforced by the Rust
-bridge.
+The event reference lists shared payload tables, optional fields, and accepted
+string values.
 
 ### `c2.ui`
 
 `c2.ui` is the declarative retained UI namespace for plugin-owned floating
 windows and plugin settings pages.
 
-See [API_UI.md](./API_UI).
+See [API_UI.md](./API_UI.md).
 
-## API Conventions
+## API conventions
 
 - All functions live under the global `c2` table.
 - Declarative UI helpers live under `c2.ui`.
@@ -68,7 +64,7 @@ See [API_UI.md](./API_UI).
   action, then listen for the matching `c2.EventType.*` payload.
 - Every callback payload table includes a `type` field.
 
-## Common Patterns
+## Common patterns
 
 ### Register a command
 

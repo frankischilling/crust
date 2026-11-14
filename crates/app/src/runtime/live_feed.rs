@@ -236,6 +236,7 @@ fn format_err(e: &HelixError) -> String {
         HelixError::RateLimited => "Rate limited by Twitch (will retry)".to_owned(),
         HelixError::Http(m) => format!("Network error: {m}"),
         HelixError::Decode(m) => format!("Decode error: {m}"),
+        HelixError::Unsupported(endpoint) => format!("Endpoint unavailable: {endpoint}"),
     }
 }
 

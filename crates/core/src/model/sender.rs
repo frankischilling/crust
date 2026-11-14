@@ -60,8 +60,11 @@ pub struct Sender {
     pub user_id: super::UserId,
     /// Raw login name (lowercase).
     pub login: String,
-    /// Display name as supplied by the server.
+    /// Display name shown in chat, including any local nickname.
     pub display_name: String,
+    /// Server display name retained while a local nickname is applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_display_name: Option<String>,
     /// #rrggbb color from IRC tag, or None.
     pub color: Option<String>,
     /// Optional provider paint metadata (e.g. 7TV name paint).

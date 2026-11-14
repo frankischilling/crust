@@ -20,7 +20,7 @@ pub const DEFAULT_CHAT_FONT_SIZE: f32 = 13.5;
 pub const MIN_CHAT_FONT_SIZE: f32 = 8.0;
 /// Maximum permitted chat font size.
 pub const MAX_CHAT_FONT_SIZE: f32 = 32.0;
-/// Default UI scale ratio fed to `pixels_per_point`.
+/// Default UI zoom multiplier, applied on top of the monitor's native scale.
 pub const DEFAULT_UI_FONT_SIZE: f32 = 1.0;
 /// Minimum UI scale ratio. Below this, egui hit-targets shrink below usable size.
 pub const MIN_UI_FONT_SIZE: f32 = 0.75;
@@ -85,7 +85,7 @@ pub fn chat_font_size() -> f32 {
     load_f32(&CHAT_FONT_SIZE_BITS, DEFAULT_CHAT_FONT_SIZE)
 }
 
-/// Current UI scale ratio applied to egui `pixels_per_point`.
+/// Current UI zoom multiplier, independent of the monitor's native scale.
 #[inline]
 pub fn ui_font_size() -> f32 {
     load_f32(&UI_FONT_SIZE_BITS, DEFAULT_UI_FONT_SIZE)

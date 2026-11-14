@@ -1,15 +1,14 @@
-# Crust Plugin Wiki
+# Crust plugin documentation
 
-The plugin wiki has moved to [`docs/HOME.md`](./HOME).
+The [documentation index](./HOME.md) links to the app and plugin guides.
+For plugin development, start with installation and the API reference:
 
-Start here:
-
-- [`Installation`](./Installation)
-- [`Lifecycle`](./Lifecycle)
-- [`API Reference`](./API)
-- [`Core And Callbacks`](./API_Core)
-- [`Chat And Channels`](./API_Chat)
-- [`Accounts And Settings`](./API_Accounts_Settings)
-- [`Moderation And Creator Tools`](./API_Moderation)
-- [`Events`](./API_Events)
-- [`Examples`](./Examples)
+- [`Installation`](./Installation.md)
+- [`Lifecycle`](./Lifecycle.md)
+- [`API Reference`](./API.md)
+- [`Core And Callbacks`](./API_Core.md)
+- [`Chat And Channels`](./API_Chat.md)
+- [`Accounts And Settings`](./API_Accounts_Settings.md)
+- [`Moderation And Creator Tools`](./API_Moderation.md)
+- [`Events`](./API_Events.md)
+- [`Examples`](./Examples.md)

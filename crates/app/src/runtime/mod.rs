@@ -1,4 +1,5 @@
 pub(crate) mod assets;
+pub(crate) mod auth;
 pub(crate) mod badges;
 pub(crate) mod channel_points_claimer;
 pub(crate) mod emote_loading;

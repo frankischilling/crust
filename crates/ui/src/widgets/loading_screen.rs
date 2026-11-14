@@ -334,7 +334,7 @@ impl LoadingScreen {
                         ui.set_width(card_w);
                         egui::Frame::new()
                             .fill(a(t::bg_surface()))
-                            .stroke(egui::Stroke::new(1.0, a(t::border_subtle())))
+                            .stroke(egui::Stroke::new(1.0_f32, a(t::border_subtle())))
                             .corner_radius(t::RADIUS)
                             .inner_margin(egui::Margin::symmetric(16, 14))
                             .show(ui, |ui| {
@@ -538,7 +538,7 @@ impl LoadingScreen {
                                         egui::Frame::new()
                                             .fill(a(t::bg_base()))
                                             .stroke(egui::Stroke::new(
-                                                1.0,
+                                                1.0_f32,
                                                 a(t::border_subtle()),
                                             ))
                                             .corner_radius(t::RADIUS_SM)
@@ -616,7 +616,7 @@ impl LoadingScreen {
                 ui.set_width(card_w);
                 egui::Frame::new()
                     .fill(a(t::bg_surface()))
-                    .stroke(egui::Stroke::new(1.0, a(t::border_subtle())))
+                    .stroke(egui::Stroke::new(1.0_f32, a(t::border_subtle())))
                     .corner_radius(t::RADIUS)
                     .inner_margin(egui::Margin::symmetric(10, 10))
                     .show(ui, |ui| {
@@ -755,7 +755,7 @@ impl LoadingScreen {
                             as usize;
                         egui::Frame::new()
                             .fill(a(t::bg_base()))
-                            .stroke(egui::Stroke::new(1.0, a(t::border_subtle())))
+                            .stroke(egui::Stroke::new(1.0_f32, a(t::border_subtle())))
                             .corner_radius(t::RADIUS_SM)
                             .inner_margin(egui::Margin::symmetric(7, 6))
                             .show(ui, |ui| {

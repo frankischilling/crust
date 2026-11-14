@@ -80,6 +80,7 @@ pub struct SettingsStats {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(test, derive(Default))]
 pub struct SettingsPageState {
     pub kick_beta_enabled: bool,
     pub irc_beta_enabled: bool,
@@ -100,7 +101,7 @@ pub struct SettingsPageState {
     pub light_theme: bool,
     /// Chat body font size in points.
     pub chat_font_size: f32,
-    /// UI scale ratio fed to `pixels_per_point`.
+    /// UI zoom multiplier, independent of native display density.
     pub ui_font_size: f32,
     /// Top chrome toolbar label size (pt).
     pub topbar_font_size: f32,
@@ -723,7 +724,7 @@ fn render_commands_section(ui: &mut egui::Ui, state: &mut SettingsPageState, com
                 if ui
                     .add(
                         egui::Button::new(
-                            RichText::new("").font(t::tiny()).color(t::red()),
+                            RichText::new("×").font(t::tiny()).color(t::red()),
                         )
                         .min_size(action_btn_size),
                     )
@@ -855,7 +856,7 @@ fn render_plugin_manifest_line(ui: &mut egui::Ui, label: &str, value: &str) {
 fn render_plugin_status_card(ui: &mut egui::Ui, status: &PluginStatus, compact: bool) {
     let frame = egui::Frame::new()
         .fill(t::bg_surface())
-        .stroke(egui::Stroke::new(1.0, t::border_subtle()))
+        .stroke(egui::Stroke::new(1.0_f32, t::border_subtle()))
         .inner_margin(Margin::same(if compact { 8 } else { 10 }));
 
     frame.show(ui, |ui| {
@@ -925,7 +926,7 @@ fn render_sections_nav(
     let section_margin = if ultra_compact { 6 } else { 10 };
     egui::Frame::new()
         .fill(t::bg_surface())
-        .stroke(egui::Stroke::new(1.0, t::border_subtle()))
+        .stroke(egui::Stroke::new(1.0_f32, t::border_subtle()))
         .inner_margin(Margin::same(section_margin))
         .show(ui, |ui| {
             ui.label(
@@ -1366,10 +1367,11 @@ fn render_settings_content(
                                 if ui
                                     .add(
                                         egui::Button::new(
-                                            RichText::new("").font(t::tiny()).color(t::red()),
+                                            RichText::new("×").font(t::tiny()).color(t::red()),
                                         )
                                         .min_size(egui::vec2(24.0, 20.0)),
                                     )
+                                    .on_hover_text("Delete moderation preset")
                                     .clicked()
                                 {
                                     delete_preset_idx = Some(i);
@@ -2168,10 +2170,11 @@ fn render_settings_content(
                                 if ui
                                     .add(
                                         egui::Button::new(
-                                            RichText::new("").font(t::tiny()).color(t::red()),
+                                            RichText::new("×").font(t::tiny()).color(t::red()),
                                         )
                                         .min_size(action_btn_size),
                                     )
+                                    .on_hover_text("Delete nickname alias")
                                     .clicked()
                                 {
                                     delete_nick_idx = Some(i);
@@ -2278,10 +2281,11 @@ fn render_settings_content(
                                 if ui
                                     .add(
                                         egui::Button::new(
-                                            RichText::new("").font(t::tiny()).color(t::red()),
+                                            RichText::new("×").font(t::tiny()).color(t::red()),
                                         )
                                         .min_size(action_btn_size),
                                     )
+                                    .on_hover_text("Remove ignored user")
                                     .clicked()
                                 {
                                     delete_user_idx = Some(i);
@@ -2421,10 +2425,11 @@ fn render_settings_content(
                                 if ui
                                     .add(
                                         egui::Button::new(
-                                            RichText::new("").font(t::tiny()).color(t::red()),
+                                            RichText::new("×").font(t::tiny()).color(t::red()),
                                         )
                                         .min_size(action_btn_size),
                                     )
+                                    .on_hover_text("Remove ignored phrase")
                                     .clicked()
                                 {
                                     delete_phrase_idx = Some(i);
@@ -2983,6 +2988,29 @@ fn render_settings_content(
         });
 }
 
+fn bounded_settings_scroll<R>(
+    ui: &mut egui::Ui,
+    id: &'static str,
+    max_height: f32,
+    fill_height: bool,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::scroll_area::ScrollAreaOutput<R> {
+    let width = ui.available_width().max(0.0);
+    egui::ScrollArea::both()
+        .id_salt(id)
+        .max_width(width)
+        .max_height(max_height.max(0.0))
+        .min_scrolled_width(0.0)
+        .min_scrolled_height(0.0)
+        .auto_shrink([false, !fill_height])
+        .show(ui, |ui| {
+            // Keep labels wrapping normally; oversized controls can still be
+            // reached with the horizontal scrollbar instead of growing the window.
+            ui.set_max_width(width);
+            add_contents(ui)
+        })
+}
+
 pub fn show_settings_page(
     ctx: &Context,
     settings_open: &mut bool,
@@ -2991,24 +3019,32 @@ pub fn show_settings_page(
     plugin_ui_session: &mut PluginUiSessionState,
     stats: SettingsStats,
 ) {
-    let screen = ctx.screen_rect();
-    let settings_default_pos = egui::pos2(
-        (screen.center().x - 380.0).max(8.0),
-        (screen.center().y - 280.0).max(8.0),
-    );
-    let min_w = 300.0_f32.min((screen.width() - 16.0).max(160.0));
-    let min_h = 280.0_f32.min((screen.height() - 16.0).max(160.0));
-    let default_w = 760.0_f32.min((screen.width() - 16.0).max(min_w));
-    let default_h = 560.0_f32.min((screen.height() - 16.0).max(min_h));
+    let bounds = ctx.screen_rect().shrink(8.0);
+    let style = ctx.style();
+    let frame = egui::Frame::window(&style);
+    let heading = egui::TextStyle::Heading.resolve(&style);
+    let title_height = ctx
+        .fonts(|fonts| fonts.row_height(&heading))
+        .max(style.spacing.interact_size.y)
+        + frame.inner_margin.sum().y
+        + frame.stroke.width;
+    let max_size = (bounds.size() - frame.total_margin().sum() - egui::vec2(0.0, title_height))
+        .max(egui::Vec2::splat(1.0));
+    let min_size = egui::vec2(300.0, 280.0).min(max_size);
+    let default_size = egui::vec2(760.0, 560.0).min(max_size);
+    let settings_default_pos = (bounds.center() - default_size * 0.5).max(bounds.min);
     egui::Window::new("Settings")
         .open(settings_open)
         .collapsible(false)
         .resizable(true)
         .order(egui::Order::Foreground)
+        .frame(frame)
+        .constrain_to(bounds)
+        .min_size(min_size)
+        .max_size(max_size)
         .default_pos(settings_default_pos)
-        .default_size(egui::vec2(default_w, default_h))
+        .default_size(default_size)
         .show(ctx, |ui| {
-            ui.set_min_size(egui::vec2(min_w, min_h));
             let compact_layout = ui.available_width() < 720.0;
             let ultra_compact_layout = ui.available_width() < 500.0;
             ui.vertical(|ui| {
@@ -3023,11 +3059,17 @@ pub fn show_settings_page(
             ui.add_space(8.0);
 
             if compact_layout {
-                render_sections_nav(ui, settings_section, stats, true, ultra_compact_layout);
+                let nav_height = (ui.available_height() * 0.4).min(180.0);
+                bounded_settings_scroll(ui, "settings_compact_nav", nav_height, false, |ui| {
+                    render_sections_nav(ui, settings_section, stats, true, ultra_compact_layout);
+                });
                 ui.add_space(8.0);
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
+                bounded_settings_scroll(
+                    ui,
+                    "settings_compact_content",
+                    ui.available_height(),
+                    true,
+                    |ui| {
                         render_settings_content(
                             ui,
                             *settings_section,
@@ -3036,26 +3078,42 @@ pub fn show_settings_page(
                             true,
                             ultra_compact_layout,
                         );
-                    });
+                    },
+                );
             } else {
-                ui.columns(2, |cols| {
-                    let nav = &mut cols[0];
-                    nav.set_min_width(170.0);
-                    render_sections_nav(nav, settings_section, stats, false, false);
-
-                    let content = &mut cols[1];
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(content, |ui| {
-                            render_settings_content(
+                let height = ui.available_height();
+                ui.horizontal_top(|ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(200.0, height),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            bounded_settings_scroll(ui, "settings_wide_nav", height, true, |ui| {
+                                render_sections_nav(ui, settings_section, stats, false, false);
+                            });
+                        },
+                    );
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), height),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            bounded_settings_scroll(
                                 ui,
-                                *settings_section,
-                                state,
-                                plugin_ui_session,
-                                false,
-                                false,
+                                "settings_wide_content",
+                                height,
+                                true,
+                                |ui| {
+                                    render_settings_content(
+                                        ui,
+                                        *settings_section,
+                                        state,
+                                        plugin_ui_session,
+                                        false,
+                                        false,
+                                    );
+                                },
                             );
-                        });
+                        },
+                    );
                 });
             }
         });
@@ -3073,5 +3131,168 @@ pub fn show_settings_page(
         state
             .filter_editor_modal
             .show(ctx, hi_rules, hi_bufs, fi_records, fi_bufs);
+    }
+}
+
+#[cfg(test)]
+mod responsive_tests {
+    use super::*;
+
+    struct SettingsHarness {
+        ctx: Context,
+        state: SettingsPageState,
+        section: SettingsSection,
+        plugins: PluginUiSessionState,
+        open: bool,
+        time: f64,
+    }
+
+    impl SettingsHarness {
+        fn new() -> Self {
+            Self {
+                ctx: Context::default(),
+                state: SettingsPageState {
+                    chat_font_size: t::DEFAULT_CHAT_FONT_SIZE,
+                    ui_font_size: 1.0,
+                    hotkey_bindings: crust_core::HotkeyBindings::defaults(),
+                    command_aliases: vec![crust_core::commands::CommandAlias {
+                        trigger: "greet".to_owned(),
+                        body: "Hello {1}!".to_owned(),
+                        enabled: true,
+                    }],
+                    ..Default::default()
+                },
+                section: SettingsSection::Appearance,
+                plugins: PluginUiSessionState::default(),
+                open: true,
+                time: 0.0,
+            }
+        }
+
+        fn frame(&mut self, size: egui::Vec2, events: Vec<egui::Event>) -> egui::FullOutput {
+            self.time += 0.1;
+            self.ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    time: Some(self.time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    show_settings_page(
+                        ctx,
+                        &mut self.open,
+                        &mut self.section,
+                        &mut self.state,
+                        &mut self.plugins,
+                        SettingsStats {
+                            highlights_count: 0,
+                            ignores_count: 0,
+                            auto_join_count: 0,
+                        },
+                    )
+                },
+            )
+        }
+
+        fn window_rect(&self) -> egui::Rect {
+            self.ctx
+                .memory(|memory| memory.area_rect(egui::Id::new("Settings")))
+                .unwrap()
+        }
+
+        fn click(&mut self, size: egui::Vec2, position: egui::Pos2) {
+            for pressed in [true, false] {
+                self.frame(
+                    size,
+                    vec![
+                        egui::Event::PointerMoved(position),
+                        egui::Event::PointerButton {
+                            pos: position,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+        }
+    }
+
+    fn visible_text_rect(output: &egui::FullOutput, wanted: &str) -> Option<egui::Rect> {
+        output.shapes.iter().find_map(|shape| {
+            if let egui::epaint::Shape::Text(text) = &shape.shape {
+                let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+                if text.galley.text() == wanted && shape.clip_rect.contains_rect(rect) {
+                    return Some(rect);
+                }
+            }
+            None
+        })
+    }
+
+    #[test]
+    fn settings_sections_stay_inside_a_shrinking_viewport_and_close_remains_clickable() {
+        let mut harness = SettingsHarness::new();
+        let mut output = egui::FullOutput::default();
+        let sizes = [
+            egui::vec2(900.0, 700.0),
+            egui::vec2(480.0, 640.0),
+            egui::vec2(320.0, 300.0),
+        ];
+        for size in sizes {
+            for section in settings_sections() {
+                harness.section = section;
+                for _ in 0..4 {
+                    output = harness.frame(size, Vec::new());
+                }
+                let window = harness.window_rect();
+                assert!(
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, size).contains_rect(window),
+                    "{section:?} window {window:?} escaped viewport {size:?}"
+                );
+                assert!(visible_text_rect(&output, "Settings").is_some());
+            }
+        }
+        let window = harness.window_rect();
+        let title_y = visible_text_rect(&output, "Settings").unwrap().center().y;
+        let close = egui::pos2(window.right() - (title_y - window.top()), title_y);
+        harness.click(*sizes.last().unwrap(), close);
+        assert!(
+            !harness.open,
+            "Close should remain reachable after shrinking the viewport"
+        );
+    }
+
+    #[test]
+    fn narrow_settings_scroll_to_bottom_controls_without_moving_the_title() {
+        let mut harness = SettingsHarness::new();
+        let size = egui::vec2(480.0, 640.0);
+        let mut output = egui::FullOutput::default();
+        for _ in 0..4 {
+            output = harness.frame(size, Vec::new());
+        }
+        assert!(visible_text_rect(&output, "Show split-header game").is_none());
+        let window = harness.window_rect();
+        let pointer = egui::pos2(window.center().x, window.bottom() - 60.0);
+        harness.frame(
+            size,
+            vec![
+                egui::Event::PointerMoved(pointer),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -2000.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        for _ in 0..30 {
+            output = harness.frame(size, Vec::new());
+        }
+        let game = visible_text_rect(&output, "Show split-header game")
+            .expect("The bottom appearance control should be reachable by scrolling");
+        assert!(visible_text_rect(&output, "Settings").is_some());
+        harness.click(size, game.center());
+        assert!(harness.state.split_header_show_game);
     }
 }

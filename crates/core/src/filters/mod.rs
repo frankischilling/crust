@@ -1,7 +1,6 @@
-//! Chatterino-compatible filter expression language.
+//! Typed filter expression language.
 //!
-//! Mirrors `chatterino2-master/src/controllers/filters/lang/` but written in
-//! Rust. Expressions are tokenized ([`lexer`]), parsed into an [`Expression`]
+//! Expressions are tokenized ([`lexer`]), parsed into an [`Expression`]
 //! AST ([`parser`]), statically type-checked (`types::synthesize_type`), and
 //! evaluated against a [`Context`] (`eval::evaluate`).
 //!

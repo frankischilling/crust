@@ -447,7 +447,7 @@ impl IrcStatusPanel {
     fn section_frame(ui: &mut Ui, title: &str, subtitle: &str, add_contents: impl FnOnce(&mut Ui)) {
         egui::Frame::new()
             .fill(t::bg_surface())
-            .stroke(egui::Stroke::new(1.0, t::border_subtle()))
+            .stroke(egui::Stroke::new(1.0_f32, t::border_subtle()))
             .corner_radius(t::RADIUS)
             .inner_margin(egui::Margin::symmetric(10, 8))
             .show(ui, |ui| {
@@ -1559,7 +1559,7 @@ fn status_row(ui: &mut Ui, key: &str, value: impl Into<String>) {
 fn status_chip(ui: &mut Ui, text: &str, fg: Color32) {
     egui::Frame::new()
         .fill(t::bg_raised())
-        .stroke(egui::Stroke::new(1.0, t::border_subtle()))
+        .stroke(egui::Stroke::new(1.0_f32, t::border_subtle()))
         .corner_radius(t::RADIUS_SM)
         .inner_margin(egui::Margin::symmetric(8, 4))
         .show(ui, |ui| {

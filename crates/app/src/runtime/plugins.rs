@@ -347,14 +347,10 @@ impl LuaPluginHost {
     }
 
     pub fn plugin_root_dir() -> PathBuf {
-        // Tests MUST NOT touch the user's real plugin directory; they
-        // write fixture plugins into this path and rely on best-effort
-        // cleanup via remove_dir_all. Any panic before cleanup would
-        // otherwise leave test fixtures in the production AppData dir
-        // and they would be loaded at next app launch.
+        // Tests get an isolated fixture directory that is removed on unwind.
         #[cfg(test)]
         {
-            return std::env::temp_dir().join("crust-test-plugins");
+            return tests::plugin_fixture_root();
         }
         #[cfg(not(test))]
         {
@@ -1640,77 +1636,79 @@ fn event_kind_name(kind: PluginEventKind) -> &'static str {
     }
 }
 
+// Numeric callback IDs are public API. Append new kinds to preserve existing IDs.
+const PLUGIN_EVENT_KINDS: &[PluginEventKind] = &[
+    PluginEventKind::CompletionRequested,
+    PluginEventKind::EmoteImageReady,
+    PluginEventKind::Authenticated,
+    PluginEventKind::EmoteCatalogUpdated,
+    PluginEventKind::LoggedOut,
+    PluginEventKind::AccountListUpdated,
+    PluginEventKind::ChannelJoined,
+    PluginEventKind::ChannelParted,
+    PluginEventKind::ChannelRedirected,
+    PluginEventKind::ConnectionStateChanged,
+    PluginEventKind::MessageReceived,
+    PluginEventKind::WhisperReceived,
+    PluginEventKind::MessageDeleted,
+    PluginEventKind::SystemNotice,
+    PluginEventKind::Error,
+    PluginEventKind::HistoryLoaded,
+    PluginEventKind::UserProfileLoaded,
+    PluginEventKind::UserProfileUnavailable,
+    PluginEventKind::StreamStatusUpdated,
+    PluginEventKind::IvrLogsLoaded,
+    PluginEventKind::IvrLogsFailed,
+    PluginEventKind::ChannelEmotesLoaded,
+    PluginEventKind::BetaFeaturesUpdated,
+    PluginEventKind::ChatUiBehaviorUpdated,
+    PluginEventKind::GeneralSettingsUpdated,
+    PluginEventKind::SlashUsageCountsUpdated,
+    PluginEventKind::EmotePickerPreferencesUpdated,
+    PluginEventKind::AppearanceSettingsUpdated,
+    PluginEventKind::RoomStateUpdated,
+    PluginEventKind::AutoModQueueAppend,
+    PluginEventKind::AutoModQueueRemove,
+    PluginEventKind::UnbanRequestsLoaded,
+    PluginEventKind::UnbanRequestsFailed,
+    PluginEventKind::UnbanRequestUpsert,
+    PluginEventKind::UnbanRequestResolved,
+    PluginEventKind::OpenModerationTools,
+    PluginEventKind::HighlightRulesUpdated,
+    PluginEventKind::FilterRecordsUpdated,
+    PluginEventKind::ModActionPresetsUpdated,
+    PluginEventKind::SelfAvatarLoaded,
+    PluginEventKind::LinkPreviewReady,
+    PluginEventKind::SenderCosmeticsUpdated,
+    PluginEventKind::IrcTopicChanged,
+    PluginEventKind::AuthExpired,
+    PluginEventKind::UserMessagesCleared,
+    PluginEventKind::UserStateUpdated,
+    PluginEventKind::ChannelMessagesCleared,
+    PluginEventKind::ClearUserMessagesLocally,
+    PluginEventKind::ImagePrefetchQueued,
+    PluginEventKind::PluginUiAction,
+    PluginEventKind::PluginUiChange,
+    PluginEventKind::PluginUiSubmit,
+    PluginEventKind::PluginUiWindowClosed,
+    PluginEventKind::NicknamesUpdated,
+    PluginEventKind::IgnoredUsersUpdated,
+    PluginEventKind::IgnoredPhrasesUpdated,
+    PluginEventKind::UserPronounsLoaded,
+    PluginEventKind::UsercardSettingsUpdated,
+    PluginEventKind::FontSettingsUpdated,
+    PluginEventKind::RestoreLastActiveChannel,
+    PluginEventKind::LowTrustStatusUpdated,
+    PluginEventKind::SoundSettingsUpdated,
+    PluginEventKind::UploadStarted,
+    PluginEventKind::UploadFinished,
+    PluginEventKind::HotkeyBindingsUpdated,
+];
+
 fn push_event_type_table(L: *mut lua_State) {
     unsafe {
         lua_createtable(L, 0, 0);
-        let kinds = [
-            PluginEventKind::CompletionRequested,
-            PluginEventKind::EmoteImageReady,
-            PluginEventKind::Authenticated,
-            PluginEventKind::EmoteCatalogUpdated,
-            PluginEventKind::LoggedOut,
-            PluginEventKind::AccountListUpdated,
-            PluginEventKind::ChannelJoined,
-            PluginEventKind::ChannelParted,
-            PluginEventKind::ChannelRedirected,
-            PluginEventKind::ConnectionStateChanged,
-            PluginEventKind::MessageReceived,
-            PluginEventKind::WhisperReceived,
-            PluginEventKind::MessageDeleted,
-            PluginEventKind::SystemNotice,
-            PluginEventKind::Error,
-            PluginEventKind::HistoryLoaded,
-            PluginEventKind::UserProfileLoaded,
-            PluginEventKind::UserProfileUnavailable,
-            PluginEventKind::StreamStatusUpdated,
-            PluginEventKind::IvrLogsLoaded,
-            PluginEventKind::IvrLogsFailed,
-            PluginEventKind::ChannelEmotesLoaded,
-            PluginEventKind::BetaFeaturesUpdated,
-            PluginEventKind::ChatUiBehaviorUpdated,
-            PluginEventKind::GeneralSettingsUpdated,
-            PluginEventKind::SlashUsageCountsUpdated,
-            PluginEventKind::EmotePickerPreferencesUpdated,
-            PluginEventKind::AppearanceSettingsUpdated,
-            PluginEventKind::FontSettingsUpdated,
-            PluginEventKind::RestoreLastActiveChannel,
-            PluginEventKind::RoomStateUpdated,
-            PluginEventKind::AutoModQueueAppend,
-            PluginEventKind::AutoModQueueRemove,
-            PluginEventKind::UnbanRequestsLoaded,
-            PluginEventKind::UnbanRequestsFailed,
-            PluginEventKind::UnbanRequestUpsert,
-            PluginEventKind::UnbanRequestResolved,
-            PluginEventKind::OpenModerationTools,
-            PluginEventKind::HighlightRulesUpdated,
-            PluginEventKind::FilterRecordsUpdated,
-            PluginEventKind::ModActionPresetsUpdated,
-            PluginEventKind::SelfAvatarLoaded,
-            PluginEventKind::LinkPreviewReady,
-            PluginEventKind::SenderCosmeticsUpdated,
-            PluginEventKind::IrcTopicChanged,
-            PluginEventKind::AuthExpired,
-            PluginEventKind::UserMessagesCleared,
-            PluginEventKind::LowTrustStatusUpdated,
-            PluginEventKind::UserStateUpdated,
-            PluginEventKind::ChannelMessagesCleared,
-            PluginEventKind::ClearUserMessagesLocally,
-            PluginEventKind::ImagePrefetchQueued,
-            PluginEventKind::PluginUiAction,
-            PluginEventKind::PluginUiChange,
-            PluginEventKind::PluginUiSubmit,
-            PluginEventKind::PluginUiWindowClosed,
-            PluginEventKind::NicknamesUpdated,
-            PluginEventKind::IgnoredUsersUpdated,
-            PluginEventKind::IgnoredPhrasesUpdated,
-            PluginEventKind::UserPronounsLoaded,
-            PluginEventKind::UsercardSettingsUpdated,
-            PluginEventKind::SoundSettingsUpdated,
-            PluginEventKind::UploadStarted,
-            PluginEventKind::UploadFinished,
-            PluginEventKind::HotkeyBindingsUpdated,
-        ];
-        for (idx, kind) in kinds.into_iter().enumerate() {
+        for (idx, kind) in PLUGIN_EVENT_KINDS.iter().copied().enumerate() {
             set_field_int(L, -1, event_kind_name(kind), idx as i64);
         }
     }
@@ -1719,74 +1717,9 @@ fn push_event_type_table(L: *mut lua_State) {
 fn event_kind_from_value(L: *mut lua_State, idx: c_int) -> Option<PluginEventKind> {
     unsafe {
         match lua_type(L, idx) {
-            LUA_TNUMBER => match lua_value_int(L, idx)? {
-                0 => Some(PluginEventKind::CompletionRequested),
-                1 => Some(PluginEventKind::EmoteImageReady),
-                2 => Some(PluginEventKind::Authenticated),
-                3 => Some(PluginEventKind::EmoteCatalogUpdated),
-                4 => Some(PluginEventKind::LoggedOut),
-                5 => Some(PluginEventKind::AccountListUpdated),
-                6 => Some(PluginEventKind::ChannelJoined),
-                7 => Some(PluginEventKind::ChannelParted),
-                8 => Some(PluginEventKind::ChannelRedirected),
-                9 => Some(PluginEventKind::ConnectionStateChanged),
-                10 => Some(PluginEventKind::MessageReceived),
-                11 => Some(PluginEventKind::WhisperReceived),
-                12 => Some(PluginEventKind::MessageDeleted),
-                13 => Some(PluginEventKind::SystemNotice),
-                14 => Some(PluginEventKind::Error),
-                15 => Some(PluginEventKind::HistoryLoaded),
-                16 => Some(PluginEventKind::UserProfileLoaded),
-                17 => Some(PluginEventKind::UserProfileUnavailable),
-                18 => Some(PluginEventKind::StreamStatusUpdated),
-                19 => Some(PluginEventKind::IvrLogsLoaded),
-                20 => Some(PluginEventKind::IvrLogsFailed),
-                21 => Some(PluginEventKind::ChannelEmotesLoaded),
-                22 => Some(PluginEventKind::BetaFeaturesUpdated),
-                23 => Some(PluginEventKind::ChatUiBehaviorUpdated),
-                24 => Some(PluginEventKind::GeneralSettingsUpdated),
-                25 => Some(PluginEventKind::SlashUsageCountsUpdated),
-                26 => Some(PluginEventKind::EmotePickerPreferencesUpdated),
-                27 => Some(PluginEventKind::AppearanceSettingsUpdated),
-                28 => Some(PluginEventKind::RoomStateUpdated),
-                29 => Some(PluginEventKind::AutoModQueueAppend),
-                30 => Some(PluginEventKind::AutoModQueueRemove),
-                31 => Some(PluginEventKind::UnbanRequestsLoaded),
-                32 => Some(PluginEventKind::UnbanRequestsFailed),
-                33 => Some(PluginEventKind::UnbanRequestUpsert),
-                34 => Some(PluginEventKind::UnbanRequestResolved),
-                35 => Some(PluginEventKind::OpenModerationTools),
-                36 => Some(PluginEventKind::HighlightRulesUpdated),
-                37 => Some(PluginEventKind::FilterRecordsUpdated),
-                38 => Some(PluginEventKind::ModActionPresetsUpdated),
-                39 => Some(PluginEventKind::SelfAvatarLoaded),
-                40 => Some(PluginEventKind::LinkPreviewReady),
-                41 => Some(PluginEventKind::SenderCosmeticsUpdated),
-                42 => Some(PluginEventKind::IrcTopicChanged),
-                43 => Some(PluginEventKind::AuthExpired),
-                44 => Some(PluginEventKind::UserMessagesCleared),
-                45 => Some(PluginEventKind::UserStateUpdated),
-                46 => Some(PluginEventKind::ChannelMessagesCleared),
-                47 => Some(PluginEventKind::ClearUserMessagesLocally),
-                48 => Some(PluginEventKind::ImagePrefetchQueued),
-                49 => Some(PluginEventKind::PluginUiAction),
-                50 => Some(PluginEventKind::PluginUiChange),
-                51 => Some(PluginEventKind::PluginUiSubmit),
-                52 => Some(PluginEventKind::PluginUiWindowClosed),
-                53 => Some(PluginEventKind::NicknamesUpdated),
-                54 => Some(PluginEventKind::IgnoredUsersUpdated),
-                55 => Some(PluginEventKind::IgnoredPhrasesUpdated),
-                56 => Some(PluginEventKind::UserPronounsLoaded),
-                57 => Some(PluginEventKind::UsercardSettingsUpdated),
-                58 => Some(PluginEventKind::FontSettingsUpdated),
-                59 => Some(PluginEventKind::RestoreLastActiveChannel),
-                60 => Some(PluginEventKind::LowTrustStatusUpdated),
-                61 => Some(PluginEventKind::SoundSettingsUpdated),
-                62 => Some(PluginEventKind::UploadStarted),
-                63 => Some(PluginEventKind::UploadFinished),
-                64 => Some(PluginEventKind::HotkeyBindingsUpdated),
-                _ => None,
-            },
+            LUA_TNUMBER => usize::try_from(lua_value_int(L, idx)?)
+                .ok()
+                .and_then(|index| PLUGIN_EVENT_KINDS.get(index).copied()),
             LUA_TSTRING => {
                 let name = lua_value_string(L, idx)?.to_ascii_lowercase();
                 Some(match name.as_str() {
@@ -5175,7 +5108,8 @@ fn event_kind(event: &AppEvent) -> Option<PluginEventKind> {
         AppEvent::WhisperReceived { .. } => PluginEventKind::WhisperReceived,
         AppEvent::MessageDeleted { .. } => PluginEventKind::MessageDeleted,
         AppEvent::SystemNotice(_) => PluginEventKind::SystemNotice,
-        AppEvent::Error { .. } => PluginEventKind::Error,
+        AppEvent::Error { .. } | AppEvent::MessageSendRejected { .. } => PluginEventKind::Error,
+        AppEvent::AuthenticationPending { .. } => return None,
         AppEvent::HistoryLoaded { .. } => PluginEventKind::HistoryLoaded,
         AppEvent::UserProfileLoaded { .. } => PluginEventKind::UserProfileLoaded,
         AppEvent::UserProfileUnavailable { .. } => PluginEventKind::UserProfileUnavailable,
@@ -5239,7 +5173,9 @@ fn event_kind(event: &AppEvent) -> Option<PluginEventKind> {
         AppEvent::UserStateUpdated { .. } => PluginEventKind::UserStateUpdated,
         AppEvent::UserMessagesCleared { .. } => PluginEventKind::UserMessagesCleared,
         AppEvent::LowTrustStatusUpdated { .. } => PluginEventKind::LowTrustStatusUpdated,
-        AppEvent::ChannelMessagesCleared { .. } => PluginEventKind::ChannelMessagesCleared,
+        AppEvent::ChannelMessagesCleared { .. } | AppEvent::ChannelChatCleared { .. } => {
+            PluginEventKind::ChannelMessagesCleared
+        }
         AppEvent::ClearUserMessagesLocally { .. } => PluginEventKind::ClearUserMessagesLocally,
         AppEvent::ImagePrefetchQueued { .. } => PluginEventKind::ImagePrefetchQueued,
         AppEvent::PluginUiAction { .. } => PluginEventKind::PluginUiAction,
@@ -5262,7 +5198,7 @@ fn event_kind(event: &AppEvent) -> Option<PluginEventKind> {
         // plugins. Plugins that care about hype trains can subscribe to
         // the underlying EventSub notice via MessageReceived (begin/end
         // chat lines).
-        AppEvent::HypeTrainUpdated { .. } => return None,
+        AppEvent::HypeTrainUpdated { .. } | AppEvent::HypeTrainCleared { .. } => return None,
         // Raid banner state is UI-only; the underlying raid is already
         // delivered to plugins as a `MsgKind::Raid` chat line via
         // MessageReceived.
@@ -5348,6 +5284,7 @@ unsafe fn make_event_table(L: *mut lua_State, event: &AppEvent) -> c_int {
         AppEvent::ChannelJoined { channel }
         | AppEvent::ChannelParted { channel }
         | AppEvent::ChannelMessagesCleared { channel }
+        | AppEvent::ChannelChatCleared { channel }
         | AppEvent::ClearUserMessagesLocally { channel, .. } => {
             push_channel_table(L, channel);
             lua_setfield(L, -2, cstring("channel").as_ptr());
@@ -5431,6 +5368,12 @@ unsafe fn make_event_table(L: *mut lua_State, event: &AppEvent) -> c_int {
             set_field_string(L, -1, "context", context);
             set_field_string(L, -1, "message", message);
         }
+        AppEvent::MessageSendRejected { reason, .. } => {
+            // Drafts and reply context stay in the UI's recovery path.
+            set_field_string(L, -1, "context", "SendMessage");
+            set_field_string(L, -1, "message", reason);
+        }
+        AppEvent::AuthenticationPending { .. } => {}
         AppEvent::HistoryLoaded { channel, messages } => {
             push_channel_table(L, channel);
             lua_setfield(L, -2, cstring("channel").as_ptr());
@@ -6138,7 +6081,7 @@ unsafe fn make_event_table(L: *mut lua_State, event: &AppEvent) -> c_int {
         AppEvent::SpellDictionaryUpdated { .. } => {}
         // Hype train state is UI-only banner data; plugins see the begin/end
         // chat line via MessageReceived.
-        AppEvent::HypeTrainUpdated { .. } => {}
+        AppEvent::HypeTrainUpdated { .. } | AppEvent::HypeTrainCleared { .. } => {}
         // Raid banner state is UI-only; plugins see the raid as a MsgKind::Raid line.
         AppEvent::RaidBannerShown { .. } => {}
         // Shared-chat source-channel metadata is UI-only.
@@ -6196,6 +6139,52 @@ mod tests {
     use crust_core::plugins::{PluginHost, PluginUiHostSlot};
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    thread_local! {
+        static FIXTURE_ROOT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    }
+
+    struct TestScope {
+        root: PathBuf,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    fn test_scope() -> TestScope {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "crust-plugin-fixture-{}-{}-{}",
+            std::process::id(),
+            system_time_unix_ms(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+        ));
+        FIXTURE_ROOT.with(|current| *current.borrow_mut() = Some(root.clone()));
+        TestScope { root, _lock: lock }
+    }
+
+    pub(super) fn plugin_fixture_root() -> PathBuf {
+        FIXTURE_ROOT.with(|current| {
+            current.borrow().clone().expect("plugin tests require a fixture scope")
+        })
+    }
+
+    impl Drop for TestScope {
+        fn drop(&mut self) {
+            // Release the global host before removing its fixtures, including
+            // when an assertion unwinds. Drop it outside the global lock.
+            let host = plugin_host_cell()
+                .write()
+                .unwrap_or_else(|p| p.into_inner())
+                .take();
+            drop(host);
+            plugin_state_index()
+                .write()
+                .unwrap_or_else(|p| p.into_inner())
+                .clear();
+            FIXTURE_ROOT.with(|current| *current.borrow_mut() = None);
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
 
     struct LuaStateGuard(*mut lua_State);
 
@@ -6277,7 +6266,7 @@ mod tests {
 
     #[test]
     fn event_table_builds_authenticated_payload() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = test_scope();
         let lua = LuaStateGuard::new();
         let event = AppEvent::Authenticated {
             username: "alice".to_owned(),
@@ -6300,8 +6289,39 @@ mod tests {
     }
 
     #[test]
+    fn rejected_message_reports_plugin_error_without_exposing_the_draft() {
+        let _guard = test_scope();
+        let lua = LuaStateGuard::new();
+        let event = AppEvent::MessageSendRejected {
+            channel: ChannelId::new("room"),
+            text: "private unsent draft".to_owned(),
+            reply_to_msg_id: Some("parent-id".to_owned()),
+            reply: Some(crust_core::ReplyInfo {
+                parent_msg_id: "parent-id".to_owned(),
+                parent_user_login: "viewer".to_owned(),
+                parent_display_name: "Viewer".to_owned(),
+                parent_msg_body: "quoted message".to_owned(),
+            }),
+            reason: "Message was not sent. Sign-in is still in progress.".to_owned(),
+        };
+        assert_eq!(event_kind(&event), Some(PluginEventKind::Error));
+        let idx = unsafe { make_event_table(lua.ptr(), &event) };
+        assert_eq!(lua_get_string_field(lua.ptr(), idx, "type").as_deref(), Some("Error"));
+        assert_eq!(lua_get_string_field(lua.ptr(), idx, "context").as_deref(), Some("SendMessage"));
+        assert_eq!(lua_get_string_field(lua.ptr(), idx, "message").as_deref(), Some("Message was not sent. Sign-in is still in progress."));
+        for field in ["text", "channel", "reply", "reply_to_msg_id"] {
+            unsafe {
+                lua_getfield(lua.ptr(), idx, cstring(field).as_ptr());
+                assert_eq!(lua_type(lua.ptr(), -1), LUA_TNIL);
+                lua_pop(lua.ptr(), 1);
+            }
+        }
+        assert!(event_kind(&AppEvent::AuthenticationPending { username: Some("alice".to_owned()) }).is_none());
+    }
+
+    #[test]
     fn callback_event_parser_rejects_unknown_values() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = test_scope();
         let lua = LuaStateGuard::new();
         unsafe {
             lua_pushinteger(lua.ptr(), 999);
@@ -6315,7 +6335,7 @@ mod tests {
 
     #[test]
     fn callback_event_parser_accepts_new_values() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = test_scope();
         let lua = LuaStateGuard::new();
         unsafe {
             lua_pushstring(lua.ptr(), cstring("EmoteImageReady").as_ptr());
@@ -6349,8 +6369,41 @@ mod tests {
     }
 
     #[test]
+    fn every_exported_event_constant_registers_the_same_event_kind() {
+        let _guard = test_scope();
+        let lua = LuaStateGuard::new();
+        push_event_type_table(lua.ptr());
+        let table = unsafe { lua_gettop(lua.ptr()) };
+        for &kind in PLUGIN_EVENT_KINDS {
+            unsafe {
+                lua_getfield(lua.ptr(), table, cstring(event_kind_name(kind)).as_ptr());
+                assert_eq!(
+                    event_kind_from_value(lua.ptr(), -1),
+                    Some(kind),
+                    "{}",
+                    event_kind_name(kind),
+                );
+                lua_pop(lua.ptr(), 1);
+            }
+        }
+        for (kind, id) in [
+            (PluginEventKind::RoomStateUpdated, 28),
+            (PluginEventKind::ImagePrefetchQueued, 48),
+            (PluginEventKind::PluginUiAction, 49),
+            (PluginEventKind::FontSettingsUpdated, 58),
+            (PluginEventKind::RestoreLastActiveChannel, 59),
+            (PluginEventKind::LowTrustStatusUpdated, 60),
+        ] {
+            assert_eq!(
+                lua_get_int_field(lua.ptr(), table, event_kind_name(kind)),
+                Some(id),
+            );
+        }
+    }
+
+    #[test]
     fn event_table_builds_emote_image_ready_payload() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = test_scope();
         let lua = LuaStateGuard::new();
         let event = AppEvent::EmoteImageReady {
             uri: "emote://test".to_owned(),
@@ -6379,7 +6432,7 @@ mod tests {
 
     #[test]
     fn event_table_builds_emote_catalog_payload() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = test_scope();
         let lua = LuaStateGuard::new();
         let event = AppEvent::EmoteCatalogUpdated {
             emotes: vec![
@@ -6408,7 +6461,7 @@ mod tests {
 
     #[test]
     fn event_table_builds_user_messages_cleared_payload() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = test_scope();
         let lua = LuaStateGuard::new();
         let event = AppEvent::UserMessagesCleared {
             channel: ChannelId::new("some_channel"),
@@ -6428,7 +6481,7 @@ mod tests {
 
     #[test]
     fn event_table_builds_image_prefetch_queued_payload() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = test_scope();
         let lua = LuaStateGuard::new();
         let event = AppEvent::ImagePrefetchQueued { count: 7 };
         let idx = unsafe { make_event_table(lua.ptr(), &event) };
@@ -6442,7 +6495,7 @@ mod tests {
 
     #[test]
     fn event_table_builds_plugin_ui_change_payload() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = test_scope();
         let lua = LuaStateGuard::new();
         let mut form_values = BTreeMap::new();
         form_values.insert("name".to_owned(), PluginUiValue::String("Crust".to_owned()));
@@ -6472,7 +6525,7 @@ mod tests {
 
     #[test]
     fn event_table_builds_host_panel_payload() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = test_scope();
         let lua = LuaStateGuard::new();
         let mut form_values = BTreeMap::new();
         form_values.insert(
@@ -6509,13 +6562,7 @@ mod tests {
 
     #[test]
     fn callback_is_removed_when_plugin_unloads() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp_root =
-            std::env::temp_dir().join(format!("crust-lua-api-test-{}", system_time_unix_ms()));
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("HOME", &temp_root);
-        std::env::set_var("XDG_DATA_HOME", temp_root.join(".local/share"));
+        let _guard = test_scope();
 
         let plugin_root = LuaPluginHost::plugin_root_dir();
         let plugin_dir = plugin_root.join("event_probe");
@@ -6566,28 +6613,11 @@ end)
         host.dispatch_event(&event);
         assert!(cmd_rx.try_recv().is_err());
 
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn ui_window_registration_is_available_to_ui_snapshot() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp_root =
-            std::env::temp_dir().join(format!("crust-plugin-ui-window-{}", system_time_unix_ms()));
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("HOME", &temp_root);
-        std::env::set_var("XDG_DATA_HOME", temp_root.join(".local/share"));
+        let _guard = test_scope();
 
         let plugin_root = LuaPluginHost::plugin_root_dir();
         let plugin_dir = plugin_root.join("ui_window_probe");
@@ -6626,30 +6656,11 @@ c2.ui.register_window({
         assert_eq!(snapshot.windows[0].window.title, "Demo Window");
         assert_eq!(snapshot.windows[0].window.children.len(), 2);
 
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn ui_settings_page_registration_is_available_to_ui_snapshot() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp_root = std::env::temp_dir().join(format!(
-            "crust-plugin-ui-settings-{}",
-            system_time_unix_ms()
-        ));
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("HOME", &temp_root);
-        std::env::set_var("XDG_DATA_HOME", temp_root.join(".local/share"));
+        let _guard = test_scope();
 
         let plugin_root = LuaPluginHost::plugin_root_dir();
         let plugin_dir = plugin_root.join("ui_settings_probe");
@@ -6686,30 +6697,11 @@ c2.ui.register_settings_page({
         assert_eq!(snapshot.settings_pages[0].page.id, "settings");
         assert_eq!(snapshot.settings_pages[0].page.title, "Settings Demo");
 
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn host_panel_registration_is_available_to_ui_snapshot() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp_root = std::env::temp_dir().join(format!(
-            "crust-plugin-ui-host-panel-{}",
-            system_time_unix_ms()
-        ));
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("HOME", &temp_root);
-        std::env::set_var("XDG_DATA_HOME", temp_root.join(".local/share"));
+        let _guard = test_scope();
 
         let plugin_root = LuaPluginHost::plugin_root_dir();
         let plugin_dir = plugin_root.join("ui_host_panel_probe");
@@ -6766,30 +6758,11 @@ c2.ui.register_host_panel({
         assert_eq!(snapshot.host_panels[0].panel.order, 25);
         assert_eq!(snapshot.host_panels[0].panel.children.len(), 2);
 
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn invalid_ui_window_spec_is_ignored() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp_root = std::env::temp_dir().join(format!(
-            "crust-plugin-ui-invalid-window-{}",
-            system_time_unix_ms()
-        ));
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("HOME", &temp_root);
-        std::env::set_var("XDG_DATA_HOME", temp_root.join(".local/share"));
+        let _guard = test_scope();
 
         let plugin_root = LuaPluginHost::plugin_root_dir();
         let plugin_dir = plugin_root.join("ui_invalid_window_probe");
@@ -6818,30 +6791,11 @@ c2.ui.register_window({
         let snapshot = host.plugin_ui_snapshot();
         assert!(snapshot.windows.is_empty());
 
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn invalid_host_panel_spec_is_ignored() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp_root = std::env::temp_dir().join(format!(
-            "crust-plugin-ui-invalid-host-panel-{}",
-            system_time_unix_ms()
-        ));
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("HOME", &temp_root);
-        std::env::set_var("XDG_DATA_HOME", temp_root.join(".local/share"));
+        let _guard = test_scope();
 
         let plugin_root = LuaPluginHost::plugin_root_dir();
         let plugin_dir = plugin_root.join("ui_invalid_host_panel_probe");
@@ -6877,30 +6831,11 @@ c2.ui.register_host_panel({
         let snapshot = host.plugin_ui_snapshot();
         assert!(snapshot.host_panels.is_empty());
 
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn invalid_ui_settings_page_spec_is_ignored() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp_root = std::env::temp_dir().join(format!(
-            "crust-plugin-ui-invalid-settings-{}",
-            system_time_unix_ms()
-        ));
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("HOME", &temp_root);
-        std::env::set_var("XDG_DATA_HOME", temp_root.join(".local/share"));
+        let _guard = test_scope();
 
         let plugin_root = LuaPluginHost::plugin_root_dir();
         let plugin_dir = plugin_root.join("ui_invalid_settings_probe");
@@ -6927,30 +6862,11 @@ c2.ui.register_settings_page("not_a_table")
         let snapshot = host.plugin_ui_snapshot();
         assert!(snapshot.settings_pages.is_empty());
 
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn ui_window_commands_update_snapshot_state() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp_root = std::env::temp_dir().join(format!(
-            "crust-plugin-ui-window-commands-{}",
-            system_time_unix_ms()
-        ));
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("HOME", &temp_root);
-        std::env::set_var("XDG_DATA_HOME", temp_root.join(".local/share"));
+        let _guard = test_scope();
 
         let plugin_root = LuaPluginHost::plugin_root_dir();
         let plugin_dir = plugin_root.join("ui_window_command_probe");
@@ -7029,30 +6945,11 @@ end)
         snapshot = host.plugin_ui_snapshot();
         assert!(snapshot.windows.is_empty());
 
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn host_panel_update_uses_explicit_id() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp_root = std::env::temp_dir().join(format!(
-            "crust-plugin-ui-host-panel-update-{}",
-            system_time_unix_ms()
-        ));
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("HOME", &temp_root);
-        std::env::set_var("XDG_DATA_HOME", temp_root.join(".local/share"));
+        let _guard = test_scope();
 
         let plugin_root = LuaPluginHost::plugin_root_dir();
         let plugin_dir = plugin_root.join("ui_host_panel_update_probe");
@@ -7106,30 +7003,11 @@ c2.ui.update_host_panel("beta", {
         assert_eq!(updated.panel.title.as_deref(), Some("Beta"));
         assert_eq!(updated.panel.slot, PluginUiHostSlot::SettingsChat);
 
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn host_panel_commands_update_snapshot_state() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp_root = std::env::temp_dir().join(format!(
-            "crust-plugin-ui-host-panel-commands-{}",
-            system_time_unix_ms()
-        ));
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("HOME", &temp_root);
-        std::env::set_var("XDG_DATA_HOME", temp_root.join(".local/share"));
+        let _guard = test_scope();
 
         let plugin_root = LuaPluginHost::plugin_root_dir();
         let plugin_dir = plugin_root.join("ui_host_panel_command_probe");
@@ -7217,30 +7095,11 @@ end)
         snapshot = host.plugin_ui_snapshot();
         assert!(snapshot.host_panels.is_empty());
 
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn ui_host_panels_demo_plugin_loads() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp_root = std::env::temp_dir().join(format!(
-            "crust-plugin-ui-host-panel-example-{}",
-            system_time_unix_ms()
-        ));
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("HOME", &temp_root);
-        std::env::set_var("XDG_DATA_HOME", temp_root.join(".local/share"));
+        let _guard = test_scope();
 
         let plugin_root = LuaPluginHost::plugin_root_dir();
         let source_plugin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -7285,28 +7144,11 @@ end)
                 && panel.panel.slot == PluginUiHostSlot::ChannelHeader
         }));
 
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn clock_usage_plugin_loads_and_registers_command() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp_root =
-            std::env::temp_dir().join(format!("crust-clock-usage-smoke-{}", system_time_unix_ms()));
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("HOME", &temp_root);
-        std::env::set_var("XDG_DATA_HOME", temp_root.join(".local/share"));
+        let _guard = test_scope();
 
         let source_plugin =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/clock_usage_plugin");
@@ -7331,30 +7173,11 @@ end)
         let commands = host.command_infos();
         assert!(commands.iter().any(|cmd| cmd.name == "crusttime"));
 
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn current_channel_binding_returns_nil_without_active_channel() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp_root = std::env::temp_dir().join(format!(
-            "crust-current-channel-nil-{}",
-            system_time_unix_ms()
-        ));
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("HOME", &temp_root);
-        std::env::set_var("XDG_DATA_HOME", temp_root.join(".local/share"));
+        let _guard = test_scope();
 
         let plugin_root = LuaPluginHost::plugin_root_dir();
         let plugin_dir = plugin_root.join("current_channel_probe");
@@ -7400,30 +7223,11 @@ end)
             other => panic!("unexpected command from current_channel probe: {other:?}"),
         }
 
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn current_channel_binding_returns_active_channel_snapshot() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp_root = std::env::temp_dir().join(format!(
-            "crust-current-channel-active-{}",
-            system_time_unix_ms()
-        ));
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("HOME", &temp_root);
-        std::env::set_var("XDG_DATA_HOME", temp_root.join(".local/share"));
+        let _guard = test_scope();
 
         let plugin_root = LuaPluginHost::plugin_root_dir();
         let plugin_dir = plugin_root.join("current_channel_active_probe");
@@ -7471,28 +7275,11 @@ end)
             other => panic!("unexpected command from current_channel probe: {other:?}"),
         }
 
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn api_tour_plugin_loads() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp_root =
-            std::env::temp_dir().join(format!("crust-api-tour-smoke-{}", system_time_unix_ms()));
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("HOME", &temp_root);
-        std::env::set_var("XDG_DATA_HOME", temp_root.join(".local/share"));
+        let _guard = test_scope();
 
         let source_plugin =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/api_tour_plugin");
@@ -7514,30 +7301,11 @@ end)
             "api_tour_plugin should load: {statuses:#?}"
         );
 
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn event_callback_demo_plugin_loads() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp_root = std::env::temp_dir().join(format!(
-            "crust-event-callback-demo-smoke-{}",
-            system_time_unix_ms()
-        ));
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("HOME", &temp_root);
-        std::env::set_var("XDG_DATA_HOME", temp_root.join(".local/share"));
+        let _guard = test_scope();
 
         let source_plugin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../plugins/event_callback_demo_plugin");
@@ -7559,30 +7327,11 @@ end)
             "event_callback_demo_plugin should load: {statuses:#?}"
         );
 
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn loader_progress_demo_plugin_loads() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp_root = std::env::temp_dir().join(format!(
-            "crust-loader-progress-demo-smoke-{}",
-            system_time_unix_ms()
-        ));
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("HOME", &temp_root);
-        std::env::set_var("XDG_DATA_HOME", temp_root.join(".local/share"));
+        let _guard = test_scope();
 
         let source_plugin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../plugins/loader_progress_demo_plugin");
@@ -7604,28 +7353,11 @@ end)
             "loader_progress_demo_plugin should load: {statuses:#?}"
         );
 
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn clock_usage_plugin_delayed_tick_callback_runs() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp_root =
-            std::env::temp_dir().join(format!("crust-clock-usage-delay-{}", system_time_unix_ms()));
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("HOME", &temp_root);
-        std::env::set_var("XDG_DATA_HOME", temp_root.join(".local/share"));
+        let _guard = test_scope();
 
         let source_plugin =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/clock_usage_plugin");
@@ -7689,30 +7421,11 @@ end)
             other => panic!("unexpected follow-up command from clock plugin: {other:?}"),
         }
 
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn ui_window_showcase_plugin_loads() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp_root = std::env::temp_dir().join(format!(
-            "crust-ui-window-showcase-smoke-{}",
-            system_time_unix_ms()
-        ));
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("HOME", &temp_root);
-        std::env::set_var("XDG_DATA_HOME", temp_root.join(".local/share"));
+        let _guard = test_scope();
 
         let source_plugin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../plugins/ui_window_showcase_plugin");
@@ -7734,30 +7447,11 @@ end)
             "ui_window_showcase_plugin should load: {statuses:#?}"
         );
 
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn ui_settings_demo_plugin_loads() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp_root = std::env::temp_dir().join(format!(
-            "crust-ui-settings-demo-smoke-{}",
-            system_time_unix_ms()
-        ));
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("HOME", &temp_root);
-        std::env::set_var("XDG_DATA_HOME", temp_root.join(".local/share"));
+        let _guard = test_scope();
 
         let source_plugin =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/ui_settings_demo_plugin");
@@ -7779,30 +7473,11 @@ end)
             "ui_settings_demo_plugin should load: {statuses:#?}"
         );
 
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn send_message_binding_supports_reply_to_msg_id() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp_root = std::env::temp_dir().join(format!(
-            "crust-send-message-reply-id-{}",
-            system_time_unix_ms()
-        ));
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("HOME", &temp_root);
-        std::env::set_var("XDG_DATA_HOME", temp_root.join(".local/share"));
+        let _guard = test_scope();
 
         let plugin_root = LuaPluginHost::plugin_root_dir();
         let plugin_dir = plugin_root.join("send_message_reply_id_probe");
@@ -7846,30 +7521,11 @@ c2.send_message("some_channel", "hello", {
         }
         assert!(host.plugin_statuses().iter().any(|status| status.loaded));
 
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn send_message_binding_supports_full_reply_metadata() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp_root = std::env::temp_dir().join(format!(
-            "crust-send-message-reply-full-{}",
-            system_time_unix_ms()
-        ));
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("HOME", &temp_root);
-        std::env::set_var("XDG_DATA_HOME", temp_root.join(".local/share"));
+        let _guard = test_scope();
 
         let plugin_root = LuaPluginHost::plugin_root_dir();
         let plugin_dir = plugin_root.join("send_message_reply_full_probe");
@@ -7923,30 +7579,11 @@ c2.send_message("some_channel", "hello", {
         }
         assert!(host.plugin_statuses().iter().any(|status| status.loaded));
 
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn send_message_binding_ignores_malformed_reply_options() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp_root = std::env::temp_dir().join(format!(
-            "crust-send-message-reply-invalid-{}",
-            system_time_unix_ms()
-        ));
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("HOME", &temp_root);
-        std::env::set_var("XDG_DATA_HOME", temp_root.join(".local/share"));
+        let _guard = test_scope();
 
         let plugin_root = LuaPluginHost::plugin_root_dir();
         let plugin_dir = plugin_root.join("send_message_reply_invalid_probe");
@@ -7994,30 +7631,11 @@ c2.send_message("some_channel", "hello", {
         }
         assert!(host.plugin_statuses().iter().any(|status| status.loaded));
 
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn emote_image_ready_callback_dispatches_payload() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp_root = std::env::temp_dir().join(format!(
-            "crust-emote-image-callback-{}",
-            system_time_unix_ms()
-        ));
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("HOME", &temp_root);
-        std::env::set_var("XDG_DATA_HOME", temp_root.join(".local/share"));
+        let _guard = test_scope();
 
         let plugin_root = LuaPluginHost::plugin_root_dir();
         let plugin_dir = plugin_root.join("emote_image_probe");
@@ -8061,30 +7679,11 @@ end)
             other => panic!("unexpected command from callback: {other:?}"),
         }
 
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn image_prefetch_queued_callback_dispatches_payload() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp_root = std::env::temp_dir().join(format!(
-            "crust-image-prefetch-callback-{}",
-            system_time_unix_ms()
-        ));
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("HOME", &temp_root);
-        std::env::set_var("XDG_DATA_HOME", temp_root.join(".local/share"));
+        let _guard = test_scope();
 
         let plugin_root = LuaPluginHost::plugin_root_dir();
         let plugin_dir = plugin_root.join("image_prefetch_probe");
@@ -8123,30 +7722,11 @@ end)
             other => panic!("unexpected command from callback: {other:?}"),
         }
 
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn plugin_ui_action_callback_dispatches_payload() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp_root = std::env::temp_dir().join(format!(
-            "crust-plugin-ui-action-callback-{}",
-            system_time_unix_ms()
-        ));
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("HOME", &temp_root);
-        std::env::set_var("XDG_DATA_HOME", temp_root.join(".local/share"));
+        let _guard = test_scope();
 
         let plugin_root = LuaPluginHost::plugin_root_dir();
         let plugin_dir = plugin_root.join("plugin_ui_action_probe");
@@ -8192,30 +7772,11 @@ end)
             other => panic!("unexpected command from callback: {other:?}"),
         }
 
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn plugin_ui_submit_callback_dispatches_form_values() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp_root = std::env::temp_dir().join(format!(
-            "crust-plugin-ui-submit-callback-{}",
-            system_time_unix_ms()
-        ));
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("HOME", &temp_root);
-        std::env::set_var("XDG_DATA_HOME", temp_root.join(".local/share"));
+        let _guard = test_scope();
 
         let plugin_root = LuaPluginHost::plugin_root_dir();
         let plugin_dir = plugin_root.join("plugin_ui_submit_probe");
@@ -8262,30 +7823,11 @@ end)
             other => panic!("unexpected command from callback: {other:?}"),
         }
 
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn plugin_ui_event_dispatch_is_scoped_to_target_plugin() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp_root = std::env::temp_dir().join(format!(
-            "crust-plugin-ui-target-scope-{}",
-            system_time_unix_ms()
-        ));
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("HOME", &temp_root);
-        std::env::set_var("XDG_DATA_HOME", temp_root.join(".local/share"));
+        let _guard = test_scope();
 
         let plugin_root = LuaPluginHost::plugin_root_dir();
         for plugin_name in ["plugin_ui_scope_alpha", "plugin_ui_scope_beta"] {
@@ -8338,30 +7880,11 @@ end)
         }
         assert!(cmd_rx.try_recv().is_err());
 
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn ui_callback_is_removed_when_plugin_unloads() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp_root = std::env::temp_dir().join(format!(
-            "crust-plugin-ui-unload-callback-{}",
-            system_time_unix_ms()
-        ));
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("HOME", &temp_root);
-        std::env::set_var("XDG_DATA_HOME", temp_root.join(".local/share"));
+        let _guard = test_scope();
 
         let plugin_root = LuaPluginHost::plugin_root_dir();
         let plugin_dir = plugin_root.join("plugin_ui_unload_probe");
@@ -8420,28 +7943,11 @@ end)
         });
         assert!(cmd_rx.try_recv().is_err());
 
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn reward_redemption_status_binding_sends_command() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp_root =
-            std::env::temp_dir().join(format!("crust-reward-binding-{}", system_time_unix_ms()));
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("HOME", &temp_root);
-        std::env::set_var("XDG_DATA_HOME", temp_root.join(".local/share"));
+        let _guard = test_scope();
 
         let plugin_root = LuaPluginHost::plugin_root_dir();
         let plugin_dir = plugin_root.join("reward_probe");
@@ -8495,30 +8001,11 @@ c2.update_reward_redemption_status(
         }
         assert!(host.plugin_statuses().iter().any(|status| status.loaded));
 
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn reward_redemption_status_binding_ignores_invalid_args() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp_root = std::env::temp_dir().join(format!(
-            "crust-reward-binding-invalid-{}",
-            system_time_unix_ms()
-        ));
-        let old_home = std::env::var_os("HOME");
-        let old_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("HOME", &temp_root);
-        std::env::set_var("XDG_DATA_HOME", temp_root.join(".local/share"));
+        let _guard = test_scope();
 
         let plugin_root = LuaPluginHost::plugin_root_dir();
         let plugin_dir = plugin_root.join("reward_probe_invalid");
@@ -8546,17 +8033,6 @@ c2.update_reward_redemption_status("some_channel")
         assert!(host.plugin_statuses().iter().any(|status| status.loaded));
         assert!(cmd_rx.try_recv().is_err());
 
-        if let Some(value) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        if let Some(value) = old_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(&temp_root);
     }
 }
 

@@ -1,7 +1,5 @@
 //! Types and values for the filter expression language.
 //!
-//! Mirrors `chatterino2-master/src/controllers/filters/lang/Types.hpp`.
-//!
 //! [`Type`] describes what kind of value an expression produces; runtime
 //! [`Value`]s carry that data. Static type-checking via [`synthesize_type`]
 //! walks the AST with a [`TypingContext`] (identifier -> declared type) and
@@ -19,7 +17,7 @@ use crate::filters::ast::{BinOp, Expression, Span, UnOp};
 /// `List` is a heterogeneous list; `StringList` means every element is a
 /// String (used for e.g. `author.badges`). `MatchingSpecifier` is a
 /// two-element `{regex, int}` list that describes a `match ... group N`
-/// operation (same as Chatterino).
+/// operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Type {
     Bool,
@@ -71,8 +69,7 @@ impl PartialEq for Value {
             (Value::Str(a), Value::Str(b)) => a == b,
             (Value::Regex(a), Value::Regex(b)) => a.as_str() == b.as_str(),
             (Value::List(a), Value::List(b)) => a == b,
-            // Cross-type comparison: allow Int <-> Bool via truthy coercion
-            // to match Chatterino's lenient eval semantics.
+            // Compare booleans with their integer values, false = 0 and true = 1.
             (Value::Bool(a), Value::Int(b)) | (Value::Int(b), Value::Bool(a)) => {
                 i64::from(*a) == *b
             }
@@ -188,7 +185,7 @@ pub fn synthesize_type(
             for it in items {
                 types.push(synthesize_type(it, typing)?);
             }
-            // Chatterino's MatchingSpecifier pattern: {Regex, Int}.
+            // A MatchingSpecifier contains {Regex, Int}.
             if types.len() == 2 && types[0] == Type::Regex && types[1] == Type::Int {
                 return Ok(Type::MatchingSpecifier);
             }

@@ -8,10 +8,11 @@ use crate::widgets::chrome::{self, ChromeIcon, IconButtonState};
 /// icons don't clip at larger font sizes.
 #[inline]
 pub fn split_header_height() -> f32 {
-    26.0 * t::font_scale()
+    (26.0 * t::font_scale())
+        .max(t::icon_btn_sm() + 4.0)
+        .max(t::small().size + 4.0)
 }
 const HEADER_PAD_X: f32 = 6.0;
-const HEADER_CTRL_SIZE: f32 = 18.0;
 const HEADER_CTRL_GAP: f32 = 3.0;
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -47,7 +48,7 @@ pub fn show_split_header(
     ui.painter().hline(
         hdr_rect.x_range(),
         hdr_rect.bottom(),
-        egui::Stroke::new(1.0, t::border_subtle()),
+        egui::Stroke::new(1.0_f32, t::border_subtle()),
     );
     if is_focused {
         let accent = t::accent();
@@ -58,16 +59,25 @@ pub fn show_split_header(
     }
 
     let mut result = SplitHeaderResult::default();
-    let mut control_count = 1_usize; // close
-    if !ultra_compact {
-        control_count += 1; // search
-    }
-    if !compact {
-        control_count += 1; // menu
-    }
+    let icon_size = t::icon_btn_sm();
+    let menu_width = ui
+        .painter()
+        .layout_no_wrap("...".to_owned(), t::small(), t::text_muted())
+        .size()
+        .x
+        + ui.spacing().button_padding.x * 2.0;
     let controls_w = HEADER_PAD_X * 2.0
-        + control_count as f32 * HEADER_CTRL_SIZE
-        + control_count.saturating_sub(1) as f32 * HEADER_CTRL_GAP;
+        + icon_size
+        + if ultra_compact {
+            0.0
+        } else {
+            icon_size + HEADER_CTRL_GAP
+        }
+        + if compact {
+            0.0
+        } else {
+            menu_width + HEADER_CTRL_GAP
+        };
 
     let controls_rect = egui::Rect::from_min_max(
         egui::pos2(
@@ -90,6 +100,21 @@ pub fn show_split_header(
             .layout(egui::Layout::right_to_left(egui::Align::Center)),
     );
     controls_ui.spacing_mut().item_spacing.x = HEADER_CTRL_GAP;
+
+    // Keep Close at the right edge as optional controls appear or disappear.
+    let close = chrome::icon_button(
+        &mut controls_ui,
+        ChromeIcon::Close,
+        "Close split",
+        IconButtonState {
+            compact: true,
+            danger: false,
+            ..Default::default()
+        },
+    );
+    if close.clicked() {
+        result.close_clicked = true;
+    }
 
     if !compact {
         controls_ui.menu_button(
@@ -123,21 +148,6 @@ pub fn show_split_header(
                 }
             },
         );
-    }
-
-    let close = chrome::icon_button(
-        &mut controls_ui,
-        ChromeIcon::Close,
-        "Close split",
-        IconButtonState {
-            compact: true,
-            danger: false,
-            ..Default::default()
-        },
-    )
-    .on_hover_text("Close split");
-    if close.clicked() {
-        result.close_clicked = true;
     }
 
     if !ultra_compact {
@@ -190,6 +200,7 @@ pub fn show_split_header(
             .max_rect(title_rect)
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
+    title_ui.set_clip_rect(title_rect.intersect(ui.clip_rect()));
     let title_resp = title_ui.add_sized(
         [title_rect.width().max(8.0), 16.0],
         egui::Label::new(
@@ -217,5 +228,85 @@ fn badge_count_label(count: u32) -> String {
         "99+".to_owned()
     } else {
         count.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header_frame(
+        ctx: &egui::Context,
+        width: f32,
+        events: Vec<egui::Event>,
+    ) -> (SplitHeaderResult, egui::Pos2) {
+        let mut result = SplitHeaderResult::default();
+        let mut close_center = egui::Pos2::ZERO;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 200.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let pane = ui.max_rect();
+                    close_center = egui::pos2(
+                        pane.right() - HEADER_PAD_X - t::icon_btn_sm() / 2.0,
+                        pane.top() + split_header_height() / 2.0,
+                    );
+                    result = show_split_header(
+                        ui,
+                        pane,
+                        &ChannelId::new("a_very_long_channel_name"),
+                        true,
+                        15,
+                        2,
+                        false,
+                        Some("A long stream title that must not cover the controls"),
+                    );
+                });
+            },
+        );
+        (result, close_center)
+    }
+
+    #[test]
+    fn close_button_stays_at_right_edge_at_each_header_width() {
+        for width in [150.0, 210.0, 360.0] {
+            let ctx = egui::Context::default();
+            let (_, pos) = header_frame(&ctx, width, Vec::new());
+            header_frame(
+                &ctx,
+                width,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            let (result, _) = header_frame(
+                &ctx,
+                width,
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            assert!(
+                result.close_clicked,
+                "Close was not clickable at width {width}"
+            );
+            assert!(!result.toggle_search_clicked);
+        }
     }
 }

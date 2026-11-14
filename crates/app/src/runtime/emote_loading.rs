@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use crust_core::{
     events::AppEvent,
     model::{ChannelId, EmoteCatalogEntry},
@@ -298,14 +296,10 @@ pub(crate) fn prefetch_emote_images(
     info!("Prefetching {} emote images...", urls.len());
     let _ = evt_tx.try_send(AppEvent::ImagePrefetchQueued { count: urls.len() });
 
-    let sem = Arc::new(tokio::sync::Semaphore::new(20));
-
     for url in urls {
-        let sem = sem.clone();
         let cache = cache.clone();
         let evt_tx = evt_tx.clone();
         tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
             fetch_emote_image(&url, &cache, &evt_tx).await;
         });
     }

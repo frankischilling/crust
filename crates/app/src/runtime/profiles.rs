@@ -5,7 +5,7 @@ use crust_core::{
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::runtime::assets::fetch_and_decode_raw;
+use crate::runtime::assets::fetch_profile_image;
 
 fn non_empty_opt(input: Option<String>) -> Option<String> {
     input.and_then(|v| {
@@ -577,16 +577,7 @@ pub(crate) async fn fetch_twitch_user_profile(
 
     // Pre-fetch avatar bytes so egui can display them right away.
     if let Some(ref logo) = avatar_url {
-        if let Ok((w, h, raw)) = fetch_and_decode_raw(logo).await {
-            let _ = evt_tx
-                .send(AppEvent::EmoteImageReady {
-                    uri: logo.clone(),
-                    width: w,
-                    height: h,
-                    raw_bytes: raw,
-                })
-                .await;
-        }
+        fetch_profile_image(logo, &evt_tx).await;
     }
 }
 
@@ -954,16 +945,7 @@ pub(crate) async fn fetch_kick_user_profile(login: &str, evt_tx: mpsc::Sender<Ap
     };
 
     if let Some(ref logo) = avatar_url {
-        if let Ok((w, h, raw)) = fetch_and_decode_raw(logo).await {
-            let _ = evt_tx
-                .send(AppEvent::EmoteImageReady {
-                    uri: logo.clone(),
-                    width: w,
-                    height: h,
-                    raw_bytes: raw,
-                })
-                .await;
-        }
+        fetch_profile_image(logo, &evt_tx).await;
     }
 
     let _ = evt_tx.send(AppEvent::UserProfileLoaded { profile }).await;
@@ -1082,16 +1064,7 @@ pub(crate) async fn fetch_shared_channel_profile(
     // Pre-fetch the image bytes so the 18x18 shared badge chip can render
     // immediately without a second frame.
     if let Some(ref url) = profile_url {
-        if let Ok((w, h, raw)) = fetch_and_decode_raw(url).await {
-            let _ = evt_tx
-                .send(AppEvent::EmoteImageReady {
-                    uri: url.clone(),
-                    width: w,
-                    height: h,
-                    raw_bytes: raw,
-                })
-                .await;
-        }
+        fetch_profile_image(url, &evt_tx).await;
     }
 
     // Write to the session-scoped cache *before* emitting the event so the
@@ -1360,16 +1333,7 @@ pub(crate) async fn fetch_shared_chat_session(
     // paint instantly rather than flickering from text fallback to image.
     for p in &participants {
         if let Some(url) = p.profile_url.as_ref().filter(|s| !s.is_empty()) {
-            if let Ok((w, h, raw)) = fetch_and_decode_raw(url).await {
-                let _ = evt_tx
-                    .send(AppEvent::EmoteImageReady {
-                        uri: url.clone(),
-                        width: w,
-                        height: h,
-                        raw_bytes: raw,
-                    })
-                    .await;
-            }
+            fetch_profile_image(url, &evt_tx).await;
         }
     }
 
@@ -1415,16 +1379,7 @@ pub(crate) async fn fetch_self_avatar(login: &str, evt_tx: mpsc::Sender<AppEvent
     let Some(avatar_url) = user.logo else { return };
 
     // Pre-fetch image bytes
-    if let Ok((w, h, raw)) = fetch_and_decode_raw(&avatar_url).await {
-        let _ = evt_tx
-            .send(AppEvent::EmoteImageReady {
-                uri: avatar_url.clone(),
-                width: w,
-                height: h,
-                raw_bytes: raw,
-            })
-            .await;
-    }
+    fetch_profile_image(&avatar_url, &evt_tx).await;
 
     let _ = evt_tx.send(AppEvent::SelfAvatarLoaded { avatar_url }).await;
 }

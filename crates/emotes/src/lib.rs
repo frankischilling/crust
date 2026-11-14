@@ -1,7 +1,9 @@
 pub mod cache;
+mod download;
 pub mod providers;
 
 pub use cache::EmoteCache;
+pub use download::{read_image_response, MAX_IMAGE_DOWNLOAD_BYTES};
 pub use providers::{EmoteInfo, EmoteProvider};
 
 use thiserror::Error;
@@ -14,6 +16,8 @@ pub enum EmoteError {
     Io(#[from] std::io::Error),
     #[error("Image decode error: {0}")]
     Image(#[from] image::ImageError),
+    #[error("Image response exceeds the {limit} byte download limit")]
+    ImageTooLarge { limit: usize },
     #[error("Serialization error: {0}")]
     Serde(#[from] serde_json::Error),
     #[error("Not found: {0}")]

@@ -1,6 +1,7 @@
-# Core And Callbacks
+# Core and callbacks
 
-This page covers the shared helpers every plugin usually touches first.
+These helpers register commands and callbacks, read app state, and control
+filters, uploads, sounds, and shortcuts.
 
 ## `c2.log(level, ...parts)`
 
@@ -47,7 +48,7 @@ Register a Lua callback for host-driven events.
 - `event_type`: a value from `c2.EventType` or the matching event-type string
 - `handler`: function called as `handler(ev)`
 
-Callback payloads are documented in [API_Events](./API_Events).
+Callback payloads are documented in [API_Events](./API_Events.md).
 
 Completion callbacks are special:
 
@@ -71,16 +72,10 @@ Schedule `callback()` to run later on the plugin VM.
 
 ## `c2.reload_plugins()`
 
-Reload all plugins from disk.
+Reload all plugins from disk and rebuild the plugin registry. This calls the
+host's reload command and does not return a payload table.
 
-- this is an action helper, not a fetch helper
-- it causes the host to rebuild the plugin registry from the current plugin
-  directories
-- it does not add a new Crust capability beyond the existing Rust reload
-  command
-- it does not return a payload table
-
-## Read-Only Helpers
+## Read-only helpers
 
 ## `c2.plugin_dir()`
 
@@ -108,9 +103,6 @@ Fields:
 - `username`: omitted when no authenticated account is active
 - `user_id`: omitted when no authenticated account is active
 - `display_name`: omitted when no authenticated account is active
-
-`username`, `user_id`, and `display_name` are omitted when no authenticated
-account is active.
 
 ## `c2.current_channel()`
 
@@ -146,10 +138,12 @@ Channel snapshot fields:
 - `kick`
 - `irc`
 
-## Filter Engine
+## Filter expressions
 
-Crust exposes the Chatterino-compatible filter expression language to
-plugins. See the appendix in the main parity doc for grammar.
+Plugins can parse and evaluate the same typed expressions used by chat filters.
+The [identifier definitions](../crates/core/src/filters/context.rs) list the
+available names and types; the [parser](../crates/core/src/filters/parser.rs)
+defines the grammar.
 
 ### `c2.filters_parse(expression)`
 
@@ -175,9 +169,12 @@ Return values:
 - on success: a boolean (the expression's truthiness)
 - on parse / type error: `nil, error_message`
 
-Identifiers that are not present in `context` resolve to
-`false` / empty string / empty list, matching Chatterino's lenient
-runtime semantics.
+An identifier missing from the supplied `context` evaluates to `false`.
+Supply the declared value type for each identifier used by the expression.
+
+When Crust builds a message filter context, `flags.shared` and `flags.whisper`
+reflect the message's Shared Chat and whisper metadata. A Lua caller passes
+those values in its own `context` table.
 
 ## Uploader
 
@@ -195,7 +192,7 @@ The upload progresses asynchronously. Subscribe to
 progress; on success the resolved URL is also appended to the input
 buffer of `channel` by the host.
 
-## Sound Events
+## Sound events
 
 ### `c2.set_sound_settings(events)`
 
@@ -209,10 +206,10 @@ snapshot (emitted on startup and after every successful change).
 
 ### `c2.get_sound_settings()`
 
-Return the current per-event sound settings map. Same shape as the
-`events` argument to `set_sound_settings`. Useful when a plugin loads
-after the startup `SoundSettingsUpdated` snapshot has fired. Returns
-host defaults if no snapshot has been cached yet.
+Return the current sound settings map in the same shape as the `events`
+argument to `set_sound_settings`. Use this when a plugin loads after the startup
+`SoundSettingsUpdated` event. If no snapshot has been cached, it returns host
+defaults.
 
 ## Hotkeys
 
@@ -228,10 +225,10 @@ snapshot (emitted on startup and after every successful change).
 
 ### `c2.get_hotkey_bindings()`
 
-Return the current hotkey binding map. Same shape as the `bindings`
-argument to `set_hotkey_bindings`. Useful when a plugin loads after the
-startup `HotkeyBindingsUpdated` snapshot has fired. Returns the built-in
-defaults if no snapshot has been cached yet.
+Return the current shortcut map in the same shape as the `bindings` argument
+to `set_hotkey_bindings`. Use this when a plugin loads after the startup
+`HotkeyBindingsUpdated` event. If no snapshot has been cached, it returns the
+built-in defaults.
 
 ## Example
 

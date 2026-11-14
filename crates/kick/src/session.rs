@@ -484,6 +484,7 @@ impl KickSession {
             timestamp,
             channel: channel.clone(),
             sender: Sender {
+                original_display_name: None,
                 user_id: UserId(user_id_str),
                 login,
                 display_name,
@@ -504,9 +505,11 @@ impl KickSession {
                 is_mention: false,
                 custom_reward_id: None,
                 is_history: false,
+                suppress_notification: false,
             },
             reply: None,
             msg_kind: MsgKind::Chat,
+            shared: None,
         };
 
         self.emit(KickEvent::ChatMessage(chat_msg)).await;
@@ -603,6 +606,7 @@ impl KickSession {
             timestamp,
             channel: channel.clone(),
             sender: Sender {
+                original_display_name: None,
                 user_id: UserId(creator_user_id),
                 login: creator_login,
                 display_name: creator,
@@ -623,9 +627,11 @@ impl KickSession {
                 is_mention: false,
                 custom_reward_id: None,
                 is_history: false,
+                suppress_notification: false,
             },
             reply: None,
             msg_kind: MsgKind::Chat,
+            shared: None,
         };
 
         self.emit(KickEvent::ChatMessage(chat_msg)).await;

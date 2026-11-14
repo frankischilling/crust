@@ -3,7 +3,11 @@
 Callbacks registered with `c2.register_callback()` receive a typed Lua table.
 Every payload includes a `type` field matching the event name.
 
-## Common Nested Tables
+Register callbacks with a `c2.EventType` constant or the event's string name.
+The exported constants and numeric parser share one mapping; new numeric IDs
+are appended so existing IDs keep their meaning.
+
+## Common nested tables
 
 Some events include nested tables reused across the API:
 
@@ -179,7 +183,7 @@ Return a table with:
 - `values`
 - `hide_others`
 
-## Account And Connection Events
+## Account and connection events
 
 ### `c2.EventType.Authenticated`
 
@@ -218,7 +222,7 @@ Fields:
 
 No payload fields.
 
-## Loader And Emote Events
+## Loader and emote events
 
 ### `c2.EventType.EmoteImageReady`
 
@@ -253,7 +257,7 @@ Fields:
 
 This event reports how many image-prefetch jobs were queued.
 
-## Chat And Channel Events
+## Chat and channel events
 
 ### `c2.EventType.ChannelJoined`
 
@@ -449,7 +453,7 @@ Each `stops` entry includes:
 
 When present, `badge` uses the shared `badge` table shape.
 
-## Fetch Result Events
+## Fetch result events
 
 ### `c2.EventType.HistoryLoaded`
 
@@ -532,7 +536,7 @@ Fields:
 These fields are omitted when the upstream metadata source does not provide
 them.
 
-## Settings And Moderation Events
+## Settings and moderation events
 
 ### `c2.EventType.BetaFeaturesUpdated`
 
@@ -758,14 +762,6 @@ Each `presets` entry includes:
 
 `icon_url` is omitted when unset.
 
-Each `presets` entry includes:
-
-- `label`
-- `command_template`
-- `icon_url`
-
-`icon_url` is omitted when unset.
-
 ### `c2.EventType.PluginUiAction`
 
 Fields:
@@ -840,7 +836,25 @@ Notes:
 - this event is emitted when the user closes a floating plugin window through the window chrome
 - calling `c2.ui.close_window(id)` updates retained state but does not emit `PluginUiWindowClosed`
 
-## Subsystem Settings Events
+## Subsystem settings events
+
+### `c2.EventType.FontSettingsUpdated`
+
+Snapshot of font and UI sizes. Each field is numeric:
+
+- `chat_font_size`
+- `ui_font_size`
+- `topbar_font_size`
+- `tabs_font_size`
+- `timestamps_font_size`
+- `pills_font_size`
+- `popups_font_size`
+- `chips_font_size`
+- `usercard_font_size`
+- `dialog_font_size`
+
+`ui_font_size` is the UI scale factor. The popup, chip, user-card, and dialog
+fields use `0.0` to follow the chat font size automatically.
 
 ### `c2.EventType.SoundSettingsUpdated`
 

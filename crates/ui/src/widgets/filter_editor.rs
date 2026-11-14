@@ -437,7 +437,7 @@ fn build_layouter<'a>(
                 &body[err_start..end_clamped],
                 &font_id,
                 t::text_primary(),
-                Some(egui::Stroke::new(1.5, t::red())),
+                Some(egui::Stroke::new(1.5_f32, t::red())),
             );
             if end_clamped < byte_len {
                 append(&mut job, &body[end_clamped..], &font_id, t::text_primary(), None);

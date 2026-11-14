@@ -253,7 +253,7 @@ fn render_row(
                         let pill_resp = Frame::new()
                             .fill(pill_bg)
                             .corner_radius(CornerRadius::same(4))
-                            .stroke(Stroke::new(1.0, t::alpha(Color32::BLACK, 40)))
+                            .stroke(Stroke::new(1.0_f32, t::alpha(Color32::BLACK, 40)))
                             .inner_margin(Margin::symmetric(6, 1))
                             .show(ui, |ui| {
                                 ui.add(

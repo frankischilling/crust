@@ -439,7 +439,7 @@ fn normalize_oauth_token(token: Option<&str>) -> Option<String> {
 
 async fn helix_auth_from_token(oauth_token: Option<&str>) -> Option<(String, String)> {
     let bearer = normalize_oauth_token(oauth_token)?;
-    match crate::validate_token(&bearer).await {
+    match super::auth::validate_token(&bearer).await {
         Ok(info) => Some((info.client_id, bearer)),
         Err(e) => {
             warn!("Helix auth setup failed while validating token: {e}");
@@ -805,13 +805,10 @@ fn prefetch_badge_images(
     }
     info!("Prefetching {} badge images...", urls.len());
     let _ = evt_tx.try_send(AppEvent::ImagePrefetchQueued { count: urls.len() });
-    let sem = Arc::new(tokio::sync::Semaphore::new(20));
     for url in urls {
-        let sem = sem.clone();
         let cache = cache.clone();
         let evt_tx = evt_tx.clone();
         tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
             fetch_emote_image(&url, &cache, &evt_tx).await;
         });
     }

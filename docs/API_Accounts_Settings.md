@@ -1,9 +1,9 @@
-# Accounts And Settings
+# Accounts and settings
 
-These helpers update account state, connection identity, and persisted app
+Use these helpers to manage accounts, configure IRC identity, and save app
 preferences.
 
-## Account Management
+## Account management
 
 ## `c2.login(token)`
 
@@ -40,7 +40,7 @@ Useful callback events:
 - `c2.EventType.AccountListUpdated`
 - `c2.EventType.AuthExpired`
 
-## IRC Identity
+## IRC identity
 
 ## `c2.set_irc_nick(nick)`
 
@@ -50,7 +50,7 @@ Set the IRC nickname used by Crust.
 
 Update IRC authentication credentials.
 
-## Feature Flags And Shell Preferences
+## Feature flags and window preferences
 
 ## `c2.set_beta_features(settings)`
 
@@ -139,7 +139,7 @@ event payload always emits `name`.
 
 - `desktop_notifications_enabled`
 
-## Rules And Local Moderation Preferences
+## Rules and local moderation preferences
 
 ## `c2.set_highlight_rules(rules)`
 
@@ -204,7 +204,7 @@ Each preset may include:
 
 `icon_url` is omitted in callback payloads when not set.
 
-## Matching Events
+## Matching events
 
 Most settings helpers eventually produce one of these callback payloads:
 

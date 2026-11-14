@@ -1,6 +1,7 @@
 pub mod app;
 pub mod commands;
 pub mod external;
+pub mod image_cache;
 pub mod perf;
 pub mod sound;
 pub mod spellcheck;

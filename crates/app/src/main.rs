@@ -34,7 +34,11 @@ use seventv::{
     SevenTvResolvedStyle, SevenTvUserStyleRaw,
 };
 
-use runtime::assets::fetch_emote_image;
+use runtime::assets::ImageRequests;
+use runtime::auth::{
+    detach_active_account, save_validated_account, spawn_validation, AuthValidationRequests,
+    TokenValidationResult, ValidateError, ValidationKind,
+};
 use runtime::badges::{
     load_badge_map_cache_into, load_channel_badges, load_global_badges, resolve_badge_url, BadgeMap,
 };
@@ -626,26 +630,6 @@ fn main() -> Result<()> {
 
 // Reducer: application state reducer
 
-/// Result of a background token validation, sent back to the reducer loop.
-enum TokenValidationResult {
-    Startup {
-        token: String,
-        result: Result<ValidateInfo, ValidateError>,
-    },
-    Login {
-        token: String,
-        result: Result<ValidateInfo, ValidateError>,
-    },
-    AddAccount {
-        token: String,
-        result: Result<ValidateInfo, ValidateError>,
-    },
-    Refresh {
-        token: String,
-        result: Result<ValidateInfo, ValidateError>,
-    },
-}
-
 #[derive(Debug, Clone, Copy)]
 enum UpdateCheckTrigger {
     Startup,
@@ -757,8 +741,7 @@ async fn reducer_loop(
     kick_runtime_enabled: bool,
     irc_runtime_enabled: bool,
 ) {
-    // Track URLs we've already queued for image download
-    let mut pending_images: HashSet<String> = HashSet::new();
+    let image_requests = ImageRequests::default();
     // Track URLs we've already kicked off a link-preview fetch for.
     let mut pending_link_previews: HashSet<String> = HashSet::new();
     // Track recent EventSub metadata.message_id values to avoid applying
@@ -898,18 +881,10 @@ async fn reducer_loop(
 
     let mut joined_channels: HashSet<String> = canonical_auto_join.into_iter().collect();
 
-    // Set to `true` whenever we explicitly send `SessionCommand::Authenticate`.
-    // While this flag is set, `TwitchEvent::Connected` will skip re-joining
-    // channels because the connection is either anonymous (about to be
-    // replaced) or mid-reconnect.  The channels are joined instead from
-    // `TwitchEvent::Authenticated` once the correct identity is confirmed.
-    // For passive reconnects (network drop on an already-authenticated
-    // session) this flag stays `false`, so `Connected` handles the rejoin
-    // as before.
-    let mut auth_in_progress = false;
+    let mut auth_requests = AuthValidationRequests::default();
+    let mut expected_irc_identity: Option<(u64, String)> = None;
 
-    // Internal channel for background token validation results so
-    // validate_token() never blocks the reducer loop.
+    // Account changes invalidate older validation and IRC authentication events.
     let (token_val_tx, mut token_val_rx) = mpsc::channel::<TokenValidationResult>(8);
 
     // Internal channel for background GitHub release checks.
@@ -951,39 +926,21 @@ async fn reducer_loop(
         }
     }
 
-    // If we have a saved token AND a saved username, immediately tell the UI
-    // the user is logged in (optimistic) so they don't see the login prompt.
-    // We will validate the token in the background; if invalid we undo it.
+    // Validate the selected saved account before enabling authenticated controls.
     let startup_username = if !settings.default_account.is_empty() {
         settings.default_account.clone()
     } else {
         settings.username.clone()
     };
-    if let (Some(token), uname) = (&saved_token, &startup_username) {
-        if !token.is_empty() && !uname.is_empty() {
-            let _ = evt_tx
-                .send(AppEvent::Authenticated {
-                    username: uname.to_string(),
-                    user_id: String::new(), // filled in properly when GLOBALUSERSTATE arrives
-                })
-                .await;
-        }
-    }
-
-    // If we have a saved token, validate in the background and auto-login
-    // via the token_val_rx channel.  Set auth_in_progress *now* so that
-    // Connected events arriving before validation completes don't trigger
-    // premature channel rejoins.
+    // Anonymous chat remains available while the saved token is validated.
     if let Some(token) = saved_token {
         info!("Found saved token, spawning background validation...");
-        auth_in_progress = true;
-        let tx = token_val_tx.clone();
-        tokio::spawn(async move {
-            let result = validate_token(&token).await;
-            let _ = tx
-                .send(TokenValidationResult::Startup { token, result })
-                .await;
-        });
+        let expected_login = (!startup_username.is_empty()).then(|| startup_username.clone());
+        let _ = evt_tx.send(AppEvent::AuthenticationPending {
+            username: expected_login.clone(),
+        }).await;
+        let request = auth_requests.begin(ValidationKind::Startup, expected_login);
+        spawn_validation(token_val_tx.clone(), request, token);
     }
 
     // Broadcast the initial account list so the UI knows about all saved
@@ -1345,23 +1302,16 @@ async fn reducer_loop(
                         let _ = evt_tx.send(AppEvent::ConnectionStateChanged {
                             state: ConnectionState::Connected,
                         }).await;
-                        // Re-join channels only for passive reconnects (network
-                        // drops).  When auth_in_progress is true, the connection
-                        // is either anonymous or mid-auth-switch; joining channels
-                        // would be premature and creates a double-join (the real
-                        // rejoin happens from TwitchEvent::Authenticated below).
-                        if !auth_in_progress {
-                            let twitch_restore: Vec<ChannelId> = parsed_auto_join_channels(&settings)
-                                .into_iter()
-                                .filter(|id| id.is_twitch())
-                                .collect();
-                            if !twitch_restore.is_empty() {
-                                info!("Restoring {} Twitch channels from auto-join", twitch_restore.len());
-                            }
-                            for id in twitch_restore {
-                                let _ = evt_tx.send(AppEvent::ChannelJoined { channel: id.clone() }).await;
-                                let _ = sess_tx.send(SessionCommand::JoinChannel(id)).await;
-                            }
+                        let twitch_restore: Vec<ChannelId> = parsed_auto_join_channels(&settings)
+                            .into_iter()
+                            .filter(|id| id.is_twitch())
+                            .collect();
+                        if !twitch_restore.is_empty() {
+                            info!("Restoring {} Twitch channels from auto-join", twitch_restore.len());
+                        }
+                        for id in twitch_restore {
+                            let _ = evt_tx.send(AppEvent::ChannelJoined { channel: id.clone() }).await;
+                            let _ = sess_tx.send(SessionCommand::JoinChannel(id)).await;
                         }
                     }
                     TwitchEvent::Disconnected => {
@@ -1383,6 +1333,32 @@ async fn reducer_loop(
                         let _ = evt_tx.send(AppEvent::Error {
                             context: "Connection".into(),
                             message: e,
+                        }).await;
+                    }
+                    TwitchEvent::AuthenticationFailed { generation, message } => {
+                        if expected_irc_identity.as_ref().map(|(id, _)| *id) != Some(generation) {
+                            continue;
+                        }
+                        expected_irc_identity = None;
+                        auth_username = None;
+                        auth_user_id = None;
+                        auth_scopes.clear();
+                        helix_client_id = None;
+                        whisper_history_loaded_for = None;
+                        settings.username.clear();
+                        settings.oauth_token.clear();
+                        if let Some(store) = &settings_store {
+                            let _ = store.delete_token();
+                            let _ = store.save(&settings);
+                        }
+                        clear_account_channel_state(&mut channel_mod_status, &mut self_badges, &mut self_color, &evt_tx).await;
+                        let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
+                        clear_live_feed_auth(&live_feed_tx, &authed_helix).await;
+                        let _ = evt_tx.send(AppEvent::Error { context: "Login".into(), message }).await;
+                        let _ = evt_tx.send(AppEvent::AccountListUpdated {
+                            accounts: settings.accounts.iter().map(|account| account.username.clone()).collect(),
+                            active: None,
+                            default: (!settings.default_account.is_empty()).then(|| settings.default_account.clone()),
                         }).await;
                     }
                     TwitchEvent::RoomState { channel, room_id, emote_only, followers_only, slow, subs_only, r9k } => {
@@ -1504,16 +1480,14 @@ async fn reducer_loop(
                             }
                         }
                     }
-                    TwitchEvent::Authenticated { username, user_id } => {
-                        // If we got here because of an explicit Authenticate
-                        // command (auth_in_progress = true), we need to rejoin
-                        // channels now that the correct identity is confirmed.
-                        // For passive reconnects the flag is false and channels
-                        // were already re-joined from TwitchEvent::Connected.
-                        let join_now = auth_in_progress;
-                        auth_in_progress = false;
-
-                        auth_username = Some(username.clone());
+                    TwitchEvent::Authenticated { username, user_id, generation } => {
+                        if !expected_irc_identity.as_ref().is_some_and(|(expected_generation, expected_user)| {
+                            *expected_generation == generation && expected_user == &user_id
+                        }) {
+                            debug!("Ignoring authentication from a replaced IRC session");
+                            continue;
+                        }
+                        auth_username = Some(settings.username.clone());
                         auth_user_id = Some(user_id.clone());
                         sync_eventsub_auth(
                             &eventsub_tx,
@@ -1565,20 +1539,6 @@ async fn reducer_loop(
                                             .await;
                                     });
                                 }
-                            }
-                        }
-
-                        if join_now {
-                            let twitch_restore: Vec<ChannelId> = parsed_auto_join_channels(&settings)
-                                .into_iter()
-                                .filter(|id| id.is_twitch())
-                                .collect();
-                            if !twitch_restore.is_empty() {
-                                info!("Restoring {} Twitch channels after authentication", twitch_restore.len());
-                            }
-                            for id in twitch_restore {
-                                let _ = evt_tx.send(AppEvent::ChannelJoined { channel: id.clone() }).await;
-                                let _ = sess_tx.send(SessionCommand::JoinChannel(id)).await;
                             }
                         }
 
@@ -1801,11 +1761,10 @@ async fn reducer_loop(
                         }
 
                         // Apply nickname alias to sender display name.
-                        crust_core::model::apply_nickname(
+                        crust_core::model::apply_sender_nickname(
                             &settings.nicknames,
-                            &msg.sender.login,
                             &msg.channel.0,
-                            &mut msg.sender.display_name,
+                            &mut msg.sender,
                         );
 
                         // Mention / reply-to-me detection
@@ -1881,49 +1840,20 @@ async fn reducer_loop(
                         // is fetched on-demand when the user hovers.
                         for span in &msg.spans {
                             let url = match span {
-                                crust_core::Span::Emote { url, .. } => Some(url.clone()),
-                                crust_core::Span::Emoji { url, .. } => Some(url.clone()),
+                                crust_core::Span::Emote { url, .. }
+                                | crust_core::Span::Emoji { url, .. } => Some(url.as_str()),
                                 _ => None,
                             };
                             if let Some(url) = url {
-                                if !pending_images.contains(&url) {
-                                    pending_images.insert(url.clone());
-                                    let evt_tx = evt_tx.clone();
-                                    let cache = emote_cache.clone();
-                                    tokio::spawn(async move {
-                                        fetch_emote_image(&url, &cache, &evt_tx).await;
-                                    });
-                                }
+                                image_requests.request(url, &emote_cache, &evt_tx);
                             }
                         }
                         // Queue badge image fetches for the user's own
                         // badges plus any Shared Chat source-channel badges.
-                        let shared_badge_urls: Vec<String> = msg
-                            .shared
-                            .as_ref()
-                            .map(|s| s.badges.iter().filter_map(|b| b.url.clone()).collect())
-                            .unwrap_or_default();
-                        for badge in &msg.sender.badges {
+                        let shared_badges = msg.shared.iter().flat_map(|source| source.badges.iter());
+                        for badge in msg.sender.badges.iter().chain(shared_badges) {
                             if let Some(url) = &badge.url {
-                                if !pending_images.contains(url) {
-                                    pending_images.insert(url.clone());
-                                    let url = url.clone();
-                                    let evt_tx = evt_tx.clone();
-                                    let cache = emote_cache.clone();
-                                    tokio::spawn(async move {
-                                        fetch_emote_image(&url, &cache, &evt_tx).await;
-                                    });
-                                }
-                            }
-                        }
-                        for url in shared_badge_urls {
-                            if !pending_images.contains(&url) {
-                                pending_images.insert(url.clone());
-                                let evt_tx = evt_tx.clone();
-                                let cache = emote_cache.clone();
-                                tokio::spawn(async move {
-                                    fetch_emote_image(&url, &cache, &evt_tx).await;
-                                });
+                                image_requests.request(url, &emote_cache, &evt_tx);
                             }
                         }
 
@@ -2017,10 +1947,11 @@ async fn reducer_loop(
                         }).await;
                         // Show a moderation notice in chat
                         let text = format_timeout_text(&login, seconds);
-                        let msg = make_system_message(
+                        let mut msg = make_system_message(
                             local_msg_id, channel.clone(), text, Utc::now(),
                             MsgKind::Timeout { login: login.clone(), seconds },
                         );
+                        msg.server_id = Some(format!("{}{}", crust_core::model::IRC_MODERATION_ID_PREFIX, local_msg_id));
                         local_msg_id += 1;
                         let _ = evt_tx.send(AppEvent::MessageReceived {
                             channel,
@@ -2033,10 +1964,11 @@ async fn reducer_loop(
                             login: login.clone(),
                         }).await;
                         let text = format!("{login} was permanently banned.");
-                        let msg = make_system_message(
+                        let mut msg = make_system_message(
                             local_msg_id, channel.clone(), text, Utc::now(),
                             MsgKind::Ban { login: login.clone() },
                         );
+                        msg.server_id = Some(format!("{}{}", crust_core::model::IRC_MODERATION_ID_PREFIX, local_msg_id));
                         local_msg_id += 1;
                         let _ = evt_tx.send(AppEvent::MessageReceived {
                             channel,
@@ -2045,15 +1977,16 @@ async fn reducer_loop(
                     }
                     TwitchEvent::ChatCleared { channel } => {
                         let _ = evt_tx
-                            .send(AppEvent::ChannelMessagesCleared {
+                            .send(AppEvent::ChannelChatCleared {
                                 channel: channel.clone(),
                             })
                             .await;
-                        let msg = make_system_message(
+                        let mut msg = make_system_message(
                             local_msg_id, channel.clone(),
                             "Chat was cleared by a moderator.".to_owned(),
                             Utc::now(), MsgKind::ChatCleared,
                         );
+                        msg.server_id = Some(format!("{}{}", crust_core::model::IRC_MODERATION_ID_PREFIX, local_msg_id));
                         local_msg_id += 1;
                         let _ = evt_tx.send(AppEvent::MessageReceived {
                             channel,
@@ -2103,7 +2036,12 @@ async fn reducer_loop(
                             source_login,
                         }).await;
                     }
-                    TwitchEvent::UserStateUpdated { channel, is_mod, mut badges, color } => {
+                    TwitchEvent::UserStateUpdated { channel, is_mod, mut badges, color, generation } => {
+                        if auth_user_id.is_none()
+                            || expected_irc_identity.as_ref().map(|(id, _)| *id) != Some(generation)
+                        {
+                            continue;
+                        }
                         channel_mod_status.insert(channel.clone(), is_mod);
                         if let Some(broadcaster_id) = channel_room_ids.get(&channel).cloned() {
                             let _ = eventsub_tx
@@ -2239,33 +2177,18 @@ async fn reducer_loop(
                         // Queue image fetches for emotes/emoji
                         for span in &msg.spans {
                             let url = match span {
-                                crust_core::Span::Emote { url, .. } => Some(url.clone()),
-                                crust_core::Span::Emoji { url, .. } => Some(url.clone()),
+                                crust_core::Span::Emote { url, .. }
+                                | crust_core::Span::Emoji { url, .. } => Some(url.as_str()),
                                 _ => None,
                             };
                             if let Some(url) = url {
-                                if !pending_images.contains(&url) {
-                                    pending_images.insert(url.clone());
-                                    let evt_tx = evt_tx.clone();
-                                    let cache = emote_cache.clone();
-                                    tokio::spawn(async move {
-                                        fetch_emote_image(&url, &cache, &evt_tx).await;
-                                    });
-                                }
+                                image_requests.request(url, &emote_cache, &evt_tx);
                             }
                         }
                         // Queue badge image fetches
                         for badge in &msg.sender.badges {
                             if let Some(url) = &badge.url {
-                                if !pending_images.contains(url) {
-                                    pending_images.insert(url.clone());
-                                    let url = url.clone();
-                                    let evt_tx = evt_tx.clone();
-                                    let cache = emote_cache.clone();
-                                    tokio::spawn(async move {
-                                        fetch_emote_image(&url, &cache, &evt_tx).await;
-                                    });
-                                }
+                                image_requests.request(url, &emote_cache, &evt_tx);
                             }
                         }
 
@@ -2303,7 +2226,7 @@ async fn reducer_loop(
                     }
                     KickEvent::ChatCleared { channel } => {
                         let _ = evt_tx
-                            .send(AppEvent::ChannelMessagesCleared {
+                            .send(AppEvent::ChannelChatCleared {
                                 channel: channel.clone(),
                             })
                             .await;
@@ -2514,19 +2437,12 @@ async fn reducer_loop(
 
                         for span in &msg.spans {
                             let url = match span {
-                                crust_core::Span::Emote { url, .. } => Some(url.clone()),
-                                crust_core::Span::Emoji { url, .. } => Some(url.clone()),
+                                crust_core::Span::Emote { url, .. }
+                                | crust_core::Span::Emoji { url, .. } => Some(url.as_str()),
                                 _ => None,
                             };
                             if let Some(url) = url {
-                                if !pending_images.contains(&url) {
-                                    pending_images.insert(url.clone());
-                                    let evt_tx = evt_tx.clone();
-                                    let cache = emote_cache.clone();
-                                    tokio::spawn(async move {
-                                        fetch_emote_image(&url, &cache, &evt_tx).await;
-                                    });
-                                }
+                                image_requests.request(url, &emote_cache, &evt_tx);
                             }
                         }
 
@@ -2555,24 +2471,22 @@ async fn reducer_loop(
                     EventSubEvent::Reconnecting { attempt } => {
                         debug!("EventSub reconnect attempt {attempt}");
                     }
-                    EventSubEvent::Backfill(plan) => {
+                    EventSubEvent::BackfillRequested => {
                         // Fan out Helix refreshes for stream status, unban queue,
                         // active poll, active prediction, and latest hype train.
                         // Synthetic notices produced by the runner are routed back
-                        // through `eventsub_evt_tx_for_backfill` so they pick up
-                        // this loop's 45s `should_drop_duplicate_eventsub_notice`
-                        // window when the websocket replays the same event id.
+                        // through the session event channel for normal handling.
                         let ctx = runtime::eventsub_backfill::BackfillContext {
                             evt_tx: evt_tx.clone(),
                             eventsub_evt_tx: eventsub_evt_tx_for_backfill.clone(),
-                            helix: authed_helix.clone() as Arc<dyn crust_twitch::helix::HelixApi>,
+                            helix: authed_helix.clone(),
                             oauth_token: settings.oauth_token.clone(),
                             helix_client_id: helix_client_id.clone(),
                             auth_user_id: auth_user_id.clone(),
                             channel_room_ids: channel_room_ids.clone(),
                             channel_mod_status: channel_mod_status.clone(),
                         };
-                        runtime::eventsub_backfill::run_backfill(plan, ctx);
+                        runtime::eventsub_backfill::run_backfill(ctx);
                     }
                     EventSubEvent::Notice(notice) => {
                         if let Some(event_id) = notice.event_id.as_deref() {
@@ -2611,6 +2525,7 @@ async fn reducer_loop(
                                 user_id: UserId(user_id.to_owned()),
                                 login: login.to_owned(),
                                 display_name: display_name.to_owned(),
+                                original_display_name: None,
                                 color: None,
                                 name_paint: None,
                                 badges: Vec::new(),
@@ -2619,6 +2534,7 @@ async fn reducer_loop(
                                 user_id: UserId(String::new()),
                                 login: "automod".to_owned(),
                                 display_name: "AutoMod".to_owned(),
+                                original_display_name: None,
                                 color: None,
                                 name_paint: None,
                                 badges: vec![Badge {
@@ -3027,7 +2943,7 @@ async fn reducer_loop(
                                         match effect {
                                             ModerationActionEffect::ChannelMessagesCleared => {
                                                 let _ = evt_tx
-                                                    .send(AppEvent::ChannelMessagesCleared {
+                                                    .send(AppEvent::ChannelChatCleared {
                                                         channel: channel.clone(),
                                                     })
                                                     .await;
@@ -3144,13 +3060,17 @@ async fn reducer_loop(
 
                             if should_emit_eventsub_notice_message(&notice.kind) {
                                 let (msg_kind, text) = eventsub_notice_to_message(&notice.kind);
-                                let msg = make_system_message(
+                                let mut msg = make_system_message(
                                     local_msg_id,
                                     channel.clone(),
                                     text,
                                     Utc::now(),
                                     msg_kind,
                                 );
+                                if matches!(msg.msg_kind, MsgKind::Timeout { .. } | MsgKind::Ban { .. } | MsgKind::ChatCleared) {
+                                    let event_id = notice.event_id.clone().unwrap_or_else(|| format!("local-{local_msg_id}"));
+                                    msg.server_id = Some(format!("{}{event_id}", crust_core::model::EVENTSUB_MODERATION_ID_PREFIX));
+                                }
                                 local_msg_id += 1;
                                 let _ = evt_tx
                                     .send(AppEvent::MessageReceived {
@@ -3271,6 +3191,43 @@ async fn reducer_loop(
 
             // UI command
             Some(cmd) = cmd_rx.recv() => {
+                if let Some(rejection) = auth_requests.action_rejection(
+                    &cmd,
+                    auth_user_id.is_some(),
+                    expected_irc_identity.is_some(),
+                ) {
+                    let _ = evt_tx.send(rejection).await;
+                    continue;
+                }
+
+                // Detach before validation starts. Otherwise a delayed command
+                // could use the old account after a failed switch completes.
+                if matches!(&cmd, AppCommand::Login { .. } | AppCommand::AddAccount { .. } | AppCommand::SwitchAccount { .. }) {
+                    auth_requests.cancel();
+                    detach_active_account(
+                        &mut settings, &mut auth_username, &mut auth_user_id,
+                        &mut auth_scopes, &mut helix_client_id, &mut expected_irc_identity,
+                    );
+                    whisper_history_loaded_for = None;
+                    let _ = sess_tx.send(SessionCommand::LogoutAndReconnect).await;
+                    clear_account_channel_state(&mut channel_mod_status, &mut self_badges, &mut self_color, &evt_tx).await;
+                    let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
+                    clear_live_feed_auth(&live_feed_tx, &authed_helix).await;
+                    if let Some(store) = &settings_store {
+                        let _ = store.delete_token();
+                        let _ = store.save(&settings);
+                    }
+                    let username = match &cmd {
+                        AppCommand::SwitchAccount { username } => Some(username.clone()),
+                        _ => None,
+                    };
+                    let _ = evt_tx.send(AppEvent::AuthenticationPending { username }).await;
+                    let _ = evt_tx.send(AppEvent::AccountListUpdated {
+                        accounts: settings.accounts.iter().map(|account| account.username.clone()).collect(),
+                        active: None,
+                        default: (!settings.default_account.is_empty()).then(|| settings.default_account.clone()),
+                    }).await;
+                }
                 match cmd {
                     AppCommand::JoinChannel { channel } => {
                         if channel.is_kick() {
@@ -3441,15 +3398,8 @@ async fn reducer_loop(
                         });
                     }
                     AppCommand::FetchImage { url } => {
-                        // On-demand fetch (e.g. HD emote requested on hover)
-                        if !pending_images.contains(&url) {
-                            pending_images.insert(url.clone());
-                            let evt_tx = evt_tx.clone();
-                            let cache = emote_cache.clone();
-                            tokio::spawn(async move {
-                                fetch_emote_image(&url, &cache, &evt_tx).await;
-                            });
-                        }
+                        // A visible asset may have been evicted from the UI cache.
+                        image_requests.request_visible(&url, &emote_cache, &evt_tx);
                     }
                     AppCommand::FetchLinkPreview { url } => {
                         if !pending_link_previews.contains(&url) {
@@ -3463,14 +3413,13 @@ async fn reducer_loop(
                     }
                     AppCommand::Login { token } => {
                         info!("Login requested, spawning background validation...");
-                        let tx = token_val_tx.clone();
-                        tokio::spawn(async move {
-                            let result = validate_token(&token).await;
-                            let _ = tx.send(TokenValidationResult::Login { token, result }).await;
-                        });
+                        let request = auth_requests.begin(ValidationKind::Login, None);
+                        spawn_validation(token_val_tx.clone(), request, token);
                     }
                     AppCommand::Logout => {
                         info!("Logout requested");
+                        auth_requests.cancel();
+                        expected_irc_identity = None;
                         // Delete saved token and clear saved username
                         if let Some(store) = &settings_store {
                             let _ = store.delete_token();
@@ -3483,11 +3432,12 @@ async fn reducer_loop(
                         auth_username = None;
                         auth_user_id = None;
                         auth_scopes.clear();
+                        helix_client_id = None;
                         whisper_history_loaded_for = None;
+                        clear_account_channel_state(&mut channel_mod_status, &mut self_badges, &mut self_color, &evt_tx).await;
                         let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
                         clear_live_feed_auth(&live_feed_tx, &authed_helix).await;
                         let _ = sess_tx.send(SessionCommand::LogoutAndReconnect).await;
-                        let _ = evt_tx.send(AppEvent::LoggedOut).await;
                         // Broadcast updated account list.
                         let account_names: Vec<String> = settings.accounts.iter().map(|a| a.username.clone()).collect();
                         let default = if settings.default_account.is_empty() { None } else { Some(settings.default_account.clone()) };
@@ -3499,45 +3449,16 @@ async fn reducer_loop(
                     }
                     AppCommand::AddAccount { token } => {
                         info!("AddAccount requested, spawning background validation...");
-                        let tx = token_val_tx.clone();
-                        tokio::spawn(async move {
-                            let result = validate_token(&token).await;
-                            let _ = tx.send(TokenValidationResult::AddAccount { token, result }).await;
-                        });
+                        let request = auth_requests.begin(ValidationKind::AddAccount, None);
+                        spawn_validation(token_val_tx.clone(), request, token);
                     }
                     AppCommand::SwitchAccount { username } => {
                         info!("SwitchAccount to {username}");
+                        auth_requests.cancel();
                         let token_opt = settings_store.as_ref().and_then(|s| s.load_account_token(&username));
                         if let Some(token) = token_opt {
-                            settings.username = username.clone();
-                            // Keep the legacy oauth_token field in sync so that
-                            // load_token() fallback always returns the right token.
-                            settings.oauth_token = token.clone();
-                            if let Some(store) = &settings_store {
-                                let _ = store.save(&settings);
-                                // Refresh per-account keyring slot too.
-                                store.try_save_account_keyring(&username, &token);
-                            }
-                            // Reset auth state before re-authenticating so the
-                            // UI clears the old avatar immediately.
-                            auth_username = None;
-                            auth_user_id = None;
-                            whisper_history_loaded_for = None;
-                            let _ = evt_tx.send(AppEvent::LoggedOut).await;
-                            let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
-                            clear_live_feed_auth(&live_feed_tx, &authed_helix).await;
-                            auth_in_progress = true;
-                            let _ = sess_tx.send(SessionCommand::Authenticate {
-                                token,
-                                nick: username.clone(),
-                            }).await;
-                            let account_names: Vec<String> = settings.accounts.iter().map(|a| a.username.clone()).collect();
-                            let default = if settings.default_account.is_empty() { None } else { Some(settings.default_account.clone()) };
-                            let _ = evt_tx.send(AppEvent::AccountListUpdated {
-                                accounts: account_names,
-                                active: Some(username),
-                                default,
-                            }).await;
+                            let request = auth_requests.begin(ValidationKind::SwitchAccount, Some(username));
+                            spawn_validation(token_val_tx.clone(), request, token);
                         } else {
                             warn!("SwitchAccount: no saved token for {username}");
                             let _ = evt_tx.send(AppEvent::Error {
@@ -3548,7 +3469,10 @@ async fn reducer_loop(
                     }
                     AppCommand::RemoveAccount { username } => {
                         info!("RemoveAccount {username}");
-                        let was_active = auth_username.as_deref() == Some(username.as_str());
+                        let cancelled_sign_in = auth_requests.is_pending() && auth_user_id.is_none();
+                        auth_requests.cancel();
+                        let was_active = settings.username.eq_ignore_ascii_case(&username)
+                            || auth_username.as_deref().is_some_and(|login| login.eq_ignore_ascii_case(&username));
                         if let Some(store) = &settings_store {
                             let _ = store.delete_account(&username);
                         }
@@ -3557,43 +3481,31 @@ async fn reducer_loop(
                         if settings.default_account == username {
                             settings.default_account = String::new();
                         }
-                        if was_active {
-                            // Try to switch to the first remaining account.
-                            let next = settings.accounts.first().cloned();
-                            if let Some(acc) = next {
-                                let token_opt = settings_store.as_ref().and_then(|s| s.load_account_token(&acc.username));
-                                if let Some(token) = token_opt {
-                                    settings.username = acc.username.clone();
-                                    auth_in_progress = true;
-                                    let _ = sess_tx.send(SessionCommand::Authenticate {
-                                        token,
-                                        nick: acc.username.clone(),
-                                    }).await;
-                                } else {
-                                    auth_username = None;
-                                    auth_user_id = None;
-                                    auth_scopes.clear();
-                                    whisper_history_loaded_for = None;
-                                    settings.username = String::new();
-                                    let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
-                                    clear_live_feed_auth(&live_feed_tx, &authed_helix).await;
-                                    let _ = sess_tx.send(SessionCommand::LogoutAndReconnect).await;
-                                    let _ = evt_tx.send(AppEvent::LoggedOut).await;
-                                }
-                            } else {
-                                auth_username = None;
-                                auth_user_id = None;
-                                auth_scopes.clear();
-                                whisper_history_loaded_for = None;
-                                settings.username = String::new();
-                                let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
-                                clear_live_feed_auth(&live_feed_tx, &authed_helix).await;
-                                let _ = sess_tx.send(SessionCommand::LogoutAndReconnect).await;
-                                let _ = evt_tx.send(AppEvent::LoggedOut).await;
-                            }
+                        if was_active || cancelled_sign_in {
+                            detach_active_account(
+                                &mut settings, &mut auth_username, &mut auth_user_id,
+                                &mut auth_scopes, &mut helix_client_id, &mut expected_irc_identity,
+                            );
+                            whisper_history_loaded_for = None;
+                            clear_account_channel_state(&mut channel_mod_status, &mut self_badges, &mut self_color, &evt_tx).await;
+                            let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
+                            clear_live_feed_auth(&live_feed_tx, &authed_helix).await;
+                            let _ = sess_tx.send(SessionCommand::LogoutAndReconnect).await;
                             if let Some(store) = &settings_store {
-                                let _ = store.save(&settings);
+                                let _ = store.delete_token();
                             }
+                            if let Some(account) = settings.accounts.first().filter(|_| was_active) {
+                                if let Some(token) = settings_store.as_ref().and_then(|s| s.load_account_token(&account.username)) {
+                                    let _ = evt_tx.send(AppEvent::AuthenticationPending {
+                                        username: Some(account.username.clone()),
+                                    }).await;
+                                    let request = auth_requests.begin(ValidationKind::SwitchAccount, Some(account.username.clone()));
+                                    spawn_validation(token_val_tx.clone(), request, token);
+                                }
+                            }
+                        }
+                        if let Some(store) = &settings_store {
+                            let _ = store.save(&settings);
                         }
                         let account_names: Vec<String> = settings.accounts.iter().map(|a| a.username.clone()).collect();
                         let active = if settings.username.is_empty() { None } else { Some(settings.username.clone()) };
@@ -4330,6 +4242,13 @@ async fn reducer_loop(
                         }
                     }
                     AppCommand::RefreshAuth => {
+                        if auth_requests.is_pending() {
+                            let _ = evt_tx.send(AppEvent::Error {
+                                context: "RefreshAuth".into(),
+                                message: "Authentication is already being checked. Try again after the current account change.".into(),
+                            }).await;
+                            continue;
+                        }
                         // Re-validate the stored OAuth token without forcing a
                         // full logout/login flow.  If the token is still valid,
                         // this is a no-op.  If invalid, the validate path will
@@ -4344,13 +4263,9 @@ async fn reducer_loop(
                         };
 
                         if let Some(token) = token_opt {
-                            let tx = token_val_tx.clone();
-                            tokio::spawn(async move {
-                                let result = validate_token(&token).await;
-                                let _ = tx
-                                    .send(TokenValidationResult::Refresh { token, result })
-                                    .await;
-                            });
+                            let expected_login = (!settings.username.is_empty()).then(|| settings.username.clone());
+                            let request = auth_requests.begin(ValidationKind::Refresh, expected_login);
+                            spawn_validation(token_val_tx.clone(), request, token);
                         } else {
                             let _ = evt_tx
                                 .send(AppEvent::AuthExpired)
@@ -4659,6 +4574,7 @@ async fn reducer_loop(
                                     user_id: UserId(uid.clone()),
                                     login: uname.to_lowercase(),
                                     display_name: uname.clone(),
+                                    original_display_name: None,
                                     color: self_color.clone(),
                                     name_paint: None,
                                     badges: self_badges.get(&channel).cloned().unwrap_or_default(),
@@ -4711,19 +4627,12 @@ async fn reducer_loop(
                             // Queue image fetches for emotes in the echo
                             for span in &echo.spans {
                                 let url = match span {
-                                    crust_core::Span::Emote { url, .. } => Some(url.clone()),
-                                    crust_core::Span::Emoji { url, .. } => Some(url.clone()),
+                                    crust_core::Span::Emote { url, .. }
+                                    | crust_core::Span::Emoji { url, .. } => Some(url.as_str()),
                                     _ => None,
                                 };
                                 if let Some(url) = url {
-                                    if !pending_images.contains(&url) {
-                                        pending_images.insert(url.clone());
-                                        let evt_tx = evt_tx.clone();
-                                        let cache = emote_cache.clone();
-                                        tokio::spawn(async move {
-                                            fetch_emote_image(&url, &cache, &evt_tx).await;
-                                        });
-                                    }
+                                    image_requests.request(url, &emote_cache, &evt_tx);
                                 }
                             }
 
@@ -4764,6 +4673,7 @@ async fn reducer_loop(
                                         user_id: UserId(display.to_owned()),
                                         login: display.to_lowercase(),
                                         display_name: display.to_owned(),
+                                        original_display_name: None,
                                         color: None,
                                         name_paint: None,
                                         badges: Vec::new(),
@@ -4810,19 +4720,12 @@ async fn reducer_loop(
 
                                 for span in &echo.spans {
                                     let url = match span {
-                                        crust_core::Span::Emote { url, .. } => Some(url.clone()),
-                                        crust_core::Span::Emoji { url, .. } => Some(url.clone()),
+                                        crust_core::Span::Emote { url, .. }
+                                        | crust_core::Span::Emoji { url, .. } => Some(url.as_str()),
                                         _ => None,
                                     };
                                     if let Some(url) = url {
-                                        if !pending_images.contains(&url) {
-                                            pending_images.insert(url.clone());
-                                            let evt_tx = evt_tx.clone();
-                                            let cache = emote_cache.clone();
-                                            tokio::spawn(async move {
-                                                fetch_emote_image(&url, &cache, &evt_tx).await;
-                                            });
-                                        }
+                                        image_requests.request(url, &emote_cache, &evt_tx);
                                     }
                                 }
 
@@ -6058,229 +5961,125 @@ async fn reducer_loop(
                 }
             }
 
-            // Background token validation results
-            Some(val) = token_val_rx.recv() => {
-                match val {
-                    TokenValidationResult::Startup { token, result } => {
-                        match result {
-                            Ok(info) => {
-                                warn_missing_whisper_scope(&evt_tx, &info.scopes).await;
-                                auth_scopes = info.scopes.clone();
-                                let login = info.login;
-                                info!("Saved token valid for user: {login}");
-                                if !info.client_id.is_empty() {
-                                    helix_client_id = Some(info.client_id);
-                                }
-                                if settings.username != login {
-                                    settings.username = login.clone();
-                                    if let Some(store) = &settings_store {
-                                        let _ = store.save(&settings);
-                                    }
-                                }
-                                sync_eventsub_auth(
-                                    &eventsub_tx,
-                                    &settings,
-                                    helix_client_id.as_deref(),
-                                    auth_user_id.as_deref(),
-                                    &auth_scopes,
-                                )
-                                .await;
-                                sync_live_feed_auth(
-                                    &live_feed_tx,
-                                    &authed_helix,
-                                    &settings,
-                                    helix_client_id.as_deref(),
-                                    auth_user_id.as_deref(),
-                                )
-                                .await;
-                                // auth_in_progress was already set to true before spawn
-                                let _ = sess_tx
-                                    .send(SessionCommand::Authenticate { token, nick: login })
-                                    .await;
+            // Ignore results from an account operation the user has replaced.
+            Some(completion) = token_val_rx.recv() => {
+                let Some(completion) = auth_requests.finish(completion) else {
+                    continue;
+                };
+                let TokenValidationResult { request, token, result } = completion;
+                match result {
+                    Ok(info) => {
+                        warn_missing_whisper_scope(&evt_tx, &info.scopes).await;
+                        let refresh_only = request.kind == ValidationKind::Refresh
+                            && auth_username.as_deref() == Some(info.login.as_str())
+                            && auth_user_id.as_deref() == Some(info.user_id.as_str());
+                        save_validated_account(&mut settings, &token, &info);
+                        if let Some(store) = &settings_store {
+                            if let Err(error) = store.save(&settings) {
+                                warn!("Failed to save validated account: {error}");
                             }
-                            Err(ValidateError::Unauthorized) => {
-                                warn!("Saved token rejected by Twitch, clearing and starting anonymous");
-                                auth_in_progress = false;
-                                auth_scopes.clear();
-                                let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
-                                clear_live_feed_auth(&live_feed_tx, &authed_helix).await;
+                            store.try_save_keyring(&token);
+                            store.try_save_account_keyring(&info.login, &token);
+                        }
+
+                        if !refresh_only {
+                            expected_irc_identity = Some((request.id, info.user_id.clone()));
+                            auth_username = None;
+                            auth_user_id = None;
+                            whisper_history_loaded_for = None;
+                            clear_account_channel_state(
+                                &mut channel_mod_status,
+                                &mut self_badges,
+                                &mut self_color,
+                                &evt_tx,
+                            ).await;
+                            let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
+                            clear_live_feed_auth(&live_feed_tx, &authed_helix).await;
+                        }
+                        // The validated token owns all of these fields. An account
+                        // transition must not retain the previous client's scopes.
+                        auth_scopes = info.scopes;
+                        helix_client_id = Some(info.client_id);
+
+                        if refresh_only {
+                            sync_eventsub_auth(
+                                &eventsub_tx, &settings, helix_client_id.as_deref(),
+                                auth_user_id.as_deref(), &auth_scopes,
+                            ).await;
+                            sync_live_feed_auth(
+                                &live_feed_tx, &authed_helix, &settings,
+                                helix_client_id.as_deref(), auth_user_id.as_deref(),
+                            ).await;
+                            let _ = evt_tx.send(AppEvent::Authenticated {
+                                username: info.login.clone(),
+                                user_id: info.user_id,
+                            }).await;
+                        } else {
+                            let _ = evt_tx.send(AppEvent::AuthenticationPending {
+                                username: Some(info.login.clone()),
+                            }).await;
+                            let _ = sess_tx.send(SessionCommand::Authenticate {
+                                token,
+                                nick: info.login.clone(),
+                                generation: request.id,
+                            }).await;
+                        }
+                        let _ = evt_tx.send(AppEvent::AccountListUpdated {
+                            accounts: settings.accounts.iter().map(|account| account.username.clone()).collect(),
+                            active: Some(info.login),
+                            default: (!settings.default_account.is_empty()).then(|| settings.default_account.clone()),
+                        }).await;
+                    }
+                    Err(error) => {
+                        let revoked = matches!(error, ValidateError::Unauthorized | ValidateError::WrongAccount { .. });
+                        if request.kind == ValidationKind::Refresh && matches!(error, ValidateError::Unauthorized) {
+                            let _ = evt_tx.send(AppEvent::AuthExpired).await;
+                        }
+                        if request.kind == ValidationKind::Startup
+                            || (request.kind == ValidationKind::Refresh && revoked)
+                        {
+                            expected_irc_identity = None;
+                            auth_username = None;
+                            auth_user_id = None;
+                            auth_scopes.clear();
+                            helix_client_id = None;
+                            whisper_history_loaded_for = None;
+                            clear_account_channel_state(
+                                &mut channel_mod_status,
+                                &mut self_badges,
+                                &mut self_color,
+                                &evt_tx,
+                            ).await;
+                            let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
+                            clear_live_feed_auth(&live_feed_tx, &authed_helix).await;
+                            if revoked {
+                                settings.username.clear();
+                                settings.oauth_token.clear();
                                 if let Some(store) = &settings_store {
                                     let _ = store.delete_token();
-                                }
-                                let _ = evt_tx.send(AppEvent::LoggedOut).await;
-                            }
-                            Err(ValidateError::Transient(e)) => {
-                                warn!("Token validation failed ({e}), keeping token and starting anonymous");
-                                auth_in_progress = false;
-                                auth_scopes.clear();
-                                let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
-                                clear_live_feed_auth(&live_feed_tx, &authed_helix).await;
-                                let _ = evt_tx.send(AppEvent::LoggedOut).await;
-                            }
-                        }
-                    }
-                    TokenValidationResult::Login { token, result } => {
-                        match result {
-                            Ok(info) => {
-                                warn_missing_whisper_scope(&evt_tx, &info.scopes).await;
-                                auth_scopes = info.scopes.clone();
-                                let login = info.login;
-                                info!("Token valid for user: {login}");
-                                if !info.client_id.is_empty() {
-                                    helix_client_id = Some(info.client_id);
-                                }
-                                settings.username = login.clone();
-                                settings.oauth_token = token.clone();
-                                if let Some(acc) = settings.accounts.iter_mut().find(|a| a.username == login) {
-                                    acc.oauth_token = token.clone();
-                                } else {
-                                    settings.accounts.push(crust_storage::AccountEntry {
-                                        username: login.clone(),
-                                        oauth_token: token.clone(),
-                                    });
-                                }
-                                if let Some(store) = &settings_store {
-                                    if let Err(e) = store.save(&settings) {
-                                        warn!("Failed to save settings: {e}");
-                                    }
-                                    store.try_save_account_keyring(&login, &token);
-                                }
-                                if auth_username.is_some() {
-                                    auth_username = None;
-                                    auth_user_id = None;
-                                    auth_scopes.clear();
-                                    let _ = evt_tx.send(AppEvent::LoggedOut).await;
-                                }
-                                let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
-                                clear_live_feed_auth(&live_feed_tx, &authed_helix).await;
-                                auth_in_progress = true;
-                                let _ = sess_tx.send(SessionCommand::Authenticate {
-                                    token,
-                                    nick: login.clone(),
-                                }).await;
-                                let account_names: Vec<String> = settings.accounts.iter().map(|a| a.username.clone()).collect();
-                                let default = if settings.default_account.is_empty() { None } else { Some(settings.default_account.clone()) };
-                                let _ = evt_tx.send(AppEvent::AccountListUpdated {
-                                    accounts: account_names,
-                                    active: Some(login),
-                                    default,
-                                }).await;
-                            }
-                            Err(e) => {
-                                warn!("Token validation failed: {e}");
-                                let _ = evt_tx.send(AppEvent::Error {
-                                    context: "Login".into(),
-                                    message: format!("Invalid token: {e}"),
-                                }).await;
-                            }
-                        }
-                    }
-                    TokenValidationResult::AddAccount { token, result } => {
-                        match result {
-                            Ok(info) => {
-                                warn_missing_whisper_scope(&evt_tx, &info.scopes).await;
-                                auth_scopes = info.scopes.clone();
-                                let login = info.login;
-                                info!("AddAccount: token valid for {login}");
-                                if !info.client_id.is_empty() {
-                                    helix_client_id = Some(info.client_id);
-                                }
-                                if let Some(acc) = settings.accounts.iter_mut().find(|a| a.username == login) {
-                                    acc.oauth_token = token.clone();
-                                } else {
-                                    settings.accounts.push(crust_storage::AccountEntry {
-                                        username: login.clone(),
-                                        oauth_token: token.clone(),
-                                    });
-                                }
-                                settings.username = login.clone();
-                                settings.oauth_token = token.clone();
-                                if let Some(store) = &settings_store {
-                                    if let Err(e) = store.save(&settings) {
-                                        warn!("Failed to save settings for AddAccount {login}: {e}");
-                                    }
-                                    store.try_save_account_keyring(&login, &token);
-                                }
-                                if auth_username.is_some() {
-                                    auth_username = None;
-                                    auth_user_id = None;
-                                    auth_scopes.clear();
-                                    let _ = evt_tx.send(AppEvent::LoggedOut).await;
-                                }
-                                let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
-                                clear_live_feed_auth(&live_feed_tx, &authed_helix).await;
-                                auth_in_progress = true;
-                                let _ = sess_tx.send(SessionCommand::Authenticate {
-                                    token,
-                                    nick: login.clone(),
-                                }).await;
-                                let account_names: Vec<String> = settings.accounts.iter().map(|a| a.username.clone()).collect();
-                                let default = if settings.default_account.is_empty() { None } else { Some(settings.default_account.clone()) };
-                                let _ = evt_tx.send(AppEvent::AccountListUpdated {
-                                    accounts: account_names,
-                                    active: Some(login),
-                                    default,
-                                }).await;
-                            }
-                            Err(e) => {
-                                warn!("AddAccount token validation failed: {e}");
-                                let _ = evt_tx.send(AppEvent::Error {
-                                    context: "AddAccount".into(),
-                                    message: format!("Invalid token: {e}"),
-                                }).await;
-                            }
-                        }
-                    }
-                    TokenValidationResult::Refresh { token, result } => {
-                        match result {
-                            Ok(info) => {
-                                warn_missing_whisper_scope(&evt_tx, &info.scopes).await;
-                                auth_scopes = info.scopes.clone();
-                                let login = info.login;
-                                let client_id = info.client_id;
-
-                                if !client_id.is_empty() {
-                                    helix_client_id = Some(client_id);
-                                }
-                                // Keep legacy and active-account token fields in sync.
-                                settings.oauth_token = token.clone();
-                                if !settings.username.is_empty() {
-                                    if let Some(acc) = settings
-                                        .accounts
-                                        .iter_mut()
-                                        .find(|a| a.username == settings.username)
-                                    {
-                                        acc.oauth_token = token.clone();
-                                    }
-                                }
-                                if let Some(store) = &settings_store {
                                     let _ = store.save(&settings);
-                                    if !settings.username.is_empty() {
-                                        store.try_save_account_keyring(&settings.username, &token);
-                                    }
-                                }
-
-                                // If the runtime lost auth state, re-authenticate silently.
-                                if auth_username.is_none() {
-                                    auth_in_progress = true;
-                                    let nick = if login.is_empty() {
-                                        settings.username.clone()
-                                    } else {
-                                        login
-                                    };
-                                    let _ = sess_tx
-                                        .send(SessionCommand::Authenticate { token, nick })
-                                        .await;
                                 }
                             }
-                            Err(ValidateError::Unauthorized) => {
-                                auth_scopes.clear();
-                                let _ = evt_tx.send(AppEvent::AuthExpired).await;
+                            if request.kind == ValidationKind::Refresh {
+                                let _ = sess_tx.send(SessionCommand::LogoutAndReconnect).await;
                             }
-                            Err(ValidateError::Transient(e)) => {
-                                warn!("RefreshAuth transient validation error: {e}");
-                            }
+                            let _ = evt_tx.send(AppEvent::AccountListUpdated {
+                                accounts: settings.accounts.iter().map(|account| account.username.clone()).collect(),
+                                active: None,
+                                default: (!settings.default_account.is_empty()).then(|| settings.default_account.clone()),
+                            }).await;
                         }
+                        let context = match request.kind {
+                            ValidationKind::Startup | ValidationKind::Login => "Login",
+                            ValidationKind::AddAccount => "AddAccount",
+                            ValidationKind::SwitchAccount => "SwitchAccount",
+                            ValidationKind::Refresh => "RefreshAuth",
+                        };
+                        warn!("{context} token validation failed: {error}");
+                        let _ = evt_tx.send(AppEvent::Error {
+                            context: context.into(),
+                            message: format!("Could not authenticate: {error}"),
+                        }).await;
                     }
                 }
             }
@@ -6290,6 +6089,25 @@ async fn reducer_loop(
     }
 
     info!("Reducer loop exiting");
+}
+
+async fn clear_account_channel_state(
+    channel_mod_status: &mut HashMap<ChannelId, bool>,
+    self_badges: &mut HashMap<ChannelId, Vec<Badge>>,
+    self_color: &mut Option<String>,
+    evt_tx: &mpsc::Sender<AppEvent>,
+) {
+    let _ = evt_tx.send(AppEvent::LoggedOut).await;
+    self_badges.clear();
+    *self_color = None;
+    for (channel, _) in channel_mod_status.drain() {
+        let _ = evt_tx.send(AppEvent::UserStateUpdated {
+            channel,
+            is_mod: false,
+            badges: Vec::new(),
+            color: None,
+        }).await;
+    }
 }
 
 async fn sync_eventsub_auth(
@@ -7716,6 +7534,7 @@ fn persist_whisper_message(
             user_id: UserId(sender_login.clone()),
             login: sender_login,
             display_name: sender_display_name,
+            original_display_name: None,
             color: None,
             name_paint: None,
             badges: Vec::new(),
@@ -9143,82 +8962,6 @@ async fn helix_cancel_prediction(
     .await;
 }
 
-/// Error returned by [`validate_token`].
-#[derive(Debug)]
-enum ValidateError {
-    /// The Twitch API explicitly rejected the token (HTTP 401 / 403).
-    /// The token should be deleted from storage.
-    Unauthorized,
-    /// A transient problem (network error, server 5xx, parse failure, ...).
-    /// The token should be kept so it can be retried next launch.
-    Transient(String),
-}
-
-impl std::fmt::Display for ValidateError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unauthorized => write!(f, "token rejected by Twitch (unauthorized)"),
-            Self::Transient(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-/// Information returned by a successful token validation.
-struct ValidateInfo {
-    /// Twitch login name (always lowercase).
-    login: String,
-    /// Twitch user-id string for the token owner (available for future use).
-    #[allow(dead_code)]
-    user_id: String,
-    /// Client-id of the application the token was issued to.
-    client_id: String,
-    /// OAuth scopes currently granted by this token.
-    scopes: Vec<String>,
-}
-
-/// Validate a Twitch OAuth token via the Twitch API and return the login name.
-async fn validate_token(token: &str) -> Result<ValidateInfo, ValidateError> {
-    let bare = token.strip_prefix("oauth:").unwrap_or(token);
-    let client = reqwest::Client::new();
-    let resp = client
-        .get("https://id.twitch.tv/oauth2/validate")
-        .header("Authorization", format!("OAuth {bare}"))
-        .send()
-        .await
-        .map_err(|e| ValidateError::Transient(format!("HTTP error: {e}")))?;
-
-    let status = resp.status();
-    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return Err(ValidateError::Unauthorized);
-    }
-    if !status.is_success() {
-        return Err(ValidateError::Transient(format!(
-            "Token rejected (HTTP {status})"
-        )));
-    }
-
-    #[derive(serde::Deserialize)]
-    struct ValidateResponse {
-        login: String,
-        #[serde(default)]
-        user_id: String,
-        #[serde(default)]
-        client_id: String,
-        #[serde(default)]
-        scopes: Vec<String>,
-    }
-
-    let body = resp.json::<ValidateResponse>().await.map_err(|e| {
-        ValidateError::Transient(format!("Failed to parse validation response: {e}"))
-    })?;
-
-    Ok(ValidateInfo {
-        login: body.login,
-        user_id: body.user_id,
-        client_id: body.client_id,
-        scopes: body.scopes,
-    })
-}
 
 fn token_has_scope(scopes: &[String], required: &str) -> bool {
     scopes
@@ -9413,6 +9156,7 @@ async fn fetch_current_twitch_pinned_message(channel: ChannelId, evt_tx: mpsc::S
         user_id: UserId(snapshot.sender_id),
         login: snapshot.sender_login,
         display_name: snapshot.sender_display_name,
+        original_display_name: None,
         color: None,
         name_paint: None,
         badges: Vec::new(),
@@ -10012,7 +9756,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        format_completed_poll_message, format_eventsub_notice_text,
+        eventsub_notice_to_message, format_completed_poll_message, format_eventsub_notice_text,
         moderation_action_effect_from_notice, moderation_command_remaining_cooldown,
         parse_twitch_pinned_snapshot_json, should_drop_duplicate_eventsub_notice,
         should_emit_eventsub_notice_message, stream_status_is_live_from_notice,
@@ -10020,7 +9764,7 @@ mod tests {
         APP_MIN_INNER_SIZE, MODERATION_CMD_COOLDOWN,
     };
     use crate::runtime::system_messages::is_twitch_pinned_notice;
-    use crust_core::model::ChannelId;
+    use crust_core::model::{ChannelId, MsgKind};
     use crust_twitch::eventsub::EventSubNoticeKind;
 
     #[test]
@@ -10170,10 +9914,12 @@ mod tests {
             action: "ban".to_owned(),
             target_login: Some("viewer123".to_owned()),
             target_message_id: None,
+            reason: Some("Repeated spam".to_owned()),
             source_channel_login: Some("partner_stream".to_owned()),
         });
 
         assert!(text.contains("mod_jane performed ban on viewer123 in #partner_stream."));
+        assert!(text.contains("Reason: Repeated spam"));
     }
 
     #[test]
@@ -10205,6 +9951,46 @@ mod tests {
                 created_at: Some("2026-03-31T19:35:00Z".to_owned()),
             }
         ));
+    }
+
+    #[test]
+    fn moderation_actions_keep_structured_notices_for_cross_source_merging() {
+        for action in ["ban", "timeout", "timeout_600s", "clear", " TIMEOUT_30s "] {
+            let notice = EventSubNoticeKind::ModerationAction {
+                moderator_login: "moderator".to_owned(),
+                action: action.to_owned(),
+                target_login: Some("viewer".to_owned()),
+                target_message_id: None,
+                reason: None,
+                source_channel_login: None,
+            };
+            assert!(should_emit_eventsub_notice_message(&notice), "{action}");
+            let (kind, text) = eventsub_notice_to_message(&notice);
+            assert!(matches!(kind, MsgKind::Timeout { .. } | MsgKind::Ban { .. } | MsgKind::ChatCleared));
+            assert!(text.contains("moderator"));
+            assert!(moderation_action_effect_from_notice(action, Some("viewer"), None).is_some());
+        }
+    }
+
+    #[test]
+    fn moderation_notices_keep_actions_without_an_irc_notice_and_shared_sources() {
+        for (action, source_channel_login) in [
+            ("unban", None),
+            ("untimeout", None),
+            ("warn", None),
+            ("delete", None),
+            ("timeout_600s", Some("partner_stream")),
+        ] {
+            let notice = EventSubNoticeKind::ModerationAction {
+                moderator_login: "moderator".to_owned(),
+                action: action.to_owned(),
+                target_login: Some("viewer".to_owned()),
+                target_message_id: None,
+                reason: None,
+                source_channel_login: source_channel_login.map(str::to_owned),
+            };
+            assert!(should_emit_eventsub_notice_message(&notice), "{action}");
+        }
     }
 
     #[test]

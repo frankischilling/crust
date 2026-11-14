@@ -1,12 +1,11 @@
+use crate::app::UiCommandSender;
+use crate::image_cache::UiImageCache;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use egui::{Color32, Context, RichText, ScrollArea, Vec2};
-use image::DynamicImage;
-use tokio::sync::mpsc;
 use tracing::info;
 
-use crust_core::events::AppCommand;
 use crust_core::model::EmoteCatalogEntry;
 
 use super::emoji_list::emoji_catalog_entries;
@@ -17,8 +16,6 @@ use super::chrome;
 const EMOTE_SIZE: f32 = 28.0;
 const CELL_SIZE: f32 = EMOTE_SIZE + 8.0;
 const ROW_H: f32 = CELL_SIZE + 4.0;
-/// Fallback image fetches per frame (safety net if prefetch hasn't finished).
-const FETCH_BATCH: usize = 12;
 /// Max recent emotes kept in memory.
 const RECENT_LIMIT: usize = 80;
 
@@ -79,16 +76,12 @@ pub struct EmotePicker {
     pub open: bool,
     filter: String,
     active_view: PickerView,
-    /// URLs we've already requested fetching for (fallback lazy fetch).
-    requested: HashSet<String>,
     /// Cached filtered/grouped view.
     cache: Option<CachedView>,
     /// Cached ranked indices for the current filter/tab/ranking preferences.
     display_cache: Option<CachedDisplay>,
     /// Last size we logged to avoid spamming every frame.
     last_logged_size: Option<Vec2>,
-    /// Cached static textures for animated emotes (first frame).
-    static_frames: HashMap<String, egui::TextureHandle>,
     /// Pre-generated emoji catalog entries (created once).
     emoji_entries: Vec<EmoteCatalogEntry>,
     /// Favorite emotes by unique URL.
@@ -109,11 +102,9 @@ impl Default for EmotePicker {
             open: false,
             filter: String::new(),
             active_view: PickerView::All,
-            requested: HashSet::new(),
             cache: None,
             display_cache: None,
             last_logged_size: None,
-            static_frames: HashMap::new(),
             emoji_entries: emoji_catalog_entries(),
             favorite_urls: HashSet::new(),
             recent_urls: Vec::new(),
@@ -449,8 +440,8 @@ impl EmotePicker {
         &mut self,
         ctx: &Context,
         catalog: &[EmoteCatalogEntry],
-        emote_bytes: &HashMap<String, (u32, u32, Arc<[u8]>)>,
-        cmd_tx: &mpsc::Sender<AppCommand>,
+        emote_bytes: &UiImageCache,
+        _cmd_tx: &UiCommandSender,
         animate_emotes: bool,
     ) -> Option<String> {
         if !self.open {
@@ -636,7 +627,6 @@ impl EmotePicker {
                 let available_h = ui.available_height();
                 let cols = ((available_w / CELL_SIZE) as usize).max(1);
                 let num_rows = (display_indices.len() + cols - 1) / cols;
-                let mut fetches_this_frame = 0usize;
                 let pointer_pos = ui.input(|i| i.pointer.hover_pos());
                 let mut has_animated_visible = false;
                 let view = self.cache.as_ref().expect("cache initialized");
@@ -681,44 +671,18 @@ impl EmotePicker {
                                     egui::vec2(EMOTE_SIZE, EMOTE_SIZE),
                                 );
 
-                                // Fallback lazy fetch
-                                let has_bytes = emote_bytes.contains_key(entry.url.as_str());
-                                if !has_bytes
-                                    && fetches_this_frame < FETCH_BATCH
-                                    && !self.requested.contains(&entry.url)
-                                {
-                                    self.requested.insert(entry.url.clone());
-                                    let _ = cmd_tx.try_send(AppCommand::FetchImage {
-                                        url: entry.url.clone(),
-                                    });
-                                    fetches_this_frame += 1;
-                                }
-
                                 let is_hovered = pointer_pos
                                     .map(|pos| cell_rect.contains(pos))
                                     .unwrap_or(false);
 
-                                if has_bytes {
-                                    let &(w, h, ref raw) =
-                                        emote_bytes.get(entry.url.as_str()).unwrap();
+                                if let Some(&(w, h, ref raw)) = emote_bytes.get(entry.url.as_str()) {
                                     let animated = is_likely_animated_url(&entry.url);
                                     // Keep 7TV animation hover-only to avoid repaint storms in dense lists.
                                     let animate_in_grid = animated
                                         && animate_emotes
                                         && (entry.provider != "7tv" || is_hovered);
                                     if animated && !animate_in_grid {
-                                        if !self.static_frames.contains_key(&entry.url) {
-                                            if let Some(img) = decode_static_frame(raw) {
-                                                let tex = ui.ctx().load_texture(
-                                                    format!("static://{}", entry.url),
-                                                    img,
-                                                    egui::TextureOptions::LINEAR,
-                                                );
-                                                self.static_frames.insert(entry.url.clone(), tex);
-                                            }
-                                        }
-
-                                        if let Some(tex) = self.static_frames.get(&entry.url) {
+                                        if let Some(tex) = emote_bytes.static_texture(ui.ctx(), &entry.url) {
                                             let size = fit_size(w, h, EMOTE_SIZE);
                                             let image_rect = egui::Rect::from_center_size(
                                                 cell_rect.center(),
@@ -807,7 +771,7 @@ impl EmotePicker {
                             ui.painter().rect_stroke(
                                 rect.expand(2.0),
                                 4.0,
-                                egui::Stroke::new(1.5, t::accent()),
+                                egui::Stroke::new(1.5_f32, t::accent()),
                                 egui::epaint::StrokeKind::Outside,
                             );
 
@@ -911,17 +875,4 @@ fn fit_size(w: u32, h: u32, max_side: f32) -> Vec2 {
 fn is_likely_animated_url(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
     lower.contains(".gif") || lower.contains(".webp")
-}
-
-fn decode_static_frame(raw: &[u8]) -> Option<egui::ColorImage> {
-    let img = image::load_from_memory(raw).ok()?;
-    dynamic_image_to_color_image(img)
-}
-
-fn dynamic_image_to_color_image(img: DynamicImage) -> Option<egui::ColorImage> {
-    let rgba = img.to_rgba8();
-    let w = usize::try_from(rgba.width()).ok()?;
-    let h = usize::try_from(rgba.height()).ok()?;
-    let pixels = rgba.into_raw();
-    Some(egui::ColorImage::from_rgba_unmultiplied([w, h], &pixels))
 }

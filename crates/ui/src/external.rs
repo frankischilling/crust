@@ -1,18 +1,17 @@
 //! External-tool process spawners (Streamlink, custom player).
 //!
-//! Mirrors Chatterino's Streamlink integration: right-click a Twitch channel ->
-//! "Open in Streamlink" / "Open in player" spawns a detached process using
-//! configuration from `AppSettings::external_tools`.
+//! Right-click a Twitch channel and choose "Open in Streamlink" or "Open in
+//! player" to start a process configured by `AppSettings::external_tools`.
 //!
 //! # Error visibility
 //!
-//! Streamlink silently exits if no video player is configured (e.g. the
-//! Windows default assumes VLC is installed).  To surface those failures, the
-//! `spawn_*` helpers capture stderr on a pipe and return the live [`Child`] to
-//! the caller, which is expected to poll the exit status and forward a tail
-//! of stderr to the user when the status is nonzero.
+//! Streamlink can exit if no video player is configured. The `spawn_*` helpers
+//! capture both output streams and return the live [`Child`]. Callers use
+//! [`finalize_exit`] to drain those streams and report a bounded tail when the
+//! process fails.
 
-use std::io::ErrorKind;
+use std::collections::VecDeque;
+use std::io::{self, ErrorKind, Read};
 use std::process::{Child, Command, Stdio};
 
 use tracing::warn;
@@ -32,36 +31,67 @@ const DEFAULT_MPV_BINARY: &str = "mpv";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+const OUTPUT_TAIL_BYTES: usize = 64 * 1024;
+
 /// Split `input` into argv tokens using shell-style quoting.
 ///
-/// Supports single/double quotes and backslash escapes.  Unterminated quotes
-/// accept the remaining text as-is rather than erroringmatches the relaxed
-/// behavior users expect from a settings text field.
+/// Single and double quotes group arguments, including empty arguments.
+/// Backslashes escape double quotes and, outside quotes, whitespace or single
+/// quotes. Other backslashes stay literal so Windows paths remain intact.
+/// Before a double quote, each pair of backslashes produces one literal slash.
+/// An unterminated quote includes the remaining text in the current argument.
 pub fn split_shell_args(input: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut in_single = false;
     let mut in_double = false;
+    let mut started = false;
     let mut iter = input.chars().peekable();
 
     while let Some(c) = iter.next() {
         match c {
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
+            '\'' if !in_double => {
+                in_single = !in_single;
+                started = true;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                started = true;
+            }
             '\\' if !in_single => {
-                if let Some(next) = iter.next() {
-                    cur.push(next);
+                started = true;
+                let mut slashes = 1;
+                while iter.peek() == Some(&'\\') {
+                    iter.next();
+                    slashes += 1;
+                }
+                match iter.peek().copied() {
+                    Some('"') => {
+                        cur.extend(std::iter::repeat_n('\\', slashes / 2));
+                        if slashes % 2 != 0 {
+                            cur.push(iter.next().expect("peeked quote"));
+                        }
+                    }
+                    Some(next) if !in_double && (next.is_whitespace() || next == '\'') => {
+                        cur.extend(std::iter::repeat_n('\\', slashes - 1));
+                        cur.push(iter.next().expect("peeked character"));
+                    }
+                    _ => cur.extend(std::iter::repeat_n('\\', slashes)),
                 }
             }
             c if c.is_whitespace() && !in_single && !in_double => {
-                if !cur.is_empty() {
+                if started {
                     out.push(std::mem::take(&mut cur));
+                    started = false;
                 }
             }
-            c => cur.push(c),
+            c => {
+                cur.push(c);
+                started = true;
+            }
         }
     }
-    if !cur.is_empty() {
+    if started {
         out.push(cur);
     }
     out
@@ -178,7 +208,8 @@ fn maybe_inject_twitch_auth(args: &mut Vec<String>, session_token: &str) {
 /// Used by `spawn_player` to decide whether to inject the Twitch auth header
 /// into a user template whose first token expands to streamlink.
 fn looks_like_streamlink(program: &str) -> bool {
-    std::path::Path::new(program)
+    let filename = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    std::path::Path::new(filename)
         .file_stem()
         .and_then(|s| s.to_str())
         .map(|s| s.eq_ignore_ascii_case("streamlink"))
@@ -228,11 +259,39 @@ pub fn spawn_streamlink(
     spawn_with(&mut cmd, &binary)
 }
 
-/// Wrap a resolved binary path in double quotes so it survives the shell-
-/// style argv split used by player templates, even when the path contains
-/// spaces (e.g. `C:\Program Files\mpv\mpv.exe`).
-fn quote_for_template(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\\\""))
+fn expand_player_args(
+    template: &str,
+    channel: &str,
+    quality: &str,
+    mpv: &str,
+    streamlink: &str,
+) -> Vec<String> {
+    let url = format!("twitch.tv/{channel}");
+    split_shell_args(template)
+        .into_iter()
+        .map(|arg| {
+            let mut expanded = String::with_capacity(arg.len());
+            let mut rest = arg.as_str();
+            while let Some(start) = rest.find('{') {
+                expanded.push_str(&rest[..start]);
+                rest = &rest[start..];
+                let Some(end) = rest.find('}') else {
+                    break;
+                };
+                expanded.push_str(match &rest[1..end] {
+                    "channel" => channel,
+                    "url" => &url,
+                    "quality" => quality,
+                    "mpv" => mpv,
+                    "streamlink" => streamlink,
+                    _ => &rest[..=end],
+                });
+                rest = &rest[end + 1..];
+            }
+            expanded.push_str(rest);
+            expanded
+        })
+        .collect()
 }
 
 /// Spawn the user's custom player template with `{channel}`, `{url}`,
@@ -240,8 +299,8 @@ fn quote_for_template(value: &str) -> String {
 ///
 /// `{mpv}` / `{streamlink}` expand to the configured absolute paths, or to
 /// the platform default binary name when the corresponding setting is empty.
-/// Expanded tokens are quoted before argv split so paths with spaces stay
-/// intact.
+/// Substitution happens after argument parsing, so each value stays in its
+/// argument even when it contains spaces, quotes, or another placeholder.
 pub fn spawn_player(
     channel: &str,
     template: &str,
@@ -261,18 +320,14 @@ pub fn spawn_player(
                 .to_owned(),
         );
     }
-    let url = format!("twitch.tv/{channel}");
-    let quality = default_quality(quality);
-    let mpv = quote_for_template(&resolve_mpv_binary(mpv_path));
-    let streamlink = quote_for_template(&resolve_streamlink_binary(streamlink_path));
-    let expanded = template
-        .replace("{channel}", channel)
-        .replace("{url}", &url)
-        .replace("{quality}", quality)
-        .replace("{mpv}", &mpv)
-        .replace("{streamlink}", &streamlink);
-    let mut tokens = split_shell_args(&expanded);
-    if tokens.is_empty() {
+    let mut tokens = expand_player_args(
+        template,
+        channel,
+        default_quality(quality),
+        &resolve_mpv_binary(mpv_path),
+        &resolve_streamlink_binary(streamlink_path),
+    );
+    if tokens.first().is_none_or(|program| program.is_empty()) {
         return Err("Player command is empty after expansion".to_owned());
     }
     let program = tokens.remove(0);
@@ -305,26 +360,64 @@ fn stream_tail(raw: &[u8]) -> String {
     tail.join(" | ")
 }
 
+fn read_output_tail(mut reader: impl Read) -> io::Result<Vec<u8>> {
+    let mut tail = VecDeque::with_capacity(OUTPUT_TAIL_BYTES);
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        let excess = (tail.len() + read).saturating_sub(OUTPUT_TAIL_BYTES);
+        tail.drain(..excess);
+        tail.extend(&buffer[..read]);
+    }
+    Ok(tail.into_iter().collect())
+}
+
+type OutputReader = std::thread::JoinHandle<io::Result<Vec<u8>>>;
+
+fn finish_output_reader(reader: Option<OutputReader>) -> Result<Vec<u8>, String> {
+    match reader {
+        Some(reader) => reader
+            .join()
+            .map_err(|_| "output reader stopped unexpectedly".to_owned())?
+            .map_err(|error| format!("could not read process output: {error}")),
+        None => Ok(Vec::new()),
+    }
+}
+
 /// Convert a [`Child`]'s exit result into a user-facing error message.
 ///
 /// Returns `Ok(())` when the process exited successfully, `Err(msg)` when it
-/// exited nonzero or the wait itself failed.  Both stdout and stderr are
-/// inspectedStreamlink and mpv both log errors across the two streams on
-/// Windows, so relying on stderr alone leaves users with empty messages.
+/// exited nonzero or the wait itself failed. Both output pipes are drained
+/// concurrently, retaining at most 64 KiB each for exit diagnostics.
 ///
 /// Designed to be called from a `spawn_blocking` task because
-/// [`Child::wait_with_output`] blocks the current thread.
-pub fn finalize_exit(child: Child, label: &str) -> Result<(), String> {
-    match child.wait_with_output() {
-        Ok(output) if output.status.success() => Ok(()),
-        Ok(output) => {
-            let code = output
-                .status
+/// [`Child::wait`] blocks the current thread.
+pub fn finalize_exit(mut child: Child, label: &str) -> Result<(), String> {
+    let stdout = child
+        .stdout
+        .take()
+        .map(|pipe| std::thread::spawn(move || read_output_tail(pipe)));
+    let stderr = child
+        .stderr
+        .take()
+        .map(|pipe| std::thread::spawn(move || read_output_tail(pipe)));
+    let status = child.wait();
+    let stdout = finish_output_reader(stdout);
+    let stderr = finish_output_reader(stderr);
+    match status {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => {
+            let code = status
                 .code()
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "signal".to_owned());
-            let stderr_tail = stream_tail(&output.stderr);
-            let stdout_tail = stream_tail(&output.stdout);
+            let stderr_tail = stderr.map(|bytes| stream_tail(&bytes)).unwrap_or_else(|error| error);
+            let stdout_tail = stdout.map(|bytes| stream_tail(&bytes)).unwrap_or_else(|error| error);
             let combined = match (stderr_tail.is_empty(), stdout_tail.is_empty()) {
                 (false, false) => format!("{stderr_tail} | {stdout_tail}"),
                 (false, true) => stderr_tail,
@@ -333,7 +426,7 @@ pub fn finalize_exit(child: Child, label: &str) -> Result<(), String> {
             };
             if combined.is_empty() {
                 Err(format!(
-                    "{label} exited with status {code} (no outputtry running the command manually to see why)"
+                    "{label} exited with status {code} (no output; try running the command manually to see why)"
                 ))
             } else {
                 Err(format!("{label} exited ({code}): {combined}"))
@@ -371,6 +464,120 @@ mod tests {
     #[test]
     fn split_backslash_escape() {
         assert_eq!(split_shell_args(r#"a\ b c"#), vec!["a b", "c"]);
+    }
+
+    #[test]
+    fn split_preserves_windows_and_unc_paths() {
+        assert_eq!(
+            split_shell_args(
+                r#""C:\Program Files\mpv\mpv.exe" --config-dir=C:\Users\viewer\mpv "\\server\share\video file.mp4""#
+            ),
+            vec![
+                r"C:\Program Files\mpv\mpv.exe",
+                r"--config-dir=C:\Users\viewer\mpv",
+                r"\\server\share\video file.mp4",
+            ]
+        );
+        assert_eq!(split_shell_args("C:\\media\\"), vec!["C:\\media\\"]);
+    }
+
+    #[test]
+    fn split_keeps_empty_quoted_arguments_and_escaped_quotes() {
+        assert_eq!(
+            split_shell_args(r#"mpv "" '' --title "a \"quoted\" title""#),
+            vec!["mpv", "", "", "--title", "a \"quoted\" title"]
+        );
+    }
+
+    #[test]
+    fn split_handles_quoted_directories_with_trailing_backslashes() {
+        assert_eq!(
+            split_shell_args(r#"--config-dir "C:\cache\\" --other-dir 'C:\other\' --flag"#),
+            vec!["--config-dir", "C:\\cache\\", "--other-dir", "C:\\other\\", "--flag"]
+        );
+    }
+
+    #[test]
+    fn player_template_expands_paths_as_single_arguments() {
+        let mpv = r"C:\Program Files\mpv\mpv.exe";
+        let streamlink = r"\\server\tools\streamlink.exe";
+        assert_eq!(
+            expand_player_args(
+                r#"{streamlink} --player "{mpv}" {url} {quality} --title "Watching {channel}""#,
+                "rustlang",
+                "best",
+                mpv,
+                streamlink,
+            ),
+            vec![
+                streamlink,
+                "--player",
+                mpv,
+                "twitch.tv/rustlang",
+                "best",
+                "--title",
+                "Watching rustlang",
+            ]
+        );
+    }
+
+    #[test]
+    fn player_template_values_are_not_reparsed_or_expanded_again() {
+        let mpv = "/players/{streamlink}/a \"quoted\" player";
+        assert_eq!(
+            expand_player_args(
+                r#"{mpv} --quality={quality} "{channel}" {unknown} trailing{"#,
+                "channel with spaces",
+                "best --other-flag",
+                mpv,
+                "streamlink",
+            ),
+            vec![
+                mpv,
+                "--quality=best --other-flag",
+                "channel with spaces",
+                "{unknown}",
+                "trailing{",
+            ]
+        );
+    }
+
+    #[test]
+    fn process_output_retains_only_the_bounded_tail() {
+        let mut output = vec![b'x'; OUTPUT_TAIL_BYTES * 8];
+        output.extend_from_slice(b"\nlast output line\n");
+        let tail = read_output_tail(io::Cursor::new(&output)).unwrap();
+        assert_eq!(tail.len(), OUTPUT_TAIL_BYTES);
+        assert_eq!(tail, output[output.len() - OUTPUT_TAIL_BYTES..]);
+        assert!(stream_tail(&tail).ends_with("last output line"));
+    }
+
+    #[test]
+    fn monitor_drains_both_output_streams_and_reports_exit() {
+        const CHILD_FLAG: &str = "CRUST_EXTERNAL_OUTPUT_TEST_CHILD";
+        if std::env::var_os(CHILD_FLAG).is_some() {
+            use std::io::Write;
+            let output = vec![b'x'; OUTPUT_TAIL_BYTES * 8];
+            io::stdout().write_all(&output).unwrap();
+            io::stderr().write_all(&output).unwrap();
+            println!("\nstdout sentinel");
+            eprintln!("\nstderr sentinel");
+            std::process::exit(7);
+        }
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "external::tests::monitor_drains_both_output_streams_and_reports_exit",
+                "--nocapture",
+            ])
+            .env(CHILD_FLAG, "1");
+        let child = spawn_with(&mut command, "process output fixture").unwrap();
+        let error = finalize_exit(child, "fixture").unwrap_err();
+        assert!(error.contains("exited (7)"), "{error}");
+        assert!(error.contains("stdout sentinel"));
+        assert!(error.contains("stderr sentinel"));
+        assert!(error.len() < 2 * OUTPUT_TAIL_BYTES + 100);
     }
 
     #[test]

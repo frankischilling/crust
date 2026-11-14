@@ -1,11 +1,9 @@
-//! Identifier ↔ Value/Type bindings for filter expressions evaluated against
+//! Identifier and value/type bindings for filter expressions evaluated against
 //! Crust's [`ChatMessage`].
 //!
-//! The [`MESSAGE_TYPING_CONTEXT`] static mirrors Chatterino's
-//! `MESSAGE_TYPING_CONTEXT` in `Filter.cpp`. Identifiers that Crust doesn't
-//! currently track (for example `flags.automod`, `reward.*`) are still
-//! declared here so expressions pass the static type check; at runtime they
-//! resolve to sensible defaults (`false`, empty string, `-1`).
+//! [`MESSAGE_TYPING_CONTEXT`] declares the supported identifiers. Metadata
+//! that Crust does not track, such as `flags.automod`, uses the defaults
+//! documented in [`build_message_context`].
 
 use std::collections::HashMap;
 
@@ -145,8 +143,8 @@ pub fn build_message_context(
             | MsgKind::Raid { .. }
     );
     let is_bits = matches!(msg.msg_kind, MsgKind::Bits { .. });
-    let is_reward = matches!(msg.msg_kind, MsgKind::ChannelPointsReward { .. })
-        || f.custom_reward_id.is_some();
+    let is_reward =
+        matches!(msg.msg_kind, MsgKind::ChannelPointsReward { .. }) || f.custom_reward_id.is_some();
     ctx.insert("flags.action".into(), Value::Bool(f.is_action));
     ctx.insert("flags.highlighted".into(), Value::Bool(f.is_highlighted));
     ctx.insert(
@@ -161,14 +159,16 @@ pub fn build_message_context(
     ctx.insert("flags.elevated_message".into(), Value::Bool(f.is_pinned));
     ctx.insert("flags.hype_chat".into(), Value::Bool(f.is_pinned));
     ctx.insert("flags.cheer_message".into(), Value::Bool(is_bits));
-    // Whisper messages in Crust are a separate stream; default to false.
-    ctx.insert("flags.whisper".into(), Value::Bool(false));
+    ctx.insert(
+        "flags.whisper".into(),
+        Value::Bool(msg.channel.as_str().starts_with("whisper:")),
+    );
     ctx.insert("flags.reply".into(), Value::Bool(msg.reply.is_some()));
+    ctx.insert("flags.shared".into(), Value::Bool(msg.shared.is_some()));
     // Not tracked yet in Crust.
     ctx.insert("flags.automod".into(), Value::Bool(false));
     ctx.insert("flags.restricted".into(), Value::Bool(false));
     ctx.insert("flags.monitored".into(), Value::Bool(false));
-    ctx.insert("flags.shared".into(), Value::Bool(false));
     ctx.insert("flags.similar".into(), Value::Bool(false));
     ctx.insert("flags.watch_streak".into(), Value::Bool(false));
     ctx.insert("flags.pinned".into(), Value::Bool(f.is_pinned));
@@ -178,10 +178,7 @@ pub fn build_message_context(
     ctx.insert("flags.deleted".into(), Value::Bool(f.is_deleted));
 
     // -- message.*
-    ctx.insert(
-        "message.content".into(),
-        Value::Str(msg.raw_text.clone()),
-    );
+    ctx.insert("message.content".into(), Value::Str(msg.raw_text.clone()));
     ctx.insert(
         "message.length".into(),
         Value::Int(msg.raw_text.chars().count() as i64),
@@ -222,12 +219,7 @@ pub fn build_message_context(
         ctx.insert("reward.cost".into(), Value::Int(-1));
         ctx.insert(
             "reward.id".into(),
-            Value::Str(
-                msg.flags
-                    .custom_reward_id
-                    .clone()
-                    .unwrap_or_default(),
-            ),
+            Value::Str(msg.flags.custom_reward_id.clone().unwrap_or_default()),
         );
     }
 
@@ -252,6 +244,7 @@ mod tests {
             timestamp: Utc::now(),
             channel: ChannelId("somech".into()),
             sender: Sender {
+                original_display_name: None,
                 user_id: UserId("42".into()),
                 login: login.to_string(),
                 display_name: login.to_string(),
@@ -294,6 +287,30 @@ mod tests {
         let msg = make_message("alice", "gg ez", Vec::new());
         let ctx = build_message_context(&msg, "somech", Some(true), false);
         assert_eq!(evaluate(&expr, &ctx), Value::Bool(false));
+    }
+
+    #[test]
+    fn shared_and_whisper_filters_follow_message_metadata() {
+        let mut msg = make_message("alice", "hello", Vec::new());
+        let shared = parse("flags.shared").unwrap();
+        let whisper = parse("flags.whisper").unwrap();
+        let ctx = build_message_context(&msg, "somech", None, false);
+        assert_eq!(evaluate(&shared, &ctx), Value::Bool(false));
+        assert_eq!(evaluate(&whisper, &ctx), Value::Bool(false));
+
+        msg.shared = Some(crate::model::SharedChatSource {
+            room_id: "123".to_owned(),
+            ..Default::default()
+        });
+        let ctx = build_message_context(&msg, "somech", None, false);
+        assert_eq!(evaluate(&shared, &ctx), Value::Bool(true));
+        assert_eq!(evaluate(&whisper, &ctx), Value::Bool(false));
+
+        msg.shared = None;
+        msg.channel = ChannelId::new("whisper:alice");
+        let ctx = build_message_context(&msg, "alice", None, false);
+        assert_eq!(evaluate(&shared, &ctx), Value::Bool(false));
+        assert_eq!(evaluate(&whisper, &ctx), Value::Bool(true));
     }
 
     #[test]

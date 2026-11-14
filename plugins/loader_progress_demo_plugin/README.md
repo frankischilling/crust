@@ -1,15 +1,12 @@
-# Loader Progress Demo Plugin
+# Loader progress demo
 
-This example focuses on low-level loader notifications and related image/emote events.
-
-It shows:
+Tracks queued and completed image requests through these events:
 
 - `c2.EventType.ImagePrefetchQueued`
 - `c2.EventType.EmoteImageReady`
 - `c2.EventType.EmoteCatalogUpdated`
-- basic Lua-side counters for queued vs completed image work
 
-Try:
+Use `/loadwatch` to inspect the counters, reset them, or request an image:
 
 - `/loadwatch`
 - `/loadwatch reset`

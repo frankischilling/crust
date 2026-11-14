@@ -62,11 +62,11 @@ pub fn icon_button(
         Color32::TRANSPARENT
     };
     let stroke = if state.selected {
-        Stroke::new(1.0, t::border_accent())
+        Stroke::new(1.0_f32, t::border_accent())
     } else if state.danger {
-        Stroke::new(1.0, t::red().gamma_multiply(0.4))
+        Stroke::new(1.0_f32, t::red().gamma_multiply(0.4))
     } else {
-        Stroke::new(1.0, t::border_subtle().gamma_multiply(0.6))
+        Stroke::new(1.0_f32, t::border_subtle().gamma_multiply(0.6))
     };
     ui.painter()
         .rect(rect, t::RADIUS_SM, fill, stroke, egui::StrokeKind::Middle);
@@ -82,7 +82,7 @@ pub fn icon_button(
 pub fn toolbar_group_frame() -> Frame {
     Frame::new()
         .fill(t::bg_header())
-        .stroke(Stroke::new(1.0, t::border_subtle()))
+        .stroke(Stroke::new(1.0_f32, t::border_subtle()))
         .corner_radius(t::RADIUS)
         .inner_margin(Margin::symmetric(6, 3))
 }
@@ -90,7 +90,7 @@ pub fn toolbar_group_frame() -> Frame {
 pub fn card_frame() -> Frame {
     Frame::new()
         .fill(t::bg_card())
-        .stroke(Stroke::new(1.0, t::border_subtle()))
+        .stroke(Stroke::new(1.0_f32, t::border_subtle()))
         .corner_radius(t::RADIUS)
         .inner_margin(t::CARD_MARGIN)
 }
@@ -114,7 +114,7 @@ pub fn dialog_header(ui: &mut Ui, title: &str, subtitle: Option<&str>) {
 pub fn pill(ui: &mut Ui, text: impl AsRef<str>, fg: Color32, bg: Color32) -> Response {
     Frame::new()
         .fill(bg)
-        .stroke(Stroke::new(1.0, fg.gamma_multiply(0.35)))
+        .stroke(Stroke::new(1.0_f32, fg.gamma_multiply(0.35)))
         .corner_radius(t::RADIUS_SM)
         .inner_margin(Margin::symmetric(6, 2))
         .show(ui, |ui| {
@@ -136,7 +136,7 @@ fn paint_icon(ui: &Ui, rect: egui::Rect, icon: ChromeIcon, state: IconButtonStat
     } else {
         t::text_secondary()
     };
-    let stroke = Stroke::new(if state.compact { 1.4 } else { 1.6 }, stroke_color);
+    let stroke = Stroke::new(if state.compact { 1.4_f32 } else { 1.6_f32 }, stroke_color);
     let painter = ui.painter();
     match icon {
         ChromeIcon::Join => {
