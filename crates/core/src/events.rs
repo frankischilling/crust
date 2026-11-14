@@ -690,6 +690,10 @@ pub enum AppEvent {
     ChannelMessagesCleared {
         channel: ChannelId,
     },
+    /// A moderator cleared chat; hide user messages while retaining notices.
+    ChannelChatCleared {
+        channel: ChannelId,
+    },
     /// The logged-in user's avatar URL has been resolved.
     SelfAvatarLoaded {
         avatar_url: String,
@@ -1133,10 +1137,9 @@ pub enum AppEvent {
         channel: ChannelId,
         result: Result<String, String>,
     },
-    /// Hype train lifecycle update from Twitch EventSub.  Emitted for the
-    /// broadcaster's own channel once per EventSub notification (begin,
-    /// progress, end).  The UI renders a live banner from the latest state
-    /// until `phase == "end"` and the banner's configured cooldown elapses.
+    /// Hype train lifecycle update from a live notification or status refresh.
+    /// The UI keeps the latest banner until it is cleared or the end-phase
+    /// cooldown elapses.
     HypeTrainUpdated {
         /// Target channel the hype train belongs to.
         channel: ChannelId,
@@ -1159,6 +1162,13 @@ pub enum AppEvent {
         /// ISO 8601 timestamp the current phase expires (begin/progress) or
         /// the cooldown ends (end).
         ends_at: Option<String>,
+    },
+    /// A successful status refresh found no active hype train.
+    HypeTrainCleared {
+        channel: ChannelId,
+        /// When the status request began. A newer live update must survive
+        /// an older request's empty response.
+        checked_at: std::time::Instant,
     },
     /// A raid arrived for a channel. The UI reduces this into
     /// `AppState.raid_banners` so a prominent banner renders above the chat

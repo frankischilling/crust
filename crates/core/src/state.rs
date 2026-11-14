@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -55,9 +55,8 @@ impl TabVisibilityRule {
 /// long-running sessions.
 pub const MENTIONS_BUFFER_CAP: usize = 2_000;
 
-/// In-flight Twitch hype train state for a single channel. Populated from
-/// EventSub `channel.hype_train.*` notifications so the UI can render a
-/// live banner (see C4 in `CHATTERINO_PARITY_TODO.md`).
+/// Twitch hype train state for a channel's banner. Populated from live
+/// notifications and status refreshes.
 ///
 /// Cleared after the hype train ends and its cooldown elapses.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,21 +269,90 @@ impl AppState {
         }
     }
 
-    /// Redirect a channel (e.g. IRC 470 forward).
-    /// Moves the existing channel state to the new id, preserving messages
-    /// and tab position.
-    pub fn redirect_channel(&mut self, old: &ChannelId, new: &ChannelId) {
-        if let Some(mut ch_state) = self.channels.remove(old) {
-            ch_state.id = new.clone();
-            self.channels.insert(new.clone(), ch_state);
+    /// Redirect a channel, preserving its history and an existing destination's
+    /// metadata. Returns false when the source is missing or already canonical.
+    pub fn redirect_channel(&mut self, old: &ChannelId, new: &ChannelId) -> bool {
+        if old == new {
+            return false;
         }
-        // Update channel order in-place to preserve tab position.
-        if let Some(pos) = self.channel_order.iter().position(|c| c == old) {
-            self.channel_order[pos] = new.clone();
+        let Some(mut source) = self.channels.remove(old) else {
+            return false;
+        };
+        source.id = new.clone();
+        for message in &mut source.messages {
+            message.channel = new.clone();
+        }
+
+        let destination_exists = self.channels.contains_key(new);
+        if let Some(destination) = self.channels.get_mut(new) {
+            let mut ids = HashSet::new();
+            let mut server_ids = HashSet::new();
+            // Destination copies win when both buffers contain the same row.
+            let mut messages: Vec<_> = destination.messages.drain(..)
+                .chain(source.messages)
+                .filter(|message| {
+                    ids.insert(message.id)
+                        && message.server_id.as_ref().filter(|id| !id.is_empty())
+                            .map_or(true, |id| server_ids.insert(id.clone()))
+                })
+                .collect();
+            messages.sort_by_key(|message| (message.timestamp, message.id.0));
+            for mut message in messages {
+                message.channel = new.clone();
+                destination.push_message(message);
+            }
+            destination.chatters.extend(source.chatters);
+            destination.unread_count = destination.unread_count.saturating_add(source.unread_count);
+            destination.unread_mentions = destination.unread_mentions.saturating_add(source.unread_mentions);
+            for (login, entry) in source.low_trust_users {
+                destination.low_trust_users.entry(login).or_insert(entry);
+            }
+        } else {
+            self.channels.insert(new.clone(), source);
+        }
+
+        let mut seen_destination = false;
+        self.channel_order.retain_mut(|channel| {
+            if channel == old {
+                if destination_exists {
+                    return false;
+                }
+                *channel = new.clone();
+            }
+            if channel == new {
+                if seen_destination {
+                    return false;
+                }
+                seen_destination = true;
+            }
+            true
+        });
+        if !seen_destination {
+            self.channel_order.push(new.clone());
         }
         if self.active_channel.as_ref() == Some(old) {
             self.active_channel = Some(new.clone());
         }
+        for message in &mut self.mentions {
+            if &message.channel == old {
+                message.channel = new.clone();
+            }
+        }
+        if let Some(rule) = self.tab_visibility_rules.remove(old) {
+            if !destination_exists {
+                self.tab_visibility_rules.insert(new.clone(), rule);
+            }
+        }
+        if let Some(state) = self.hype_trains.remove(old) {
+            self.hype_trains.entry(new.clone()).or_insert(state);
+        }
+        if let Some(state) = self.raid_banners.remove(old) {
+            self.raid_banners.entry(new.clone()).or_insert(state);
+        }
+        if let Some(state) = self.shared_chat_sessions.remove(old) {
+            self.shared_chat_sessions.entry(new.clone()).or_insert(state);
+        }
+        true
     }
 
     pub fn active_state(&self) -> Option<&ChannelState> {
@@ -305,6 +373,21 @@ impl AppState {
     /// [`Self::expire_stale_hype_trains`] on a timer to drop stale entries.
     pub fn apply_hype_train_update(&mut self, channel: ChannelId, state: HypeTrainState) {
         self.hype_trains.insert(channel, state);
+    }
+
+    /// Clear a banner after an empty status response, preserving any live
+    /// update received after the request started at `checked_at`.
+    pub fn clear_hype_train_if_stale(&mut self, channel: &ChannelId, checked_at: Instant) -> bool {
+        if self
+            .hype_trains
+            .get(channel)
+            .is_some_and(|state| state.updated_at <= checked_at)
+        {
+            self.hype_trains.remove(channel);
+            true
+        } else {
+            false
+        }
     }
 
     /// Evict hype-train entries whose "end" phase has been stale for more
@@ -346,7 +429,9 @@ impl AppState {
 
     /// Fetch the current raid banner for `channel`, if any.
     pub fn raid_banner_for(&self, channel: &ChannelId) -> Option<&RaidBannerState> {
-        self.raid_banners.get(channel).filter(|banner| !banner.dismissed)
+        self.raid_banners
+            .get(channel)
+            .filter(|banner| !banner.dismissed)
     }
 
     /// Replace the live snapshot wholesale and mark loaded. Clears any
@@ -386,6 +471,7 @@ impl AppState {
     /// history (`flags.is_history == true`) are accepted so restart
     /// persistence can backfill the buffer without bumping unread.
     pub fn push_mention(&mut self, msg: ChatMessage, bump_unread: bool) {
+        let bump_unread = bump_unread && !msg.flags.is_history;
         // Dedupe: if we already have this server_id in the buffer (history
         // replay racing a live echo, for example) skip to avoid duplicates.
         if let Some(sid) = msg.server_id.as_deref() {
@@ -443,10 +529,7 @@ impl AppState {
 
     /// Bulk-replace the visibility rule map (used when rehydrating from
     /// persistent settings at startup).
-    pub fn replace_tab_visibility_rules(
-        &mut self,
-        rules: HashMap<ChannelId, TabVisibilityRule>,
-    ) {
+    pub fn replace_tab_visibility_rules(&mut self, rules: HashMap<ChannelId, TabVisibilityRule>) {
         // Drop any `Always` entries callers may have passed in; absence is
         // the canonical representation of the default.
         self.tab_visibility_rules = rules
@@ -478,23 +561,23 @@ impl AppState {
     /// timestamp ascending so restart-loaded rows interleave correctly with
     /// any already-accumulated live rows.
     pub fn prepend_mentions_history(&mut self, mut msgs: Vec<ChatMessage>) {
-        let existing_ids: std::collections::HashSet<&str> = self
+        let mut existing_ids: std::collections::HashSet<String> = self
             .mentions
             .iter()
-            .filter_map(|m| m.server_id.as_deref())
+            .filter_map(|m| m.server_id.clone().filter(|id| !id.is_empty()))
             .collect();
         msgs.retain(|m| {
             m.server_id
                 .as_deref()
-                .map(|id| !existing_ids.contains(id))
+                .filter(|id| !id.is_empty())
+                .map(|id| existing_ids.insert(id.to_owned()))
                 .unwrap_or(true)
         });
         if msgs.is_empty() {
             return;
         }
         let total_cap = (msgs.len() + self.mentions.len()).min(MENTIONS_BUFFER_CAP);
-        let mut merged: Vec<ChatMessage> =
-            Vec::with_capacity(msgs.len() + self.mentions.len());
+        let mut merged: Vec<ChatMessage> = Vec::with_capacity(msgs.len() + self.mentions.len());
         merged.extend(self.mentions.drain(..));
         merged.extend(msgs);
         merged.sort_by_key(|m| m.timestamp);
@@ -710,6 +793,16 @@ mod mentions_state_tests {
     }
 
     #[test]
+    fn historical_mentions_never_increment_unread() {
+        let mut s = AppState::default();
+        let mut msg = mention("history", 1, true);
+        msg.flags.is_history = true;
+        s.push_mention(msg, true);
+        assert_eq!(s.mentions.len(), 1);
+        assert_eq!(s.mentions_unread, 0);
+    }
+
+    #[test]
     fn push_mention_dedupes_by_server_id() {
         let mut s = AppState::default();
         s.push_mention(mention("same", 1, true), true);
@@ -726,7 +819,10 @@ mod mentions_state_tests {
         }
         assert_eq!(s.mentions.len(), MENTIONS_BUFFER_CAP);
         // Oldest must have been evicted.
-        assert_eq!(s.mentions.front().unwrap().server_id.as_deref(), Some("m50"));
+        assert_eq!(
+            s.mentions.front().unwrap().server_id.as_deref(),
+            Some("m50")
+        );
     }
 
     #[test]
@@ -737,6 +833,7 @@ mod mentions_state_tests {
         // History rows: one older, one that duplicates the live one.
         s.prepend_mentions_history(vec![
             mention("older", 50, true),
+            mention("older", 50, true), // Duplicate within this batch.
             mention("live", 100, true), // dup -> must be skipped
             mention("oldest", 10, true),
         ]);
@@ -747,6 +844,185 @@ mod mentions_state_tests {
             .map(|m| m.server_id.as_deref().unwrap())
             .collect();
         assert_eq!(ids, vec!["oldest", "older", "live"]);
+    }
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    use super::*;
+    use crate::model::{MessageFlags, MessageId, MsgKind, Sender, UserId};
+    use chrono::{TimeZone, Utc};
+
+    fn message(channel: &ChannelId, id: u64, body: &str) -> ChatMessage {
+        ChatMessage {
+            id: MessageId(id),
+            server_id: Some(format!("message-{id}")),
+            timestamp: Utc.timestamp_opt(id as i64, 0).unwrap(),
+            channel: channel.clone(),
+            sender: Sender {
+                user_id: UserId("sender".to_owned()),
+                login: "sender".to_owned(),
+                display_name: "Sender".to_owned(),
+                color: None,
+                name_paint: None,
+                badges: Vec::new(),
+            },
+            raw_text: body.to_owned(),
+            spans: Default::default(),
+            twitch_emotes: Vec::new(),
+            flags: MessageFlags::default(),
+            reply: None,
+            msg_kind: MsgKind::Chat,
+            shared: None,
+        }
+    }
+
+    #[test]
+    fn redirect_to_new_channel_preserves_tab_position_and_retargets_history() {
+        let old = ChannelId::irc("irc.example", 6697, true, "old");
+        let new = ChannelId::irc("irc.example", 6697, true, "new");
+        let before = ChannelId::new("before");
+        let after = ChannelId::new("after");
+        let mut state = AppState::default();
+        for channel in [&before, &old, &after] {
+            state.join_channel(channel.clone());
+        }
+        let row = message(&old, 1, "source history");
+        let source = state.channels.get_mut(&old).unwrap();
+        source.topic = Some("existing topic".to_owned());
+        source.push_message(row.clone());
+        state.mentions.push_back(row);
+        state.active_channel = Some(old.clone());
+        state.set_tab_visibility_rule(old.clone(), TabVisibilityRule::HideWhenOffline);
+
+        assert!(state.redirect_channel(&old, &new));
+        assert_eq!(state.channel_order, vec![before, new.clone(), after]);
+        assert_eq!(state.active_channel.as_ref(), Some(&new));
+        assert!(!state.channels.contains_key(&old));
+        let destination = &state.channels[&new];
+        assert_eq!(destination.id, new);
+        assert_eq!(destination.topic.as_deref(), Some("existing topic"));
+        assert_eq!(destination.messages[0].raw_text, "source history");
+        assert_eq!(destination.messages[0].channel, new);
+        assert_eq!(state.mentions[0].channel, new);
+        assert_eq!(state.tab_visibility_rule(&new), TabVisibilityRule::HideWhenOffline);
+    }
+
+    #[test]
+    fn redirect_to_open_channel_merges_history_without_replacing_destination_metadata() {
+        let old = ChannelId::irc("irc.example", 6697, true, "old");
+        let new = ChannelId::irc("irc.example", 6697, true, "new");
+        let middle = ChannelId::new("middle");
+        let mut state = AppState::default();
+        for channel in [&old, &middle, &new] {
+            state.join_channel(channel.clone());
+        }
+        state.channel_order.push(new.clone());
+        state.active_channel = Some(old.clone());
+        state.set_tab_visibility_rule(old.clone(), TabVisibilityRule::HideWhenOffline);
+        let source = state.channels.get_mut(&old).unwrap();
+        source.topic = Some("source topic".to_owned());
+        source.is_mod = true;
+        source.room_state.slow_mode = Some(5);
+        source.chatters.insert("source chatter".to_owned());
+        source.unread_count = 2;
+        source.push_message(message(&old, 1, "source history"));
+        source.push_message(message(&old, 2, "stale copy"));
+        let mut same_server_id = message(&old, 4, "duplicate server row");
+        same_server_id.server_id = Some("message-5".to_owned());
+        source.push_message(same_server_id);
+        let destination = state.channels.get_mut(&new).unwrap();
+        destination.topic = Some("destination topic".to_owned());
+        destination.room_state.slow_mode = Some(17);
+        destination.chatters.insert("destination chatter".to_owned());
+        destination.unread_count = 3;
+        destination.push_message(message(&new, 2, "destination copy"));
+        destination.push_message(message(&new, 3, "destination history"));
+        destination.push_message(message(&new, 5, "canonical server row"));
+        state.mentions.push_back(message(&old, 1, "source mention"));
+
+        assert!(state.redirect_channel(&old, &new));
+        assert_eq!(state.channel_order, vec![middle, new.clone()]);
+        assert_eq!(state.active_channel.as_ref(), Some(&new));
+        let destination = &state.channels[&new];
+        assert_eq!(destination.topic.as_deref(), Some("destination topic"));
+        assert_eq!(destination.room_state.slow_mode, Some(17));
+        assert!(!destination.is_mod);
+        assert_eq!(destination.unread_count, 5);
+        assert_eq!(destination.chatters.len(), 2);
+        assert_eq!(destination.messages.iter().map(|row| row.id.0).collect::<Vec<_>>(), vec![1, 2, 3, 5]);
+        assert!(destination.messages.iter().all(|row| row.channel == new));
+        assert_eq!(destination.messages[1].raw_text, "destination copy");
+        assert_eq!(state.mentions[0].channel, new);
+        assert_eq!(state.tab_visibility_rule(&new), TabVisibilityRule::Always);
+    }
+
+    #[test]
+    fn redirect_is_harmless_for_same_or_missing_source() {
+        let channel = ChannelId::new("existing");
+        let missing = ChannelId::new("missing");
+        let mut state = AppState::default();
+        state.join_channel(channel.clone());
+        state.channels.get_mut(&channel).unwrap().push_message(message(&channel, 1, "keep"));
+        assert!(!state.redirect_channel(&channel, &channel));
+        assert!(!state.redirect_channel(&missing, &channel));
+        assert!(!state.redirect_channel(&missing, &ChannelId::new("unopened")));
+        assert_eq!(state.channel_order, vec![channel.clone()]);
+        assert_eq!(state.channels.len(), 1);
+        assert_eq!(state.channels[&channel].messages[0].raw_text, "keep");
+    }
+}
+
+#[cfg(test)]
+mod hype_train_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn train(updated_at: Instant) -> HypeTrainState {
+        HypeTrainState {
+            phase: "progress".to_owned(),
+            level: 2,
+            progress: 100,
+            goal: 1000,
+            total: 600,
+            top_contributor_login: None,
+            top_contributor_type: None,
+            top_contributor_total: None,
+            ends_at: None,
+            updated_at,
+        }
+    }
+
+    #[test]
+    fn successful_empty_refresh_clears_only_the_requested_stale_banner() {
+        let mut state = AppState::default();
+        let channel = ChannelId::new("alice");
+        let other = ChannelId::new("bob");
+        let updated_at = Instant::now();
+        let checked_at = updated_at + Duration::from_secs(1);
+        state.apply_hype_train_update(channel.clone(), train(updated_at));
+        state.apply_hype_train_update(other.clone(), train(updated_at));
+
+        assert!(state.clear_hype_train_if_stale(&channel, checked_at));
+        assert!(state.hype_train_for(&channel).is_none());
+        assert!(state.hype_train_for(&other).is_some());
+        assert!(!state.clear_hype_train_if_stale(&channel, checked_at));
+
+        state.apply_hype_train_update(channel.clone(), train(checked_at));
+        assert!(state.clear_hype_train_if_stale(&channel, checked_at));
+    }
+
+    #[test]
+    fn empty_refresh_preserves_a_live_update_received_during_the_request() {
+        let mut state = AppState::default();
+        let channel = ChannelId::new("alice");
+        let checked_at = Instant::now();
+        state.apply_hype_train_update(channel.clone(), train(checked_at));
+        let live_update = train(checked_at + Duration::from_secs(1));
+        state.apply_hype_train_update(channel.clone(), live_update.clone());
+
+        assert!(!state.clear_hype_train_if_stale(&channel, checked_at));
+        assert_eq!(state.hype_train_for(&channel), Some(&live_update));
     }
 }
 
@@ -809,14 +1085,15 @@ mod tab_visibility_tests {
         map.insert(ChannelId::new("b"), TabVisibilityRule::Always);
         s.replace_tab_visibility_rules(map);
         assert_eq!(s.tab_visibility_rules.len(), 1);
-        assert!(s
-            .tab_visibility_rules
-            .contains_key(&ChannelId::new("a")));
+        assert!(s.tab_visibility_rules.contains_key(&ChannelId::new("a")));
     }
 
     #[test]
     fn rule_key_roundtrip() {
-        for rule in [TabVisibilityRule::Always, TabVisibilityRule::HideWhenOffline] {
+        for rule in [
+            TabVisibilityRule::Always,
+            TabVisibilityRule::HideWhenOffline,
+        ] {
             assert_eq!(TabVisibilityRule::from_key(rule.as_key()), rule);
         }
         // Unknown keys fall back to Always.

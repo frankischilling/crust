@@ -79,6 +79,13 @@ impl VisibleIndices {
             .map(|i| messages[self.get(i)].id.0)
             .collect()
     }
+
+    fn contains_index(&self, index: usize) -> bool {
+        match self {
+            Self::All(n) => index < *n,
+            Self::Filtered(indices) => indices.binary_search(&index).is_ok(),
+        }
+    }
 }
 
 /// Extra context to locate a reply parent when direct msg-id lookup fails.
@@ -493,7 +500,10 @@ impl<'a> MessageList<'a> {
                     })
                     .collect(),
             ),
-            _ if self.ignored_logins.is_empty() && self.ignored_users.is_empty() => {
+            _ if self.ignored_logins.is_empty()
+                && self.ignored_users.is_empty()
+                && self.filter_records.iter().all(|filter| filter.action != FilterAction::Hide) =>
+            {
                 VisibleIndices::All(self.messages.len())
             }
             _ => VisibleIndices::Filtered(
@@ -544,7 +554,8 @@ impl<'a> MessageList<'a> {
                 snapshot_ids = live_visible_indices.collect_ids(self.messages);
             }
             let live_ids: Vec<u64> = self.messages.iter().map(|m| m.id.0).collect();
-            let mapped = map_snapshot_ids_to_indices(&snapshot_ids, &live_ids);
+            let mut mapped = map_snapshot_ids_to_indices(&snapshot_ids, &live_ids);
+            mapped.retain(|&idx| live_visible_indices.contains_index(idx));
             let persisted_ids: Vec<u64> = mapped.iter().map(|&idx| live_ids[idx]).collect();
             ui.ctx()
                 .data_mut(|d| d.insert_temp(paused_snapshot_key, persisted_ids));
@@ -1264,7 +1275,7 @@ impl<'a> MessageList<'a> {
         ui.painter().rect_stroke(
             rect,
             egui::CornerRadius::same(6),
-            egui::Stroke::new(1.0, stroke),
+            egui::Stroke::new(1.0_f32, stroke),
             egui::epaint::StrokeKind::Outside,
         );
         ui.painter().text(
@@ -1993,7 +2004,7 @@ impl<'a> MessageList<'a> {
             painter.rect_stroke(
                 btn_rect,
                 8.0,
-                egui::Stroke::new(1.0, t::accent()),
+                egui::Stroke::new(1.0_f32, t::accent()),
                 egui::epaint::StrokeKind::Outside,
             );
             // Button label
@@ -2250,48 +2261,19 @@ impl<'a> MessageList<'a> {
                             render_shared_chat_chip(ui, shared, self.emote_bytes);
                         }
 
-                        // Badges: image if loaded, else text fallback. For
-                        // Shared Chat mirrors we also append the source
-                        // channel's mod/vip badges with a "(from <source>)"
-                        // tooltip suffix (matches Chatterino
-                        // `appendSharedChatBadges`).
+                        // Shared messages append distinct source moderator/VIP badges.
                         let shared_badge_tooltip_suffix =
                             msg.shared.as_ref().and_then(|s| {
                                 s.display_name
-                                    .clone()
-                                    .or_else(|| s.login.clone())
+                                    .as_deref()
                                     .filter(|v| !v.is_empty())
+                                    .or_else(|| s.login.as_deref().filter(|v| !v.is_empty()))
                             });
-                        let own_badge_keys: std::collections::HashSet<(String, String)> = msg
-                            .sender
-                            .badges
-                            .iter()
-                            .map(|b| (b.name.clone(), b.version.clone()))
-                            .collect();
-                        let extra_shared_badges: Vec<_> = msg
-                            .shared
-                            .as_ref()
-                            .map(|s| {
-                                s.badges
-                                    .iter()
-                                    .filter(|b| {
-                                        (b.name == "moderator" || b.name == "vip")
-                                            && !own_badge_keys
-                                                .contains(&(b.name.clone(), b.version.clone()))
-                                    })
-                                    .cloned()
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        for badge in msg.sender.badges.iter().chain(extra_shared_badges.iter()) {
+                        for (badge, from_source) in message_badges(msg) {
                             let mut tooltip_label =
                                 pretty_badge_name(&badge.name, &badge.version);
-                            if extra_shared_badges
-                                .iter()
-                                .any(|b| std::ptr::eq(b, badge) || (b.name == badge.name && b.version == badge.version))
-                                && (badge.name == "moderator" || badge.name == "vip")
-                            {
-                                if let Some(src) = &shared_badge_tooltip_suffix {
+                            if from_source {
+                                if let Some(src) = shared_badge_tooltip_suffix {
                                     tooltip_label = format!("{tooltip_label} ({src})");
                                 }
                             }
@@ -2396,7 +2378,7 @@ impl<'a> MessageList<'a> {
                             let chip_stroke = t::alpha(t::accent_dim(), 200);
                             let chip = egui::Frame::new()
                                 .fill(chip_bg)
-                                .stroke(egui::Stroke::new(1.0, chip_stroke))
+                                .stroke(egui::Stroke::new(1.0_f32, chip_stroke))
                                 .corner_radius(egui::CornerRadius::same(3))
                                 .inner_margin(egui::Margin::symmetric(5, 1))
                                 .show(ui, |ui| {
@@ -2646,25 +2628,29 @@ impl<'a> MessageList<'a> {
                 (t::raid_cyan(), Some(text))
             }
             MsgKind::Timeout { login, seconds } => {
-                let dur = if *seconds < 60 {
-                    format!("{seconds}s")
-                } else if *seconds < 3600 {
-                    format!("{}m", seconds / 60)
+                let text = if let Some(text) = moderation_notice_text(msg) {
+                    text.to_owned()
                 } else {
-                    format!("{}h {}m", seconds / 3600, (seconds % 3600) / 60)
+                    let dur = if *seconds < 60 {
+                        format!("{seconds}s")
+                    } else if *seconds < 3600 {
+                        format!("{}m", seconds / 60)
+                    } else {
+                        format!("{}h {}m", seconds / 3600, (seconds % 3600) / 60)
+                    };
+                    format!("⏱  {login} was timed out for {dur}.")
                 };
-                (
-                    t::yellow(),
-                    Some(format!("⏱  {login} was timed out for {dur}.")),
-                )
+                (t::yellow(), Some(text))
             }
             MsgKind::Ban { login } => (
                 t::red(),
-                Some(format!("🚫  {login} was permanently banned.")),
+                Some(moderation_notice_text(msg).map(str::to_owned)
+                    .unwrap_or_else(|| format!("🚫  {login} was permanently banned."))),
             ),
             MsgKind::ChatCleared => (
                 t::text_secondary(),
-                Some("🗑  Chat was cleared by a moderator.".to_owned()),
+                Some(moderation_notice_text(msg).map(str::to_owned)
+                    .unwrap_or_else(|| "🗑  Chat was cleared by a moderator.".to_owned())),
             ),
             MsgKind::SystemInfo => {
                 let (color, text) = style_system_info_text(&msg.raw_text);
@@ -3262,7 +3248,7 @@ impl<'a> MessageList<'a> {
                                     };
                                     let response = egui::Frame::new()
                                         .fill(bg_color)
-                                        .stroke(egui::Stroke::new(1.0, stroke_color))
+                                        .stroke(egui::Stroke::new(1.0_f32, stroke_color))
                                         .corner_radius(egui::CornerRadius::same(2))
                                         .inner_margin(egui::Margin::symmetric(1, 0))
                                         .show(ui, |ui| {
@@ -4297,6 +4283,26 @@ fn pretty_badge_name(name: &str, version: &str) -> String {
 /// `MessageElementFlag::BadgeSharedChannel` + `makeSharedChatBadge`):
 /// source-channel profile picture at ~18x18 when resolved, else a text
 /// fallback chip with the channel login.
+fn moderation_notice_text(msg: &ChatMessage) -> Option<&str> {
+    if msg.server_id.as_deref().is_some_and(|id| id.starts_with("eventsub:moderation:")) {
+        let text = msg.raw_text.trim();
+        (!text.is_empty()).then_some(text)
+    } else {
+        None
+    }
+}
+
+fn message_badges(msg: &ChatMessage) -> impl Iterator<Item = (&Badge, bool)> {
+    let source_badges = msg.shared.iter().flat_map(|source| source.badges.iter()).filter(move |badge| {
+        (badge.name == "moderator" || badge.name == "vip")
+            && !msg.sender.badges.iter().any(|own| {
+                own.name == badge.name && own.version == badge.version
+            })
+    });
+    msg.sender.badges.iter().map(|badge| (badge, false))
+        .chain(source_badges.map(|badge| (badge, true)))
+}
+
 fn render_shared_chat_chip(
     ui: &mut Ui,
     shared: &crust_core::model::SharedChatSource,
@@ -4377,7 +4383,7 @@ fn render_shared_chat_chip(
     };
     let response = egui::Frame::new()
         .fill(bg)
-        .stroke(egui::Stroke::new(1.0, stroke))
+        .stroke(egui::Stroke::new(1.0_f32, stroke))
         .corner_radius(egui::CornerRadius::same(4))
         .inner_margin(egui::Margin::symmetric(3, 1))
         .show(ui, |ui| {
@@ -4423,7 +4429,7 @@ fn render_low_trust_chip(ui: &mut Ui, status: LowTrustStatus) {
     };
     let response = egui::Frame::new()
         .fill(bg)
-        .stroke(egui::Stroke::new(1.0, stroke))
+        .stroke(egui::Stroke::new(1.0_f32, stroke))
         .corner_radius(egui::CornerRadius::same(4))
         .inner_margin(egui::Margin::symmetric(3, 1))
         .show(ui, |ui| {
@@ -4447,7 +4453,7 @@ fn render_badge_fallback(ui: &mut Ui, name: &str, version: &str, tooltip: &str) 
     };
     let response = egui::Frame::new()
         .fill(bg)
-        .stroke(egui::Stroke::new(1.0, stroke))
+        .stroke(egui::Stroke::new(1.0_f32, stroke))
         .corner_radius(egui::CornerRadius::same(4))
         .inner_margin(egui::Margin::symmetric(3, 1))
         .show(ui, |ui| {
@@ -4990,6 +4996,107 @@ mod tests {
             msg_kind: MsgKind::Chat,
             shared: None,
         }
+    }
+
+    fn render_test_messages(
+        ctx: &egui::Context,
+        messages: &VecDeque<ChatMessage>,
+        filters: &[crust_core::model::filters::CompiledFilter],
+    ) -> MessageListPerfStats {
+        let channel = ChannelId::new("rustlang");
+        let images = HashMap::new();
+        let previews = HashMap::new();
+        let ignored_logins = HashSet::new();
+        let ignored_users = crust_core::ignores::CompiledIgnoredUsers::new(&[]);
+        let low_trust = HashMap::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let list = MessageList::new(
+            messages, &images, &tx, &channel, &previews, None,
+            false, 3, false, false, false, true, false,
+            &ignored_logins, &ignored_users, &[], filters, &[], &low_trust,
+        );
+        let mut stats = MessageListPerfStats::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO, egui::vec2(500.0, 400.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    stats = list.show(ui).perf_stats;
+                });
+            },
+        );
+        stats
+    }
+
+    #[test]
+    fn eventsub_moderation_text_keeps_moderator_and_reason() {
+        let mut message = test_msg("system", "", None);
+        message.msg_kind = MsgKind::Timeout { login: "sender".to_owned(), seconds: 60 };
+        message.raw_text = "Moderator timed out sender for 1m: spam".to_owned();
+        assert!(moderation_notice_text(&message).is_none());
+        message.server_id = Some("eventsub:moderation:event-id".to_owned());
+        assert_eq!(moderation_notice_text(&message), Some("Moderator timed out sender for 1m: spam"));
+        message.raw_text = "  ".to_owned();
+        assert!(moderation_notice_text(&message).is_none());
+    }
+
+    #[test]
+    fn shared_badges_keep_own_order_and_append_only_distinct_source_roles() {
+        let badge = |name: &str| Badge {
+            name: name.to_owned(),
+            version: "1".to_owned(),
+            url: None,
+        };
+        let mut message = test_msg("sender", "1", None);
+        message.sender.badges = vec![badge("subscriber"), badge("moderator")];
+        message.shared = Some(crust_core::model::SharedChatSource {
+            badges: vec![badge("subscriber"), badge("moderator"), badge("vip")],
+            ..Default::default()
+        });
+        let badges: Vec<_> = message_badges(&message)
+            .map(|(badge, source)| (badge.name.as_str(), source))
+            .collect();
+        assert_eq!(badges, vec![("subscriber", false), ("moderator", false), ("vip", true)]);
+    }
+
+    #[test]
+    fn hide_filters_apply_without_search_or_ignored_users_and_while_paused() {
+        use crust_core::model::filters::{compile_filters, FilterRecord, FilterScope};
+
+        let mut hidden = test_msg("sender", "1", None);
+        hidden.raw_text = "hide this message".to_owned();
+        let mut kept = test_msg("sender", "1", None);
+        kept.id = MessageId(2);
+        let messages = VecDeque::from([hidden, kept]);
+        let filters = compile_filters(&[FilterRecord::new("hidden", "hide", FilterScope::Global)]);
+
+        for paused in [false, true] {
+            let ctx = egui::Context::default();
+            assert_eq!(render_test_messages(&ctx, &messages, &[]).retained_rows, 2);
+            if paused {
+                ctx.data_mut(|d| {
+                    d.insert_temp(Id::new("scroll_paused").with("rustlang"), true);
+                    d.insert_temp(Id::new("paused_snapshot_ids").with("rustlang"), vec![1_u64, 2]);
+                });
+            }
+            assert_eq!(render_test_messages(&ctx, &messages, &filters).retained_rows, 1);
+        }
+    }
+
+    #[test]
+    fn dim_filter_keeps_matching_messages_visible() {
+        use crust_core::model::filters::{compile_filters, FilterRecord, FilterScope};
+
+        let messages = VecDeque::from([test_msg("sender", "1", None)]);
+        let mut filter = FilterRecord::new("dimmed", "hello", FilterScope::Global);
+        filter.action = FilterAction::Dim;
+        let filters = compile_filters(&[filter]);
+        let ctx = egui::Context::default();
+        assert_eq!(render_test_messages(&ctx, &messages, &filters).retained_rows, 1);
     }
 
     #[test]

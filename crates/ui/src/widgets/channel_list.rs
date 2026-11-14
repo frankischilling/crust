@@ -215,11 +215,8 @@ impl<'a> ChannelList<'a> {
                             row_rect.right_center() - egui::vec2(6.0 + badge_w * 0.5, 0.0),
                             egui::vec2(badge_w, badge_h),
                         );
-                        ui.painter().rect_filled(
-                            badge_rect,
-                            t::RADIUS_SM,
-                            t::mention_pill_bg(),
-                        );
+                        ui.painter()
+                            .rect_filled(badge_rect, t::RADIUS_SM, t::mention_pill_bg());
                         ui.painter().text(
                             badge_rect.center(),
                             egui::Align2::CENTER_CENTER,
@@ -262,7 +259,7 @@ impl<'a> ChannelList<'a> {
                             let y = ui.cursor().min.y - t::CHANNEL_ROW_GAP * 0.5;
                             let x_range = ui.max_rect().x_range();
                             ui.painter()
-                                .hline(x_range, y, egui::Stroke::new(2.0, t::accent()));
+                                .hline(x_range, y, egui::Stroke::new(2.0_f32, t::accent()));
                         }
                     }
 
@@ -521,7 +518,47 @@ impl<'a> ChannelList<'a> {
                                         .color(t::text_secondary())
                                 };
 
-                                let label_resp = ui.add(
+                                let badge = if unread_mentions > 0 {
+                                    Some((unread_mentions, true))
+                                } else if unread_count > 0 {
+                                    Some((unread_count, false))
+                                } else {
+                                    None
+                                };
+                                let badge_label = badge.map(|(count, _)| {
+                                    if count > 99 {
+                                        "99+".to_owned()
+                                    } else {
+                                        count.to_string()
+                                    }
+                                });
+                                let close_size = t::icon_btn_sm();
+                                let mut trailing_width = if self.show_close_button {
+                                    close_size + ui.spacing().item_spacing.x
+                                } else {
+                                    0.0
+                                };
+                                if let Some(label) = &badge_label {
+                                    let mention = badge.is_some_and(|(_, mention)| mention);
+                                    trailing_width += ui
+                                        .painter()
+                                        .layout_no_wrap(
+                                            label.clone(),
+                                            if mention { t::tiny() } else { t::small() },
+                                            t::text_secondary(),
+                                        )
+                                        .size()
+                                        .x
+                                        + if mention { 10.0 } else { 0.0 }
+                                        + ui.spacing().item_spacing.x;
+                                }
+                                let label_resp = ui.add_sized(
+                                    [
+                                        (ui.available_width()
+                                            - trailing_width.max(ui.spacing().item_spacing.x))
+                                        .max(0.0),
+                                        t::body().size,
+                                    ],
                                     egui::Label::new(name_text)
                                         .sense(egui::Sense::click())
                                         .truncate(),
@@ -533,6 +570,23 @@ impl<'a> ChannelList<'a> {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
+                                        if self.show_close_button {
+                                            let close = ui
+                                                .add_visible(
+                                                    is_hovered || is_active,
+                                                    egui::Button::new(
+                                                        RichText::new("✕")
+                                                            .font(t::small())
+                                                            .color(t::text_secondary()),
+                                                    )
+                                                    .frame(false)
+                                                    .min_size(egui::vec2(close_size, close_size)),
+                                                )
+                                                .on_hover_text("Close channel");
+                                            if close.clicked() {
+                                                result.closed = Some(ch.clone());
+                                            }
+                                        }
                                         if unread_mentions > 0 {
                                             // Mentions / highlights badge - semantic warning pill.
                                             let label = if unread_mentions > 99 {
@@ -564,30 +618,6 @@ impl<'a> ChannelList<'a> {
                                                     .font(t::small())
                                                     .color(t::text_secondary()),
                                             );
-                                        } else {
-                                            let show_close =
-                                                self.show_close_button && (is_hovered || is_active);
-                                            let close = ui.add_visible(
-                                                show_close,
-                                                egui::Label::new(
-                                                    RichText::new("✕").font(t::small()).color(
-                                                        if is_hovered {
-                                                            t::text_secondary()
-                                                        } else {
-                                                            t::text_muted()
-                                                        },
-                                                    ),
-                                                )
-                                                .sense(egui::Sense::click()),
-                                            );
-                                            if close.clicked() {
-                                                result.closed = Some(ch.clone());
-                                            }
-                                            if close.hovered() {
-                                                ui.ctx().set_cursor_icon(
-                                                    egui::CursorIcon::PointingHand,
-                                                );
-                                            }
                                         }
                                     },
                                 );
@@ -657,7 +687,7 @@ impl<'a> ChannelList<'a> {
                         let y = ui.cursor().min.y - t::CHANNEL_ROW_GAP * 0.5;
                         let x_range = ui.max_rect().x_range();
                         ui.painter()
-                            .hline(x_range, y, egui::Stroke::new(2.0, t::accent()));
+                            .hline(x_range, y, egui::Stroke::new(2.0_f32, t::accent()));
                     }
                     // Signal to the app that a drop-zone overlay should be shown.
                     result.dragging_outside = ds.outside_sidebar;
@@ -665,5 +695,93 @@ impl<'a> ChannelList<'a> {
             });
 
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sidebar_frame(
+        ctx: &egui::Context,
+        unread_mentions: u32,
+        events: Vec<egui::Event>,
+    ) -> (ChannelListResult, egui::Pos2) {
+        let channel = ChannelId::new("a_channel_name_far_longer_than_the_sidebar");
+        let channels = vec![channel.clone()];
+        let mut state = ChannelState::new(channel.clone());
+        state.unread_count = 25;
+        state.unread_mentions = unread_mentions;
+        let states = HashMap::from([(channel.clone(), state)]);
+        let rules = HashMap::new();
+        let mut list = ChannelList {
+            channels: &channels,
+            active: Some(&channel),
+            channel_states: &states,
+            live_channels: None,
+            show_live_indicator: false,
+            show_close_button: true,
+            show_live_feed_pin: false,
+            live_feed_count: 0,
+            show_mentions_pin: false,
+            mentions_total: 0,
+            mentions_unread: 0,
+            tab_visibility_rules: &rules,
+        };
+        let mut result = None;
+        let mut close_center = egui::Pos2::ZERO;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(210.0, 200.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let area = ui.available_rect_before_wrap();
+                    close_center = egui::pos2(
+                        area.right() - 8.0 - t::icon_btn_sm() / 2.0,
+                        area.top() + 5.0 + t::icon_btn_sm().max(ui.spacing().interact_size.y) / 2.0,
+                    );
+                    result = Some(list.show(ui));
+                });
+            },
+        );
+        (result.unwrap(), close_center)
+    }
+
+    #[test]
+    fn long_channel_name_and_unread_badge_leave_close_button_reachable() {
+        for mentions in [0, 3, 100] {
+            let ctx = egui::Context::default();
+            let (_, pos) = sidebar_frame(&ctx, mentions, Vec::new());
+            sidebar_frame(
+                &ctx,
+                mentions,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            let (result, _) = sidebar_frame(
+                &ctx,
+                mentions,
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            assert!(result.closed.is_some(), "Close was not clickable with {mentions} mentions");
+        }
     }
 }

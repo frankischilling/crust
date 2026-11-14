@@ -172,7 +172,7 @@ impl LoginDialog {
                     }
 
                     ui.label(
-                        RichText::new("Get a token at twitchtokengenerator.com  (chat:edit + chat:read; for the Live feed add user:read:follows; for whispers add user:manage:whispers; for polls/points also add channel:manage:polls and channel:manage:redemptions)")
+                        RichText::new("Get a token at twitchtokengenerator.com (chat:edit + chat:read). For the Live feed, add user:read:follows; for whispers, user:manage:whispers; for polls and points, channel:manage:polls and channel:manage:redemptions; for Hype Trains on your channel, channel:read:hype_train.")
                             .font(t::small())
                             .color(t::text_muted()),
                     );
@@ -300,7 +300,7 @@ fn draw_account_row(
                 ui.painter()
                     .circle_filled(center, avatar_r, t::accent_dim());
                 ui.painter()
-                    .circle_stroke(center, avatar_r, egui::Stroke::new(1.5, t::accent()));
+                    .circle_stroke(center, avatar_r, egui::Stroke::new(1.5_f32, t::accent()));
                 ui.painter().text(
                     center,
                     egui::Align2::CENTER_CENTER,
@@ -357,7 +357,7 @@ fn draw_account_row(
                     [56.0, t::bar_h()],
                     egui::Button::new(RichText::new("Remove").font(t::small()).color(t::red()))
                         .fill(t::red().gamma_multiply(0.08))
-                        .stroke(egui::Stroke::new(1.0, t::red().gamma_multiply(0.3))),
+                        .stroke(egui::Stroke::new(1.0_f32, t::red().gamma_multiply(0.3))),
                 )
                 .on_hover_text(format!("Remove {acc_name} from saved accounts"))
                 .clicked()

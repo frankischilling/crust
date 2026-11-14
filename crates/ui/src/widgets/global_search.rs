@@ -216,7 +216,7 @@ pub fn show_global_search_window(
                         Frame::window(&child_ctx.style())
                             .fill(t::bg_dialog())
                             .corner_radius(t::RADIUS)
-                            .stroke(Stroke::new(1.0, t::border_accent())),
+                            .stroke(Stroke::new(1.0_f32, t::border_accent())),
                     )
                     .open(&mut open)
                     .show(child_ctx, |ui| {
@@ -229,7 +229,7 @@ pub fn show_global_search_window(
                     .frame(
                         chrome::card_frame()
                             .fill(t::bg_dialog())
-                            .stroke(Stroke::new(1.0, t::border_subtle()))
+                            .stroke(Stroke::new(1.0_f32, t::border_subtle()))
                             .inner_margin(egui::Margin::same(12)),
                     )
                     .show(child_ctx, |ui| {
@@ -519,7 +519,7 @@ fn stat_pill(ui: &mut Ui, text: String) {
         .fill(t::bg_surface())
         .corner_radius(t::RADIUS_SM)
         .inner_margin(egui::Margin::symmetric(6, 3))
-        .stroke(Stroke::new(1.0, t::border_accent()))
+        .stroke(Stroke::new(1.0_f32, t::border_accent()))
         .show(ui, |ui| {
             ui.label(
                 RichText::new(text)

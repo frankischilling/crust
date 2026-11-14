@@ -11,6 +11,11 @@ pub struct RoomState {
 }
 
 const MAX_MESSAGES: usize = 1500;
+const MODERATION_DEDUP_ROWS: usize = 20;
+const MODERATION_DEDUP_MILLIS: u64 = 5000;
+
+pub const IRC_MODERATION_ID_PREFIX: &str = "irc:moderation:";
+pub const EVENTSUB_MODERATION_ID_PREFIX: &str = "eventsub:moderation:";
 
 /// Twitch low-trust / suspicious-user treatment for a single user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -51,6 +56,7 @@ pub struct ChannelState {
     /// the UI to render MONITORED / RESTRICTED chips on message rows
     /// and to populate the moderation tools "Low Trust" tab.
     pub low_trust_users: std::collections::HashMap<String, LowTrustEntry>,
+    paired_moderation_notices: std::collections::VecDeque<super::MessageId>,
 }
 
 impl ChannelState {
@@ -65,6 +71,7 @@ impl ChannelState {
             is_mod: false,
             topic: None,
             low_trust_users: std::collections::HashMap::new(),
+            paired_moderation_notices: std::collections::VecDeque::new(),
         }
     }
 
@@ -112,6 +119,52 @@ impl ChannelState {
             self.messages.pop_front();
         }
         self.messages.push_back(msg);
+    }
+
+    /// Merge paired IRC and EventSub notices, retaining EventSub's details.
+    /// Each notice can pair once so repeated actions remain separate rows.
+    pub fn absorb_moderation_notice(&mut self, msg: &super::ChatMessage) -> bool {
+        let Some(incoming_eventsub) = moderation_notice_origin(msg) else {
+            return false;
+        };
+        if msg.channel != self.id {
+            return false;
+        }
+        let matched = self
+            .messages
+            .iter()
+            .enumerate()
+            .rev()
+            .take(MODERATION_DEDUP_ROWS)
+            .find_map(|(index, existing)| {
+                let existing_eventsub = moderation_notice_origin(existing)?;
+                if incoming_eventsub == existing_eventsub
+                    || self.paired_moderation_notices.contains(&existing.id)
+                    || existing.channel != msg.channel
+                    || (msg.timestamp - existing.timestamp)
+                        .num_milliseconds()
+                        .unsigned_abs()
+                        > MODERATION_DEDUP_MILLIS
+                    || !same_moderation_action(&existing.msg_kind, &msg.msg_kind)
+                {
+                    return None;
+                }
+                Some(index)
+            });
+        let Some(index) = matched else {
+            return false;
+        };
+        let existing = &mut self.messages[index];
+        let id = existing.id;
+        if incoming_eventsub {
+            *existing = msg.clone();
+            existing.id = id;
+        }
+        if self.paired_moderation_notices.len() >= MODERATION_DEDUP_ROWS {
+            self.paired_moderation_notices.pop_front();
+        }
+        self.paired_moderation_notices.push_back(id);
+        true
     }
 
     /// Try to absorb a Twitch echo of one of our own sent messages.
@@ -181,11 +234,29 @@ impl ChannelState {
     /// Mark every non-deleted message from `login` as deleted (timeout/ban).
     pub fn delete_messages_from(&mut self, login: &str) {
         for m in &mut self.messages {
-            if m.msg_kind == super::MsgKind::Chat
-                && m.sender.login.eq_ignore_ascii_case(login)
+            if matches!(
+                m.msg_kind,
+                super::MsgKind::Chat
+                    | super::MsgKind::Bits { .. }
+                    | super::MsgKind::SuspiciousUserMessage
+            ) && m.sender.login.eq_ignore_ascii_case(login)
                 && !m.flags.is_deleted
             {
                 m.flags.is_deleted = true;
+            }
+        }
+    }
+
+    /// Mark chat messages deleted without removing notices or scroll context.
+    pub fn delete_all_chat_messages(&mut self) {
+        for message in &mut self.messages {
+            if matches!(
+                message.msg_kind,
+                super::MsgKind::Chat
+                    | super::MsgKind::Bits { .. }
+                    | super::MsgKind::SuspiciousUserMessage
+            ) {
+                message.flags.is_deleted = true;
             }
         }
     }
@@ -262,25 +333,20 @@ impl ChannelState {
         false
     }
 
-    /// Prepend historical messages (e.g. from recent-messages API or local
-    /// SQLite log) to the buffer. Duplicates (matched by `server_id`) are
-    /// skipped. After the merge the buffer is sorted by timestamp ascending
-    /// so two independent history sources (e.g. local DB + robotty) can
-    /// arrive in any order and still interleave chronologicallyavoiding
-    /// the bug where a later-arriving batch of newer messages ended up at
-    /// the very top of the chat. Live messages (pushed via `push_message`
-    /// with timestamps >= history) naturally sort to the end.
+    /// Merge history in timestamp order, skipping repeated server IDs both
+    /// within the incoming batch and against the current buffer.
     pub fn prepend_history(&mut self, mut msgs: Vec<super::ChatMessage>) {
         // Drop duplicates by server_id against what's already in the buffer.
-        let existing_ids: std::collections::HashSet<&str> = self
+        let mut existing_ids: std::collections::HashSet<String> = self
             .messages
             .iter()
-            .filter_map(|m| m.server_id.as_deref())
+            .filter_map(|m| m.server_id.clone().filter(|id| !id.is_empty()))
             .collect();
         msgs.retain(|m| {
             m.server_id
                 .as_deref()
-                .map(|id| !existing_ids.contains(id))
+                .filter(|id| !id.is_empty())
+                .map(|id| existing_ids.insert(id.to_owned()))
                 .unwrap_or(true)
         });
         if msgs.is_empty() {
@@ -296,7 +362,7 @@ impl ChannelState {
         merged.extend(msgs);
         merged.sort_by_key(|m| m.timestamp);
 
-        // Enforce capdrop oldest.
+        // Keep the most recent messages when the merged buffer exceeds its cap.
         if merged.len() > MAX_MESSAGES {
             let excess = merged.len() - MAX_MESSAGES;
             merged.drain(0..excess);
@@ -305,6 +371,52 @@ impl ChannelState {
         let mut new_deque = std::collections::VecDeque::with_capacity(total_cap);
         new_deque.extend(merged);
         self.messages = new_deque;
+    }
+}
+
+fn moderation_notice_origin(msg: &super::ChatMessage) -> Option<bool> {
+    if msg.flags.is_history
+        || !matches!(
+            msg.msg_kind,
+            super::MsgKind::Timeout { .. }
+                | super::MsgKind::Ban { .. }
+                | super::MsgKind::ChatCleared
+        )
+    {
+        return None;
+    }
+    let id = msg.server_id.as_deref()?;
+    if id.starts_with(EVENTSUB_MODERATION_ID_PREFIX) {
+        Some(true)
+    } else if id.starts_with(IRC_MODERATION_ID_PREFIX) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn same_moderation_action(left: &super::MsgKind, right: &super::MsgKind) -> bool {
+    match (left, right) {
+        (
+            super::MsgKind::Timeout {
+                login: left,
+                seconds: left_seconds,
+            },
+            super::MsgKind::Timeout {
+                login: right,
+                seconds: right_seconds,
+            },
+        ) => {
+            left.eq_ignore_ascii_case(right)
+                && (*left_seconds == 0
+                    || *right_seconds == 0
+                    || left_seconds.abs_diff(*right_seconds) <= 2)
+        }
+        (super::MsgKind::Ban { login: left }, super::MsgKind::Ban { login: right }) => {
+            left.eq_ignore_ascii_case(right)
+        }
+        (super::MsgKind::ChatCleared, super::MsgKind::ChatCleared) => true,
+        _ => false,
     }
 }
 
@@ -326,7 +438,10 @@ mod tests {
         assert_eq!(alice.status, LowTrustStatus::Restricted);
         let bob = ch.low_trust_users.get("bob").expect("bob tracked");
         assert_eq!(bob.status, LowTrustStatus::Monitored);
-        assert_eq!(ch.low_trust_status("Alice"), Some(LowTrustStatus::Restricted));
+        assert_eq!(
+            ch.low_trust_status("Alice"),
+            Some(LowTrustStatus::Restricted)
+        );
         ch.clear_low_trust("alice");
         assert!(ch.low_trust_status("Alice").is_none());
         assert!(ch.low_trust_status("bob").is_some());
@@ -337,6 +452,247 @@ mod tests {
         let mut ch = ChannelState::new(super::super::ChannelId::new("rustlang"));
         ch.set_low_trust("   ", "99", "ghost", LowTrustStatus::Monitored);
         assert!(ch.low_trust_users.is_empty());
+    }
+
+    #[test]
+    fn history_deduplicates_within_batch_and_preserves_live_rows() {
+        let mut room = ChannelState::new(super::super::ChannelId::new("rustlang"));
+        let mut live = test_hype_message("train", "begin", 1, 0, 1);
+        live.server_id = Some("live".to_owned());
+        live.timestamp = Utc.timestamp_opt(30, 0).unwrap();
+        room.push_message(live.clone());
+
+        let mut older = live.clone();
+        older.server_id = Some("older".to_owned());
+        older.timestamp = Utc.timestamp_opt(10, 0).unwrap();
+        older.flags.is_history = true;
+        let mut duplicate_live = live.clone();
+        duplicate_live.raw_text = "replayed live row".to_owned();
+        duplicate_live.flags.is_history = true;
+        let mut without_id = older.clone();
+        without_id.server_id = None;
+        room.prepend_history(vec![
+            older.clone(),
+            older,
+            duplicate_live,
+            without_id.clone(),
+            without_id,
+        ]);
+
+        assert_eq!(room.messages.len(), 4);
+        assert_eq!(
+            room.messages
+                .iter()
+                .filter(|m| m.server_id.as_deref() == Some("older"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            room.messages
+                .iter()
+                .filter(|m| m.server_id.is_none())
+                .count(),
+            2
+        );
+        assert_eq!(room.messages.back().unwrap().raw_text, live.raw_text);
+        assert!(!room.messages.back().unwrap().flags.is_history);
+    }
+
+    #[test]
+    fn user_clear_deletes_chat_bits_and_suspicious_messages_only() {
+        let mut room = ChannelState::new(super::super::ChannelId::new("rustlang"));
+        for kind in [
+            super::super::MsgKind::Chat,
+            super::super::MsgKind::Bits { amount: 100 },
+            super::super::MsgKind::SuspiciousUserMessage,
+            super::super::MsgKind::SystemInfo,
+        ] {
+            let mut msg = test_hype_message("train", "begin", 1, 0, 1);
+            msg.sender.login = "Alice".to_owned();
+            msg.msg_kind = kind;
+            room.push_message(msg);
+        }
+        let mut other = room.messages[0].clone();
+        other.sender.login = "bob".to_owned();
+        room.push_message(other);
+        room.delete_messages_from("ALICE");
+        let deleted: Vec<_> = room.messages.iter().map(|m| m.flags.is_deleted).collect();
+        assert_eq!(deleted, [true, true, true, false, false]);
+    }
+
+    fn moderation_notice(
+        id: u64,
+        eventsub: bool,
+        kind: super::super::MsgKind,
+        seconds: i64,
+    ) -> super::super::ChatMessage {
+        let mut message = test_hype_message("train", "begin", 1, 0, 1);
+        message.id = super::super::MessageId(id);
+        message.timestamp = Utc.timestamp_opt(seconds, 0).unwrap();
+        let prefix = if eventsub {
+            EVENTSUB_MODERATION_ID_PREFIX
+        } else {
+            IRC_MODERATION_ID_PREFIX
+        };
+        message.server_id = Some(format!("{prefix}{id}"));
+        message.raw_text = if eventsub {
+            "moderator performed the action"
+        } else {
+            "action received from chat"
+        }
+        .to_owned();
+        message.msg_kind = kind;
+        message
+    }
+
+    #[test]
+    fn moderation_duplicates_keep_eventsub_details_in_both_arrival_orders() {
+        for kind in [
+            super::super::MsgKind::Timeout {
+                login: "alice".into(),
+                seconds: 600,
+            },
+            super::super::MsgKind::Ban {
+                login: "alice".into(),
+            },
+            super::super::MsgKind::ChatCleared,
+        ] {
+            for first_eventsub in [false, true] {
+                let mut room = ChannelState::new(super::super::ChannelId::new("rustlang"));
+                room.push_message(moderation_notice(1, first_eventsub, kind.clone(), 10));
+                assert!(room.absorb_moderation_notice(&moderation_notice(
+                    2,
+                    !first_eventsub,
+                    kind.clone(),
+                    11
+                )));
+                assert_eq!(room.messages.len(), 1);
+                assert_eq!(room.messages[0].id, super::super::MessageId(1));
+                assert_eq!(room.messages[0].raw_text, "moderator performed the action");
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_moderation_actions_from_one_source_remain_separate() {
+        for source in [false, true] {
+            let mut room = ChannelState::new(super::super::ChannelId::new("rustlang"));
+            let kind = super::super::MsgKind::Timeout {
+                login: "alice".into(),
+                seconds: 600,
+            };
+            room.push_message(moderation_notice(1, source, kind.clone(), 10));
+            let second = moderation_notice(2, source, kind, 11);
+            assert!(!room.absorb_moderation_notice(&second));
+            room.push_message(second);
+            assert_eq!(room.messages.len(), 2);
+        }
+    }
+
+    #[test]
+    fn each_moderation_action_pairs_at_most_once() {
+        let mut room = ChannelState::new(super::super::ChannelId::new("rustlang"));
+        let kind = super::super::MsgKind::Timeout {
+            login: "alice".into(),
+            seconds: 600,
+        };
+        for (index, source) in [false, false, true, true, false].into_iter().enumerate() {
+            let notice = moderation_notice(index as u64 + 1, source, kind.clone(), 10);
+            if !room.absorb_moderation_notice(&notice) {
+                room.push_message(notice);
+            }
+        }
+        assert_eq!(room.messages.len(), 3);
+        assert_eq!(
+            room.messages
+                .iter()
+                .filter(|message| message.raw_text.contains("moderator"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn unrelated_or_stale_moderation_actions_are_not_absorbed() {
+        let kind = super::super::MsgKind::Timeout {
+            login: "alice".into(),
+            seconds: 600,
+        };
+        let mut room = ChannelState::new(super::super::ChannelId::new("rustlang"));
+        room.push_message(moderation_notice(1, false, kind.clone(), 10));
+        let cases = [
+            moderation_notice(2, true, kind.clone(), 16),
+            moderation_notice(
+                3,
+                true,
+                super::super::MsgKind::Timeout {
+                    login: "bob".into(),
+                    seconds: 600,
+                },
+                10,
+            ),
+            moderation_notice(
+                4,
+                true,
+                super::super::MsgKind::Timeout {
+                    login: "alice".into(),
+                    seconds: 30,
+                },
+                10,
+            ),
+            moderation_notice(
+                5,
+                true,
+                super::super::MsgKind::Ban {
+                    login: "alice".into(),
+                },
+                10,
+            ),
+        ];
+        for message in cases {
+            assert!(!room.absorb_moderation_notice(&message));
+        }
+        let mut history = moderation_notice(6, true, kind.clone(), 10);
+        history.flags.is_history = true;
+        assert!(!room.absorb_moderation_notice(&history));
+        let mut other_channel = moderation_notice(7, true, kind, 10);
+        other_channel.channel = super::super::ChannelId::new("other");
+        assert!(!room.absorb_moderation_notice(&other_channel));
+    }
+
+    #[test]
+    fn channel_clear_preserves_notices_for_cross_source_merging() {
+        let mut room = ChannelState::new(super::super::ChannelId::new("rustlang"));
+        for kind in [
+            super::super::MsgKind::Chat,
+            super::super::MsgKind::Bits { amount: 1 },
+            super::super::MsgKind::SystemInfo,
+        ] {
+            let mut message = test_hype_message("train", "begin", 1, 0, 1);
+            message.msg_kind = kind;
+            room.push_message(message);
+        }
+        room.push_message(moderation_notice(
+            10,
+            true,
+            super::super::MsgKind::ChatCleared,
+            10,
+        ));
+        room.delete_all_chat_messages();
+        assert_eq!(
+            room.messages
+                .iter()
+                .map(|message| message.flags.is_deleted)
+                .collect::<Vec<_>>(),
+            [true, true, false, false]
+        );
+        assert!(room.absorb_moderation_notice(&moderation_notice(
+            11,
+            false,
+            super::super::MsgKind::ChatCleared,
+            11
+        )));
+        assert_eq!(room.messages.len(), 4);
     }
 
     fn test_hype_message_with_metadata(

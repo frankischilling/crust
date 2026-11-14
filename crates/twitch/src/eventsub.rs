@@ -1,15 +1,21 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tokio_tungstenite::connect_async;
 use tracing::{debug, info, warn};
 
+mod subscriptions;
+use subscriptions::SubscriptionWorker;
+
 const EVENTSUB_WS_URL: &str = "wss://eventsub.wss.twitch.tv/ws";
+const EVENTSUB_SUBSCRIPTIONS_URL: &str = "https://api.twitch.tv/helix/eventsub/subscriptions";
 const RECONNECT_BACKOFF_SECS: &[u64] = &[1, 2, 5, 10, 20, 30];
+const EVENTSUB_WELCOME_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// EventSub event deduplication cache size (number of recent event IDs to track).
 const EVENT_DEDUP_CACHE_SIZE: usize = 10000;
@@ -88,6 +94,20 @@ pub enum EventSubNoticeKind {
         status: Option<String>,
         details: Option<String>,
     },
+    HypeTrainLifecycle {
+        train_id: String,
+        phase: String,
+        level: u32,
+        progress: u64,
+        goal: u64,
+        total: u64,
+        last_contribution_login: Option<String>,
+        top_contribution_login: Option<String>,
+        top_contribution_type: Option<String>,
+        top_contribution_total: Option<u64>,
+        started_at: Option<String>,
+        ends_at: Option<String>,
+    },
     AutoModMessageHold {
         message_id: String,
         sender_user_id: String,
@@ -152,6 +172,7 @@ pub enum EventSubNoticeKind {
         action: String,
         target_login: Option<String>,
         target_message_id: Option<String>,
+        reason: Option<String>,
         source_channel_login: Option<String>,
     },
     StreamOnline,
@@ -176,7 +197,7 @@ pub enum EventSubEvent {
     Error(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct EventSubAuth {
     token: String,
     client_id: String,
@@ -205,34 +226,43 @@ pub struct EventSubSession {
     auth: Option<EventSubAuth>,
     watched_broadcasters: HashMap<String, WatchedBroadcaster>,
     http: reqwest::Client,
+    subscriptions_url: String,
     resumed_once: bool,
     /// Deduplication cache: tracks recent event IDs to prevent duplicate processing.
-    seen_event_ids: LruCache,
+    seen_event_ids: RecentEventIds,
 }
 
-/// Simple LRU cache for event ID deduplication.
-struct LruCache {
-    items: Vec<String>,
+/// Bounded event ID history, ordered by first receipt.
+struct RecentEventIds {
+    items: HashSet<String>,
+    order: VecDeque<String>,
     capacity: usize,
 }
 
-impl LruCache {
+impl RecentEventIds {
     fn new(capacity: usize) -> Self {
         Self {
-            items: Vec::with_capacity(capacity),
+            items: HashSet::with_capacity(capacity),
+            order: VecDeque::with_capacity(capacity),
             capacity,
         }
     }
 
     fn contains(&self, key: &str) -> bool {
-        self.items.iter().any(|s| s == key)
+        self.items.contains(key)
     }
 
     fn insert(&mut self, key: String) {
-        if self.items.len() >= self.capacity {
-            self.items.remove(0);
+        if self.capacity == 0 || self.items.contains(&key) {
+            return;
         }
-        self.items.push(key);
+        if self.items.len() >= self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.items.remove(&oldest);
+            }
+        }
+        self.order.push_back(key.clone());
+        self.items.insert(key);
     }
 }
 
@@ -247,8 +277,9 @@ impl EventSubSession {
             auth: None,
             watched_broadcasters: HashMap::new(),
             http: reqwest::Client::new(),
+            subscriptions_url: EVENTSUB_SUBSCRIPTIONS_URL.to_owned(),
             resumed_once: false,
-            seen_event_ids: LruCache::new(EVENT_DEDUP_CACHE_SIZE),
+            seen_event_ids: RecentEventIds::new(EVENT_DEDUP_CACHE_SIZE),
         }
     }
 
@@ -290,67 +321,187 @@ impl EventSubSession {
                 .get(attempt as usize)
                 .copied()
                 .unwrap_or(*RECONNECT_BACKOFF_SECS.last().unwrap_or(&30));
-            tokio::time::sleep(Duration::from_secs(delay)).await;
-            attempt = attempt.saturating_add(1);
+            match self.wait_for_reconnect(Duration::from_secs(delay)).await {
+                EventSubConnectOutcome::Stop => return,
+                EventSubConnectOutcome::Reconnect { immediate, .. } => {
+                    if immediate {
+                        attempt = 0;
+                        connect_url = EVENTSUB_WS_URL.to_owned();
+                    } else {
+                        attempt = attempt.saturating_add(1);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn wait_for_reconnect(&mut self, delay: Duration) -> EventSubConnectOutcome {
+        let retry = tokio::time::sleep(delay);
+        tokio::pin!(retry);
+        loop {
+            tokio::select! {
+                biased;
+                command = self.cmd_rx.recv() => {
+                    let Some(command) = command else {
+                        return EventSubConnectOutcome::Stop;
+                    };
+                    if self.apply_command(command) == CommandEffect::AuthChanged {
+                        return EventSubConnectOutcome::Reconnect {
+                            reconnect_url: None,
+                            immediate: true,
+                        };
+                    }
+                }
+                _ = &mut retry => {
+                    return EventSubConnectOutcome::Reconnect {
+                        reconnect_url: None,
+                        immediate: false,
+                    };
+                }
+            }
+        }
+    }
+
+    fn apply_command(&mut self, command: EventSubCommand) -> CommandEffect {
+        match command {
+            EventSubCommand::SetAuth {
+                token,
+                client_id,
+                user_id,
+                scopes,
+            } => {
+                let token = token.trim();
+                let bare = token
+                    .strip_prefix("oauth:")
+                    .unwrap_or(token)
+                    .trim()
+                    .to_owned();
+                let next_auth = if bare.is_empty()
+                    || client_id.trim().is_empty()
+                    || user_id.trim().is_empty()
+                {
+                    None
+                } else {
+                    Some(EventSubAuth {
+                        token: bare,
+                        client_id: client_id.trim().to_owned(),
+                        user_id: user_id.trim().to_owned(),
+                        scopes: scopes
+                            .into_iter()
+                            .map(|scope| scope.trim().to_ascii_lowercase())
+                            .filter(|scope| !scope.is_empty())
+                            .collect(),
+                    })
+                };
+                if self.auth != next_auth {
+                    self.auth = next_auth;
+                    CommandEffect::AuthChanged
+                } else {
+                    CommandEffect::Unchanged
+                }
+            }
+            EventSubCommand::ClearAuth => {
+                if self.auth.take().is_some() {
+                    CommandEffect::AuthChanged
+                } else {
+                    CommandEffect::Unchanged
+                }
+            }
+            EventSubCommand::WatchChannel {
+                broadcaster_id,
+                can_moderate,
+            } => {
+                let bid = broadcaster_id.trim();
+                if bid.is_empty() {
+                    return CommandEffect::Unchanged;
+                }
+                self.watched_broadcasters
+                    .insert(bid.to_owned(), WatchedBroadcaster { can_moderate });
+                CommandEffect::SubscriptionsChanged
+            }
+            EventSubCommand::UnwatchChannel { broadcaster_id } => {
+                if self
+                    .watched_broadcasters
+                    .remove(broadcaster_id.trim())
+                    .is_some()
+                {
+                    CommandEffect::SubscriptionsChanged
+                } else {
+                    CommandEffect::Unchanged
+                }
+            }
         }
     }
 
     async fn connect_once(&mut self, url: &str) -> Result<EventSubConnectOutcome, String> {
         info!("Connecting EventSub websocket: {url}");
-        let (ws, _) = connect_async(url)
+        let (ws, _) = tokio::time::timeout(Duration::from_secs(10), connect_async(url))
             .await
+            .map_err(|_| "EventSub connection timed out".to_owned())?
             .map_err(|e| format!("connect failed: {e}"))?;
         let (mut sink, mut stream) = ws.split();
 
         let mut session_id: Option<String> = None;
+        let mut subscriptions: Option<SubscriptionWorker> = None;
+        let mut reconnect: Option<ReconnectAttempt> = None;
+        let mut keepalive_timeout = EVENTSUB_WELCOME_TIMEOUT;
+        let mut activity_deadline = Instant::now() + EVENTSUB_WELCOME_TIMEOUT;
 
         loop {
             tokio::select! {
+                _ = tokio::time::sleep_until(activity_deadline) => {
+                    return Err(if session_id.is_none() {
+                        "EventSub welcome timed out".to_owned()
+                    } else {
+                        "EventSub keepalive timed out".to_owned()
+                    });
+                }
+                handoff = async { (&mut reconnect.as_mut().expect("pending reconnect").task).await }, if reconnect.is_some() => {
+                    let (socket, welcome) = handoff.map_err(|error| format!("reconnect task failed: {error}"))??;
+                    reconnect = None;
+                    let sid = welcome.id;
+                    keepalive_timeout = welcome.keepalive_timeout;
+                    activity_deadline = welcome.received_at + keepalive_timeout;
+                    // Keep the logical HTTP worker through a socket transfer so
+                    // recovery cannot overtake an accepted POST or DELETE.
+                    if let Some(worker) = &subscriptions {
+                        worker.resume(sid.clone(), self.desired_subscriptions());
+                    } else {
+                        subscriptions = self.auth.clone().map(|auth| SubscriptionWorker::start(
+                            self.http.clone(),
+                            self.subscriptions_url.clone(),
+                            auth,
+                            sid.clone(),
+                            self.desired_subscriptions(),
+                            true,
+                        ));
+                    }
+                    // The new welcome confirms transfer before the old socket closes.
+                    let (next_sink, next_stream) = socket.split();
+                    sink = next_sink;
+                    stream = next_stream;
+                    session_id = Some(sid.clone());
+                    self.emit(EventSubEvent::Connected { resumed: true }).await;
+                    self.emit(EventSubEvent::BackfillRequested).await;
+                }
                 maybe_cmd = self.cmd_rx.recv() => {
                     let Some(cmd) = maybe_cmd else {
                         return Ok(EventSubConnectOutcome::Stop);
                     };
-                    match cmd {
-                        EventSubCommand::SetAuth { token, client_id, user_id, scopes } => {
-                            let bare = token.strip_prefix("oauth:").unwrap_or(&token).trim().to_owned();
-                            if bare.is_empty() || client_id.trim().is_empty() || user_id.trim().is_empty() {
-                                self.auth = None;
-                                continue;
-                            }
-                            self.auth = Some(EventSubAuth {
-                                token: bare,
-                                client_id: client_id.trim().to_owned(),
-                                user_id: user_id.trim().to_owned(),
-                                scopes: scopes
-                                    .into_iter()
-                                    .map(|scope| scope.trim().to_ascii_lowercase())
-                                    .filter(|scope| !scope.is_empty())
-                                    .collect(),
+                    match self.apply_command(cmd) {
+                        CommandEffect::AuthChanged => {
+                            // Subscriptions belong to the account on this socket.
+                            return Ok(EventSubConnectOutcome::Reconnect {
+                                reconnect_url: None,
+                                immediate: true,
                             });
-                            if let Some(ref sid) = session_id {
-                                self.subscribe_user_topics(sid).await;
-                                self.subscribe_all(sid).await;
+                        }
+                        CommandEffect::SubscriptionsChanged => {
+                            if let Some(worker) = &subscriptions {
+                                worker.replace(self.desired_subscriptions());
                             }
                         }
-                        EventSubCommand::ClearAuth => {
-                            self.auth = None;
-                        }
-                        EventSubCommand::WatchChannel { broadcaster_id, can_moderate } => {
-                            let bid = broadcaster_id.trim();
-                            if bid.is_empty() {
-                                continue;
-                            }
-                            self.watched_broadcasters.insert(
-                                bid.to_owned(),
-                                WatchedBroadcaster { can_moderate },
-                            );
-                            if let Some(ref sid) = session_id {
-                                self.subscribe_channel(sid, bid, can_moderate).await;
-                            }
-                        }
-                        EventSubCommand::UnwatchChannel { broadcaster_id } => {
-                            self.watched_broadcasters.remove(broadcaster_id.trim());
-                        }
+                        CommandEffect::Unchanged => {}
                     }
                 }
                 maybe_msg = stream.next() => {
@@ -380,16 +531,22 @@ impl EventSubSession {
                                 .and_then(Value::as_str)
                                 .unwrap_or("");
 
+                            if session_id.is_some()
+                                && matches!(message_type, "notification" | "session_keepalive" | "session_reconnect" | "revocation")
+                                && parsed.get("payload").is_some_and(Value::is_object)
+                            {
+                                activity_deadline = Instant::now() + keepalive_timeout;
+                            }
+
                             match message_type {
                                 "session_welcome" => {
-                                    let sid = parsed
-                                        .get("payload")
-                                        .and_then(|p| p.get("session"))
-                                        .and_then(|s| s.get("id"))
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("")
-                                        .to_owned();
-                                    if sid.is_empty() {
+                                    let Some(welcome) = SessionWelcome::parse(&parsed) else {
+                                        continue;
+                                    };
+                                    let sid = welcome.id;
+                                    keepalive_timeout = welcome.keepalive_timeout;
+                                    activity_deadline = welcome.received_at + keepalive_timeout;
+                                    if session_id.as_deref() == Some(sid.as_str()) {
                                         continue;
                                     }
 
@@ -399,11 +556,17 @@ impl EventSubSession {
                                     }).await;
                                     self.emit(EventSubEvent::BackfillRequested).await;
                                     self.resumed_once = true;
-                                    self.subscribe_user_topics(&sid).await;
-                                    self.subscribe_all(&sid).await;
+                                    subscriptions = self.auth.clone().map(|auth| SubscriptionWorker::start(
+                                        self.http.clone(),
+                                        self.subscriptions_url.clone(),
+                                        auth,
+                                        sid,
+                                        self.desired_subscriptions(),
+                                        false,
+                                    ));
                                 }
                                 "session_keepalive" => {
-                                    // No-op; keepalive proves the socket/session is healthy.
+                                    // The valid envelope refreshed the activity deadline above.
                                 }
                                 "session_reconnect" => {
                                     let reconnect_url = parsed
@@ -413,10 +576,16 @@ impl EventSubSession {
                                         .and_then(Value::as_str)
                                         .map(str::to_owned);
 
-                                    return Ok(EventSubConnectOutcome::Reconnect {
-                                        reconnect_url,
-                                        immediate: true,
-                                    });
+                                    if let Some(url) = reconnect_url {
+                                        if reconnect.is_none() {
+                                            reconnect = Some(ReconnectAttempt::start(url));
+                                        }
+                                    } else {
+                                        return Ok(EventSubConnectOutcome::Reconnect {
+                                            reconnect_url: None,
+                                            immediate: true,
+                                        });
+                                    }
                                 }
                                 "revocation" => {
                                     let reason = parsed
@@ -453,7 +622,9 @@ impl EventSubSession {
                                     }
 
                                     if let Some(notice) = parse_notice(&parsed, sub_type) {
-                                        self.emit(EventSubEvent::Notice(notice)).await;
+                                        if self.accepts_notice(sub_type, &notice.broadcaster_id) {
+                                            self.emit(EventSubEvent::Notice(notice)).await;
+                                        }
                                     }
                                 }
                                 other => {
@@ -492,127 +663,42 @@ impl EventSubSession {
         }
     }
 
-    async fn subscribe_all(&self, session_id: &str) {
-        if session_id.trim().is_empty() {
-            return;
-        }
+    fn accepts_notice(&self, sub_type: &str, broadcaster_id: &str) -> bool {
+        self.auth.is_some()
+            && (sub_type == "user.whisper.message"
+                || self.watched_broadcasters.contains_key(broadcaster_id))
+    }
+
+    fn desired_subscriptions(&self) -> Vec<SubscriptionSpec> {
         let Some(auth) = self.auth.as_ref() else {
-            return;
+            return Vec::new();
         };
-        let estimated_total_cost: u32 = self
+        let mut specs: Vec<_> = self
             .watched_broadcasters
             .iter()
-            .map(|(broadcaster_id, watched)| {
+            .flat_map(|(broadcaster_id, watched)| {
                 subscription_specs(broadcaster_id, auth, watched.can_moderate)
-                    .iter()
-                    .map(|spec| spec.estimated_cost)
-                    .sum::<u32>()
             })
-            .sum();
-        debug!(
-            "EventSub plan estimated websocket cost {estimated_total_cost}/{EVENTSUB_MAX_ESTIMATED_COST} across {} watched broadcasters",
-            self.watched_broadcasters.len()
-        );
-        for (broadcaster_id, watched) in &self.watched_broadcasters {
-            self.subscribe_channel(session_id, broadcaster_id, watched.can_moderate)
-                .await;
+            .collect();
+        if auth.has_any_scope(&["user:read:whispers", "user:manage:whispers"]) {
+            specs.push(SubscriptionSpec {
+                kind: "user.whisper.message",
+                version: "1",
+                condition: json!({ "user_id": auth.user_id }),
+                estimated_cost: 0,
+                priority: SubscriptionPriority::Critical,
+                fallback: None,
+            });
         }
+        specs
     }
+}
 
-    async fn subscribe_channel(&self, session_id: &str, broadcaster_id: &str, can_moderate: bool) {
-        let Some(auth) = self.auth.as_ref() else {
-            return;
-        };
-
-        let specs = subscription_specs(broadcaster_id, auth, can_moderate);
-        for spec in specs {
-            self.subscribe_spec(session_id, broadcaster_id, &spec, auth)
-                .await;
-        }
-    }
-
-    async fn subscribe_user_topics(&self, session_id: &str) {
-        let Some(auth) = self.auth.as_ref() else {
-            return;
-        };
-
-        if !auth.has_any_scope(&["user:read:whispers", "user:manage:whispers"]) {
-            return;
-        }
-
-        let spec = SubscriptionSpec {
-            kind: "user.whisper.message",
-            version: "1",
-            condition: json!({
-                "user_id": auth.user_id,
-            }),
-            estimated_cost: 0,
-            priority: SubscriptionPriority::Critical,
-            fallback: None,
-        };
-        self.subscribe_spec(session_id, &auth.user_id, &spec, auth)
-            .await;
-    }
-
-    async fn subscribe_spec(
-        &self,
-        session_id: &str,
-        broadcaster_id: &str,
-        spec: &SubscriptionSpec,
-        auth: &EventSubAuth,
-    ) {
-        let body = json!({
-            "type": spec.kind,
-            "version": spec.version,
-            "condition": spec.condition,
-            "transport": {
-                "method": "websocket",
-                "session_id": session_id,
-            }
-        });
-
-        let resp = self
-            .http
-            .post("https://api.twitch.tv/helix/eventsub/subscriptions")
-            .header("Authorization", format!("Bearer {}", auth.token))
-            .header("Client-Id", &auth.client_id)
-            .json(&body)
-            .send()
-            .await;
-
-        match resp {
-            Ok(r) if r.status().is_success() => {
-                debug!("EventSub subscribed: {} for {}", spec.kind, broadcaster_id);
-            }
-            Ok(r) if r.status() == StatusCode::CONFLICT => {
-                debug!(
-                    "EventSub already subscribed (conflict): {} for {}",
-                    spec.kind, broadcaster_id
-                );
-            }
-            Ok(r) => {
-                let status = r.status();
-                let body = r.text().await.unwrap_or_default();
-                if is_expected_authz_failure(status, &body) {
-                    debug!(
-                        "EventSub subscription unavailable {} for {}: HTTP {} - {}",
-                        spec.kind, broadcaster_id, status, body
-                    );
-                } else {
-                    warn!(
-                        "EventSub subscribe failed {} for {}: HTTP {} - {}",
-                        spec.kind, broadcaster_id, status, body
-                    );
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "EventSub subscribe request failed {} for {}: {}",
-                    spec.kind, broadcaster_id, e
-                );
-            }
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandEffect {
+    Unchanged,
+    AuthChanged,
+    SubscriptionsChanged,
 }
 
 enum EventSubConnectOutcome {
@@ -623,6 +709,83 @@ enum EventSubConnectOutcome {
     Stop,
 }
 
+type EventSubSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+struct SessionWelcome {
+    id: String,
+    keepalive_timeout: Duration,
+    received_at: Instant,
+}
+
+impl SessionWelcome {
+    fn parse(message: &Value) -> Option<Self> {
+        let session = message.get("payload")?.get("session")?;
+        let id = session.get("id")?.as_str().filter(|id| !id.is_empty())?;
+        let keepalive_timeout = session
+            .get("keepalive_timeout_seconds")
+            .and_then(Value::as_u64)
+            .filter(|seconds| (10..=600).contains(seconds))
+            .map(Duration::from_secs)
+            .unwrap_or(EVENTSUB_WELCOME_TIMEOUT);
+        Some(Self {
+            id: id.to_owned(),
+            keepalive_timeout,
+            received_at: Instant::now(),
+        })
+    }
+}
+
+struct ReconnectAttempt {
+    task: tokio::task::JoinHandle<Result<(EventSubSocket, SessionWelcome), String>>,
+}
+
+impl ReconnectAttempt {
+    fn start(url: String) -> Self {
+        let task = tokio::spawn(async move {
+            tokio::time::timeout(EVENTSUB_WELCOME_TIMEOUT, async move {
+                let (mut socket, _) = connect_async(&url)
+                    .await
+                    .map_err(|error| format!("reconnect failed: {error}"))?;
+                while let Some(message) = socket.next().await {
+                    match message.map_err(|error| format!("reconnect read failed: {error}"))? {
+                        tokio_tungstenite::tungstenite::Message::Text(text) => {
+                            let message: Value = serde_json::from_str(&text)
+                                .map_err(|error| format!("invalid reconnect welcome: {error}"))?;
+                            if message["metadata"]["message_type"].as_str()
+                                == Some("session_welcome")
+                            {
+                                if let Some(welcome) = SessionWelcome::parse(&message) {
+                                    return Ok((socket, welcome));
+                                }
+                            }
+                        }
+                        tokio_tungstenite::tungstenite::Message::Ping(payload) => {
+                            socket
+                                .send(tokio_tungstenite::tungstenite::Message::Pong(payload))
+                                .await
+                                .map_err(|error| format!("reconnect pong failed: {error}"))?;
+                        }
+                        tokio_tungstenite::tungstenite::Message::Close(_) => break,
+                        _ => {}
+                    }
+                }
+                Err("replacement socket closed before welcome".to_owned())
+            })
+            .await
+            .map_err(|_| "replacement socket welcome timed out".to_owned())?
+        });
+        Self { task }
+    }
+}
+
+impl Drop for ReconnectAttempt {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SubscriptionSpec {
     kind: &'static str,
     version: &'static str,
@@ -643,8 +806,6 @@ enum SubscriptionFallback {
     StreamStatusPolling,
     IrcUsernotice,
 }
-
-const EVENTSUB_MAX_ESTIMATED_COST: u32 = 10;
 
 fn is_expected_authz_failure(status: StatusCode, body: &str) -> bool {
     status == StatusCode::FORBIDDEN
@@ -855,6 +1016,23 @@ fn subscription_specs(
             priority: SubscriptionPriority::Critical,
             fallback: None,
         });
+    }
+
+    if is_broadcaster && auth.has_scope("channel:read:hype_train") {
+        for kind in [
+            "channel.hype_train.begin",
+            "channel.hype_train.progress",
+            "channel.hype_train.end",
+        ] {
+            candidates.push(SubscriptionSpec {
+                kind,
+                version: "2",
+                condition: json!({"broadcaster_user_id": bid}),
+                estimated_cost: 0,
+                priority: SubscriptionPriority::Critical,
+                fallback: None,
+            });
+        }
     }
 
     if can_moderate && has_any_scope(auth, &["moderator:read:followers"]) {
@@ -1269,6 +1447,62 @@ fn parse_notice(root: &Value, sub_type: &str) -> Option<EventSubNotice> {
                 details: summarize_prediction_details(event),
             }
         }
+        "channel.hype_train.begin" | "channel.hype_train.progress" | "channel.hype_train.end" => {
+            let top = event
+                .get("top_contributions")
+                .and_then(Value::as_array)
+                .and_then(|contributions| {
+                    contributions.iter().max_by_key(|contribution| {
+                        contribution
+                            .get("total")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0)
+                    })
+                });
+            let contribution_login = |contribution: &Value| {
+                pick_optional_non_empty(
+                    contribution.get("user_login").and_then(Value::as_str),
+                    contribution.get("user_name").and_then(Value::as_str),
+                )
+                .map(str::to_owned)
+            };
+            EventSubNoticeKind::HypeTrainLifecycle {
+                train_id: event.get("id").and_then(Value::as_str)?.to_owned(),
+                phase: sub_type
+                    .split('.')
+                    .next_back()
+                    .unwrap_or("progress")
+                    .to_owned(),
+                level: event
+                    .get("level")
+                    .and_then(Value::as_u64)
+                    .and_then(|level| u32::try_from(level).ok())
+                    .unwrap_or(0),
+                progress: event.get("progress").and_then(Value::as_u64).unwrap_or(0),
+                goal: event.get("goal").and_then(Value::as_u64).unwrap_or(0),
+                total: event.get("total").and_then(Value::as_u64).unwrap_or(0),
+                last_contribution_login: event
+                    .get("last_contribution")
+                    .and_then(contribution_login),
+                top_contribution_login: top.and_then(contribution_login),
+                top_contribution_type: top
+                    .and_then(|contribution| contribution.get("type"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                top_contribution_total: top
+                    .and_then(|contribution| contribution.get("total"))
+                    .and_then(Value::as_u64),
+                started_at: event
+                    .get("started_at")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                ends_at: pick_optional_non_empty(
+                    event.get("expires_at").and_then(Value::as_str),
+                    event.get("ended_at").and_then(Value::as_str),
+                )
+                .map(str::to_owned),
+            }
+        }
         "automod.message.hold" => {
             let message = event.get("message");
             let sender = message.and_then(|m| m.get("sender"));
@@ -1546,7 +1780,12 @@ fn parse_notice(root: &Value, sub_type: &str) -> Option<EventSubNotice> {
                 .to_owned(),
         },
         "channel.moderate" => {
-            let action = parse_moderation_action(event);
+            let action = parse_moderation_action(
+                event,
+                root.get("metadata")
+                    .and_then(|metadata| metadata.get("message_timestamp"))
+                    .and_then(Value::as_str),
+            );
             EventSubNoticeKind::ModerationAction {
                 moderator_login: pick_non_empty(
                     event.get("moderator_user_login").and_then(Value::as_str),
@@ -1555,12 +1794,22 @@ fn parse_notice(root: &Value, sub_type: &str) -> Option<EventSubNotice> {
                 )
                 .to_owned(),
                 action,
-                target_login: pick_optional_non_empty(
-                    event.get("user_login").and_then(Value::as_str),
-                    event.get("target_user_login").and_then(Value::as_str),
-                )
-                .map(str::to_owned),
+                target_login: moderation_action_payload(event)
+                    .and_then(|payload| find_nested_string_field(payload, "user_login"))
+                    .or_else(|| {
+                        pick_optional_non_empty(
+                            event.get("user_login").and_then(Value::as_str),
+                            event.get("target_user_login").and_then(Value::as_str),
+                        )
+                        .map(str::to_owned)
+                    }),
                 target_message_id: parse_moderation_target_message_id(event),
+                reason: moderation_action_payload(event)
+                    .and_then(|payload| payload.get("reason"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|reason| !reason.is_empty())
+                    .map(str::to_owned),
                 source_channel_login: pick_optional_non_empty(
                     event
                         .get("source_broadcaster_user_login")
@@ -1569,6 +1818,11 @@ fn parse_notice(root: &Value, sub_type: &str) -> Option<EventSubNotice> {
                         .get("source_broadcaster_user_name")
                         .and_then(Value::as_str),
                 )
+                .filter(|source| {
+                    broadcaster_login
+                        .as_deref()
+                        .is_none_or(|login| !source.eq_ignore_ascii_case(login))
+                })
                 .map(str::to_owned),
             }
         }
@@ -1605,7 +1859,7 @@ fn normalize_tier(raw: Option<&str>) -> String {
     }
 }
 
-fn parse_moderation_action(event: &Value) -> String {
+fn parse_moderation_action(event: &Value, timestamp: Option<&str>) -> String {
     let Some(action) = event.get("action") else {
         return "updated moderation state".to_owned();
     };
@@ -1613,7 +1867,7 @@ fn parse_moderation_action(event: &Value) -> String {
     if let Some(action_str) = action.as_str() {
         let trimmed = action_str.trim();
         if !trimmed.is_empty() {
-            return trimmed.to_owned();
+            return format_moderation_action(trimmed, event.get(trimmed), timestamp);
         }
     }
 
@@ -1697,7 +1951,60 @@ fn parse_moderation_action(event: &Value) -> String {
     "updated moderation state".to_owned()
 }
 
+fn format_moderation_action(
+    action: &str,
+    payload: Option<&Value>,
+    timestamp: Option<&str>,
+) -> String {
+    let Some(payload) = payload else {
+        return action.to_owned();
+    };
+    let value = match action.strip_prefix("shared_chat_").unwrap_or(action) {
+        "timeout" => payload
+            .get("duration_seconds")
+            .or_else(|| payload.get("duration"))
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                let expires = payload
+                    .get("expires_at")
+                    .and_then(Value::as_str)
+                    .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())?;
+                let started =
+                    timestamp.and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())?;
+                let millis = (expires - started).num_milliseconds();
+                u64::try_from(millis)
+                    .ok()
+                    .map(|millis| (millis + 500) / 1000)
+            })
+            .map(|seconds| format!("{action}_{seconds}s")),
+        "slow" => payload
+            .get("wait_time_seconds")
+            .and_then(Value::as_u64)
+            .map(|seconds| format!("{action}_{seconds}s")),
+        "followers" => payload
+            .get("follow_duration_minutes")
+            .and_then(Value::as_u64)
+            .map(|minutes| format!("{action}_{minutes}m")),
+        _ => None,
+    };
+    value.unwrap_or_else(|| action.to_owned())
+}
+
+fn moderation_action_payload(event: &Value) -> Option<&Value> {
+    let action = event.get("action")?;
+    if let Some(name) = action.as_str() {
+        event.get(name.trim())
+    } else {
+        Some(action)
+    }
+}
+
 fn parse_moderation_target_message_id(event: &Value) -> Option<String> {
+    if let Some(message_id) = moderation_action_payload(event)
+        .and_then(|payload| find_nested_string_field(payload, "message_id"))
+    {
+        return Some(message_id);
+    }
     if let Some(message_id) = event
         .get("message_id")
         .and_then(Value::as_str)
@@ -1895,9 +2202,453 @@ fn compact_u64(value: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use std::time::Duration;
 
-    use super::{parse_notice, subscription_specs, EventSubAuth, EventSubNoticeKind};
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::json;
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc;
+    use tokio::time::Instant;
+    use tokio_tungstenite::tungstenite::Message;
+
+    use super::{
+        parse_notice, subscription_specs, EventSubAuth, EventSubCommand, EventSubConnectOutcome,
+        EventSubEvent, EventSubNoticeKind, EventSubSession, RecentEventIds,
+    };
+
+    fn test_session() -> (
+        EventSubSession,
+        mpsc::Sender<EventSubCommand>,
+        mpsc::Receiver<EventSubEvent>,
+    ) {
+        let (event_tx, event_rx) = mpsc::channel(16);
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        (EventSubSession::new(event_tx, cmd_rx), cmd_tx, event_rx)
+    }
+
+    async fn wait_for_connection(events: &mut mpsc::Receiver<EventSubEvent>) -> bool {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some(event) = events.recv().await {
+                if let EventSubEvent::Connected { resumed } = event {
+                    return resumed;
+                }
+            }
+            panic!("session stopped before connecting");
+        })
+        .await
+        .expect("welcome was not processed")
+    }
+
+    async fn wait_for_pong(
+        socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        payload: &[u8],
+    ) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            socket
+                .send(Message::Ping(payload.to_vec().into()))
+                .await
+                .unwrap();
+            loop {
+                match socket.next().await {
+                    Some(Ok(Message::Pong(received))) if received.as_slice() == payload => return,
+                    Some(Ok(_)) => {}
+                    other => panic!("socket closed before pong: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("ping was not processed");
+    }
+
+    #[tokio::test]
+    async fn missing_welcome_closes_idle_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (mut session, _commands, _events) = test_session();
+        let client = tokio::spawn(async move { session.connect_once(&url).await });
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        wait_for_pong(&mut socket, b"handshake-complete").await;
+
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::time::resume();
+        let outcome = tokio::time::timeout(Duration::from_secs(3), client)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, Err(error) if error == "EventSub welcome timed out"));
+        assert!(matches!(
+            socket.next().await,
+            None | Some(Err(_)) | Some(Ok(Message::Close(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn keepalive_deadline_refreshes_on_events_but_not_ping_or_invalid_json() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (mut session, _commands, mut events) = test_session();
+        let client = tokio::spawn(async move { session.connect_once(&url).await });
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        socket
+            .send(Message::Text(
+                json!({
+                    "metadata": {"message_type": "session_welcome"},
+                    "payload": {"session": {"id": "idle-test", "keepalive_timeout_seconds": 10}}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        assert!(!wait_for_connection(&mut events).await);
+
+        // Keep network I/O on the real clock; advance only the inactivity timer.
+        for message_type in ["session_keepalive", "notification"] {
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(9)).await;
+            assert!(
+                !client.is_finished(),
+                "valid traffic did not refresh the deadline"
+            );
+            tokio::time::resume();
+            let payload = if message_type == "notification" {
+                json!({"event": {
+                    "broadcaster_user_id": "123",
+                    "broadcaster_user_login": "example"
+                }})
+            } else {
+                json!({})
+            };
+            socket
+                .send(Message::Text(
+                    json!({
+                        "metadata": {
+                            "message_type": message_type,
+                            "subscription_type": "stream.online"
+                        },
+                        "payload": payload
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            wait_for_pong(&mut socket, message_type.as_bytes()).await;
+        }
+
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(9)).await;
+        assert!(!client.is_finished());
+        tokio::time::resume();
+        socket.send(Message::Text("{invalid".into())).await.unwrap();
+        wait_for_pong(&mut socket, b"ping-is-not-keepalive").await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::time::resume();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(3), client)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, Err(error) if error == "EventSub keepalive timed out"));
+        assert!(matches!(
+            socket.next().await,
+            None | Some(Err(_)) | Some(Ok(Message::Close(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn resumed_socket_uses_replacement_keepalive_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (mut session, _commands, mut events) = test_session();
+        let client = tokio::spawn(async move { session.connect_once(&url).await });
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut old_socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        old_socket
+            .send(Message::Text(
+                json!({
+                    "metadata": {"message_type": "session_welcome"},
+                    "payload": {"session": {"id": "old-socket", "keepalive_timeout_seconds": 10}}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        assert!(!wait_for_connection(&mut events).await);
+
+        let replacement = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reconnect_url = format!("ws://{}", replacement.local_addr().unwrap());
+        old_socket
+            .send(Message::Text(
+                json!({
+                    "metadata": {"message_type": "session_reconnect"},
+                    "payload": {"session": {"reconnect_url": reconnect_url}}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let (stream, _) = replacement.accept().await.unwrap();
+        let mut new_socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        new_socket
+            .send(Message::Text(
+                json!({
+                    "metadata": {"message_type": "session_welcome"},
+                    "payload": {"session": {"id": "new-socket", "keepalive_timeout_seconds": 30}}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        assert!(wait_for_connection(&mut events).await);
+
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::time::resume();
+        wait_for_pong(&mut new_socket, b"replacement-is-active").await;
+        assert!(
+            !client.is_finished(),
+            "the old timeout survived the socket transfer"
+        );
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(20)).await;
+        tokio::time::resume();
+        let outcome = tokio::time::timeout(Duration::from_secs(3), client)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, Err(error) if error == "EventSub keepalive timed out"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_backoff_applies_channel_commands_and_wakes_for_auth() {
+        let (mut session, commands, _events) = test_session();
+        let sender = commands.clone();
+        let producer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            for command in [
+                EventSubCommand::WatchChannel {
+                    broadcaster_id: " 123 ".into(),
+                    can_moderate: false,
+                },
+                EventSubCommand::WatchChannel {
+                    broadcaster_id: "456".into(),
+                    can_moderate: true,
+                },
+                EventSubCommand::UnwatchChannel {
+                    broadcaster_id: " 123 ".into(),
+                },
+                EventSubCommand::SetAuth {
+                    token: "  oauth: new-token  ".into(),
+                    client_id: " client ".into(),
+                    user_id: " user ".into(),
+                    scopes: vec![" USER:READ:WHISPERS ".into()],
+                },
+            ] {
+                sender.send(command).await.unwrap();
+            }
+        });
+        let start = Instant::now();
+        let outcome = session.wait_for_reconnect(Duration::from_secs(30)).await;
+        assert_eq!(start.elapsed(), Duration::from_secs(5));
+        assert!(matches!(
+            outcome,
+            EventSubConnectOutcome::Reconnect {
+                immediate: true,
+                ..
+            }
+        ));
+        assert!(!session.watched_broadcasters.contains_key("123"));
+        assert!(session.watched_broadcasters["456"].can_moderate);
+        let auth = session.auth.unwrap();
+        assert_eq!(auth.token, "new-token");
+        assert_eq!(auth.client_id, "client");
+        assert_eq!(auth.user_id, "user");
+        assert!(auth.has_scope("user:read:whispers"));
+        producer.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_backoff_channel_updates_keep_original_deadline() {
+        let (mut session, commands, _events) = test_session();
+        let sender = commands.clone();
+        let producer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            sender
+                .send(EventSubCommand::WatchChannel {
+                    broadcaster_id: "123".into(),
+                    can_moderate: false,
+                })
+                .await
+                .unwrap();
+        });
+        let start = Instant::now();
+        let outcome = session.wait_for_reconnect(Duration::from_secs(30)).await;
+        assert_eq!(start.elapsed(), Duration::from_secs(30));
+        assert!(matches!(
+            outcome,
+            EventSubConnectOutcome::Reconnect {
+                immediate: false,
+                ..
+            }
+        ));
+        assert!(session.watched_broadcasters.contains_key("123"));
+        producer.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_backoff_stops_immediately_when_command_input_closes() {
+        let (mut session, commands, _events) = test_session();
+        commands
+            .send(EventSubCommand::WatchChannel {
+                broadcaster_id: "123".into(),
+                can_moderate: false,
+            })
+            .await
+            .unwrap();
+        drop(commands);
+        let start = Instant::now();
+        let outcome = session.wait_for_reconnect(Duration::from_secs(30)).await;
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert!(matches!(outcome, EventSubConnectOutcome::Stop));
+        assert!(session.watched_broadcasters.contains_key("123"));
+    }
+
+    async fn change_auth_on_open_socket(command: EventSubCommand) -> EventSubSession {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(8);
+        let mut session = EventSubSession::new(event_tx, cmd_rx);
+        session.auth = Some(auth("old-user", &["user:read:whispers"]));
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            cmd_tx.send(command).await.unwrap();
+            let closed = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+                .await
+                .expect("old account socket stayed open");
+            assert!(
+                closed.is_none()
+                    || matches!(
+                        closed,
+                        Some(Err(_)) | Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))
+                    )
+            );
+        });
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            session.connect_once(&url),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            EventSubConnectOutcome::Reconnect {
+                reconnect_url: None,
+                immediate: true
+            }
+        ));
+        server.await.unwrap();
+        session
+    }
+
+    #[tokio::test]
+    async fn account_switch_closes_previous_event_subscriptions() {
+        let session = change_auth_on_open_socket(EventSubCommand::SetAuth {
+            token: "  oauth: new-token  ".into(),
+            client_id: "client".into(),
+            user_id: "new-user".into(),
+            scopes: vec!["user:read:whispers".into()],
+        })
+        .await;
+        let auth = session.auth.unwrap();
+        assert_eq!(auth.user_id, "new-user");
+        assert_eq!(auth.token, "new-token");
+    }
+
+    #[tokio::test]
+    async fn logout_closes_previous_event_subscriptions() {
+        let session = change_auth_on_open_socket(EventSubCommand::ClearAuth).await;
+        assert!(session.auth.is_none());
+    }
+
+    #[tokio::test]
+    async fn invalid_auth_clears_previous_event_subscriptions() {
+        let session = change_auth_on_open_socket(EventSubCommand::SetAuth {
+            token: String::new(),
+            client_id: "client".into(),
+            user_id: "new-user".into(),
+            scopes: vec![],
+        })
+        .await;
+        assert!(session.auth.is_none());
+    }
+
+    #[test]
+    fn event_deduplication_retains_recent_unique_ids() {
+        let mut cache = RecentEventIds::new(2);
+        cache.insert("first".into());
+        cache.insert("second".into());
+        cache.insert("first".into());
+        assert!(cache.contains("first"));
+        assert!(cache.contains("second"));
+        cache.insert("third".into());
+        assert!(!cache.contains("first"));
+        assert!(cache.contains("second"));
+        assert!(cache.contains("third"));
+        cache.insert("first".into());
+        assert!(!cache.contains("second"));
+        assert!(cache.contains("first"));
+        assert!(cache.contains("third"));
+    }
+
+    #[test]
+    fn zero_capacity_event_cache_stays_empty() {
+        let mut cache = RecentEventIds::new(0);
+        cache.insert("event".into());
+        assert!(!cache.contains("event"));
+    }
+
+    #[test]
+    #[ignore = "manual comparison of full event ID caches"]
+    fn perf_event_id_deduplication() {
+        const CAPACITY: usize = 10_000;
+        const EVENTS: usize = 20_000;
+        let ids: Vec<String> = (0..CAPACITY + EVENTS)
+            .map(|id| format!("{id:032x}"))
+            .collect();
+        let mut previous = ids[..CAPACITY].to_vec();
+        let started = std::time::Instant::now();
+        for id in &ids[CAPACITY..] {
+            assert!(!std::hint::black_box(
+                previous.iter().any(|entry| entry == id)
+            ));
+            previous.remove(0);
+            previous.push(id.clone());
+        }
+        let previous_elapsed = started.elapsed();
+
+        let mut cache = RecentEventIds::new(CAPACITY);
+        for id in &ids[..CAPACITY] {
+            cache.insert(id.clone());
+        }
+        let started = std::time::Instant::now();
+        for id in &ids[CAPACITY..] {
+            assert!(!std::hint::black_box(cache.contains(id)));
+            cache.insert(id.clone());
+        }
+        let elapsed = started.elapsed();
+        println!("[perf] event ID cache, {EVENTS} events at capacity {CAPACITY}: previous={previous_elapsed:?}, current={elapsed:?}");
+    }
 
     fn auth(user_id: &str, scopes: &[&str]) -> EventSubAuth {
         EventSubAuth {
@@ -1982,6 +2733,32 @@ mod tests {
         assert!(!other_kinds.contains(&"channel.channel_points_custom_reward_redemption.add"));
         assert!(!other_kinds.contains(&"channel.poll.begin"));
         assert!(!other_kinds.contains(&"channel.prediction.begin"));
+    }
+
+    #[test]
+    fn hype_train_topics_require_broadcaster_scope_and_use_current_version() {
+        let broadcaster = auth("123", &["channel:read:hype_train"]);
+        let specs = subscription_specs("123", &broadcaster, false);
+        for kind in [
+            "channel.hype_train.begin",
+            "channel.hype_train.progress",
+            "channel.hype_train.end",
+        ] {
+            let spec = specs
+                .iter()
+                .find(|spec| spec.kind == kind)
+                .expect("hype subscription");
+            assert_eq!(spec.version, "2");
+            assert_eq!(spec.condition, json!({"broadcaster_user_id": "123"}));
+        }
+        for specs in [
+            subscription_specs("123", &auth("123", &[]), false),
+            subscription_specs("999", &broadcaster, true),
+        ] {
+            assert!(!specs
+                .iter()
+                .any(|spec| spec.kind.starts_with("channel.hype_train.")));
+        }
     }
 
     #[test]
@@ -2080,14 +2857,88 @@ mod tests {
                 target_login,
                 target_message_id,
                 source_channel_login,
+                reason,
             } => {
                 assert_eq!(moderator_login, "mod_jane");
                 assert_eq!(action, "warn");
                 assert_eq!(target_login.as_deref(), Some("viewer123"));
                 assert_eq!(target_message_id, None);
                 assert_eq!(source_channel_login, None);
+                assert_eq!(reason, None);
             }
             other => panic!("unexpected kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn moderation_string_actions_read_their_nested_targets() {
+        for action in ["ban", "timeout", "delete", "warn"] {
+            let mut event = json!({
+                "broadcaster_user_id": "123",
+                "broadcaster_user_login": "streamer",
+                "source_broadcaster_user_login": "streamer",
+                "moderator_user_login": "mod_jane",
+                "action": action,
+            });
+            event[action] = json!({
+                "user_id": "456",
+                "user_login": "viewer123",
+                "message_id": if action == "delete" { Some("deleted-message") } else { None },
+                "expires_at": "2026-11-13T20:10:00Z",
+                "reason": "  Repeated spam  ",
+            });
+            let payload = json!({
+                "metadata": { "message_timestamp": "2026-11-13T20:00:00Z" },
+                "payload": { "event": event },
+            });
+            let notice = parse_notice(&payload, "channel.moderate").unwrap();
+            let EventSubNoticeKind::ModerationAction {
+                action: parsed_action,
+                target_login,
+                target_message_id,
+                source_channel_login,
+                reason,
+                ..
+            } = notice.kind
+            else {
+                panic!("expected moderation action")
+            };
+            assert_eq!(target_login.as_deref(), Some("viewer123"));
+            assert_eq!(reason.as_deref(), Some("Repeated spam"));
+            assert_eq!(
+                parsed_action,
+                if action == "timeout" {
+                    "timeout_600s"
+                } else {
+                    action
+                }
+            );
+            assert_eq!(
+                target_message_id.as_deref(),
+                if action == "delete" {
+                    Some("deleted-message")
+                } else {
+                    None
+                }
+            );
+            assert!(source_channel_login.is_none());
+        }
+    }
+
+    #[test]
+    fn moderation_string_actions_keep_room_mode_parameters() {
+        for (action, field, value, expected) in [
+            ("slow", "wait_time_seconds", 30, "slow_30s"),
+            ("followers", "follow_duration_minutes", 10, "followers_10m"),
+        ] {
+            let mut event = json!({ "broadcaster_user_id": "123", "action": action });
+            event[action] = json!({});
+            event[action][field] = json!(value);
+            let notice =
+                parse_notice(&json!({"payload": {"event": event}}), "channel.moderate").unwrap();
+            assert!(
+                matches!(notice.kind, EventSubNoticeKind::ModerationAction { action, .. } if action == expected)
+            );
         }
     }
 
@@ -2312,6 +3163,67 @@ mod tests {
                 assert!(details.contains("Burgers"));
             }
             other => panic!("unexpected kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_hype_train_lifecycle_preserves_progress_and_contributors() {
+        for phase in ["begin", "progress", "end"] {
+            let mut event = json!({
+                "id": "train-1",
+                "broadcaster_user_id": "123",
+                "broadcaster_user_login": "streamer",
+                "level": 3,
+                "total": 4500,
+                "top_contributions": [
+                    {"user_login": "alice", "type": "bits", "total": 500},
+                    {"user_login": "bob", "type": "subscription", "total": 1500}
+                ],
+                "started_at": "2026-01-01T00:00:00Z"
+            });
+            if phase == "end" {
+                event["ended_at"] = json!("2026-01-01T00:05:00Z");
+            } else {
+                event["progress"] = json!(1000);
+                event["goal"] = json!(2500);
+                event["expires_at"] = json!("2026-01-01T00:05:00Z");
+            }
+            let payload =
+                json!({"metadata": {"message_id": "event-1"}, "payload": {"event": event}});
+            let notice = parse_notice(&payload, &format!("channel.hype_train.{phase}")).unwrap();
+            assert_eq!(notice.event_id.as_deref(), Some("event-1"));
+            match notice.kind {
+                EventSubNoticeKind::HypeTrainLifecycle {
+                    train_id,
+                    phase: parsed_phase,
+                    level,
+                    progress,
+                    goal,
+                    total,
+                    last_contribution_login,
+                    top_contribution_login,
+                    top_contribution_type,
+                    top_contribution_total,
+                    started_at,
+                    ends_at,
+                } => {
+                    assert_eq!(train_id, "train-1");
+                    assert_eq!(parsed_phase, phase);
+                    assert_eq!(level, 3);
+                    assert_eq!(total, 4500);
+                    assert_eq!(
+                        (progress, goal),
+                        if phase == "end" { (0, 0) } else { (1000, 2500) }
+                    );
+                    assert_eq!(last_contribution_login, None);
+                    assert_eq!(top_contribution_login.as_deref(), Some("bob"));
+                    assert_eq!(top_contribution_type.as_deref(), Some("subscription"));
+                    assert_eq!(top_contribution_total, Some(1500));
+                    assert_eq!(started_at.as_deref(), Some("2026-01-01T00:00:00Z"));
+                    assert_eq!(ends_at.as_deref(), Some("2026-01-01T00:05:00Z"));
+                }
+                other => panic!("unexpected kind: {other:?}"),
+            }
         }
     }
 

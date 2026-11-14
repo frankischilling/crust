@@ -1,29 +1,16 @@
-//! Reconnect-backfill runner.
-//!
-//! Called by the main select loop when the EventSub websocket session
-//! emits `EventSubEvent::Backfill(plan)`. Fans out Helix refreshes for
-//! every state-bearing topic covered by acceptance criterion "no events >
-//! 1 minute old lost":
-//!
-//! - Stream status (via `fetch_twitch_user_profile`)
-//! - Pending unban queue (moderated channels only)
-//! - Active poll / prediction / hype train - converted into synthetic
-//!   `EventSubNotice`s and routed back through the session event channel
-//!   so they pick up the existing 45s `should_drop_duplicate_eventsub_notice`
-//!   window in `main.rs`. If the websocket later replays the same event id
-//!   we drop the duplicate cleanly.
-//!
-//! The runner is deliberately conservative: HTTP failures are swallowed
-//! (logged and dropped) so a partial backfill never blocks chat flow.
+//! Refresh current channel state after an EventSub reconnect. The API can
+//! recover active polls, predictions, and hype trains; it cannot replay
+//! transient events that occurred while the connection was down.
 
-use std::collections::HashMap;
+use std::collections::{hash_map::DefaultHasher, HashMap};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crust_core::events::AppEvent;
 use crust_core::model::ChannelId;
-use crust_twitch::eventsub::backfill::BackfillPlan;
 use crust_twitch::eventsub::{EventSubEvent, EventSubNotice, EventSubNoticeKind};
-use crust_twitch::helix::{HelixApi, HelixHypeTrain, HelixPoll, HelixPrediction};
+use crust_twitch::helix::{AuthedHelix, HelixApi, HelixHypeTrain, HelixPoll, HelixPrediction};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -36,7 +23,7 @@ use crate::runtime::profiles::fetch_twitch_user_profile;
 pub(crate) struct BackfillContext {
     pub evt_tx: mpsc::Sender<AppEvent>,
     pub eventsub_evt_tx: mpsc::Sender<EventSubEvent>,
-    pub helix: Arc<dyn HelixApi>,
+    pub helix: Arc<AuthedHelix>,
     pub oauth_token: String,
     pub helix_client_id: Option<String>,
     pub auth_user_id: Option<String>,
@@ -44,29 +31,22 @@ pub(crate) struct BackfillContext {
     pub channel_mod_status: HashMap<ChannelId, bool>,
 }
 
-/// Dispatch the backfill plan across per-broadcaster tokio tasks. Returns
+/// Dispatch state refreshes across per-broadcaster tokio tasks. Returns
 /// immediately after spawning; individual tasks finish asynchronously.
-pub(crate) fn run_backfill(plan: BackfillPlan, ctx: BackfillContext) {
+pub(crate) fn run_backfill(ctx: BackfillContext) {
+    let auth_changes = ctx.helix.subscribe_auth_changes();
     debug!(
-        "EventSub backfill: {} watched channels, disconnect {}s (resumed={})",
-        plan.watched.len(),
-        plan.disconnect.as_secs(),
-        plan.resumed
+        "EventSub backfill: {} known channels",
+        ctx.channel_room_ids.len()
     );
 
-    // Stream-status backfill via IVR profile refresh - reuses the existing
-    // `fetch_twitch_user_profile` path that already fans StreamStatusChanged
-    // into the UI. Mirrors the old `BackfillRequested` arm's behaviour.
-    for (channel, _room_id) in ctx
-        .channel_room_ids
-        .iter()
-        .filter(|(ch, _)| ch.is_twitch())
-    {
+    // Refresh stream status through the existing profile path.
+    for (channel, _room_id) in ctx.channel_room_ids.iter().filter(|(ch, _)| ch.is_twitch()) {
         let login = channel.display_name().to_owned();
         let etx = ctx.evt_tx.clone();
         let token = ctx.oauth_token.clone();
         let client_id = ctx.helix_client_id.clone();
-        tokio::spawn(async move {
+        spawn_backfill_job(auth_changes.clone(), async move {
             fetch_twitch_user_profile(&login, Some(token.as_str()), client_id.as_deref(), etx)
                 .await;
         });
@@ -74,12 +54,12 @@ pub(crate) fn run_backfill(plan: BackfillPlan, ctx: BackfillContext) {
 
     // Unban-queue backfill for moderated Twitch channels. Broadcasters
     // count as moderators of their own channel, mirroring main.rs.
-    for (channel, broadcaster_id) in ctx
-        .channel_room_ids
-        .iter()
-        .filter(|(ch, _)| ch.is_twitch())
-    {
-        let is_mod = ctx.channel_mod_status.get(channel).copied().unwrap_or(false)
+    for (channel, broadcaster_id) in ctx.channel_room_ids.iter().filter(|(ch, _)| ch.is_twitch()) {
+        let is_mod = ctx
+            .channel_mod_status
+            .get(channel)
+            .copied()
+            .unwrap_or(false)
             || ctx.auth_user_id.as_deref() == Some(broadcaster_id.as_str());
         if !is_mod {
             continue;
@@ -90,7 +70,7 @@ pub(crate) fn run_backfill(plan: BackfillPlan, ctx: BackfillContext) {
         let token = ctx.oauth_token.clone();
         let client_id = ctx.helix_client_id.clone();
         let etx = ctx.evt_tx.clone();
-        tokio::spawn(async move {
+        spawn_backfill_job(auth_changes.clone(), async move {
             crate::helix_fetch_unban_requests(
                 &token,
                 client_id.as_deref(),
@@ -103,32 +83,43 @@ pub(crate) fn run_backfill(plan: BackfillPlan, ctx: BackfillContext) {
         });
     }
 
-    // Poll / prediction / hype-train synthetic-notice backfill. These
-    // three Helix endpoints are per-broadcaster and gated on the current
-    // login's scopes; `AuthedHelix` surfaces a `MissingScope` error that
-    // we silently log and drop. The plan.watched list only contains
-    // broadcasters the session actually subscribed to, so we can spawn
-    // unconditionally.
-    for snapshot in plan.watched {
-        let bid = snapshot.broadcaster_id.clone();
+    // These endpoints require the broadcaster's own token. Moderator access
+    // to another channel does not grant access to its polls or predictions.
+    for (channel, broadcaster_id) in ctx.channel_room_ids.iter().filter(|(channel, id)| {
+        channel.is_twitch() && ctx.auth_user_id.as_deref() == Some(id.as_str())
+    }) {
+        let bid = broadcaster_id.clone();
         let helix = Arc::clone(&ctx.helix);
         let esub_tx = ctx.eventsub_evt_tx.clone();
-        let broadcaster_login = ctx
-            .channel_room_ids
-            .iter()
-            .find(|(_, room_id)| *room_id == &bid)
-            .map(|(ch, _)| ch.display_name().to_owned());
-        tokio::spawn(async move {
-            backfill_stateful_topics(helix, bid, broadcaster_login, esub_tx).await;
+        let evt_tx = ctx.evt_tx.clone();
+        let channel = channel.clone();
+        let broadcaster_login = Some(channel.display_name().to_owned());
+        spawn_backfill_job(auth_changes.clone(), async move {
+            backfill_stateful_topics(helix, channel, bid, broadcaster_login, esub_tx, evt_tx).await;
         });
     }
 }
 
+fn spawn_backfill_job(
+    mut auth_changes: tokio::sync::watch::Receiver<()>,
+    job: impl std::future::Future<Output = ()> + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            _ = auth_changes.changed() => {}
+            _ = job => {}
+        }
+    })
+}
+
 async fn backfill_stateful_topics(
     helix: Arc<dyn HelixApi>,
+    channel: ChannelId,
     broadcaster_id: String,
     broadcaster_login: Option<String>,
     esub_tx: mpsc::Sender<EventSubEvent>,
+    evt_tx: mpsc::Sender<AppEvent>,
 ) {
     match helix.get_active_poll(&broadcaster_id).await {
         Ok(Some(poll)) => {
@@ -137,9 +128,9 @@ async fn backfill_stateful_topics(
             }
         }
         Ok(None) => {}
-        Err(err) => debug!(
-            "EventSub backfill: active poll fetch failed for {broadcaster_id}: {err}"
-        ),
+        Err(err) => {
+            debug!("EventSub backfill: active poll fetch failed for {broadcaster_id}: {err}")
+        }
     }
 
     match helix.get_active_prediction(&broadcaster_id).await {
@@ -151,28 +142,45 @@ async fn backfill_stateful_topics(
             }
         }
         Ok(None) => {}
-        Err(err) => debug!(
-            "EventSub backfill: active prediction fetch failed for {broadcaster_id}: {err}"
-        ),
+        Err(err) => {
+            debug!("EventSub backfill: active prediction fetch failed for {broadcaster_id}: {err}")
+        }
     }
 
-    match helix.get_latest_hype_train(&broadcaster_id).await {
+    let checked_at = Instant::now();
+    match helix.get_active_hype_train(&broadcaster_id).await {
         Ok(Some(train)) => {
             if let Some(notice) = hype_train_to_notice(&broadcaster_id, &broadcaster_login, &train)
             {
                 let _ = esub_tx.send(EventSubEvent::Notice(notice)).await;
+            } else if train
+                .expires_at
+                .as_deref()
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                .is_some_and(|expires| expires <= chrono::Utc::now())
+            {
+                let _ = evt_tx
+                    .send(AppEvent::HypeTrainCleared {
+                        channel,
+                        checked_at,
+                    })
+                    .await;
             }
         }
-        Ok(None) => {}
-        Err(err) => warn!(
-            "EventSub backfill: hype train fetch failed for {broadcaster_id}: {err}"
-        ),
+        Ok(None) => {
+            let _ = evt_tx
+                .send(AppEvent::HypeTrainCleared {
+                    channel,
+                    checked_at,
+                })
+                .await;
+        }
+        Err(err) => warn!("EventSub backfill: hype train fetch failed for {broadcaster_id}: {err}"),
     }
 }
 
-/// Build a synthetic poll notice from a Helix `HelixPoll`. The event_id is
-/// the poll id so the 45s dedup window correctly collapses with any real
-/// `channel.poll.progress` websocket replay.
+/// Build a synthetic poll notice. Its ID deduplicates unchanged backfills;
+/// WebSocket notifications have independent event IDs.
 pub(crate) fn poll_to_notice(
     broadcaster_id: &str,
     broadcaster_login: &Option<String>,
@@ -181,17 +189,21 @@ pub(crate) fn poll_to_notice(
     if !poll.status.eq_ignore_ascii_case("ACTIVE") {
         return None;
     }
-    Some(EventSubNotice {
-        event_id: Some(format!("backfill:poll:{}", poll.id)),
-        broadcaster_id: broadcaster_id.to_owned(),
-        broadcaster_login: broadcaster_login.clone(),
-        kind: EventSubNoticeKind::PollLifecycle {
-            title: poll.title.clone(),
-            phase: "progress".to_owned(),
-            status: Some(poll.status.clone()),
-            details: summarise_poll(poll),
+    Some(with_snapshot_id(
+        "poll",
+        &poll.id,
+        EventSubNotice {
+            event_id: None,
+            broadcaster_id: broadcaster_id.to_owned(),
+            broadcaster_login: broadcaster_login.clone(),
+            kind: EventSubNoticeKind::PollLifecycle {
+                title: poll.title.clone(),
+                phase: "progress".to_owned(),
+                status: Some(poll.status.clone()),
+                details: summarise_poll(poll),
+            },
         },
-    })
+    ))
 }
 
 fn summarise_poll(poll: &HelixPoll) -> Option<String> {
@@ -242,17 +254,21 @@ pub(crate) fn prediction_to_notice(
     } else {
         "progress"
     };
-    Some(EventSubNotice {
-        event_id: Some(format!("backfill:prediction:{}", prediction.id)),
-        broadcaster_id: broadcaster_id.to_owned(),
-        broadcaster_login: broadcaster_login.clone(),
-        kind: EventSubNoticeKind::PredictionLifecycle {
-            title: prediction.title.clone(),
-            phase: phase.to_owned(),
-            status: Some(prediction.status.clone()),
-            details: summarise_prediction(prediction),
+    Some(with_snapshot_id(
+        "prediction",
+        &prediction.id,
+        EventSubNotice {
+            event_id: None,
+            broadcaster_id: broadcaster_id.to_owned(),
+            broadcaster_login: broadcaster_login.clone(),
+            kind: EventSubNoticeKind::PredictionLifecycle {
+                title: prediction.title.clone(),
+                phase: phase.to_owned(),
+                status: Some(prediction.status.clone()),
+                details: summarise_prediction(prediction),
+            },
         },
-    })
+    ))
 }
 
 fn summarise_prediction(prediction: &HelixPrediction) -> Option<String> {
@@ -295,50 +311,70 @@ pub(crate) fn hype_train_to_notice(
     broadcaster_login: &Option<String>,
     train: &HelixHypeTrain,
 ) -> Option<EventSubNotice> {
-    // Only surface hype trains whose cooldown window is still open - if
-    // both `expires_at` and `cooldown_ends_at` are missing / in the past,
-    // Helix is returning a historical event we shouldn't chat-spam about.
-    let ends_at = train
-        .expires_at
-        .clone()
-        .or_else(|| train.cooldown_ends_at.clone());
-    if ends_at.is_none() {
+    hype_train_to_notice_at(broadcaster_id, broadcaster_login, train, chrono::Utc::now())
+}
+
+fn hype_train_to_notice_at(
+    broadcaster_id: &str,
+    broadcaster_login: &Option<String>,
+    train: &HelixHypeTrain,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<EventSubNotice> {
+    let expires_at = train.expires_at.as_deref()?;
+    let expiry = chrono::DateTime::parse_from_rfc3339(expires_at).ok()?;
+    if expiry <= now {
         return None;
     }
+    let ends_at = Some(expires_at.to_owned());
 
-    let top = train
-        .top_contributions
-        .iter()
-        .max_by_key(|c| c.total);
+    let top = train.top_contributions.iter().max_by_key(|c| c.total);
     let top_contribution_login = top
         .and_then(|c| pick(c.user_login.as_deref(), c.user_name.as_deref()))
         .map(str::to_owned);
     let top_contribution_type = top.and_then(|c| c.contribution_type.clone());
     let top_contribution_total = top.map(|c| c.total);
 
-    let last_contribution_login = train.last_contribution.as_ref().and_then(|c| {
-        pick(c.user_login.as_deref(), c.user_name.as_deref()).map(str::to_owned)
-    });
+    let last_contribution_login = train
+        .last_contribution
+        .as_ref()
+        .and_then(|c| pick(c.user_login.as_deref(), c.user_name.as_deref()).map(str::to_owned));
 
-    Some(EventSubNotice {
-        event_id: Some(format!("backfill:hype_train:{}", train.id)),
-        broadcaster_id: broadcaster_id.to_owned(),
-        broadcaster_login: broadcaster_login.clone(),
-        kind: EventSubNoticeKind::HypeTrainLifecycle {
-            train_id: train.id.clone(),
-            phase: "progress".to_owned(),
-            level: train.level,
-            progress: train.progress,
-            goal: train.goal,
-            total: train.total,
-            last_contribution_login,
-            top_contribution_login,
-            top_contribution_type,
-            top_contribution_total,
-            started_at: train.started_at.clone(),
-            ends_at,
+    Some(with_snapshot_id(
+        "hype_train",
+        &train.id,
+        EventSubNotice {
+            event_id: None,
+            broadcaster_id: broadcaster_id.to_owned(),
+            broadcaster_login: broadcaster_login.clone(),
+            kind: EventSubNoticeKind::HypeTrainLifecycle {
+                train_id: train.id.clone(),
+                phase: "progress".to_owned(),
+                level: train.level,
+                progress: train.progress,
+                goal: train.goal,
+                total: train.total,
+                last_contribution_login,
+                top_contribution_login,
+                top_contribution_type,
+                top_contribution_total,
+                started_at: train.started_at.clone(),
+                ends_at,
+            },
         },
-    })
+    ))
+}
+
+fn with_snapshot_id(topic: &str, object_id: &str, mut notice: EventSubNotice) -> EventSubNotice {
+    // A reconnect can observe a new phase or vote total for the same object.
+    // Hash the displayed state so only an unchanged snapshot is suppressed.
+    let mut hash = DefaultHasher::new();
+    format!("{:?}", notice.kind).hash(&mut hash);
+    notice.event_id = Some(format!(
+        "backfill:{topic}:{}:{object_id}:{:016x}",
+        notice.broadcaster_id,
+        hash.finish(),
+    ));
+    notice
 }
 
 fn pick<'a>(a: Option<&'a str>, b: Option<&'a str>) -> Option<&'a str> {
@@ -349,7 +385,144 @@ fn pick<'a>(a: Option<&'a str>, b: Option<&'a str>) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crust_twitch::helix::{HelixPollChoice, HelixPredictionOutcome};
+    use crust_twitch::helix::{
+        FollowedChannel, HelixError, HelixPollChoice, HelixPredictionOutcome, HelixStream,
+    };
+
+    struct HypeResponse(Result<Option<HelixHypeTrain>, HelixError>);
+
+    #[async_trait::async_trait]
+    impl HelixApi for HypeResponse {
+        async fn get_followed(&self, _: &str) -> Result<Vec<FollowedChannel>, HelixError> {
+            unreachable!("state refresh does not load follows")
+        }
+
+        async fn get_streams(&self, _: &[String]) -> Result<Vec<HelixStream>, HelixError> {
+            unreachable!("state refresh does not load streams")
+        }
+
+        async fn get_active_hype_train(
+            &self,
+            _: &str,
+        ) -> Result<Option<HelixHypeTrain>, HelixError> {
+            self.0.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_hype_state_clears_a_banner_but_failed_fetch_does_not() {
+        for success in [true, false] {
+            let result = if success {
+                Ok(None)
+            } else {
+                Err(HelixError::RateLimited)
+            };
+            let (evt_tx, mut evt_rx) = mpsc::channel(4);
+            let (esub_tx, _esub_rx) = mpsc::channel(4);
+            let started = Instant::now();
+            backfill_stateful_topics(
+                Arc::new(HypeResponse(result)),
+                ChannelId::new("alice"),
+                "123".to_owned(),
+                Some("alice".to_owned()),
+                esub_tx,
+                evt_tx,
+            )
+            .await;
+            match evt_rx.try_recv() {
+                Ok(AppEvent::HypeTrainCleared {
+                    channel,
+                    checked_at,
+                }) => {
+                    assert!(success);
+                    assert_eq!(channel, ChannelId::new("alice"));
+                    assert!(checked_at >= started && checked_at <= Instant::now());
+                }
+                Err(_) => assert!(!success),
+                other => panic!("unexpected refresh event: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn account_changes_cancel_old_backfill_publication() {
+        for switch_account in [false, true] {
+            let helix = AuthedHelix::new();
+            helix
+                .set_auth("old-token".to_owned(), "client".to_owned())
+                .await;
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let (evt_tx, mut evt_rx) = mpsc::channel(1);
+            let job = spawn_backfill_job(helix.subscribe_auth_changes(), async move {
+                started_tx.send(()).unwrap();
+                let _ = release_rx.await;
+                let _ = evt_tx
+                    .send(AppEvent::UnbanRequestsLoaded {
+                        channel: ChannelId::new("alice"),
+                        requests: Vec::new(),
+                    })
+                    .await;
+            });
+            started_rx.await.unwrap();
+            if switch_account {
+                helix
+                    .set_auth("new-token".to_owned(), "client".to_owned())
+                    .await;
+            } else {
+                helix.clear_auth().await;
+            }
+            let _ = release_tx.send(());
+            tokio::time::timeout(std::time::Duration::from_secs(1), job)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                evt_rx.try_recv().is_err(),
+                "old account queue must not be published"
+            );
+        }
+    }
+
+    #[test]
+    fn changed_snapshots_survive_deduplication_within_the_reconnect_window() {
+        use crate::runtime::eventsub_notices::should_drop_duplicate_eventsub_notice;
+
+        let mut seen = HashMap::new();
+        let now = Instant::now();
+        let mut gc_at = now;
+        let mut dropped = |notice: EventSubNotice| {
+            should_drop_duplicate_eventsub_notice(
+                &mut seen,
+                notice.event_id.as_deref().unwrap(),
+                now,
+                &mut gc_at,
+            )
+        };
+        let mut poll = test_poll("ACTIVE");
+        assert!(!dropped(poll_to_notice("123", &None, &poll).unwrap()));
+        assert!(dropped(poll_to_notice("123", &None, &poll).unwrap()));
+        poll.choices[0].votes += 1;
+        assert!(!dropped(poll_to_notice("123", &None, &poll).unwrap()));
+
+        let mut prediction = HelixPrediction {
+            id: "same-prediction".into(),
+            title: "Will the run finish?".into(),
+            status: "ACTIVE".into(),
+            outcomes: Vec::new(),
+            winning_outcome_id: None,
+        };
+        assert!(!dropped(
+            prediction_to_notice("123", &None, &prediction).unwrap()
+        ));
+        prediction.status = "LOCKED".into();
+        assert!(!dropped(
+            prediction_to_notice("123", &None, &prediction).unwrap()
+        ));
+        assert!(dropped(
+            prediction_to_notice("123", &None, &prediction).unwrap()
+        ));
+    }
 
     fn test_poll(status: &str) -> HelixPoll {
         HelixPoll {
@@ -378,7 +551,11 @@ mod tests {
     #[test]
     fn poll_to_notice_carries_helix_id_as_event_id_for_dedup() {
         let notice = poll_to_notice("123", &None, &test_poll("ACTIVE")).expect("active poll");
-        assert_eq!(notice.event_id.as_deref(), Some("backfill:poll:poll-1"));
+        assert!(notice
+            .event_id
+            .as_deref()
+            .unwrap()
+            .starts_with("backfill:poll:123:poll-1:"));
         assert_eq!(notice.broadcaster_id, "123");
     }
 
@@ -416,10 +593,11 @@ mod tests {
             EventSubNoticeKind::PredictionLifecycle { phase, .. } => assert_eq!(phase, "lock"),
             other => panic!("unexpected kind: {other:?}"),
         }
-        assert_eq!(
-            notice.event_id.as_deref(),
-            Some("backfill:prediction:pred-1")
-        );
+        assert!(notice
+            .event_id
+            .as_deref()
+            .unwrap()
+            .starts_with("backfill:prediction:123:pred-1:"));
     }
 
     #[test]
@@ -440,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn hype_train_to_notice_requires_cooldown_or_expiry_timestamp() {
+    fn hype_train_to_notice_requires_an_active_expiry_timestamp() {
         let train_missing = HelixHypeTrain {
             id: "ht-1".into(),
             level: 3,
@@ -455,7 +633,7 @@ mod tests {
         };
         assert!(hype_train_to_notice("123", &None, &train_missing).is_none());
 
-        let train_with_cooldown = HelixHypeTrain {
+        let mut train_with_cooldown = HelixHypeTrain {
             id: "ht-2".into(),
             level: 4,
             total: 1500,
@@ -467,9 +645,22 @@ mod tests {
             top_contributions: Vec::new(),
             last_contribution: None,
         };
-        let notice =
-            hype_train_to_notice("123", &None, &train_with_cooldown).expect("notice emitted");
-        assert_eq!(notice.event_id.as_deref(), Some("backfill:hype_train:ht-2"));
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-22T10:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(hype_train_to_notice_at("123", &None, &train_with_cooldown, now).is_none());
+        train_with_cooldown.expires_at = Some("2026-04-22T10:00:00Z".to_owned());
+        assert!(hype_train_to_notice_at("123", &None, &train_with_cooldown, now).is_none());
+        train_with_cooldown.expires_at = Some("invalid".to_owned());
+        assert!(hype_train_to_notice_at("123", &None, &train_with_cooldown, now).is_none());
+        train_with_cooldown.expires_at = Some("2026-04-22T11:00:00Z".to_owned());
+        let notice = hype_train_to_notice_at("123", &None, &train_with_cooldown, now)
+            .expect("notice emitted");
+        assert!(notice
+            .event_id
+            .as_deref()
+            .unwrap()
+            .starts_with("backfill:hype_train:123:ht-2:"));
         match notice.kind {
             EventSubNoticeKind::HypeTrainLifecycle {
                 train_id,

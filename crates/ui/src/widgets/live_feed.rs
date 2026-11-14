@@ -189,7 +189,7 @@ impl<'a> LiveFeed<'a> {
         ui.painter().hline(
             rect.left() + m.pad_x..=rect.right() - m.pad_x,
             rect.bottom(),
-            egui::Stroke::new(1.0, t::border_subtle()),
+            egui::Stroke::new(1.0_f32, t::border_subtle()),
         );
 
         // Thumbnail rect, vertically centered

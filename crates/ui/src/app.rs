@@ -175,6 +175,53 @@ struct EventToast {
     born: std::time::Instant,
 }
 
+impl EventToast {
+    fn from_message(is_active: bool, message: &crust_core::model::ChatMessage) -> Option<Self> {
+        if !is_active || message.flags.is_history || message.flags.suppress_notification {
+            return None;
+        }
+        match &message.msg_kind {
+            MsgKind::Sub { display_name, months, is_gift, plan, .. } => {
+                let gifted_to_me = *is_gift && message.flags.is_mention;
+                let text = if gifted_to_me {
+                    format!("🎉🎊  You received a gifted {} sub!", plan)
+                } else if *is_gift {
+                    format!("🎁  {} received a gifted {} sub!", display_name, plan)
+                } else if *months <= 1 {
+                    format!("⭐  {} just subscribed with {}!", display_name, plan)
+                } else {
+                    format!("⭐  {} resubscribed x{}!", display_name, months)
+                };
+                Some(Self {
+                    text,
+                    hue: if gifted_to_me { t::raid_cyan() } else { t::gold() },
+                    confetti: gifted_to_me,
+                    born: std::time::Instant::now(),
+                })
+            }
+            MsgKind::Raid { display_name, viewer_count, .. } => Some(Self {
+                text: format!("🚀  {} is raiding with {} viewers!", display_name, viewer_count),
+                hue: t::raid_cyan(),
+                confetti: false,
+                born: std::time::Instant::now(),
+            }),
+            MsgKind::Bits { amount } if *amount >= 100 => Some(Self {
+                text: format!("💎  {} cheered {} bits!", message.sender.display_name, amount),
+                hue: t::bits_orange(),
+                confetti: false,
+                born: std::time::Instant::now(),
+            }),
+            _ if message.flags.is_pinned => Some(Self {
+                text: format!("📌  {} sent a pinned message", message.sender.display_name),
+                hue: t::gold(),
+                confetti: false,
+                born: std::time::Instant::now(),
+            }),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct PendingReply {
     channel: ChannelId,
@@ -290,6 +337,25 @@ impl SplitPanes {
     /// The channel of the focused pane, if any.
     fn focused_channel(&self) -> Option<&ChannelId> {
         self.panes.get(self.focused).map(|p| &p.channel)
+    }
+
+    /// Focus an existing channel pane or replace the focused pane's channel.
+    fn activate_channel(&mut self, channel: &ChannelId) {
+        if let Some(index) = self.panes.iter().position(|pane| &pane.channel == channel) {
+            self.focused = index;
+        } else if let Some(pane) = self.panes.get_mut(self.focused) {
+            pane.channel = channel.clone();
+            pane.input_buf.clear();
+        }
+    }
+
+    /// Keep both drafts when a redirected channel already has another pane.
+    fn redirect_channel(&mut self, old: &ChannelId, new: &ChannelId) {
+        for pane in &mut self.panes {
+            if &pane.channel == old {
+                pane.channel = new.clone();
+            }
+        }
     }
 
     /// Ensure all pane fractions sum to 1.0 and none are too tiny.
@@ -1185,32 +1251,32 @@ fn apply_theme_visuals(ctx: &egui::Context) {
 
     vis.widgets.inactive.weak_bg_fill = t::bg_surface();
     vis.widgets.inactive.bg_fill = t::bg_surface();
-    vis.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, t::text_secondary());
-    vis.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, t::border_subtle());
+    vis.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, t::text_secondary());
+    vis.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, t::border_subtle());
     vis.widgets.inactive.corner_radius = t::RADIUS;
 
     vis.widgets.hovered.weak_bg_fill = t::hover_bg();
     vis.widgets.hovered.bg_fill = t::hover_bg();
-    vis.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, t::text_primary());
-    vis.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, t::border_accent());
+    vis.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, t::text_primary());
+    vis.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, t::border_accent());
     vis.widgets.hovered.corner_radius = t::RADIUS;
 
     vis.widgets.active.weak_bg_fill = t::accent_dim();
     vis.widgets.active.bg_fill = t::accent_dim();
-    vis.widgets.active.fg_stroke = egui::Stroke::new(1.0, t::text_on_accent());
-    vis.widgets.active.bg_stroke = egui::Stroke::new(1.0, t::accent());
+    vis.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, t::text_on_accent());
+    vis.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, t::accent());
     vis.widgets.active.corner_radius = t::RADIUS;
 
     vis.widgets.open.weak_bg_fill = t::bg_raised();
     vis.widgets.open.bg_fill = t::bg_raised();
 
     vis.selection.bg_fill = t::accent_dim();
-    vis.selection.stroke = egui::Stroke::new(1.0, t::accent());
+    vis.selection.stroke = egui::Stroke::new(1.0_f32, t::accent());
 
     vis.window_corner_radius = t::RADIUS;
     vis.window_stroke = t::stroke_subtle();
     vis.menu_corner_radius = t::RADIUS;
-    vis.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, t::border_subtle());
+    vis.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, t::border_subtle());
 
     let mut style = egui::Style {
         visuals: vis,
@@ -2601,7 +2667,7 @@ exit 1
                 for (idx, item) in items.iter().enumerate() {
                     let mut frame = chrome::card_frame();
                     if idx == focused {
-                        frame = frame.stroke(egui::Stroke::new(1.5, t::accent()));
+                        frame = frame.stroke(egui::Stroke::new(1.5_f32, t::accent()));
                     }
                     frame.show(ui, |ui| {
                         ui.horizontal(|ui| {
@@ -2696,7 +2762,7 @@ exit 1
                 for (idx, (login, entry)) in filtered.iter().enumerate() {
                     let mut frame = chrome::card_frame();
                     if idx == focused {
-                        frame = frame.stroke(egui::Stroke::new(1.5, t::accent()));
+                        frame = frame.stroke(egui::Stroke::new(1.5_f32, t::accent()));
                     }
                     frame.show(ui, |ui| {
                         ui.horizontal(|ui| {
@@ -2837,7 +2903,7 @@ exit 1
                     let draft = drafts.entry(key).or_default();
                     let mut frame = chrome::card_frame();
                     if idx == focused {
-                        frame = frame.stroke(egui::Stroke::new(1.5, t::accent()));
+                        frame = frame.stroke(egui::Stroke::new(1.5_f32, t::accent()));
                     }
                     frame.show(ui, |ui| {
                         ui.horizontal(|ui| {
@@ -3227,7 +3293,7 @@ exit 1
                             idle_fill
                         })
                         .stroke(if is_selected {
-                            egui::Stroke::new(1.0, t::accent())
+                            egui::Stroke::new(1.0_f32, t::accent())
                         } else {
                             t::stroke_subtle()
                         })
@@ -3275,14 +3341,14 @@ exit 1
                                         if unread_mentions > 0 {
                                             chrome::pill(
                                                 ui,
-                                                compact_badge_count(unread_mentions).to_string(),
+                                                compact_badge_count(unread_mentions),
                                                 t::text_primary(),
                                                 t::mention_pill_bg(),
                                             );
                                         } else if unread > 0 {
                                             chrome::pill(
                                                 ui,
-                                                compact_badge_count(unread).to_string(),
+                                                compact_badge_count(unread),
                                                 t::gold(),
                                                 t::warning_soft_bg(),
                                             );
@@ -3413,7 +3479,7 @@ exit 1
                                                     |ui| {
                                                         egui::Frame::new()
                                                             .fill(self_fill)
-                                                            .stroke(egui::Stroke::new(1.0, self_stroke))
+                                                            .stroke(egui::Stroke::new(1.0_f32, self_stroke))
                                                             .corner_radius(t::RADIUS)
                                                             .inner_margin(Margin::symmetric(10, 8))
                                                             .show(ui, |ui| {
@@ -3449,7 +3515,7 @@ exit 1
                                                     |ui| {
                                                         egui::Frame::new()
                                                             .fill(other_fill)
-                                                            .stroke(egui::Stroke::new(1.0, other_stroke))
+                                                            .stroke(egui::Stroke::new(1.0_f32, other_stroke))
                                                             .corner_radius(t::RADIUS)
                                                             .inner_margin(Margin::symmetric(10, 8))
                                                             .show(ui, |ui| {
@@ -3789,19 +3855,51 @@ exit 1
                 old_channel,
                 new_channel,
             } => {
-                self.state.redirect_channel(&old_channel, &new_channel);
-                if let Some(cached) = self.sorted_chatters.remove(&old_channel) {
-                    self.sorted_chatters.insert(new_channel.clone(), cached);
-                }
-                if let Some(queue) = self.automod_queue.remove(&old_channel) {
-                    self.automod_queue.insert(new_channel.clone(), queue);
-                }
-                if let Some(requests) = self.unban_requests.remove(&old_channel) {
-                    self.unban_requests.insert(new_channel.clone(), requests);
-                }
-                if let Some(reply) = self.pending_reply.as_mut() {
-                    if reply.channel == old_channel {
-                        reply.channel = new_channel;
+                if self.state.redirect_channel(&old_channel, &new_channel) {
+                    self.split_panes.redirect_channel(&old_channel, &new_channel);
+                    self.sorted_chatters.remove(&old_channel);
+                    self.sorted_chatters.remove(&new_channel);
+                    self.chatters_dirty.remove(&old_channel);
+                    self.chatters_dirty.insert(new_channel.clone());
+                    if let Some(queue) = self.automod_queue.remove(&old_channel) {
+                        let destination = self.automod_queue.entry(new_channel.clone()).or_default();
+                        for item in queue {
+                            if !destination.iter().any(|existing| existing.message_id == item.message_id) {
+                                destination.push(item);
+                            }
+                        }
+                    }
+                    if let Some(requests) = self.unban_requests.remove(&old_channel) {
+                        let destination = self.unban_requests.entry(new_channel.clone()).or_default();
+                        for item in requests {
+                            if !destination.iter().any(|existing| existing.request_id == item.request_id) {
+                                destination.push(item);
+                            }
+                        }
+                    }
+                    if let Some(search) = self.message_search.remove(&old_channel) {
+                        self.message_search.entry(new_channel.clone()).or_insert(search);
+                    }
+                    if let Some(message_id) = self.pending_scroll_to_message.remove(&old_channel) {
+                        self.pending_scroll_to_message.entry(new_channel.clone()).or_insert(message_id);
+                    }
+                    if self.pending_active_snap.remove(&old_channel) {
+                        self.pending_active_snap.insert(new_channel.clone());
+                    }
+                    let old_prefix = format!("{}::", old_channel.as_str());
+                    let draft_keys: Vec<_> = self.unban_resolution_drafts.keys()
+                        .filter(|key| key.starts_with(&old_prefix)).cloned().collect();
+                    for key in draft_keys {
+                        if let Some(draft) = self.unban_resolution_drafts.remove(&key) {
+                            let suffix = &key[old_prefix.len()..];
+                            self.unban_resolution_drafts
+                                .entry(format!("{}::{suffix}", new_channel.as_str())).or_insert(draft);
+                        }
+                    }
+                    if let Some(reply) = self.pending_reply.as_mut() {
+                        if reply.channel == old_channel {
+                            reply.channel = new_channel;
+                        }
                     }
                 }
             }
@@ -3905,73 +4003,7 @@ exit 1
 
                 // Generate a short-lived event toast for high-visibility events.
                 // Only pop banners for the channel the user is watching.
-                let maybe_toast: Option<EventToast> = if !is_active {
-                    None
-                } else {
-                    match &message.msg_kind {
-                        MsgKind::Sub {
-                            display_name,
-                            months,
-                            is_gift,
-                            plan,
-                            ..
-                        } => {
-                            let gifted_to_me = *is_gift && message.flags.is_mention;
-                            let text = if gifted_to_me {
-                                format!("🎉🎊  You received a gifted {} sub!", plan)
-                            } else if *is_gift {
-                                format!("🎁  {} received a gifted {} sub!", display_name, plan)
-                            } else if *months <= 1 {
-                                format!("⭐  {} just subscribed with {}!", display_name, plan)
-                            } else {
-                                format!("⭐  {} resubscribed x{}!", display_name, months)
-                            };
-                            Some(EventToast {
-                                text,
-                                hue: if gifted_to_me {
-                                    t::raid_cyan()
-                                } else {
-                                    t::gold()
-                                },
-                                confetti: gifted_to_me,
-                                born: std::time::Instant::now(),
-                            })
-                        }
-                        MsgKind::Raid {
-                            display_name,
-                            viewer_count,
-                            ..
-                        } => Some(EventToast {
-                            text: format!(
-                                "🚀  {} is raiding with {} viewers!",
-                                display_name, viewer_count
-                            ),
-                            hue: t::raid_cyan(),
-                            confetti: false,
-                            born: std::time::Instant::now(),
-                        }),
-                        MsgKind::Bits { amount } if *amount >= 100 => Some(EventToast {
-                            text: format!(
-                                "💎  {} cheered {} bits!",
-                                message.sender.display_name, amount
-                            ),
-                            hue: t::bits_orange(),
-                            confetti: false,
-                            born: std::time::Instant::now(),
-                        }),
-                        _ if message.flags.is_pinned => Some(EventToast {
-                            text: format!(
-                                "📌  {} sent a pinned message",
-                                message.sender.display_name
-                            ),
-                            hue: t::gold(),
-                            confetti: false,
-                            born: std::time::Instant::now(),
-                        }),
-                        _ => None,
-                    }
-                };
-                if let Some(toast) = maybe_toast {
+                if let Some(toast) = EventToast::from_message(is_active, &message) {
                     self.enqueue_event_toast(toast);
                 }
 
@@ -4010,9 +4042,10 @@ exit 1
                         MsgKind::Chat | MsgKind::Bits { .. } => {
                             let display_name = message.sender.display_name.trim();
                             if !display_name.is_empty() {
-                                let should_insert = ch.chatters.contains(display_name)
-                                    || ch.chatters.len() < MAX_TRACKED_CHATTERS;
-                                if should_insert && ch.chatters.insert(display_name.to_owned()) {
+                                if ch.chatters.len() < MAX_TRACKED_CHATTERS
+                                    && !ch.chatters.contains(display_name)
+                                {
+                                    ch.chatters.insert(display_name.to_owned());
                                     // Defer the sort.  On busy channels with
                                     // thousands of chatters, rebuilding the
                                     // sorted vec on every unique new chatter
@@ -4030,9 +4063,10 @@ exit 1
                     // duplicate entry.  absorb_own_echo returns true when an
                     // unconfirmed local echo was found and stamped with the
                     // real server_id; in that case we skip the normal push.
-                    let absorbed = message.flags.is_self
+                    let absorbed = (message.flags.is_self
                         && message.server_id.is_some()
-                        && ch.absorb_own_echo(&message);
+                        && ch.absorb_own_echo(&message))
+                        || ch.absorb_moderation_notice(&message);
                     if absorbed {
                         // Echo landed on an existing local copy; the mention
                         // (if any) was already recorded when that local copy
@@ -4827,6 +4861,11 @@ exit 1
                     ch.messages.clear();
                 }
             }
+            AppEvent::ChannelChatCleared { channel } => {
+                if let Some(ch) = self.state.channels.get_mut(&channel) {
+                    ch.delete_all_chat_messages();
+                }
+            }
             AppEvent::SelfAvatarLoaded { avatar_url } => {
                 self.state.auth.avatar_url = Some(avatar_url);
             }
@@ -5455,6 +5494,9 @@ exit 1
                     },
                 );
             }
+            AppEvent::HypeTrainCleared { channel, checked_at } => {
+                self.state.clear_hype_train_if_stale(&channel, checked_at);
+            }
             AppEvent::RaidBannerShown {
                 channel,
                 display_name,
@@ -5710,7 +5752,7 @@ exit 1
                         rect,
                         t::RADIUS,
                         bg,
-                        egui::Stroke::new(1.0, border),
+                        egui::Stroke::new(1.0_f32, border),
                         egui::StrokeKind::Middle,
                     );
 
@@ -6205,7 +6247,7 @@ exit 1
                                 row_rect,
                                 t::RADIUS_SM,
                                 row_fill,
-                                egui::Stroke::new(1.0, t::border_subtle()),
+                                egui::Stroke::new(1.0_f32, t::border_subtle()),
                                 egui::StrokeKind::Middle,
                             );
 
@@ -6364,13 +6406,7 @@ exit 1
                 ctx.request_repaint();
             }
         }
-        if !self.split_panes.panes.is_empty() {
-            let focused = self.split_panes.focused;
-            if let Some(pane) = self.split_panes.panes.get_mut(focused) {
-                pane.channel = channel.clone();
-                pane.input_buf.clear();
-            }
-        }
+        self.split_panes.activate_channel(&channel);
         self.state.active_channel = Some(channel.clone());
         self.persist_active_channel(&channel);
     }
@@ -7824,7 +7860,7 @@ impl eframe::App for CrustApp {
                         top: 4,
                         bottom: 1,
                     })
-                    .stroke(egui::Stroke::new(1.0, t::border_subtle())),
+                    .stroke(egui::Stroke::new(1.0_f32, t::border_subtle())),
             )
             .show(ctx, |ui| {
                 let bar_width = ui.available_width();
@@ -8320,7 +8356,7 @@ impl eframe::App for CrustApp {
                         Frame::new()
                             .fill(t::bg_header())
                             .inner_margin(t::TAB_STRIP_MARGIN)
-                            .stroke(egui::Stroke::new(1.0, t::border_subtle())),
+                            .stroke(egui::Stroke::new(1.0_f32, t::border_subtle())),
                     )
                     .show(ctx, |ui| {
                         egui::ScrollArea::horizontal()
@@ -8342,9 +8378,9 @@ impl eframe::App for CrustApp {
                                             (t::text_primary(), t::bg_surface())
                                         };
                                         let stroke = if is_active {
-                                            egui::Stroke::new(1.0, t::border_accent())
+                                            egui::Stroke::new(1.0_f32, t::border_accent())
                                         } else {
-                                            egui::Stroke::new(1.0, t::border_subtle())
+                                            egui::Stroke::new(1.0_f32, t::border_subtle())
                                         };
                                         let count = self.state.live_channels.len();
                                         let tab_frame = egui::Frame::new()
@@ -8406,9 +8442,9 @@ impl eframe::App for CrustApp {
                                             (t::text_primary(), t::bg_surface())
                                         };
                                         let stroke = if is_active {
-                                            egui::Stroke::new(1.0, t::border_accent())
+                                            egui::Stroke::new(1.0_f32, t::border_accent())
                                         } else {
-                                            egui::Stroke::new(1.0, t::border_subtle())
+                                            egui::Stroke::new(1.0_f32, t::border_subtle())
                                         };
                                         let total = self.state.mentions.len();
                                         let unread = self.state.mentions_unread;
@@ -8529,9 +8565,9 @@ impl eframe::App for CrustApp {
                                         };
 
                                         let tab_stroke = if is_active {
-                                            egui::Stroke::new(1.0, t::border_accent())
+                                            egui::Stroke::new(1.0_f32, t::border_accent())
                                         } else {
-                                            egui::Stroke::new(1.0, t::border_subtle())
+                                            egui::Stroke::new(1.0_f32, t::border_subtle())
                                         };
 
                                         let mut close_clicked = false;
@@ -8890,7 +8926,7 @@ impl eframe::App for CrustApp {
                         Frame::new()
                             .fill(t::bg_surface())
                             .inner_margin(t::SIDEBAR_MARGIN)
-                            .stroke(egui::Stroke::new(1.0, t::border_subtle())),
+                            .stroke(egui::Stroke::new(1.0_f32, t::border_subtle())),
                     )
                     .show(ctx, |ui| {
                         if has_host_panels_for_slot(
@@ -9224,7 +9260,7 @@ impl eframe::App for CrustApp {
                             Frame::new()
                                 .fill(t::bg_surface())
                                 .inner_margin(t::SIDEBAR_MARGIN)
-                                .stroke(egui::Stroke::new(1.0, t::border_subtle())),
+                                .stroke(egui::Stroke::new(1.0_f32, t::border_subtle())),
                         )
                         .show(ctx, |ui| {
                             self.analytics_panel.show(ui, ch_state);
@@ -9341,7 +9377,7 @@ impl eframe::App for CrustApp {
                             ui.painter().vline(
                                 pane_left - sep_w * 0.5,
                                 total.y_range(),
-                                egui::Stroke::new(1.0, t::border_subtle()),
+                                egui::Stroke::new(1.0_f32, t::border_subtle()),
                             );
                         }
 
@@ -9358,6 +9394,7 @@ impl eframe::App for CrustApp {
 
                         let mut pane_ui = ui.new_child(
                             egui::UiBuilder::new()
+                                .id_salt(("split_pane", pi))
                                 .max_rect(pane_rect)
                                 .layout(egui::Layout::top_down(egui::Align::LEFT)),
                         );
@@ -9460,9 +9497,10 @@ impl eframe::App for CrustApp {
                         }
 
                         // Pane chat input (bottom)
-                        let input_h = t::bar_h()
+                        let input_h = (t::chat_font_size() + 16.0).max(t::bar_h())
                             + (t::INPUT_MARGIN.top + t::INPUT_MARGIN.bottom)
-                                as f32;
+                                as f32
+                            + pane_inner_pad;
                         let input_rect = egui::Rect::from_min_max(
                             egui::pos2(
                                 pane_rect.left() + pane_inner_pad,
@@ -9482,11 +9520,12 @@ impl eframe::App for CrustApp {
                         ui.painter().hline(
                             input_rect.x_range(),
                             input_rect.top(),
-                            egui::Stroke::new(1.0, t::border_subtle()),
+                            egui::Stroke::new(1.0_f32, t::border_subtle()),
                         );
                         {
                         let mut inp_ui = pane_ui.new_child(
                             egui::UiBuilder::new()
+                                .id_salt("chat_input_tray")
                                 .max_rect(input_rect)
                                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
                         );
@@ -9514,6 +9553,10 @@ impl eframe::App for CrustApp {
                                 prevent_overlong_twitch_messages: self
                                     .prevent_overlong_twitch_messages,
                                 animate_emotes: animations_allowed,
+                                accept_dropped_files: ctx.pointer_latest_pos().map_or(is_focused, |pos| {
+                                    pane_rect.contains(pos)
+                                        && ctx.layer_id_at(pos) == Some(pane_ui.layer_id())
+                                }),
                             };
                             let inp = chat.show(
                                 &mut inp_ui,
@@ -9929,7 +9972,7 @@ impl eframe::App for CrustApp {
                             Frame::new()
                                 .fill(t::bg_surface())
                                 .inner_margin(Margin::ZERO)
-                                .stroke(egui::Stroke::new(1.0, t::border_subtle())),
+                                .stroke(egui::Stroke::new(1.0_f32, t::border_subtle())),
                         )
                         .show_inside(ui, |ui| {
                             // Collect sorted chatters for @username autocomplete
@@ -9952,6 +9995,9 @@ impl eframe::App for CrustApp {
                                 prevent_overlong_twitch_messages: self
                                     .prevent_overlong_twitch_messages,
                                 animate_emotes: animations_allowed,
+                                accept_dropped_files: ctx.pointer_latest_pos().map_or(true, |pos| {
+                                    ctx.layer_id_at(pos) == Some(ui.layer_id())
+                                }),
                             };
                             let result = chat.show(ui, &mut self.chat_input_buf);
                             for up in result.uploads {
@@ -10307,7 +10353,7 @@ impl eframe::App for CrustApp {
                         zone_rect,
                         egui::CornerRadius::same(8),
                         t::alpha(ac, alpha),
-                        egui::Stroke::new(2.0, t::alpha(ac, border_alpha)),
+                        egui::Stroke::new(2.0_f32, t::alpha(ac, border_alpha)),
                         egui::epaint::StrokeKind::Outside,
                     );
                     // Center label.
@@ -10356,14 +10402,14 @@ impl eframe::App for CrustApp {
                     let time = ctx.input(|input| input.time) as f32;
                     let border_stroke = if toast.confetti {
                         egui::Stroke::new(
-                            1.6,
+                            1.6_f32,
                             rainbow_color(
                                 (time * 0.16 + age * 0.35).fract(),
                                 (200.0 * opacity) as u8,
                             ),
                         )
                     } else {
-                        egui::Stroke::new(1.5, t::alpha(toast.hue, (160.0 * opacity) as u8))
+                        egui::Stroke::new(1.5_f32, t::alpha(toast.hue, (160.0 * opacity) as u8))
                     };
                     let fill_col = {
                         let o = t::overlay_fill();
@@ -10483,7 +10529,7 @@ impl eframe::App for CrustApp {
 fn channel_tab_badge(ui: &mut egui::Ui, label: String, fg: Color32, bg: Color32) {
     egui::Frame::new()
         .fill(bg)
-        .stroke(egui::Stroke::new(1.0, fg.gamma_multiply(0.35)))
+        .stroke(egui::Stroke::new(1.0_f32, fg.gamma_multiply(0.35)))
         .corner_radius(t::RADIUS_SM)
         .inner_margin(egui::Margin::symmetric(5, 0))
         .show(ui, |ui| {
@@ -12418,11 +12464,101 @@ mod tests {
     use super::{
         filter_channels_for_query, parse_slash_command, parse_twitch_channel_login_arg,
         quick_switch_priority_bucket, responsive_layout, toolbar_visibility, top_tab_metrics,
-        whisper_thread_matches_query, TabVisualStyle,
+        whisper_thread_matches_query, EventToast, SplitPanes, TabVisualStyle,
     };
     use crate::theme as t;
     use crust_core::events::AppCommand;
     use crust_core::model::ChannelId;
+
+    #[test]
+    fn redirecting_splits_preserves_both_drafts_and_focused_pane() {
+        let old = ChannelId::irc("irc.example", 6697, true, "old");
+        let new = ChannelId::irc("irc.example", 6697, true, "new");
+        let other = ChannelId::new("other");
+        let mut splits = SplitPanes::default();
+        splits.add_pane(old.clone(), None);
+        splits.add_pane(other.clone(), None);
+        splits.panes[0].input_buf = "source draft".to_owned();
+        splits.focused = 0;
+        splits.redirect_channel(&old, &new);
+        assert_eq!(splits.panes[0].channel, new);
+        assert_eq!(splits.panes[0].input_buf, "source draft");
+        assert_eq!(splits.panes[1].channel, other);
+        assert_eq!(splits.focused, 0);
+
+        splits.panes[0].channel = old.clone();
+        splits.panes[1].channel = new.clone();
+        splits.panes[1].input_buf = "destination draft".to_owned();
+        splits.redirect_channel(&old, &new);
+        assert_eq!(splits.panes.len(), 2);
+        assert!(splits.panes.iter().all(|pane| pane.channel == new));
+        assert_eq!(splits.panes[0].input_buf, "source draft");
+        assert_eq!(splits.panes[1].input_buf, "destination draft");
+        assert_eq!(splits.focused, 0);
+        splits.redirect_channel(&new, &new);
+        assert_eq!(splits.panes[1].input_buf, "destination draft");
+    }
+
+    #[test]
+    fn reactivating_visible_split_preserves_panes_and_drafts() {
+        let alice = ChannelId::new("alice");
+        let bob = ChannelId::new("bob");
+        let mut splits = SplitPanes::default();
+        splits.add_pane(alice.clone(), None);
+        splits.add_pane(bob.clone(), None);
+        splits.panes[0].input_buf = "draft for alice".to_owned();
+        splits.panes[1].input_buf = "draft for bob".to_owned();
+
+        splits.activate_channel(&alice);
+        assert_eq!(splits.focused, 0);
+        assert_eq!(splits.panes[0].input_buf, "draft for alice");
+        splits.activate_channel(&bob);
+        assert_eq!(splits.focused, 1);
+        assert_eq!(splits.panes.len(), 2);
+        assert_eq!(splits.panes[0].channel, alice);
+        assert_eq!(splits.panes[1].channel, bob);
+        assert_eq!(splits.panes[0].input_buf, "draft for alice");
+        assert_eq!(splits.panes[1].input_buf, "draft for bob");
+    }
+
+    #[test]
+    fn event_toasts_suppress_history_mirrors_and_background_channels() {
+        use crust_core::model::{ChatMessage, MessageFlags, MessageId, MsgKind, Sender, UserId};
+
+        let mut message = ChatMessage {
+            id: MessageId(1),
+            server_id: None,
+            timestamp: chrono::Utc::now(),
+            channel: ChannelId::new("example"),
+            sender: Sender {
+                user_id: UserId("1".to_owned()),
+                login: "sender".to_owned(),
+                display_name: "Sender".to_owned(),
+                color: None,
+                name_paint: None,
+                badges: Vec::new(),
+            },
+            raw_text: String::new(),
+            spans: Default::default(),
+            twitch_emotes: Vec::new(),
+            flags: MessageFlags::default(),
+            reply: None,
+            msg_kind: MsgKind::Bits { amount: 100 },
+            shared: None,
+        };
+        let live = EventToast::from_message(true, &message).expect("live cheer toast");
+        assert!(live.text.contains("Sender cheered 100 bits"));
+        assert!(!live.confetti);
+        assert!(EventToast::from_message(false, &message).is_none());
+        message.flags.is_history = true;
+        assert!(EventToast::from_message(true, &message).is_none());
+        message.flags.is_history = false;
+        message.flags.suppress_notification = true;
+        assert!(EventToast::from_message(true, &message).is_none());
+        message.flags.suppress_notification = false;
+        message.msg_kind = MsgKind::Bits { amount: 99 };
+        assert!(EventToast::from_message(true, &message).is_none());
+    }
 
     #[test]
     fn responsive_layout_prefers_top_tabs_on_narrow_windows() {

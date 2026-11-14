@@ -404,7 +404,7 @@ impl UserProfilePopup {
                 p.circle_stroke(
                     av_rect.center(),
                     AV / 2.0,
-                    egui::Stroke::new(2.0, t::accent()),
+                    egui::Stroke::new(2.0_f32, t::accent()),
                 );
                 p.text(
                     av_rect.center(),
@@ -484,7 +484,7 @@ impl UserProfilePopup {
                                 .fill(t::alpha(c, 35))
                                 .corner_radius(t::RADIUS_SM)
                                 .inner_margin(egui::Margin::symmetric(5, 2))
-                                .stroke(egui::Stroke::new(1.0, c))
+                                .stroke(egui::Stroke::new(1.0_f32, c))
                                 .show(ui, |ui| {
                                     ui.add(egui::Label::new(
                                         RichText::new("● Chat color").color(c).small(),
@@ -548,7 +548,7 @@ impl UserProfilePopup {
 
         egui::Frame::new()
             .fill(t::bg_card())
-            .stroke(egui::Stroke::new(1.0, t::border_subtle()))
+            .stroke(egui::Stroke::new(1.0_f32, t::border_subtle()))
             .corner_radius(t::RADIUS_SM)
             .inner_margin(egui::Margin::symmetric(6, 5))
             .show(ui, |ui| {
@@ -582,7 +582,7 @@ impl UserProfilePopup {
         egui::Frame::new()
             .fill(t::danger_soft_bg())
             .corner_radius(t::RADIUS)
-            .stroke(egui::Stroke::new(1.0, t::alpha(t::red(), 80)))
+            .stroke(egui::Stroke::new(1.0_f32, t::alpha(t::red(), 80)))
             .inner_margin(egui::Margin::symmetric(8, 6))
             .show(ui, |ui| {
                 if let Some(ref title) = profile.stream_title {
@@ -658,7 +658,7 @@ impl UserProfilePopup {
                     .fill(bg)
                     .corner_radius(CornerRadius::same(4))
                     .stroke(if active {
-                        egui::Stroke::new(1.0, t::border_subtle())
+                        egui::Stroke::new(1.0_f32, t::border_subtle())
                     } else {
                         egui::Stroke::NONE
                     })
@@ -836,7 +836,7 @@ impl UserProfilePopup {
     fn render_profile_tab(&self, ui: &mut egui::Ui, profile: &UserProfile) {
         egui::Frame::new()
             .fill(t::bg_card())
-            .stroke(egui::Stroke::new(1.0, t::border_subtle()))
+            .stroke(egui::Stroke::new(1.0_f32, t::border_subtle()))
             .corner_radius(t::RADIUS_SM)
             .inner_margin(egui::Margin::symmetric(8, 6))
             .show(ui, |ui| {
@@ -900,7 +900,7 @@ impl UserProfilePopup {
             ui.add_space(5.0);
             egui::Frame::new()
                 .fill(t::bg_card())
-                .stroke(egui::Stroke::new(1.0, t::border_subtle()))
+                .stroke(egui::Stroke::new(1.0_f32, t::border_subtle()))
                 .corner_radius(t::RADIUS_SM)
                 .inner_margin(egui::Margin::symmetric(8, 6))
                 .show(ui, |ui| {
@@ -924,7 +924,7 @@ impl UserProfilePopup {
             ui.add_space(5.0);
             egui::Frame::new()
                 .fill(t::bg_card())
-                .stroke(egui::Stroke::new(1.0, t::border_subtle()))
+                .stroke(egui::Stroke::new(1.0_f32, t::border_subtle()))
                 .corner_radius(t::RADIUS_SM)
                 .inner_margin(egui::Margin::symmetric(8, 6))
                 .show(ui, |ui| {
@@ -1565,7 +1565,7 @@ fn small_action_btn(ui: &mut egui::Ui, label: &str) -> bool {
     ui.add(
         egui::Button::new(RichText::new(label).small())
             .fill(t::bg_raised())
-            .stroke(egui::Stroke::new(1.0, t::border_subtle()))
+            .stroke(egui::Stroke::new(1.0_f32, t::border_subtle()))
             .min_size(egui::vec2(72.0, 20.0)),
     )
     .clicked()

@@ -1,8 +1,7 @@
 //! Tokenizer for the filter expression language.
 //!
-//! Mirrors `chatterino2-master/src/controllers/filters/lang/Tokenizer.cpp` but
-//! produces `Spanned<Token>` values rather than raw strings so the parser can
-//! report precise error locations.
+//! Produces `Spanned<Token>` values so the parser can report precise error
+//! locations.
 
 use thiserror::Error;
 
@@ -293,9 +292,7 @@ impl<'a> Lexer<'a> {
                 b'!' => return Ok(Some(self.consume_n(Token::Not, 1, start, line, col))),
                 b'+' => return Ok(Some(self.consume_n(Token::Plus, 1, start, line, col))),
                 b'-' => {
-                    // Could be a negative integer literal if followed by a digit,
-                    // but Chatterino treats '-' as an operator and parses
-                    // negatives as Minus <int>. We match that behavior.
+                    // The parser handles negation from a separate Minus token.
                     return Ok(Some(self.consume_n(Token::Minus, 1, start, line, col)));
                 }
                 b'*' => return Ok(Some(self.consume_n(Token::Multiply, 1, start, line, col))),

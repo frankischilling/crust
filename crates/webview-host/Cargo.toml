@@ -15,7 +15,7 @@ name = "crust-webview"
 path = "src/main.rs"
 
 [dependencies]
-crust-webview = { path = "../webview", version = "0.5.1" }
+crust-webview = { workspace = true }
 wry = { version = "0.55", default-features = false, features = ["os-webview", "protocol"] }
 tao = "0.30"
 serde_json = { workspace = true }

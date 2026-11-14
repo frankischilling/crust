@@ -182,7 +182,7 @@ pub fn show_channel_info_bars(
 
                                 egui::Frame::new()
                                     .fill(status_bg)
-                                    .stroke(egui::Stroke::new(1.0, status_col.gamma_multiply(0.5)))
+                                    .stroke(egui::Stroke::new(1.0_f32, status_col.gamma_multiply(0.5)))
                                     .corner_radius(t::RADIUS_SM)
                                     .inner_margin(egui::Margin::symmetric(6, 1))
                                     .show(ui, |ui| {
@@ -392,7 +392,7 @@ pub fn show_channel_info_bars(
                     Frame::new()
                         .fill(t::warning_soft_bg())
                         .inner_margin(egui::Margin::symmetric(8, 3))
-                        .stroke(egui::Stroke::new(1.0, t::gold().gamma_multiply(0.45))),
+                        .stroke(egui::Stroke::new(1.0_f32, t::gold().gamma_multiply(0.45))),
                 )
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
@@ -431,7 +431,7 @@ fn points_pill(ui: &mut egui::Ui, balance: u64) {
     let color = t::gold();
     egui::Frame::new()
         .fill(t::alpha(color, 22))
-        .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.5)))
+        .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.5)))
         .corner_radius(t::RADIUS_SM)
         .inner_margin(egui::Margin::symmetric(6, 1))
         .show(ui, |ui| {
@@ -459,7 +459,7 @@ fn fmt_points(n: u64) -> String {
 fn room_state_pill(ui: &mut egui::Ui, text: &str, color: Color32) {
     egui::Frame::new()
         .fill(t::alpha(color, 20))
-        .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.4)))
+        .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.4)))
         .corner_radius(t::RADIUS_SM)
         .inner_margin(egui::Margin::symmetric(5, 0))
         .show(ui, |ui| {

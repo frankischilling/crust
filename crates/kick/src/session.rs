@@ -504,9 +504,11 @@ impl KickSession {
                 is_mention: false,
                 custom_reward_id: None,
                 is_history: false,
+                suppress_notification: false,
             },
             reply: None,
             msg_kind: MsgKind::Chat,
+            shared: None,
         };
 
         self.emit(KickEvent::ChatMessage(chat_msg)).await;
@@ -623,9 +625,11 @@ impl KickSession {
                 is_mention: false,
                 custom_reward_id: None,
                 is_history: false,
+                suppress_notification: false,
             },
             reply: None,
             msg_kind: MsgKind::Chat,
+            shared: None,
         };
 
         self.emit(KickEvent::ChatMessage(chat_msg)).await;

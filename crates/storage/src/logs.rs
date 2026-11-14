@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, NaiveDate, Utc};
 use crust_core::model::{ChannelId, ChatMessage, MessageFlags, MessageId, MsgKind, Sender, UserId};
 use directories::ProjectDirs;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, TransactionBehavior};
 
 use crate::StorageError;
 
@@ -12,9 +12,7 @@ const SQLITE_LOG_FILENAME: &str = "chat_logs.sqlite3";
 const DEFAULT_RECENT_LIMIT: usize = 800;
 const MAX_ROWS_PER_CHANNEL: i64 = 50_000;
 
-/// SQLite-backed chat log store.
-///
-/// This replaces legacy flat-file day logs with indexed per-channel history.
+/// SQLite chat history with indexed reads and a per-channel retention limit.
 #[derive(Clone)]
 pub struct LogStore {
     conn: Arc<Mutex<Connection>>,
@@ -35,10 +33,10 @@ impl LogStore {
     }
 
     pub fn with_db_path(path: PathBuf) -> Result<Self, StorageError> {
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(&path)?;
+        let mut conn = Connection::open(&path)?;
         conn.execute_batch(
             r#"
             PRAGMA journal_mode = WAL;
@@ -57,6 +55,40 @@ impl LogStore {
                 ON chat_messages(channel, server_id);
             "#,
         )?;
+        // Seed counts once for existing databases. Triggers keep them accurate
+        // across transactions and other connections without rescanning history.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let has_counts: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'chat_message_counts')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_counts {
+            tx.execute_batch(
+                "CREATE TABLE chat_message_counts (
+                    channel TEXT PRIMARY KEY,
+                    message_count INTEGER NOT NULL
+                 );
+                 INSERT INTO chat_message_counts(channel, message_count)
+                 SELECT channel, COUNT(*) FROM chat_messages GROUP BY channel;",
+            )?;
+        }
+        tx.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS chat_message_count_insert
+             AFTER INSERT ON chat_messages BEGIN
+                 INSERT INTO chat_message_counts(channel, message_count)
+                 VALUES (NEW.channel, 1)
+                 ON CONFLICT(channel) DO UPDATE
+                     SET message_count = message_count + 1;
+             END;
+             CREATE TRIGGER IF NOT EXISTS chat_message_count_delete
+             AFTER DELETE ON chat_messages BEGIN
+                 UPDATE chat_message_counts SET message_count = message_count - 1
+                 WHERE channel = OLD.channel;
+             END;",
+        )?;
+        tx.commit()?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             db_path: path,
@@ -71,30 +103,38 @@ impl LogStore {
         }
         let payload = serde_json::to_string(msg).map_err(|e| StorageError::Serde(e.to_string()))?;
         let ts_ms = msg.timestamp.timestamp_millis();
-        let channel = msg.channel.as_str().to_owned();
-        let server_id = msg.server_id.clone();
+        let channel = msg.channel.as_str();
+        let server_id = msg.server_id.as_deref().filter(|id| !id.is_empty());
         let mut conn = self
             .conn
             .lock()
             .map_err(|_| StorageError::Io(std::io::Error::other("chat log DB mutex poisoned")))?;
         let tx = conn.transaction()?;
-        tx.execute(
+        let inserted = tx.execute(
             "INSERT INTO chat_messages(channel, ts_ms, server_id, payload_json)
-             VALUES (?1, ?2, ?3, ?4)",
+             SELECT ?1, ?2, ?3, ?4
+             WHERE ?3 IS NULL OR NOT EXISTS (
+                 SELECT 1 FROM chat_messages WHERE channel = ?1 AND server_id = ?3
+             )",
             params![channel, ts_ms, server_id, payload],
         )?;
-        // Keep only the most recent rows for each channel.
-        tx.execute(
-            "DELETE FROM chat_messages
-             WHERE id IN (
-               SELECT id
-               FROM chat_messages
-               WHERE channel = ?1
-               ORDER BY ts_ms DESC, id DESC
-               LIMIT -1 OFFSET ?2
-             )",
-            params![msg.channel.as_str(), MAX_ROWS_PER_CHANNEL],
-        )?;
+        if inserted != 0 {
+            let count: i64 = tx.query_row(
+                "SELECT message_count FROM chat_message_counts WHERE channel = ?1",
+                params![channel],
+                |row| row.get(0),
+            )?;
+            if count > MAX_ROWS_PER_CHANNEL {
+                // The timestamp index reaches the oldest excess rows directly.
+                tx.execute(
+                    "DELETE FROM chat_messages WHERE id IN (
+                         SELECT id FROM chat_messages WHERE channel = ?1
+                         ORDER BY ts_ms ASC, id ASC LIMIT ?2
+                     )",
+                    params![channel, count - MAX_ROWS_PER_CHANNEL],
+                )?;
+            }
+        }
         tx.commit()?;
         Ok(())
     }
@@ -153,6 +193,9 @@ impl LogStore {
             r#"SELECT payload_json
              FROM chat_messages
              WHERE channel NOT LIKE 'whisper:%'
+               AND CASE WHEN json_valid(payload_json)
+                   THEN COALESCE(json_extract(payload_json, '$.flags.suppress_notification'), 0) = 0
+                   ELSE 0 END
                AND (
                  payload_json LIKE '%"is_highlighted":true%'
                  OR payload_json LIKE '%"is_mention":true%'
@@ -172,7 +215,9 @@ impl LogStore {
                 // false-positives (e.g. a user typed `"is_mention":true` in
                 // chat and it slipped through escaping).
                 let f = &msg.flags;
-                if f.is_highlighted || f.is_mention || f.is_first_msg || f.is_pinned {
+                if !f.suppress_notification
+                    && (f.is_highlighted || f.is_mention || f.is_first_msg || f.is_pinned)
+                {
                     out.push(msg);
                 }
             }
@@ -355,6 +400,285 @@ mod tests {
         std::env::temp_dir().join(format!("crust-{name}-{nanos}.sqlite3"))
     }
 
+    fn message(id: u64, timestamp_ms: i64, channel: &str) -> ChatMessage {
+        ChatMessage {
+            id: MessageId(id),
+            server_id: Some(format!("message-{id}")),
+            timestamp: Utc.timestamp_millis_opt(timestamp_ms).unwrap(),
+            channel: ChannelId::new(channel),
+            sender: Sender {
+                user_id: UserId("1".to_owned()),
+                login: "alice".to_owned(),
+                display_name: "Alice".to_owned(),
+                color: None,
+                name_paint: None,
+                badges: Vec::new(),
+            },
+            raw_text: format!("message {id}"),
+            spans: Default::default(),
+            twitch_emotes: Vec::new(),
+            flags: MessageFlags::default(),
+            reply: None,
+            msg_kind: MsgKind::Chat,
+            shared: None,
+        }
+    }
+
+    #[test]
+    fn repeated_server_ids_are_deduplicated_per_channel() {
+        let store = LogStore::with_db_path(PathBuf::from(":memory:")).unwrap();
+        let original = message(1, 1000, "first");
+        store.append_message(&original).unwrap();
+        store.append_message(&original).unwrap();
+        let mut other_channel = original.clone();
+        other_channel.channel = ChannelId::new("second");
+        store.append_message(&other_channel).unwrap();
+        let mut without_id = message(2, 2000, "first");
+        without_id.server_id = None;
+        store.append_message(&without_id).unwrap();
+        store.append_message(&without_id).unwrap();
+        let mut history = message(3, 3000, "first");
+        history.flags.is_history = true;
+        store.append_message(&history).unwrap();
+        assert_eq!(
+            store.recent_messages(&original.channel, 10).unwrap().len(),
+            3
+        );
+        assert_eq!(
+            store
+                .recent_messages(&other_channel.channel, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        let conn = store.conn.lock().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT message_count FROM chat_message_counts WHERE channel = 'first'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn retention_keeps_exact_limit_and_evicts_by_timestamp_then_id() {
+        let store = LogStore::with_db_path(PathBuf::from(":memory:")).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "WITH RECURSIVE rows(n) AS (
+                     VALUES(1) UNION ALL SELECT n + 1 FROM rows WHERE n < ?1
+                 )
+                 INSERT INTO chat_messages(channel, ts_ms, server_id, payload_json)
+                 SELECT 'busy', n, 'seed-' || n, '{}' FROM rows",
+                params![MAX_ROWS_PER_CHANNEL],
+            )
+            .unwrap();
+        }
+        store
+            .append_message(&message(100_000, MAX_ROWS_PER_CHANNEL + 1, "busy"))
+            .unwrap();
+        store.append_message(&message(100_001, 0, "busy")).unwrap();
+        store
+            .append_message(&message(100_002, MAX_ROWS_PER_CHANNEL + 1, "busy"))
+            .unwrap();
+        store.append_message(&message(100_003, 0, "other")).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let (count, oldest, newest): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), MIN(ts_ms), MAX(ts_ms) FROM chat_messages WHERE channel = 'busy'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (count, oldest, newest),
+            (MAX_ROWS_PER_CHANNEL, 3, MAX_ROWS_PER_CHANNEL + 1)
+        );
+        let recorded: i64 = conn
+            .query_row(
+                "SELECT message_count FROM chat_message_counts WHERE channel = 'busy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded, count);
+        let other: i64 = conn
+            .query_row(
+                "SELECT message_count FROM chat_message_counts WHERE channel = 'other'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(other, 1);
+    }
+
+    #[test]
+    #[ignore = "manual performance comparison; timings depend on the machine"]
+    fn perf_log_retention() {
+        use std::time::Instant;
+
+        const APPENDS: i64 = 500;
+        let messages: Vec<_> = (1..=APPENDS)
+            .map(|n| {
+                message(
+                    (MAX_ROWS_PER_CHANNEL + n) as u64,
+                    MAX_ROWS_PER_CHANNEL + n,
+                    "busy",
+                )
+            })
+            .collect();
+        let mut previous_samples = Vec::new();
+        let mut current_samples = Vec::new();
+
+        for round in 0..5 {
+            // Alternate order to reduce warm-up bias. Seed and migration are
+            // outside the timing; both variants start with 50,000 indexed rows.
+            for current in [round % 2 == 0, round % 2 != 0] {
+                let store = LogStore::with_db_path(PathBuf::from(":memory:")).unwrap();
+                {
+                    let conn = store.conn.lock().unwrap();
+                    if !current {
+                        conn.execute_batch(
+                            "DROP TRIGGER chat_message_count_insert;
+                             DROP TRIGGER chat_message_count_delete;
+                             DROP TABLE chat_message_counts;",
+                        )
+                        .unwrap();
+                    }
+                    conn.execute(
+                        "WITH RECURSIVE rows(n) AS (
+                             VALUES(1) UNION ALL SELECT n + 1 FROM rows WHERE n < ?1
+                         )
+                         INSERT INTO chat_messages(channel, ts_ms, server_id, payload_json)
+                         SELECT 'busy', n, 'seed-' || n, '{}' FROM rows",
+                        params![MAX_ROWS_PER_CHANNEL],
+                    )
+                    .unwrap();
+                }
+
+                let started = Instant::now();
+                for msg in &messages {
+                    if current {
+                        store.append_message(msg).unwrap();
+                    } else {
+                        // The previous append path, including serialization,
+                        // locking, insert, offset-based retention and commit.
+                        let payload = serde_json::to_string(msg).unwrap();
+                        let channel = msg.channel.as_str().to_owned();
+                        let server_id = msg.server_id.clone();
+                        let mut conn = store.conn.lock().unwrap();
+                        let tx = conn.transaction().unwrap();
+                        tx.execute(
+                            "INSERT INTO chat_messages(channel, ts_ms, server_id, payload_json)
+                             VALUES (?1, ?2, ?3, ?4)",
+                            params![
+                                channel,
+                                msg.timestamp.timestamp_millis(),
+                                server_id,
+                                payload
+                            ],
+                        )
+                        .unwrap();
+                        tx.execute(
+                            "DELETE FROM chat_messages WHERE id IN (
+                                 SELECT id FROM chat_messages WHERE channel = ?1
+                                 ORDER BY ts_ms DESC, id DESC LIMIT -1 OFFSET ?2
+                             )",
+                            params![msg.channel.as_str(), MAX_ROWS_PER_CHANNEL],
+                        )
+                        .unwrap();
+                        tx.commit().unwrap();
+                    }
+                }
+                let elapsed = started.elapsed();
+                let conn = store.conn.lock().unwrap();
+                let retained: (i64, i64, i64) = conn.query_row(
+                    "SELECT COUNT(*), MIN(ts_ms), MAX(ts_ms) FROM chat_messages WHERE channel = 'busy'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                ).unwrap();
+                assert_eq!(
+                    retained,
+                    (
+                        MAX_ROWS_PER_CHANNEL,
+                        APPENDS + 1,
+                        MAX_ROWS_PER_CHANNEL + APPENDS
+                    )
+                );
+                if current {
+                    current_samples.push(elapsed);
+                } else {
+                    previous_samples.push(elapsed);
+                }
+            }
+        }
+        previous_samples.sort_unstable();
+        current_samples.sort_unstable();
+        eprintln!(
+            "SQLite {}: {APPENDS} appends at {MAX_ROWS_PER_CHANNEL} retained rows; median of 5, in-memory, dev profile. Previous {:?}; current {:?}; ratio {:.2}x",
+            rusqlite::version(),
+            previous_samples[2],
+            current_samples[2],
+            previous_samples[2].as_secs_f64() / current_samples[2].as_secs_f64(),
+        );
+    }
+
+    #[test]
+    fn existing_database_migrates_counts_and_multiple_connections_stay_consistent() {
+        let path = temp_db_path("logs-migration");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE chat_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, channel TEXT NOT NULL,
+                    ts_ms INTEGER NOT NULL, server_id TEXT, payload_json TEXT NOT NULL
+                 );
+                 INSERT INTO chat_messages(channel, ts_ms, server_id, payload_json)
+                 VALUES ('channel', 1, 'existing', '{}');",
+            )
+            .unwrap();
+        }
+        let first = LogStore::with_db_path(path.clone()).unwrap();
+        let second = LogStore::with_db_path(path.clone()).unwrap();
+        first.append_message(&message(1, 1000, "channel")).unwrap();
+        second.append_message(&message(2, 2000, "channel")).unwrap();
+        second.append_message(&message(1, 1000, "channel")).unwrap();
+        {
+            let mut conn = second.conn.lock().unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute("DELETE FROM chat_messages WHERE channel = 'channel'", [])
+                .unwrap();
+            tx.rollback().unwrap();
+        }
+        {
+            let conn = first.conn.lock().unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT message_count FROM chat_message_counts WHERE channel = 'channel'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 3);
+            conn.execute("DELETE FROM chat_messages WHERE server_id = 'existing'", [])
+                .unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT message_count FROM chat_message_counts WHERE channel = 'channel'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 2);
+        }
+        drop(first);
+        drop(second);
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn round_trip_recent_messages() {
         let path = temp_db_path("logs-roundtrip");
@@ -447,10 +771,22 @@ mod tests {
             .append_message(&mk(1, 10, ChannelId::new("forsen"), plain.clone(), "plain"))
             .expect("append plain");
         store
-            .append_message(&mk(2, 20, ChannelId::new("forsen"), hl.clone(), "highlighted"))
+            .append_message(&mk(
+                2,
+                20,
+                ChannelId::new("forsen"),
+                hl.clone(),
+                "highlighted",
+            ))
             .expect("append hl");
         store
-            .append_message(&mk(3, 30, ChannelId::new("xqc"), mention.clone(), "mention"))
+            .append_message(&mk(
+                3,
+                30,
+                ChannelId::new("xqc"),
+                mention.clone(),
+                "mention",
+            ))
             .expect("append mention");
         // Whisper: must be excluded even if highlighted.
         store
@@ -463,9 +799,25 @@ mod tests {
             ))
             .expect("append whisper");
 
+        store
+            .append_message(&mk(
+                5,
+                50,
+                ChannelId::new("partner"),
+                MessageFlags {
+                    is_highlighted: true,
+                    suppress_notification: true,
+                    ..Default::default()
+                },
+                "suppressed shared chat mirror",
+            ))
+            .expect("append suppressed mirror");
+
         let rows = store.recent_mentions(10).expect("load mentions");
         let ids: Vec<_> = rows.iter().map(|m| m.raw_text.as_str()).collect();
         assert_eq!(ids, vec!["highlighted", "mention"]);
+        let latest = store.recent_mentions(1).expect("load latest mention");
+        assert_eq!(latest[0].raw_text, "mention");
 
         let _ = std::fs::remove_file(path);
     }

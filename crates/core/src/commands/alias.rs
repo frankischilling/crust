@@ -1,9 +1,8 @@
 //! Custom command aliases. Users define triggers like `/hello` that expand to
 //! another message or command - e.g. `/hello = /me says hi {1} {2+}`.
 //!
-//! Mirrors Chatterino2's `CommandController` / `Command` but reworked as a
-//! pure function that takes an input line and an alias list and returns the
-//! expanded text. The UI layer calls [`expand_command_aliases`] before
+//! [`expand_command_aliases`] takes an input line and an alias list and returns
+//! the expanded text. The UI layer calls it before
 //! dispatching a message, so aliases compose with the built-in slash parser:
 //! aliases whose body starts with another `/<cmd>` get re-parsed through the
 //! normal slash-command pipeline (server-side `/me`, Helix `/announce`, ...).
@@ -19,10 +18,10 @@
 //! | `{input}`   | Full argument list (everything after the trigger)        |
 //! | `{channel}` | Current channel login (display name, no leading `#`)     |
 //! | `{user}`    | Currently authenticated user login, or empty if anon     |
-//! | `{streamer}`| Alias of `{channel}` - matches Chatterino's naming       |
+//! | `{streamer}`| Alias of `{channel}`                                    |
 //!
-//! Missing positional arguments expand to the empty string (matching
-//! Chatterino). Unknown variables (e.g. `{foo}`) are left untouched so users
+//! Missing positional arguments expand to the empty string.
+//! Unknown variables (e.g. `{foo}`) are left untouched so users
 //! can include literal braces in chat by picking names the engine doesn't
 //! recognise.
 //!
@@ -33,7 +32,7 @@
 use serde::{Deserialize, Serialize};
 
 /// One user-defined alias. `trigger` is the bare command name *without* the
-/// leading slash (Chatterino stores it the same way). `body` is the raw
+/// leading slash. `body` is the raw
 /// expansion template - it may itself start with `/` to chain into another
 /// command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,8 +53,7 @@ fn bool_true() -> bool {
 
 impl CommandAlias {
     /// Construct a new enabled alias, stripping a leading slash from the
-    /// trigger if the user included one (Chatterino's "/hello" input works
-    /// identically to "hello").
+    /// trigger if the user included one. "/hello" and "hello" name the same alias.
     pub fn new(trigger: impl Into<String>, body: impl Into<String>) -> Self {
         Self {
             trigger: normalize_trigger(&trigger.into()),
@@ -90,9 +88,7 @@ pub fn normalize_trigger(raw: &str) -> String {
     s.to_owned()
 }
 
-/// Max recursive alias expansions per input line. Chatterino uses a similar
-/// cap; we pick a small number because any legitimate use rarely chains more
-/// than two or three aliases.
+/// Maximum recursive alias expansions per input line.
 pub const MAX_ALIAS_DEPTH: usize = 8;
 
 /// Outcome of [`expand_command_aliases`]. `Unchanged` is returned when the
@@ -223,7 +219,7 @@ pub fn expand_command_aliases(
         };
 
         let canonical = alias.canonical_trigger();
-        if chain.iter().any(|t| *t == canonical) {
+        if chain.contains(&canonical) {
             // Cycle: record the repeated trigger so the message points at it.
             let mut cycle = chain.clone();
             cycle.push(canonical);
@@ -262,9 +258,8 @@ fn split_command_head(line: &str) -> (&str, &str) {
     }
 }
 
-/// Split `args` on ASCII whitespace, preserving order. Used to resolve
-/// positional variables. We deliberately don't honour quotes - Chatterino's
-/// engine is also whitespace-split - so users get predictable behaviour.
+/// Split `args` on whitespace to resolve positional variables, preserving order.
+/// Quotes do not group arguments.
 fn split_args(args: &str) -> Vec<&str> {
     args.split_whitespace().collect()
 }
@@ -349,9 +344,8 @@ fn resolve_variable(
 
 /// Return the verbatim substring of `raw_args` starting at the n-th
 /// whitespace-separated token (1-indexed). Preserves the exact whitespace
-/// the user typed between tokens, matching Chatterino's behaviour - e.g.
-/// `/hi hello   there` with `{1+}` yields `"hello   there"` rather than
-/// `"hello there"`.
+/// the user typed between tokens. For example, `/hi hello   there` with `{1+}`
+/// yields `"hello   there"`.
 fn slice_from_nth_token(raw_args: &str, n: usize) -> String {
     if n == 0 {
         return String::new();

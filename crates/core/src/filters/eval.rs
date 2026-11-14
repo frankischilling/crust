@@ -1,20 +1,16 @@
 //! Runtime evaluator for the filter expression AST.
 //!
-//! Mirrors `chatterino2-master/src/controllers/filters/lang/expressions/*`
-//! but intentionally lenient: identifiers that are missing from the
-//! [`Context`] resolve to a default value for their inferred operator
-//! operand (so a filter referencing `flags.automod` still works on
-//! platforms where that flag isn't tracked).
+//! Identifiers missing from the [`Context`] evaluate to `false`.
+//! Integer arithmetic wraps on overflow; division and remainder by zero
+//! evaluate to `false`.
 
 use crate::filters::ast::{BinOp, Expression, UnOp};
 use crate::filters::types::{Context, Value};
 
 /// Evaluate `expr` against `ctx`.
 ///
-/// The evaluator never panics and never returns a `Result`; a runtime
-/// issue (divide-by-zero, type mismatch that slipped past the static
-/// checker, missing identifier) resolves to a sensible `false`/empty
-/// result, matching Chatterino's behavior.
+/// Invalid operands, missing identifiers, and zero divisors evaluate to `false`.
+/// A failed regex capture returns an empty string.
 pub fn evaluate(expr: &Expression, ctx: &Context) -> Value {
     match expr {
         Expression::Literal { value, .. } => value.clone(),
@@ -106,7 +102,7 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         }
         // Cross-type int/bool comparison
         (Value::Int(i), Value::Bool(b)) | (Value::Bool(b), Value::Int(i)) => *i == i64::from(*b),
-        // String <=> Int coercion: match Chatterino's tolerant comparison
+        // Compare an integer with a string containing the same integer.
         (Value::Str(s), Value::Int(i)) | (Value::Int(i), Value::Str(s)) => {
             s.parse::<i64>().map(|n| n == *i).unwrap_or(false)
         }

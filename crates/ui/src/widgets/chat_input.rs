@@ -44,7 +44,7 @@ struct TabState {
 }
 
 /// Message-history recall state (Up / Down arrows).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct HistState {
     /// -1 = normal input, 0 = most recent sent msg, 1 = second-most-recent, ...
     idx: i32,
@@ -52,6 +52,16 @@ struct HistState {
     saved_input: String,
     /// What we set the buffer to (to detect user edits -> reset).
     expected_buf: String,
+}
+
+impl Default for HistState {
+    fn default() -> Self {
+        Self {
+            idx: -1,
+            saved_input: String::new(),
+            expected_buf: String::new(),
+        }
+    }
 }
 
 /// Chat input bar shown at the bottom of the message area.
@@ -81,6 +91,8 @@ pub struct ChatInput<'a> {
     pub prevent_overlong_twitch_messages: bool,
     /// Whether animated emotes should animate this frame.
     pub animate_emotes: bool,
+    /// Whether dropped files belong to this pane.
+    pub accept_dropped_files: bool,
 }
 
 /// A single image the user wants to upload (clipboard paste or file drop).
@@ -121,6 +133,9 @@ impl<'a> ChatInput<'a> {
             add_to_dictionary: None,
         };
 
+        let text_edit_id = ui.id().with("chat_input");
+        let input_had_focus = ui.memory(|m| m.has_focus(text_edit_id));
+
         // Clipboard image paste (Ctrl/Cmd+V)
         // egui-winit 0.31's keyboard handler early-returns from a Ctrl+V
         // *press* when its internal `clipboard.get()` fails (image-only
@@ -130,37 +145,24 @@ impl<'a> ChatInput<'a> {
         // with `modifiers.ctrl` attachedwe use that as our paste trigger.
         // Also match `Event::Paste(_)` for the successful text-paste path
         // (where clipboard had both text and image).
-        let paste_signal = ui.input(|i| {
-            i.events.iter().any(|e| match e {
-                egui::Event::Paste(_) => true,
-                // Key release with Ctrl/Cmdfires even when egui-winit
-                // swallowed the press event as a (failed) paste shortcut.
-                egui::Event::Key {
-                    key: Key::V,
-                    pressed: false,
-                    modifiers,
-                    ..
-                } => modifiers.command || modifiers.ctrl,
-                // Press event (only reachable when egui-winit does NOT
-                // match the paste shortcut, e.g. future versions).
-                egui::Event::Key {
-                    key: Key::V,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } => modifiers.command || modifiers.ctrl,
-                _ => false,
-            })
-        });
-        // Debounce: fire at most once per unique press+release cycle. We
-        // stash the last frame number where we uploaded on this key so a
-        // future egui-winit change that pushes BOTH press and release
-        // wouldn't trigger a double upload.
-        let paste_debounce_id = ui.id().with("paste_debounce_frame");
-        let now_frame = ui.ctx().cumulative_pass_nr();
-        let last_frame: Option<u64> = ui.ctx().data(|d| d.get_temp(paste_debounce_id));
-        let paste_signal =
-            paste_signal && last_frame.map_or(true, |f| now_frame.saturating_sub(f) > 1);
+        let paste_signal = if input_had_focus {
+            let paste_state_id = Id::new("chat_image_paste_release");
+            let mut skip_release = ui
+                .ctx()
+                .data(|d| d.get_temp(paste_state_id).unwrap_or(false));
+            let requested = ui.input(|i| {
+                image_paste_requested(
+                    &i.events,
+                    i.modifiers.command || i.modifiers.ctrl,
+                    &mut skip_release,
+                )
+            });
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(paste_state_id, skip_release));
+            requested
+        } else {
+            false
+        };
         if paste_signal {
             match try_clipboard_image_as_png() {
                 Some(upload) => {
@@ -177,8 +179,6 @@ impl<'a> ChatInput<'a> {
                                 )
                         });
                     });
-                    ui.ctx()
-                        .data_mut(|d| d.insert_temp(paste_debounce_id, now_frame));
                     tracing::info!("uploader: clipboard image captured via Ctrl+V");
                     result.uploads.push(upload);
                 }
@@ -191,7 +191,11 @@ impl<'a> ChatInput<'a> {
         }
 
         // Drag-drop image file(s)
-        let dropped: Vec<egui::DroppedFile> = ui.ctx().input(|i| i.raw.dropped_files.clone());
+        let dropped = if self.accept_dropped_files {
+            ui.input_mut(|i| std::mem::take(&mut i.raw.dropped_files))
+        } else {
+            Vec::new()
+        };
         for f in &dropped {
             if let Some(upload) = dropped_file_to_upload(f) {
                 result.uploads.push(upload);
@@ -276,32 +280,55 @@ impl<'a> ChatInput<'a> {
                     }
 
                     // Pre-check autocompletes before TextEdit consumes keys.
-                    let pre_emote_matches = find_autocomplete_matches(buf, self.emote_catalog);
-                    let pre_username_matches = find_username_matches(buf, self.chatters);
-                    let pre_slash_matches = find_slash_matches(buf, self.slash_usage_counts);
-                    let pre_join_matches =
-                        find_join_channel_matches(buf, self.channel, self.known_channels);
+                    let pre_emote_matches = if input_had_focus {
+                        find_autocomplete_matches(buf, self.emote_catalog)
+                    } else {
+                        Vec::new()
+                    };
+                    let pre_username_matches = if input_had_focus && pre_emote_matches.is_empty() {
+                        find_username_matches(buf, self.chatters)
+                    } else {
+                        Vec::new()
+                    };
+                    let pre_slash_matches = if input_had_focus
+                        && pre_emote_matches.is_empty()
+                        && pre_username_matches.is_empty()
+                    {
+                        find_slash_matches(buf, self.slash_usage_counts)
+                    } else {
+                        Vec::new()
+                    };
+                    let pre_join_matches = if input_had_focus
+                        && pre_emote_matches.is_empty()
+                        && pre_username_matches.is_empty()
+                        && pre_slash_matches.is_empty()
+                    {
+                        find_join_channel_matches(buf, self.channel, self.known_channels)
+                    } else {
+                        Vec::new()
+                    };
                     let autocomplete_active = !pre_emote_matches.is_empty()
                         || !pre_username_matches.is_empty()
                         || !pre_slash_matches.is_empty()
                         || !pre_join_matches.is_empty();
 
-                    // Always consume Tab / Up / Down before TextEdit so they
-                    // don't cause focus changes or unwanted behaviour.
-                    // Enter is only consumed when an autocomplete popup is active.
+                    // Consume shortcuts only for the focused composer, before
+                    // TextEdit handles cursor movement or focus navigation.
                     let mut consumed_tab = false;
                     let mut consumed_enter = false;
                     let mut consumed_up = false;
                     let mut consumed_down = false;
 
-                    ui.input_mut(|i| {
-                        consumed_tab = i.consume_key(egui::Modifiers::NONE, Key::Tab);
-                        consumed_up = i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
-                        consumed_down = i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
-                        if autocomplete_active {
-                            consumed_enter = i.consume_key(egui::Modifiers::NONE, Key::Enter);
-                        }
-                    });
+                    if input_had_focus {
+                        ui.input_mut(|i| {
+                            consumed_tab = i.consume_key(egui::Modifiers::NONE, Key::Tab);
+                            consumed_up = i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
+                            consumed_down = i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
+                            if autocomplete_active {
+                                consumed_enter = i.consume_key(egui::Modifiers::NONE, Key::Enter);
+                            }
+                        });
+                    }
 
                     // Text input - reserve space for emote button + Send button + gaps
                     // At narrow widths, hide Send button and emote picker to maximise input
@@ -336,6 +363,7 @@ impl<'a> ChatInput<'a> {
                     let te_output = ui
                         .allocate_ui(egui::vec2(text_width, input_h), |ui| {
                             egui::TextEdit::singleline(buf)
+                                .id(text_edit_id)
                                 .hint_text(hint_text)
                                 .text_color(t::text_primary())
                                 .font(t::body())
@@ -349,7 +377,6 @@ impl<'a> ChatInput<'a> {
                         })
                         .inner;
                     let resp = te_output.response;
-                    let text_edit_id = resp.id;
                     let ac_id = text_edit_id.with("autocomplete_selection");
                     let tab_id = text_edit_id.with("tab_complete_state");
                     let hist_id = text_edit_id.with("msg_history_state");
@@ -382,22 +409,44 @@ impl<'a> ChatInput<'a> {
 
                     // Recompute matches after TextEdit may have changed buf.
                     // Emote autocomplete takes priority, then @username, then slash, then /join.
-                    let matches = find_autocomplete_matches(buf, self.emote_catalog);
-                    let username_matches = if matches.is_empty() {
-                        find_username_matches(buf, self.chatters)
+                    let input_active = resp.has_focus() || input_had_focus;
+                    let reuse_matches = input_had_focus && !resp.changed();
+                    let matches = if !input_active {
+                        Vec::new()
+                    } else if reuse_matches {
+                        pre_emote_matches
+                    } else {
+                        find_autocomplete_matches(buf, self.emote_catalog)
+                    };
+                    let username_matches = if input_active && matches.is_empty() {
+                        if reuse_matches {
+                            pre_username_matches
+                        } else {
+                            find_username_matches(buf, self.chatters)
+                        }
                     } else {
                         Vec::new()
                     };
-                    let slash_matches = if matches.is_empty() && username_matches.is_empty() {
-                        find_slash_matches(buf, self.slash_usage_counts)
-                    } else {
-                        Vec::new()
-                    };
-                    let join_matches = if matches.is_empty()
+                    let slash_matches =
+                        if input_active && matches.is_empty() && username_matches.is_empty() {
+                            if reuse_matches {
+                                pre_slash_matches
+                            } else {
+                                find_slash_matches(buf, self.slash_usage_counts)
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                    let join_matches = if input_active
+                        && matches.is_empty()
                         && username_matches.is_empty()
                         && slash_matches.is_empty()
                     {
-                        find_join_channel_matches(buf, self.channel, self.known_channels)
+                        if reuse_matches {
+                            pre_join_matches
+                        } else {
+                            find_join_channel_matches(buf, self.channel, self.known_channels)
+                        }
                     } else {
                         Vec::new()
                     };
@@ -566,7 +615,7 @@ impl<'a> ChatInput<'a> {
                                 let code = &ts.matches[ts.index];
                                 *buf = format!("{}{} ", ts.prefix, code);
                                 ts.expected_buf = buf.clone();
-                                move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
+                                move_cursor_to_end(ui.ctx(), text_edit_id, buf.chars().count());
                                 ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                             }
 
@@ -615,7 +664,7 @@ impl<'a> ChatInput<'a> {
 
                             hs.expected_buf = buf.clone();
                             ui.ctx().data_mut(|d| d.insert_temp(hist_id, hs));
-                            move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
+                            move_cursor_to_end(ui.ctx(), text_edit_id, buf.chars().count());
                             ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                         }
                     }
@@ -623,25 +672,25 @@ impl<'a> ChatInput<'a> {
                     // Replace the :query token with the accepted emote
                     if let Some(ref code) = accepted_emote {
                         replace_autocomplete_token(buf, code);
-                        move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
+                        move_cursor_to_end(ui.ctx(), text_edit_id, buf.chars().count());
                         ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                         ac_sel = 0;
                     }
                     if let Some(ref username) = accepted_username {
                         replace_mention_token(buf, username);
-                        move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
+                        move_cursor_to_end(ui.ctx(), text_edit_id, buf.chars().count());
                         ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                         ac_sel = 0;
                     }
                     if let Some(ref command) = accepted_slash_cmd {
                         replace_slash_token(buf, command);
-                        move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
+                        move_cursor_to_end(ui.ctx(), text_edit_id, buf.chars().count());
                         ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                         ac_sel = 0;
                     }
                     if let Some(ref channel_name) = accepted_join_channel {
                         replace_join_arg_token(buf, channel_name);
-                        move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
+                        move_cursor_to_end(ui.ctx(), text_edit_id, buf.chars().count());
                         ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                         ac_sel = 0;
                     }
@@ -661,7 +710,7 @@ impl<'a> ChatInput<'a> {
                     {
                         truncate_to_max_chars(buf, TWITCH_MAX_CHARS);
                         twitch_char_count = buf.chars().count();
-                        move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
+                        move_cursor_to_end(ui.ctx(), text_edit_id, buf.chars().count());
                         ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                     }
                     let twitch_over_limit =
@@ -718,6 +767,11 @@ impl<'a> ChatInput<'a> {
                         if send_btn.clicked() && can_submit {
                             result.send = Some(buf.trim().to_owned());
                             buf.clear();
+                            ui.ctx()
+                                .data_mut(|d| d.insert_temp(hist_id, HistState::default()));
+                            ui.ctx()
+                                .data_mut(|d| d.insert_temp(tab_id, TabState::default()));
+                            resp.request_focus();
                         }
                     }
 
@@ -754,7 +808,7 @@ impl<'a> ChatInput<'a> {
                         ui.painter().rect_stroke(
                             resp.rect.expand(1.0),
                             4.0,
-                            Stroke::new(1.0, t::red()),
+                            Stroke::new(1.0_f32, t::red()),
                             egui::epaint::StrokeKind::Outside,
                         );
                     }
@@ -775,7 +829,7 @@ impl<'a> ChatInput<'a> {
                                 self.show_autocomplete_popup(ui, &resp, &matches, ac_sel)
                             {
                                 replace_autocomplete_token(buf, &clicked);
-                                move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
+                                move_cursor_to_end(ui.ctx(), text_edit_id, buf.chars().count());
                                 ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                                 ui.ctx().data_mut(|d| d.insert_temp(ac_id, 0i32));
                             }
@@ -787,7 +841,7 @@ impl<'a> ChatInput<'a> {
                                 ac_sel,
                             ) {
                                 replace_mention_token(buf, &clicked);
-                                move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
+                                move_cursor_to_end(ui.ctx(), text_edit_id, buf.chars().count());
                                 ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                                 ui.ctx().data_mut(|d| d.insert_temp(ac_id, 0i32));
                             }
@@ -795,21 +849,21 @@ impl<'a> ChatInput<'a> {
                             self.show_slash_autocomplete_popup(ui, &resp, &slash_matches, ac_sel)
                         {
                             replace_slash_token(buf, &clicked);
-                            move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
+                            move_cursor_to_end(ui.ctx(), text_edit_id, buf.chars().count());
                             ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                             ui.ctx().data_mut(|d| d.insert_temp(ac_id, 0i32));
                         } else if let Some(clicked) =
                             self.show_join_autocomplete_popup(ui, &resp, &join_matches, ac_sel)
                         {
                             replace_join_arg_token(buf, &clicked);
-                            move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
+                            move_cursor_to_end(ui.ctx(), text_edit_id, buf.chars().count());
                             ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                             ui.ctx().data_mut(|d| d.insert_temp(ac_id, 0i32));
                         }
                     }
 
                     // Spell-check context menu (right-click)
-                    let sc_id = Id::new("spell_check_ctx");
+                    let sc_id = text_edit_id.with("spell_check_ctx");
 
                     // On right-click, determine the word at the cursor and
                     // compute suggestions if it is misspelled.
@@ -817,7 +871,7 @@ impl<'a> ChatInput<'a> {
                         let cursor_idx = egui::TextEdit::load_state(ui.ctx(), text_edit_id)
                             .and_then(|s| s.cursor.char_range())
                             .map(|r| r.primary.index)
-                            .unwrap_or(buf.len());
+                            .unwrap_or_else(|| buf.chars().count());
 
                         let (word, byte_start, byte_end) =
                             crate::spellcheck::word_at_cursor(buf, cursor_idx);
@@ -965,10 +1019,8 @@ impl<'a> ChatInput<'a> {
                             ui.separator();
                             if ui
                                 .button(
-                                    RichText::new(format!(
-                                        "Add \"{display_word}\" to dictionary"
-                                    ))
-                                    .font(t::small()),
+                                    RichText::new(format!("Add \"{display_word}\" to dictionary"))
+                                        .font(t::small()),
                                 )
                                 .clicked()
                             {
@@ -1021,12 +1073,12 @@ impl<'a> ChatInput<'a> {
 
                     if context_insert_help {
                         *buf = "/help".to_owned();
-                        move_cursor_to_end(ui.ctx(), text_edit_id, buf.len());
+                        move_cursor_to_end(ui.ctx(), text_edit_id, buf.chars().count());
                         ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                     }
 
                     if let Some((start, end, replacement)) = spell_replace {
-                        let new_len = start + replacement.len();
+                        let new_len = buf[..start].chars().count() + replacement.chars().count();
                         buf.replace_range(start..end, &replacement);
                         move_cursor_to_end(ui.ctx(), text_edit_id, new_len);
                         ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
@@ -1078,7 +1130,7 @@ impl<'a> ChatInput<'a> {
         painter.rect_stroke(
             popup_rect,
             6.0,
-            egui::Stroke::new(1.0, t::border_subtle()),
+            egui::Stroke::new(1.0_f32, t::border_subtle()),
             egui::epaint::StrokeKind::Outside,
         );
 
@@ -1303,7 +1355,7 @@ impl<'a> ChatInput<'a> {
         painter.rect_stroke(
             popup_rect,
             6.0,
-            egui::Stroke::new(1.0, t::border_subtle()),
+            egui::Stroke::new(1.0_f32, t::border_subtle()),
             egui::epaint::StrokeKind::Outside,
         );
 
@@ -1396,7 +1448,7 @@ impl<'a> ChatInput<'a> {
         painter.rect_stroke(
             popup_rect,
             6.0,
-            egui::Stroke::new(1.0, t::border_subtle()),
+            egui::Stroke::new(1.0_f32, t::border_subtle()),
             egui::epaint::StrokeKind::Outside,
         );
 
@@ -1484,7 +1536,7 @@ impl<'a> ChatInput<'a> {
         painter.rect_stroke(
             popup_rect,
             6.0,
-            egui::Stroke::new(1.0, t::border_subtle()),
+            egui::Stroke::new(1.0_f32, t::border_subtle()),
             egui::epaint::StrokeKind::Outside,
         );
 
@@ -1764,7 +1816,39 @@ fn extract_mention_query(buf: &str) -> Option<&str> {
     None
 }
 
-/// Move the TextEdit cursor to `char_pos` (pass `buf.len()` for end-of-input).
+fn image_paste_requested(
+    events: &[egui::Event],
+    shortcut_held: bool,
+    skip_release: &mut bool,
+) -> bool {
+    let mut requested = false;
+    for event in events {
+        match event {
+            egui::Event::Paste(_) => {
+                requested = true;
+                *skip_release = shortcut_held;
+            }
+            egui::Event::Key {
+                key: Key::V,
+                pressed,
+                modifiers,
+                ..
+            } if modifiers.command || modifiers.ctrl => {
+                if *pressed {
+                    requested = true;
+                    *skip_release = true;
+                } else {
+                    requested |= !*skip_release;
+                    *skip_release = false;
+                }
+            }
+            _ => {}
+        }
+    }
+    requested
+}
+
+/// Move the TextEdit cursor to a character index.
 fn move_cursor_to_end(ctx: &egui::Context, id: egui::Id, char_pos: usize) {
     use egui::text::{CCursor, CCursorRange};
     if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
@@ -1913,33 +1997,18 @@ fn extract_last_word(buf: &str) -> (&str, &str) {
 /// Yields `(word_slice, char_start, byte_start, char_end)`.
 fn iter_words(buf: &str) -> Vec<(&str, usize, usize, usize)> {
     let mut result = Vec::new();
-    let chars: Vec<char> = buf.chars().collect();
-    let n = chars.len();
-    let mut i = 0;
-    while i < n {
-        // Skip non-alpha
-        if !chars[i].is_ascii_alphabetic() {
-            i += 1;
-            continue;
+    let mut start = None;
+    let mut char_end = 0;
+    for (char_idx, (byte_idx, ch)) in buf.char_indices().enumerate() {
+        char_end = char_idx + 1;
+        if ch.is_ascii_alphabetic() {
+            start.get_or_insert((char_idx, byte_idx));
+        } else if let Some((char_start, byte_start)) = start.take() {
+            result.push((&buf[byte_start..byte_idx], char_start, byte_start, char_idx));
         }
-        let start = i;
-        while i < n && chars[i].is_ascii_alphabetic() {
-            i += 1;
-        }
-        let char_start = start;
-        let char_end = i;
-        // Convert char indices -> byte slice
-        let byte_start: usize = buf
-            .char_indices()
-            .nth(char_start)
-            .map(|(idx, _)| idx)
-            .unwrap_or(buf.len());
-        let byte_end: usize = buf
-            .char_indices()
-            .nth(char_end)
-            .map(|(idx, _)| idx)
-            .unwrap_or(buf.len());
-        result.push((&buf[byte_start..byte_end], char_start, byte_start, char_end));
+    }
+    if let Some((char_start, byte_start)) = start {
+        result.push((&buf[byte_start..], char_start, byte_start, char_end));
     }
     result
 }
@@ -1949,7 +2018,7 @@ fn paint_wavy_underline(painter: &egui::Painter, x0: f32, x1: f32, y: f32, color
     const WAVE_H: f32 = 1.5; // half amplitude
     const WAVE_LEN: f32 = 4.0; // one full wave = 4px
 
-    let stroke = Stroke::new(1.0, color);
+    let stroke = Stroke::new(1.0_f32, color);
     let mut points: Vec<Pos2> = Vec::new();
 
     let mut x = x0;
@@ -2073,9 +2142,7 @@ fn dropped_file_to_upload(f: &egui::DroppedFile) -> Option<PendingUpload> {
         },
     };
 
-    // GIF + WEBP are uploaded as-is to preserve animation. PNG/JPEG likewise
-    // bypass re-encoding. Chatterino only re-encodes when the source is not a
-    // known image type.
+    // Upload known image formats unchanged to preserve animation and avoid re-encoding.
     Some(PendingUpload {
         bytes,
         format: format.to_owned(),
@@ -2085,7 +2152,207 @@ fn dropped_file_to_upload(f: &egui::DroppedFile) -> Option<PendingUpload> {
 
 #[cfg(test)]
 mod tests {
-    use super::truncate_to_max_chars;
+    use super::*;
+
+    fn key(key: Key, pressed: bool, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    fn raw_input(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            events,
+            ..Default::default()
+        }
+    }
+
+    fn show_test_input(
+        ui: &mut Ui,
+        buf: &mut String,
+        history: &[String],
+        focus: bool,
+        accept_dropped_files: bool,
+    ) -> ChatInputResult {
+        if focus {
+            let id = ui.id().with("chat_input");
+            ui.memory_mut(|m| m.request_focus(id));
+        }
+        ChatInput {
+            channel: &ChannelId::new("example"),
+            logged_in: true,
+            username: None,
+            emote_catalog: &[],
+            emote_bytes: &HashMap::new(),
+            pending_reply: None,
+            message_history: history,
+            slash_usage_counts: &HashMap::new(),
+            known_channels: &[],
+            chatters: &[],
+            prevent_overlong_twitch_messages: false,
+            animate_emotes: false,
+            accept_dropped_files,
+        }
+        .show(ui, buf)
+    }
+
+    #[test]
+    fn unfocused_input_leaves_navigation_and_autocomplete_keys_alone() {
+        for pressed in [Key::Tab, Key::ArrowUp, Key::ArrowDown, Key::Enter] {
+            let ctx = egui::Context::default();
+            let mut buf = "/he".to_owned();
+            let _ = ctx.run(
+                raw_input(vec![key(pressed, true, egui::Modifiers::NONE)]),
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.memory_mut(|m| m.request_focus(Id::new("other_input")));
+                        let result =
+                            show_test_input(ui, &mut buf, &["sent".to_owned()], false, false);
+                        assert!(result.send.is_none());
+                        assert_eq!(buf, "/he");
+                        assert!(ui.input(|i| i.events.iter().any(|event| matches!(
+                            event,
+                            egui::Event::Key { key, pressed: true, .. } if *key == pressed
+                        ))));
+                    });
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn history_starts_with_latest_message_and_restores_draft() {
+        let history = vec!["older".to_owned(), "newest".to_owned()];
+        for draft in ["", "unfinished draft"] {
+            let ctx = egui::Context::default();
+            let mut buf = draft.to_owned();
+            let _ = ctx.run(raw_input(Vec::new()), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_test_input(ui, &mut buf, &history, true, false);
+                });
+            });
+            for (pressed, expected) in [
+                (Key::ArrowUp, "newest"),
+                (Key::ArrowUp, "older"),
+                (Key::ArrowDown, "newest"),
+                (Key::ArrowDown, draft),
+            ] {
+                let _ = ctx.run(
+                    raw_input(vec![key(pressed, true, egui::Modifiers::NONE)]),
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            show_test_input(ui, &mut buf, &history, false, false);
+                        });
+                    },
+                );
+                assert_eq!(buf, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn later_split_keeps_ownership_of_history_shortcuts() {
+        let ctx = egui::Context::default();
+        let history = vec!["older".to_owned(), "newest".to_owned()];
+        let mut first = String::new();
+        let mut second = String::new();
+        for warmup in [true, false] {
+            let events = if warmup {
+                Vec::new()
+            } else {
+                vec![key(Key::ArrowUp, true, egui::Modifiers::NONE)]
+            };
+            let _ = ctx.run(raw_input(events), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.push_id("first", |ui| {
+                        show_test_input(ui, &mut first, &history, false, false);
+                    });
+                    ui.push_id("second", |ui| {
+                        show_test_input(ui, &mut second, &history, warmup, false);
+                    });
+                });
+            });
+        }
+        assert!(first.is_empty());
+        assert_eq!(second, "newest");
+    }
+
+    #[test]
+    fn dropped_image_is_consumed_once_by_its_target_pane() {
+        let ctx = egui::Context::default();
+        let mut raw = raw_input(Vec::new());
+        raw.dropped_files.push(egui::DroppedFile {
+            name: "example.png".to_owned(),
+            bytes: Some(Arc::from([1_u8, 2, 3])),
+            ..Default::default()
+        });
+        let _ = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                for (index, accepts, expected) in [(0, false, 0), (1, true, 1), (2, true, 0)] {
+                    ui.push_id(index, |ui| {
+                        let result = show_test_input(ui, &mut String::new(), &[], false, accepts);
+                        assert_eq!(result.uploads.len(), expected);
+                    });
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn image_paste_ignores_release_after_press_even_when_frames_pass() {
+        let mut skip_release = false;
+        assert!(image_paste_requested(
+            &[key(Key::V, true, egui::Modifiers::CTRL)],
+            true,
+            &mut skip_release
+        ));
+        for _ in 0..20 {
+            assert!(!image_paste_requested(&[], true, &mut skip_release));
+        }
+        assert!(!image_paste_requested(
+            &[key(Key::V, false, egui::Modifiers::CTRL)],
+            true,
+            &mut skip_release
+        ));
+        assert!(image_paste_requested(
+            &[key(Key::V, false, egui::Modifiers::CTRL)],
+            true,
+            &mut skip_release
+        ));
+    }
+
+    #[test]
+    fn image_paste_text_event_and_release_form_one_request() {
+        let mut skip_release = false;
+        assert!(image_paste_requested(
+            &[egui::Event::Paste("clipboard text".to_owned())],
+            true,
+            &mut skip_release
+        ));
+        assert!(!image_paste_requested(
+            &[key(Key::V, false, egui::Modifiers::CTRL)],
+            true,
+            &mut skip_release
+        ));
+    }
+
+    #[test]
+    fn spellcheck_word_offsets_preserve_unicode_positions() {
+        assert_eq!(
+            iter_words("🙂one, café two"),
+            vec![("one", 1, 4, 4), ("caf", 6, 9, 9), ("two", 11, 15, 14)]
+        );
+        assert!(iter_words("").is_empty());
+        assert!(iter_words("🙂123").is_empty());
+    }
 
     #[test]
     fn truncate_to_max_chars_is_unicode_safe() {

@@ -1,4 +1,5 @@
 pub mod eventsub;
+pub mod gql;
 pub mod helix;
 pub mod irc;
 pub mod providers;

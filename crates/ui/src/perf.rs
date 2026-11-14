@@ -302,7 +302,7 @@ fn draw_sparkline(ui: &mut egui::Ui, samples: &VecDeque<f32>, width: f32, height
     if points.len() >= 2 {
         ui.painter().add(egui::Shape::line(
             points,
-            egui::Stroke::new(1.5, t::sparkline_stroke()),
+            egui::Stroke::new(1.5_f32, t::sparkline_stroke()),
         ));
     }
 }

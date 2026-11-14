@@ -369,7 +369,7 @@ impl AnalyticsPanel {
                     .add(
                         egui::Button::new(RichText::new("💾").font(t::small()))
                             .fill(t::bg_raised())
-                            .stroke(egui::Stroke::new(1.0, t::border_subtle())),
+                            .stroke(egui::Stroke::new(1.0_f32, t::border_subtle())),
                     )
                     .on_hover_text("Save snapshot to file");
                 if save_btn.clicked() {
@@ -380,7 +380,7 @@ impl AnalyticsPanel {
                     .add(
                         egui::Button::new(RichText::new("🗑").font(t::small()))
                             .fill(t::bg_raised())
-                            .stroke(egui::Stroke::new(1.0, t::border_subtle())),
+                            .stroke(egui::Stroke::new(1.0_f32, t::border_subtle())),
                     )
                     .on_hover_text("Reset stats from now");
                 if wipe_btn.clicked() {
@@ -429,7 +429,7 @@ impl AnalyticsPanel {
                         t::bg_raised()
                     })
                     .stroke(egui::Stroke::new(
-                        1.0,
+                        1.0_f32,
                         if selected {
                             t::accent()
                         } else {
@@ -465,7 +465,7 @@ impl AnalyticsPanel {
                         egui::Color32::TRANSPARENT
                     })
                     .stroke(egui::Stroke::new(
-                        1.0,
+                        1.0_f32,
                         if selected {
                             t::border_accent()
                         } else {

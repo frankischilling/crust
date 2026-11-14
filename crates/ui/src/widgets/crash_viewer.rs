@@ -225,7 +225,7 @@ impl CrashViewer {
                                     t::bg_dialog()
                                 })
                                 .stroke(egui::Stroke::new(
-                                    if selected { 1.0 } else { 0.5 },
+                                    if selected { 1.0_f32 } else { 0.5_f32 },
                                     if selected {
                                         t::accent()
                                     } else {

@@ -685,12 +685,8 @@ impl EmotePicker {
                                 let has_bytes = emote_bytes.contains_key(entry.url.as_str());
                                 if !has_bytes
                                     && fetches_this_frame < FETCH_BATCH
-                                    && !self.requested.contains(&entry.url)
+                                    && queue_image_request(&mut self.requested, &entry.url, cmd_tx)
                                 {
-                                    self.requested.insert(entry.url.clone());
-                                    let _ = cmd_tx.try_send(AppCommand::FetchImage {
-                                        url: entry.url.clone(),
-                                    });
                                     fetches_this_frame += 1;
                                 }
 
@@ -807,7 +803,7 @@ impl EmotePicker {
                             ui.painter().rect_stroke(
                                 rect.expand(2.0),
                                 4.0,
-                                egui::Stroke::new(1.5, t::accent()),
+                                egui::Stroke::new(1.5_f32, t::accent()),
                                 egui::epaint::StrokeKind::Outside,
                             );
 
@@ -897,6 +893,24 @@ impl EmotePicker {
     }
 }
 
+fn queue_image_request(
+    requested: &mut HashSet<String>,
+    url: &str,
+    cmd_tx: &mpsc::Sender<AppCommand>,
+) -> bool {
+    if requested.contains(url) {
+        return false;
+    }
+    if cmd_tx
+        .try_send(AppCommand::FetchImage { url: url.to_owned() })
+        .is_err()
+    {
+        return false;
+    }
+    requested.insert(url.to_owned());
+    true
+}
+
 /// Scale image dimensions to a target height, preserving aspect ratio.
 fn fit_size(w: u32, h: u32, max_side: f32) -> Vec2 {
     if w == 0 || h == 0 {
@@ -924,4 +938,29 @@ fn dynamic_image_to_color_image(img: DynamicImage) -> Option<egui::ColorImage> {
     let h = usize::try_from(rgba.height()).ok()?;
     let pixels = rgba.into_raw();
     Some(egui::ColorImage::from_rgba_unmultiplied([w, h], &pixels))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_command_queue_does_not_permanently_suppress_an_image() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(AppCommand::FetchImage { url: "occupied".to_owned() })
+            .unwrap();
+        let mut requested = HashSet::new();
+        assert!(!queue_image_request(&mut requested, "image", &tx));
+        assert!(!requested.contains("image"));
+        rx.try_recv().unwrap();
+        assert!(queue_image_request(&mut requested, "image", &tx));
+        assert!(matches!(
+            rx.try_recv(), Ok(AppCommand::FetchImage { url }) if url == "image"
+        ));
+        assert!(!queue_image_request(&mut requested, "image", &tx));
+        assert!(rx.try_recv().is_err());
+        drop(rx);
+        assert!(!queue_image_request(&mut requested, "another", &tx));
+        assert!(!requested.contains("another"));
+    }
 }

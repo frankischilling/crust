@@ -855,7 +855,7 @@ fn render_plugin_manifest_line(ui: &mut egui::Ui, label: &str, value: &str) {
 fn render_plugin_status_card(ui: &mut egui::Ui, status: &PluginStatus, compact: bool) {
     let frame = egui::Frame::new()
         .fill(t::bg_surface())
-        .stroke(egui::Stroke::new(1.0, t::border_subtle()))
+        .stroke(egui::Stroke::new(1.0_f32, t::border_subtle()))
         .inner_margin(Margin::same(if compact { 8 } else { 10 }));
 
     frame.show(ui, |ui| {
@@ -925,7 +925,7 @@ fn render_sections_nav(
     let section_margin = if ultra_compact { 6 } else { 10 };
     egui::Frame::new()
         .fill(t::bg_surface())
-        .stroke(egui::Stroke::new(1.0, t::border_subtle()))
+        .stroke(egui::Stroke::new(1.0_f32, t::border_subtle()))
         .inner_margin(Margin::same(section_margin))
         .show(ui, |ui| {
             ui.label(

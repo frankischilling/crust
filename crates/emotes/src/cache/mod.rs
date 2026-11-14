@@ -49,11 +49,43 @@ struct CacheInner {
     in_flight: HashMap<String, broadcast::Sender<Result<(u32, u32, Vec<u8>), String>>>,
 }
 
+/// Releases waiters even when the task owning a request is cancelled.
+struct InFlightRequest {
+    inner: Arc<Mutex<CacheInner>>,
+    url: Option<String>,
+}
+
+impl InFlightRequest {
+    fn finish(mut self, result: &Result<(u32, u32, Vec<u8>), EmoteError>) {
+        let url = self.url.take().expect("active request");
+        let sender = self.inner.lock().unwrap().in_flight.remove(&url);
+        if let Some(sender) = sender.filter(|sender| sender.receiver_count() != 0) {
+            let value = match result {
+                Ok(value) => Ok(value.clone()),
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = sender.send(value);
+        }
+    }
+}
+
+impl Drop for InFlightRequest {
+    fn drop(&mut self) {
+        if let Some(url) = self.url.take() {
+            self.inner.lock().unwrap().in_flight.remove(&url);
+        }
+    }
+}
+
 impl EmoteCache {
     pub fn new() -> Result<Self, EmoteError> {
         let dirs = ProjectDirs::from("dev", "crust", "crust")
             .ok_or_else(|| EmoteError::Io(std::io::Error::other("no config dir")))?;
         let disk_dir = dirs.cache_dir().join("emotes");
+        Self::with_disk_dir(disk_dir)
+    }
+
+    fn with_disk_dir(disk_dir: PathBuf) -> Result<Self, EmoteError> {
         std::fs::create_dir_all(&disk_dir)?;
 
         Ok(Self {
@@ -63,7 +95,10 @@ impl EmoteCache {
                 in_flight: HashMap::new(),
             })),
             disk_dir,
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(30))
+                .build()?,
         })
     }
 
@@ -98,21 +133,20 @@ impl EmoteCache {
             .join(&key.provider)
             .join(format!("{}_{}.bin", key.id, key.scale));
 
-        if disk_path.exists() {
-            if let Ok(data) = tokio::fs::read(&disk_path).await {
-                let bytes: Bytes = data.into();
-                let mut guard = self.inner.lock().unwrap();
-                guard
-                    .bytes
-                    .put(key.clone(), (bytes.clone(), Instant::now()));
-                return Ok(bytes);
-            }
+        if let Some((bytes, fetched_at)) = read_disk_cache(&disk_path).await {
+            self.inner
+                .lock()
+                .unwrap()
+                .bytes
+                .put(key.clone(), (bytes.clone(), fetched_at));
+            return Ok(bytes);
         }
 
         // 3. Network
         debug!("Fetching emote from {url}");
-        let resp = self.client.get(url).send().await?;
+        let resp = self.client.get(url).send().await?.error_for_status()?;
         let bytes: Bytes = resp.bytes().await?;
+        validate_image(bytes.clone()).await?;
 
         // Persist to disk
         if let Some(parent) = disk_path.parent() {
@@ -133,51 +167,35 @@ impl EmoteCache {
     }
 
     /// Fetch image bytes for a URL; return `(width, height, raw_bytes)`.
-    /// Image dimensions are read from the file header only - no full RGBA decode.
-    /// egui's built-in loaders (WebP / GIF / Image) handle decoding + animation.
+    /// Cache misses are validated before storage. Warm memory hits only read
+    /// dimensions; egui's loaders handle rendering and animation.
     ///
     /// Checks memory -> disk -> network in order, writing through on a cache miss.
     pub async fn fetch_and_decode(&self, url: &str) -> Result<(u32, u32, Vec<u8>), EmoteError> {
         // Derive a stable disk path from a hash of the URL.
-        let disk_path = self
-            .disk_dir
-            .join("url")
-            .join(format!("{:016x}.bin", url_hash(url)));
+        let url_id = format!("{:016x}", url_hash(url));
+        let disk_path = self.disk_dir.join("url").join(format!("{url_id}.bin"));
 
         // 1. Memory cache (keyed by a synthetic AssetKey derived from the URL hash).
         let mem_key = AssetKey {
             provider: "url".into(),
-            id: format!("{:016x}", url_hash(url)),
+            id: url_id,
             scale: 1,
         };
-        {
+        let cached = {
             let mut guard = self.inner.lock().unwrap();
-            if let Some((bytes, ts)) = guard.bytes.get(&mem_key) {
-                if ts.elapsed() < DISK_TTL {
-                    let raw: Vec<u8> = bytes.to_vec();
-                    let (w, h) = read_header_dims(&raw);
-                    return Ok((w, h, raw));
-                }
-            }
+            guard
+                .bytes
+                .get(&mem_key)
+                .filter(|(_, ts)| ts.elapsed() < DISK_TTL)
+                .map(|(bytes, _)| bytes.clone())
+        };
+        if let Some(bytes) = cached {
+            let (w, h) = read_header_dims(&bytes)?;
+            return Ok((w, h, bytes.to_vec()));
         }
 
-        // 2. Disk cache.
-        if disk_path.exists() {
-            if let Ok(data) = tokio::fs::read(&disk_path).await {
-                let (w, h) = read_header_dims(&data);
-                let bytes: Bytes = data.clone().into();
-                self.inner
-                    .lock()
-                    .unwrap()
-                    .bytes
-                    .put(mem_key, (bytes, Instant::now()));
-                return Ok((w, h, data));
-            }
-        }
-
-        // 3. Network - with in-flight request coalescing.
-        //    If another task is already fetching this URL, subscribe to its
-        //    broadcast instead of issuing a duplicate request.
+        // Coalesce both disk reads and network requests for the same URL.
         let url_key = url.to_owned();
         let maybe_rx = {
             let mut guard = self.inner.lock().unwrap();
@@ -202,44 +220,36 @@ impl EmoteCache {
                 ))),
             };
         }
+        let request = InFlightRequest {
+            inner: self.inner.clone(),
+            url: Some(url_key),
+        };
 
-        debug!("Fetching emote image: {url}");
         let fetch_result: Result<(u32, u32, Vec<u8>), EmoteError> = async {
-            let resp = self.client.get(url).send().await?;
-            let raw_bytes = resp.bytes().await?.to_vec();
-
-            // Write through to disk.
-            if let Some(parent) = disk_path.parent() {
-                let _ = tokio::fs::create_dir_all(parent).await;
-            }
-            let _ = tokio::fs::write(&disk_path, &raw_bytes).await;
-
-            {
-                let bytes: Bytes = raw_bytes.clone().into();
-                self.inner
-                    .lock()
-                    .unwrap()
-                    .bytes
-                    .put(mem_key, (bytes, Instant::now()));
-            }
-
-            let (w, h) = read_header_dims(&raw_bytes);
-            Ok((w, h, raw_bytes))
+            let (bytes, fetched_at) = if let Some(cached) = read_disk_cache(&disk_path).await {
+                cached
+            } else {
+                debug!("Fetching emote image: {url}");
+                let resp = self.client.get(url).send().await?.error_for_status()?;
+                let bytes = resp.bytes().await?;
+                validate_image(bytes.clone()).await?;
+                if let Some(parent) = disk_path.parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
+                let _ = tokio::fs::write(&disk_path, &bytes).await;
+                (bytes, Instant::now())
+            };
+            let (w, h) = read_header_dims(&bytes)?;
+            self.inner
+                .lock()
+                .unwrap()
+                .bytes
+                .put(mem_key, (bytes.clone(), fetched_at));
+            Ok((w, h, bytes.to_vec()))
         }
         .await;
 
-        // Notify waiters and remove in-flight entry.
-        {
-            let mut guard = self.inner.lock().unwrap();
-            if let Some(tx) = guard.in_flight.remove(&url_key) {
-                let broadcast_val = match &fetch_result {
-                    Ok(v) => Ok(v.clone()),
-                    Err(e) => Err(e.to_string()),
-                };
-                let _ = tx.send(broadcast_val);
-            }
-        }
-
+        request.finish(&fetch_result);
         fetch_result
     }
 
@@ -270,12 +280,290 @@ fn url_hash(url: &str) -> u64 {
     hash
 }
 
-/// Read image dimensions from the file header without full RGBA decoding.
-/// Falls back to (1, 1) for unrecognized formats.
-fn read_header_dims(bytes: &[u8]) -> (u32, u32) {
-    image::ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .ok()
-        .and_then(|r| r.into_dimensions().ok())
-        .unwrap_or((1, 1))
+async fn read_disk_cache(path: &std::path::Path) -> Option<(Bytes, Instant)> {
+    let modified = tokio::fs::metadata(path).await.ok()?.modified().ok()?;
+    let age = modified.elapsed().ok()?;
+    if age >= DISK_TTL {
+        return None;
+    }
+    let bytes: Bytes = tokio::fs::read(path).await.ok()?.into();
+    if validate_image(bytes.clone()).await.is_err() {
+        let _ = tokio::fs::remove_file(path).await;
+        return None;
+    }
+    Some((bytes, Instant::now().checked_sub(age)?))
+}
+
+async fn validate_image(bytes: Bytes) -> Result<(), EmoteError> {
+    // Validate cache misses away from the async event loop. A readable header
+    // alone does not prove that a response contains decodable image data.
+    tokio::task::spawn_blocking(move || {
+        image::ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()?
+            .decode()?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| EmoteError::Io(std::io::Error::other(error.to_string())))?
+}
+
+/// Read image dimensions without decoding the image into pixels.
+fn read_header_dims(bytes: &[u8]) -> Result<(u32, u32), EmoteError> {
+    Ok(image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()?
+        .into_dimensions()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::SystemTime;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    struct TestCache(EmoteCache);
+
+    impl TestCache {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let stamp = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "crust-emote-cache-{}-{stamp}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            Self(EmoteCache::with_disk_dir(path).unwrap())
+        }
+
+        fn url_path(&self, url: &str) -> PathBuf {
+            self.0
+                .disk_dir
+                .join("url")
+                .join(format!("{:016x}.bin", url_hash(url)))
+        }
+    }
+
+    impl Drop for TestCache {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0.disk_dir);
+        }
+    }
+
+    fn png(width: u32) -> Vec<u8> {
+        let mut out = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(width, 1)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .unwrap();
+        out.into_inner()
+    }
+
+    async fn respond(stream: &mut TcpStream, status: &str, bytes: &[u8]) {
+        let mut request = Vec::new();
+        while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+            let mut chunk = [0; 1024];
+            let count = stream.read(&mut chunk).await.unwrap();
+            assert!(count > 0, "connection closed before request headers");
+            request.extend_from_slice(&chunk[..count]);
+            assert!(request.len() <= 16 * 1024, "request headers too large");
+        }
+        let headers = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            bytes.len()
+        );
+        stream.write_all(headers.as_bytes()).await.unwrap();
+        stream.write_all(bytes).await.unwrap();
+        stream.shutdown().await.unwrap();
+    }
+
+    async fn server(
+        responses: Vec<(&'static str, Vec<u8>)>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/emote", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            for (status, bytes) in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                respond(&mut stream, status, &bytes).await;
+            }
+        });
+        (url, task)
+    }
+
+    #[tokio::test]
+    async fn failed_http_response_is_not_cached_and_can_retry() {
+        let cache = TestCache::new();
+        let bytes = png(2);
+        let (url, task) = server(vec![
+            ("503 Service Unavailable", bytes.clone()),
+            ("200 OK", bytes.clone()),
+        ])
+        .await;
+        assert!(matches!(
+            cache.0.fetch_and_decode(&url).await,
+            Err(EmoteError::Http(_))
+        ));
+        assert!(!cache.url_path(&url).exists());
+        assert!(cache.0.inner.lock().unwrap().in_flight.is_empty());
+        assert_eq!(cache.0.fetch_and_decode(&url).await.unwrap(), (2, 1, bytes));
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn image_header_without_pixel_data_does_not_poison_the_cache() {
+        let cache = TestCache::new();
+        let mut truncated = png(1);
+        let image_data = truncated
+            .windows(4)
+            .position(|bytes| bytes == b"IDAT")
+            .unwrap();
+        truncated.truncate(image_data + 4);
+        assert!(read_header_dims(&truncated).is_ok());
+        assert!(image::load_from_memory(&truncated).is_err());
+        let valid = png(1);
+        let (url, task) = server(vec![("200 OK", truncated), ("200 OK", valid.clone())]).await;
+        assert!(cache.0.fetch_and_decode(&url).await.is_err());
+        assert!(!cache.url_path(&url).exists());
+        assert_eq!(cache.0.fetch_and_decode(&url).await.unwrap(), (1, 1, valid));
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn corrupt_and_expired_disk_entries_are_refetched() {
+        for corrupt in [true, false] {
+            let cache = TestCache::new();
+            let bytes = png(2);
+            let (url, task) = server(vec![("200 OK", bytes.clone())]).await;
+            let path = cache.url_path(&url);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &path,
+                if corrupt {
+                    b"not an image".to_vec()
+                } else {
+                    png(1)
+                },
+            )
+            .unwrap();
+            if !corrupt {
+                std::fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_modified(SystemTime::now() - DISK_TTL - Duration::from_secs(1))
+                    .unwrap();
+            }
+            assert_eq!(cache.0.fetch_and_decode(&url).await.unwrap(), (2, 1, bytes));
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn disk_age_is_preserved_in_memory_and_requests_are_coalesced() {
+        let cache = TestCache::new();
+        let bytes = png(3);
+        let (url, task) = server(vec![("200 OK", bytes.clone())]).await;
+        let (first, second) = tokio::join!(
+            cache.0.fetch_and_decode(&url),
+            cache.0.fetch_and_decode(&url)
+        );
+        assert_eq!(first.unwrap(), (3, 1, bytes.clone()));
+        assert_eq!(second.unwrap(), (3, 1, bytes.clone()));
+        task.await.unwrap();
+
+        cache.0.inner.lock().unwrap().bytes.clear();
+        let age = Duration::from_secs(23 * 3600);
+        std::fs::File::options()
+            .write(true)
+            .open(cache.url_path(&url))
+            .unwrap()
+            .set_modified(SystemTime::now() - age)
+            .unwrap();
+        assert_eq!(cache.0.fetch_and_decode(&url).await.unwrap(), (3, 1, bytes));
+        let inner = cache.0.inner.lock().unwrap();
+        assert!(inner
+            .bytes
+            .iter()
+            .all(|(_, (_, fetched_at))| fetched_at.elapsed() >= age));
+    }
+
+    #[tokio::test]
+    async fn cancelled_fetch_releases_waiters_and_allows_a_new_request() {
+        let cache = TestCache::new();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/emote", listener.local_addr().unwrap());
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let (first, _) = listener.accept().await.unwrap();
+            accepted_tx.send(()).unwrap();
+            let (mut retry, _) = listener.accept().await.unwrap();
+            respond(&mut retry, "200 OK", &png(2)).await;
+            drop(first);
+        });
+        let leader_cache = cache.0.clone();
+        let leader_url = url.clone();
+        let leader = tokio::spawn(async move { leader_cache.fetch_and_decode(&leader_url).await });
+        tokio::time::timeout(Duration::from_secs(3), accepted_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let waiter_cache = cache.0.clone();
+        let waiter_url = url.clone();
+        let waiter = tokio::spawn(async move { waiter_cache.fetch_and_decode(&waiter_url).await });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if cache
+                    .0
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .in_flight
+                    .get(&url)
+                    .is_some_and(|tx| tx.receiver_count() > 0)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        leader.abort();
+        assert!(leader.await.unwrap_err().is_cancelled());
+        assert!(tokio::time::timeout(Duration::from_secs(3), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+        assert!(cache.0.inner.lock().unwrap().in_flight.is_empty());
+        assert_eq!(cache.0.fetch_and_decode(&url).await.unwrap().0, 2);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn asset_key_fetch_rejects_error_responses_and_invalid_images() {
+        let cache = TestCache::new();
+        let key = AssetKey {
+            provider: "test".to_owned(),
+            id: "one".to_owned(),
+            scale: 1,
+        };
+        let bytes = png(1);
+        let (url, task) = server(vec![
+            ("404 Not Found", bytes.clone()),
+            ("200 OK", b"error page".to_vec()),
+            ("200 OK", bytes.clone()),
+        ])
+        .await;
+        assert!(cache.0.get_bytes(&key, &url).await.is_err());
+        assert!(cache.0.get_bytes(&key, &url).await.is_err());
+        assert_eq!(
+            cache.0.get_bytes(&key, &url).await.unwrap().as_ref(),
+            bytes.as_slice()
+        );
+        task.await.unwrap();
+    }
 }

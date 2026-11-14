@@ -34,7 +34,7 @@ use seventv::{
     SevenTvResolvedStyle, SevenTvUserStyleRaw,
 };
 
-use runtime::assets::fetch_emote_image;
+use runtime::assets::ImageRequests;
 use runtime::badges::{
     load_badge_map_cache_into, load_channel_badges, load_global_badges, resolve_badge_url, BadgeMap,
 };
@@ -757,8 +757,7 @@ async fn reducer_loop(
     kick_runtime_enabled: bool,
     irc_runtime_enabled: bool,
 ) {
-    // Track URLs we've already queued for image download
-    let mut pending_images: HashSet<String> = HashSet::new();
+    let image_requests = ImageRequests::default();
     // Track URLs we've already kicked off a link-preview fetch for.
     let mut pending_link_previews: HashSet<String> = HashSet::new();
     // Track recent EventSub metadata.message_id values to avoid applying
@@ -1881,49 +1880,20 @@ async fn reducer_loop(
                         // is fetched on-demand when the user hovers.
                         for span in &msg.spans {
                             let url = match span {
-                                crust_core::Span::Emote { url, .. } => Some(url.clone()),
-                                crust_core::Span::Emoji { url, .. } => Some(url.clone()),
+                                crust_core::Span::Emote { url, .. }
+                                | crust_core::Span::Emoji { url, .. } => Some(url.as_str()),
                                 _ => None,
                             };
                             if let Some(url) = url {
-                                if !pending_images.contains(&url) {
-                                    pending_images.insert(url.clone());
-                                    let evt_tx = evt_tx.clone();
-                                    let cache = emote_cache.clone();
-                                    tokio::spawn(async move {
-                                        fetch_emote_image(&url, &cache, &evt_tx).await;
-                                    });
-                                }
+                                image_requests.request(url, &emote_cache, &evt_tx);
                             }
                         }
                         // Queue badge image fetches for the user's own
                         // badges plus any Shared Chat source-channel badges.
-                        let shared_badge_urls: Vec<String> = msg
-                            .shared
-                            .as_ref()
-                            .map(|s| s.badges.iter().filter_map(|b| b.url.clone()).collect())
-                            .unwrap_or_default();
-                        for badge in &msg.sender.badges {
+                        let shared_badges = msg.shared.iter().flat_map(|source| source.badges.iter());
+                        for badge in msg.sender.badges.iter().chain(shared_badges) {
                             if let Some(url) = &badge.url {
-                                if !pending_images.contains(url) {
-                                    pending_images.insert(url.clone());
-                                    let url = url.clone();
-                                    let evt_tx = evt_tx.clone();
-                                    let cache = emote_cache.clone();
-                                    tokio::spawn(async move {
-                                        fetch_emote_image(&url, &cache, &evt_tx).await;
-                                    });
-                                }
-                            }
-                        }
-                        for url in shared_badge_urls {
-                            if !pending_images.contains(&url) {
-                                pending_images.insert(url.clone());
-                                let evt_tx = evt_tx.clone();
-                                let cache = emote_cache.clone();
-                                tokio::spawn(async move {
-                                    fetch_emote_image(&url, &cache, &evt_tx).await;
-                                });
+                                image_requests.request(url, &emote_cache, &evt_tx);
                             }
                         }
 
@@ -2017,10 +1987,11 @@ async fn reducer_loop(
                         }).await;
                         // Show a moderation notice in chat
                         let text = format_timeout_text(&login, seconds);
-                        let msg = make_system_message(
+                        let mut msg = make_system_message(
                             local_msg_id, channel.clone(), text, Utc::now(),
                             MsgKind::Timeout { login: login.clone(), seconds },
                         );
+                        msg.server_id = Some(format!("{}{}", crust_core::model::IRC_MODERATION_ID_PREFIX, local_msg_id));
                         local_msg_id += 1;
                         let _ = evt_tx.send(AppEvent::MessageReceived {
                             channel,
@@ -2033,10 +2004,11 @@ async fn reducer_loop(
                             login: login.clone(),
                         }).await;
                         let text = format!("{login} was permanently banned.");
-                        let msg = make_system_message(
+                        let mut msg = make_system_message(
                             local_msg_id, channel.clone(), text, Utc::now(),
                             MsgKind::Ban { login: login.clone() },
                         );
+                        msg.server_id = Some(format!("{}{}", crust_core::model::IRC_MODERATION_ID_PREFIX, local_msg_id));
                         local_msg_id += 1;
                         let _ = evt_tx.send(AppEvent::MessageReceived {
                             channel,
@@ -2045,15 +2017,16 @@ async fn reducer_loop(
                     }
                     TwitchEvent::ChatCleared { channel } => {
                         let _ = evt_tx
-                            .send(AppEvent::ChannelMessagesCleared {
+                            .send(AppEvent::ChannelChatCleared {
                                 channel: channel.clone(),
                             })
                             .await;
-                        let msg = make_system_message(
+                        let mut msg = make_system_message(
                             local_msg_id, channel.clone(),
                             "Chat was cleared by a moderator.".to_owned(),
                             Utc::now(), MsgKind::ChatCleared,
                         );
+                        msg.server_id = Some(format!("{}{}", crust_core::model::IRC_MODERATION_ID_PREFIX, local_msg_id));
                         local_msg_id += 1;
                         let _ = evt_tx.send(AppEvent::MessageReceived {
                             channel,
@@ -2239,33 +2212,18 @@ async fn reducer_loop(
                         // Queue image fetches for emotes/emoji
                         for span in &msg.spans {
                             let url = match span {
-                                crust_core::Span::Emote { url, .. } => Some(url.clone()),
-                                crust_core::Span::Emoji { url, .. } => Some(url.clone()),
+                                crust_core::Span::Emote { url, .. }
+                                | crust_core::Span::Emoji { url, .. } => Some(url.as_str()),
                                 _ => None,
                             };
                             if let Some(url) = url {
-                                if !pending_images.contains(&url) {
-                                    pending_images.insert(url.clone());
-                                    let evt_tx = evt_tx.clone();
-                                    let cache = emote_cache.clone();
-                                    tokio::spawn(async move {
-                                        fetch_emote_image(&url, &cache, &evt_tx).await;
-                                    });
-                                }
+                                image_requests.request(url, &emote_cache, &evt_tx);
                             }
                         }
                         // Queue badge image fetches
                         for badge in &msg.sender.badges {
                             if let Some(url) = &badge.url {
-                                if !pending_images.contains(url) {
-                                    pending_images.insert(url.clone());
-                                    let url = url.clone();
-                                    let evt_tx = evt_tx.clone();
-                                    let cache = emote_cache.clone();
-                                    tokio::spawn(async move {
-                                        fetch_emote_image(&url, &cache, &evt_tx).await;
-                                    });
-                                }
+                                image_requests.request(url, &emote_cache, &evt_tx);
                             }
                         }
 
@@ -2303,7 +2261,7 @@ async fn reducer_loop(
                     }
                     KickEvent::ChatCleared { channel } => {
                         let _ = evt_tx
-                            .send(AppEvent::ChannelMessagesCleared {
+                            .send(AppEvent::ChannelChatCleared {
                                 channel: channel.clone(),
                             })
                             .await;
@@ -2514,19 +2472,12 @@ async fn reducer_loop(
 
                         for span in &msg.spans {
                             let url = match span {
-                                crust_core::Span::Emote { url, .. } => Some(url.clone()),
-                                crust_core::Span::Emoji { url, .. } => Some(url.clone()),
+                                crust_core::Span::Emote { url, .. }
+                                | crust_core::Span::Emoji { url, .. } => Some(url.as_str()),
                                 _ => None,
                             };
                             if let Some(url) = url {
-                                if !pending_images.contains(&url) {
-                                    pending_images.insert(url.clone());
-                                    let evt_tx = evt_tx.clone();
-                                    let cache = emote_cache.clone();
-                                    tokio::spawn(async move {
-                                        fetch_emote_image(&url, &cache, &evt_tx).await;
-                                    });
-                                }
+                                image_requests.request(url, &emote_cache, &evt_tx);
                             }
                         }
 
@@ -2555,24 +2506,22 @@ async fn reducer_loop(
                     EventSubEvent::Reconnecting { attempt } => {
                         debug!("EventSub reconnect attempt {attempt}");
                     }
-                    EventSubEvent::Backfill(plan) => {
+                    EventSubEvent::BackfillRequested => {
                         // Fan out Helix refreshes for stream status, unban queue,
                         // active poll, active prediction, and latest hype train.
                         // Synthetic notices produced by the runner are routed back
-                        // through `eventsub_evt_tx_for_backfill` so they pick up
-                        // this loop's 45s `should_drop_duplicate_eventsub_notice`
-                        // window when the websocket replays the same event id.
+                        // through the session event channel for normal handling.
                         let ctx = runtime::eventsub_backfill::BackfillContext {
                             evt_tx: evt_tx.clone(),
                             eventsub_evt_tx: eventsub_evt_tx_for_backfill.clone(),
-                            helix: authed_helix.clone() as Arc<dyn crust_twitch::helix::HelixApi>,
+                            helix: authed_helix.clone(),
                             oauth_token: settings.oauth_token.clone(),
                             helix_client_id: helix_client_id.clone(),
                             auth_user_id: auth_user_id.clone(),
                             channel_room_ids: channel_room_ids.clone(),
                             channel_mod_status: channel_mod_status.clone(),
                         };
-                        runtime::eventsub_backfill::run_backfill(plan, ctx);
+                        runtime::eventsub_backfill::run_backfill(ctx);
                     }
                     EventSubEvent::Notice(notice) => {
                         if let Some(event_id) = notice.event_id.as_deref() {
@@ -3027,7 +2976,7 @@ async fn reducer_loop(
                                         match effect {
                                             ModerationActionEffect::ChannelMessagesCleared => {
                                                 let _ = evt_tx
-                                                    .send(AppEvent::ChannelMessagesCleared {
+                                                    .send(AppEvent::ChannelChatCleared {
                                                         channel: channel.clone(),
                                                     })
                                                     .await;
@@ -3144,13 +3093,17 @@ async fn reducer_loop(
 
                             if should_emit_eventsub_notice_message(&notice.kind) {
                                 let (msg_kind, text) = eventsub_notice_to_message(&notice.kind);
-                                let msg = make_system_message(
+                                let mut msg = make_system_message(
                                     local_msg_id,
                                     channel.clone(),
                                     text,
                                     Utc::now(),
                                     msg_kind,
                                 );
+                                if matches!(msg.msg_kind, MsgKind::Timeout { .. } | MsgKind::Ban { .. } | MsgKind::ChatCleared) {
+                                    let event_id = notice.event_id.clone().unwrap_or_else(|| format!("local-{local_msg_id}"));
+                                    msg.server_id = Some(format!("{}{event_id}", crust_core::model::EVENTSUB_MODERATION_ID_PREFIX));
+                                }
                                 local_msg_id += 1;
                                 let _ = evt_tx
                                     .send(AppEvent::MessageReceived {
@@ -3442,14 +3395,7 @@ async fn reducer_loop(
                     }
                     AppCommand::FetchImage { url } => {
                         // On-demand fetch (e.g. HD emote requested on hover)
-                        if !pending_images.contains(&url) {
-                            pending_images.insert(url.clone());
-                            let evt_tx = evt_tx.clone();
-                            let cache = emote_cache.clone();
-                            tokio::spawn(async move {
-                                fetch_emote_image(&url, &cache, &evt_tx).await;
-                            });
-                        }
+                        image_requests.request(&url, &emote_cache, &evt_tx);
                     }
                     AppCommand::FetchLinkPreview { url } => {
                         if !pending_link_previews.contains(&url) {
@@ -4711,19 +4657,12 @@ async fn reducer_loop(
                             // Queue image fetches for emotes in the echo
                             for span in &echo.spans {
                                 let url = match span {
-                                    crust_core::Span::Emote { url, .. } => Some(url.clone()),
-                                    crust_core::Span::Emoji { url, .. } => Some(url.clone()),
+                                    crust_core::Span::Emote { url, .. }
+                                    | crust_core::Span::Emoji { url, .. } => Some(url.as_str()),
                                     _ => None,
                                 };
                                 if let Some(url) = url {
-                                    if !pending_images.contains(&url) {
-                                        pending_images.insert(url.clone());
-                                        let evt_tx = evt_tx.clone();
-                                        let cache = emote_cache.clone();
-                                        tokio::spawn(async move {
-                                            fetch_emote_image(&url, &cache, &evt_tx).await;
-                                        });
-                                    }
+                                    image_requests.request(url, &emote_cache, &evt_tx);
                                 }
                             }
 
@@ -4810,19 +4749,12 @@ async fn reducer_loop(
 
                                 for span in &echo.spans {
                                     let url = match span {
-                                        crust_core::Span::Emote { url, .. } => Some(url.clone()),
-                                        crust_core::Span::Emoji { url, .. } => Some(url.clone()),
+                                        crust_core::Span::Emote { url, .. }
+                                        | crust_core::Span::Emoji { url, .. } => Some(url.as_str()),
                                         _ => None,
                                     };
                                     if let Some(url) = url {
-                                        if !pending_images.contains(&url) {
-                                            pending_images.insert(url.clone());
-                                            let evt_tx = evt_tx.clone();
-                                            let cache = emote_cache.clone();
-                                            tokio::spawn(async move {
-                                                fetch_emote_image(&url, &cache, &evt_tx).await;
-                                            });
-                                        }
+                                        image_requests.request(url, &emote_cache, &evt_tx);
                                     }
                                 }
 
@@ -10012,7 +9944,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        format_completed_poll_message, format_eventsub_notice_text,
+        eventsub_notice_to_message, format_completed_poll_message, format_eventsub_notice_text,
         moderation_action_effect_from_notice, moderation_command_remaining_cooldown,
         parse_twitch_pinned_snapshot_json, should_drop_duplicate_eventsub_notice,
         should_emit_eventsub_notice_message, stream_status_is_live_from_notice,
@@ -10020,7 +9952,7 @@ mod tests {
         APP_MIN_INNER_SIZE, MODERATION_CMD_COOLDOWN,
     };
     use crate::runtime::system_messages::is_twitch_pinned_notice;
-    use crust_core::model::ChannelId;
+    use crust_core::model::{ChannelId, MsgKind};
     use crust_twitch::eventsub::EventSubNoticeKind;
 
     #[test]
@@ -10170,10 +10102,12 @@ mod tests {
             action: "ban".to_owned(),
             target_login: Some("viewer123".to_owned()),
             target_message_id: None,
+            reason: Some("Repeated spam".to_owned()),
             source_channel_login: Some("partner_stream".to_owned()),
         });
 
         assert!(text.contains("mod_jane performed ban on viewer123 in #partner_stream."));
+        assert!(text.contains("Reason: Repeated spam"));
     }
 
     #[test]
@@ -10205,6 +10139,46 @@ mod tests {
                 created_at: Some("2026-03-31T19:35:00Z".to_owned()),
             }
         ));
+    }
+
+    #[test]
+    fn moderation_actions_keep_structured_notices_for_cross_source_merging() {
+        for action in ["ban", "timeout", "timeout_600s", "clear", " TIMEOUT_30s "] {
+            let notice = EventSubNoticeKind::ModerationAction {
+                moderator_login: "moderator".to_owned(),
+                action: action.to_owned(),
+                target_login: Some("viewer".to_owned()),
+                target_message_id: None,
+                reason: None,
+                source_channel_login: None,
+            };
+            assert!(should_emit_eventsub_notice_message(&notice), "{action}");
+            let (kind, text) = eventsub_notice_to_message(&notice);
+            assert!(matches!(kind, MsgKind::Timeout { .. } | MsgKind::Ban { .. } | MsgKind::ChatCleared));
+            assert!(text.contains("moderator"));
+            assert!(moderation_action_effect_from_notice(action, Some("viewer"), None).is_some());
+        }
+    }
+
+    #[test]
+    fn moderation_notices_keep_actions_without_an_irc_notice_and_shared_sources() {
+        for (action, source_channel_login) in [
+            ("unban", None),
+            ("untimeout", None),
+            ("warn", None),
+            ("delete", None),
+            ("timeout_600s", Some("partner_stream")),
+        ] {
+            let notice = EventSubNoticeKind::ModerationAction {
+                moderator_login: "moderator".to_owned(),
+                action: action.to_owned(),
+                target_login: Some("viewer".to_owned()),
+                target_message_id: None,
+                reason: None,
+                source_channel_login: source_channel_login.map(str::to_owned),
+            };
+            assert!(should_emit_eventsub_notice_message(&notice), "{action}");
+        }
     }
 
     #[test]

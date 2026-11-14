@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{TimeZone as _, Utc};
 use futures_util::{SinkExt, StreamExt};
@@ -9,12 +9,17 @@ use tracing::{debug, error, info, warn};
 
 use crust_core::model::{
     Badge, ChannelId, ChatMessage, MessageFlags, MessageId, MsgKind, ReplyInfo, Sender,
-    SystemNotice, TwitchEmotePos, UserId,
+    SharedChatSource, SystemNotice, TwitchEmotePos, UserId,
 };
 
 use crate::{
     irc::{split_and_parse, IrcMessage},
     TwitchError,
+};
+
+use super::{
+    outbound::OutboundQueue,
+    ratelimit::{ChatRateLimiter, RateLimiter},
 };
 
 const WS_URL: &str = "wss://irc-ws.chat.twitch.tv:443";
@@ -103,6 +108,7 @@ pub enum TwitchEvent {
         channel: ChannelId,
         display_name: String,
         viewer_count: u32,
+        source_login: Option<String>,
     },
 }
 
@@ -128,13 +134,18 @@ pub enum SessionCommand {
 
 /// Twitch IRC session - supports both anonymous (justinfan) and authenticated modes.
 pub struct TwitchSession {
-    channels: HashSet<ChannelId>,
+    // Retain sent timestamps across reconnects and account changes. Changing
+    // sockets must not reset a Twitch rate window.
+    chat_limiter: ChatRateLimiter,
+    join_limiter: RateLimiter,
+    elevated_channels: HashSet<ChannelId>,
     event_tx: mpsc::Sender<TwitchEvent>,
     cmd_rx: mpsc::Receiver<SessionCommand>,
     next_msg_id: u64,
     /// If set, we connect with authentication.
     auth_token: Option<String>,
     auth_nick: Option<String>,
+    connection_nick: Option<String>,
     /// Set to true when Twitch explicitly rejects our auth credentials via NOTICE.
     /// Used by `run()` to break the reconnect loop rather than retrying with a
     /// token that will never work.
@@ -152,12 +163,15 @@ impl TwitchSession {
         cmd_rx: mpsc::Receiver<SessionCommand>,
     ) -> Self {
         Self {
-            channels: HashSet::new(),
+            chat_limiter: ChatRateLimiter::new(),
+            join_limiter: RateLimiter::join(),
+            elevated_channels: HashSet::new(),
             event_tx,
             cmd_rx,
             next_msg_id: 1,
             auth_token: None,
             auth_nick: None,
+            connection_nick: None,
             auth_failed: false,
             voluntary_reconnect: false,
         }
@@ -175,6 +189,15 @@ impl TwitchSession {
         }
     }
 
+    async fn outbound_notice(&self, channel: ChannelId, text: &str) {
+        self.emit(TwitchEvent::SystemNotice(SystemNotice {
+            channel: Some(channel),
+            text: text.to_owned(),
+            timestamp: Utc::now(),
+        }))
+        .await;
+    }
+
     /// Main entry point: runs the connect/reconnect loop.
     pub async fn run(mut self) {
         let mut attempt: u32 = 0;
@@ -182,12 +205,9 @@ impl TwitchSession {
         // getting any IRC data). Several in a row often indicates an auth problem.
         let mut quick_fail_streak: u32 = 0;
         loop {
-            self.emit(if attempt == 0 {
-                TwitchEvent::Connected // optimistic; real Connected sent after 001
-            } else {
-                TwitchEvent::Reconnecting { attempt }
-            })
-            .await;
+            if attempt > 0 {
+                self.emit(TwitchEvent::Reconnecting { attempt }).await;
+            }
 
             let started = std::time::Instant::now();
             match self.connect_once().await {
@@ -200,6 +220,7 @@ impl TwitchSession {
                         error!("{msg}");
                         self.auth_failed = false;
                         self.auth_token = None;
+                        self.auth_nick = None;
                         self.emit(TwitchEvent::Error(msg.to_owned())).await;
                         // Fall through to reconnect loop but now anonymous.
                     }
@@ -231,6 +252,7 @@ impl TwitchSession {
                         error!("{msg}");
                         self.auth_failed = false;
                         self.auth_token = None;
+                        self.auth_nick = None;
                         quick_fail_streak = 0;
                         self.emit(TwitchEvent::Error(msg.to_owned())).await;
                         // Continue loop; next attempt will be anonymous.
@@ -281,6 +303,10 @@ impl TwitchSession {
     }
 
     async fn connect_once(&mut self) -> Result<bool, TwitchError> {
+        self.connect_to(WS_URL).await
+    }
+
+    async fn connect_to(&mut self, url: &str) -> Result<bool, TwitchError> {
         let is_authed = self.auth_token.is_some();
         if is_authed {
             info!(
@@ -290,7 +316,14 @@ impl TwitchSession {
         } else {
             info!("Connecting anonymously to {WS_URL}");
         }
-        let (ws_stream, _) = connect_async(WS_URL).await?;
+        let (ws_stream, _) = tokio::time::timeout(Duration::from_secs(10), connect_async(url))
+            .await
+            .map_err(|_| {
+                TwitchError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "Twitch IRC connection timed out after 10 seconds",
+                ))
+            })??;
         let (mut sink, mut stream) = ws_stream.split();
 
         macro_rules! send_raw {
@@ -313,16 +346,40 @@ impl TwitchSession {
                 .auth_nick
                 .clone()
                 .unwrap_or_else(|| "crust_user".into());
+            self.connection_nick = Some(nick.clone());
             send_raw!(format!("PASS {pass}"));
             send_raw!(format!("NICK {nick}"));
         } else {
             // Anonymous login - no PASS needed
             let nick = format!("justinfan{}", rand_number());
+            self.connection_nick = Some(nick.clone());
             send_raw!(format!("NICK {nick}"));
         }
 
-        // Event loop: handle incoming frames and commands
+        // Privileges must be confirmed again for this connection. The token
+        // owner's own channel is the one exception we can identify locally.
+        self.elevated_channels.clear();
+        if self.auth_token.is_some() {
+            if let Some(nick) = self.auth_nick.as_deref() {
+                let channel = ChannelId::new(nick);
+                if is_valid_twitch_channel(&channel) {
+                    self.elevated_channels.insert(channel);
+                }
+            }
+        }
+        let mut outbound = OutboundQueue::default();
+
+        // Rate waits are a select branch, so incoming PINGs and account/control
+        // commands remain responsive while output is queued.
         loop {
+            let now = Instant::now();
+            let next_send = outbound.next_send_at(
+                &mut self.chat_limiter,
+                &mut self.join_limiter,
+                &self.elevated_channels,
+                now,
+            );
+            let send_deadline = tokio::time::Instant::from_std(next_send.unwrap_or(now));
             tokio::select! {
                 maybe_frame = stream.next() => {
                     match maybe_frame {
@@ -340,8 +397,16 @@ impl TwitchSession {
                                 match result {
                                     Err(e) => warn!("IRC parse: {e}"),
                                     Ok(msg) => {
+                                        if msg.command == "RECONNECT" {
+                                            info!("Server requested a reconnect");
+                                            self.voluntary_reconnect = true;
+                                            return Ok(true);
+                                        }
                                         if let Some(reply) = self.handle_irc(&msg).await {
                                             send_raw!(reply);
+                                        }
+                                        if self.auth_failed {
+                                            return Ok(true);
                                         }
                                     }
                                 }
@@ -350,6 +415,9 @@ impl TwitchSession {
                         Some(Ok(Message::Close(_))) => {
                             info!("Server close frame");
                             return Ok(true);
+                        }
+                        Some(Ok(Message::Ping(payload))) => {
+                            sink.send(Message::Pong(payload)).await?;
                         }
                         Some(Ok(_)) => {}
                     }
@@ -366,21 +434,38 @@ impl TwitchSession {
                             return Ok(false);
                         }
                         Some(SessionCommand::JoinChannel(ch)) => {
-                            self.channels.insert(ch.clone());
-                            send_raw!(format!("JOIN {}", ch.irc_name()));
+                            let ch = ChannelId::new(ch.as_str());
+                            if !is_valid_twitch_channel(&ch) {
+                                self.outbound_notice(ch, "Channel not joined: invalid Twitch channel.").await;
+                            } else if outbound.join(ch.clone()).is_err() {
+                                self.outbound_notice(ch, "Channel not joined: too many joins are waiting. Try again shortly.").await;
+                            } else if self.auth_token.is_some()
+                                && self.auth_nick.as_deref().is_some_and(|nick| nick.eq_ignore_ascii_case(ch.as_str()))
+                            {
+                                self.elevated_channels.insert(ch);
+                            }
                         }
                         Some(SessionCommand::LeaveChannel(ch)) => {
-                            self.channels.remove(&ch);
-                            send_raw!(format!("PART {}", ch.irc_name()));
+                            let ch = ChannelId::new(ch.as_str());
+                            if !is_valid_twitch_channel(&ch) {
+                                self.outbound_notice(ch, "Channel not left: invalid Twitch channel.").await;
+                            } else {
+                                self.elevated_channels.remove(&ch);
+                                if outbound.leave(&ch) {
+                                    send_raw!(format!("PART {}", ch.irc_name()));
+                                }
+                            }
                         }
                         Some(SessionCommand::SendMessage(ch, text, reply_id)) => {
+                            let ch = ChannelId::new(ch.as_str());
                             if self.auth_token.is_some() {
-                                let line = if let Some(parent_id) = reply_id {
-                                    format!("@reply-parent-msg-id={} PRIVMSG {} :{}", parent_id, ch.irc_name(), text)
+                                if let Some(line) = format_privmsg(&ch, &text, reply_id.as_deref()) {
+                                    if !outbound.message(ch.clone(), line) {
+                                        self.outbound_notice(ch, "Message not sent: outgoing queue is full. Wait for pending messages to send, then try again.").await;
+                                    }
                                 } else {
-                                    format!("PRIVMSG {} :{}", ch.irc_name(), text)
-                                };
-                                send_raw!(line);
+                                    self.outbound_notice(ch, "Message not sent: invalid channel, reply ID, or line break.").await;
+                                }
                             } else {
                                 warn!("Cannot send message: not authenticated");
                             }
@@ -404,6 +489,17 @@ impl TwitchSession {
                             let _ = sink.send(Message::Text("QUIT".into())).await;
                             return Ok(true); // triggers reconnect
                         }
+                    }
+                }
+
+                _ = tokio::time::sleep_until(send_deadline), if next_send.is_some() => {
+                    if let Some(line) = outbound.pop_ready(
+                        &mut self.chat_limiter,
+                        &mut self.join_limiter,
+                        &self.elevated_channels,
+                        Instant::now(),
+                    ) {
+                        send_raw!(line);
                     }
                 }
             }
@@ -518,7 +614,7 @@ impl TwitchSession {
                 if let Some(ch_raw) = msg.params.first() {
                     let channel = ChannelId::new(ch_raw.as_str());
                     // Trailing text present = target login was named
-                    if let Some(login) = msg.trailing().filter(|s| !s.is_empty()) {
+                    if let Some(login) = msg.params.get(1).filter(|s| !s.is_empty()) {
                         if let Some(secs_str) = msg.tags.get("ban-duration") {
                             let seconds = secs_str.parse::<u32>().unwrap_or(0);
                             self.emit(TwitchEvent::UserTimedOut {
@@ -592,6 +688,23 @@ impl TwitchSession {
                         .get("color")
                         .filter(|s| !s.is_empty())
                         .map(str::to_owned);
+                    let elevated = is_mod
+                        || msg.tags.get("vip") == Some("1")
+                        || badges.iter().any(|badge| {
+                            matches!(
+                                badge.name.as_str(),
+                                "broadcaster" | "moderator" | "lead_moderator" | "vip"
+                            )
+                        })
+                        || self
+                            .auth_nick
+                            .as_deref()
+                            .is_some_and(|nick| nick.eq_ignore_ascii_case(channel.as_str()));
+                    if self.auth_token.is_some() && elevated {
+                        self.elevated_channels.insert(channel.clone());
+                    } else {
+                        self.elevated_channels.remove(&channel);
+                    }
                     self.emit(TwitchEvent::UserStateUpdated {
                         channel,
                         is_mod,
@@ -602,7 +715,7 @@ impl TwitchSession {
                 }
             }
             "NOTICE" | "HOSTTARGET" => {
-                if let Some(text) = msg.trailing() {
+                if let Some(text) = msg.params.get(1) {
                     let ch = msg.params.first().map(|s| ChannelId::new(s.as_str()));
                     // Detect explicit auth-failure notices from Twitch so the
                     // reconnect loop can stop rather than retrying indefinitely.
@@ -637,7 +750,7 @@ impl TwitchSession {
                     .or_else(|| msg.nick())
                     .unwrap_or("unknown")
                     .to_owned();
-                let sub_msg = msg.trailing().unwrap_or("").to_owned();
+                let sub_msg = msg.params.get(1).cloned().unwrap_or_default();
 
                 match msg_id {
                     "sub" | "resub" => {
@@ -685,6 +798,18 @@ impl TwitchSession {
                         .await;
                     }
                     "raid" => {
+                        let source_login = msg
+                            .tags
+                            .get("msg-param-login")
+                            .map(str::trim)
+                            .filter(|login| !login.is_empty())
+                            .map(str::to_ascii_lowercase);
+                        let display_name = msg
+                            .tags
+                            .get("msg-param-displayName")
+                            .filter(|name| !name.is_empty())
+                            .unwrap_or(&display_name)
+                            .to_owned();
                         let viewer_count = msg
                             .tags
                             .get("msg-param-viewerCount")
@@ -694,6 +819,7 @@ impl TwitchSession {
                             channel,
                             display_name,
                             viewer_count,
+                            source_login,
                         })
                         .await;
                     }
@@ -704,8 +830,8 @@ impl TwitchSession {
                             .tags
                             .get("system-msg")
                             .filter(|s| !s.is_empty())
-                            .map(|s| unescape_irc_tag(s))
-                            .or_else(|| msg.trailing().map(|s| s.to_owned()))
+                            .map(str::to_owned)
+                            .or_else(|| msg.params.get(1).cloned())
                             .unwrap_or_default();
                         if !text.is_empty() {
                             self.emit(TwitchEvent::SystemNotice(SystemNotice {
@@ -725,122 +851,22 @@ impl TwitchSession {
 
     /// Check if an IRC message was sent by our own nick.
     fn is_own_nick(&self, msg: &IrcMessage) -> bool {
-        if let Some(nick) = msg.nick() {
-            if let Some(ref auth_nick) = self.auth_nick {
-                return nick.eq_ignore_ascii_case(auth_nick);
-            }
-            return nick.starts_with("justinfan");
-        }
-        false
+        msg.nick()
+            .zip(
+                self.connection_nick
+                    .as_deref()
+                    .or(self.auth_nick.as_deref()),
+            )
+            .is_some_and(|(nick, own_nick)| nick.eq_ignore_ascii_case(own_nick))
     }
 
     /// Parse PRIVMSG into a ChatMessage (spans left empty - filled by reducer).
     fn parse_privmsg(&mut self, msg: &IrcMessage) -> Option<ChatMessage> {
-        let channel_raw = msg.params.first()?;
-        let channel = ChannelId::new(channel_raw.as_str());
-        let raw_text = msg.trailing()?.to_owned();
-
-        // Handle /me ACTION
-        let (text, is_action) = if raw_text.starts_with("\x01ACTION ") && raw_text.ends_with('\x01')
-        {
-            (&raw_text[8..raw_text.len() - 1], true)
-        } else {
-            (raw_text.as_str(), false)
-        };
-
-        let tags = &msg.tags;
-        let login = msg.nick().unwrap_or("").to_owned();
-        let display_name = tags.get("display-name").unwrap_or(&login).to_owned();
-        let color = tags
-            .get("color")
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned);
-        let user_id = tags.get("user-id").unwrap_or("").to_owned();
-        let server_id = extract_server_message_id(tags);
-
-        let badges: Vec<Badge> = tags
-            .get("badges")
-            .unwrap_or("")
-            .split(',')
-            .filter(|s| !s.is_empty())
-            .filter_map(|b| {
-                let mut parts = b.splitn(2, '/');
-                Some(Badge {
-                    name: parts.next()?.to_owned(),
-                    version: parts.next().unwrap_or("0").to_owned(),
-                    url: None, // resolved later by the reducer via badge_map
-                })
-            })
-            .collect();
-
-        // Parse Twitch emote positions from the emotes tag
-        let twitch_emotes =
-            crust_core::format::parse_twitch_emotes_tag(tags.get("emotes").unwrap_or(""));
-
-        let sender = Sender {
-            user_id: UserId(user_id),
-            login,
-            display_name,
-            color,
-            name_paint: None,
-            badges,
-        };
-
-        let is_own = self.is_own_nick(msg);
-
-        // Bits detection
-        let bits: u32 = tags.get("bits").and_then(|s| s.parse().ok()).unwrap_or(0);
-        let msg_kind = if bits > 0 {
-            MsgKind::Bits { amount: bits }
-        } else {
-            MsgKind::Chat
-        };
-
-        // Reply metadata
-        let reply = if let Some(parent_id) = tags.get("reply-parent-msg-id") {
-            if !parent_id.is_empty() {
-                Some(ReplyInfo {
-                    parent_msg_id: parent_id.to_owned(),
-                    parent_user_login: tags.get("reply-parent-user-login").unwrap_or("").to_owned(),
-                    parent_display_name: tags
-                        .get("reply-parent-display-name")
-                        .unwrap_or("")
-                        .to_owned(),
-                    parent_msg_body: tags.get("reply-parent-msg-body").unwrap_or("").to_owned(),
-                })
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        Some(ChatMessage {
-            id: self.alloc_id(),
-            server_id,
-            timestamp: Utc::now(),
-            channel,
-            sender,
-            raw_text: text.to_owned(),
-            spans: smallvec::SmallVec::new(), // filled by reducer
-            twitch_emotes,
-            flags: MessageFlags {
-                is_action,
-                is_highlighted: irc_msg_id_contains(tags, "highlighted-message"),
-                is_deleted: false,
-                is_first_msg: tags.get("first-msg") == Some("1"),
-                is_pinned: is_pinned_chat_message(tags),
-                is_self: is_own,
-                is_mention: false, // set by reducer once auth_username is known
-                custom_reward_id: tags
-                    .get("custom-reward-id")
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned),
-                is_history: false,
-            },
-            reply,
-            msg_kind,
-        })
+        let mut message = parse_privmsg_irc(msg, self.auth_nick.as_deref(), self.next_msg_id)?;
+        message.id = self.alloc_id();
+        message.flags.is_self = self.is_own_nick(msg);
+        message.flags.is_history = false;
+        Some(message)
     }
 
     /// Parse WHISPER into a lightweight payload for UI whisper management.
@@ -867,7 +893,7 @@ impl TwitchSession {
             return None;
         }
 
-        let raw_text = msg.trailing()?.to_owned();
+        let raw_text = msg.params.get(1)?.to_owned();
         let text = if raw_text.starts_with("\x01ACTION ") && raw_text.ends_with('\x01') {
             raw_text[8..raw_text.len() - 1].to_owned()
         } else {
@@ -919,9 +945,12 @@ pub fn parse_privmsg_irc(
     local_nick: Option<&str>,
     id: u64,
 ) -> Option<ChatMessage> {
+    if msg.command != "PRIVMSG" {
+        return None;
+    }
     let channel_raw = msg.params.first()?;
     let channel = ChannelId::new(channel_raw.as_str());
-    let raw_text = msg.trailing()?.to_owned();
+    let raw_text = msg.params.get(1)?;
 
     // Handle /me ACTION
     let (text, is_action) = if raw_text.starts_with("\x01ACTION ") && raw_text.ends_with('\x01') {
@@ -932,7 +961,11 @@ pub fn parse_privmsg_irc(
 
     let tags = &msg.tags;
     let login = msg.nick().unwrap_or("").to_owned();
-    let display_name = tags.get("display-name").unwrap_or(&login).to_owned();
+    let display_name = tags
+        .get("display-name")
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&login)
+        .to_owned();
     let color = tags
         .get("color")
         .filter(|s| !s.is_empty())
@@ -1018,9 +1051,47 @@ pub fn parse_privmsg_irc(
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned),
             is_history: true,
+            suppress_notification: false,
         },
         reply,
-        msg_kind: MsgKind::Chat,
+        msg_kind: match tags.get("bits").and_then(|s| s.parse::<u32>().ok()) {
+            Some(amount) if amount > 0 => MsgKind::Bits { amount },
+            _ => MsgKind::Chat,
+        },
+        shared: parse_shared_chat(tags),
+    })
+}
+
+fn parse_shared_chat(tags: &crate::irc::types::IrcTags) -> Option<SharedChatSource> {
+    let room_id = tags.get("source-room-id")?.trim();
+    if room_id.is_empty() || tags.get("room-id").map(str::trim) == Some(room_id) {
+        return None;
+    }
+    let badges = tags
+        .get("source-badges")
+        .unwrap_or("")
+        .split(',')
+        .filter_map(|badge| {
+            let (name, version) = badge.split_once('/')?;
+            if !matches!(name, "moderator" | "vip" | "lead_moderator") {
+                return None;
+            }
+            Some(Badge {
+                name: name.to_owned(),
+                version: version.to_owned(),
+                url: None,
+            })
+        })
+        .collect();
+    Some(SharedChatSource {
+        room_id: room_id.to_owned(),
+        source_message_id: tags
+            .get("source-id")
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned),
+        badges,
+        ..SharedChatSource::default()
     })
 }
 
@@ -1101,29 +1172,35 @@ fn is_transient_error(e: &crate::TwitchError) -> bool {
     }
 }
 
-/// Unescape IRC tag value escaping (\\s = space, \\: = semicolon, etc.).
-pub fn unescape_irc_tag(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some('s') => out.push(' '),
-                Some(':') => out.push(';'),
-                Some('r') => out.push('\r'),
-                Some('n') => out.push('\n'),
-                Some('\\') => out.push('\\'),
-                Some(o) => {
-                    out.push('\\');
-                    out.push(o);
-                }
-                None => out.push('\\'),
-            }
-        } else {
-            out.push(c);
-        }
+fn is_valid_twitch_channel(channel: &ChannelId) -> bool {
+    let name = channel.as_str();
+    channel.is_twitch()
+        && !name.is_empty()
+        && name.len() <= 25
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn format_privmsg(channel: &ChannelId, text: &str, reply_id: Option<&str>) -> Option<String> {
+    if !is_valid_twitch_channel(channel)
+        || !crate::irc::types::is_single_irc_line(text)
+        || reply_id.is_some_and(|id| {
+            id.is_empty()
+                || id
+                    .chars()
+                    .any(|c| c.is_whitespace() || matches!(c, '\0' | ';' | '\\'))
+        })
+    {
+        return None;
     }
-    out
+    let target = channel.irc_name();
+    Some(if let Some(parent_id) = reply_id {
+        format!("@reply-parent-msg-id={parent_id} PRIVMSG {target} :{text}")
+    } else {
+        format!("PRIVMSG {target} :{text}")
+    })
 }
 
 /// Generate a random 5-digit number for justinfan nick.
@@ -1135,4 +1212,491 @@ fn rand_number() -> u32 {
         .unwrap_or(12345);
     // Simple LCG - doesn't need to be crypto
     (seed.wrapping_mul(1103515245).wrapping_add(12345) >> 16) % 90000 + 10000
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::irc::parse_line;
+
+    fn session() -> (TwitchSession, mpsc::Receiver<TwitchEvent>) {
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
+        (TwitchSession::new(event_tx, cmd_rx), event_rx)
+    }
+
+    #[tokio::test]
+    async fn clearchat_without_a_target_clears_the_channel() {
+        let (mut session, mut events) = session();
+        let message = parse_line("@room-id=1 :tmi.twitch.tv CLEARCHAT #room").unwrap();
+        session.handle_irc(&message).await;
+        assert!(
+            matches!(events.try_recv().unwrap(), TwitchEvent::ChatCleared { channel } if channel == ChannelId::new("room"))
+        );
+    }
+
+    #[tokio::test]
+    async fn clearchat_targets_preserve_timeout_and_ban_semantics() {
+        let (mut session, mut events) = session();
+        let timeout =
+            parse_line("@ban-duration=600 :tmi.twitch.tv CLEARCHAT #room :alice").unwrap();
+        session.handle_irc(&timeout).await;
+        assert!(
+            matches!(events.try_recv().unwrap(), TwitchEvent::UserTimedOut { login, seconds: 600, .. } if login == "alice")
+        );
+        let ban = parse_line(":tmi.twitch.tv CLEARCHAT #room :bob").unwrap();
+        session.handle_irc(&ban).await;
+        assert!(
+            matches!(events.try_recv().unwrap(), TwitchEvent::UserBanned { login, .. } if login == "bob")
+        );
+    }
+
+    #[tokio::test]
+    async fn subscription_without_a_body_has_no_chat_text() {
+        let (mut session, mut events) = session();
+        let message =
+            parse_line("@msg-id=sub;display-name=Alice :tmi.twitch.tv USERNOTICE #room").unwrap();
+        session.handle_irc(&message).await;
+        assert!(
+            matches!(events.try_recv().unwrap(), TwitchEvent::SubAlert { sub_msg, .. } if sub_msg.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn raid_preserves_source_login_and_raid_display_name() {
+        let (mut session, mut events) = session();
+        let message = parse_line(
+            "@msg-id=raid;display-name=Fallback;msg-param-login=Raider;msg-param-displayName=RaiderDisplay;msg-param-viewerCount=42 :tmi.twitch.tv USERNOTICE #room",
+        )
+        .unwrap();
+        session.handle_irc(&message).await;
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            TwitchEvent::Raid { display_name, viewer_count: 42, source_login, .. }
+                if display_name == "RaiderDisplay" && source_login.as_deref() == Some("raider")
+        ));
+    }
+
+    #[tokio::test]
+    async fn system_notices_do_not_decode_tags_twice() {
+        let (mut session, mut events) = session();
+        let message = parse_line(
+            r"@msg-id=announcement;system-msg=literal\\s\sword :tmi.twitch.tv USERNOTICE #room",
+        )
+        .unwrap();
+        session.handle_irc(&message).await;
+        assert!(
+            matches!(events.try_recv().unwrap(), TwitchEvent::SystemNotice(notice) if notice.text == r"literal\s word")
+        );
+
+        let empty = parse_line("@msg-id=unknown :tmi.twitch.tv USERNOTICE #room").unwrap();
+        session.handle_irc(&empty).await;
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn live_and_history_messages_keep_the_same_server_metadata() {
+        let (mut session, _events) = session();
+        session.auth_nick = Some("alice".into());
+        let message = parse_line(r"@id=message-1;bits=100;tmi-sent-ts=1700000000123;display-name=;reply-parent-msg-id=parent;reply-parent-msg-body=hello\sworld :alice!user@host PRIVMSG #room :Cheer100 🦀").unwrap();
+        let live = session.parse_privmsg(&message).unwrap();
+        let history = parse_privmsg_irc(&message, Some("alice"), 10).unwrap();
+        for parsed in [&live, &history] {
+            assert_eq!(parsed.timestamp.timestamp_millis(), 1700000000123);
+            assert_eq!(parsed.sender.display_name, "alice");
+            assert_eq!(parsed.raw_text, "Cheer100 🦀");
+            assert_eq!(
+                parsed.reply.as_ref().unwrap().parent_msg_body,
+                "hello world"
+            );
+            assert!(matches!(parsed.msg_kind, MsgKind::Bits { amount: 100 }));
+            assert!(parsed.flags.is_self);
+        }
+        assert!(!live.flags.is_history);
+        assert!(history.flags.is_history);
+    }
+
+    #[test]
+    fn messages_without_a_body_are_ignored() {
+        let (mut session, _events) = session();
+        let chat = parse_line(":alice!user@host PRIVMSG #room").unwrap();
+        assert!(session.parse_privmsg(&chat).is_none());
+        assert!(parse_privmsg_irc(&chat, None, 1).is_none());
+        let whisper = parse_line(":alice!user@host WHISPER bob").unwrap();
+        assert!(session.parse_whisper(&whisper).is_none());
+    }
+
+    #[test]
+    fn shared_chat_metadata_survives_live_and_history_parsing() {
+        let (mut session, _events) = session();
+        let message = parse_line("@room-id=1;source-room-id=2;id=local-id;source-id=source-id;source-badges=subscriber/12,moderator/1,vip/1,lead_moderator/1 :alice!user@host PRIVMSG #room :hello").unwrap();
+        let live = session.parse_privmsg(&message).unwrap();
+        let history = parse_privmsg_irc(&message, None, 10).unwrap();
+        for parsed in [&live, &history] {
+            let shared = parsed.shared.as_ref().unwrap();
+            assert_eq!(shared.room_id, "2");
+            assert_eq!(shared.source_message_id.as_deref(), Some("source-id"));
+            let names: Vec<_> = shared
+                .badges
+                .iter()
+                .map(|badge| badge.name.as_str())
+                .collect();
+            assert_eq!(names, ["moderator", "vip", "lead_moderator"]);
+            assert_eq!(parsed.server_id.as_deref(), Some("local-id"));
+            assert!(!parsed.flags.suppress_notification);
+        }
+    }
+
+    #[test]
+    fn local_and_empty_shared_chat_sources_do_not_mark_mirrors() {
+        for tags in [
+            "room-id=1;source-room-id=1",
+            "room-id=1;source-room-id=",
+            "room-id=1",
+        ] {
+            let line = format!("@{tags} :alice!user@host PRIVMSG #room :hello");
+            let message = parse_privmsg_irc(&parse_line(&line).unwrap(), None, 1).unwrap();
+            assert!(message.shared.is_none());
+        }
+    }
+
+    #[test]
+    fn anonymous_identity_matches_only_the_connected_nickname() {
+        let (mut session, _events) = session();
+        session.connection_nick = Some("justinfan12345".into());
+        let own = parse_line(":justinfan12345!user@host JOIN #room").unwrap();
+        let other = parse_line(":justinfan67890!user@host JOIN #room").unwrap();
+        assert!(session.is_own_nick(&own));
+        assert!(!session.is_own_nick(&other));
+    }
+
+    #[test]
+    fn outgoing_messages_cannot_change_irc_framing() {
+        let channel = ChannelId::new("room");
+        assert_eq!(
+            format_privmsg(&channel, "hello 🦀", Some("parent-id")).as_deref(),
+            Some("@reply-parent-msg-id=parent-id PRIVMSG #room :hello 🦀")
+        );
+        for text in ["hello\r\nQUIT", "hello\nQUIT", "hello\0world"] {
+            assert!(format_privmsg(&channel, text, None).is_none());
+        }
+        for reply in [
+            "parent PRIVMSG #other :bad",
+            "parent;other=value",
+            "parent\\svalue",
+        ] {
+            assert!(format_privmsg(&channel, "hello", Some(reply)).is_none());
+        }
+        assert!(format_privmsg(&ChannelId::new("room,other"), "hello", None).is_none());
+    }
+
+    #[test]
+    fn outgoing_channel_targets_allow_only_one_twitch_login() {
+        for name in ["room", "room_123", "ab"] {
+            assert!(is_valid_twitch_channel(&ChannelId::new(name)));
+        }
+        for name in [
+            "",
+            "room,other",
+            "room other",
+            "room\r\nPRIVMSG #other :injected",
+            "room\0other",
+            "room:other",
+            "__mentions__",
+            "kick:room",
+        ] {
+            let channel = ChannelId::new(name);
+            assert!(!is_valid_twitch_channel(&channel), "{name:?}");
+            assert!(format_privmsg(&channel, "hello", None).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn userstate_grants_and_revokes_elevated_send_limits() {
+        let (mut session, mut events) = session();
+        session.auth_token = Some("test-token".into());
+        session.auth_nick = Some("alice".into());
+        let channel = ChannelId::new("room");
+        for (tags, expected) in [
+            ("mod=1;badges=", true),
+            ("mod=0;badges=vip/1", true),
+            ("mod=0;badges=broadcaster/1", true),
+            ("mod=0;badges=moderator/1", true),
+            ("mod=0;badges=", false),
+        ] {
+            let line = format!("@{tags} :tmi.twitch.tv USERSTATE #room");
+            session.handle_irc(&parse_line(&line).unwrap()).await;
+            assert_eq!(session.elevated_channels.contains(&channel), expected);
+            events.try_recv().unwrap();
+        }
+    }
+
+    async fn server_text(
+        socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    ) -> String {
+        match tokio::time::timeout(Duration::from_secs(3), socket.next())
+            .await
+            .expect("server receives a frame promptly")
+            .expect("connection remains open")
+            .expect("valid WebSocket frame")
+        {
+            Message::Text(text) => text,
+            other => panic!("expected IRC text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_chat_reaches_the_socket_in_channel_order() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (event_tx, _events) = mpsc::channel(32);
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let mut session = TwitchSession::new(event_tx, cmd_rx);
+        session.auth_token = Some("test-token".into());
+        session.auth_nick = Some("alice".into());
+        for text in ["first", "second", "third"] {
+            cmd_tx
+                .send(SessionCommand::SendMessage(
+                    ChannelId::new("room"),
+                    text.to_owned(),
+                    None,
+                ))
+                .await
+                .unwrap();
+        }
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for _ in 0..3 {
+                server_text(&mut socket).await;
+            }
+            for text in ["first", "second", "third"] {
+                assert_eq!(
+                    server_text(&mut socket).await,
+                    format!("PRIVMSG #room :{text}")
+                );
+            }
+            cmd_tx.send(SessionCommand::Disconnect).await.unwrap();
+            assert_eq!(server_text(&mut socket).await, "QUIT");
+        });
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(6), session.connect_to(&url))
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rate_waits_allow_ping_and_auth_changes_without_replaying_old_chat() {
+        for switch_account in [false, true] {
+            let (event_tx, _events) = mpsc::channel(32);
+            let (cmd_tx, cmd_rx) = mpsc::channel(16);
+            let mut session = TwitchSession::new(event_tx, cmd_rx);
+            session.auth_token = Some("old-token".into());
+            session.auth_nick = Some("alice".into());
+            let now = Instant::now();
+            for _ in 0..20 {
+                assert!(session.join_limiter.try_consume_at(now));
+                assert!(session.chat_limiter.try_consume_at(
+                    &ChannelId::new("moderated"),
+                    true,
+                    now,
+                ));
+            }
+            cmd_tx
+                .send(SessionCommand::JoinChannel(ChannelId::new("room")))
+                .await
+                .unwrap();
+            for text in ["old first", "old second"] {
+                cmd_tx
+                    .send(SessionCommand::SendMessage(
+                        ChannelId::new("room"),
+                        text.to_owned(),
+                        None,
+                    ))
+                    .await
+                    .unwrap();
+            }
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let server_commands = cmd_tx.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                for _ in 0..3 {
+                    server_text(&mut socket).await;
+                }
+                socket
+                    .send(Message::Text("PING :waiting".to_owned()))
+                    .await
+                    .unwrap();
+                assert_eq!(server_text(&mut socket).await, "PONG :waiting");
+                let command = if switch_account {
+                    SessionCommand::Authenticate {
+                        token: "new-token".to_owned(),
+                        nick: "bob".to_owned(),
+                    }
+                } else {
+                    SessionCommand::LogoutAndReconnect
+                };
+                server_commands.send(command).await.unwrap();
+                assert_eq!(server_text(&mut socket).await, "QUIT");
+            });
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), session.connect_to(&url))
+                    .await
+                    .unwrap()
+                    .unwrap()
+            );
+            server.await.unwrap();
+            assert_eq!(
+                session.auth_nick.as_deref(),
+                switch_account.then_some("bob")
+            );
+
+            // Remove rate waits in the fixture so any accidentally retained
+            // output would be visible immediately on the next connection.
+            session.chat_limiter = ChatRateLimiter::new();
+            session.join_limiter = RateLimiter::join();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                for _ in 0..if switch_account { 3 } else { 2 } {
+                    server_text(&mut socket).await;
+                }
+                socket
+                    .send(Message::Text("PING :new-session".to_owned()))
+                    .await
+                    .unwrap();
+                assert_eq!(server_text(&mut socket).await, "PONG :new-session");
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), socket.next())
+                        .await
+                        .is_err(),
+                    "old JOINs and chat must not reach the new connection"
+                );
+                cmd_tx.send(SessionCommand::Disconnect).await.unwrap();
+                assert_eq!(server_text(&mut socket).await, "QUIT");
+            });
+            assert!(
+                !tokio::time::timeout(Duration::from_secs(5), session.connect_to(&url))
+                    .await
+                    .unwrap()
+                    .unwrap()
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn socket_joins_are_deduplicated_and_invalid_targets_are_never_written() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (event_tx, _events) = mpsc::channel(32);
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let mut session = TwitchSession::new(event_tx, cmd_rx);
+        for name in ["room,other", "room\r\nPRIVMSG #other :injected"] {
+            cmd_tx
+                .send(SessionCommand::JoinChannel(ChannelId::new(name)))
+                .await
+                .unwrap();
+            cmd_tx
+                .send(SessionCommand::LeaveChannel(ChannelId::new(name)))
+                .await
+                .unwrap();
+        }
+        for _ in 0..3 {
+            cmd_tx
+                .send(SessionCommand::JoinChannel(ChannelId::new("room")))
+                .await
+                .unwrap();
+        }
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for _ in 0..2 {
+                server_text(&mut socket).await;
+            }
+            assert_eq!(server_text(&mut socket).await, "JOIN #room");
+            socket
+                .send(Message::Text("PING :joined".to_owned()))
+                .await
+                .unwrap();
+            assert_eq!(server_text(&mut socket).await, "PONG :joined");
+            cmd_tx
+                .send(SessionCommand::LeaveChannel(ChannelId::new("room")))
+                .await
+                .unwrap();
+            assert_eq!(server_text(&mut socket).await, "PART #room");
+            cmd_tx.send(SessionCommand::Disconnect).await.unwrap();
+            assert_eq!(server_text(&mut socket).await, "QUIT");
+        });
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(5), session.connect_to(&url))
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        server.await.unwrap();
+    }
+
+    async fn connect_with_server_message(session: &mut TwitchSession, message: &str) -> bool {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let handshake_lines = if session.auth_token.is_some() { 3 } else { 2 };
+        let message = message.to_owned();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for _ in 0..handshake_lines {
+                socket.next().await.unwrap().unwrap();
+            }
+            socket.send(Message::Text(message)).await.unwrap();
+            let _ = release_rx.await;
+        });
+        let result = tokio::time::timeout(Duration::from_secs(5), session.connect_to(&url))
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = release_tx.send(());
+        server.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn server_reconnect_requests_restart_the_connection_immediately() {
+        let (event_tx, mut events) = mpsc::channel(8);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
+        let mut session = TwitchSession::new(event_tx, cmd_rx);
+        assert!(connect_with_server_message(&mut session, ":tmi.twitch.tv RECONNECT\r\n").await);
+        assert!(session.voluntary_reconnect);
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn rejected_authentication_does_not_wait_for_a_socket_close() {
+        let (event_tx, mut events) = mpsc::channel(8);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
+        let mut session = TwitchSession::new(event_tx, cmd_rx);
+        session.auth_token = Some("test-token".into());
+        session.auth_nick = Some("alice".into());
+        assert!(
+            connect_with_server_message(
+                &mut session,
+                ":tmi.twitch.tv NOTICE * :Login authentication failed\r\n"
+            )
+            .await
+        );
+        assert!(session.auth_failed);
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            TwitchEvent::SystemNotice(_)
+        ));
+    }
 }

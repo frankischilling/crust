@@ -46,7 +46,7 @@ pub fn show_shared_chat_banner(
 
     egui::Frame::new()
         .fill(fill)
-        .stroke(Stroke::new(1.0, border))
+        .stroke(Stroke::new(1.0_f32, border))
         .corner_radius(CornerRadius::same(6))
         .inner_margin(BANNER_INNER_PAD)
         .outer_margin(BANNER_OUTER_PAD)

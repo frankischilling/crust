@@ -571,7 +571,7 @@ fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
             continue;
         }
         for i in 1..n.len() {
-            if h[start + i].to_ascii_lowercase() != n[i].to_ascii_lowercase() {
+            if !h[start + i].eq_ignore_ascii_case(&n[i]) {
                 continue 'outer;
             }
         }

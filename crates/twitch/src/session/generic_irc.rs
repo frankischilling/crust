@@ -661,6 +661,14 @@ impl ServerWorker {
         source_channel: &str,
         text: &str,
     ) -> Result<Option<WorkerExit>, IrcSessionError> {
+        if !crate::irc::types::is_single_irc_line(text) {
+            self.emit_command_notice(
+                source_channel,
+                "Message not sent: IRC messages cannot contain line breaks or null bytes.",
+            )
+            .await;
+            return Ok(None);
+        }
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return Ok(None);
@@ -1264,7 +1272,7 @@ fn parse_irc_privmsg(msg: &IrcMessage, key: &ServerKey, my_nick: &str) -> Option
         .or_else(|| normalize_irc_nick(target_raw))
         .unwrap_or_else(|| target_raw.to_ascii_lowercase());
     let channel = ChannelId::irc(&key.host, key.port, key.tls, target_name);
-    let raw_text = msg.trailing()?.to_owned();
+    let raw_text = msg.params.get(1)?;
 
     let (text, is_action) = if raw_text.starts_with("\x01ACTION ") && raw_text.ends_with('\x01') {
         (&raw_text[8..raw_text.len() - 1], true)
@@ -1327,9 +1335,11 @@ fn parse_irc_privmsg(msg: &IrcMessage, key: &ServerKey, my_nick: &str) -> Option
             is_mention: false,
             custom_reward_id: None,
             is_history: false,
+            suppress_notification: false,
         },
         reply: None,
         msg_kind: MsgKind::Chat,
+        shared: None,
     })
 }
 
@@ -1522,6 +1532,12 @@ fn parse_invite_command_args(
 }
 
 async fn write_irc_line<W: AsyncWrite + Unpin>(writer: &mut W, line: &str) -> std::io::Result<()> {
+    if !crate::irc::types::is_single_irc_line(line) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "IRC messages cannot contain line breaks or null bytes",
+        ));
+    }
     writer.write_all(line.as_bytes()).await?;
     writer.write_all(b"\r\n").await?;
     writer.flush().await
@@ -1590,7 +1606,7 @@ fn fallback_nick_after_collision(current: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::is_raw_irc_protocol_line;
+    use super::*;
 
     #[test]
     fn detects_raw_irc_privmsg_line() {
@@ -1606,6 +1622,40 @@ mod tests {
     #[test]
     fn accepts_numeric_reply_style_line() {
         assert!(is_raw_irc_protocol_line("332 #rust :topic"));
+    }
+
+    #[tokio::test]
+    async fn rejects_injected_irc_lines_without_writing() {
+        for line in [
+            "PRIVMSG #room :hello\r\nQUIT",
+            "PRIVMSG #room :hello\nQUIT",
+            "PRIVMSG #room :hello\0world",
+        ] {
+            let mut bytes = Vec::new();
+            let error = write_irc_line(&mut bytes, line).await.unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(bytes.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn writes_one_irc_terminator_and_preserves_unicode() {
+        let mut bytes = Vec::new();
+        write_irc_line(&mut bytes, "PRIVMSG #room :hello 🦀")
+            .await
+            .unwrap();
+        assert_eq!(bytes, "PRIVMSG #room :hello 🦀\r\n".as_bytes());
+    }
+
+    #[test]
+    fn ignores_privmsg_without_a_body() {
+        let key = ServerKey {
+            host: "example.com".into(),
+            port: 6697,
+            tls: true,
+        };
+        let message = parse_line(":alice!user@host PRIVMSG #room").unwrap();
+        assert!(parse_irc_privmsg(&message, &key, "bob").is_none());
     }
 }
 
