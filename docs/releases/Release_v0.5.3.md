@@ -45,6 +45,9 @@ by account and fixes chat navigation and focus.
   address that nickname, and private tabs remain separate from rooms with the
   same name. Failed sends do not create a new conversation tab.
 - Account changes and shutdown cancel a stalled initial EventSub connection.
+- EventSub allows a short delivery delay around the keepalive interval, avoiding
+  premature reconnects. Healthy traffic resets the retry delay after earlier
+  connection failures.
 - A delayed avatar response cannot replace the active account's avatar after a
   switch or logout.
 - Whispers preserve the sender's user ID through live delivery and saved history,

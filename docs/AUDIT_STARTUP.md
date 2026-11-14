@@ -85,6 +85,20 @@ and catalog refreshes retokenize each thread with its original sender IDs.
 Observed senders share the existing bounded lookup queue. Missing IDs and old
 login placeholders stay unidentified.
 
+## EventSub recovery
+
+The saved-account desktop run exposed repeated reconnects around the advertised
+keepalive boundary. The client expired its watchdog at the same interval when
+the server sends an idle keepalive, leaving no time for delivery or scheduling
+delays. Established sessions now allow two extra seconds. A silent connection
+still expires, and Ping frames or malformed messages do not refresh the deadline.
+The initial connection and welcome deadlines remain ten seconds.
+
+Valid notifications or keepalives received after thirty seconds of an established
+session reset the reconnect delay. Earlier failures therefore cannot leave later
+disconnects waiting at the maximum backoff. Account changes and shutdown cancel
+the initial handshake and retry wait immediately.
+
 ## Live channel emotes
 
 Joined Twitch channels receive BTTV and 7TV set changes over provider sockets.
@@ -175,16 +189,18 @@ tokenization tests cover Unicode text and malformed native-emote ranges.
 Headless UI tests exercise the production widgets with keyboard, pointer, wheel,
 and resize input, including chat input while startup is active.
 
-The combined workspace gate passed 1,038 tests, with 11 ignored and no failures.
+The combined workspace gate passed 1,039 tests, with 11 ignored and no failures.
 Correctness Clippy checks passed. Loopback WebSocket and HTTP tests cover provider
 subscription acknowledgments, delayed snapshots, live removals, active-set
 changes, and fresh subscriptions after reconnect. Reconciliation tests cover
 offline edits, repeated events, overflow, and obsolete room or set lifetimes.
+EventSub loopbacks cover delayed keepalives, idle expiry, replacement-session
+timeouts, and retry recovery after healthy traffic.
 
 Offline native captures confirmed that chat, settings, and search controls fit
-at wide, narrow, and enlarged-text sizes. The saved-account desktop run, Windows
-packaging, and final Linux checks are still in progress. Follow
-[PR #16](https://github.com/frankischilling/crust/pull/16) for those results.
+at wide, narrow, and enlarged-text sizes. Saved-account desktop observations and
+Windows and Linux release checks are recorded in
+[PR #16](https://github.com/frankischilling/crust/pull/16).
 
 Channel-specific follower inventory and live updates for the remaining emote
 scopes remain tracked in

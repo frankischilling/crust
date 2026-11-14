@@ -16,6 +16,10 @@ const EVENTSUB_WS_URL: &str = "wss://eventsub.wss.twitch.tv/ws";
 const EVENTSUB_SUBSCRIPTIONS_URL: &str = "https://api.twitch.tv/helix/eventsub/subscriptions";
 const RECONNECT_BACKOFF_SECS: &[u64] = &[1, 2, 5, 10, 20, 30];
 const EVENTSUB_WELCOME_TIMEOUT: Duration = Duration::from_secs(10);
+// Twitch sends an idle keepalive at the advertised interval. Allow delivery and
+// scheduler jitter before declaring that connection lost.
+const EVENTSUB_KEEPALIVE_GRACE: Duration = Duration::from_secs(2);
+const EVENTSUB_HEALTHY_SESSION: Duration = Duration::from_secs(30);
 
 /// EventSub event deduplication cache size (number of recent event IDs to track).
 const EVENT_DEDUP_CACHE_SIZE: usize = 10000;
@@ -228,6 +232,7 @@ pub struct EventSubSession {
     http: reqwest::Client,
     subscriptions_url: String,
     resumed_once: bool,
+    reconnect_attempt: u32,
     /// Deduplication cache: tracks recent event IDs to prevent duplicate processing.
     seen_event_ids: RecentEventIds,
 }
@@ -279,6 +284,7 @@ impl EventSubSession {
             http: reqwest::Client::new(),
             subscriptions_url: EVENTSUB_SUBSCRIPTIONS_URL.to_owned(),
             resumed_once: false,
+            reconnect_attempt: 0,
             seen_event_ids: RecentEventIds::new(EVENT_DEDUP_CACHE_SIZE),
         }
     }
@@ -288,11 +294,13 @@ impl EventSubSession {
     }
 
     pub async fn run(mut self) {
-        let mut attempt: u32 = 0;
         let mut connect_url = EVENTSUB_WS_URL.to_owned();
 
         loop {
-            self.emit(EventSubEvent::Reconnecting { attempt }).await;
+            self.emit(EventSubEvent::Reconnecting {
+                attempt: self.reconnect_attempt,
+            })
+            .await;
 
             match self.connect_once(&connect_url).await {
                 Ok(EventSubConnectOutcome::Stop) => {
@@ -305,7 +313,7 @@ impl EventSubSession {
                 }) => {
                     connect_url = reconnect_url.unwrap_or_else(|| EVENTSUB_WS_URL.to_owned());
                     if immediate {
-                        attempt = 0;
+                        self.reconnect_attempt = 0;
                         continue;
                     }
                 }
@@ -318,17 +326,17 @@ impl EventSubSession {
             }
 
             let delay = RECONNECT_BACKOFF_SECS
-                .get(attempt as usize)
+                .get(self.reconnect_attempt as usize)
                 .copied()
                 .unwrap_or(*RECONNECT_BACKOFF_SECS.last().unwrap_or(&30));
             match self.wait_for_reconnect(Duration::from_secs(delay)).await {
                 EventSubConnectOutcome::Stop => return,
                 EventSubConnectOutcome::Reconnect { immediate, .. } => {
                     if immediate {
-                        attempt = 0;
+                        self.reconnect_attempt = 0;
                         connect_url = EVENTSUB_WS_URL.to_owned();
                     } else {
-                        attempt = attempt.saturating_add(1);
+                        self.reconnect_attempt = self.reconnect_attempt.saturating_add(1);
                     }
                 }
             }
@@ -463,6 +471,7 @@ impl EventSubSession {
         let mut session_id: Option<String> = None;
         let mut subscriptions: Option<SubscriptionWorker> = None;
         let mut reconnect: Option<ReconnectAttempt> = None;
+        let mut connected_since: Option<Instant> = None;
         let mut keepalive_timeout = EVENTSUB_WELCOME_TIMEOUT;
         let mut activity_deadline = Instant::now() + EVENTSUB_WELCOME_TIMEOUT;
 
@@ -480,7 +489,8 @@ impl EventSubSession {
                     reconnect = None;
                     let sid = welcome.id;
                     keepalive_timeout = welcome.keepalive_timeout;
-                    activity_deadline = welcome.received_at + keepalive_timeout;
+                    activity_deadline = welcome.received_at + keepalive_timeout + EVENTSUB_KEEPALIVE_GRACE;
+                    connected_since.get_or_insert(welcome.received_at);
                     // Keep the logical HTTP worker through a socket transfer so
                     // recovery cannot overtake an accepted POST or DELETE.
                     if let Some(worker) = &subscriptions {
@@ -554,7 +564,13 @@ impl EventSubSession {
                                 && matches!(message_type, "notification" | "session_keepalive" | "session_reconnect" | "revocation")
                                 && parsed.get("payload").is_some_and(Value::is_object)
                             {
-                                activity_deadline = Instant::now() + keepalive_timeout;
+                                let received_at = Instant::now();
+                                activity_deadline = received_at + keepalive_timeout + EVENTSUB_KEEPALIVE_GRACE;
+                                if matches!(message_type, "notification" | "session_keepalive")
+                                    && connected_since.is_some_and(|since| received_at.duration_since(since) >= EVENTSUB_HEALTHY_SESSION)
+                                {
+                                    self.reconnect_attempt = 0;
+                                }
                             }
 
                             match message_type {
@@ -564,12 +580,13 @@ impl EventSubSession {
                                     };
                                     let sid = welcome.id;
                                     keepalive_timeout = welcome.keepalive_timeout;
-                                    activity_deadline = welcome.received_at + keepalive_timeout;
+                                    activity_deadline = welcome.received_at + keepalive_timeout + EVENTSUB_KEEPALIVE_GRACE;
                                     if session_id.as_deref() == Some(sid.as_str()) {
                                         continue;
                                     }
 
                                     session_id = Some(sid.clone());
+                                    connected_since = Some(welcome.received_at);
                                     self.emit(EventSubEvent::Connected {
                                         resumed: self.resumed_once,
                                     }).await;
@@ -2379,7 +2396,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keepalive_deadline_refreshes_on_events_but_not_ping_or_invalid_json() {
+    async fn keepalive_deadline_tolerates_jitter_but_ignores_ping_and_invalid_json() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let (mut session, _commands, mut events) = test_session();
@@ -2402,12 +2419,13 @@ mod tests {
         // Keep network I/O on the real clock; advance only the inactivity timer.
         for message_type in ["session_keepalive", "notification"] {
             tokio::time::pause();
-            tokio::time::advance(Duration::from_secs(9)).await;
+            tokio::time::advance(Duration::from_millis(10_500)).await;
             assert!(
                 !client.is_finished(),
-                "valid traffic did not refresh the deadline"
+                "the watchdog did not allow keepalive delivery jitter"
             );
             tokio::time::resume();
+            wait_for_pong(&mut socket, b"waiting-for-delayed-keepalive").await;
             let payload = if message_type == "notification" {
                 json!({"event": {
                     "broadcaster_user_id": "123",
@@ -2440,7 +2458,7 @@ mod tests {
         socket.send(Message::Text("{invalid".into())).await.unwrap();
         wait_for_pong(&mut socket, b"ping-is-not-keepalive").await;
         tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::time::advance(Duration::from_secs(4)).await;
         tokio::time::resume();
 
         let outcome = tokio::time::timeout(Duration::from_secs(3), client)
@@ -2504,7 +2522,7 @@ mod tests {
         assert!(wait_for_connection(&mut events).await);
 
         tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::time::advance(Duration::from_secs(13)).await;
         tokio::time::resume();
         wait_for_pong(&mut new_socket, b"replacement-is-active").await;
         assert!(
@@ -2519,6 +2537,71 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(outcome, Err(error) if error == "EventSub keepalive timed out"));
+    }
+
+    #[tokio::test]
+    async fn healthy_traffic_resets_backoff_but_short_or_idle_sessions_do_not() {
+        for (elapsed_secs, message_type, expected_attempt) in [
+            (1, Some("session_keepalive"), 4),
+            (31, Some("session_keepalive"), 0),
+            (31, Some("notification"), 0),
+            (31, None, 4),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let (mut session, _commands, mut events) = test_session();
+            session.reconnect_attempt = 4;
+            let client = tokio::spawn(async move {
+                let outcome = session.connect_once(&url).await;
+                (session, outcome)
+            });
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket
+                .send(Message::Text(
+                    json!({
+                        "metadata": {"message_type": "session_welcome"},
+                        "payload": {"session": {"id": "backoff-test", "keepalive_timeout_seconds": 60}}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            assert!(!wait_for_connection(&mut events).await);
+
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(elapsed_secs)).await;
+            tokio::time::resume();
+            let frame = message_type.map_or_else(
+                || "{invalid".to_owned(),
+                |message_type| {
+                    json!({
+                        "metadata": {"message_type": message_type},
+                        "payload": {}
+                    })
+                    .to_string()
+                },
+            );
+            socket.send(Message::Text(frame.into())).await.unwrap();
+            wait_for_pong(&mut socket, b"backoff-check").await;
+            socket.close(None).await.unwrap();
+            let (session, outcome) = tokio::time::timeout(Duration::from_secs(3), client)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                outcome,
+                Ok(EventSubConnectOutcome::Reconnect {
+                    immediate: false,
+                    ..
+                })
+            ));
+            assert_eq!(
+                session.reconnect_attempt, expected_attempt,
+                "unexpected retry delay after {elapsed_secs}s with {message_type:?}"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]
