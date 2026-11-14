@@ -8,8 +8,6 @@ use crust_core::model::{Badge, ChannelId, ChatMessage, UserProfile};
 
 use crate::theme as t;
 
-use super::chrome;
-
 // Public action returned from show()
 
 /// Action emitted by the popup when a moderation button is pressed.
@@ -922,20 +920,7 @@ impl UserProfilePopup {
                     add_row("Joined", fmt_join_date(ts));
                 }
                 if !self.shared_channels.is_empty() {
-                    let count = self.shared_channels.len();
-                    let preview = self
-                        .shared_channels
-                        .iter()
-                        .take(3)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let suffix = if count > 3 {
-                        format!(" +{} more", count - 3)
-                    } else {
-                        String::new()
-                    };
-                    add_row("Shared channels", format!("{count} ({preview}{suffix})"));
+                    add_row("Shared channels", self.shared_channels.len().to_string());
                 }
                 if !profile.is_live {
                     if let Some(ref ts) = profile.last_broadcast_at {
@@ -1462,14 +1447,24 @@ impl UserProfilePopup {
         }
 
         let title = self.popup_title();
-        let screen = ctx.screen_rect();
-        let content_width = (screen.width() - 40.0).clamp(0.0, 430.0);
-        let content_height = (screen.height() - 56.0).max(32.0);
+        let bounds = ctx.screen_rect().shrink(8.0);
+        let style = ctx.style();
+        let frame = egui::Frame::window(&style);
+        let title_height = ctx
+            .fonts(|fonts| fonts.row_height(&egui::TextStyle::Heading.resolve(&style)))
+            .max(style.spacing.interact_size.y)
+            + frame.inner_margin.sum().y
+            + frame.stroke.width;
+        let max_size = (bounds.size() - frame.total_margin().sum() - egui::vec2(0.0, title_height))
+            .max(egui::Vec2::splat(1.0));
+        let content_width = max_size.x.min(430.0);
+        let content_height = max_size.y;
 
         let mut actions: Vec<PopupAction> = Vec::new();
         let mut open = self.open;
 
         egui::Window::new(title)
+            .frame(frame)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -1477,6 +1472,7 @@ impl UserProfilePopup {
             .max_width(content_width)
             .default_width(content_width)
             .max_height(content_height)
+            .constrain_to(bounds)
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.set_width(content_width);
@@ -1497,14 +1493,6 @@ impl UserProfilePopup {
                             Self::render_unavailable_state(ui);
                             return;
                         };
-
-                        let profile_subtitle = format!("@{}", profile.login);
-                        chrome::dialog_header(
-                            ui,
-                            profile.display_name.as_str(),
-                            Some(profile_subtitle.as_str()),
-                        );
-                        ui.add_space(6.0);
 
                         self.render_profile_header(ui, &profile, emote_bytes, stv_avatars);
                         ui.add_space(4.0);
@@ -1923,6 +1911,7 @@ mod tests {
         events: Vec<egui::Event>,
         presets: &[crust_core::model::mod_actions::ModActionPreset],
     ) -> (egui::FullOutput, Vec<PopupAction>) {
+        crate::app::apply_theme_visuals(ctx);
         let mut actions = Vec::new();
         let output = ctx.run(
             egui::RawInput {

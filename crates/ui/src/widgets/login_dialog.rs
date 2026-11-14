@@ -44,13 +44,19 @@ pub struct LoginDialog {
 impl LoginDialog {
     pub fn toggle(&mut self) {
         self.open = !self.open;
+        self.clear_transient_state();
         if self.open {
-            self.token_buf.clear();
-            self.error_msg = None;
             // Auto-expand the add-account form when there are no accounts yet.
             self.show_add_form = self.accounts.is_empty() && self.active_account.is_none();
+            self.focus_token = self.show_add_form;
         }
-        self.focus_token = self.open && self.show_add_form;
+    }
+
+    fn clear_transient_state(&mut self) {
+        self.token_buf.clear();
+        self.show_add_form = false;
+        self.error_msg = None;
+        self.focus_token = false;
         self.focused_control = None;
         self.remove_account = None;
     }
@@ -82,6 +88,7 @@ impl LoginDialog {
         emote_bytes: &UiImageCache,
     ) -> Option<LoginAction> {
         if !self.open {
+            self.clear_transient_state();
             return None;
         }
         let token_id = egui::Id::new("login_token_input");
@@ -121,9 +128,7 @@ impl LoginDialog {
         };
         if close {
             self.open = false;
-            self.focus_token = false;
-            self.focused_control = None;
-            self.token_buf.clear();
+            self.clear_transient_state();
             return None;
         }
 
@@ -342,10 +347,7 @@ impl LoginDialog {
                 .is_some_and(|response| response.layer_id == dialog_layer)
         });
         if !self.open {
-            self.focus_token = false;
-            self.focused_control = None;
-            self.token_buf.clear();
-            self.remove_account = None;
+            self.clear_transient_state();
         }
         result
     }
@@ -556,6 +558,7 @@ mod tests {
                 ..Default::default()
             },
             |ctx| {
+                crate::app::apply_theme_visuals(ctx);
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut String::new())
@@ -674,6 +677,95 @@ mod tests {
         assert!(frame(&ctx, &mut dialog, vec![key(egui::Key::Escape)]).is_none());
         assert!(!dialog.open);
         assert!(dialog.token_buf.is_empty());
+    }
+
+    #[test]
+    fn all_account_close_paths_clear_token_and_pending_removal() {
+        for route in ["toggle", "external", "escape", "close button", "title bar"] {
+            let ctx = egui::Context::default();
+            let mut dialog = LoginDialog::default();
+            dialog.accounts.push("alice".to_owned());
+            dialog.toggle();
+            for _ in 0..3 {
+                frame(&ctx, &mut dialog, Vec::new());
+            }
+            let (output, _) = frame_at(&ctx, &mut dialog, Vec::new(), egui::vec2(700.0, 600.0));
+            assert!(click(
+                &ctx,
+                &mut dialog,
+                label_rect(&output, "Add account").unwrap().center()
+            )
+            .is_none());
+            frame(&ctx, &mut dialog, Vec::new());
+            frame(
+                &ctx,
+                &mut dialog,
+                vec![egui::Event::Text("discarded-token".to_owned())],
+            );
+            assert_eq!(dialog.token_buf, "discarded-token", "{route}");
+            let (output, _) = frame_at(&ctx, &mut dialog, Vec::new(), egui::vec2(700.0, 600.0));
+            assert!(click(
+                &ctx,
+                &mut dialog,
+                label_rect(&output, "Remove").unwrap().center()
+            )
+            .is_none());
+            assert_eq!(dialog.remove_account.as_deref(), Some("alice"), "{route}");
+            dialog.error_msg = Some("Token entry needs attention.".to_owned());
+
+            match route {
+                "toggle" => dialog.toggle(),
+                "external" => {
+                    dialog.open = false;
+                    assert!(frame(&ctx, &mut dialog, Vec::new()).is_none());
+                }
+                "escape" => {
+                    ctx.memory_mut(|memory| {
+                        memory.request_focus(egui::Id::new("login_token_input"))
+                    });
+                    frame(&ctx, &mut dialog, Vec::new());
+                    assert!(frame(&ctx, &mut dialog, vec![key(egui::Key::Escape)]).is_none());
+                }
+                _ => {
+                    let mut output = egui::FullOutput::default();
+                    for _ in 0..3 {
+                        output =
+                            frame_at(&ctx, &mut dialog, Vec::new(), egui::vec2(700.0, 600.0)).0;
+                    }
+                    let target = if route == "close button" {
+                        label_rect(&output, "Close").unwrap().center()
+                    } else {
+                        let window = ctx
+                            .memory(|memory| {
+                                memory.area_rect(egui::Id::new("login_accounts_window"))
+                            })
+                            .unwrap();
+                        let title = label_rect(&output, "Accounts").unwrap();
+                        egui::pos2(
+                            window.right() - (title.center().y - window.top()),
+                            title.center().y,
+                        )
+                    };
+                    assert!(click(&ctx, &mut dialog, target).is_none());
+                }
+            }
+
+            assert!(!dialog.open, "{route}");
+            assert!(dialog.token_buf.is_empty(), "{route}");
+            assert!(dialog.remove_account.is_none(), "{route}");
+            assert!(dialog.error_msg.is_none(), "{route}");
+            assert!(!dialog.show_add_form, "{route}");
+            assert!(!dialog.focus_token, "{route}");
+            assert!(dialog.focused_control.is_none(), "{route}");
+            assert_eq!(dialog.accounts, ["alice"], "{route}");
+
+            dialog.toggle();
+            frame(&ctx, &mut dialog, Vec::new());
+            assert!(dialog.open);
+            assert!(dialog.token_buf.is_empty());
+            assert!(dialog.remove_account.is_none());
+            assert!(!dialog.show_add_form);
+        }
     }
 
     fn label_rect(output: &egui::FullOutput, label: &str) -> Option<egui::Rect> {

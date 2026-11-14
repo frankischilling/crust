@@ -17,7 +17,8 @@ compact layout uses a page selector. Each page retains its own scroll position,
 and fields retain their identity when the window changes between layouts.
 Searching supports keyboard selection and Escape without changing an unrelated
 setting. Advanced text-size overrides are collapsed initially so the main font
-and layout controls are easier to reach.
+and layout controls are easier to reach. Group labels, instructions, and dialog
+subtitles use a more readable secondary text color in the dark theme.
 
 Highlight and filter rules use responsive editors. Reorder, duplicate, remove,
 mode selection, and validation remain available in narrow windows. The expression
@@ -31,8 +32,8 @@ popups. Closing Settings discards the unfinished expression draft.
 Accounts separates identity and status from actions. Saved accounts scroll
 inside the dialog while Close remains visible. The startup-account action has a
 text label, and removing an account requires an explicit second action that can
-be cancelled. Every close path clears the token field. Account controls retain
-stable IDs as the list changes.
+be cancelled. Every close path clears the token field and any pending removal
+confirmation. Account controls retain stable IDs as the list changes.
 
 The toolbar sizes its action group to the actual controls. It no longer draws a
 wide empty outlined group or labels the image-cache entry count as an emote
@@ -90,6 +91,10 @@ title-bar close control remains visible. Long display names and metadata wrap.
 ### Native interface captures
 
 These captures use the production UI with synthetic messages and accounts.
+Native checks also open a profile from a username, scroll to its footer and
+moderation controls, and compose a whisper without joining a channel. Profile
+and whisper controls remain inside a 480 × 320 viewport and at 1.5× interface
+scale. The whisper fixture types a draft without sending it.
 
 ![Searchable settings with grouped navigation](images/v0.5.4-settings.png)
 
@@ -187,8 +192,9 @@ with Rust 1.98.1. The same generated 112 × 112 GIF contains 120 frames and
 | First-call range | 12.180–15.464 ms | 0.0346–0.2196 ms |
 | Median complete decode | 12.948 ms | 13.205 ms |
 
-The first call blocks about 312 times less. Complete decoding takes comparable
-time; the improvement comes from moving that work away from the UI thread.
+The median first-call blocking time fell by about 99.7%. Complete decoding takes
+comparable time; the improvement comes from moving that work away from the UI
+thread.
 
 ```bash
 cargo test -p crust-ui --lib --release --locked perf_animation_cold_load -- --ignored --nocapture --test-threads=1
@@ -216,13 +222,86 @@ claim about sustained messages per second on the network.
 cargo test -p crust-ui --lib --release --locked perf_four_channel_backlog -- --ignored --nocapture --test-threads=1
 ```
 
+## Native saved-account measurements
+
+Windows checks used the existing account and saved channel layout. Four rooms
+were requested, with three authenticated JOIN acknowledgments and three
+ROOMSTATE responses. The fourth room displayed a server access refusal. Live
+messages, badges, and emotes were visible, and the picker, Accounts, and Settings
+opened from the native window.
+
+The cache-empty checks temporarily moved only the badge and emote disk caches.
+They retained settings, account credentials, SQLite history, and OS caches; this
+was not an OS cold start. The original image and badge caches were restored
+after each check. No Cargo build or benchmark ran alongside the timed samples.
+
+These observations span v0.5.4 candidates with the same animation and provider
+implementation. The startup comparisons preceded a later correction to
+diagnostic counter sampling. They used the same logging filter as the baseline;
+the separate phase profile enables additional timing logs.
+
+### Startup milestones
+
+Times below are seconds from the startup log marker. They describe individual
+milestones, rather than the time when every provider or image was ready.
+
+| Milestone | Warm baseline | Warm candidate | Cache-empty baseline | Cache-empty candidate |
+| --- | ---: | ---: | ---: | ---: |
+| Authenticated identity | 1.762 | 0.557 | 0.619 | 0.600 |
+| Last of three authenticated JOINs | 2.038 | 0.802 | 0.881 | 0.846 |
+| Startup local history delivered | 2.046 | 0.812 | 0.891 | 0.854 |
+| Startup remote history parsed | 3.215 | 1.491 | 1.586 | 1.495 |
+| First fresh 7TV snapshot | 7.860 | 2.036 | 5.772 | 2.706 |
+
+The warm baseline joined anonymously before authentication and repeated startup
+work. The candidate runs authenticated first. Each candidate run delivered
+1,600 local-history rows, 399 mention-history rows, and 844 parsed remote
+messages. These are deliveries, not unique final message counts.
+
+The warm candidate loaded 1,140 cached badge mappings. The cache-empty candidate
+loaded 569 bundled global definitions at 0.009 seconds and 440 network global
+definitions at 0.475 seconds. Image-fetch attempts were two versus one in the
+warm runs and 75 versus 47 in the cache-empty runs. The logs do not count cache
+hits or completed downloads, and the visible images differed between runs.
+
+BTTV completed three snapshots in each candidate run. The expanded 7TV workflow
+completed 73 successful snapshots in the warm run and 69 in the cache-empty run,
+with no logged failed snapshots or socket closures. Provider subscription counts
+include global and personal scopes; they are not chat-room counts.
+
+### Process samples and sustained chat
+
+The following samples cover Crust's main process at 60 seconds from launch;
+they do not include separate webview or browser processes.
+
+| Run | Cumulative CPU time | Working set | Private memory |
+| --- | ---: | ---: | ---: |
+| Warm baseline | 0.8906 s | 325.9 MiB | 276.1 MiB |
+| Warm candidate | 0.6250 s | 316.3 MiB | 269.4 MiB |
+| Cache-empty baseline | 0.5625 s | 336.8 MiB | 294.4 MiB |
+| Cache-empty candidate | 0.8750 s | 316.8 MiB | 271.6 MiB |
+
+All 3-, 20-, and 60-second samples were responsive. Neither candidate run logged
+an application error or a UI update above the 100 ms warning threshold during
+the first minute. Authentication ordering, live traffic, retained history,
+provider activity, and visible images changed between runs. These single-run
+observations cannot isolate a startup, CPU, memory, or caching speedup.
+
+An additional five-minute candidate run stayed responsive at all six samples
+and logged no application error or slow-update warning during the measured
+300 seconds. Cumulative CPU time reached 1.4531 seconds. Working set grew from
+314.9 MiB at three seconds to 344.3 MiB at 300 seconds; private memory grew from
+267.7 to 302.6 MiB. Growth continued through the last sample, so this check does
+not establish a memory plateau or identify the cause of that growth.
+
 ## Diagnosing long updates
 
 The Performance overlay separates UI update duration from repaint rate and
 repaint intervals. Waiting for the next event during idle chat is no longer
-presented as slow rendering. Retained rows count the physical message buffers;
-eligible rows count the rows remaining after filters and pause snapshots.
-Active and rendered rows describe the smaller rendering workload.
+presented as slow rendering. Retained rows count the physical buffers of the
+rendered lists or panes; they do not count all history held by the application.
+Eligible rows count the rows remaining after filters and pause snapshots. Active
+and rendered rows describe the smaller rendering workload.
 
 `crust_ui::timing` records elapsed phases for image admission, setup, event
 handling, emote backfill, maintenance, dialogs, navigation, chat, overlays,
@@ -237,14 +316,68 @@ $env:CRUST_SLOW_FRAME_MS = '100'
 .\target\release\crust.exe
 ```
 
-Phase durations exclude event-loop waits and GPU presentation. Background decode
-time is counted when a job finishes and can include work begun during earlier
-frames. Texture-upload timing measures CPU submission to egui, not GPU completion.
+Phase durations are elapsed time, not per-thread CPU time. They exclude
+event-loop waits and GPU presentation. Decode and upload work counters compare
+cumulative totals with the previous UI update, including
+work completed between updates. Background decode time can overlap UI work or
+come entirely from that interval. Texture-upload timing measures CPU submission
+to egui, not GPU completion. Separate atomic counters can place a job's completion
+count and duration in adjacent records; their cumulative totals are preserved.
 
-The historical 337 ms elapsed update in issue #17 remains unattributed. The
-animation benchmark demonstrates a separate reproducible cost; it does not
-establish the cause of that earlier observation. The new phase and workload
-counters make a recurrence easier to diagnose.
+### Recorded phase profile
+
+The final instrumented build recorded 494 UI updates during a separate
+60-second saved-account run. Median update duration was 0.8059 ms, p95 was
+2.2412 ms, p99 was 3.3757 ms, and the maximum was 6.4321 ms. Every timing record
+parsed successfully. There were no slow-update warnings, application errors, or
+event-limit overruns.
+
+| Phase | p95 | Maximum |
+| --- | ---: | ---: |
+| Entire UI update | 2.2412 ms | 6.4321 ms |
+| Image admission | 0.0007 ms | 0.0164 ms |
+| Setup | 0.0240 ms | 0.0904 ms |
+| Event processing | 0.3157 ms | 2.0846 ms |
+| Emote backfill | 0.7923 ms | 1.9446 ms |
+| Maintenance | 0.0473 ms | 0.3026 ms |
+| Dialogs | 0.0063 ms | 0.0513 ms |
+| Navigation | 0.1579 ms | 5.5228 ms |
+| Chat | 1.0324 ms | 3.6910 ms |
+| Overlays | 0.0028 ms | 0.0090 ms |
+| Image cleanup | 0.0007 ms | 0.0124 ms |
+| Finalization | 0.0002 ms | 0.0266 ms |
+
+The largest update occurred 1.023 seconds after startup. Navigation accounted
+for 5.5228 ms and chat for 0.7986 ms. That update processed one event and rendered
+25 rows from 400 active rows and 800 retained rows, with no remaining event
+backlog.
+
+Across the minute, the UI processed 287 events, at most 32 per update; pending
+events peaked at one. Emote backfill performed 41,904 row-processing operations,
+at most 400 per update, with at most four pending refresh jobs. These operations
+include repeated processing of retained messages.
+
+The rendered chat list retained up to 1,247 rows and considered at most 400
+active rows. Rendered rows had a median of 24, p95 of 26, and maximum of 40.
+There were 124 prefix rebuilds, 40,915 height-cache misses, and 32 texture
+uploads. The separate four-pane benchmark above covers the larger rendering
+workload.
+
+Animation reservations, pending decodes, completed decodes, and accumulated
+decode time stayed at zero in this native sample. Animated decoding was exercised
+by the controlled GIF benchmark and the real-worker accounting regression.
+The latter lets a GIF finish between UI updates and verifies that its completion
+and duration are reported once.
+
+Timing logs are emitted after the duration sample. Their cost is absent from
+the phase timings and affects the profiling process, so this run's process
+figures are not used in the warm/cache-empty comparison.
+
+The historical 337 ms elapsed update in issue #17 and a 323 ms update at
+58.380 seconds in the warm baseline remain unattributed. The animation benchmark
+demonstrates a separate reproducible cost; it does not establish the cause of
+those observations. The new phase and workload counters make a recurrence
+easier to diagnose.
 
 ## Verification
 
@@ -254,9 +387,10 @@ ownership, stale snapshots, personal membership changes, background image
 loading, settings and expression-editor input, account removal, and narrow
 composer interaction.
 
-The final Windows workspace run passed 1,104 tests, with thirteen ignored
-benchmark or soak tests and no failures. The UI suite accounts for 339 passing
-tests; the application/runtime suite accounts for 254.
+The final Windows workspace run passed 1,106 tests, with thirteen ignored
+benchmark or soak tests and no failures. The UI suite accounts for 341 passing
+tests; the application/runtime suite accounts for 254. The two rendering and
+animation benchmarks above ran separately from that gate.
 
 | Area | Verified behavior |
 | --- | --- |
@@ -272,8 +406,10 @@ tests; the application/runtime suite accounts for 254.
 Offline native fixtures exercise the production UI with synthetic messages and
 images at wide, narrow, and 1.5× enlarged layouts. Saved-account desktop checks
 exercise actual authentication, channel connections, history, provider loading,
-and live chat rendering. Network sends and destructive moderation use automated
-coverage; reading real chat does not verify server acceptance of a sent message.
+live chat rendering, and mouse navigation. Native keyboard injection remained
+inconclusive; UI regressions cover keyboard behavior. Network sends and
+destructive moderation use automated coverage; reading real chat does not verify
+server acceptance of a sent message.
 
 The final integrated gate uses:
 

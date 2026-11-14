@@ -1050,7 +1050,7 @@ fn render_sections_nav(
                 for section in sections {
                     if group != section.group() {
                         group = section.group();
-                        ui.label(RichText::new(group).font(t::tiny()).color(t::text_muted()));
+                        ui.label(RichText::new(group).font(t::tiny()).color(t::text_helper()));
                     }
                     ui.selectable_value(selected, *section, section.title());
                 }
@@ -1063,7 +1063,7 @@ fn render_sections_nav(
                     ui.add_space(8.0);
                 }
                 group = section.group();
-                ui.label(RichText::new(group).font(t::tiny()).color(t::text_muted()));
+                ui.label(RichText::new(group).font(t::tiny()).color(t::text_helper()));
             }
             if ui
                 .add_sized(
@@ -1179,14 +1179,14 @@ fn render_settings_content(
                     ui.label(
                         RichText::new("Tip: Ctrl+= / Ctrl+- / Ctrl+0 or Ctrl+scroll to zoom chat.")
                             .font(t::tiny())
-                            .color(t::text_muted()),
+                            .color(t::text_helper()),
                     );
                     ui.add_space(4.0);
                     egui::CollapsingHeader::new("Advanced text sizes")
                         .id_salt("settings_advanced_text_sizes")
                         .show(ui, |ui| {
                         ui.label(RichText::new("Uncheck Auto to set a size for one part of the interface.")
-                            .font(t::tiny()).color(t::text_muted()));
+                            .font(t::tiny()).color(t::text_helper()));
                         let section_range = t::MIN_SECTION_FONT_SIZE..=t::MAX_SECTION_FONT_SIZE;
                         let chat_font = state.chat_font_size;
                         for (label, slot, auto_offset) in [
@@ -1255,7 +1255,7 @@ fn render_settings_content(
                         ui.label(
                             RichText::new("Enable IRC beta to use the IRC diagnostics panel.")
                                 .font(t::tiny())
-                                .color(t::text_muted()),
+                                .color(t::text_helper()),
                         );
                     }
                     ui.add_space(6.0);
@@ -2612,7 +2612,7 @@ pub fn show_settings_page(
             ui.label(
                 RichText::new("Changes save automatically.")
                     .font(t::tiny())
-                    .color(t::text_muted()),
+                    .color(t::text_helper()),
             );
             ui.add_space(6.0);
             if matches.is_empty() {

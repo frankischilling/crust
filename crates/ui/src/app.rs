@@ -1,4 +1,4 @@
-use crate::image_cache::UiImageCache;
+use crate::image_cache::{ImageWorkStats, UiImageCache};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -1120,6 +1120,7 @@ pub struct CrustApp {
     pending_auth: Option<String>,
     unsent_messages: UnsentMessages,
     emote_bytes: UiImageCache,
+    previous_image_work: ImageWorkStats,
     join_dialog: JoinDialog,
     login_dialog: LoginDialog,
     quick_switch: ChannelQuickSwitch,
@@ -1486,7 +1487,7 @@ pub struct CrustApp {
 /// Apply the Crust colour palette to egui, reading the current dark/light
 /// flag from `theme::is_light()`.  Called once at startup and again whenever
 /// the user toggles the theme.
-fn apply_theme_visuals(ctx: &egui::Context) {
+pub(crate) fn apply_theme_visuals(ctx: &egui::Context) {
     let mut vis = if t::is_light() {
         egui::Visuals::light()
     } else {
@@ -1713,6 +1714,7 @@ impl CrustApp {
             pending_auth: None,
             unsent_messages: UnsentMessages::default(),
             emote_bytes: UiImageCache::default(),
+            previous_image_work: ImageWorkStats::default(),
             join_dialog: JoinDialog::default(),
             login_dialog: LoginDialog::default(),
             quick_switch: ChannelQuickSwitch::default(),
@@ -7941,7 +7943,6 @@ impl eframe::App for CrustApp {
 impl CrustApp {
     fn update_ui(&mut self, ctx: &Context) {
         let frame_start = std::time::Instant::now();
-        let image_work_before = self.emote_bytes.work_stats(ctx);
         let mut phase_start = frame_start;
         let mut finish_phase = || {
             let now = std::time::Instant::now();
@@ -11172,6 +11173,8 @@ impl CrustApp {
         let frame_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
         self.perf.record_update(frame_ms as f32);
         let image_work = self.emote_bytes.work_stats(ctx);
+        // Include worker completions while the UI was idle between updates.
+        let image_work_before = std::mem::replace(&mut self.previous_image_work, image_work);
         static SLOW_THRESHOLD_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let slow_threshold_ms = *SLOW_THRESHOLD_MS.get_or_init(|| {
             std::env::var("CRUST_SLOW_FRAME_MS")
@@ -13234,6 +13237,94 @@ mod tests {
         let (commands, receiver) = tokio::sync::mpsc::channel(64);
         let (_, events) = tokio::sync::mpsc::channel(64);
         (super::CrustApp::with_event_channels(commands, events), receiver)
+    }
+
+    #[test]
+    fn image_work_completed_between_ui_updates_is_reported_once() {
+        #[derive(Default)]
+        struct WorkRecord {
+            completed_decodes: u64,
+            decode_micros: u64,
+        }
+        impl tracing::field::Visit for WorkRecord {
+            fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                match field.name() {
+                    "completed_decodes" => self.completed_decodes = value,
+                    "background_decode_us" => self.decode_micros = value,
+                    _ => {}
+                }
+            }
+            fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+        }
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<WorkRecord>>>);
+        impl tracing::Subscriber for Capture {
+            fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+                metadata.target() == "crust_ui::timing"
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut record = WorkRecord::default();
+                event.record(&mut record);
+                self.0.lock().unwrap().push(record);
+            }
+        }
+
+        let records = std::sync::Arc::new(std::sync::Mutex::new(Vec::<WorkRecord>::new()));
+        tracing::subscriber::with_default(Capture(records.clone()), || {
+            let (mut app, _commands) = test_app();
+            let ctx = egui::Context::default();
+            production_ui_frame(&ctx, &mut app, Vec::new());
+            assert!(!records.lock().unwrap().is_empty(), "the UI timing event must be captured");
+            records.lock().unwrap().clear();
+
+            let mut raw = Vec::new();
+            {
+                let mut encoder = image::codecs::gif::GifEncoder::new(&mut raw);
+                for color in [[255, 0, 0, 255], [0, 255, 0, 255]] {
+                    encoder.encode_frame(image::Frame::from_parts(
+                        image::RgbaImage::from_pixel(64, 64, image::Rgba(color)),
+                        0, 0, image::Delay::from_numer_denom_ms(100, 1),
+                    )).unwrap();
+                }
+            }
+            ctx.include_bytes("bytes://between-updates.gif", raw);
+            assert!(matches!(ctx.try_load_image(
+                "bytes://between-updates.gif#0", egui::load::SizeHint::default(),
+            ), Ok(egui::load::ImagePoll::Pending { .. })));
+
+            // Let the real decoder finish while no UI update is running.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let completed = loop {
+                let work = app.emote_bytes.work_stats(&ctx);
+                if work.completed_decodes == 1 && work.pending_decodes == 0 && work.decode_micros > 0 {
+                    break work;
+                }
+                assert!(std::time::Instant::now() < deadline, "background decode did not finish");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            };
+            assert!(completed.decode_micros > 0);
+
+            production_ui_frame(&ctx, &mut app, Vec::new());
+            {
+                let records = records.lock().unwrap();
+                assert_eq!(records.iter().map(|record| record.completed_decodes).sum::<u64>(), 1);
+                assert_eq!(records.iter().map(|record| record.decode_micros).sum::<u64>(),
+                    completed.decode_micros);
+            }
+
+            records.lock().unwrap().clear();
+            production_ui_frame(&ctx, &mut app, Vec::new());
+            let records = records.lock().unwrap();
+            assert!(!records.is_empty());
+            assert!(records.iter().all(|record| record.completed_decodes == 0
+                && record.decode_micros == 0), "completed work must not be counted twice");
+        });
     }
 
     fn scoped_emote(url: &str, channel: Option<ChannelId>, user: Option<&str>) -> crust_core::EmoteCatalogEntry {

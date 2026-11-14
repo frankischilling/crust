@@ -117,7 +117,7 @@ pub fn dialog_header(ui: &mut Ui, title: &str, subtitle: Option<&str>) {
         ui.label(
             RichText::new(subtitle)
                 .font(t::small())
-                .color(t::text_muted()),
+                .color(t::text_helper()),
         );
     }
 }

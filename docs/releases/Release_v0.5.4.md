@@ -8,7 +8,8 @@ global and personal sets.
 ## Interface
 
 - Search settings by page or option. Connections, Plugins, External tools, and
-  Updates have separate pages, with compact navigation in narrow windows.
+  Updates have separate pages, with compact navigation in narrow windows and
+  clearer helper text in the dark theme.
 - Settings pages keep their scroll positions and field focus when resized.
   Highlight and filter editors preserve their actions in narrow layouts.
 - The expression editor keeps Save and Cancel visible, handles Unicode
