@@ -36,6 +36,8 @@ pub struct LoginDialog {
     token_buf: String,
     show_add_form: bool,
     error_msg: Option<String>,
+    focus_token: bool,
+    focused_control: Option<egui::Id>,
 }
 
 impl LoginDialog {
@@ -47,6 +49,8 @@ impl LoginDialog {
             // Auto-expand the add-account form when there are no accounts yet.
             self.show_add_form = self.accounts.is_empty() && self.active_account.is_none();
         }
+        self.focus_token = self.open && self.show_add_form;
+        self.focused_control = None;
     }
 
     /// Keep the dialog's account list in sync with the application state.
@@ -78,6 +82,32 @@ impl LoginDialog {
         if !self.open {
             return None;
         }
+        let token_id = egui::Id::new("login_token_input");
+        let window_id = egui::Id::new("login_accounts_window");
+        let dialog_layer = egui::LayerId::new(egui::Order::Middle, window_id);
+        // Escape clears egui's focus before widgets run. Remember the owned
+        // control so keyboard dismissal also works after tabbing to a button.
+        let focused = ctx.memory(|memory| memory.focused().or_else(|| {
+            self.focused_control.filter(|id| memory.had_focus_last_frame(*id))
+        }));
+        let owns_escape = focused.and_then(|id| ctx.read_response(id))
+            .is_some_and(|response| response.layer_id == dialog_layer);
+        let owns_submit = self.show_add_form && focused == Some(token_id);
+        let (close, submit) = if !ctx.is_context_menu_open() {
+            ctx.input_mut(|input| (
+                owns_escape && crate::app::consume_exact_key(input, egui::Modifiers::NONE, egui::Key::Escape),
+                owns_submit && crate::app::consume_exact_key(input, egui::Modifiers::NONE, egui::Key::Enter),
+            ))
+        } else {
+            (false, false)
+        };
+        if close {
+            self.open = false;
+            self.focus_token = false;
+            self.focused_control = None;
+            self.token_buf.clear();
+            return None;
+        }
 
         // Build the account list to display.  We rely on `self.accounts`
         // (from AccountListUpdated events) but gracefully fall back to the
@@ -100,6 +130,7 @@ impl LoginDialog {
         let mut result: Option<LoginAction> = None;
 
         egui::Window::new("Accounts")
+            .id(window_id)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -162,16 +193,17 @@ impl LoginDialog {
 
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut self.token_buf)
+                            .id(token_id)
                             .hint_text("oauth:abc123...")
                             .password(true)
                             .desired_width((ui.available_width() - 8.0).max(96.0)),
                     );
-                    if self.token_buf.is_empty() {
+                    if std::mem::take(&mut self.focus_token) {
                         resp.request_focus();
                     }
 
                     ui.label(
-                        RichText::new("Get a token at twitchtokengenerator.com (chat:edit + chat:read). For the Live feed, add user:read:follows; for whispers, user:manage:whispers; for polls and points, channel:manage:polls and channel:manage:redemptions; for Hype Trains on your channel, channel:read:hype_train.")
+                        RichText::new("Get a token at twitchtokengenerator.com (chat:edit + chat:read). For the Twitch emote picker and autocomplete, add user:read:emotes. Chat works without this scope. For the Live feed, add user:read:follows; for whispers, user:manage:whispers; for polls and points, channel:manage:polls and channel:manage:redemptions; for Hype Trains on your channel, channel:read:hype_train.")
                             .font(t::small())
                             .color(t::text_muted()),
                     );
@@ -183,21 +215,20 @@ impl LoginDialog {
 
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        let enter = resp.lost_focus()
-                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         if (ui
                             .add_sized(
                                 [84.0, t::bar_h()],
                                 egui::Button::new(RichText::new("Add account").font(t::small())),
                             )
                             .clicked()
-                            || enter)
+                            || submit)
                             && !self.token_buf.trim().is_empty()
                         {
                             let token = self.token_buf.trim().to_owned();
                             result = Some(LoginAction::Login(token));
                             self.token_buf.clear();
                             self.show_add_form = false;
+                            self.focus_token = false;
                             self.open = false;
                         }
                         if ui
@@ -224,6 +255,7 @@ impl LoginDialog {
                         .clicked()
                     {
                         self.show_add_form = true;
+                        self.focus_token = true;
                         self.token_buf.clear();
                         self.error_msg = None;
                     }
@@ -247,6 +279,13 @@ impl LoginDialog {
                 ui.add_space(2.0);
             });
 
+        self.focused_control = ctx.memory(|memory| memory.focused()).filter(|id| {
+            ctx.read_response(*id).is_some_and(|response| response.layer_id == dialog_layer)
+        });
+        if !self.open {
+            self.focus_token = false;
+            self.focused_control = None;
+        }
         result
     }
 }
@@ -418,4 +457,111 @@ fn draw_account_row(
             }
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(ctx: &egui::Context, dialog: &mut LoginDialog, events: Vec<egui::Event>) -> Option<LoginAction> {
+        let mut action = None;
+        let images = UiImageCache::default();
+        let _ = ctx.run(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 600.0))),
+            events,
+            ..Default::default()
+        }, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.add(egui::TextEdit::singleline(&mut String::new()).id(egui::Id::new("external_login_composer")));
+            });
+            action = dialog.show(ctx, false, None, None, &images);
+        });
+        action
+    }
+
+    fn key(key: egui::Key) -> egui::Event {
+        egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }
+    }
+
+    #[test]
+    fn empty_token_field_does_not_trap_keyboard_focus() {
+        let ctx = egui::Context::default();
+        let mut dialog = LoginDialog::default();
+        dialog.toggle();
+        frame(&ctx, &mut dialog, Vec::new());
+        assert!(ctx.memory(|memory| memory.has_focus(egui::Id::new("login_token_input"))));
+        frame(&ctx, &mut dialog, vec![key(egui::Key::Tab)]);
+        frame(&ctx, &mut dialog, Vec::new());
+        assert!(!ctx.memory(|memory| memory.has_focus(egui::Id::new("login_token_input"))));
+        assert!(dialog.focused_control.is_some());
+        frame(&ctx, &mut dialog, vec![key(egui::Key::Escape)]);
+        assert!(!dialog.open);
+    }
+
+    #[test]
+    fn login_escape_does_not_close_for_an_external_composer() {
+        let ctx = egui::Context::default();
+        let mut dialog = LoginDialog::default();
+        dialog.toggle();
+        frame(&ctx, &mut dialog, Vec::new());
+        let external_id = egui::Id::new("external_login_composer");
+        ctx.memory_mut(|memory| memory.request_focus(external_id));
+        frame(&ctx, &mut dialog, Vec::new());
+        assert!(ctx.memory(|memory| memory.has_focus(external_id)));
+        frame(&ctx, &mut dialog, vec![key(egui::Key::Escape)]);
+        assert!(dialog.open);
+    }
+
+    #[test]
+    fn login_cancel_button_handles_enter_without_submitting() {
+        let ctx = egui::Context::default();
+        let mut dialog = LoginDialog::default();
+        dialog.toggle();
+        frame(&ctx, &mut dialog, Vec::new());
+        frame(&ctx, &mut dialog, vec![egui::Event::Text("cancelled-token".to_owned())]);
+        for _ in 0..2 {
+            frame(&ctx, &mut dialog, vec![key(egui::Key::Tab)]);
+            frame(&ctx, &mut dialog, Vec::new());
+        }
+        assert!(frame(&ctx, &mut dialog, vec![key(egui::Key::Enter)]).is_none());
+        assert!(dialog.open);
+        assert!(!dialog.show_add_form);
+        assert!(dialog.token_buf.is_empty());
+    }
+
+    #[test]
+    fn account_buttons_allow_keyboard_dismissal_without_the_token_form() {
+        let ctx = egui::Context::default();
+        let mut dialog = LoginDialog::default();
+        dialog.accounts.push("alice".to_owned());
+        dialog.toggle();
+        frame(&ctx, &mut dialog, Vec::new());
+        assert!(!dialog.show_add_form);
+        for _ in 0..4 {
+            frame(&ctx, &mut dialog, vec![key(egui::Key::Tab)]);
+            frame(&ctx, &mut dialog, Vec::new());
+            if dialog.focused_control.is_some() { break; }
+        }
+        assert!(dialog.focused_control.is_some());
+        frame(&ctx, &mut dialog, vec![key(egui::Key::Escape)]);
+        assert!(!dialog.open);
+    }
+
+    #[test]
+    fn token_input_submits_with_enter_and_closes_with_escape() {
+        let ctx = egui::Context::default();
+        let mut dialog = LoginDialog::default();
+        dialog.toggle();
+        frame(&ctx, &mut dialog, Vec::new());
+        frame(&ctx, &mut dialog, vec![egui::Event::Text("test-token".to_owned())]);
+        assert!(matches!(frame(&ctx, &mut dialog, vec![key(egui::Key::Enter)]), Some(LoginAction::Login(token)) if token == "test-token"));
+        assert!(!dialog.open);
+        assert!(dialog.token_buf.is_empty());
+        dialog.toggle();
+        frame(&ctx, &mut dialog, Vec::new());
+        frame(&ctx, &mut dialog, vec![egui::Event::Text("cancelled-token".to_owned())]);
+        assert!(frame(&ctx, &mut dialog, vec![key(egui::Key::Escape)]).is_none());
+        assert!(!dialog.open);
+        assert!(dialog.token_buf.is_empty());
+    }
 }

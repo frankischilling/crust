@@ -358,7 +358,7 @@ impl<'a> ChannelList<'a> {
                     // Right-click menu for quick channel actions.
                     row_resp.context_menu(|ui| {
                         if ui
-                            .button(RichText::new("Switch to channel").font(t::small()))
+                            .button(RichText::new(if ch.is_irc_query() { "Switch to private chat" } else { "Switch to channel" }).font(t::small()))
                             .clicked()
                         {
                             result.selected = Some(ch.clone());
@@ -366,10 +366,12 @@ impl<'a> ChannelList<'a> {
                         }
 
                         if ui
-                            .button(RichText::new("Copy channel").font(t::small()))
+                            .button(RichText::new(if ch.is_irc_query() { "Copy nickname" } else { "Copy channel" }).font(t::small()))
                             .clicked()
                         {
-                            let copy = if ch.is_kick() {
+                            let copy = if ch.is_irc_query() {
+                                ch.display_name().to_owned()
+                            } else if ch.is_kick() {
                                 format!("kick:{}", ch.display_name())
                             } else if ch.is_irc() {
                                 if let Some(t) = ch.irc_target() {
@@ -511,7 +513,9 @@ impl<'a> ChannelList<'a> {
 
                                 // Channel name label
                                 let display = ch.display_name();
-                                let prefix = if ch.is_kick() || ch.is_irc_server_tab() {
+                                let prefix = if ch.is_irc_query() {
+                                    "@ "
+                                } else if ch.is_kick() || ch.is_irc_server_tab() {
                                     ""
                                 } else {
                                     "# "

@@ -10,7 +10,7 @@ commands. Kick and generic IRC support remain beta features.
 - Twitch chat via IRC over WebSocket (anonymous and authenticated modes)
 - Twitch EventSub events: subs / gift subs / raids / channel-points redemptions / poll + prediction lifecycle / stream `online` + `offline` / hype-train begin/progress/end / moderator + AutoMod + suspicious-user + whisper topics, with `session_reconnect` continuity, deduplication across 10,000 recent event IDs, and backfill after reconnect
 - Kick chat integration (beta / currently incomplete)
-- Generic IRC integration (beta), including IRC server tabs and keyed channel joins
+- Generic IRC integration (beta), including server tabs, keyed channel joins, and private conversations
 - IRC channel redirect handling (old channel target -> new channel target)
 
 ### Channels, tabs, and navigation
@@ -23,13 +23,14 @@ commands. Kick and generic IRC support remain beta features.
   - mention-first ordering (mentions -> unread -> others)
   - unified channel + whisper-thread list
   - query aliases for platforms and whispers
-  - keyboard navigation and activation
+  - keyboard navigation that scrolls selection into view and follows search focus
 - Split-pane chat view (up to 4 panes):
   - drag channel to split
   - focused-pane tracking
   - split header controls and per-pane search toggle
   - split keyboard navigation and pane reordering shortcuts
   - independent drafts and stable composer focus when panes are added, moved, or closed
+  - independent scrolling and pause state when the same channel appears in two panes
 
 ### Desktop UI shell
 
@@ -39,7 +40,10 @@ commands. Kick and generic IRC support remain beta features.
 - Optional analytics side panel
 - Optional IRC status diagnostics panel
 - Optional performance overlay for chat rendering stats
-- Startup loading screen for initial prefetch visibility
+- Compact startup status while chat, settings, and navigation remain available
+- Icon controls with visible keyboard focus and labels for accessibility tools
+- Layout controls that show the active layout and disable the sidebar when the
+  window is too narrow
 
 ### Messages and rendering
 
@@ -62,6 +66,8 @@ commands. Kick and generic IRC support remain beta features.
 - Message deletion and user-message clear handling in UI
 - Optional timestamp rendering (12h/24h, with/without seconds)
 - Optional long-message collapse with configurable line limits
+- Unicode-aware tokenization that preserves whitespace and ignores reversed
+  native-emote ranges
 
 ### Input and command UX
 
@@ -83,11 +89,13 @@ commands. Kick and generic IRC support remain beta features.
   - 7TV
   - Kick
 - Channel emotes stay in their channel; personal emotes resolve for their owner
+- Paginated Twitch account inventory for the picker, autocomplete, and outgoing
+  emote ranges, with the optional `user:read:emotes` scope
 - Provider and scope precedence is consistent between chat, autocomplete, and the picker
 - Animated emote support (GIF/WebP)
 - Emoji tokenization/rendering via Twemoji URLs
 - Badge rendering from global/channel badge sources
-- 7TV sender colors, badges, and avatars
+- 7TV sender colors, selected username paints, badges, and avatars
 - Emote picker features:
   - favorites
   - recents
@@ -95,6 +103,15 @@ commands. Kick and generic IRC support remain beta features.
   - focused search, Ctrl+Tab / Ctrl+Shift+Tab navigation, and insertion at the caret
   - favorites menus that stay open while the pointer moves from an emote to an action
 - Emote image caching in memory and on disk
+- Images load as they become visible; provider catalogs become available independently
+- Live channel-set additions, renames, and removals from BTTV and 7TV on Twitch,
+  with 7TV channel-set updates also available on Kick
+- Active 7TV channel-set changes and reconnect reconciliation, with stale
+  subscription and snapshot checks
+
+Chat works without `user:read:emotes`. Twitch follower emotes that require a
+channel query and live updates for global and personal sets remain follow-ups in
+[issue #9](https://github.com/frankischilling/crust/issues/9).
 
 ### Whispers
 
@@ -103,6 +120,14 @@ commands. Kick and generic IRC support remain beta features.
 - Per-thread unread counts and mention counts
 - Whisper compose/open workflow from thread context
 - Whisper desktop notifications (when enabled)
+- Saved threads belong to the account's immutable Twitch user ID and remain
+  available after that account changes its login
+- Legacy rows with no owner or only a login-based owner stay stored but are not
+  assigned to a current account
+- Sender IDs survive saved history, allowing personal emotes to resolve for their owner
+- Reply uses the visible composer and preserves an existing draft
+- Temporary send-failure notices visible only to the owning account, cleared on
+  account changes or logout
 
 ### Moderation and creator tools
 
@@ -234,6 +259,10 @@ messages; ordinary live chat keeps its 1,500-message limit.
 The tables below show default shortcuts. Settings > Hotkeys lets you rebind
 registered app actions and reports conflicts. Text editing, autocomplete, and
 palette navigation also use the widget shortcuts listed below.
+
+While a shortcut is waiting to be rebound, keyboard input goes to that binding.
+Escape cancels without changing it. Leaving Hotkeys or closing Settings also
+cancels an unfinished capture.
 
 ### Global and navigation
 

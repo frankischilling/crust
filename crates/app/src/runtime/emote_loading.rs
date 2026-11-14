@@ -1,56 +1,103 @@
 use crust_core::{events::AppEvent, model::ChannelId};
 use crust_emotes::{
-    cache::EmoteCache,
     providers::{
         BttvProvider, EmoteInfo, FfzProvider, KickProvider, SevenTvProvider, TwitchGlobalProvider,
     },
     EmoteProvider,
 };
+use futures_util::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use tokio::sync::mpsc;
-use tracing::info;
 
-use super::assets::fetch_emote_image;
+use super::live_emotes::{LiveBinding, LiveSource, Provider};
 use crate::seventv::{load_7tv_user_for_twitch, SevenTvCosmeticUpdate};
 
+type ProviderLoad<'a> = BoxFuture<'a, (&'static str, Option<Vec<EmoteInfo>>)>;
+type ChannelProviderLoad<'a> = BoxFuture<'a, ChannelProviderResult>;
+
+struct ChannelProviderResult {
+    provider: &'static str,
+    emotes: Option<Vec<EmoteInfo>>,
+    source: Option<LiveSource>,
+    expected_source: Option<LiveBinding>,
+}
+
+impl From<(&'static str, Option<Vec<EmoteInfo>>)> for ChannelProviderResult {
+    fn from((provider, emotes): (&'static str, Option<Vec<EmoteInfo>>)) -> Self {
+        Self {
+            provider,
+            emotes,
+            source: None,
+            expected_source: None,
+        }
+    }
+}
+
+async fn load_seven_tv_channel(
+    provider: &SevenTvProvider,
+    platform: &str,
+    room_id: &str,
+    expected_source: Option<LiveBinding>,
+) -> ChannelProviderResult {
+    match provider.load_channel_state(platform, room_id).await {
+        Some(state) => ChannelProviderResult {
+            provider: "7tv",
+            emotes: Some(state.emotes),
+            source: Some(LiveSource {
+                provider: Provider::SevenTv,
+                platform: platform.into(),
+                room_id: room_id.into(),
+                user_id: state.user_id,
+                set_id: state.set_id,
+                connection_index: state.connection_index,
+            }),
+            expected_source,
+        },
+        None => ChannelProviderResult {
+            provider: "7tv",
+            emotes: None,
+            source: None,
+            expected_source,
+        },
+    }
+}
+
 /// Publish built-in globals immediately and load remote provider sets in the background.
-pub(crate) async fn load_global_emotes(
-    index: &crate::EmoteIndex,
-    cache: &Option<EmoteCache>,
-    evt_tx: &mpsc::Sender<AppEvent>,
-) {
+pub(crate) async fn load_global_emotes(index: &crate::EmoteIndex, evt_tx: &mpsc::Sender<AppEvent>) {
     let twitch = TwitchGlobalProvider::new().load_global().await;
-    let urls = twitch.iter().map(|emote| emote.url_1x.clone()).collect();
     index.write().unwrap().replace_global("twitch", twitch);
     send_emote_catalog(index, evt_tx).await;
-    prefetch_emote_images(urls, cache, evt_tx);
 
     let bttv = BttvProvider::new();
     let ffz = FfzProvider::new();
     let seven_tv = SevenTvProvider::new();
     let index = index.clone();
-    let cache = cache.clone();
     let evt_tx = evt_tx.clone();
     tokio::spawn(async move {
-        let (b, f, s) = tokio::join!(
-            bttv.load_global(),
-            ffz.load_global(),
-            seven_tv.load_global()
-        );
-        let urls = b
-            .iter()
-            .chain(&f)
-            .chain(&s)
-            .map(|emote| emote.url_1x.clone())
-            .collect();
-        {
-            let mut registry = index.write().unwrap();
-            registry.replace_global("bttv", b);
-            registry.replace_global("ffz", f);
-            registry.replace_global("7tv", s);
-        }
-        send_emote_catalog(&index, &evt_tx).await;
-        prefetch_emote_images(urls, &cache, &evt_tx);
+        let providers: FuturesUnordered<ProviderLoad<'_>> = [
+            async { ("bttv", Some(bttv.load_global().await)) }.boxed(),
+            async { ("ffz", Some(ffz.load_global().await)) }.boxed(),
+            async { ("7tv", Some(seven_tv.load_global().await)) }.boxed(),
+        ]
+        .into_iter()
+        .collect();
+        publish_global_loads(providers, &index, &evt_tx).await;
     });
+}
+
+async fn publish_global_loads(
+    mut providers: FuturesUnordered<ProviderLoad<'_>>,
+    index: &crate::EmoteIndex,
+    evt_tx: &mpsc::Sender<AppEvent>,
+) {
+    while let Some((provider, emotes)) = providers.next().await {
+        if evt_tx.is_closed() {
+            return;
+        }
+        if let Some(emotes) = emotes {
+            index.write().unwrap().replace_global(provider, emotes);
+            send_emote_catalog(index, evt_tx).await;
+        }
+    }
 }
 
 pub(crate) fn queue_7tv_user_lookup(
@@ -120,19 +167,42 @@ pub(crate) async fn load_channel_emotes(
     room_id: &str,
     generation: u64,
     index: &crate::EmoteIndex,
-    cache: &Option<EmoteCache>,
     evt_tx: &mpsc::Sender<AppEvent>,
 ) {
     let bttv = BttvProvider::new();
     let ffz = FfzProvider::new();
     let seven_tv = SevenTvProvider::new();
-    let (b, f, s) = tokio::join!(
-        bttv.load_channel(room_id),
-        ffz.load_channel(room_id),
-        seven_tv.load_channel(room_id),
-    );
-    let emotes = vec![("bttv", b), ("ffz", f), ("7tv", s)];
-    complete_channel_load(channel, generation, emotes, index, cache, evt_tx).await;
+    let bttv_source = index
+        .read()
+        .unwrap()
+        .live_binding(channel, generation, "bttv");
+    let seven_tv_source = index
+        .read()
+        .unwrap()
+        .live_binding(channel, generation, "7tv");
+    let providers: FuturesUnordered<ChannelProviderLoad<'_>> = [
+        async {
+            ChannelProviderResult {
+                provider: "bttv",
+                emotes: bttv.load_channel(room_id).await,
+                source: Some(LiveSource {
+                    provider: Provider::Bttv,
+                    platform: "TWITCH".into(),
+                    room_id: room_id.into(),
+                    user_id: None,
+                    set_id: None,
+                    connection_index: None,
+                }),
+                expected_source: bttv_source,
+            }
+        }
+        .boxed(),
+        async { ChannelProviderResult::from(("ffz", ffz.load_channel(room_id).await)) }.boxed(),
+        load_seven_tv_channel(&seven_tv, "TWITCH", room_id, seven_tv_source).boxed(),
+    ]
+    .into_iter()
+    .collect();
+    publish_channel_loads(channel, generation, providers, index, evt_tx).await;
 }
 
 pub(crate) async fn load_kick_channel_emotes(
@@ -140,63 +210,96 @@ pub(crate) async fn load_kick_channel_emotes(
     kick_user_id: u64,
     generation: u64,
     index: &crate::EmoteIndex,
-    cache: &Option<EmoteCache>,
     evt_tx: &mpsc::Sender<AppEvent>,
 ) {
     let kick = KickProvider::new();
     let seven_tv = SevenTvProvider::new();
-    let (native, third_party) = tokio::join!(kick.load_channel(channel.display_name()), async {
-        if kick_user_id == 0 {
-            Some(Vec::new())
-        } else {
-            seven_tv.load_kick_channel(&kick_user_id.to_string()).await
+    let seven_tv_source = index
+        .read()
+        .unwrap()
+        .live_binding(channel, generation, "7tv");
+    let room_id = kick_user_id.to_string();
+    let providers: FuturesUnordered<ChannelProviderLoad<'_>> = [
+        async {
+            ChannelProviderResult::from(("kick", kick.load_channel(channel.display_name()).await))
         }
-    });
-    let emotes = vec![("kick", native), ("7tv", third_party)];
-    complete_channel_load(channel, generation, emotes, index, cache, evt_tx).await;
-}
-
-async fn complete_channel_load(
-    channel: &ChannelId,
-    generation: u64,
-    providers: Vec<(&str, Option<Vec<EmoteInfo>>)>,
-    index: &crate::EmoteIndex,
-    cache: &Option<EmoteCache>,
-    evt_tx: &mpsc::Sender<AppEvent>,
-) {
-    let urls = providers
-        .iter()
-        .filter_map(|(_, emotes)| emotes.as_ref())
-        .flatten()
-        .map(|emote| emote.url_1x.clone())
-        .collect();
-    let count = {
-        let mut registry = index.write().unwrap();
-        for (provider, emotes) in providers {
-            if !registry.replace_channel(channel, generation, provider, emotes) {
-                return;
+        .boxed(),
+        async {
+            if kick_user_id == 0 {
+                ChannelProviderResult::from(("7tv", Some(Vec::new())))
+            } else {
+                load_seven_tv_channel(&seven_tv, "KICK", &room_id, seven_tv_source).await
             }
         }
-        registry.channel_emote_count(channel)
+        .boxed(),
+    ]
+    .into_iter()
+    .collect();
+    publish_channel_loads(channel, generation, providers, index, evt_tx).await;
+}
+
+async fn publish_channel_loads<F, R>(
+    channel: &ChannelId,
+    generation: u64,
+    mut providers: FuturesUnordered<F>,
+    index: &crate::EmoteIndex,
+    evt_tx: &mpsc::Sender<AppEvent>,
+) where
+    F: std::future::Future<Output = R>,
+    R: Into<ChannelProviderResult>,
+{
+    // Each completed provider becomes available immediately. A slow response
+    // cannot hold the other catalogs back, and images load when a widget uses them.
+    while let Some(result) = providers.next().await {
+        let ChannelProviderResult {
+            provider,
+            emotes,
+            source,
+            expected_source,
+        } = result.into();
+        let succeeded = emotes.is_some();
+        if evt_tx.is_closed()
+            || !index.write().unwrap().replace_channel_with_source(
+                channel,
+                generation,
+                provider,
+                emotes,
+                source,
+                expected_source,
+            )
+        {
+            return;
+        }
+        if succeeded {
+            send_emote_catalog(index, evt_tx).await;
+        }
+    }
+
+    // Reserve capacity before checking generation: the channel can close or
+    // start a replacement load while the event queue is full.
+    let Ok(permit) = evt_tx.reserve().await else {
+        return;
     };
-    send_emote_catalog(index, evt_tx).await;
-    let _ = evt_tx
-        .send(AppEvent::ChannelEmotesLoaded {
+    let mut registry = index.write().unwrap();
+    if registry.complete_channel_load(channel, generation) {
+        permit.send(AppEvent::ChannelEmotesLoaded {
             channel: channel.clone(),
-            count,
-        })
-        .await;
-    prefetch_emote_images(urls, cache, evt_tx);
+            count: registry.channel_emote_count(channel),
+        });
+    }
 }
 
 /// Serialize publications so a slow sender cannot publish an obsolete snapshot last.
 pub(crate) async fn send_emote_catalog(index: &crate::EmoteIndex, evt_tx: &mpsc::Sender<AppEvent>) {
     static PUBLISH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _publication = PUBLISH.lock().await;
-    let entries = index.read().unwrap().catalog();
-    let _ = evt_tx
-        .send(AppEvent::EmoteCatalogUpdated { emotes: entries })
-        .await;
+    let Ok(permit) = evt_tx.reserve().await else {
+        return;
+    };
+    let registry = index.read().unwrap();
+    permit.send(AppEvent::EmoteCatalogUpdated {
+        emotes: registry.catalog(),
+    });
 }
 
 pub(crate) async fn clear_personal_emotes(
@@ -207,22 +310,247 @@ pub(crate) async fn clear_personal_emotes(
     send_emote_catalog(index, evt_tx).await;
 }
 
-/// Prefetch newly loaded images through the shared concurrency and retry limits.
-pub(crate) fn prefetch_emote_images(
-    urls: Vec<String>,
-    cache: &Option<EmoteCache>,
-    evt_tx: &mpsc::Sender<AppEvent>,
-) {
-    if urls.is_empty() {
-        return;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, RwLock};
+    use std::task::Poll;
+    use std::time::Duration;
+
+    fn index() -> crate::EmoteIndex {
+        Arc::new(RwLock::new(
+            super::super::emote_registry::EmoteRegistry::default(),
+        ))
     }
-    info!("Prefetching {} emote images...", urls.len());
-    let _ = evt_tx.try_send(AppEvent::ImagePrefetchQueued { count: urls.len() });
-    for url in urls {
-        let cache = cache.clone();
-        let evt_tx = evt_tx.clone();
-        tokio::spawn(async move {
-            fetch_emote_image(&url, &cache, &evt_tx).await;
+
+    fn emote(provider: &str, code: &str) -> EmoteInfo {
+        EmoteInfo {
+            provider: provider.to_owned(),
+            id: code.to_owned(),
+            code: code.to_owned(),
+            url_1x: format!("https://example.test/{code}.png"),
+            url_2x: None,
+            url_4x: None,
+        }
+    }
+
+    async fn receive(events: &mut mpsc::Receiver<AppEvent>) -> AppEvent {
+        tokio::time::timeout(Duration::from_secs(3), events.recv())
+            .await
+            .expect("provider publication timed out")
+            .expect("provider publication closed")
+    }
+
+    fn codes(event: AppEvent) -> Vec<String> {
+        let AppEvent::EmoteCatalogUpdated { emotes } = event else {
+            panic!("expected a catalog publication");
+        };
+        let mut codes: Vec<_> = emotes.into_iter().map(|emote| emote.code).collect();
+        codes.sort();
+        codes
+    }
+
+    #[tokio::test]
+    async fn global_catalog_publishes_fast_providers_before_slow_ones() {
+        let index = index();
+        let (events, mut received) = mpsc::channel(4);
+        let (release, pending) = tokio::sync::oneshot::channel();
+        let providers: FuturesUnordered<ProviderLoad<'static>> = [
+            async { ("bttv", Some(vec![emote("bttv", "Fast")])) }.boxed(),
+            async move {
+                pending.await.unwrap();
+                ("7tv", Some(vec![emote("7tv", "Slow")]))
+            }
+            .boxed(),
+        ]
+        .into_iter()
+        .collect();
+        let task = tokio::spawn(async move {
+            publish_global_loads(providers, &index, &events).await;
         });
+
+        assert_eq!(codes(receive(&mut received).await), ["Fast"]);
+        assert!(!task.is_finished());
+        release.send(()).unwrap();
+        assert_eq!(codes(receive(&mut received).await), ["Fast", "Slow"]);
+        task.await.unwrap();
+        assert!(received.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn channel_catalog_updates_progressively_and_settles_once() {
+        let index = index();
+        let channel = ChannelId::new("room");
+        let generation = {
+            let mut registry = index.write().unwrap();
+            registry.open_channel(&channel);
+            let generation = registry.begin_channel_load(&channel, "42", false).unwrap();
+            registry.replace_channel(
+                &channel,
+                generation,
+                "7tv",
+                Some(vec![emote("7tv", "Retained")]),
+            );
+            generation
+        };
+        let (events, mut received) = mpsc::channel(4);
+        let (release, pending) = tokio::sync::oneshot::channel();
+        let providers: FuturesUnordered<ProviderLoad<'static>> = [
+            async { ("bttv", Some(vec![emote("bttv", "Fast")])) }.boxed(),
+            async move {
+                pending.await.unwrap();
+                ("ffz", Some(vec![emote("ffz", "Slow")]))
+            }
+            .boxed(),
+            async { ("7tv", None) }.boxed(),
+        ]
+        .into_iter()
+        .collect();
+        let task_channel = channel.clone();
+        let task_index = index.clone();
+        let task = tokio::spawn(async move {
+            publish_channel_loads(&task_channel, generation, providers, &task_index, &events).await;
+        });
+
+        assert_eq!(codes(receive(&mut received).await), ["Fast", "Retained"]);
+        assert!(
+            received.try_recv().is_err(),
+            "a pending provider must not complete the channel"
+        );
+        release.send(()).unwrap();
+        assert_eq!(
+            codes(receive(&mut received).await),
+            ["Fast", "Retained", "Slow"]
+        );
+        assert!(matches!(receive(&mut received).await,
+            AppEvent::ChannelEmotesLoaded { channel: loaded, count: 3 } if loaded == channel));
+        task.await.unwrap();
+        assert!(received.try_recv().is_err());
+        assert!(
+            index
+                .write()
+                .unwrap()
+                .begin_channel_load(&channel, "42", false)
+                .is_some(),
+            "a failed provider must remain retryable"
+        );
+    }
+
+    #[tokio::test]
+    async fn early_provider_failure_cannot_restart_a_pending_channel_load() {
+        let index = index();
+        let channel = ChannelId::new("room");
+        let generation = {
+            let mut registry = index.write().unwrap();
+            registry.open_channel(&channel);
+            registry.begin_channel_load(&channel, "42", false).unwrap()
+        };
+        let (release, pending) = tokio::sync::oneshot::channel();
+        let providers: FuturesUnordered<ProviderLoad<'static>> = [
+            async { ("bttv", None) }.boxed(),
+            async move {
+                pending.await.unwrap();
+                ("7tv", Some(vec![emote("7tv", "Available")]))
+            }
+            .boxed(),
+        ]
+        .into_iter()
+        .collect();
+        let (events, mut received) = mpsc::channel(4);
+        let mut publish = Box::pin(publish_channel_loads(
+            &channel, generation, providers, &index, &events,
+        ));
+        assert!(matches!(futures_util::poll!(&mut publish), Poll::Pending));
+        assert!(index
+            .write()
+            .unwrap()
+            .begin_channel_load(&channel, "42", false)
+            .is_none());
+        release.send(()).unwrap();
+        publish.await;
+        assert_eq!(codes(receive(&mut received).await), ["Available"]);
+        assert!(matches!(receive(&mut received).await,
+            AppEvent::ChannelEmotesLoaded { channel: loaded, count: 1 } if loaded == channel));
+        assert!(index
+            .write()
+            .unwrap()
+            .begin_channel_load(&channel, "42", false)
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn empty_channel_provider_replaces_the_old_set_without_image_work() {
+        let index = index();
+        let channel = ChannelId::new("room");
+        let generation = {
+            let mut registry = index.write().unwrap();
+            registry.open_channel(&channel);
+            let generation = registry.begin_channel_load(&channel, "42", false).unwrap();
+            registry.replace_channel(&channel, generation, "7tv", Some(vec![emote("7tv", "Old")]));
+            generation
+        };
+        let providers: FuturesUnordered<ProviderLoad<'static>> =
+            [async { ("7tv", Some(Vec::new())) }.boxed()]
+                .into_iter()
+                .collect();
+        let (events, mut received) = mpsc::channel(4);
+        publish_channel_loads(&channel, generation, providers, &index, &events).await;
+        assert!(codes(receive(&mut received).await).is_empty());
+        assert!(matches!(
+            receive(&mut received).await,
+            AppEvent::ChannelEmotesLoaded { count: 0, .. }
+        ));
+        assert!(received.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn replaced_channel_load_cannot_publish_a_completion_after_backpressure() {
+        let index = index();
+        let channel = ChannelId::new("room");
+        let generation = {
+            let mut registry = index.write().unwrap();
+            registry.open_channel(&channel);
+            registry.begin_channel_load(&channel, "42", false).unwrap()
+        };
+        let (events, mut received) = mpsc::channel(1);
+        events
+            .send(AppEvent::EmoteCatalogUpdated { emotes: Vec::new() })
+            .await
+            .unwrap();
+        let mut publish = Box::pin(publish_channel_loads(
+            &channel,
+            generation,
+            FuturesUnordered::<ChannelProviderLoad<'static>>::new(),
+            &index,
+            &events,
+        ));
+        assert!(matches!(futures_util::poll!(&mut publish), Poll::Pending));
+        index.write().unwrap().reconnect_channel(&channel);
+        received.recv().await.unwrap();
+        publish.await;
+        assert!(received.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn catalog_snapshot_is_captured_after_waiting_for_event_capacity() {
+        let index = index();
+        index
+            .write()
+            .unwrap()
+            .replace_global("7tv", vec![emote("7tv", "Old")]);
+        let (events, mut received) = mpsc::channel(1);
+        events
+            .send(AppEvent::EmoteCatalogUpdated { emotes: Vec::new() })
+            .await
+            .unwrap();
+        let mut publish = Box::pin(send_emote_catalog(&index, &events));
+        assert!(matches!(futures_util::poll!(&mut publish), Poll::Pending));
+        index
+            .write()
+            .unwrap()
+            .replace_global("7tv", vec![emote("7tv", "Current")]);
+        received.recv().await.unwrap();
+        publish.await;
+        assert_eq!(codes(receive(&mut received).await), ["Current"]);
     }
 }

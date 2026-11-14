@@ -5,8 +5,6 @@ use crust_core::{
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::runtime::assets::fetch_profile_image;
-
 fn non_empty_opt(input: Option<String>) -> Option<String> {
     input.and_then(|v| {
         let trimmed = v.trim();
@@ -557,7 +555,7 @@ pub(crate) async fn fetch_twitch_user_profile(
         display_name: user.display_name,
         description: user.description,
         created_at: user.created_at,
-        avatar_url: avatar_url.clone(),
+        avatar_url,
         followers: user.followers,
         is_partner: user.roles.as_ref().map_or(false, |r| r.is_partner),
         is_affiliate: user.roles.as_ref().map_or(false, |r| r.is_affiliate),
@@ -574,11 +572,6 @@ pub(crate) async fn fetch_twitch_user_profile(
     };
 
     let _ = evt_tx.send(AppEvent::UserProfileLoaded { profile }).await;
-
-    // Pre-fetch avatar bytes so egui can display them right away.
-    if let Some(ref logo) = avatar_url {
-        fetch_profile_image(logo, &evt_tx).await;
-    }
 }
 
 /// Fetch external chat logs from the IVR logs API (logs.ivr.fi).
@@ -928,7 +921,7 @@ pub(crate) async fn fetch_kick_user_profile(login: &str, evt_tx: mpsc::Sender<Ap
         display_name,
         description,
         created_at,
-        avatar_url: avatar_url.clone(),
+        avatar_url,
         followers,
         is_partner: user.as_ref().and_then(|u| u.is_verified).unwrap_or(false),
         is_affiliate: false,
@@ -944,18 +937,13 @@ pub(crate) async fn fetch_kick_user_profile(login: &str, evt_tx: mpsc::Sender<Ap
         ban_reason: None,
     };
 
-    if let Some(ref logo) = avatar_url {
-        fetch_profile_image(logo, &evt_tx).await;
-    }
-
     let _ = evt_tx.send(AppEvent::UserProfileLoaded { profile }).await;
 }
 
 /// Resolve a Shared Chat source channel by its Twitch user-id (room-id) via
 /// Helix `/users?id=<id>` and emit `AppEvent::SharedChannelResolved`.  When
 /// Helix credentials are missing we fall back to IVR's login-less endpoint,
-/// which also accepts numeric ids. Also pre-fetches the profile picture so
-/// `emote_bytes` has the bytes ready by the time the UI paints.
+/// which also accepts numeric ids. Avatar bytes load when the source is visible.
 pub(crate) async fn fetch_shared_channel_profile(
     room_id: String,
     bare_token: Option<&str>,
@@ -1059,12 +1047,6 @@ pub(crate) async fn fetch_shared_channel_profile(
     }
     if display.is_empty() {
         display = login.clone();
-    }
-
-    // Pre-fetch the image bytes so the 18x18 shared badge chip can render
-    // immediately without a second frame.
-    if let Some(ref url) = profile_url {
-        fetch_profile_image(url, &evt_tx).await;
     }
 
     // Write to the session-scoped cache *before* emitting the event so the
@@ -1329,14 +1311,6 @@ pub(crate) async fn fetch_shared_chat_session(
         b_host.cmp(&a_host).then_with(|| b.viewer_count.cmp(&a.viewer_count))
     });
 
-    // Queue pre-fetch of each participant's avatar so the banner can
-    // paint instantly rather than flickering from text fallback to image.
-    for p in &participants {
-        if let Some(url) = p.profile_url.as_ref().filter(|s| !s.is_empty()) {
-            fetch_profile_image(url, &evt_tx).await;
-        }
-    }
-
     let session_state = SharedChatSessionState {
         session_id: session.session_id,
         host_broadcaster_id: session.host_broadcaster_id,
@@ -1352,18 +1326,16 @@ pub(crate) async fn fetch_shared_chat_session(
         .await;
 }
 
-/// Fetch the logged-in user's avatar URL and image bytes for the top-bar pill.
+/// Resolve the account's avatar URL; the visible account button loads its image.
 pub(crate) async fn fetch_self_avatar(login: &str, evt_tx: mpsc::Sender<AppEvent>) {
-    if login.is_empty() {
-        return;
-    }
+    let Some(account) = crate::normalize_whisper_login(login) else { return; };
 
     #[derive(serde::Deserialize)]
     struct IvrUserMin {
         logo: Option<String>,
     }
 
-    let url = format!("https://api.ivr.fi/v2/twitch/user?login={login}");
+    let url = format!("https://api.ivr.fi/v2/twitch/user?login={account}");
     let client = reqwest::Client::new();
     let resp = match client.get(&url).send().await {
         Ok(r) if r.status().is_success() => r,
@@ -1378,8 +1350,5 @@ pub(crate) async fn fetch_self_avatar(login: &str, evt_tx: mpsc::Sender<AppEvent
     };
     let Some(avatar_url) = user.logo else { return };
 
-    // Pre-fetch image bytes
-    fetch_profile_image(&avatar_url, &evt_tx).await;
-
-    let _ = evt_tx.send(AppEvent::SelfAvatarLoaded { avatar_url }).await;
+    let _ = evt_tx.send(AppEvent::SelfAvatarLoaded { account, avatar_url }).await;
 }

@@ -235,7 +235,7 @@ impl EmoteCatalogEntry {
     /// Larger values win when several available entries use the same code.
     pub fn resolution_priority(&self) -> u8 {
         if self.user_id.is_some() {
-            return 80;
+            return if self.provider == "twitch" { 90 } else { 80 };
         }
         match (self.channel.is_some(), self.provider.as_str()) {
             (true, "kick") => 70,

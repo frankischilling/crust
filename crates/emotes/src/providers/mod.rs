@@ -272,6 +272,14 @@ pub struct SevenTvProvider {
     client: reqwest::Client,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SevenTvChannel {
+    pub emotes: Vec<EmoteInfo>,
+    pub user_id: Option<String>,
+    pub set_id: Option<String>,
+    pub connection_index: Option<usize>,
+}
+
 impl SevenTvProvider {
     pub fn new() -> Self {
         Self {
@@ -296,8 +304,9 @@ impl EmoteProvider for SevenTvProvider {
     }
 
     async fn load_channel(&self, channel_id: &str) -> Option<Vec<EmoteInfo>> {
-        let url = format!("https://7tv.io/v3/users/twitch/{channel_id}");
-        self.fetch_user_emote_set(&url).await
+        self.load_channel_state("TWITCH", channel_id)
+            .await
+            .map(|state| state.emotes)
     }
 }
 
@@ -447,6 +456,155 @@ struct EmoteFile {
     width: Option<u32>,
 }
 
+fn valid_7tv_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+/// Parse the complete active-emote shape used by REST and live set updates.
+pub fn parse_7tv_emote(value: serde_json::Value) -> Option<EmoteInfo> {
+    parse_7tv_emote_entry(serde_json::from_value(value).ok()?)
+}
+
+/// Empty REST sets can omit `emotes`; their set ID distinguishes them from invalid JSON.
+pub fn parse_7tv_emote_set(value: serde_json::Value) -> Option<Vec<EmoteInfo>> {
+    let object = value.as_object()?;
+    if !object.contains_key("emotes") {
+        let id = object.get("id")?.as_str()?;
+        if !valid_7tv_id(id)
+            || object
+                .get("emote_count")
+                .is_some_and(|count| count.as_u64() != Some(0))
+        {
+            return None;
+        }
+        return Some(Vec::new());
+    }
+    let set: EmoteSetResp = serde_json::from_value(value).ok()?;
+    Some(SevenTvProvider::parse_emote_set(set))
+}
+
+fn parse_7tv_emote_entry(emote: EmoteSetEntry) -> Option<EmoteInfo> {
+    if !valid_7tv_id(&emote.id)
+        || emote.name.is_empty()
+        || emote.name.len() > 128
+        || emote
+            .name
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return None;
+    }
+    let data = emote.data?;
+    let host = data.host.url.trim_end_matches('/');
+    let base = if host.starts_with("//") {
+        format!("https:{host}")
+    } else {
+        host.to_owned()
+    };
+    let url = reqwest::Url::parse(&base).ok()?;
+    if !matches!(url.scheme(), "https" | "http")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let files = data.host.files;
+    // Prefer larger assets so emotes remain crisp when rendered down in chat.
+    let file_1x = choose_7tv_file_by_scale(&files, &[4, 3, 2, 1])
+        .or_else(|| choose_7tv_smallest_file(&files))
+        .map(|file| format!("{base}/{}", file.name));
+    let file_2x =
+        choose_7tv_file_by_scale(&files, &[2, 3, 4]).map(|file| format!("{base}/{}", file.name));
+    let file_4x =
+        choose_7tv_file_by_scale(&files, &[4, 3, 2]).map(|file| format!("{base}/{}", file.name));
+    Some(EmoteInfo {
+        id: emote.id,
+        code: emote.name,
+        url_1x: file_1x?,
+        url_2x: file_2x,
+        url_4x: file_4x,
+        provider: "7tv".to_owned(),
+    })
+}
+
+fn parse_7tv_channel(
+    value: serde_json::Value,
+    platform: &str,
+    room_id: &str,
+) -> Option<SevenTvChannel> {
+    let object = value.as_object()?;
+    let user = object.get("user").filter(|user| user.is_object());
+    let user_id = user
+        .and_then(|user| user.get("id"))
+        .and_then(|id| id.as_str())
+        .filter(|id| valid_7tv_id(id))
+        .map(str::to_owned);
+    let connection_index = user
+        .and_then(|user| user.get("connections"))
+        .and_then(|connections| connections.as_array())
+        .and_then(|connections| {
+            connections.iter().position(|connection| {
+                connection.get("id").and_then(|id| id.as_str()) == Some(room_id)
+                    && connection
+                        .get("platform")
+                        .and_then(|platform| platform.as_str())
+                        .is_some_and(|value| value.eq_ignore_ascii_case(platform))
+            })
+        });
+    let outer_set_id = match object.get("emote_set_id") {
+        Some(serde_json::Value::Null) | None => None,
+        Some(value) => Some(value.as_str().filter(|id| valid_7tv_id(id))?.to_owned()),
+    };
+    let set = object.get("emote_set");
+    if let (Some(outer), Some(nested)) = (
+        outer_set_id.as_deref(),
+        set.and_then(|set| set.get("id")).and_then(|id| id.as_str()),
+    ) {
+        if outer != nested {
+            return None;
+        }
+    }
+    let set_id = outer_set_id.or_else(|| {
+        set.and_then(|set| set.get("id"))
+            .and_then(|id| id.as_str())
+            .filter(|id| valid_7tv_id(id))
+            .map(str::to_owned)
+    });
+    let emotes = match set {
+        Some(serde_json::Value::Null) => {
+            if set_id.is_some() {
+                return None;
+            }
+            Vec::new()
+        }
+        Some(set) => parse_7tv_emote_set(set.clone())?,
+        None => {
+            let known_connection = object.get("id").and_then(|id| id.as_str()) == Some(room_id)
+                && object
+                    .get("platform")
+                    .and_then(|platform| platform.as_str())
+                    .is_some_and(|value| value.eq_ignore_ascii_case(platform));
+            if set_id.is_some() || (!known_connection && connection_index.is_none()) {
+                return None;
+            }
+            Vec::new()
+        }
+    };
+    Some(SevenTvChannel {
+        emotes,
+        user_id,
+        set_id,
+        connection_index,
+    })
+}
+
 fn seven_tv_file_scale(file_name: &str) -> Option<u8> {
     let name = file_name
         .split('.')
@@ -517,73 +675,64 @@ impl SevenTvProvider {
             .ok()?
             .error_for_status()
             .ok()?;
-        let set = read_bounded_json::<EmoteSetResp>(response, 8 * 1024 * 1024).await?;
-        Some(Self::parse_emote_set(set))
+        let set = read_bounded_json::<serde_json::Value>(response, 8 * 1024 * 1024).await?;
+        parse_7tv_emote_set(set)
     }
 
-    async fn fetch_user_emote_set(&self, url: &str) -> Option<Vec<EmoteInfo>> {
-        #[derive(Deserialize)]
-        struct UserResp {
-            emote_set: Option<EmoteSetResp>,
+    pub async fn load_channel_state(
+        &self,
+        platform: &str,
+        room_id: &str,
+    ) -> Option<SevenTvChannel> {
+        let path = match platform {
+            "TWITCH" => "twitch",
+            "KICK" => "kick",
+            _ => return None,
+        };
+        if room_id.is_empty()
+            || room_id.len() > 32
+            || !room_id.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return None;
         }
-        Some(
-            fetch_channel_json::<UserResp>(self.client.get(url))
-                .await?
-                .and_then(|user| user.emote_set)
-                .map(Self::parse_emote_set)
-                .unwrap_or_default(),
-        )
+        let url = format!("https://7tv.io/v3/users/{path}/{room_id}");
+        self.fetch_channel_state(&url, platform, room_id).await
+    }
+
+    async fn fetch_channel_state(
+        &self,
+        url: &str,
+        platform: &str,
+        room_id: &str,
+    ) -> Option<SevenTvChannel> {
+        match fetch_channel_json::<serde_json::Value>(self.client.get(url)).await? {
+            Some(value) => parse_7tv_channel(value, platform, room_id),
+            None => Some(SevenTvChannel::default()),
+        }
     }
 
     async fn fetch_emote_set(&self, url: &str) -> Vec<EmoteInfo> {
-        match self.client.get(url).send().await {
-            Ok(r) => match r.json::<EmoteSetResp>().await {
-                Ok(set) => Self::parse_emote_set(set),
-                Err(e) => {
-                    tracing::warn!("7tv parse failed: {e}");
-                    vec![]
-                }
-            },
-            Err(e) => {
-                tracing::warn!("7tv fetch failed: {e}");
-                vec![]
+        match fetch_channel_json::<serde_json::Value>(self.client.get(url)).await {
+            Some(Some(value)) => parse_7tv_emote_set(value).unwrap_or_default(),
+            Some(None) => Vec::new(),
+            None => {
+                tracing::warn!("7tv emote set fetch failed");
+                Vec::new()
             }
         }
     }
 
     /// Load 7TV emotes for a Kick user-id.
     pub async fn load_kick_channel(&self, kick_user_id: &str) -> Option<Vec<EmoteInfo>> {
-        let url = format!("https://7tv.io/v3/users/kick/{kick_user_id}");
-        self.fetch_user_emote_set(&url).await
+        self.load_channel_state("KICK", kick_user_id)
+            .await
+            .map(|state| state.emotes)
     }
 
     fn parse_emote_set(set: EmoteSetResp) -> Vec<EmoteInfo> {
         set.emotes
             .into_iter()
-            .filter_map(|e| {
-                let data = e.data?;
-                let base = format!("https:{}", data.host.url.trim_end_matches('/'));
-                let files = data.host.files;
-
-                // Prefer larger assets by default so 7TV emotes remain crisp
-                // even when rendered down in chat rows.
-                let file_1x = choose_7tv_file_by_scale(&files, &[4, 3, 2, 1])
-                    .or_else(|| choose_7tv_smallest_file(&files))
-                    .map(|f| format!("{base}/{}", f.name));
-                let file_2x = choose_7tv_file_by_scale(&files, &[2, 3, 4])
-                    .map(|f| format!("{base}/{}", f.name));
-                // Prefer true 4x assets for HD previews; fall back to 3x/2x.
-                let file_4x = choose_7tv_file_by_scale(&files, &[4, 3, 2])
-                    .map(|f| format!("{base}/{}", f.name));
-                Some(EmoteInfo {
-                    id: e.id,
-                    code: e.name,
-                    url_1x: file_1x?,
-                    url_2x: file_2x,
-                    url_4x: file_4x,
-                    provider: "7tv".to_owned(),
-                })
-            })
+            .filter_map(parse_7tv_emote_entry)
             .collect()
     }
 }
@@ -694,6 +843,172 @@ fn normalize_kick_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn active_emote(host: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": "emote-id", "name": "Hello",
+            "data": { "host": { "url": host, "files": [
+                { "name": "1x.webp", "width": 32 },
+                { "name": "2x.webp", "width": 64 },
+                { "name": "4x.webp", "width": 128 }
+            ]}}
+        })
+    }
+
+    #[test]
+    fn channel_metadata_tracks_provider_user_set_and_matching_connection() {
+        let response = serde_json::json!({
+            "id": "42", "platform": "TWITCH", "emote_set_id": "nested-set",
+            "emote_set": { "id": "nested-set", "emotes": [active_emote("//cdn.7tv.app/emote/id")] },
+            "user": { "id": "provider-user", "connections": [
+                { "id": "42", "platform": "KICK" },
+                { "id": "99", "platform": "TWITCH" },
+                { "id": "42", "platform": "TWITCH" }
+            ]}
+        });
+        let state = parse_7tv_channel(response.clone(), "TWITCH", "42").unwrap();
+        assert_eq!(state.user_id.as_deref(), Some("provider-user"));
+        assert_eq!(state.set_id.as_deref(), Some("nested-set"));
+        assert_eq!(state.connection_index, Some(2));
+        assert_eq!(state.emotes.len(), 1);
+
+        let mut conflicting = response.clone();
+        conflicting["emote_set_id"] = serde_json::json!("different-set");
+        assert!(parse_7tv_channel(conflicting, "TWITCH", "42").is_none());
+
+        let mut kick = response;
+        kick.as_object_mut().unwrap().remove("emote_set_id");
+        kick["platform"] = serde_json::json!("KICK");
+        kick["emote_set"]["id"] = serde_json::json!("kick-set");
+        let state = parse_7tv_channel(kick, "KICK", "42").unwrap();
+        assert_eq!(state.set_id.as_deref(), Some("kick-set"));
+        assert_eq!(state.connection_index, Some(0));
+    }
+
+    #[test]
+    fn missing_channel_assignments_are_empty_but_malformed_snapshots_fail() {
+        let state = parse_7tv_channel(serde_json::json!({
+            "id": "42", "platform": "TWITCH", "emote_set": null,
+            "user": { "id": "provider-user", "connections": [{ "id": "42", "platform": "TWITCH" }] }
+        }), "TWITCH", "42").unwrap();
+        assert!(state.emotes.is_empty());
+        assert_eq!(state.user_id.as_deref(), Some("provider-user"));
+        assert_eq!(state.connection_index, Some(0));
+        assert!(state.set_id.is_none());
+        assert!(parse_7tv_channel(
+            serde_json::json!({ "id": "42", "platform": "TWITCH" }),
+            "TWITCH",
+            "42"
+        )
+        .unwrap()
+        .emotes
+        .is_empty());
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!(null),
+            serde_json::json!({ "emote_set": {} }),
+            serde_json::json!({ "emote_set": "invalid" }),
+            serde_json::json!({ "emote_set_id": "assigned", "emote_set": null }),
+            serde_json::json!({ "emote_set_id": "../invalid", "emote_set": { "emotes": [] } }),
+        ] {
+            assert!(parse_7tv_channel(value, "TWITCH", "42").is_none());
+        }
+    }
+
+    #[test]
+    fn empty_sets_can_omit_the_emotes_field_only_with_a_valid_identity() {
+        for value in [
+            serde_json::json!({ "id": "empty-set" }),
+            serde_json::json!({ "id": "empty-set", "emote_count": 0 }),
+            serde_json::json!({ "emotes": [] }),
+        ] {
+            assert!(parse_7tv_emote_set(value).unwrap().is_empty());
+        }
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({ "id": "" }),
+            serde_json::json!({ "id": "../invalid" }),
+            serde_json::json!({ "id": "x".repeat(129) }),
+            serde_json::json!({ "id": "set", "emote_count": 2 }),
+            serde_json::json!({ "id": "set", "emotes": null }),
+        ] {
+            assert!(parse_7tv_emote_set(value).is_none());
+        }
+        let state = parse_7tv_channel(
+            serde_json::json!({ "emote_set": { "id": "empty-set" } }),
+            "TWITCH",
+            "42",
+        )
+        .unwrap();
+        assert_eq!(state.set_id.as_deref(), Some("empty-set"));
+        assert!(state.emotes.is_empty());
+    }
+
+    #[test]
+    fn shared_emote_parser_accepts_absolute_urls_and_preserves_scale_selection() {
+        let relative = parse_7tv_emote(active_emote("//cdn.7tv.app/emote/id/")).unwrap();
+        let absolute_value = active_emote("https://cdn.7tv.app/emote/id/");
+        let absolute = parse_7tv_emote(absolute_value.clone()).unwrap();
+        assert_eq!(absolute, relative);
+        assert_eq!(absolute.url_1x, "https://cdn.7tv.app/emote/id/4x.webp");
+        assert_eq!(
+            absolute.url_2x.as_deref(),
+            Some("https://cdn.7tv.app/emote/id/2x.webp")
+        );
+        assert_eq!(
+            parse_7tv_emote_set(serde_json::json!({ "emotes": [absolute_value] })).unwrap(),
+            vec![absolute]
+        );
+        for host in [
+            "invalid",
+            "data:text/plain,emote",
+            "https://user:secret@example.test/emote",
+        ] {
+            assert!(parse_7tv_emote(active_emote(host)).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_state_fetch_preserves_empty_success_and_failure() {
+        use tokio::io::AsyncWriteExt;
+        let provider = SevenTvProvider::with_client(
+            reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()
+                .unwrap(),
+        );
+        for (status, body, succeeded) in [
+            (404, "", true),
+            (503, "{}", false),
+            (200, "invalid", false),
+            (200, "{}", false),
+            (200, "{\"emote_set\":null}", true),
+            (200, "{\"emote_set\":{\"id\":\"empty\"}}", true),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_http_headers(&mut stream).await;
+                let response = format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+            let state = provider
+                .fetch_channel_state(&format!("http://{address}/user"), "TWITCH", "42")
+                .await;
+            assert_eq!(state.is_some(), succeeded);
+            if let Some(state) = state {
+                assert!(state.emotes.is_empty());
+            }
+            server.await.unwrap();
+        }
+        assert!(provider.load_channel_state("OTHER", "42").await.is_none());
+        assert!(provider
+            .load_channel_state("TWITCH", "../42")
+            .await
+            .is_none());
+    }
 
     #[test]
     fn personal_sets_are_selected_by_the_personal_flag_not_the_channel_set() {

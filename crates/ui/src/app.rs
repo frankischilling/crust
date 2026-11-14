@@ -56,7 +56,8 @@ use crate::widgets::{
         PluginUiSessionState,
     },
     settings_page::{
-        parse_settings_lines, show_settings_page, SettingsPageState, SettingsSection, SettingsStats,
+        handle_hotkey_capture, parse_settings_lines, show_settings_page, SettingsPageState,
+        SettingsSection, SettingsStats,
     },
     split_header::{show_split_header, split_header_height},
     user_profile_popup::{PopupAction, UserProfilePopup},
@@ -310,6 +311,8 @@ fn responsive_layout(window_width: f32) -> ResponsiveLayout {
 struct EventToast {
     /// Fully-formatted display text (icon + message).
     text: String,
+    /// Private notices are cleared when this account is detached.
+    owner_user_id: Option<String>,
     /// Accent tint used for the border (Sub = gold, Raid = cyan, Bits = orange).
     hue: Color32,
     /// Whether to draw celebratory confetti particles around the toast.
@@ -337,6 +340,7 @@ impl EventToast {
                 };
                 Some(Self {
                     text,
+                    owner_user_id: None,
                     hue: if gifted_to_me { t::raid_cyan() } else { t::gold() },
                     confetti: gifted_to_me,
                     born: std::time::Instant::now(),
@@ -344,18 +348,21 @@ impl EventToast {
             }
             MsgKind::Raid { display_name, viewer_count, .. } => Some(Self {
                 text: format!("🚀  {} is raiding with {} viewers!", display_name, viewer_count),
+                owner_user_id: None,
                 hue: t::raid_cyan(),
                 confetti: false,
                 born: std::time::Instant::now(),
             }),
             MsgKind::Bits { amount } if *amount >= 100 => Some(Self {
                 text: format!("💎  {} cheered {} bits!", message.sender.display_name, amount),
+                owner_user_id: None,
                 hue: t::bits_orange(),
                 confetti: false,
                 born: std::time::Instant::now(),
             }),
             _ if message.flags.is_pinned => Some(Self {
                 text: format!("📌  {} sent a pinned message", message.sender.display_name),
+                owner_user_id: None,
                 hue: t::gold(),
                 confetti: false,
                 born: std::time::Instant::now(),
@@ -373,6 +380,7 @@ struct PendingReply {
 
 #[derive(Clone)]
 struct WhisperLine {
+    from_user_id: String,
     from_login: String,
     from_display_name: String,
     text: String,
@@ -648,6 +656,33 @@ impl ChannelLayout {
         match self {
             Self::Sidebar => "sidebar",
             Self::TopTabs => "top_tabs",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ChannelLayoutControls {
+    sidebar_selected: bool,
+    sidebar_enabled: bool,
+    sidebar_label: &'static str,
+    tabs_selected: bool,
+}
+
+impl ChannelLayoutControls {
+    fn new(layout: ChannelLayout, sidebar_visible: bool, force_top_tabs: bool) -> Self {
+        let sidebar_selected = layout == ChannelLayout::Sidebar && sidebar_visible && !force_top_tabs;
+        Self {
+            sidebar_selected,
+            sidebar_enabled: !force_top_tabs,
+            sidebar_label: if force_top_tabs {
+                "Widen the window to use the channel sidebar"
+            } else if sidebar_selected {
+                "Hide channel sidebar"
+            } else {
+                "Show channel sidebar"
+            },
+            tabs_selected: layout == ChannelLayout::TopTabs
+                || (force_top_tabs && sidebar_visible),
         }
     }
 }
@@ -1017,6 +1052,13 @@ struct ChannelQuickSwitch {
     query: String,
     selected: usize,
     focus_query: bool,
+    scroll_to_selected: bool,
+}
+
+impl ChannelQuickSwitch {
+    fn search_id() -> egui::Id {
+        egui::Id::new("channel_quick_switch_search")
+    }
 }
 
 #[derive(Clone)]
@@ -1102,10 +1144,6 @@ pub struct CrustApp {
     whisper_unread_mentions: HashMap<String, u32>,
     /// Currently selected whisper thread login.
     active_whisper_login: Option<String>,
-    /// Deduplicates whisper emote/emoji image fetches while loading.
-    whisper_pending_images: HashSet<String>,
-    /// Deduplicates live-feed thumbnail fetches.
-    live_feed_pending_thumbnails: HashSet<String>,
     /// Startup loading overlay (shown until initial emotes + history are ready).
     loading_screen: LoadingScreen,
     /// Cached stream status per channel (key = channel login, lowercase).
@@ -1675,8 +1713,6 @@ impl CrustApp {
             whisper_unread: HashMap::new(),
             whisper_unread_mentions: HashMap::new(),
             active_whisper_login: None,
-            whisper_pending_images: HashSet::new(),
-            live_feed_pending_thumbnails: HashSet::new(),
             loading_screen: LoadingScreen::default(),
             stream_statuses: HashMap::new(),
             stream_status_fetched: HashMap::new(),
@@ -1901,6 +1937,35 @@ impl CrustApp {
             self.sidebar_visible = true;
         }
         self.send_appearance_settings();
+    }
+
+    fn activate_sidebar_control(&mut self) {
+        match self.channel_layout {
+            ChannelLayout::TopTabs => self.set_channel_layout(ChannelLayout::Sidebar),
+            ChannelLayout::Sidebar => self.toggle_sidebar_visible(),
+        }
+    }
+
+    fn show_channel_layout_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        force_top_tabs: bool,
+        compact: bool,
+    ) -> (egui::Response, egui::Response) {
+        let controls = ChannelLayoutControls::new(self.channel_layout, self.sidebar_visible, force_top_tabs);
+        let sidebar = ui.add_enabled_ui(controls.sidebar_enabled, |ui| {
+            chrome::icon_button(ui, ChromeIcon::Sidebar, controls.sidebar_label,
+                IconButtonState { selected: controls.sidebar_selected, compact, ..Default::default() })
+        }).inner.on_disabled_hover_text(controls.sidebar_label);
+        if sidebar.clicked() {
+            self.activate_sidebar_control();
+        }
+        let tabs = chrome::icon_button(ui, ChromeIcon::Tabs, "Use top tabs for channels",
+            IconButtonState { selected: controls.tabs_selected, compact, ..Default::default() });
+        if tabs.clicked() {
+            self.set_channel_layout(ChannelLayout::TopTabs);
+        }
+        (sidebar, tabs)
     }
 
     fn request_stream_status_refresh(&mut self, login: &str) {
@@ -2194,6 +2259,7 @@ exit 1
     fn push_event_toast(&mut self, text: String, hue: Color32, confetti: bool) {
         self.enqueue_event_toast(EventToast {
             text,
+            owner_user_id: None,
             hue,
             confetti,
             born: std::time::Instant::now(),
@@ -3224,6 +3290,18 @@ exit 1
         }
     }
 
+    fn clear_whisper_state(&mut self) {
+        self.event_toasts.retain(|toast| toast.owner_user_id.is_none());
+        self.event_toast_queue.retain(|toast| toast.owner_user_id.is_none());
+        self.whispers_visible = false;
+        self.whisper_threads.clear();
+        self.whisper_display_names.clear();
+        self.whisper_order.clear();
+        self.whisper_unread.clear();
+        self.whisper_unread_mentions.clear();
+        self.active_whisper_login = None;
+    }
+
     fn invalidate_input_emote_catalogs(&mut self, ctx: &Context) {
         self.input_emote_catalogs.clear();
         self.emote_picker.invalidate_catalog();
@@ -3254,9 +3332,8 @@ exit 1
         }
     }
 
-    fn tokenize_whisper_text(&self, text: &str, twitch_emotes: &[TwitchEmotePos], is_self: bool) -> Vec<Span> {
-        let sender = if is_self { self.state.auth.user_id.as_deref().unwrap_or_default() } else { "" };
-        tokenize_whisper_text(text, twitch_emotes, &self.emote_catalog, &self.emote_catalog_index, sender)
+    fn tokenize_whisper_text(&self, text: &str, twitch_emotes: &[TwitchEmotePos], sender_user_id: &str) -> Vec<Span> {
+        tokenize_whisper_text(text, twitch_emotes, &self.emote_catalog, &self.emote_catalog_index, sender_user_id)
     }
 
     fn queue_emote_refresh(&mut self) {
@@ -3322,11 +3399,8 @@ exit 1
                     }
                     remaining -= lines.len();
                     for line in lines {
-                        let sender = if line.is_self {
-                            self.state.auth.user_id.as_deref().unwrap_or_default()
-                        } else { "" };
                         line.spans = tokenize_whisper_text(&line.text, &line.twitch_emotes,
-                            &self.emote_catalog, &self.emote_catalog_index, sender);
+                            &self.emote_catalog, &self.emote_catalog_index, &line.from_user_id);
                     }
                 }
             }
@@ -3336,26 +3410,6 @@ exit 1
         }
         if !self.pending_emote_refresh.is_empty() {
             ctx.request_repaint();
-        }
-    }
-
-    fn queue_whisper_span_images(&mut self, spans: &[Span]) {
-        for span in spans {
-            let url = match span {
-                Span::Emote { url, .. } | Span::Emoji { url, .. } => Some(url.as_str()),
-                _ => None,
-            };
-            let Some(url) = url else {
-                continue;
-            };
-            if self.emote_bytes.contains_key(url) {
-                continue;
-            }
-            if self.whisper_pending_images.insert(url.to_owned()) {
-                self.send_cmd(AppCommand::FetchImage {
-                    url: url.to_owned(),
-                });
-            }
         }
     }
 
@@ -3401,9 +3455,6 @@ exit 1
                                     .italics()
                                     .color(t::text_secondary()),
                             );
-                            if self.whisper_pending_images.insert(url.clone()) {
-                                self.send_cmd(AppCommand::FetchImage { url: url.clone() });
-                            }
                         }
                     }
                     Span::Emoji { text, url } => {
@@ -3419,9 +3470,6 @@ exit 1
                             );
                         } else {
                             ui.label(RichText::new(text).font(t::small()).color(text_color));
-                            if self.whisper_pending_images.insert(url.clone()) {
-                                self.send_cmd(AppCommand::FetchImage { url: url.clone() });
-                            }
                         }
                     }
                     Span::Mention { login } => {
@@ -3536,7 +3584,20 @@ exit 1
             })
         {
             self.activate_channel(channel);
-            self.chat_input_buf = format!("/w {partner_login} ");
+            let draft = if self.split_panes.panes.len() > 1 {
+                &mut self.split_panes.panes[self.split_panes.focused].input_buf
+            } else {
+                &mut self.chat_input_buf
+            };
+            if draft.trim().is_empty() {
+                *draft = format!("/w {partner_login} ");
+            } else {
+                self.push_event_toast(
+                    "Your current draft was kept. Finish or clear it before replying to the whisper.".to_owned(),
+                    t::text_secondary(),
+                    false,
+                );
+            }
         }
     }
 
@@ -4063,9 +4124,12 @@ exit 1
                     ConnectionState::Connected => {
                         self.loading_screen.on_event(LoadEvent::Connected)
                     }
-                    _ => {}
+                    ConnectionState::Disconnected | ConnectionState::Error(_) => {
+                        self.loading_screen.on_event(LoadEvent::Disconnected)
+                    }
                 }
             }
+            AppEvent::LoggedOut => self.loading_screen.on_event(LoadEvent::Disconnected),
             AppEvent::Authenticated { username, .. } => {
                 self.loading_screen.on_event(LoadEvent::Authenticated {
                     username: username.clone(),
@@ -4518,6 +4582,8 @@ exit 1
                 }
             }
             AppEvent::WhisperReceived {
+                owner_user_id,
+                from_user_id,
                 from_login,
                 from_display_name,
                 target_login,
@@ -4529,10 +4595,19 @@ exit 1
             } => {
                 let from_login_norm = Self::normalize_whisper_login(&from_login);
                 let target_login_norm = Self::normalize_whisper_login(&target_login);
+                let active_login = self.state.auth.username.as_deref()
+                    .and_then(Self::normalize_whisper_login);
+                let owner = if is_self { from_login_norm.as_ref() } else { target_login_norm.as_ref() };
+                if !self.state.auth.logged_in || owner.is_none() || owner != active_login.as_ref()
+                    || owner_user_id.is_empty() || self.state.auth.user_id.as_deref() != Some(owner_user_id.as_str())
+                    || (is_self && from_user_id != owner_user_id)
+                {
+                    return;
+                }
                 let partner_login = if is_self {
-                    target_login_norm.or(from_login_norm)
+                    target_login_norm
                 } else {
-                    from_login_norm.or(target_login_norm)
+                    from_login_norm
                 };
                 let Some(partner_login) = partner_login else {
                     return;
@@ -4553,13 +4628,13 @@ exit 1
                     .insert(partner_login.clone(), display_name.clone());
 
                 let text = text.to_owned();
-                let spans = self.tokenize_whisper_text(&text, &twitch_emotes, is_self);
+                let spans = self.tokenize_whisper_text(&text, &twitch_emotes, &from_user_id);
                 let mentions_current_user =
                     self.whisper_message_mentions_current_user(&spans, &text);
-                self.queue_whisper_span_images(&spans);
                 let notification_body_text = text.trim().to_owned();
 
                 let line = WhisperLine {
+                    from_user_id,
                     from_login: from_login.trim().to_owned(),
                     from_display_name: from_display_name.trim().to_owned(),
                     text,
@@ -4592,7 +4667,7 @@ exit 1
                         .unwrap_or(false);
                 if thread_is_focused {
                     self.mark_whisper_thread_read(&partner_login);
-                } else if !is_history {
+                } else if !is_history && !is_self {
                     *self
                         .whisper_unread
                         .entry(partner_login.clone())
@@ -4640,8 +4715,6 @@ exit 1
                 height,
                 raw_bytes,
             } => {
-                self.whisper_pending_images.remove(&uri);
-                self.live_feed_pending_thumbnails.remove(&uri);
                 self.emote_bytes.complete(ctx, uri, width, height, raw_bytes);
             }
             AppEvent::EmoteCatalogUpdated { mut emotes } => {
@@ -4683,6 +4756,13 @@ exit 1
                 }
             }
             AppEvent::Authenticated { username, user_id } => {
+                let old_login = self.state.auth.username.as_deref()
+                    .and_then(Self::normalize_whisper_login);
+                if old_login != Self::normalize_whisper_login(&username)
+                    || self.state.auth.user_id.as_deref() != Some(user_id.as_str())
+                {
+                    self.clear_whisper_state();
+                }
                 self.pending_auth = None;
                 self.auth_refresh_inflight = false;
                 // Clear the previous account's avatar so it doesn't flash
@@ -4709,17 +4789,24 @@ exit 1
                 self.state.auth.user_id = None;
                 self.invalidate_input_emote_catalogs(ctx);
                 self.state.auth.avatar_url = None;
-                self.whispers_visible = false;
-                self.whisper_threads.clear();
-                self.whisper_display_names.clear();
-                self.whisper_order.clear();
-                self.whisper_unread.clear();
-                self.whisper_unread_mentions.clear();
-                self.active_whisper_login = None;
-                self.whisper_pending_images.clear();
+                self.clear_whisper_state();
                 if let Some(host) = plugin_host() {
                     host.update_auth_snapshot(PluginAuthSnapshot::default());
                 }
+            }
+            AppEvent::WhisperSendFailed { owner_user_id, message } => {
+                if !self.state.auth.logged_in || owner_user_id.is_empty()
+                    || self.state.auth.user_id.as_deref() != Some(owner_user_id.as_str())
+                {
+                    return;
+                }
+                self.enqueue_event_toast(EventToast {
+                    text: message,
+                    owner_user_id: Some(owner_user_id),
+                    hue: t::red(),
+                    confetti: false,
+                    born: std::time::Instant::now(),
+                });
             }
             AppEvent::Error { context, message } => {
                 if matches!(context.as_str(), "Login" | "AddAccount" | "SwitchAccount") {
@@ -5021,15 +5108,6 @@ exit 1
                     shared_channels.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
                     self.user_profile_popup.set_shared_channels(shared_channels);
 
-                    // If we have a 7TV animated avatar for this user, ensure
-                    // its bytes are prefetched so it renders immediately.
-                    if let Some(stv_url) = self.stv_avatars.get(&profile.id) {
-                        if !self.emote_bytes.contains_key(stv_url.as_str()) {
-                            self.send_cmd(AppCommand::FetchImage {
-                                url: stv_url.clone(),
-                            });
-                        }
-                    }
                     let popup_login = profile.login.clone();
                     let popup_channel = self.user_profile_popup.channel.clone();
                     self.user_profile_popup.set_profile(profile);
@@ -5187,8 +5265,15 @@ exit 1
                     ch.delete_all_chat_messages();
                 }
             }
-            AppEvent::SelfAvatarLoaded { avatar_url } => {
-                self.state.auth.avatar_url = Some(avatar_url);
+            AppEvent::SelfAvatarLoaded { account, avatar_url } => {
+                let account = Self::normalize_whisper_login(&account);
+                if self.state.auth.logged_in
+                    && account.is_some()
+                    && self.state.auth.username.as_deref()
+                        .and_then(Self::normalize_whisper_login) == account
+                {
+                    self.state.auth.avatar_url = Some(avatar_url);
+                }
             }
             AppEvent::SharedChatSessionUpdated { channel, session } => {
                 match session {
@@ -5588,7 +5673,7 @@ exit 1
                             .active_channel
                             .clone()
                             .unwrap_or_else(|| ChannelId::new("system")),
-                        text: "\u{26a0}\u{fe0f} Your Twitch token has expired. Please re-authenticate in Settings \u{2192} Account.".into(),
+                        text: "\u{26a0}\u{fe0f} Your Twitch token has expired. Use the account button in the top bar, then Add Account, to sign in with a new Twitch OAuth token.".into(),
                     });
                 }
             }
@@ -5711,7 +5796,7 @@ exit 1
             AppEvent::SenderCosmeticsUpdated {
                 user_id,
                 color,
-                name_paint: _name_paint,
+                name_paint,
                 badge,
                 avatar_url,
             } => {
@@ -5736,11 +5821,9 @@ exit 1
                 // Store 7TV animated avatar URL for this user.
                 if let Some(ref url) = avatar_url {
                     let normalized = normalize_external_url(url).unwrap_or_else(|| url.clone());
-                    self.stv_avatars.insert(user_id.clone(), normalized.clone());
-                    // Prefetch the avatar bytes so they're ready for the popup.
-                    if !self.emote_bytes.contains_key(normalized.as_str()) {
-                        self.send_cmd(AppCommand::FetchImage { url: normalized });
-                    }
+                    self.stv_avatars.insert(user_id.clone(), normalized);
+                } else {
+                    self.stv_avatars.remove(&user_id);
                 }
 
                 // Only the most-recent messages per channel are visible /
@@ -5750,34 +5833,61 @@ exit 1
                 // source on busy channels (many users resolve 7TV styles at
                 // once).  Bound to the tail window.
                 const COSMETICS_BACKFILL_TAIL: usize = 400;
-                let mut _updated = 0u32;
-                for ch in self.state.channels.values_mut() {
-                    let len = ch.messages.len();
-                    let start = len.saturating_sub(COSMETICS_BACKFILL_TAIL);
-                    for msg in ch.messages.iter_mut().skip(start) {
-                        if msg.sender.user_id.0 != user_id {
-                            continue;
-                        }
-
-                        if let Some(ref c) = color {
-                            msg.sender.color = Some(c.clone());
-                        }
-                        msg.sender.name_paint = None;
-
-                        if let Some(ref b) = badge {
-                            if let Some(existing) = msg
-                                .sender
-                                .badges
-                                .iter_mut()
-                                .find(|x| x.name.eq_ignore_ascii_case("7tv"))
-                            {
-                                *existing = b.clone();
-                            } else {
-                                msg.sender.badges.insert(0, b.clone());
-                            }
-                        }
-                        _updated += 1;
+                let apply = |sender: &mut crust_core::model::Sender| -> bool {
+                    if sender.user_id.0 != user_id {
+                        return false;
                     }
+                    if let Some(ref c) = color {
+                        sender.color = Some(c.clone());
+                    }
+                    let mut changed = sender.name_paint != name_paint;
+                    if changed {
+                        sender.name_paint = name_paint.clone();
+                    }
+                    if let Some(ref b) = badge {
+                        if let Some(existing) = sender.badges.iter_mut()
+                            .find(|badge| badge.name.eq_ignore_ascii_case("7tv"))
+                        {
+                            if existing != b {
+                                *existing = b.clone();
+                                changed = true;
+                            }
+                        } else {
+                            sender.badges.insert(0, b.clone());
+                            changed = true;
+                        }
+                    } else {
+                        let before = sender.badges.len();
+                        sender.badges.retain(|badge| !badge.name.eq_ignore_ascii_case("7tv"));
+                        changed |= before != sender.badges.len();
+                    }
+                    changed
+                };
+                let mut any_changed = false;
+                for (channel, ch) in &mut self.state.channels {
+                    if !channel.is_twitch() {
+                        continue;
+                    }
+                    let mut changed = Vec::new();
+                    for msg in ch.messages.iter_mut().rev().take(COSMETICS_BACKFILL_TAIL) {
+                        if apply(&mut msg.sender) {
+                            changed.push(msg.id);
+                        }
+                    }
+                    any_changed |= !changed.is_empty();
+                    crate::widgets::message_list::invalidate_message_layouts(ctx, channel, &changed);
+                }
+                let mut changed_mentions = Vec::new();
+                for msg in self.state.mentions.iter_mut().rev().take(COSMETICS_BACKFILL_TAIL) {
+                    if msg.channel.is_twitch() && apply(&mut msg.sender) {
+                        changed_mentions.push(msg.id);
+                    }
+                }
+                any_changed |= !changed_mentions.is_empty();
+                crate::widgets::message_list::invalidate_message_layouts(
+                    ctx, &ChannelId::mentions(), &changed_mentions);
+                if any_changed {
+                    self.global_search.invalidate();
                 }
             }
             AppEvent::PluginUiAction { .. }
@@ -5836,14 +5946,12 @@ exit 1
                 );
             }
             AppEvent::LiveFeedUpdated { channels } => {
-                self.request_live_feed_thumbnails(&channels);
                 self.state.apply_live_snapshot(channels);
             }
             AppEvent::LiveFeedError { message } => {
                 self.state.apply_live_error(message);
             }
             AppEvent::LiveFeedPartialUpdate { channels, error } => {
-                self.request_live_feed_thumbnails(&channels);
                 self.state.apply_live_partial(channels, error);
             }
             AppEvent::TwitchWebviewLoginState { logged_in } => {
@@ -6493,16 +6601,34 @@ exit 1
         }
     }
 
+    fn handle_settings_hotkey_capture(&mut self, ctx: &Context) -> bool {
+        if !self.settings_open || self.settings_section != SettingsSection::Hotkeys {
+            self.hotkey_capture_target = None;
+            return false;
+        }
+        let capturing = handle_hotkey_capture(ctx, &mut self.hotkey_capture_target,
+            &mut self.settings_hotkey_bindings);
+        if capturing && self.settings_hotkey_bindings != self.hotkey_bindings {
+            self.hotkey_bindings = self.settings_hotkey_bindings.clone();
+            self.send_cmd(AppCommand::SetHotkeyBindings {
+                bindings: self.settings_hotkey_bindings.to_pairs(),
+            });
+        }
+        capturing
+    }
+
     fn open_channel_quick_switch(&mut self) {
         self.quick_switch.open = true;
         self.quick_switch.query.clear();
         self.quick_switch.selected = 0;
         self.quick_switch.focus_query = true;
+        self.quick_switch.scroll_to_selected = true;
     }
 
     fn close_channel_quick_switch(&mut self) {
         self.quick_switch.open = false;
         self.quick_switch.focus_query = false;
+        self.quick_switch.scroll_to_selected = false;
     }
 
     fn quick_switch_candidates(&self) -> Vec<QuickSwitchCandidate> {
@@ -6520,12 +6646,16 @@ exit 1
                 .get(channel)
                 .map(|state| (state.unread_count, state.unread_mentions))
                 .unwrap_or((0, 0));
-            let prefix = if channel.is_kick() || channel.is_irc_server_tab() {
+            let prefix = if channel.is_irc_query() {
+                "@"
+            } else if channel.is_kick() || channel.is_irc_server_tab() {
                 ""
             } else {
                 "#"
             };
-            let subtitle = if channel.is_kick() {
+            let subtitle = if channel.is_irc_query() {
+                Some("IRC private chat".to_owned())
+            } else if channel.is_kick() {
                 Some("Kick channel".to_owned())
             } else if channel.is_irc() {
                 Some("IRC target".to_owned())
@@ -6597,17 +6727,27 @@ exit 1
             return false;
         }
 
+        let owns_keys = ctx.memory(|memory| {
+            memory.has_focus(ChannelQuickSwitch::search_id())
+                || (memory.focused().is_none()
+                    && memory.had_focus_last_frame(ChannelQuickSwitch::search_id()))
+        });
+        if ctx.is_context_menu_open() || !owns_keys {
+            return false;
+        }
+
         let (close, up, down, submit) = ctx.input_mut(|i| {
             (
-                i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
-                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
-                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
-                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+                consume_exact_key(i, egui::Modifiers::NONE, egui::Key::Escape),
+                consume_exact_key(i, egui::Modifiers::NONE, egui::Key::ArrowUp),
+                consume_exact_key(i, egui::Modifiers::NONE, egui::Key::ArrowDown),
+                consume_exact_key(i, egui::Modifiers::NONE, egui::Key::Enter),
             )
         });
 
         if close {
             self.close_channel_quick_switch();
+            self.focus_chat_composer(ctx);
             return true;
         }
 
@@ -6615,6 +6755,7 @@ exit 1
         if candidates.is_empty() {
             if submit {
                 self.close_channel_quick_switch();
+                self.focus_chat_composer(ctx);
             }
             return true;
         }
@@ -6630,6 +6771,7 @@ exit 1
         if down {
             self.quick_switch.selected = (self.quick_switch.selected + 1) % candidates.len();
         }
+        self.quick_switch.scroll_to_selected |= up || down;
         if submit {
             let target = candidates[self.quick_switch.selected].entry.clone();
             self.activate_quick_switch_entry(target);
@@ -6646,21 +6788,28 @@ exit 1
 
         let mut activate: Option<QuickSwitchEntry> = None;
         let mut open = self.quick_switch.open;
+        let available = ctx.screen_rect().shrink(12.0);
+        let content_width = (available.width() - 20.0).clamp(80.0, 480.0);
+        let pointer_moved = ctx.input(|input| input.pointer.delta() != egui::Vec2::ZERO);
         egui::Window::new("Quick Switch")
+            .id(egui::Id::new("channel_quick_switch_window"))
             .collapsible(false)
             .resizable(false)
+            .min_width(0.0)
+            .max_width(content_width)
             .open(&mut open)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, -36.0])
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.set_min_width(420.0);
-                ui.label(
+                ui.set_width(content_width);
+                ui.add(egui::Label::new(
                     RichText::new("Find and switch channels or whisper threads")
                         .font(t::small())
                         .color(t::text_secondary()),
-                );
+                ).wrap());
 
                 let input_resp = ui.add(
                     egui::TextEdit::singleline(&mut self.quick_switch.query)
+                        .id(ChannelQuickSwitch::search_id())
                         .desired_width(f32::INFINITY)
                         .hint_text(
                             "Type channel/login (supports twitch:, kick:, irc://, whisper:)",
@@ -6673,14 +6822,15 @@ exit 1
 
                 if input_resp.changed() {
                     self.quick_switch.selected = 0;
+                    self.quick_switch.scroll_to_selected = true;
                 }
 
                 ui.add_space(6.0);
-                ui.label(
+                ui.add(egui::Label::new(
                     RichText::new("Ctrl+K opens this palette, ↑/↓ navigates, Enter switches")
                         .font(t::tiny())
                         .color(t::text_muted()),
-                );
+                ).wrap());
                 ui.add_space(6.0);
 
                 let candidates = self.quick_switch_candidates();
@@ -6695,9 +6845,12 @@ exit 1
 
                 self.quick_switch.selected = self.quick_switch.selected.min(candidates.len() - 1);
                 let visible_rows = candidates.len().min(QUICK_SWITCH_MAX_ROWS);
+                let scroll_to_selected = self.quick_switch.scroll_to_selected;
+                let max_height = (available.height() - 160.0).max(40.0);
 
                 egui::ScrollArea::vertical()
-                    .max_height(visible_rows as f32 * 28.0 + 8.0)
+                    .id_salt("channel_quick_switch_results")
+                    .max_height((visible_rows as f32 * 28.0 + 8.0).min(max_height))
                     .show(ui, |ui| {
                         for (idx, candidate) in candidates.iter().enumerate() {
                             let is_selected = idx == self.quick_switch.selected;
@@ -6708,6 +6861,9 @@ exit 1
                                 egui::vec2(ui.available_width(), 24.0),
                                 egui::Sense::click(),
                             );
+                            if is_selected && scroll_to_selected {
+                                row_resp.scroll_to_me(Some(egui::Align::Center));
+                            }
                             let row_fill = if is_selected {
                                 t::tab_selected_bg()
                             } else if row_resp.hovered() {
@@ -6728,24 +6884,6 @@ exit 1
                                     .max_rect(row_rect.shrink2(egui::vec2(8.0, 3.0)))
                                     .layout(egui::Layout::left_to_right(egui::Align::Center)),
                             );
-                            row_ui.label(
-                                RichText::new(&candidate.label)
-                                    .font(t::small())
-                                    .color(if is_selected {
-                                        t::text_primary()
-                                    } else {
-                                        t::text_secondary()
-                                    })
-                                    .strong(),
-                            );
-                            if let Some(subtitle) = candidate.subtitle.as_deref() {
-                                row_ui.add_space(6.0);
-                                row_ui.label(
-                                    RichText::new(subtitle)
-                                        .font(t::tiny())
-                                        .color(t::text_muted()),
-                                );
-                            }
                             row_ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
@@ -6764,10 +6902,29 @@ exit 1
                                             t::bg_raised(),
                                         );
                                     }
+                                    let label_width = ui.available_width();
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(label_width, row_rect.height()),
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            ui.add_sized(
+                                                [label_width, row_rect.height()],
+                                                egui::Label::new(
+                                                    RichText::new(&candidate.label)
+                                                        .font(t::small())
+                                                        .color(if is_selected { t::text_primary() } else { t::text_secondary() })
+                                                        .strong(),
+                                                ).truncate(),
+                                            );
+                                        },
+                                    );
                                 },
                             );
+                            if let Some(subtitle) = candidate.subtitle.as_deref() {
+                                row_resp.clone().on_hover_text(format!("{}\n{subtitle}", candidate.label));
+                            }
 
-                            if row_resp.hovered() {
+                            if row_resp.hovered() && pointer_moved && !scroll_to_selected {
                                 self.quick_switch.selected = idx;
                             }
                             if row_resp.clicked() {
@@ -6775,10 +6932,12 @@ exit 1
                             }
                         }
                     });
+                self.quick_switch.scroll_to_selected = false;
             });
 
         if !open {
             self.close_channel_quick_switch();
+            self.focus_chat_composer(ctx);
             return;
         }
 
@@ -7425,31 +7584,6 @@ exit 1
         }
     }
 
-    /// Dispatch `AppCommand::FetchImage` for every new thumbnail URL in a
-    /// live-feed snapshot, deduplicating via `live_feed_pending_thumbnails`
-    /// and the existing `emote_bytes` cache.
-    fn request_live_feed_thumbnails(
-        &mut self,
-        channels: &[crust_core::model::LiveChannelSnapshot],
-    ) {
-        for snap in channels {
-            if snap.thumbnail_url.is_empty() {
-                continue;
-            }
-            if self.emote_bytes.contains_key(&snap.thumbnail_url) {
-                continue;
-            }
-            if !self.live_feed_pending_thumbnails.contains(&snap.thumbnail_url)
-                && self.try_send_cmd(AppCommand::FetchImage {
-                    url: snap.thumbnail_url.clone(),
-                })
-            {
-                self.live_feed_pending_thumbnails
-                    .insert(snap.thumbnail_url.clone());
-            }
-        }
-    }
-
     /// Apply a `LiveFeedAction` produced by the LiveFeed widget.
     fn handle_live_feed_action(&mut self, action: crate::widgets::live_feed::LiveFeedAction) {
         use crate::widgets::live_feed::LiveFeedAction;
@@ -7500,6 +7634,12 @@ exit 1
 
 impl eframe::App for CrustApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        self.update_ui(ctx);
+    }
+}
+
+impl CrustApp {
+    fn update_ui(&mut self, ctx: &Context) {
         // Slow-frame tracing: start a timer for every update() call and warn
         // loudly when a single frame takes longer than the threshold so we
         // can pinpoint hitches when users report them.  Set
@@ -7588,16 +7728,18 @@ impl eframe::App for CrustApp {
             });
         }
 
-        let picker_was_open = self.emote_picker.open;
-        self.emote_picker.handle_shortcuts(ctx);
-        if picker_was_open && !self.emote_picker.open {
-            self.focus_chat_composer(ctx);
-        }
-        let quick_switch_consumed = self.handle_quick_switch_shortcuts(ctx);
-        if !quick_switch_consumed {
-            self.handle_channel_shortcuts(ctx);
-            self.handle_search_shortcuts(ctx);
-            self.handle_font_zoom_shortcuts(ctx);
+        if !self.handle_settings_hotkey_capture(ctx) {
+            let picker_was_open = self.emote_picker.open;
+            self.emote_picker.handle_shortcuts(ctx);
+            if picker_was_open && !self.emote_picker.open {
+                self.focus_chat_composer(ctx);
+            }
+            let quick_switch_consumed = self.handle_quick_switch_shortcuts(ctx);
+            if !quick_switch_consumed {
+                self.handle_channel_shortcuts(ctx);
+                self.handle_search_shortcuts(ctx);
+                self.handle_font_zoom_shortcuts(ctx);
+            }
         }
 
         let events = self.service_runtime_channels(ctx);
@@ -7644,10 +7786,9 @@ impl eframe::App for CrustApp {
             std::time::Duration::from_secs(60),
         );
 
-        // Loading overlay: shown until connection + emotes + history are ready.
+        // Startup status stays visible while chat and settings remain usable.
         if self.loading_screen.is_active() {
             self.loading_screen.show(ctx);
-            return;
         }
         let appearance_before = self.appearance_snapshot();
 
@@ -8403,8 +8544,6 @@ impl eframe::App for CrustApp {
                 let visibility =
                     toolbar_visibility(bar_width, self.irc_beta_enabled, moderation_available);
                 let compact_account = visibility.compact_account;
-                let sidebar_open =
-                    self.channel_layout == ChannelLayout::Sidebar && self.sidebar_visible;
                 let (dot_color, conn_label) = if self.pending_auth.is_some() {
                     (t::yellow(), "Signing in...")
                 } else {
@@ -8487,54 +8626,8 @@ impl eframe::App for CrustApp {
                                     egui::Layout::left_to_right(egui::Align::Center),
                                     |ui| {
                                         ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
-                                        if chrome::icon_button(
-                                            ui,
-                                            ChromeIcon::Sidebar,
-                                            if sidebar_open {
-                                                "Hide channel sidebar"
-                                            } else {
-                                                "Show channel sidebar"
-                                            },
-                                            IconButtonState {
-                                                selected: sidebar_open,
-                                                compact: visibility.compact_controls,
-                                                ..Default::default()
-                                            },
-                                        )
-                                        .clicked()
-                                        {
-                                            match self.channel_layout {
-                                                ChannelLayout::TopTabs => {
-                                                    self.set_channel_layout(ChannelLayout::Sidebar);
-                                                }
-                                                ChannelLayout::Sidebar => {
-                                                    self.toggle_sidebar_visible();
-                                                }
-                                            }
-                                        }
-                                        if chrome::icon_button(
-                                            ui,
-                                            ChromeIcon::Tabs,
-                                            if effective_channel_layout == ChannelLayout::Sidebar {
-                                                "Move channels to top tabs"
-                                            } else {
-                                                "Move channels to the sidebar"
-                                            },
-                                            IconButtonState {
-                                                selected: effective_channel_layout
-                                                    == ChannelLayout::TopTabs,
-                                                compact: visibility.compact_controls,
-                                                ..Default::default()
-                                            },
-                                        )
-                                        .clicked()
-                                        {
-                                            if self.channel_layout == ChannelLayout::Sidebar {
-                                                self.set_channel_layout(ChannelLayout::TopTabs);
-                                            } else {
-                                                self.set_channel_layout(ChannelLayout::Sidebar);
-                                            }
-                                        }
+                                        let _ = self.show_channel_layout_controls(ui, responsive.force_top_tabs,
+                                            visibility.compact_controls);
                                     },
                                 );
                             });
@@ -8616,44 +8709,25 @@ impl eframe::App for CrustApp {
 
                                     ui.separator();
 
-                                    let sidebar_open = self.channel_layout
-                                        == ChannelLayout::Sidebar
-                                        && self.sidebar_visible;
-                                    let sidebar_label = if sidebar_open {
-                                        "Hide sidebar"
-                                    } else {
-                                        "Show sidebar"
-                                    };
+                                    let layout_controls = ChannelLayoutControls::new(self.channel_layout,
+                                        self.sidebar_visible, responsive.force_top_tabs);
                                     if ui
-                                        .button(RichText::new(sidebar_label).font(t::topbar_font()))
+                                        .add_enabled(layout_controls.sidebar_enabled,
+                                            egui::Button::new(RichText::new(layout_controls.sidebar_label)
+                                                .font(t::topbar_font()))
+                                                .selected(layout_controls.sidebar_selected))
                                         .clicked()
                                     {
-                                        match self.channel_layout {
-                                            ChannelLayout::TopTabs => {
-                                                self.set_channel_layout(ChannelLayout::Sidebar);
-                                            }
-                                            ChannelLayout::Sidebar => {
-                                                self.toggle_sidebar_visible();
-                                            }
-                                        }
+                                        self.activate_sidebar_control();
                                         ui.close_menu();
                                     }
 
-                                    let mode_label =
-                                        if self.channel_layout == ChannelLayout::Sidebar {
-                                            "Use top tabs"
-                                        } else {
-                                            "Use sidebar"
-                                        };
                                     if ui
-                                        .button(RichText::new(mode_label).font(t::topbar_font()))
+                                        .add(egui::Button::new(RichText::new("Use top tabs")
+                                            .font(t::topbar_font())).selected(layout_controls.tabs_selected))
                                         .clicked()
                                     {
-                                        if self.channel_layout == ChannelLayout::Sidebar {
-                                            self.set_channel_layout(ChannelLayout::TopTabs);
-                                        } else {
-                                            self.set_channel_layout(ChannelLayout::Sidebar);
-                                        }
+                                        self.set_channel_layout(ChannelLayout::TopTabs);
                                         ui.close_menu();
                                     }
 
@@ -9079,7 +9153,9 @@ impl eframe::App for CrustApp {
                                             .unwrap_or((0, 0));
 
                                         let display = ch.display_name();
-                                        let prefix = if ch.is_kick() || ch.is_irc_server_tab() {
+                                        let prefix = if ch.is_irc_query() {
+                                            "@"
+                                        } else if ch.is_kick() || ch.is_irc_server_tab() {
                                             ""
                                         } else {
                                             "#"
@@ -9262,7 +9338,7 @@ impl eframe::App for CrustApp {
                                         resp.context_menu(|ui| {
                                             if ui
                                                 .button(
-                                                    RichText::new("Switch to channel")
+                                                    RichText::new(if ch.is_irc_query() { "Switch to private chat" } else { "Switch to channel" })
                                                         .font(t::small()),
                                                 )
                                                 .clicked()
@@ -9281,11 +9357,13 @@ impl eframe::App for CrustApp {
                                             }
                                             if ui
                                                 .button(
-                                                    RichText::new("Copy channel").font(t::small()),
+                                                    RichText::new(if ch.is_irc_query() { "Copy nickname" } else { "Copy channel" }).font(t::small()),
                                                 )
                                                 .clicked()
                                             {
-                                                let copy = if ch.is_kick() {
+                                                let copy = if ch.is_irc_query() {
+                                                    ch.display_name().to_owned()
+                                                } else if ch.is_kick() {
                                                     format!("kick:{}", ch.display_name())
                                                 } else if ch.is_irc() {
                                                     if let Some(t) = ch.irc_target() {
@@ -9902,7 +9980,7 @@ impl eframe::App for CrustApp {
                         let is_focused = pi == self.split_panes.focused;
                         let bg_resp = ui.interact(
                             pane_rect,
-                            egui::Id::new("split_pane_bg").with(pi),
+                            egui::Id::new("split_pane_bg").with(self.split_panes.panes[pi].id),
                             egui::Sense::click(),
                         );
                         if bg_resp.clicked() {
@@ -9911,7 +9989,7 @@ impl eframe::App for CrustApp {
 
                         let mut pane_ui = ui.new_child(
                             egui::UiBuilder::new()
-                                .id_salt(("split_pane", pi))
+                                .id_salt(("split_pane", self.split_panes.panes[pi].id))
                                 .max_rect(pane_rect)
                                 .layout(egui::Layout::top_down(egui::Align::LEFT)),
                         );
@@ -10179,6 +10257,7 @@ impl eframe::App for CrustApp {
                             let is_mod = ch_state.is_mod || is_bc;
                             let mut msg_ui = pane_ui.new_child(
                                 egui::UiBuilder::new()
+                                    .id_salt("messages")
                                     .max_rect(msg_rect)
                                     .layout(egui::Layout::top_down(egui::Align::LEFT)),
                             );
@@ -10208,8 +10287,11 @@ impl eframe::App for CrustApp {
                                     msg_ui.add_space(4.0);
                                 }
                             }
-                            let scroll_to =
-                                self.pending_scroll_to_message.remove(&ch);
+                            let scroll_to = if is_focused {
+                                self.pending_scroll_to_message.remove(&ch)
+                            } else {
+                                None
+                            };
                             let ch_live = self
                                 .live_map_cache
                                 .get(ch.display_name())
@@ -10235,6 +10317,7 @@ impl eframe::App for CrustApp {
                                 &self.mod_action_presets,
                                 &ch_state.low_trust_users,
                             )
+                            .with_pane(self.split_panes.panes[pi].id, is_focused)
                             .with_scroll_to(scroll_to)
                             .with_hide_link_previews(
                                 self.streamer_mode_active && self.streamer_hide_link_previews,
@@ -13231,8 +13314,9 @@ mod tests {
     }
 
     #[test]
-    fn rejected_thumbnail_requests_can_be_retried() {
-        let (mut app, mut receiver) = saturated_app();
+    fn hidden_live_feed_snapshots_do_not_request_thumbnail_images() {
+        let (mut app, mut receiver) = test_app();
+        let ctx = egui::Context::default();
         let snapshot = crust_core::model::LiveChannelSnapshot {
             user_id: "1".to_owned(),
             user_login: "channel".to_owned(),
@@ -13241,12 +13325,12 @@ mod tests {
             thumbnail_url: "https://example.test/thumbnail.png".to_owned(),
             started_at: String::new(),
         };
-        app.request_live_feed_thumbnails(std::slice::from_ref(&snapshot));
-        assert!(!app.live_feed_pending_thumbnails.contains(&snapshot.thumbnail_url));
-        receiver.try_recv().unwrap();
-        app.service_runtime_channels(&egui::Context::default());
-        app.request_live_feed_thumbnails(std::slice::from_ref(&snapshot));
-        assert!(app.live_feed_pending_thumbnails.contains(&snapshot.thumbnail_url));
+        app.apply_event(crust_core::AppEvent::LiveFeedUpdated { channels: vec![snapshot.clone()] }, &ctx);
+        app.apply_event(crust_core::AppEvent::LiveFeedPartialUpdate {
+            channels: vec![snapshot], error: "temporarily unavailable".to_owned(),
+        }, &ctx);
+        assert!(receiver.try_recv().is_err());
+        app.emote_bytes.end_frame(&ctx, |_| panic!("a hidden thumbnail was requested"));
     }
 
     #[test]
@@ -13458,6 +13542,574 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    fn quick_switch_frame(
+        ctx: &egui::Context,
+        app: &mut super::CrustApp,
+        size: egui::Vec2,
+        events: Vec<egui::Event>,
+        other_focus: bool,
+    ) -> (bool, egui::FullOutput) {
+        let mut consumed = false;
+        let output = ctx.run(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            time: Some(ctx.cumulative_pass_nr() as f64 * 0.1),
+            events,
+            ..Default::default()
+        }, |ctx| {
+            consumed = app.handle_quick_switch_shortcuts(ctx);
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let id = super::chat_composer_id(None);
+                if other_focus {
+                    ui.memory_mut(|memory| memory.request_focus(id));
+                }
+                ui.add(egui::TextEdit::singleline(&mut app.chat_input_buf).id(id));
+            });
+            app.show_channel_quick_switch(ctx);
+        });
+        (consumed, output)
+    }
+
+    fn visible_text_rect(output: &egui::FullOutput, wanted: &str) -> Option<egui::Rect> {
+        output.shapes.iter().find_map(|shape| {
+            if let egui::epaint::Shape::Text(text) = &shape.shape {
+                let rect = text.galley.rect.translate(text.pos.to_vec2());
+                (text.galley.text() == wanted && shape.clip_rect.contains_rect(rect)).then_some(rect)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn production_ui_frame(ctx: &egui::Context, app: &mut super::CrustApp,
+        events: Vec<egui::Event>) -> egui::FullOutput {
+        ctx.run(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 800.0))),
+            time: Some(ctx.cumulative_pass_nr() as f64 * 0.1),
+            events,
+            ..Default::default()
+        }, |ctx| app.update_ui(ctx))
+    }
+
+    #[test]
+    fn hotkey_capture_records_ctrl_k_without_opening_quick_switch() {
+        let (mut app, mut commands) = test_app();
+        let ctx = egui::Context::default();
+        app.state.join_channel(ChannelId::new("channel"));
+        app.settings_open = true;
+        app.settings_section = super::SettingsSection::Hotkeys;
+        let action = crust_core::HotkeyAction::ZoomIn;
+        let label = app.settings_hotkey_bindings.get(action).display_label();
+        let mut output = egui::FullOutput::default();
+        for _ in 0..4 {
+            output = production_ui_frame(&ctx, &mut app, Vec::new());
+        }
+        let bind = visible_text_rect(&output, &label).expect("binding button is visible").center();
+        for pressed in [true, false] {
+            production_ui_frame(&ctx, &mut app, vec![
+                egui::Event::PointerMoved(bind),
+                egui::Event::PointerButton { pos: bind, button: egui::PointerButton::Primary,
+                    pressed, modifiers: egui::Modifiers::NONE },
+            ]);
+        }
+        assert_eq!(app.hotkey_capture_target, Some(action));
+        let mut events = shortcut_input(egui::Key::K, egui::Modifiers::CTRL).events;
+        events.push(egui::Event::Text("k".into()));
+        production_ui_frame(&ctx, &mut app, events);
+        assert_eq!(app.hotkey_bindings.get(action), crust_core::KeyBinding::new("K").with_ctrl());
+        assert!(app.hotkey_capture_target.is_none());
+        assert!(!app.quick_switch.open);
+        assert!(app.chat_input_buf.is_empty());
+        assert!(std::iter::from_fn(|| commands.try_recv().ok())
+            .any(|command| matches!(command, AppCommand::SetHotkeyBindings { .. })));
+    }
+
+    #[test]
+    fn captured_keys_do_not_reach_open_popups_or_the_composer() {
+        for key in [egui::Key::Escape, egui::Key::Enter, egui::Key::Tab] {
+            let (mut app, mut commands) = test_app();
+            let ctx = egui::Context::default();
+            let channel = ChannelId::new("channel");
+            app.state.join_channel(channel.clone());
+            app.state.auth.logged_in = true;
+            app.chat_input_buf = "draft stays here".into();
+            app.settings_open = true;
+            app.settings_section = super::SettingsSection::Hotkeys;
+            app.emote_picker.open = true;
+            app.message_search_mut(&channel).request_open();
+            production_ui_frame(&ctx, &mut app, Vec::new());
+            ctx.memory_mut(|memory| memory.request_focus(super::chat_composer_id(None)));
+            let action = crust_core::HotkeyAction::ZoomIn;
+            let previous = app.hotkey_bindings.get(action);
+            app.hotkey_capture_target = Some(action);
+            production_ui_frame(&ctx, &mut app, shortcut_input(key, egui::Modifiers::NONE).events);
+            assert!(app.hotkey_capture_target.is_none());
+            assert!(app.emote_picker.open, "{key:?} closed the picker");
+            assert!(app.message_search.get(&channel).unwrap().open, "{key:?} closed search");
+            assert_eq!(app.chat_input_buf, "draft stays here");
+            assert!(ctx.input(|input| !input.key_pressed(key)));
+            if key == egui::Key::Escape {
+                assert_eq!(app.hotkey_bindings.get(action), previous);
+            } else {
+                assert_eq!(app.hotkey_bindings.get(action).key, super::egui_key_name(key));
+            }
+            assert!(!std::iter::from_fn(|| commands.try_recv().ok())
+                .any(|command| matches!(command, AppCommand::SendMessage { .. })));
+        }
+    }
+
+    #[test]
+    fn invisible_hotkey_capture_does_not_suppress_app_shortcuts() {
+        for (open, section) in [(false, super::SettingsSection::Hotkeys),
+            (true, super::SettingsSection::Appearance)] {
+            let (mut app, _commands) = test_app();
+            let ctx = egui::Context::default();
+            app.settings_open = open;
+            app.settings_section = section;
+            app.hotkey_capture_target = Some(crust_core::HotkeyAction::ZoomIn);
+            let previous = app.hotkey_bindings.clone();
+            production_ui_frame(&ctx, &mut app, shortcut_input(egui::Key::K, egui::Modifiers::CTRL).events);
+            assert!(app.hotkey_capture_target.is_none());
+            assert_eq!(app.hotkey_bindings, previous);
+            assert!(app.quick_switch.open);
+        }
+    }
+
+    #[test]
+    fn quick_switch_leaves_another_composers_navigation_keys_alone() {
+        let (mut app, mut commands) = test_app();
+        app.state.join_channel(ChannelId::new("first"));
+        app.state.join_channel(ChannelId::new("second"));
+        app.state.active_channel = Some(ChannelId::new("second"));
+        app.state.auth.logged_in = true;
+        app.chat_input_buf = "message for second".to_owned();
+        let ctx = egui::Context::default();
+        let size = egui::vec2(800.0, 600.0);
+        app.open_channel_quick_switch();
+        let input = |events| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(input(Vec::new()), |ctx| app.update_ui(ctx));
+        ctx.memory_mut(|memory| memory.request_focus(super::chat_composer_id(None)));
+        for key in [egui::Key::ArrowDown, egui::Key::ArrowUp, egui::Key::Enter] {
+            let events = shortcut_input(key, egui::Modifiers::NONE).events;
+            let _ = ctx.run(input(events), |ctx| app.update_ui(ctx));
+            assert_eq!(app.state.active_channel, Some(ChannelId::new("second")));
+            assert!(app.quick_switch.open);
+        }
+        assert!(std::iter::from_fn(|| commands.try_recv().ok()).any(|command| {
+            matches!(command, AppCommand::SendMessage { channel, text, .. }
+                if channel == ChannelId::new("second") && text == "message for second")
+        }));
+    }
+
+    #[test]
+    fn quick_switch_keyboard_selection_survives_stationary_hover_and_scrolls_into_view() {
+        let (mut app, _commands) = test_app();
+        for index in 0..24 {
+            app.state.join_channel(ChannelId::new(format!("room{index:02}")));
+        }
+        let ctx = egui::Context::default();
+        let size = egui::vec2(500.0, 420.0);
+        app.open_channel_quick_switch();
+        let mut output = quick_switch_frame(&ctx, &mut app, size, Vec::new(), false).1;
+        for _ in 0..3 {
+            output = quick_switch_frame(&ctx, &mut app, size, Vec::new(), false).1;
+        }
+        let first = visible_text_rect(&output, "#room00").expect("first row is visible");
+        quick_switch_frame(&ctx, &mut app, size, vec![egui::Event::PointerMoved(first.center())], false);
+        for index in 1..24 {
+            let events = shortcut_input(egui::Key::ArrowDown, egui::Modifiers::NONE).events;
+            quick_switch_frame(&ctx, &mut app, size, events, false);
+            assert_eq!(app.quick_switch.selected, index);
+        }
+        for _ in 0..5 {
+            output = quick_switch_frame(&ctx, &mut app, size, Vec::new(), false).1;
+        }
+        assert!(visible_text_rect(&output, "#room23").is_some());
+        assert_eq!(app.quick_switch.selected, 23);
+    }
+
+    #[test]
+    fn quick_switch_stays_inside_narrow_viewports() {
+        for size in [egui::vec2(300.0, 500.0), egui::vec2(420.0, 300.0)] {
+            let (mut app, _commands) = test_app();
+            app.state.join_channel(ChannelId::new("a_long_channel_name_to_truncate"));
+            let ctx = egui::Context::default();
+            app.open_channel_quick_switch();
+            for _ in 0..4 {
+                quick_switch_frame(&ctx, &mut app, size, Vec::new(), false);
+            }
+            let window = ctx.memory(|memory| memory.area_rect(egui::Id::new("channel_quick_switch_window"))).unwrap();
+            assert!(egui::Rect::from_min_size(egui::Pos2::ZERO, size).contains_rect(window), "{window:?} exceeds {size:?}");
+        }
+    }
+
+    #[test]
+    fn startup_status_keeps_the_composer_and_join_dialog_usable() {
+        let (mut app, mut commands) = test_app();
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("rustlang");
+        app.state.join_channel(channel.clone());
+        app.state.active_channel = Some(channel);
+        app.state.auth.logged_in = true;
+        let input = |events| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 700.0))),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(input(Vec::new()), |ctx| app.update_ui(ctx));
+        ctx.memory_mut(|memory| memory.request_focus(super::chat_composer_id(None)));
+        let _ = ctx.run(input(vec![egui::Event::Text("startup draft".to_owned())]), |ctx| app.update_ui(ctx));
+        assert_eq!(app.chat_input_buf, "startup draft");
+        assert!(app.loading_screen.is_active());
+
+        app.join_dialog.toggle();
+        let _ = ctx.run(input(Vec::new()), |ctx| app.update_ui(ctx));
+        let _ = ctx.run(input(vec![egui::Event::Text("anotherchannel".to_owned())]), |ctx| app.update_ui(ctx));
+        let events = shortcut_input(egui::Key::Enter, egui::Modifiers::NONE).events;
+        let _ = ctx.run(input(events), |ctx| app.update_ui(ctx));
+        assert!(std::iter::from_fn(|| commands.try_recv().ok()).any(|command| {
+            matches!(command, AppCommand::JoinChannel { channel } if channel == ChannelId::new("anotherchannel"))
+        }));
+        assert_eq!(app.chat_input_buf, "startup draft");
+        assert!(app.loading_screen.is_active());
+    }
+
+    fn whisper_event(owner_user_id: &str, from: &str, target: &str, is_self: bool, is_history: bool) -> crust_core::AppEvent {
+        crust_core::AppEvent::WhisperReceived {
+            owner_user_id: owner_user_id.to_owned(),
+            from_user_id: if is_self { owner_user_id.to_owned() } else { String::new() },
+            from_login: from.to_owned(),
+            from_display_name: from.to_owned(),
+            target_login: target.to_owned(),
+            text: "private message".to_owned(),
+            twitch_emotes: Vec::new(),
+            is_self,
+            timestamp: chrono::Utc::now(),
+            is_history,
+        }
+    }
+
+    #[test]
+    fn incoming_and_replayed_whispers_resolve_their_own_senders_emotes() {
+        for is_history in [false, true] {
+            let (mut app, _commands) = test_app();
+            let ctx = egui::Context::default();
+            app.apply_event(crust_core::AppEvent::Authenticated {
+                username: "alice".into(), user_id: "10".into(),
+            }, &ctx);
+            app.apply_event(crust_core::AppEvent::EmoteCatalogUpdated {
+                emotes: vec![scoped_emote("global", None, None)],
+            }, &ctx);
+            for (sender_id, from, target, is_self) in [
+                ("20", "bob", "alice", false),
+                ("30", "carol", "alice", false),
+                ("", "unknown", "alice", false),
+                ("10", "alice", "bob", true),
+            ] {
+                let mut event = whisper_event("10", from, target, is_self, is_history);
+                if let crust_core::AppEvent::WhisperReceived { from_user_id, text, .. } = &mut event {
+                    *from_user_id = sender_id.into();
+                    *text = "SharedCode".into();
+                }
+                app.apply_event(event, &ctx);
+            }
+            app.apply_event(crust_core::AppEvent::EmoteCatalogUpdated { emotes: vec![
+                scoped_emote("global", None, None),
+                scoped_emote("bob-emote", None, Some("20")),
+                scoped_emote("carol-emote", None, Some("30")),
+                scoped_emote("alice-emote", None, Some("10")),
+            ] }, &ctx);
+            app.refresh_emote_messages(&ctx);
+            let url = |line: &super::WhisperLine| line.spans.iter().find_map(|span| match span {
+                crust_core::Span::Emote { url, .. } => Some(url.clone()),
+                _ => None,
+            });
+            assert_eq!(app.whisper_threads["bob"][0].from_user_id, "20");
+            assert_eq!(url(&app.whisper_threads["bob"][0]).as_deref(), Some("bob-emote"));
+            assert_eq!(url(&app.whisper_threads["bob"][1]).as_deref(), Some("alice-emote"));
+            assert_eq!(url(&app.whisper_threads["carol"][0]).as_deref(), Some("carol-emote"));
+            assert_eq!(url(&app.whisper_threads["unknown"][0]).as_deref(), Some("global"));
+
+            let mut live = whisper_event("10", "bob", "alice", false, is_history);
+            if let crust_core::AppEvent::WhisperReceived { from_user_id, text, .. } = &mut live {
+                *from_user_id = "20".into();
+                *text = "SharedCode".into();
+            }
+            app.apply_event(live, &ctx);
+            assert_eq!(url(app.whisper_threads["bob"].back().unwrap()).as_deref(), Some("bob-emote"));
+        }
+    }
+
+    #[test]
+    fn sender_cosmetics_update_owned_rows_and_clear_removed_selections_without_prefetching() {
+        let (mut app, mut commands) = test_app();
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("room");
+        app.state.join_channel(channel.clone());
+        let kick = ChannelId::kick("room");
+        app.state.join_channel(kick.clone());
+        let mut kick_message = search_message(kick.clone());
+        kick_message.sender.user_id = crust_core::UserId("painted".to_owned());
+        app.state.channels.get_mut(&kick).unwrap().messages.push_back(kick_message);
+        for index in 0..450 {
+            let mut message = search_message(channel.clone());
+            message.id = crust_core::MessageId(index);
+            message.sender.user_id = crust_core::UserId(
+                if index == 449 { "other" } else { "painted" }.to_owned());
+            message.sender.badges = vec![crust_core::model::Badge {
+                name: "moderator".to_owned(), version: "1".to_owned(), url: None,
+            }];
+            if index >= 448 {
+                app.state.mentions.push_back(message.clone());
+            }
+            app.state.channels.get_mut(&channel).unwrap().messages.push_back(message);
+        }
+        let paint = crust_core::model::SenderNamePaint {
+            function: "url".to_owned(),
+            image_url: Some("https://example.test/paint.webp".to_owned()),
+            ..Default::default()
+        };
+        let update = |name_paint: Option<crust_core::model::SenderNamePaint>| {
+            let selected = name_paint.is_some();
+            crust_core::AppEvent::SenderCosmeticsUpdated {
+                user_id: "painted".to_owned(), color: None, name_paint,
+                badge: selected.then(|| crust_core::model::Badge {
+                    name: "7tv".to_owned(), version: "supporter".to_owned(),
+                    url: Some("https://example.test/badge.webp".to_owned()),
+                }),
+                avatar_url: selected.then(|| "https://example.test/avatar.webp".to_owned()),
+            }
+        };
+        let heights_key = egui::Id::new("msg_row_h").with(channel.as_str());
+        let mentions_key = egui::Id::new("msg_row_h").with(ChannelId::mentions().as_str());
+        ctx.data_mut(|data| {
+            data.insert_temp(heights_key, std::collections::HashMap::from([
+                (49u64, 20.0f32), (50, 20.0), (449, 20.0),
+            ]));
+            data.insert_temp(mentions_key, std::collections::HashMap::from([
+                (448u64, 20.0f32), (449, 20.0),
+            ]));
+        });
+        app.stv_avatars.insert("other".to_owned(), "other-avatar".to_owned());
+        app.apply_event(update(Some(paint.clone())), &ctx);
+        let messages = &app.state.channels[&channel].messages;
+        assert!(messages[49].sender.name_paint.is_none(), "older rows stay outside the bounded backfill");
+        assert_eq!(messages[50].sender.name_paint.as_ref().unwrap().image_url.as_deref(),
+            Some("https://example.test/paint.webp"));
+        assert!(messages[449].sender.name_paint.is_none());
+        assert!(app.state.channels[&kick].messages[0].sender.name_paint.is_none());
+        assert!(app.state.mentions[0].sender.name_paint.is_some());
+        assert!(app.state.mentions[1].sender.name_paint.is_none());
+        assert_eq!(messages[50].sender.badges[0].name, "7tv");
+        assert!(app.stv_avatars.contains_key("painted"));
+        ctx.data_mut(|data| {
+            let heights = data.get_temp::<std::collections::HashMap<u64, f32>>(heights_key).unwrap();
+            assert!(heights.contains_key(&49));
+            assert!(!heights.contains_key(&50));
+            assert!(heights.contains_key(&449));
+            let mentions = data.get_temp::<std::collections::HashMap<u64, f32>>(mentions_key).unwrap();
+            assert!(!mentions.contains_key(&448));
+            assert!(mentions.contains_key(&449));
+            data.insert_temp(heights_key, std::collections::HashMap::from([(50u64, 25.0f32)]));
+        });
+        app.apply_event(update(Some(paint)), &ctx);
+        assert!(ctx.data_mut(|data| data.get_temp::<std::collections::HashMap<u64, f32>>(heights_key)
+            .unwrap().contains_key(&50)), "unchanged cosmetics retain measured rows");
+        app.emote_bytes.end_frame(&ctx, |_| panic!("paint metadata must not prefetch a hidden image"));
+        assert!(commands.try_recv().is_err());
+
+        app.apply_event(update(None), &ctx);
+        let sender = &app.state.channels[&channel].messages[50].sender;
+        assert!(sender.name_paint.is_none());
+        assert_eq!(sender.badges.iter().map(|badge| badge.name.as_str()).collect::<Vec<_>>(), ["moderator"]);
+        assert!(app.state.mentions[0].sender.name_paint.is_none());
+        assert_eq!(app.state.mentions[0].sender.badges.len(), 1);
+        assert!(!app.stv_avatars.contains_key("painted"));
+        assert_eq!(app.stv_avatars.get("other").map(String::as_str), Some("other-avatar"));
+        assert!(!ctx.data_mut(|data| data.get_temp::<std::collections::HashMap<u64, f32>>(heights_key)
+            .unwrap().contains_key(&50)), "removing a badge invalidates its row measurement");
+        app.emote_bytes.end_frame(&ctx, |_| panic!("removing cosmetics must not request images"));
+    }
+
+    #[test]
+    fn self_avatar_responses_follow_the_active_account() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        let auth = |login: &str| crust_core::AppEvent::Authenticated {
+            username: login.to_owned(), user_id: login.to_owned(),
+        };
+        let avatar = |account: &str, url: &str| crust_core::AppEvent::SelfAvatarLoaded {
+            account: account.to_owned(), avatar_url: url.to_owned(),
+        };
+        app.apply_event(avatar("first", "logged-out"), &ctx);
+        assert!(app.state.auth.avatar_url.is_none());
+        app.apply_event(auth("First"), &ctx);
+        app.apply_event(avatar("first", "first-image"), &ctx);
+        assert_eq!(app.state.auth.avatar_url.as_deref(), Some("first-image"));
+
+        app.apply_event(auth("Second"), &ctx);
+        app.apply_event(avatar("first", "late-first-image"), &ctx);
+        assert!(app.state.auth.avatar_url.is_none());
+        app.apply_event(avatar("SECOND", "second-image"), &ctx);
+        app.apply_event(avatar("first", "another-late-first-image"), &ctx);
+        assert_eq!(app.state.auth.avatar_url.as_deref(), Some("second-image"));
+
+        app.apply_event(crust_core::AppEvent::LoggedOut, &ctx);
+        app.apply_event(avatar("second", "late-second-image"), &ctx);
+        app.apply_event(avatar("", "unowned-image"), &ctx);
+        assert!(app.state.auth.avatar_url.is_none());
+    }
+
+    #[test]
+    fn whispers_reject_logged_out_and_other_account_live_or_history_events() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        for is_history in [false, true] {
+            app.apply_event(whisper_event("1", "friend", "old", false, is_history), &ctx);
+            app.apply_event(whisper_event("1", "old", "friend", true, is_history), &ctx);
+        }
+        assert!(app.whisper_threads.is_empty());
+        app.apply_event(crust_core::AppEvent::Authenticated { username: "current".to_owned(), user_id: "2".to_owned() }, &ctx);
+        for is_history in [false, true] {
+            app.apply_event(whisper_event("1", "friend", "old", false, is_history), &ctx);
+            app.apply_event(whisper_event("1", "old", "friend", true, is_history), &ctx);
+            app.apply_event(whisper_event("2", "friend", "", false, is_history), &ctx);
+            app.apply_event(whisper_event("2", "", "friend", true, is_history), &ctx);
+        }
+        assert!(app.whisper_threads.is_empty());
+        assert!(app.whisper_order.is_empty());
+        assert!(app.whisper_unread.is_empty());
+
+        app.apply_event(whisper_event("2", "Friend", "CURRENT", false, false), &ctx);
+        app.apply_event(whisper_event("2", "CURRENT", "Friend", true, false), &ctx);
+        assert_eq!(app.whisper_threads["friend"].len(), 2);
+        assert_eq!(app.whisper_unread["friend"], 1);
+        app.apply_event(crust_core::AppEvent::LoggedOut, &ctx);
+        app.apply_event(whisper_event("2", "friend", "current", false, true), &ctx);
+        assert!(app.whisper_threads.is_empty());
+    }
+
+    #[test]
+    fn late_whisper_failures_do_not_reach_a_replacement_account() {
+        let (mut app, mut commands) = test_app();
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("room");
+        app.state.join_channel(channel.clone());
+        app.state.active_channel = Some(channel.clone());
+        let auth = |id: &str| crust_core::AppEvent::Authenticated {
+            username: "alice".into(), user_id: id.into(),
+        };
+        let failed = |owner: &str| crust_core::AppEvent::WhisperSendFailed {
+            owner_user_id: owner.into(), message: "Could not send whisper to bob: unavailable".into(),
+        };
+        app.apply_event(auth("1"), &ctx);
+        app.apply_event(crust_core::AppEvent::LoggedOut, &ctx);
+        app.apply_event(failed("1"), &ctx);
+        assert!(commands.try_recv().is_err());
+        assert!(app.event_toasts.is_empty());
+        assert!(app.event_toast_queue.is_empty());
+        app.apply_event(auth("2"), &ctx);
+        app.apply_event(failed("1"), &ctx);
+        app.apply_event(failed(""), &ctx);
+        assert!(commands.try_recv().is_err());
+        assert!(app.event_toasts.is_empty());
+        assert!(app.event_toast_queue.is_empty());
+        app.apply_event(failed("2"), &ctx);
+        assert_eq!(app.event_toasts.len(), 1);
+        assert_eq!(app.event_toasts[0].text, "Could not send whisper to bob: unavailable");
+        assert_eq!(app.event_toasts[0].owner_user_id.as_deref(), Some("2"));
+        assert!(app.state.channels[&channel].messages.is_empty());
+        assert!(commands.try_recv().is_err());
+
+        // An account switch clears both displayed and delayed private notices.
+        let private = app.event_toasts[0].clone();
+        app.event_toast_queue.push_back(private.clone());
+        let mut unrelated = private;
+        unrelated.owner_user_id = None;
+        unrelated.text = "Public channel notice".into();
+        app.event_toasts.push(unrelated.clone());
+        app.event_toast_queue.push_back(unrelated);
+        app.apply_event(auth("3"), &ctx);
+        assert_eq!(app.event_toasts.len(), 1);
+        assert_eq!(app.event_toast_queue.len(), 1);
+        assert!(app.event_toasts.iter().chain(app.event_toast_queue.iter())
+            .all(|toast| toast.owner_user_id.is_none() && toast.text == "Public channel notice"));
+
+        app.apply_event(failed("3"), &ctx);
+        app.apply_event(crust_core::AppEvent::LoggedOut, &ctx);
+        assert_eq!(app.event_toasts.len() + app.event_toast_queue.len(), 2);
+        assert!(app.event_toasts.iter().chain(app.event_toast_queue.iter())
+            .all(|toast| toast.owner_user_id.is_none()));
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn reused_account_logins_cannot_receive_the_previous_owners_whispers() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        let auth = |user_id: &str| crust_core::AppEvent::Authenticated {
+            username: "alice".to_owned(), user_id: user_id.to_owned(),
+        };
+        app.apply_event(auth("1"), &ctx);
+        app.apply_event(whisper_event("1", "bob", "alice", false, false), &ctx);
+        assert_eq!(app.whisper_threads["bob"].len(), 1);
+        app.apply_event(auth("2"), &ctx);
+        assert!(app.whisper_threads.is_empty());
+        for is_history in [false, true] {
+            app.apply_event(whisper_event("1", "bob", "alice", false, is_history), &ctx);
+            app.apply_event(whisper_event("1", "alice", "bob", true, is_history), &ctx);
+            app.apply_event(whisper_event("", "bob", "alice", false, is_history), &ctx);
+        }
+        assert!(app.whisper_threads.is_empty());
+        assert!(app.whisper_unread.is_empty());
+        app.apply_event(whisper_event("2", "bob", "alice", false, false), &ctx);
+        app.apply_event(whisper_event("2", "alice", "bob", true, false), &ctx);
+        assert_eq!(app.whisper_threads["bob"].len(), 2);
+    }
+
+    #[test]
+    fn direct_account_change_clears_whispers_but_same_account_refresh_keeps_them() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        let auth = |name: &str| crust_core::AppEvent::Authenticated { username: name.to_owned(), user_id: name.to_ascii_lowercase() };
+        app.apply_event(auth("first"), &ctx);
+        app.apply_event(whisper_event("first", "friend", "first", false, true), &ctx);
+        app.chat_input_buf = "draft to keep".to_owned();
+        app.apply_event(auth("FIRST"), &ctx);
+        assert_eq!(app.whisper_threads["friend"].len(), 1);
+        app.apply_event(auth("second"), &ctx);
+        assert!(app.whisper_threads.is_empty());
+        assert!(app.active_whisper_login.is_none());
+        assert_eq!(app.chat_input_buf, "draft to keep");
+        app.apply_event(whisper_event("first", "friend", "first", false, true), &ctx);
+        app.apply_event(whisper_event("second", "friend", "second", false, true), &ctx);
+        assert_eq!(app.whisper_threads["friend"].len(), 1);
+    }
+
+    #[test]
+    fn whisper_reply_uses_the_visible_split_and_preserves_existing_drafts() {
+        let (mut app, _commands) = test_app();
+        let channel = ChannelId::new("rustlang");
+        app.state.join_channel(channel.clone());
+        app.state.join_channel(ChannelId::new("other"));
+        app.split_panes.add_pane(ChannelId::new("other"), None);
+        app.split_panes.add_pane(channel.clone(), None);
+        app.split_panes.focused = 1;
+        app.state.active_channel = Some(channel);
+        app.chat_input_buf = "hidden draft".to_owned();
+        app.split_panes.panes[0].input_buf = "other draft".to_owned();
+        app.open_whisper_compose("friend");
+        assert_eq!(app.split_panes.panes[1].input_buf, "/w friend ");
+        assert_eq!(app.chat_input_buf, "hidden draft");
+        assert_eq!(app.split_panes.panes[0].input_buf, "other draft");
+        app.split_panes.panes[1].input_buf = "current draft".to_owned();
+        app.open_whisper_compose("someoneelse");
+        assert_eq!(app.split_panes.panes[1].input_buf, "current draft");
     }
 
     fn search_message(channel: ChannelId) -> crust_core::ChatMessage {
@@ -14048,6 +14700,64 @@ mod tests {
         assert!(visibility.show_perf_toggle);
         assert!(visibility.show_stats_toggle);
         assert!(!visibility.compact_controls);
+    }
+
+    #[test]
+    fn responsive_layout_controls_match_visible_selection_and_click_actions() {
+        fn frame(ctx: &egui::Context, app: &mut super::CrustApp, narrow: bool,
+            events: Vec<egui::Event>) -> (egui::Response, egui::Response) {
+            let mut controls = None;
+            let _ = ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO,
+                    egui::vec2(if narrow { 480.0 } else { 1000.0 }, 200.0))),
+                events, ..Default::default()
+            }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        controls = Some(app.show_channel_layout_controls(ui, narrow, false));
+                    });
+                });
+            });
+            controls.unwrap()
+        }
+        fn click(ctx: &egui::Context, app: &mut super::CrustApp, narrow: bool, pos: egui::Pos2) {
+            for pressed in [true, false] {
+                let _ = frame(ctx, app, narrow, vec![egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton { pos, button: egui::PointerButton::Primary,
+                        pressed, modifiers: egui::Modifiers::NONE }]);
+            }
+        }
+        let (mut app, mut commands) = test_app();
+        let ctx = egui::Context::default();
+        app.channel_layout = super::ChannelLayout::Sidebar;
+        app.sidebar_visible = true;
+        let state = super::ChannelLayoutControls::new(app.channel_layout, app.sidebar_visible, true);
+        assert!(!state.sidebar_selected);
+        assert!(state.tabs_selected);
+        let (sidebar, tabs) = frame(&ctx, &mut app, true, Vec::new());
+        assert!(!sidebar.enabled());
+        click(&ctx, &mut app, true, sidebar.rect.center());
+        assert_eq!(app.channel_layout, super::ChannelLayout::Sidebar);
+        assert!(app.sidebar_visible);
+        click(&ctx, &mut app, true, tabs.rect.center());
+        assert_eq!(app.channel_layout, super::ChannelLayout::TopTabs);
+        assert!(std::iter::from_fn(|| commands.try_recv().ok())
+            .any(|command| matches!(command, AppCommand::SetAppearanceSettings { channel_layout, .. }
+                if channel_layout == "top_tabs")));
+
+        let (sidebar, _) = frame(&ctx, &mut app, false, Vec::new());
+        assert!(sidebar.enabled());
+        click(&ctx, &mut app, false, sidebar.rect.center());
+        assert_eq!(app.channel_layout, super::ChannelLayout::Sidebar);
+        assert!(app.sidebar_visible);
+        let state = super::ChannelLayoutControls::new(app.channel_layout, app.sidebar_visible, false);
+        assert!(state.sidebar_selected);
+        assert!(!state.tabs_selected);
+        click(&ctx, &mut app, false, sidebar.rect.center());
+        assert!(!app.sidebar_visible);
+        let (_, tabs) = frame(&ctx, &mut app, false, Vec::new());
+        click(&ctx, &mut app, false, tabs.rect.center());
+        assert_eq!(app.channel_layout, super::ChannelLayout::TopTabs);
     }
 
     #[test]

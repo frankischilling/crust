@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use egui::{
-    Align, Button, CentralPanel, Context, Frame, Grid, Id, Key, Layout, RichText, Stroke, Ui,
+    Align, Button, CentralPanel, Context, Frame, Id, Key, Layout, RichText, Stroke, Ui,
     ViewportBuilder, ViewportClass, ViewportCommand, ViewportId,
 };
 use regex::{Regex, RegexBuilder};
@@ -69,9 +69,10 @@ impl MessageSearchState {
     }
 
     pub fn is_filtering(&self) -> bool {
-        !self.username.trim().is_empty()
-            || !self.keyword.trim().is_empty()
-            || !self.regex.trim().is_empty()
+        self.open
+            && (!self.username.trim().is_empty()
+                || !self.keyword.trim().is_empty()
+                || !self.regex.trim().is_empty())
     }
 
     pub fn regex_error(&self) -> Option<&str> {
@@ -189,7 +190,8 @@ pub fn show_message_search_window(
     always_on_top: bool,
 ) {
     let viewport_id = ViewportId::from_hash_of(("message_search", channel.as_str()));
-    let title = format!("Search #{}", channel.display_name());
+    let prefix = if channel.is_irc_query() { "@" } else if channel.is_kick() || channel.is_irc_server_tab() { "" } else { "#" };
+    let title = format!("Search {prefix}{}", channel.display_name());
     let level = if always_on_top {
         egui::viewport::WindowLevel::AlwaysOnTop
     } else {
@@ -278,102 +280,27 @@ fn show_message_search_contents(
 
     ui.spacing_mut().item_spacing = egui::vec2(10.0, 8.0);
 
-    ui.horizontal(|ui| {
-        chrome::dialog_header(
-            ui,
-            "Search chat history",
-            Some(if detached {
-                "Detached search window for this channel"
-            } else {
-                "Filter by username, keyword, or Rust regex"
-            }),
-        );
-
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if !detached {
-                if ui
-                    .add(Button::new(RichText::new("Close").font(t::small())))
-                    .on_hover_text("Close search (Esc)")
-                    .clicked()
-                {
-                    search.close();
-                }
-            }
-            if ui
-                .add_enabled(!search.local_history_exhausted, Button::new(
-                    RichText::new(if search.local_history_exhausted { "No older logs" } else { "Load older logs" }).font(t::small()),
-                ))
-                .on_hover_text("Search earlier messages saved on this computer")
-                .clicked()
-            {
-                search.request_load_more_local();
-            }
-            if ui
-                .add(Button::new(RichText::new("Clear").font(t::small())))
-                .on_hover_text("Clear all filters")
-                .clicked()
-            {
-                search.clear_filters();
-            }
-            stat_pill(
-                ui,
-                if search.active_filter_count() == 0 {
-                    format!("{} / {}", stats.matched, stats.total)
-                } else {
-                    format!(
-                        "{} / {} • {} filters",
-                        stats.matched,
-                        stats.total,
-                        search.active_filter_count()
-                    )
-                },
-            );
-        });
-    });
+    show_message_search_header(ui, search, stats, compact, detached);
 
     ui.add_space(4.0);
     ui.separator();
 
     ui.add_space(2.0);
 
+    let focus_keyword = std::mem::take(&mut search.focus_keyword);
     if compact {
-        Grid::new(Id::new("message_search_compact_grid").with(channel.as_str()))
-            .num_columns(2)
-            .min_col_width(SEARCH_LABEL_WIDTH)
-            .spacing([10.0, 8.0])
-            .striped(false)
-            .show(ui, |ui| {
-                search_field_row(
-                    ui,
-                    channel,
-                    "Username",
-                    "mod, chatter...",
-                    "username",
-                    &mut search.username,
-                    false,
-                    false,
-                );
-                search_field_row(
-                    ui,
-                    channel,
-                    "Keyword",
-                    "giveaway, timeout...",
-                    "keyword",
-                    &mut search.keyword,
-                    true,
-                    false,
-                );
-                search_field_row(
-                    ui,
-                    channel,
-                    "Regex",
-                    r"^!|https?://",
-                    "regex",
-                    &mut search.regex,
-                    false,
-                    true,
-                );
-            });
+        search_field_row(
+            ui, channel, "Username", "mod, chatter...", "username",
+            &mut search.username, false, false,
+        );
+        search_field_row(
+            ui, channel, "Keyword", "giveaway, timeout...", "keyword",
+            &mut search.keyword, focus_keyword, false,
+        );
+        search_field_row(
+            ui, channel, "Regex", r"^!|https?://", "regex",
+            &mut search.regex, false, true,
+        );
     } else {
         ui.columns(3, |cols| {
             cols[0].set_min_width(SEARCH_FIELD_MIN_WIDTH);
@@ -383,7 +310,7 @@ fn show_message_search_contents(
                 &mut cols[0],
                 "Username",
                 "mod, chatter...",
-                Id::new("message_search_username").with(channel.as_str()),
+                search_field_id(channel, "username"),
                 &mut search.username,
                 false,
                 false,
@@ -392,16 +319,16 @@ fn show_message_search_contents(
                 &mut cols[1],
                 "Keyword",
                 "giveaway, timeout...",
-                Id::new("message_search_keyword").with(channel.as_str()),
+                search_field_id(channel, "keyword"),
                 &mut search.keyword,
-                true,
+                focus_keyword,
                 false,
             );
             search_field(
                 &mut cols[2],
                 "Regex",
                 r"^!|https?://",
-                Id::new("message_search_regex").with(channel.as_str()),
+                search_field_id(channel, "regex"),
                 &mut search.regex,
                 false,
                 true,
@@ -409,6 +336,7 @@ fn show_message_search_contents(
         });
     }
 
+    search.ensure_regex();
     ui.add_space(2.0);
     if let Some(err) = search.regex_error() {
         ui.label(
@@ -419,15 +347,84 @@ fn show_message_search_contents(
     } else {
         ui.label(
             RichText::new(
-                "All filters are combined. Username and keyword ignore case. Use Load older logs to search deeper local history.",
+                "Username and keyword ignore case. Messages must match every active filter.",
             )
             .font(t::small())
-            .color(t::text_muted()),
+            .color(t::text_secondary()),
         );
     }
 }
 
-fn stat_pill(ui: &mut Ui, text: String) {
+fn show_message_search_header(
+    ui: &mut Ui,
+    search: &mut MessageSearchState,
+    stats: SearchMatchStats,
+    compact: bool,
+    detached: bool,
+) {
+    let title = RichText::new("Search chat history").font(t::body()).strong().color(t::text_primary());
+    let stat_text = if search.active_filter_count() == 0 {
+        format!("{} / {}", stats.matched, stats.total)
+    } else {
+        format!("{} / {} • {} filters", stats.matched, stats.total, search.active_filter_count())
+    };
+    let text_width = |text: RichText| {
+        egui::WidgetText::from(text).into_galley(ui, Some(egui::TextWrapMode::Extend),
+            f32::INFINITY, egui::FontSelection::Default).size().x.ceil()
+    };
+    let button_width = |label: &str| {
+        (text_width(RichText::new(label).font(t::small())) + 2.0 * ui.spacing().button_padding.x)
+            .max(ui.spacing().interact_size.x)
+    };
+    let close_width = if detached { 0.0 } else { button_width("Close") };
+    let load_label = if search.local_history_exhausted { "No older logs" } else { "Load older logs" };
+    let gap = ui.spacing().item_spacing.x;
+    let actions_width = text_width(RichText::new(&stat_text).font(t::tiny())) + 14.0
+        + button_width("Clear") + button_width(load_label) + close_width
+        + gap * if detached { 2.0 } else { 3.0 };
+    let wrap_actions = compact || text_width(title.clone()) + gap + actions_width > ui.available_width();
+    let reserved_width = if wrap_actions { close_width } else { actions_width };
+    let title_width = (ui.available_width() - reserved_width
+        - if reserved_width > 0.0 { gap } else { 0.0 }).max(0.0);
+
+    ui.horizontal(|ui| {
+        // Reserve the action strip before laying out the title. Measuring only
+        // text avoids a hidden sizing pass that could disturb an active field.
+        ui.allocate_ui_with_layout(egui::vec2(title_width, ui.spacing().interact_size.y),
+            Layout::left_to_right(Align::Center), |ui| {
+                ui.set_min_width(title_width);
+                ui.add(egui::Label::new(title).truncate());
+            });
+        if !wrap_actions {
+            show_message_search_actions(ui, search, &stat_text);
+        }
+        if !detached && ui.add(Button::new(RichText::new("Close").font(t::small())))
+            .on_hover_text("Close search (Esc)").clicked()
+        {
+            search.close();
+        }
+    });
+    if wrap_actions {
+        ui.horizontal_wrapped(|ui| show_message_search_actions(ui, search, &stat_text));
+    }
+}
+
+fn show_message_search_actions(ui: &mut Ui, search: &mut MessageSearchState, stat_text: &str) {
+    stat_pill(ui, stat_text);
+    if ui.add(Button::new(RichText::new("Clear").font(t::small())))
+        .on_hover_text("Clear all filters").clicked()
+    {
+        search.clear_filters();
+    }
+    if ui.add_enabled(!search.local_history_exhausted, Button::new(
+        RichText::new(if search.local_history_exhausted { "No older logs" } else { "Load older logs" }).font(t::small()),
+    )).on_hover_text("Search earlier messages saved on this computer").clicked()
+    {
+        search.request_load_more_local();
+    }
+}
+
+fn stat_pill(ui: &mut Ui, text: &str) {
     Frame::new()
         .fill(t::bg_surface())
         .corner_radius(t::RADIUS_SM)
@@ -473,6 +470,10 @@ fn search_field(
     });
 }
 
+fn search_field_id(channel: &ChannelId, key: &str) -> Id {
+    Id::new("message_search_field").with(channel.as_str()).with(key)
+}
+
 fn search_field_row(
     ui: &mut Ui,
     channel: &ChannelId,
@@ -483,25 +484,148 @@ fn search_field_row(
     request_focus: bool,
     code_editor: bool,
 ) {
-    ui.label(
-        RichText::new(label)
-            .font(t::small())
-            .color(t::text_secondary()),
-    );
-    let id = Id::new("message_search_row")
-        .with(channel.as_str())
-        .with(key);
-    let mut edit = egui::TextEdit::singleline(value)
-        .id(id)
-        .hint_text(hint)
-        .margin(egui::Margin::symmetric(6, 5))
-        .desired_width(f32::INFINITY);
-    if code_editor {
-        edit = edit.code_editor();
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [SEARCH_LABEL_WIDTH, 28.0],
+            egui::Label::new(RichText::new(label).font(t::small()).color(t::text_secondary())),
+        );
+        let id = search_field_id(channel, key);
+        let mut edit = egui::TextEdit::singleline(value)
+            .id(id)
+            .hint_text(hint)
+            .margin(egui::Margin::symmetric(6, 5))
+            .desired_width(f32::INFINITY);
+        if code_editor {
+            edit = edit.code_editor();
+        }
+        let response = ui.add_sized([ui.available_width(), 28.0], edit);
+        if request_focus {
+            response.request_focus();
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(ctx: &Context, search: &mut MessageSearchState, width: f32, events: Vec<egui::Event>) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 600.0))),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            CentralPanel::default().show(ctx, |ui| {
+                show_message_search_contents(ui, &ChannelId::new("rustlang"), &VecDeque::new(), search, false, false);
+            });
+        });
     }
-    let response = ui.add_sized([ui.available_width(), 28.0], edit);
-    if request_focus {
-        response.request_focus();
+
+    #[test]
+    fn closing_search_disables_filters_and_reopening_restores_them() {
+        let mut search = MessageSearchState::default();
+        search.request_open();
+        search.keyword = "needle".to_owned();
+        assert!(search.is_filtering());
+        search.close();
+        assert!(!search.is_filtering());
+        assert_eq!(search.keyword, "needle");
+        search.request_open();
+        assert!(search.is_filtering());
     }
-    ui.end_row();
+
+    #[test]
+    fn search_header_controls_remain_visible_and_do_not_overlap_at_narrow_widths() {
+        fn collect_text(shape: &egui::epaint::Shape, clip: egui::Rect,
+            text: &mut Vec<(String, egui::Rect, egui::Rect)>) {
+            match shape {
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes { collect_text(shape, clip, text); }
+                }
+                egui::epaint::Shape::Text(shape) => text.push((shape.galley.text().to_owned(),
+                    egui::Rect::from_min_size(shape.pos, shape.galley.size()), clip)),
+                _ => {}
+            }
+        }
+
+        for width in [360.0, 480.0, 640.0] {
+            for pixels_per_point in [1.0, 1.875] {
+                let ctx = Context::default();
+                let mut search = MessageSearchState::default();
+                search.request_open();
+                search.username = "viewer".into();
+                search.keyword = "sample".into();
+                search.regex = "offline|Preview".into();
+                let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 600.0));
+                let mut input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+                // Supply monitor scaling as viewport input. Changing zoom before
+                // the first pass would rescale egui's default 10,000-point screen
+                // and override this test's requested logical window size.
+                input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap().native_pixels_per_point = Some(pixels_per_point);
+                let output = ctx.run(input, |ctx| {
+                    CentralPanel::default().show(ctx, |ui| {
+                        show_message_search_inline(ui, &ChannelId::new("rustlang"), &VecDeque::new(), &mut search);
+                    });
+                });
+                assert_eq!(ctx.input(|input| input.screen_rect), screen);
+                assert_eq!(ctx.pixels_per_point(), pixels_per_point);
+                let mut text = Vec::new();
+                for shape in &output.shapes { collect_text(&shape.shape, shape.clip_rect, &mut text); }
+                let fields_top = text.iter().find(|(text, _, _)| text == "Username").unwrap().1.top();
+                let mut header: Vec<_> = text.into_iter().filter(|(_, rect, _)| rect.bottom() < fields_top).collect();
+                for expected in ["Search chat history", "Close", "Clear", "Load older logs", "0 / 0 • 3 filters"] {
+                    assert!(header.iter().any(|(text, _, _)| text == expected), "missing {expected} at {width}px");
+                }
+                for (text, rect, clip) in &mut header {
+                    assert!(clip.expand(0.5).contains_rect(*rect), "clipped {text} at {width}px: {rect:?} in {clip:?}");
+                    let padding = if matches!(text.as_str(), "Close" | "Clear" | "Load older logs") {
+                        ctx.style().spacing.button_padding
+                    } else if text.contains("filters") {
+                        egui::vec2(6.0, 3.0)
+                    } else {
+                        egui::Vec2::ZERO
+                    };
+                    *rect = rect.expand2(padding);
+                    assert!(screen.contains_rect(*rect), "header overflow at {width}px: {text} {rect:?}");
+                }
+                for (index, (text, rect, _)) in header.iter().enumerate() {
+                    for (other, other_rect, _) in &header[index + 1..] {
+                        assert!(!rect.intersects(*other_rect),
+                            "overlapping header at {width}px/{pixels_per_point}x: {text} {rect:?} and {other} {other_rect:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn search_fields_keep_focus_while_typing_and_resizing() {
+        let ctx = Context::default();
+        let channel = ChannelId::new("rustlang");
+        let mut search = MessageSearchState::default();
+        search.request_open();
+        frame(&ctx, &mut search, 1000.0, Vec::new());
+        assert!(ctx.memory(|m| m.has_focus(search_field_id(&channel, "keyword"))));
+
+        for (key, first, second) in [("username", "alice", "bob"), ("regex", "^test", "$" )] {
+            ctx.memory_mut(|m| m.request_focus(search_field_id(&channel, key)));
+            frame(&ctx, &mut search, 1000.0, vec![egui::Event::Text(first.to_owned())]);
+            assert!(ctx.memory(|m| m.has_focus(search_field_id(&channel, key))),
+                "focus lost before resize in {key}: {:?}; values = {:?}, {:?}, {:?}",
+                ctx.memory(|m| m.focused()), search.username, search.keyword, search.regex);
+            frame(&ctx, &mut search, 420.0, vec![egui::Event::Text(second.to_owned())]);
+            assert!(ctx.memory(|m| m.has_focus(search_field_id(&channel, key))),
+                "focus lost after resize in {key}: {:?}; values = {:?}, {:?}, {:?}",
+                ctx.memory(|m| m.focused()), search.username, search.keyword, search.regex);
+        }
+        assert_eq!(search.username, "alicebob");
+        assert_eq!(search.regex, "^test$");
+        assert!(search.keyword.is_empty());
+        assert_eq!(search.compiled_pattern, "^test$");
+
+        search.clear_filters();
+        frame(&ctx, &mut search, 420.0, Vec::new());
+        assert!(ctx.memory(|m| m.has_focus(search_field_id(&channel, "keyword"))));
+    }
 }

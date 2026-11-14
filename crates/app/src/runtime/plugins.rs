@@ -5120,7 +5120,8 @@ fn event_kind(event: &AppEvent) -> Option<PluginEventKind> {
         AppEvent::WhisperReceived { .. } => PluginEventKind::WhisperReceived,
         AppEvent::MessageDeleted { .. } => PluginEventKind::MessageDeleted,
         AppEvent::SystemNotice(_) => PluginEventKind::SystemNotice,
-        AppEvent::Error { .. } | AppEvent::MessageSendRejected { .. } => PluginEventKind::Error,
+        AppEvent::Error { .. } | AppEvent::MessageSendRejected { .. }
+        | AppEvent::WhisperSendFailed { .. } => PluginEventKind::Error,
         AppEvent::AuthenticationPending { .. } => return None,
         AppEvent::HistoryLoaded { .. } => PluginEventKind::HistoryLoaded,
         AppEvent::UserProfileLoaded { .. } => PluginEventKind::UserProfileLoaded,
@@ -5320,6 +5321,8 @@ unsafe fn make_event_table(L: *mut lua_State, event: &AppEvent) -> c_int {
             lua_setfield(L, -2, cstring("message").as_ptr());
         }
         AppEvent::WhisperReceived {
+            owner_user_id,
+            from_user_id,
             from_login,
             from_display_name,
             target_login,
@@ -5329,6 +5332,8 @@ unsafe fn make_event_table(L: *mut lua_State, event: &AppEvent) -> c_int {
             timestamp,
             is_history,
         } => {
+            set_field_string(L, -1, "owner_user_id", owner_user_id);
+            set_field_string(L, -1, "from_user_id", from_user_id);
             set_field_string(L, -1, "from_login", from_login);
             set_field_string(L, -1, "from_display_name", from_display_name);
             set_field_string(L, -1, "target_login", target_login);
@@ -5379,6 +5384,11 @@ unsafe fn make_event_table(L: *mut lua_State, event: &AppEvent) -> c_int {
         AppEvent::Error { context, message } => {
             set_field_string(L, -1, "context", context);
             set_field_string(L, -1, "message", message);
+        }
+        AppEvent::WhisperSendFailed { owner_user_id, message } => {
+            set_field_string(L, -1, "context", "Whisper");
+            set_field_string(L, -1, "message", message);
+            set_field_string(L, -1, "owner_user_id", owner_user_id);
         }
         AppEvent::MessageSendRejected { reason, .. } => {
             // Drafts and reply context stay in the UI's recovery path.
@@ -5807,7 +5817,8 @@ unsafe fn make_event_table(L: *mut lua_State, event: &AppEvent) -> c_int {
         AppEvent::UsercardSettingsUpdated { show_pronouns } => {
             set_field_bool(L, -1, "show_pronouns", *show_pronouns);
         }
-        AppEvent::SelfAvatarLoaded { avatar_url } => {
+        AppEvent::SelfAvatarLoaded { account, avatar_url } => {
+            set_field_string(L, -1, "account", account);
             set_field_string(L, -1, "avatar_url", avatar_url);
         }
         AppEvent::LinkPreviewReady {
@@ -6336,6 +6347,21 @@ mod tests {
             }
         }
         assert!(event_kind(&AppEvent::AuthenticationPending { username: Some("alice".to_owned()) }).is_none());
+    }
+
+    #[test]
+    fn owned_whisper_failures_keep_the_plugin_error_shape() {
+        let _guard = test_scope();
+        let lua = LuaStateGuard::new();
+        let event = AppEvent::WhisperSendFailed {
+            owner_user_id: "123".into(), message: "Could not send whisper to bob: unavailable".into(),
+        };
+        assert_eq!(event_kind(&event), Some(PluginEventKind::Error));
+        let idx = unsafe { make_event_table(lua.ptr(), &event) };
+        assert_eq!(lua_get_string_field(lua.ptr(), idx, "type").as_deref(), Some("Error"));
+        assert_eq!(lua_get_string_field(lua.ptr(), idx, "context").as_deref(), Some("Whisper"));
+        assert_eq!(lua_get_string_field(lua.ptr(), idx, "owner_user_id").as_deref(), Some("123"));
+        assert_eq!(lua_get_string_field(lua.ptr(), idx, "message").as_deref(), Some("Could not send whisper to bob: unavailable"));
     }
 
     #[test]

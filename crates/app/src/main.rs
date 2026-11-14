@@ -29,7 +29,7 @@ use crust_twitch::{
 use crust_ui::CrustApp;
 use crust_uploader::{upload_image as uploader_upload, RawImage, UploaderConfig};
 use seventv::{
-    apply_7tv_cosmetics_to_sender, load_7tv_cosmetics_catalog,
+    apply_7tv_cosmetics_to_sender, complete_7tv_user_profile, load_7tv_cosmetics_catalog,
     resolve_7tv_user_style, SevenTvBadgeMeta, SevenTvCosmeticUpdate, SevenTvPaintMeta,
     SevenTvResolvedStyle, SevenTvUserStyleRaw,
 };
@@ -55,19 +55,22 @@ use runtime::eventsub_notices::{
 };
 use runtime::history::{
     load_local_older_messages, load_local_recent_mentions, load_local_recent_messages,
-    load_local_recent_whispers, load_recent_messages,
+    load_recent_messages, WhisperAccount, WhisperHistory,
 };
 use runtime::link_preview::fetch_link_preview;
+use runtime::live_emotes::LiveEmoteUpdates;
 use runtime::outgoing::{chat_echo_body, complete_whisper_send, twitch_message_error, ChatSendPublisher, OutgoingChat};
 use runtime::plugins::init_plugins;
 use runtime::profiles::{
     fetch_ivr_logs, fetch_self_avatar, fetch_shared_channel_profile, fetch_shared_chat_session,
     fetch_twitch_stream_status, fetch_twitch_user_profile, fetch_user_profile_for_channel,
 };
+use runtime::snapshots::{BadgeRequests, RoomSnapshots};
 use runtime::system_messages::{
     build_sub_text, extract_irc_msg_echo, format_timeout_text, is_twitch_pinned_notice,
     make_custom_message, make_system_message,
 };
+use runtime::twitch_emotes::TwitchEmoteInventory;
 
 mod crash;
 mod runtime;
@@ -85,7 +88,7 @@ const MODERATION_CMD_COOLDOWN: Duration = Duration::from_millis(500);
 const TWITCH_MAX_MESSAGE_CHARS: usize = 500;
 const TWITCH_GQL_URL: &str = "https://gql.twitch.tv/gql";
 const TWITCH_WEB_CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
-const WHISPER_HISTORY_CHANNEL_PREFIX: &str = "whisper:";
+const WHISPER_HISTORY_CHANNEL_PREFIX: &str = "whisper:uid:";
 const APP_INITIAL_INNER_SIZE: [f32; 2] = [1100.0, 700.0];
 const APP_MIN_INNER_SIZE: [f32; 2] = [220.0, 200.0];
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -348,7 +351,11 @@ fn main() -> Result<()> {
         .build()?;
 
     rt.spawn(async move {
+        let mut whisper_account = WhisperAccount::default();
         while let Some(evt) = evt_bridge_rx.recv().await {
+            if !whisper_account.accepts(&evt) {
+                continue;
+            }
             if let Some(host) = plugin_host() {
                 host.dispatch_event(&evt);
             }
@@ -483,13 +490,12 @@ fn main() -> Result<()> {
     // can consume a lot of stack on some libc/OpenSSL combinations.
     {
         let idx = emote_index.clone();
-        let cache = emote_cache.clone();
         let etx = evt_tx.clone();
         let bm = badge_map.clone();
         let token = saved_token.clone();
         rt.block_on(async move {
-            load_global_emotes(&idx, &cache, &etx).await;
-            load_global_badges(&bm, &cache, &etx, token).await;
+            load_global_emotes(&idx, &etx).await;
+            load_global_badges(&bm, token).await;
         });
     }
 
@@ -742,6 +748,7 @@ async fn reducer_loop(
     // Limit concurrent 7TV user-style lookups to avoid overwhelming the API.
     let stv_lookup_sem = Arc::new(tokio::sync::Semaphore::new(20));
     let mut personal_catalog_dirty = false;
+    let (live_emotes, mut live_emote_updates) = LiveEmoteUpdates::spawn(emote_index.clone());
     let mut personal_catalog_tick = tokio::time::interval(Duration::from_millis(250));
     personal_catalog_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -761,7 +768,8 @@ async fn reducer_loop(
     let mut auth_username: Option<String> = None;
     let mut auth_user_id: Option<String> = None;
     let mut auth_scopes: Vec<String> = Vec::new();
-    let mut whisper_history_loaded_for: Option<String> = None;
+    let mut whisper_history = WhisperHistory::default();
+    let mut twitch_inventory = TwitchEmoteInventory::default();
     let mut local_msg_id: u64 = 1_000_000; // offset to avoid collisions with session IDs
     let mut chat_publisher = ChatSendPublisher::default();
                                            // Helix API credentials extracted from the validate response.
@@ -770,6 +778,8 @@ async fn reducer_loop(
     // Room-ids for every joined channel (broadcaster_id used by Helix API).
     let mut channel_room_ids: std::collections::HashMap<ChannelId, String> =
         std::collections::HashMap::new();
+    let mut room_snapshots = RoomSnapshots::default();
+    let mut badge_requests = BadgeRequests::default();
     let mut channel_mod_status: HashMap<ChannelId, bool> = HashMap::new();
     // Cache of Shared Chat source-channel metadata keyed by Twitch room-id.
     // Populated by the channel_room_ids inverse lookup (when the source
@@ -1216,6 +1226,12 @@ async fn reducer_loop(
 
     loop {
         tokio::select! {
+            Some(()) = live_emote_updates.recv() => { personal_catalog_dirty = true; }
+            () = badge_requests.complete_next(), if badge_requests.has_pending() => {}
+            changed = twitch_inventory.complete_next(&emote_index), if twitch_inventory.has_pending() => {
+                if changed { send_emote_catalog(&emote_index, &evt_tx).await; }
+            }
+
             _ = update_check_interval.tick(), if settings.update_checks_enabled && updater::platform_supported() => {
                 if !update_check_inflight {
                     update_check_inflight = true;
@@ -1283,6 +1299,9 @@ async fn reducer_loop(
             Some(tw_evt) = tw_rx.recv() => {
                 match tw_evt {
                     TwitchEvent::Connected => {
+                        room_snapshots.reconnect();
+                        shared_session_last_fetch.clear();
+                        badge_requests.clear();
                         let _ = evt_tx.send(AppEvent::ConnectionStateChanged {
                             state: ConnectionState::Connected,
                         }).await;
@@ -1300,11 +1319,15 @@ async fn reducer_loop(
                         }
                     }
                     TwitchEvent::Disconnected => {
+                        room_snapshots.reconnect();
+                        shared_session_last_fetch.clear();
                         let _ = evt_tx.send(AppEvent::ConnectionStateChanged {
                             state: ConnectionState::Disconnected,
                         }).await;
                     }
                     TwitchEvent::Reconnecting { attempt } => {
+                        room_snapshots.reconnect();
+                        shared_session_last_fetch.clear();
                         let _ = evt_tx.send(AppEvent::ConnectionStateChanged {
                             state: ConnectionState::Reconnecting { attempt },
                         }).await;
@@ -1327,10 +1350,11 @@ async fn reducer_loop(
                         expected_irc_identity = None;
                         auth_username = None;
                         auth_user_id = None;
+                        twitch_inventory.clear();
                         clear_personal_emotes(&emote_index, &evt_tx).await;
                         auth_scopes.clear();
                         helix_client_id = None;
-                        whisper_history_loaded_for = None;
+                        whisper_history.clear();
                         settings.username.clear();
                         settings.oauth_token.clear();
                         if let Some(store) = &settings_store {
@@ -1348,6 +1372,9 @@ async fn reducer_loop(
                         }).await;
                     }
                     TwitchEvent::RoomState { channel, room_id, emote_only, followers_only, slow, subs_only, r9k } => {
+                        if !joined_channels.contains(&channel.0.to_lowercase()) {
+                            continue;
+                        }
                         info!("Got room-id {room_id} for #{channel}");
                         channel_room_ids.insert(channel.clone(), room_id.clone());
                         let _ = eventsub_tx
@@ -1373,43 +1400,35 @@ async fn reducer_loop(
 
                         // Load channel-specific emotes
                         let idx = emote_index.clone();
-                        let cache_clone = emote_cache.clone();
                         let rid = room_id.clone();
                         let ch = channel.clone();
                         let etx = evt_tx.clone();
                         let generation = idx.write().unwrap().begin_channel_load(&ch, &rid, false);
                         if let Some(generation) = generation {
                             tokio::spawn(async move {
-                                load_channel_emotes(&ch, &rid, generation, &idx, &cache_clone, &etx).await;
+                                load_channel_emotes(&ch, &rid, generation, &idx, &etx).await;
                             });
                         }
-                        // Load channel-specific badges
-                        let bm = badge_map.clone();
-                        let etx = evt_tx.clone();
-                        let cache_b = emote_cache.clone();
+                        // Badge retries are independent of history and pinned snapshots.
                         let ch_badge = channel.0.clone();
+                        let badge_room_id = room_id.clone();
                         let badge_token = (!settings.oauth_token.trim().is_empty())
                             .then(|| settings.oauth_token.clone());
-                        tokio::spawn(async move {
-                            load_channel_badges(
-                                &room_id,
-                                &ch_badge,
-                                &bm,
-                                &cache_b,
-                                &etx,
-                                badge_token,
-                            )
-                            .await;
+                        badge_requests.request(&channel, &room_id, false, &badge_map, async move {
+                            load_channel_badges(&badge_room_id, &ch_badge, badge_token).await
                         });
+                        let Some(snapshot) = room_snapshots.begin(&channel, &room_id, &evt_tx) else {
+                            continue;
+                        };
                         // Load persisted local chat history first (SQLite),
                         // then merge remote history on top.
                         if settings.local_log_indexing_enabled {
                             if let Some(store) = chat_logs.clone() {
-                            let ch_local = channel.clone();
-                            let etx_local = evt_tx.clone();
-                            tokio::spawn(async move {
-                                load_local_recent_messages(ch_local, store, etx_local).await;
-                            });
+                                let ch_local = channel.clone();
+                                let etx_local = snapshot.events();
+                                snapshot.spawn(async move {
+                                    load_local_recent_messages(ch_local, store, etx_local).await;
+                                });
                             }
                         }
                         // Load recent chat history
@@ -1417,16 +1436,14 @@ async fn reducer_loop(
                         let uname_hist = auth_username.clone();
                         let idx_hist = emote_index.clone();
                         let bm_hist = badge_map.clone();
-                        let cache_hist = emote_cache.clone();
-                        let etx_hist = evt_tx.clone();
+                        let etx_hist = snapshot.events();
                         let stv_tx_hist = stv_update_tx.clone();
-                        tokio::spawn(async move {
+                        snapshot.spawn(async move {
                             load_recent_messages(
                                 ch_hist.as_str(),
                                 uname_hist.as_deref(),
                                 &idx_hist,
                                 &bm_hist,
-                                &cache_hist,
                                 &etx_hist,
                                 &stv_tx_hist,
                             ).await;
@@ -1435,8 +1452,8 @@ async fn reducer_loop(
                         // Twitch does not always replay moderator-pinned state over IRC
                         // when joining, so we mirror the web client GraphQL query.
                         let ch_pin = channel.clone();
-                        let etx_pin = evt_tx.clone();
-                        tokio::spawn(async move {
+                        let etx_pin = snapshot.events();
+                        snapshot.spawn(async move {
                             fetch_current_twitch_pinned_message(ch_pin, etx_pin).await;
                         });
                         // Kick off an initial Shared Chat session probe. This
@@ -1457,9 +1474,9 @@ async fn reducer_loop(
                                 .cloned()
                                 .unwrap_or_default();
                             let cid_owned = cid.to_owned();
-                            let etx_sc = evt_tx.clone();
                             if !bid.is_empty() {
-                                tokio::spawn(async move {
+                                shared_session_last_fetch.insert(channel.clone(), Instant::now());
+                                snapshot.spawn_shared(move |etx_sc| async move {
                                     fetch_shared_chat_session(
                                         ch_sc, bid, bare, cid_owned, etx_sc,
                                     )
@@ -1468,15 +1485,30 @@ async fn reducer_loop(
                             }
                         }
                     }
-                    TwitchEvent::Authenticated { username, user_id, generation } => {
-                        if !expected_irc_identity.as_ref().is_some_and(|(expected_generation, expected_user)| {
-                            *expected_generation == generation && expected_user == &user_id
-                        }) {
+                    event @ TwitchEvent::Authenticated { .. } => {
+                        let Some((username, user_id)) = authenticated_twitch_account(
+                            &settings.username, expected_irc_identity.as_ref(), event,
+                        ) else {
                             debug!("Ignoring authentication from a replaced IRC session");
                             continue;
-                        }
-                        auth_username = Some(settings.username.clone());
+                        };
+                        let account_changed = auth_user_id.as_deref() != Some(user_id.as_str());
+                        auth_username = Some(username.clone());
                         auth_user_id = Some(user_id.clone());
+                        if account_changed {
+                            badge_requests.clear();
+                            let bm = badge_map.clone();
+                            let token = Some(settings.oauth_token.clone());
+                            tokio::spawn(async move { load_global_badges(&bm, token).await; });
+                            for (channel, room_id) in &channel_room_ids {
+                                let token = Some(settings.oauth_token.clone());
+                                let rid = room_id.clone();
+                                let scope = channel.0.clone();
+                                badge_requests.request(channel, room_id, false, &badge_map, async move {
+                                    load_channel_badges(&rid, &scope, token).await
+                                });
+                            }
+                        }
                         sync_eventsub_auth(
                             &eventsub_tx,
                             &settings,
@@ -1513,27 +1545,18 @@ async fn reducer_loop(
                             user_id: user_id.clone(),
                         }).await;
 
-                        if whisper_history_loaded_for
-                            .as_deref()
-                            != auth_username.as_deref()
-                        {
-                            whisper_history_loaded_for = auth_username.clone();
-                            if settings.local_log_indexing_enabled {
-                                if let Some(store) = chat_logs.clone() {
-                                    let etx_whisper = evt_tx.clone();
-                                    let self_login = auth_username.clone();
-                                    tokio::spawn(async move {
-                                        load_local_recent_whispers(store, self_login, etx_whisper)
-                                            .await;
-                                    });
-                                }
+                        emote_index.write().unwrap().set_account(Some(&user_id));
+                        if settings.local_log_indexing_enabled {
+                            if let (Some(store), Some(login)) = (chat_logs.clone(), auth_username.as_deref()) {
+                                whisper_history.load(store, login, &user_id, &emote_index, evt_tx.clone());
                             }
                         }
 
                         // The shared user response supplies cosmetics and personal emotes.
-                        emote_index.write().unwrap().set_account(Some(&user_id));
                         queue_7tv_user_lookup(&user_id, None, &emote_index, &stv_http_client,
                             &stv_lookup_sem, &stv_update_tx);
+                        personal_catalog_dirty |= twitch_inventory.sync(auth_user_id.as_deref(),
+                            helix_client_id.as_deref(), &settings.oauth_token, &auth_scopes, &emote_index);
                         // Fetch the user's own avatar for the top-bar profile pill.
                         {
                             let login = auth_username.clone().unwrap_or_default().to_lowercase();
@@ -1629,7 +1652,7 @@ async fn reducer_loop(
                                         .get(&msg.channel)
                                         .map(|t| t.elapsed() >= SHARED_SESSION_MIN_INTERVAL)
                                         .unwrap_or(true);
-                                    if stale {
+                                    if let Some(snapshot) = room_snapshots.get_mut(&msg.channel).filter(|_| stale) {
                                         shared_session_last_fetch
                                             .insert(msg.channel.clone(), Instant::now());
                                         let bare = settings
@@ -1639,8 +1662,7 @@ async fn reducer_loop(
                                             .to_owned();
                                         let ch_sc = msg.channel.clone();
                                         let cid_owned = cid.to_owned();
-                                        let etx_sc = evt_tx.clone();
-                                        tokio::spawn(async move {
+                                        snapshot.spawn_shared(move |etx_sc| async move {
                                             fetch_shared_chat_session(
                                                 ch_sc,
                                                 broadcaster_id,
@@ -1785,28 +1807,6 @@ async fn reducer_loop(
                             }
                         }
 
-                        // Queue image fetches for emotes/emoji/badges
-                        // Only fetch the 1x/normal URL eagerly. HD (url_hd)
-                        // is fetched on-demand when the user hovers.
-                        for span in &msg.spans {
-                            let url = match span {
-                                crust_core::Span::Emote { url, .. }
-                                | crust_core::Span::Emoji { url, .. } => Some(url.as_str()),
-                                _ => None,
-                            };
-                            if let Some(url) = url {
-                                image_requests.request(url, &emote_cache, &evt_tx);
-                            }
-                        }
-                        // Queue badge image fetches for the user's own
-                        // badges plus any Shared Chat source-channel badges.
-                        let shared_badges = msg.shared.iter().flat_map(|source| source.badges.iter());
-                        for badge in msg.sender.badges.iter().chain(shared_badges) {
-                            if let Some(url) = &badge.url {
-                                image_requests.request(url, &emote_cache, &evt_tx);
-                            }
-                        }
-
                         let channel = msg.channel.clone();
                         if settings.local_log_indexing_enabled {
                             if let Some(store) = chat_logs.as_ref() {
@@ -1821,6 +1821,8 @@ async fn reducer_loop(
                         }).await;
                     }
                     TwitchEvent::Whisper {
+                        generation,
+                        from_user_id,
                         from_login,
                         from_display_name,
                         target_login,
@@ -1829,35 +1831,29 @@ async fn reducer_loop(
                         is_self,
                         timestamp,
                     } => {
-                        if settings.local_log_indexing_enabled && !is_self {
-                            if let Some(store) = chat_logs.as_ref() {
-                                if let Err(e) = persist_whisper_message(
-                                    store,
-                                    auth_username.as_deref(),
-                                    &from_login,
-                                    &from_display_name,
-                                    &target_login,
-                                    &text,
-                                    &twitch_emotes,
-                                    is_self,
-                                    timestamp,
-                                ) {
-                                    warn!("whisper-history: failed to persist whisper: {e}");
-                                }
-                            }
-                        }
-                        let _ = evt_tx
-                            .send(AppEvent::WhisperReceived {
-                                from_login,
-                                from_display_name,
-                                target_login,
-                                text,
-                                twitch_emotes,
-                                is_self,
-                                timestamp,
-                                is_history: false,
+                        let Some(owner_user_id) = auth_user_id.as_ref().filter(|active| {
+                            expected_irc_identity.as_ref().is_some_and(|(expected_generation, expected_user)| {
+                                *expected_generation == generation && expected_user == *active
                             })
-                            .await;
+                        }).cloned() else { continue; };
+                        let event = AppEvent::WhisperReceived {
+                            owner_user_id,
+                            from_user_id,
+                            from_login,
+                            from_display_name,
+                            target_login,
+                            text,
+                            twitch_emotes,
+                            is_self,
+                            timestamp,
+                            is_history: false,
+                        };
+                        if let Some(event) = runtime::history::prepare_live_whisper(
+                            event, auth_username.as_deref(), auth_user_id.as_deref(), &emote_index,
+                            chat_logs.as_ref().filter(|_| settings.local_log_indexing_enabled),
+                        ) {
+                            let _ = evt_tx.send(event).await;
+                        }
                     }
                     TwitchEvent::MessageDeleted { channel, server_id } => {
                         let _ = evt_tx.send(AppEvent::MessageDeleted { channel, server_id }).await;
@@ -2058,13 +2054,12 @@ async fn reducer_loop(
                         info!("Kick channel {} resolved: chatroom={chatroom_id}, user={user_id}", channel.display_name());
                         // Load Kick-native + 7TV(Kick) emotes once channel info is resolved.
                         let idx = emote_index.clone();
-                        let cache_clone = emote_cache.clone();
                         let etx = evt_tx.clone();
                         let ch = channel.clone();
                         let generation = idx.write().unwrap().begin_channel_load(&ch, &user_id.to_string(), false);
                         if let Some(generation) = generation {
                             tokio::spawn(async move {
-                                load_kick_channel_emotes(&ch, user_id, generation, &idx, &cache_clone, &etx).await;
+                                load_kick_channel_emotes(&ch, user_id, generation, &idx, &etx).await;
                             });
                         }
                     }
@@ -2114,24 +2109,6 @@ async fn reducer_loop(
                                     })
                                 },
                             );
-                        }
-
-                        // Queue image fetches for emotes/emoji
-                        for span in &msg.spans {
-                            let url = match span {
-                                crust_core::Span::Emote { url, .. }
-                                | crust_core::Span::Emoji { url, .. } => Some(url.as_str()),
-                                _ => None,
-                            };
-                            if let Some(url) = url {
-                                image_requests.request(url, &emote_cache, &evt_tx);
-                            }
-                        }
-                        // Queue badge image fetches
-                        for badge in &msg.sender.badges {
-                            if let Some(url) = &badge.url {
-                                image_requests.request(url, &emote_cache, &evt_tx);
-                            }
                         }
 
                         let channel = msg.channel.clone();
@@ -2269,6 +2246,22 @@ async fn reducer_loop(
                             message,
                         }).await;
                     }
+                    GenericIrcEvent::PrivateConversationOpened { channel } => {
+                        if channel.is_irc_query() && joined_channels.insert(channel.0.to_lowercase()) {
+                            emote_index.write().unwrap().open_channel(&channel);
+                            let _ = irc_tx.send(GenericIrcSessionCommand::JoinChannel {
+                                channel: channel.clone(), key: None,
+                            }).await;
+                            let _ = evt_tx.send(AppEvent::ChannelJoined { channel: channel.clone() }).await;
+                            if settings.local_log_indexing_enabled {
+                                if let Some(store) = chat_logs.clone() {
+                                    let events = evt_tx.clone();
+                                    tokio::spawn(load_local_recent_messages(channel, store, events));
+                                }
+                            }
+                            save_channels(&settings_store, &mut settings, &joined_channels);
+                        }
+                    }
                     GenericIrcEvent::ChannelRedirected {
                         server_key: (host, port, tls),
                         old_channel,
@@ -2307,9 +2300,11 @@ async fn reducer_loop(
                         let redirect_msg = make_system_message(
                             local_msg_id,
                             new_id.clone(),
-                            format!(
-                                "Redirected from #{old_channel} to #{new_channel}"
-                            ),
+                            if new_id.is_irc_query() {
+                                format!("{} is now known as {}", old_id.display_name(), new_id.display_name())
+                            } else {
+                                format!("Redirected from #{old_channel} to #{new_channel}")
+                            },
                             Utc::now(),
                             MsgKind::SystemInfo,
                         );
@@ -2386,17 +2381,6 @@ async fn reducer_loop(
                             }
                         }
                         msg.flags.is_mention = has_mention;
-
-                        for span in &msg.spans {
-                            let url = match span {
-                                crust_core::Span::Emote { url, .. }
-                                | crust_core::Span::Emoji { url, .. } => Some(url.as_str()),
-                                _ => None,
-                            };
-                            if let Some(url) = url {
-                                image_requests.request(url, &emote_cache, &evt_tx);
-                            }
-                        }
 
                         let channel = msg.channel.clone();
                         if settings.local_log_indexing_enabled {
@@ -2819,8 +2803,10 @@ async fn reducer_loop(
                                         .await;
                                 }
                                 EventSubNoticeKind::UserWhisperMessage {
+                                    from_user_id,
                                     from_user_login,
                                     from_user_name,
+                                    to_user_id,
                                     to_user_login,
                                     to_user_name: _,
                                     text,
@@ -2831,40 +2817,25 @@ async fn reducer_loop(
                                         .map(str::trim)
                                         .filter(|s| !s.is_empty())
                                         .map(str::to_ascii_lowercase);
-                                    let is_self = local_login
-                                        .as_deref()
-                                        .map(|login| login.eq_ignore_ascii_case(from_user_login))
-                                        .unwrap_or(false);
-                                    if !is_self && settings.local_log_indexing_enabled {
-                                        if let Some(store) = chat_logs.as_ref() {
-                                            if let Err(e) = persist_whisper_message(
-                                                store,
-                                                local_login.as_deref(),
-                                                from_user_login,
-                                                from_user_name,
-                                                to_user_login,
-                                                text,
-                                                &[],
-                                                false,
-                                                Utc::now(),
-                                            ) {
-                                                warn!("whisper-history: failed to persist EventSub whisper: {e}");
-                                            }
-                                        }
+                                    let is_self = auth_user_id.as_deref() == Some(from_user_id.as_str());
+                                    let event = AppEvent::WhisperReceived {
+                                        owner_user_id: if is_self { from_user_id } else { to_user_id }.clone(),
+                                        from_user_id: from_user_id.clone(),
+                                        from_login: from_user_login.clone(),
+                                        from_display_name: from_user_name.clone(),
+                                        target_login: to_user_login.clone(),
+                                        text: text.clone(),
+                                        twitch_emotes: Vec::new(),
+                                        is_self,
+                                        timestamp: Utc::now(),
+                                        is_history: false,
+                                    };
+                                    if let Some(event) = runtime::history::prepare_live_whisper(
+                                        event, local_login.as_deref(), auth_user_id.as_deref(), &emote_index,
+                                        chat_logs.as_ref().filter(|_| settings.local_log_indexing_enabled),
+                                    ) {
+                                        let _ = evt_tx.send(event).await;
                                     }
-
-                                    let _ = evt_tx
-                                        .send(AppEvent::WhisperReceived {
-                                            from_login: from_user_login.clone(),
-                                            from_display_name: from_user_name.clone(),
-                                            target_login: to_user_login.clone(),
-                                            text: text.clone(),
-                                            twitch_emotes: Vec::new(),
-                                            is_self,
-                                            timestamp: Utc::now(),
-                                            is_history: false,
-                                        })
-                                        .await;
                                 }
                                 EventSubNoticeKind::ModerationAction {
                                     action,
@@ -3079,7 +3050,7 @@ async fn reducer_loop(
                                 .send(AppEvent::SenderCosmeticsUpdated {
                                     user_id,
                                     color: resolved.color_hex,
-                                    name_paint: None,
+                                    name_paint: resolved.name_paint,
                                     badge: resolved.badge,
                                     avatar_url: resolved.avatar_url,
                                 })
@@ -3091,11 +3062,9 @@ async fn reducer_loop(
                         generation,
                         profile,
                     } => {
-                        let (style, emotes) = profile.map(|profile| (Some(profile.style), profile.personal_emotes))
-                            .unwrap_or_default();
-                        let update = emote_index.write().unwrap()
-                            .complete_personal_load(&twitch_user_id, generation, emotes);
-                        let Some(update) = update else { continue; };
+                        let Some((update, style)) = complete_7tv_user_profile(
+                            &emote_index, &twitch_user_id, generation, profile,
+                        ) else { continue; };
                         for user_id in update.evicted_users {
                             stv_user_styles_raw.remove(&user_id);
                             stv_user_styles_resolved.remove(&user_id);
@@ -3114,7 +3083,7 @@ async fn reducer_loop(
                                     .send(AppEvent::SenderCosmeticsUpdated {
                                         user_id: twitch_user_id,
                                         color: resolved.color_hex,
-                                        name_paint: None,
+                                        name_paint: resolved.name_paint,
                                         badge: resolved.badge,
                                         avatar_url: resolved.avatar_url,
                                     })
@@ -3139,9 +3108,12 @@ async fn reducer_loop(
                 }
             }
 
-            // Coalesce personal-set arrivals before rebuilding the shared UI catalog.
+            // Coalesce live channel and personal-set changes before publishing the catalog.
             _ = personal_catalog_tick.tick() => {
+                live_emotes.sync(&emote_index);
                 drain_7tv_user_lookups(&emote_index, &stv_http_client, &stv_lookup_sem, &stv_update_tx);
+                personal_catalog_dirty |= twitch_inventory.sync(auth_user_id.as_deref(),
+                    helix_client_id.as_deref(), &settings.oauth_token, &auth_scopes, &emote_index);
                 if personal_catalog_dirty {
                     personal_catalog_dirty = false;
                     send_emote_catalog(&emote_index, &evt_tx).await;
@@ -3167,8 +3139,9 @@ async fn reducer_loop(
                         &mut settings, &mut auth_username, &mut auth_user_id,
                         &mut auth_scopes, &mut helix_client_id, &mut expected_irc_identity,
                     );
+                    twitch_inventory.clear();
                     clear_personal_emotes(&emote_index, &evt_tx).await;
-                    whisper_history_loaded_for = None;
+                    whisper_history.clear();
                     let _ = sess_tx.send(SessionCommand::LogoutAndReconnect).await;
                     clear_account_channel_state(&mut channel_mod_status, &mut self_badges, &mut self_color, &evt_tx).await;
                     let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
@@ -3321,6 +3294,10 @@ async fn reducer_loop(
                         save_channels(&settings_store, &mut settings, &joined_channels);
                     }
                     AppCommand::LeaveChannel { channel } => {
+                        room_snapshots.remove(&channel);
+                        badge_requests.remove(&channel);
+                        shared_session_last_fetch.remove(&channel);
+                        joined_channels.remove(&channel.0.to_lowercase());
                         if channel.is_kick() {
                             info!("Leaving Kick channel {}", channel.display_name());
                             let _ = kick_tx.send(KickSessionCommand::LeaveChannel(channel.clone())).await;
@@ -3341,7 +3318,6 @@ async fn reducer_loop(
                                 .await;
                         }
                         // Persist to settings
-                        joined_channels.remove(&channel.0.to_lowercase());
                         save_channels(&settings_store, &mut settings, &joined_channels);
                     }
                     AppCommand::LoadChannelEmotes { channel_twitch_id } => {
@@ -3349,8 +3325,13 @@ async fn reducer_loop(
                             .find(|(_, room_id)| **room_id == channel_twitch_id)
                             .map(|(channel, _)| channel.clone());
                         let Some(channel) = channel else { continue; };
+                        let rid = channel_twitch_id.clone();
+                        let scope = channel.0.clone();
+                        let token = (!settings.oauth_token.trim().is_empty()).then(|| settings.oauth_token.clone());
+                        badge_requests.request(&channel, &channel_twitch_id, true, &badge_map, async move {
+                            load_channel_badges(&rid, &scope, token).await
+                        });
                         let idx = emote_index.clone();
-                        let cache_clone = emote_cache.clone();
                         let etx = evt_tx.clone();
                         let generation = idx.write().unwrap().begin_channel_load(&channel, &channel_twitch_id, true);
                         let Some(generation) = generation else { continue; };
@@ -3360,7 +3341,6 @@ async fn reducer_loop(
                                 &channel_twitch_id,
                                 generation,
                                 &idx,
-                                &cache_clone,
                                 &etx,
                             )
                             .await;
@@ -3400,10 +3380,11 @@ async fn reducer_loop(
                         }
                         auth_username = None;
                         auth_user_id = None;
+                        twitch_inventory.clear();
                         clear_personal_emotes(&emote_index, &evt_tx).await;
                         auth_scopes.clear();
                         helix_client_id = None;
-                        whisper_history_loaded_for = None;
+                        whisper_history.clear();
                         clear_account_channel_state(&mut channel_mod_status, &mut self_badges, &mut self_color, &evt_tx).await;
                         let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
                         clear_live_feed_auth(&live_feed_tx, &authed_helix).await;
@@ -3456,8 +3437,9 @@ async fn reducer_loop(
                                 &mut settings, &mut auth_username, &mut auth_user_id,
                                 &mut auth_scopes, &mut helix_client_id, &mut expected_irc_identity,
                             );
+                            twitch_inventory.clear();
                             clear_personal_emotes(&emote_index, &evt_tx).await;
-                            whisper_history_loaded_for = None;
+                            whisper_history.clear();
                             clear_account_channel_state(&mut channel_mod_status, &mut self_badges, &mut self_color, &evt_tx).await;
                             let _ = eventsub_tx.send(EventSubCommand::ClearAuth).await;
                             clear_live_feed_auth(&live_feed_tx, &authed_helix).await;
@@ -4405,6 +4387,7 @@ async fn reducer_loop(
                                     let emote_guard = emote_index.read().unwrap();
                                     infer_twitch_emote_positions_from_text(
                                         &emote_guard,
+                                        from_user_id.as_deref().unwrap_or_default(),
                                         &whisper_text,
                                     )
                                 };
@@ -4552,6 +4535,8 @@ async fn reducer_loop(
                             // Tokenize the echo message
                             {
                                 let emote_guard = emote_index.read().unwrap();
+                                echo.twitch_emotes = infer_twitch_emote_positions_from_text(
+                                    &emote_guard, &echo.sender.user_id.0, &echo.raw_text);
                                 echo.spans = crust_core::format::tokenize(
                                     &echo.raw_text,
                                     echo.flags.is_action,
@@ -4568,18 +4553,6 @@ async fn reducer_loop(
                                         })
                                     },
                                 );
-                            }
-
-                            // Queue image fetches for emotes in the echo
-                            for span in &echo.spans {
-                                let url = match span {
-                                    crust_core::Span::Emote { url, .. }
-                                    | crust_core::Span::Emoji { url, .. } => Some(url.as_str()),
-                                    _ => None,
-                                };
-                                if let Some(url) = url {
-                                    image_requests.request(url, &emote_cache, &evt_tx);
-                                }
                             }
 
                             let draft = OutgoingChat {
@@ -4602,7 +4575,7 @@ async fn reducer_loop(
                                 .filter(|(command, body)| command.eq_ignore_ascii_case("/me") && !body.trim().is_empty())
                                 .map(|(_, body)| body.trim_start());
                             let irc_echo = if channel.is_irc_server_tab() {
-                                // From the server tab, only echo /msg or /privmsg targeting a channel.
+                                // Explicit messages from the server tab use their own conversation.
                                 extract_irc_msg_echo(&text, &channel)
                             } else if !text.trim_start().starts_with('/')
                                 && !is_raw_irc_protocol_line(&text)
@@ -4612,7 +4585,7 @@ async fn reducer_loop(
                             } else if let Some(body) = action_body {
                                 Some((channel.clone(), format!("\u{0001}ACTION {body}\u{0001}")))
                             } else {
-                                // Check for /msg or /privmsg targeting a channel.
+                                // Explicit messages can target another room or a private conversation.
                                 extract_irc_msg_echo(&text, &channel)
                             };
                             if let Some((echo_channel, echo_text)) = irc_echo {
@@ -4678,17 +4651,6 @@ async fn reducer_loop(
                                     );
                                 }
 
-                                for span in &echo.spans {
-                                    let url = match span {
-                                        crust_core::Span::Emote { url, .. }
-                                        | crust_core::Span::Emoji { url, .. } => Some(url.as_str()),
-                                        _ => None,
-                                    };
-                                    if let Some(url) = url {
-                                        image_requests.request(url, &emote_cache, &evt_tx);
-                                    }
-                                }
-
                                 outgoing_echo = Some(echo);
                             }
                             let draft = OutgoingChat {
@@ -4709,7 +4671,8 @@ async fn reducer_loop(
                         let whisper_text = text.trim().to_owned();
                         let whisper_twitch_emotes = {
                             let emote_guard = emote_index.read().unwrap();
-                            infer_twitch_emote_positions_from_text(&emote_guard, &whisper_text)
+                            infer_twitch_emote_positions_from_text(&emote_guard,
+                                from_user_id.as_deref().unwrap_or_default(), &whisper_text)
                         };
                         let whisper_log_store = if settings.local_log_indexing_enabled {
                             chat_logs.clone()
@@ -5941,8 +5904,9 @@ async fn reducer_loop(
                             expected_irc_identity = Some((request.id, info.user_id.clone()));
                             auth_username = None;
                             auth_user_id = None;
+                            twitch_inventory.clear();
                             clear_personal_emotes(&emote_index, &evt_tx).await;
-                            whisper_history_loaded_for = None;
+                            whisper_history.clear();
                             clear_account_channel_state(
                                 &mut channel_mod_status,
                                 &mut self_badges,
@@ -5956,6 +5920,7 @@ async fn reducer_loop(
                         // transition must not retain the previous client's scopes.
                         auth_scopes = info.scopes;
                         helix_client_id = Some(info.client_id);
+                        twitch_inventory.clear();
 
                         if refresh_only {
                             sync_eventsub_auth(
@@ -5997,10 +5962,11 @@ async fn reducer_loop(
                             expected_irc_identity = None;
                             auth_username = None;
                             auth_user_id = None;
+                            twitch_inventory.clear();
                             clear_personal_emotes(&emote_index, &evt_tx).await;
                             auth_scopes.clear();
                             helix_client_id = None;
-                            whisper_history_loaded_for = None;
+                            whisper_history.clear();
                             clear_account_channel_state(
                                 &mut channel_mod_status,
                                 &mut self_badges,
@@ -6046,6 +6012,23 @@ async fn reducer_loop(
     }
 
     info!("Reducer loop exiting");
+}
+
+fn authenticated_twitch_account(
+    validated_login: &str,
+    expected_identity: Option<&(u64, String)>,
+    event: TwitchEvent,
+) -> Option<(String, String)> {
+    let TwitchEvent::Authenticated { user_id, generation, .. } = event else {
+        return None;
+    };
+    let (expected_generation, expected_user_id) = expected_identity?;
+    if *expected_generation != generation || expected_user_id != &user_id {
+        return None;
+    }
+    // GLOBALUSERSTATE supplies a display name, which can be localized. Account
+    // routing and whisper ownership need the login from token validation.
+    Some((validated_login.to_owned(), user_id))
 }
 
 async fn clear_account_channel_state(
@@ -7413,25 +7396,31 @@ fn normalize_whisper_login(login: &str) -> Option<String> {
     Some(login)
 }
 
-fn whisper_thread_channel_id(partner_login: &str) -> ChannelId {
-    ChannelId(format!("{WHISPER_HISTORY_CHANNEL_PREFIX}{partner_login}"))
+fn normalize_whisper_user_id(user_id: &str) -> Option<&str> {
+    let user_id = user_id.trim();
+    (!user_id.is_empty() && user_id.bytes().all(|byte| byte.is_ascii_digit())).then_some(user_id)
+}
+
+fn whisper_thread_channel_id(owner_user_id: &str, partner_login: &str) -> ChannelId {
+    ChannelId(format!("{WHISPER_HISTORY_CHANNEL_PREFIX}{owner_user_id}:{partner_login}"))
 }
 
 fn infer_twitch_emote_positions_from_text(
     idx: &runtime::emote_registry::EmoteRegistry,
+    sender_user_id: &str,
     text: &str,
 ) -> Vec<TwitchEmotePos> {
     let mut out = Vec::new();
     let mut cursor_chars = 0usize;
 
-    for word in text.split_inclusive(' ') {
+    for word in text.split_inclusive(char::is_whitespace) {
         let word_char_len = word.chars().count();
         let trimmed = word.trim();
         if !trimmed.is_empty() {
             let leading_ws = word.chars().take_while(|c| c.is_whitespace()).count();
             let trimmed_len = trimmed.chars().count();
             if trimmed_len > 0 {
-                if let Some(info) = idx.twitch_global(trimmed) {
+                if let Some(info) = idx.twitch_for_user(sender_user_id, trimmed) {
                     let start = cursor_chars + leading_ws;
                     let end = start + trimmed_len - 1;
                     out.push(TwitchEmotePos {
@@ -7451,26 +7440,31 @@ fn infer_twitch_emote_positions_from_text(
 fn persist_whisper_message(
     log_store: &LogStore,
     local_login: Option<&str>,
-    from_login: &str,
-    from_display_name: &str,
-    target_login: &str,
-    text: &str,
-    twitch_emotes: &[TwitchEmotePos],
-    is_self: bool,
-    timestamp: chrono::DateTime<Utc>,
+    local_user_id: Option<&str>,
+    event: &AppEvent,
 ) -> Result<(), crust_storage::StorageError> {
+    let AppEvent::WhisperReceived {
+        owner_user_id, from_user_id, from_login, from_display_name, target_login,
+        text, twitch_emotes, is_self, timestamp, is_history,
+    } = event else { return Ok(()); };
+    let Some(local_user_id) = local_user_id.and_then(normalize_whisper_user_id) else {
+        return Ok(());
+    };
+    if *is_history || normalize_whisper_user_id(owner_user_id) != Some(local_user_id)
+        || (*is_self && normalize_whisper_user_id(from_user_id) != Some(local_user_id))
+    {
+        return Ok(());
+    }
     let from_login = normalize_whisper_login(from_login);
     let target_login = normalize_whisper_login(target_login);
-    let local_login = local_login.and_then(normalize_whisper_login);
-
-    let partner_login = if is_self {
-        target_login
-            .clone()
-            .or_else(|| from_login.clone())
-            .or(local_login)
-    } else {
-        from_login.clone().or(target_login.clone()).or(local_login)
+    let Some(local_login) = local_login.and_then(normalize_whisper_login) else {
+        return Ok(());
     };
+    let owner_login = if *is_self { from_login.as_ref() } else { target_login.as_ref() };
+    if owner_login != Some(&local_login) {
+        return Ok(());
+    }
+    let partner_login = if *is_self { target_login } else { from_login.clone() };
     let Some(partner_login) = partner_login else {
         return Ok(());
     };
@@ -7485,10 +7479,10 @@ fn persist_whisper_message(
     let msg = ChatMessage {
         id: MessageId(0),
         server_id: None,
-        timestamp,
-        channel: whisper_thread_channel_id(&partner_login),
+        timestamp: *timestamp,
+        channel: whisper_thread_channel_id(local_user_id, &partner_login),
         sender: Sender {
-            user_id: UserId(sender_login.clone()),
+            user_id: UserId(normalize_whisper_user_id(from_user_id).unwrap_or_default().to_owned()),
             login: sender_login,
             display_name: sender_display_name,
             original_display_name: None,
@@ -7505,7 +7499,7 @@ fn persist_whisper_message(
             is_deleted: false,
             is_first_msg: false,
             is_pinned: false,
-            is_self,
+            is_self: *is_self,
             is_mention: false,
             custom_reward_id: None,
             is_history: false,
@@ -7575,20 +7569,7 @@ async fn helix_send_whisper(
     evt_tx: mpsc::Sender<AppEvent>,
 ) {
     info!("Whisper send requested to {}", target_login.trim());
-    let cid = match client_id {
-        Some(cid) => cid,
-        None => {
-            let _ = evt_tx
-                .send(AppEvent::Error {
-                    context: "Whisper".into(),
-                    message: "Missing Twitch Client-ID.".into(),
-                })
-                .await;
-            return;
-        }
-    };
-
-    let sender_id = match from_user_id.map(str::trim).filter(|s| !s.is_empty()) {
+    let sender_id = match from_user_id.and_then(normalize_whisper_user_id) {
         Some(id) => id,
         None => {
             let _ = evt_tx
@@ -7601,11 +7582,24 @@ async fn helix_send_whisper(
         }
     };
 
+    let cid = match client_id {
+        Some(cid) => cid,
+        None => {
+            let _ = evt_tx
+                .send(AppEvent::WhisperSendFailed {
+                    owner_user_id: sender_id.to_owned(),
+                    message: "Missing Twitch Client-ID.".into(),
+                })
+                .await;
+            return;
+        }
+    };
+
     let bare = token.strip_prefix("oauth:").unwrap_or(token);
     if bare.trim().is_empty() {
         let _ = evt_tx
-            .send(AppEvent::Error {
-                context: "Whisper".into(),
+            .send(AppEvent::WhisperSendFailed {
+                owner_user_id: sender_id.to_owned(),
                 message: "You must be logged in to send whispers.".into(),
             })
             .await;
@@ -7618,8 +7612,8 @@ async fn helix_send_whisper(
         .to_ascii_lowercase();
     if login.is_empty() {
         let _ = evt_tx
-            .send(AppEvent::Error {
-                context: "Whisper".into(),
+            .send(AppEvent::WhisperSendFailed {
+                owner_user_id: sender_id.to_owned(),
                 message: "Usage: /w <user> <message>".into(),
             })
             .await;
@@ -7631,8 +7625,8 @@ async fn helix_send_whisper(
         .unwrap_or(false)
     {
         let _ = evt_tx
-            .send(AppEvent::Error {
-                context: "Whisper".into(),
+            .send(AppEvent::WhisperSendFailed {
+                owner_user_id: sender_id.to_owned(),
                 message: "You cannot whisper yourself.".into(),
             })
             .await;
@@ -7642,8 +7636,8 @@ async fn helix_send_whisper(
     let trimmed_text = text.trim();
     if trimmed_text.is_empty() {
         let _ = evt_tx
-            .send(AppEvent::Error {
-                context: "Whisper".into(),
+            .send(AppEvent::WhisperSendFailed {
+                owner_user_id: sender_id.to_owned(),
                 message: "Whisper message cannot be empty.".into(),
             })
             .await;
@@ -7651,8 +7645,8 @@ async fn helix_send_whisper(
     }
     if trimmed_text.chars().count() > TWITCH_MAX_MESSAGE_CHARS {
         let _ = evt_tx
-            .send(AppEvent::Error {
-                context: "Whisper".into(),
+            .send(AppEvent::WhisperSendFailed {
+                owner_user_id: sender_id.to_owned(),
                 message: format!("Whisper too long (>{TWITCH_MAX_MESSAGE_CHARS} characters)."),
             })
             .await;
@@ -7663,8 +7657,8 @@ async fn helix_send_whisper(
         Ok(id) => id,
         Err(msg) => {
             let _ = evt_tx
-                .send(AppEvent::Error {
-                    context: "Whisper".into(),
+                .send(AppEvent::WhisperSendFailed {
+                    owner_user_id: sender_id.to_owned(),
                     message: msg,
                 })
                 .await;
@@ -7696,8 +7690,8 @@ async fn helix_send_whisper(
         Ok(r) => r,
         Err(e) => {
             let _ = evt_tx
-                .send(AppEvent::Error {
-                    context: "Whisper".into(),
+                .send(AppEvent::WhisperSendFailed {
+                    owner_user_id: sender_id.to_owned(),
                     message: format!("Send whisper request failed: {e}"),
                 })
                 .await;
@@ -7714,6 +7708,7 @@ async fn helix_send_whisper(
     let event = complete_whisper_send(
         status,
         &body_text,
+        sender_id,
         sender_login,
         &login,
         trimmed_text,
@@ -9704,6 +9699,75 @@ mod tests {
     use crate::runtime::system_messages::is_twitch_pinned_notice;
     use crust_core::model::{ChannelId, MsgKind};
     use crust_twitch::eventsub::EventSubNoticeKind;
+
+    #[test]
+    fn localized_irc_display_names_keep_the_validated_login_for_private_events() {
+        use crust_core::AppEvent;
+        use crust_twitch::session::client::TwitchEvent;
+
+        let irc = crust_twitch::parse_line(
+            "@user-id=10;display-name=アリス :tmi.twitch.tv GLOBALUSERSTATE",
+        ).unwrap();
+        let auth_event = |generation| TwitchEvent::Authenticated {
+            username: irc.tags.get("display-name").unwrap().to_owned(),
+            user_id: irc.tags.get("user-id").unwrap().to_owned(),
+            generation,
+        };
+        let expected = (7, "10".to_owned());
+        assert!(super::authenticated_twitch_account("alice", Some(&expected), auth_event(6)).is_none());
+        let (username, user_id) = super::authenticated_twitch_account(
+            "alice", Some(&expected), auth_event(7),
+        ).unwrap();
+        assert_eq!(username, "alice");
+        assert_eq!(user_id, "10");
+
+        let mut bridge = super::WhisperAccount::default();
+        assert!(bridge.accepts(&AppEvent::Authenticated { username, user_id }));
+        for is_history in [false, true] {
+            assert!(bridge.accepts(&AppEvent::WhisperReceived {
+                owner_user_id: "10".into(), from_user_id: "20".into(),
+                from_login: "bob".into(), from_display_name: "Bob".into(),
+                target_login: "alice".into(), text: "hello".into(),
+                twitch_emotes: Vec::new(), is_self: false,
+                timestamp: chrono::Utc::now(), is_history,
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn whisper_validation_failures_keep_the_sending_account_id() {
+        let (events, mut received) = tokio::sync::mpsc::channel(2);
+        for (token, client_id) in [("token", None), ("", Some("client"))] {
+            super::helix_send_whisper(
+                token, client_id, Some("10"), Some("alice"), "bob", "hello",
+                Vec::new(), None, events.clone(),
+            ).await;
+            assert!(matches!(received.try_recv(), Ok(crust_core::AppEvent::WhisperSendFailed { owner_user_id, .. })
+                if owner_user_id == "10"));
+        }
+    }
+
+    #[test]
+    fn outgoing_native_emotes_use_account_inventory_and_unicode_character_positions() {
+        let mut registry = crate::runtime::emote_registry::EmoteRegistry::default();
+        let emote = |id: &str, code: &str| crust_emotes::EmoteInfo {
+            id: id.into(), code: code.into(), provider: "twitch".into(),
+            url_1x: format!("https://static-cdn.jtvnw.net/emoticons/v2/{id}/static/dark/1.0"),
+            url_2x: None, url_4x: None,
+        };
+        registry.replace_global("twitch", vec![emote("global", "Kappa")]);
+        registry.set_account(Some("alice"));
+        let generation = registry.begin_twitch_inventory("alice").unwrap();
+        registry.complete_twitch_inventory("alice", generation,
+            Some(vec![emote("subscription", "SubLove")]));
+        let text = "🙂 SubLove\tKappa";
+        let positions = super::infer_twitch_emote_positions_from_text(&registry, "alice", text);
+        assert_eq!(positions.iter().map(|pos| (pos.id.as_str(), pos.start, pos.end)).collect::<Vec<_>>(),
+            vec![("subscription", 2, 8), ("global", 10, 14)]);
+        assert_eq!(super::infer_twitch_emote_positions_from_text(&registry, "bob", text).len(), 1);
+        registry.set_account(None);
+        assert_eq!(super::infer_twitch_emote_positions_from_text(&registry, "alice", text).len(), 1);
+    }
 
     #[test]
     fn twitch_pinned_notice_detects_multi_line_pin_card_text() {

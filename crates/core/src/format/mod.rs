@@ -45,8 +45,10 @@ where
     for seg in segments {
         match seg {
             Segment::TwitchEmote { id, code } => {
-                let url = twitch_emote_url(&id);
-                let url_hd = Some(twitch_emote_url_hd(&id));
+                let (url, url_hd) = emote_lookup(&code)
+                    .filter(|(known_id, _, _, provider, _)| provider == "twitch" && known_id == &id)
+                    .map(|(_, _, url, _, url_hd)| (url, url_hd))
+                    .unwrap_or_else(|| (twitch_emote_url(&id), Some(twitch_emote_url_hd(&id))));
                 spans.push(Span::Emote {
                     id,
                     code,
@@ -81,7 +83,7 @@ fn split_by_twitch_emotes(chars: &[char], emotes: &[&TwitchEmotePos]) -> Vec<Seg
     let mut cursor: usize = 0;
 
     for e in emotes {
-        if e.start > chars.len() || e.end >= chars.len() {
+        if e.end < e.start || e.start > chars.len() || e.end >= chars.len() {
             continue; // malformed
         }
         // Free text before this emote
@@ -121,7 +123,8 @@ fn tokenize_free_text<F>(
 {
     // Split preserving whitespace so that spaces are kept in output
     for word in text.split_inclusive(' ') {
-        let trimmed = word.trim();
+        let without_leading = word.trim_start();
+        let trimmed = without_leading.trim_end();
         if trimmed.is_empty() {
             // pure whitespace
             out.push(Span::Text {
@@ -130,9 +133,13 @@ fn tokenize_free_text<F>(
             });
             continue;
         }
+        let leading = &word[..word.len() - without_leading.len()];
 
         // Third-party emote?
         if let Some((id, code, url, provider, url_hd)) = emote_lookup(trimmed) {
+            if !leading.is_empty() {
+                out.push(Span::Text { text: leading.to_owned(), is_action });
+            }
             out.push(Span::Emote {
                 id,
                 code,
@@ -141,7 +148,7 @@ fn tokenize_free_text<F>(
                 provider,
             });
             // trailing space
-            let trail = &word[trimmed.len()..];
+            let trail = &without_leading[trimmed.len()..];
             if !trail.is_empty() {
                 out.push(Span::Text {
                     text: trail.to_owned(),
@@ -153,7 +160,10 @@ fn tokenize_free_text<F>(
 
         // URL?
         if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-            let trail = &word[trimmed.len()..];
+            let trail = &without_leading[trimmed.len()..];
+            if !leading.is_empty() {
+                out.push(Span::Text { text: leading.to_owned(), is_action });
+            }
             // Channel-points rewards often ship only a link to a 7TV emote
             // page (e.g. https://7tv.app/emotes/<id>). Render those as the
             // actual emote image inline so the reward is visible, instead
@@ -185,10 +195,13 @@ fn tokenize_free_text<F>(
         if trimmed.starts_with('@') && trimmed.len() > 1 {
             let login = trimmed[1..].trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_');
             if !login.is_empty() {
+                if !leading.is_empty() {
+                    out.push(Span::Text { text: leading.to_owned(), is_action });
+                }
                 out.push(Span::Mention {
                     login: login.to_owned(),
                 });
-                let trail = &word[1 + login.len()..];
+                let trail = &without_leading[1 + login.len()..];
                 if !trail.is_empty() {
                     out.push(Span::Text {
                         text: trail.to_owned(),
@@ -415,6 +428,47 @@ mod tests {
     }
 
     #[test]
+    fn unicode_tokens_keep_leading_and_trailing_whitespace_at_character_boundaries() {
+        let text = "\tÉ \u{2003}https://example.test/é\u{a0} \n@名,\t 😀😙\u{2002}";
+        let spans = tokenize(text, true, &[], &|code| (code == "É").then(|| (
+            "unicode".into(), code.into(), "https://example.test/emote.png".into(),
+            "7tv".into(), None,
+        )));
+        let reconstructed: String = spans.iter().map(|span| match span {
+            Span::Text { text, is_action } => {
+                assert!(*is_action);
+                text.clone()
+            }
+            Span::Emote { code, .. } => code.clone(),
+            Span::Url { text, url } => {
+                assert_eq!(url, "https://example.test/é");
+                text.clone()
+            }
+            Span::Mention { login } => format!("@{login}"),
+            Span::Emoji { text, .. } => text.clone(),
+            other => panic!("unexpected span: {other:?}"),
+        }).collect();
+        assert_eq!(reconstructed, text);
+        assert!(spans.iter().any(|span| matches!(span, Span::Emote { id, .. } if id == "unicode")));
+        assert!(spans.iter().any(|span| matches!(span, Span::Mention { login } if login == "名")));
+        assert_eq!(spans.iter().filter(|span| matches!(span, Span::Emoji { .. })).count(), 2);
+    }
+
+    #[test]
+    fn whitespace_around_native_ranges_and_emote_links_is_preserved() {
+        let positions = [TwitchEmotePos { id: "25".into(), start: 1, end: 5 }];
+        let spans = tokenize("\tKappa\n", false, &positions, &|_| None);
+        assert!(matches!(&spans[0], Span::Text { text, is_action: false } if text == "\t"));
+        assert!(matches!(&spans[1], Span::Emote { id, code, .. } if id == "25" && code == "Kappa"));
+        assert!(matches!(&spans[2], Span::Text { text, is_action: false } if text == "\n"));
+
+        let spans = tokenize("\thttps://7tv.app/emotes/abc123\u{a0}", false, &[], &|_| None);
+        assert!(matches!(&spans[0], Span::Text { text, .. } if text == "\t"));
+        assert!(matches!(&spans[1], Span::Emote { id, provider, .. } if id == "abc123" && provider == "7tv"));
+        assert!(matches!(&spans[2], Span::Text { text, .. } if text == "\u{a0}"));
+    }
+
+    #[test]
     fn twitch_emotes_tag_parse() {
         let tag = "25:0-4,12-16/1902:6-10";
         let positions = parse_twitch_emotes_tag(tag);
@@ -508,6 +562,48 @@ mod tests {
             .filter(|s| matches!(s, Span::Emoji { .. }))
             .count();
         assert_eq!(emoji_count, 2);
+    }
+
+    #[test]
+    fn native_ranges_use_matching_catalog_assets_without_accepting_code_collisions() {
+        let positions = [TwitchEmotePos { id: "native".into(), start: 0, end: 3 }];
+        for (id, provider, expected) in [
+            ("native", "twitch", "https://example.test/animated.gif"),
+            ("other", "twitch", "https://static-cdn.jtvnw.net/emoticons/v2/native/static/dark/1.0"),
+            ("native", "7tv", "https://static-cdn.jtvnw.net/emoticons/v2/native/static/dark/1.0"),
+        ] {
+            let spans = tokenize("Wave", false, &positions, &|_| Some((
+                id.into(), "Wave".into(), "https://example.test/animated.gif".into(),
+                provider.into(), None,
+            )));
+            let Span::Emote { url, id, provider, .. } = &spans[0] else { panic!("expected native emote"); };
+            assert_eq!(url, expected);
+            assert_eq!(id, "native");
+            assert_eq!(provider, "twitch");
+        }
+    }
+
+    #[test]
+    fn reversed_native_ranges_are_ignored_without_changing_valid_unicode_ranges() {
+        for (ranges, expected) in [
+            (vec![(0, 0), (1, 2), (3, 4)], vec!["🙂", "漢字", "ab"]),
+            (vec![(0, 2), (1, 3)], vec!["🙂漢字", "漢字a"]),
+        ] {
+            let mut positions: Vec<TwitchEmotePos> = ranges.into_iter().enumerate()
+                .map(|(id, (start, end))| TwitchEmotePos { id: id.to_string(), start, end })
+                .collect();
+            positions.push(TwitchEmotePos { id: "malformed".into(), start: 4, end: 1 });
+            let spans = tokenize("🙂漢字ab", false, &positions, &|_| None);
+            let codes: Vec<&str> = spans.iter().filter_map(|span| match span {
+                Span::Emote { id, code, provider, .. } => {
+                    assert_ne!(id, "malformed");
+                    assert_eq!(provider, "twitch");
+                    Some(code.as_str())
+                }
+                _ => None,
+            }).collect();
+            assert_eq!(codes, expected);
+        }
     }
 
     #[test]

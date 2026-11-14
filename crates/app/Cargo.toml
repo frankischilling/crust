@@ -42,6 +42,7 @@ libc = { workspace = true }
 base64 = "0.22"
 url = { workspace = true }
 futures-util = { workspace = true }
+tokio-tungstenite = { workspace = true }
 
 # Force wayland-data-control feature onto arboard (transitive via egui-winit)
 arboard = { workspace = true }

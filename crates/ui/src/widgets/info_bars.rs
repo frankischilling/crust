@@ -51,7 +51,9 @@ pub fn show_channel_info_bars(
                         .stroke(egui::Stroke::NONE),
                 )
                 .show(ctx, |ui| {
-                    let prefix = if active_ch.is_kick() || active_ch.is_irc_server_tab() {
+                    let prefix = if active_ch.is_irc_query() {
+                        "@"
+                    } else if active_ch.is_kick() || active_ch.is_irc_server_tab() {
                         ""
                     } else {
                         "#"
@@ -146,7 +148,9 @@ pub fn show_channel_info_bars(
                             None => {
                                 // Not fetched yet - show the channel name only.
                                 let ch_prefix =
-                                    if active_ch.is_kick() || active_ch.is_irc_server_tab() {
+                                    if active_ch.is_irc_query() {
+                                        "@"
+                                    } else if active_ch.is_kick() || active_ch.is_irc_server_tab() {
                                         ""
                                     } else {
                                         "#"
@@ -205,7 +209,9 @@ pub fn show_channel_info_bars(
                                     });
 
                                 let ch_prefix2 =
-                                    if active_ch.is_kick() || active_ch.is_irc_server_tab() {
+                                    if active_ch.is_irc_query() {
+                                        "@"
+                                    } else if active_ch.is_kick() || active_ch.is_irc_server_tab() {
                                         ""
                                     } else {
                                         "#"

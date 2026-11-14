@@ -86,7 +86,8 @@ impl Default for ImageRequests {
 
 impl ImageRequests {
     /// Starts at most one task per URL, including its automatic retries.
-    pub(crate) fn request(
+    #[cfg(test)]
+    fn request(
         &self,
         url: &str,
         cache: &Option<EmoteCache>,
@@ -96,7 +97,7 @@ impl ImageRequests {
     }
 
     /// A visible cache miss must be delivered again after the UI evicts an asset.
-    /// Background prefetches still suppress URLs that completed successfully.
+    /// In-flight requests are shared across widgets displaying the same asset.
     pub(crate) fn request_visible(
         &self,
         url: &str,
@@ -308,13 +309,6 @@ async fn send_image_result(
                 .await;
             false
         }
-    }
-}
-
-/// Avatar/profile lookups use one attempt and skip failed image completions.
-pub(crate) async fn fetch_profile_image(url: &str, evt_tx: &mpsc::Sender<AppEvent>) {
-    if let Ok(image) = fetch_image_once(url, &None, image_download_slots()).await {
-        image.send(url, evt_tx, || {}).await;
     }
 }
 

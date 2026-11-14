@@ -24,11 +24,14 @@ impl std::fmt::Display for Platform {
 /// Internally:
 /// - Kick channels are stored as "kick:<slug>"
 /// - IRC channels are stored as "irc:<tls>:<host>:<port>:<channel>"
+/// - IRC private conversations use "__query__:<nick>" in the channel field
 /// - Twitch channels are stored as the bare lowercase login (no `#` prefix)
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChannelId(pub String);
 
 pub const IRC_SERVER_CONTROL_CHANNEL: &str = "__server__";
+/// A colon cannot appear in an IRC channel name, so queries stay distinct from rooms.
+pub const IRC_QUERY_CHANNEL_PREFIX: &str = "__query__:";
 
 /// Reserved `ChannelId` for the aggregated "Live" pseudo-tab.
 ///
@@ -50,6 +53,15 @@ pub struct IrcTarget {
     pub port: u16,
     pub tls: bool,
     pub channel: String,
+}
+
+impl IrcTarget {
+    /// The other participant when this target is a private conversation.
+    pub fn query_nick(&self) -> Option<&str> {
+        self.channel
+            .strip_prefix(IRC_QUERY_CHANNEL_PREFIX)
+            .filter(|nick| !nick.is_empty())
+    }
 }
 
 impl ChannelId {
@@ -77,6 +89,16 @@ impl ChannelId {
         Self(format!("irc:{tls_flag}:{host}:{port}:{channel}"))
     }
 
+    /// A private IRC conversation, separate from a room with the same name.
+    pub fn irc_query(host: impl Into<String>, port: u16, tls: bool, nick: impl Into<String>) -> Self {
+        Self::irc(
+            host,
+            port,
+            tls,
+            format!("{IRC_QUERY_CHANNEL_PREFIX}{}", nick.into().trim()),
+        )
+    }
+
     pub fn platform(&self) -> Platform {
         if self.0.starts_with("kick:") {
             Platform::Kick
@@ -102,6 +124,8 @@ impl ChannelId {
                 host
             } else {
                 channel
+                    .strip_prefix(IRC_QUERY_CHANNEL_PREFIX)
+                    .unwrap_or(channel)
             }
         } else {
             &self.0
@@ -112,9 +136,13 @@ impl ChannelId {
         &self.0
     }
 
-    /// Returns "#channel" form required by Twitch IRC JOIN / PRIVMSG.
+    /// Return the wire target: "#channel" for rooms or the nickname for a query.
     pub fn irc_name(&self) -> String {
-        format!("#{}", self.display_name())
+        if let Some(nick) = self.irc_query_nick() {
+            nick.to_owned()
+        } else {
+            format!("#{}", self.display_name())
+        }
     }
 
     /// Returns the Kick slug, if this is a Kick channel.
@@ -273,6 +301,22 @@ impl ChannelId {
             .unwrap_or(false)
     }
 
+    /// The other participant when this ID is a private IRC conversation.
+    pub fn irc_query_nick(&self) -> Option<&str> {
+        if !self.is_irc() {
+            return None;
+        }
+        self.0
+            .splitn(5, ':')
+            .nth(4)?
+            .strip_prefix(IRC_QUERY_CHANNEL_PREFIX)
+            .filter(|nick| !nick.is_empty())
+    }
+
+    pub fn is_irc_query(&self) -> bool {
+        self.irc_query_nick().is_some()
+    }
+
     /// Sentinel ChannelId for the Live feed pseudo-tab.
     pub fn live_feed() -> Self {
         Self(LIVE_FEED_CHANNEL.to_owned())
@@ -331,6 +375,27 @@ impl MessageId {
 #[cfg(test)]
 mod live_feed_sentinel_tests {
     use super::*;
+
+    #[test]
+    fn irc_queries_round_trip_without_becoming_channels() {
+        let query = ChannelId::irc_query("Chat.Example", 6697, true, "Alice");
+        let room = ChannelId::irc("chat.example", 6697, true, "alice");
+        assert_ne!(query, room);
+        assert!(query.is_irc() && query.is_irc_query());
+        assert!(!query.is_irc_server_tab());
+        assert_eq!(query.display_name(), "alice");
+        assert_eq!(query.irc_name(), "alice");
+        assert_eq!(query.irc_query_nick(), Some("alice"));
+        let target = query.irc_target().unwrap();
+        assert_eq!(target.query_nick(), Some("alice"));
+        assert_eq!(ChannelId::parse_user_input(query.as_str()), Some(query));
+        assert!(!room.is_irc_query());
+        assert_eq!(room.irc_name(), "#alice");
+        assert_eq!(room.irc_target().unwrap().query_nick(), None);
+        let server = ChannelId::irc("chat.example", 6697, true, IRC_SERVER_CONTROL_CHANNEL);
+        assert_eq!(server.display_name(), "chat.example");
+        assert!(!server.is_irc_query());
+    }
 
     #[test]
     fn local_history_ids_are_stable_and_disjoint_from_other_counters() {

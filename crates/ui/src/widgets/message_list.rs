@@ -37,21 +37,42 @@ pub struct MessageListPerfStats {
     pub height_cache_misses: usize,
 }
 
-/// Discard measurements for messages whose rendered content changed in place.
+#[derive(Clone, Copy)]
+struct MessageListView {
+    pane: u64,
+    last_pass: u64,
+}
+
+fn view_state_id(channel: &ChannelId, pane: Option<u64>, name: &str) -> Id {
+    let id = Id::new(name).with(channel.as_str());
+    pane.map_or(id, |pane| id.with(pane))
+}
+
+/// Discard measurements in each visible pane and mark hidden views for refresh.
 pub fn invalidate_message_layouts(ctx: &egui::Context, channel: &ChannelId, ids: &[MessageId]) {
     if ids.is_empty() {
         return;
     }
-    let heights_key = Id::new("msg_row_h").with(channel.as_str());
-    let dirty_key = Id::new("msg_prefix_dirty").with(channel.as_str());
+    let current_pass = ctx.cumulative_pass_nr();
     ctx.data_mut(|data| {
-        if let Some(mut heights) = data.remove_temp::<HashMap<u64, f32>>(heights_key) {
-            for id in ids {
-                heights.remove(&id.0);
+        let revision_key = Id::new("message_layout_revision").with(channel.as_str());
+        let revision = data.get_temp::<u64>(revision_key).unwrap_or(0).wrapping_add(1);
+        data.insert_temp(revision_key, revision);
+        let views_key = Id::new("message_list_views").with(channel.as_str());
+        let mut views = data.get_temp::<Vec<MessageListView>>(views_key).unwrap_or_default();
+        views.retain(|view| current_pass.saturating_sub(view.last_pass) <= 2);
+        for pane in std::iter::once(None).chain(views.iter().map(|view| Some(view.pane))) {
+            let heights_key = view_state_id(channel, pane, "msg_row_h");
+            if let Some(mut heights) = data.remove_temp::<HashMap<u64, f32>>(heights_key) {
+                for id in ids {
+                    heights.remove(&id.0);
+                }
+                data.insert_temp(heights_key, heights);
             }
-            data.insert_temp(heights_key, heights);
+            data.insert_temp(view_state_id(channel, pane, "msg_prefix_dirty"), true);
+            data.insert_temp(view_state_id(channel, pane, "applied_layout_revision"), revision);
         }
-        data.insert_temp(dirty_key, true);
+        data.insert_temp(views_key, views);
     });
 }
 
@@ -369,8 +390,11 @@ pub struct MessageList<'a> {
     emote_bytes: &'a UiImageCache,
     /// For sending on-demand image-fetch requests (e.g. HD emote on hover).
     cmd_tx: &'a UiCommandSender,
-    /// Channel identifier - used for per-channel scroll state.
+    /// Channel identifier.
     channel: &'a ChannelId,
+    /// Stable pane identity for independent scroll and layout state.
+    pane: Option<u64>,
+    focused: bool,
     /// Cached link previews keyed by URL.
     link_previews: &'a HashMap<String, LinkPreview>,
     /// Optional active search filter for this channel.
@@ -455,6 +479,8 @@ impl<'a> MessageList<'a> {
             emote_bytes,
             cmd_tx,
             channel,
+            pane: None,
+            focused: true,
             link_previews,
             search,
             collapse_long_messages,
@@ -475,6 +501,17 @@ impl<'a> MessageList<'a> {
             channel_live: None,
             channel_watching: false,
         }
+    }
+
+    fn state_id(&self, name: &str) -> Id {
+        view_state_id(self.channel, self.pane, name)
+    }
+
+    /// Give duplicate channel panes independent reading positions and measurements.
+    pub fn with_pane(mut self, pane: u64, focused: bool) -> Self {
+        self.pane = Some(pane);
+        self.focused = focused;
+        self
     }
 
     /// Request scrolling to a specific message id on this frame.
@@ -503,7 +540,25 @@ impl<'a> MessageList<'a> {
     /// * Shows a floating "↓ Resume scrolling" button while paused.
     /// * Returns a [`MessageListResult`] that may contain a reply request.
     pub fn show(&self, ui: &mut Ui) -> MessageListResult {
-        let reply_key = Id::new("ml_reply_req").with(self.channel.as_str());
+        let current_pass = ui.ctx().cumulative_pass_nr();
+        let missed_layout_update = ui.ctx().data_mut(|data| {
+            if let Some(pane) = self.pane {
+                let key = Id::new("message_list_views").with(self.channel.as_str());
+                let mut views = data.get_temp::<Vec<MessageListView>>(key).unwrap_or_default();
+                views.retain(|view| view.pane != pane && current_pass.saturating_sub(view.last_pass) <= 2);
+                views.push(MessageListView { pane, last_pass: current_pass });
+                if views.len() > 4 {
+                    views.remove(0);
+                }
+                data.insert_temp(key, views);
+            }
+            let revision = data.get_temp::<u64>(Id::new("message_layout_revision").with(self.channel.as_str())).unwrap_or(0);
+            let key = self.state_id("applied_layout_revision");
+            let changed = data.get_temp::<u64>(key).unwrap_or(0) != revision;
+            data.insert_temp(key, revision);
+            changed
+        });
+        let reply_key = self.state_id("ml_reply_req");
         let user_color_cache_key = Id::new("ml_user_color_cache").with(self.channel.as_str());
         // PERF: remove_temp transfers ownership so we don't clone the entire
         // HashMap every frame.  The cache is re-inserted at the end of show().
@@ -577,9 +632,9 @@ impl<'a> MessageList<'a> {
         };
         let live_visible_count = live_visible_indices.len();
         // Use a per-channel scroll area ID so offset doesn't leak
-        let scroll_id = egui::Id::new("message_list").with(self.channel.as_str());
-        let paused_key = egui::Id::new("scroll_paused").with(self.channel.as_str());
-        let paused_snapshot_key = egui::Id::new("paused_snapshot_ids").with(self.channel.as_str());
+        let scroll_id = self.state_id("message_list");
+        let paused_key = self.state_id("scroll_paused");
+        let paused_snapshot_key = self.state_id("paused_snapshot_ids");
 
         // "Force snap" signal from the app layer: set whenever the user
         // explicitly activates this channel (tab click, keyboard nav,
@@ -592,7 +647,7 @@ impl<'a> MessageList<'a> {
         let force_snap_key = egui::Id::new("ml_force_snap").with(self.channel.as_str());
         let force_snap: bool = ui
             .ctx()
-            .data_mut(|d| d.remove_temp(force_snap_key).unwrap_or(false));
+            .data_mut(|d| self.focused && d.remove_temp(force_snap_key).unwrap_or(false));
         if force_snap {
             ui.ctx().data_mut(|d| {
                 d.insert_temp(paused_key, false);
@@ -607,7 +662,7 @@ impl<'a> MessageList<'a> {
         // Paused snapshot behavior:
         // freeze the rendered message-id set while paused so incoming chat does
         // not keep shifting the lines the user is reading.
-        let paused_index_key = Id::new("paused_snapshot_indices").with(self.channel.as_str());
+        let paused_index_key = self.state_id("paused_snapshot_indices");
         let (mut snapshot_ids, mut paused_indices): (Vec<u64>, PausedIndexCache) = ui.ctx().data_mut(|data| {
             (data.remove_temp(paused_snapshot_key).unwrap_or_default(),
              data.remove_temp(paused_index_key).unwrap_or_default())
@@ -641,7 +696,7 @@ impl<'a> MessageList<'a> {
             && ui.input(|input| input.raw_scroll_delta.y.abs() > 0.0);
         // Store whether the wheel was used this frame, so show_resume_button
         // doesn't immediately clear the paused flag before the delta is applied.
-        let wheel_key = egui::Id::new("scroll_wheel_this_frame").with(self.channel.as_str());
+        let wheel_key = self.state_id("scroll_wheel_this_frame");
         // Batch two temp writes into one data_mut call.
         ui.ctx().data_mut(|d| {
             d.insert_temp(wheel_key, wheel_over_panel);
@@ -655,7 +710,7 @@ impl<'a> MessageList<'a> {
         // (re-)enter a channel whose old state carried a large offset,
         // the first frame would render content at the wrong position.
         // Detect "first render" via a temp flag and force offset to 0.
-        let init_key = egui::Id::new("msg_list_init").with(self.channel.as_str());
+        let init_key = self.state_id("msg_list_init");
         let first_render = !ui.ctx().data_mut(|d| {
             let seen: bool = d.get_temp(init_key).unwrap_or(false);
             if !seen {
@@ -675,7 +730,7 @@ impl<'a> MessageList<'a> {
         // pass: that's the signal that the user just made this channel
         // active again, and (if they weren't intentionally scrolled up
         // when they last left) we should re-snap to the bottom.
-        let last_pass_key = egui::Id::new("ml_last_pass").with(self.channel.as_str());
+        let last_pass_key = self.state_id("ml_last_pass");
         let current_pass = ui.ctx().cumulative_pass_nr();
         let last_pass: u64 = ui
             .ctx()
@@ -711,12 +766,12 @@ impl<'a> MessageList<'a> {
         // PERF: use remove_temp (ownership via mem::take) instead of get_temp
         // (which clones the entire HashMap every frame).  The cache is put
         // back via insert_temp at the end of each path.
-        let hc_id = egui::Id::new("msg_row_h").with(self.channel.as_str());
+        let hc_id = self.state_id("msg_row_h");
         let mut height_cache: std::collections::HashMap<u64, f32> = ui
             .ctx()
             .data_mut(|d| d.remove_temp(hc_id).unwrap_or_default());
 
-        let layout_key = egui::Id::new("msg_row_layout").with(self.channel.as_str());
+        let layout_key = self.state_id("msg_row_layout");
         let layout = RowLayoutKey {
             width: ui.available_width(),
             pixels_per_point: ui.ctx().pixels_per_point(),
@@ -744,7 +799,7 @@ impl<'a> MessageList<'a> {
                 d.insert_temp(layout_key, layout);
             }
             changed
-        });
+        }) || missed_layout_update;
         if layout_changed {
             height_cache.clear();
         }
@@ -762,12 +817,12 @@ impl<'a> MessageList<'a> {
         // Scroll-to-reply target
         // Written by the reply-header click handler; read and cleared here so
         // it only fires once.
-        let scroll_to_key = egui::Id::new("ml_scroll_to").with(self.channel.as_str());
-        let scroll_hint_key = egui::Id::new("ml_scroll_hint").with(self.channel.as_str());
-        let highlight_key = egui::Id::new("ml_highlight_msg").with(self.channel.as_str());
-        let highlight_time_key = egui::Id::new("ml_highlight_t").with(self.channel.as_str());
-        let hot_state_key = egui::Id::new("ml_hot_window").with(self.channel.as_str());
-        let anchor_key = egui::Id::new("ml_scroll_anchor").with(self.channel.as_str());
+        let scroll_to_key = self.state_id("ml_scroll_to");
+        let scroll_hint_key = self.state_id("ml_scroll_hint");
+        let highlight_key = self.state_id("ml_highlight_msg");
+        let highlight_time_key = self.state_id("ml_highlight_t");
+        let hot_state_key = self.state_id("ml_hot_window");
+        let anchor_key = self.state_id("ml_scroll_anchor");
         let scroll_target_pending = ui.ctx().data_mut(|d| {
             d.get_temp::<String>(scroll_to_key).is_some()
                 || d.get_temp::<ReplyScrollHint>(scroll_hint_key).is_some()
@@ -819,7 +874,7 @@ impl<'a> MessageList<'a> {
             !paused_before_show,
             hot_state.active_rows,
         );
-        let active_ids_key = egui::Id::new("msg_active_ids").with(self.channel.as_str());
+        let active_ids_key = self.state_id("msg_active_ids");
         let mut active_ids: Vec<u64> = ui
             .ctx()
             .data_mut(|d| d.remove_temp(active_ids_key).unwrap_or_default());
@@ -972,7 +1027,7 @@ impl<'a> MessageList<'a> {
                 // into a keep-rewriting loop for any frames where new
                 // content arrives before stick_to_bottom engages.
                 sa = sa.vertical_scroll_offset(SNAP_TO_BOTTOM_TARGET);
-                let snap_key = Id::new("snap_to_bottom").with(self.channel.as_str());
+                let snap_key = self.state_id("snap_to_bottom");
                 ui.ctx().data_mut(|d| d.insert_temp(snap_key, true));
                 ui.ctx().request_repaint();
             }
@@ -1040,8 +1095,8 @@ impl<'a> MessageList<'a> {
         // prefix[i] is the y-offset of row i. Reuse both vectors and compare the
         // complete row order: filters can change interior rows without changing
         // the count or either endpoint.
-        let ps_id = egui::Id::new("msg_prefix_sum").with(self.channel.as_str());
-        let ps_dirty_id = egui::Id::new("msg_prefix_dirty").with(self.channel.as_str());
+        let ps_id = self.state_id("msg_prefix_sum");
+        let ps_dirty_id = self.state_id("msg_prefix_dirty");
         let mut prefix: Vec<f32> = ui
             .ctx()
             .data_mut(|d| d.remove_temp(ps_id).unwrap_or_default());
@@ -1096,7 +1151,7 @@ impl<'a> MessageList<'a> {
             // actually runs instead of leaving the user stuck on this
             // frame's off-screen render.
             sa = sa.vertical_scroll_offset(SNAP_TO_BOTTOM_TARGET);
-            let snap_key = Id::new("snap_to_bottom").with(self.channel.as_str());
+            let snap_key = self.state_id("snap_to_bottom");
             ui.ctx().data_mut(|d| d.insert_temp(snap_key, true));
             ui.ctx().request_repaint();
         }
@@ -1378,7 +1433,7 @@ impl<'a> MessageList<'a> {
 
     /// Read and clear the profile-request stored by a username click this frame.
     fn take_profile_request(&self, ui: &Ui) -> Option<(String, Vec<Badge>)> {
-        let key = Id::new("ml_profile_req").with(self.channel.as_str());
+        let key = self.state_id("ml_profile_req");
         ui.ctx().data_mut(|d| {
             let v: Option<(String, Vec<Badge>)> = d.get_temp(key);
             if v.is_some() {
@@ -1882,14 +1937,14 @@ impl<'a> MessageList<'a> {
     /// If the snap-to-bottom flag is active, force the scroll offset to the
     /// current real maximum every frame until `stick_to_bottom` takes over.
     fn apply_snap(&self, ui: &mut Ui, output: &egui::scroll_area::ScrollAreaOutput<()>) {
-        let snap_key = Id::new("snap_to_bottom").with(self.channel.as_str());
+        let snap_key = self.state_id("snap_to_bottom");
         let snapping: bool = ui.ctx().data_mut(|d| d.get_temp(snap_key).unwrap_or(false));
         if !snapping {
             return;
         }
 
         // If user has scrolled up, never keep forcing snap-to-bottom.
-        let paused_key = egui::Id::new("scroll_paused").with(self.channel.as_str());
+        let paused_key = self.state_id("scroll_paused");
         let scroll_paused: bool = ui
             .ctx()
             .data_mut(|d| d.get_temp(paused_key).unwrap_or(false));
@@ -1951,9 +2006,9 @@ impl<'a> MessageList<'a> {
             egui::Rect::from_min_size(egui::pos2(x, y), size)
         }
 
-        let paused_key = egui::Id::new("scroll_paused").with(self.channel.as_str());
-        let wheel_key = egui::Id::new("scroll_wheel_this_frame").with(self.channel.as_str());
-        let prev_offset_key = egui::Id::new("scroll_prev_offset").with(self.channel.as_str());
+        let paused_key = self.state_id("scroll_paused");
+        let wheel_key = self.state_id("scroll_wheel_this_frame");
+        let prev_offset_key = self.state_id("scroll_prev_offset");
         let viewport_h = output.inner_rect.height();
         let max_scroll = (output.content_size.y - viewport_h).max(0.0);
         let at_bottom = max_scroll < 1.0 || output.state.offset.y >= max_scroll - 20.0;
@@ -2097,7 +2152,7 @@ impl<'a> MessageList<'a> {
             // Detect click on the painted rect
             let btn_response = ui.interact(
                 btn_rect,
-                Id::new("resume_scroll_btn").with(self.channel.as_str()),
+                self.state_id("resume_scroll_btn"),
                 egui::Sense::click(),
             );
             if btn_response.clicked() {
@@ -2110,7 +2165,7 @@ impl<'a> MessageList<'a> {
                 let mut state = output.state;
                 state.offset.y = max_scroll;
                 state.store(ui.ctx(), output.id);
-                let snap_key = Id::new("snap_to_bottom").with(self.channel.as_str());
+                let snap_key = self.state_id("snap_to_bottom");
                 ui.ctx().data_mut(|d| d.insert_temp(snap_key, true));
                 ui.ctx().request_repaint();
             }
@@ -2198,7 +2253,7 @@ impl<'a> MessageList<'a> {
             // After Frame::end() we re-register with the SAME id and the actual
             // frame rect; `WidgetRects::insert` updates the rect in-place while
             // keeping the original (low) idx_in_layer.
-            let bg_click_id = Id::new("msg_bg_click").with(msg.id.0);
+            let bg_click_id = self.state_id("msg_bg_click").with(msg.id.0);
             {
                 let ui = &mut prepared.content_ui;
                 // Use a zero-size rect for the early placeholder so that the
@@ -2425,7 +2480,7 @@ impl<'a> MessageList<'a> {
                                 login: msg.sender.login.clone(),
                                 channel: self.channel.clone(),
                             });
-                            let key = Id::new("ml_profile_req").with(self.channel.as_str());
+                            let key = self.state_id("ml_profile_req");
                             ui.ctx().data_mut(|d| {
                                 d.insert_temp(
                                     key,
@@ -3219,7 +3274,7 @@ impl<'a> MessageList<'a> {
                 .inner_margin(egui::Margin::symmetric(ROW_PAD_X as i8, ROW_PAD_Y as i8))
                 .begin(ui);
 
-            let bg_click_id = Id::new("msg_bg_click").with(msg.id.0);
+            let bg_click_id = self.state_id("msg_bg_click").with(msg.id.0);
             {
                 let ui = &mut prepared.content_ui;
                 let placeholder_rect =
@@ -3386,7 +3441,7 @@ impl<'a> MessageList<'a> {
                                 login: msg.sender.login.clone(),
                                 channel: self.channel.clone(),
                             });
-                            let key = Id::new("ml_profile_req").with(self.channel.as_str());
+                            let key = self.state_id("ml_profile_req");
                             ui.ctx().data_mut(|d| {
                                 d.insert_temp(
                                     key,
@@ -3850,7 +3905,7 @@ fn show_sender_name(
             }
         }
 
-        let id = Id::new("ml_sender_name_paint").with(message_id);
+        let id = ui.make_persistent_id(("ml_sender_name_paint", message_id));
         return ui.interact(response.rect, id, egui::Sense::click());
     }
 
@@ -5085,6 +5140,91 @@ mod tests {
                 message
             })
             .collect()
+    }
+
+    fn render_duplicate_panes(
+        ctx: &egui::Context,
+        messages: &VecDeque<ChatMessage>,
+        events: Vec<egui::Event>,
+    ) -> Vec<MessageListPerfStats> {
+        let channel = ChannelId::new("rustlang");
+        let images = UiImageCache::default();
+        let previews = HashMap::new();
+        let ignored = HashSet::new();
+        let ignored_users = crust_core::ignores::CompiledIgnoredUsers::new(&[]);
+        let low_trust = HashMap::new();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let sender = UiCommandSender::new(sender);
+        let mut stats = Vec::new();
+        let _ = ctx.run(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 400.0))),
+            events,
+            ..Default::default()
+        }, |ctx| {
+            stats.clear();
+            egui::CentralPanel::default().show(ctx, |ui| {
+                for (pane, left, width) in [(1, 10.0, 300.0), (2, 320.0, 660.0)] {
+                    let rect = egui::Rect::from_min_size(egui::pos2(left, 10.0), egui::vec2(width, 380.0));
+                    let mut child = ui.new_child(egui::UiBuilder::new()
+                        .id_salt(("duplicate_pane", pane))
+                        .max_rect(rect)
+                        .layout(egui::Layout::top_down(egui::Align::LEFT)));
+                    child.set_clip_rect(rect);
+                    let list = MessageList::new(
+                        messages, &images, &sender, &channel, &previews, None,
+                        false, 3, false, false, false, true, false,
+                        &ignored, &ignored_users, &[], &[], &[], &low_trust,
+                    ).with_pane(pane, pane == 1);
+                    stats.push(list.show(&mut child).perf_stats);
+                }
+            });
+        });
+        stats
+    }
+
+    #[test]
+    fn duplicate_channel_panes_keep_independent_scroll_and_layout_caches() {
+        let ctx = egui::Context::default();
+        let messages = test_buffer(1, 100);
+        for _ in 0..8 {
+            render_duplicate_panes(&ctx, &messages, Vec::new());
+        }
+        let stats = render_duplicate_panes(&ctx, &messages, Vec::new());
+        assert!(stats.iter().all(|stats| !stats.prefix_rebuilt && stats.height_cache_misses == 0));
+        render_duplicate_panes(&ctx, &messages, vec![
+            egui::Event::PointerMoved(egui::pos2(150.0, 180.0)),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, 120.0),
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let channel = ChannelId::new("rustlang");
+        assert_eq!(ctx.data(|data| data.get_temp::<bool>(view_state_id(&channel, Some(1), "scroll_paused"))), Some(true));
+        assert_eq!(ctx.data(|data| data.get_temp::<bool>(view_state_id(&channel, Some(2), "scroll_paused"))), Some(false));
+    }
+
+    #[test]
+    fn message_edits_invalidate_visible_and_hidden_duplicate_panes() {
+        let ctx = egui::Context::default();
+        let messages = test_buffer(1, 100);
+        let channel = ChannelId::new("rustlang");
+        for _ in 0..8 {
+            render_duplicate_panes(&ctx, &messages, Vec::new());
+        }
+        invalidate_message_layouts(&ctx, &channel, &[MessageId(100)]);
+        for pane in [1, 2] {
+            let heights: HashMap<u64, f32> = ctx.data(|data| data.get_temp(view_state_id(&channel, Some(pane), "msg_row_h")).unwrap());
+            assert!(!heights.contains_key(&100));
+        }
+        let stats = render_duplicate_panes(&ctx, &messages, Vec::new());
+        assert!(stats.iter().all(|stats| stats.prefix_rebuilt));
+        for _ in 0..4 {
+            render_test_messages_with(&ctx, &messages, &[], 316.0, |list| list.pane = Some(1));
+        }
+        invalidate_message_layouts(&ctx, &channel, &[MessageId(100)]);
+        let stats = render_test_messages_with(&ctx, &messages, &[], 676.0, |list| list.pane = Some(2));
+        assert!(stats.prefix_rebuilt);
     }
 
     #[test]

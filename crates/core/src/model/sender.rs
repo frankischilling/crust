@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Twitch badge metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Badge {
     pub name: String,
     pub version: String,
@@ -11,7 +11,7 @@ pub struct Badge {
 }
 
 /// One gradient stop for a painted sender name.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SenderNamePaintStop {
     /// Relative position in `[0.0, 1.0]`.
     pub at: f32,
@@ -20,7 +20,7 @@ pub struct SenderNamePaintStop {
 }
 
 /// One drop-shadow entry for a painted sender name.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SenderNamePaintShadow {
     /// Horizontal offset in logical px.
     pub x_offset: f32,
@@ -33,7 +33,7 @@ pub struct SenderNamePaintShadow {
 }
 
 /// Optional rich paint metadata for a sender name (e.g. 7TV paint).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SenderNamePaint {
     /// Paint function identifier from provider metadata.
     pub function: String,
