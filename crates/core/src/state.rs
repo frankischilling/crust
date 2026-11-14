@@ -752,6 +752,7 @@ mod mentions_state_tests {
             timestamp: Utc.timestamp_opt(ts_secs, 0).unwrap(),
             channel: ChannelId::new("someone"),
             sender: Sender {
+                original_display_name: None,
                 user_id: UserId("u".into()),
                 login: "someone".into(),
                 display_name: "Someone".into(),
@@ -860,6 +861,7 @@ mod redirect_tests {
             timestamp: Utc.timestamp_opt(id as i64, 0).unwrap(),
             channel: channel.clone(),
             sender: Sender {
+                original_display_name: None,
                 user_id: UserId("sender".to_owned()),
                 login: "sender".to_owned(),
                 display_name: "Sender".to_owned(),

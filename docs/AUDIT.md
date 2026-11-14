@@ -2,7 +2,7 @@
 
 Audit date: 2026-11-14. Starting revision: `2555d6a` (v0.5.1).
 
-These changes are on `fix/chat-audit` and await review and merge.
+The changes are tracked in [pull request #6](https://github.com/frankischilling/crust/pull/6).
 
 This pass covers the Rust workspace, chat transport and moderation behavior, message
 history, image loading, egui controls, plugin callbacks, and project documentation.
@@ -56,6 +56,25 @@ and malformed JSON do not. A silent socket reconnects, and a replacement socket 
 its own advertised timeout. Reconnect backoff processes channel and account changes
 without waiting for the delay to finish. An account change wakes the connection
 attempt immediately, while channel updates keep the original retry deadline.
+
+IRC registration now has its own ten-second deadline after the socket connects.
+An idle registration sends a probe before timing out. Socket writes also have
+deadlines, and reconnect waits continue to process account and channel commands.
+A successful registration resets the retry delay. Chat submitted while
+disconnected gets an error instead of joining a queue that cannot drain.
+
+Token validation has a ten-second deadline and a request generation. Logout,
+account removal, and a newer login invalidate older results. Saved-account
+validation checks the returned login, and session events carry a generation so
+late role or authentication updates cannot restore a previous account.
+Refreshing the same identity updates its services without reconnecting IRC.
+
+An explicit account change detaches the old identity before validation starts.
+Chat, whispers, and moderation actions require an established account; rejected
+chat keeps its text and reply for recovery. If validation fails, the client stays
+anonymous and retains the saved accounts. It cannot silently send a delayed
+action as the old account. Recovery restores an empty matching composer or keeps
+the message available separately when a newer draft is already present.
 
 ## Chat and moderation
 
@@ -111,6 +130,18 @@ The filter context now reports shared messages and whispers correctly. Hide
 filters apply without an active search or ignore list, and they also apply to
 paused chat. Dim-only rules retain the existing fast path.
 
+Nickname changes retain the sender's original display name. Editing or removing
+an alias updates live chat, loaded history, mentions, and user cards. The added
+field is optional when reading older records. An older record that already
+overwrote its original name cannot recover information that was never stored.
+
+Global search notices messages arriving after a channel reaches its retention
+limit, as well as edits to existing messages and changes to aliases. It selects
+the newest 5,000 matches before cloning results. Channel groups and keyboard
+selection use the same order; refreshing preserves the selected message when it
+still matches. A result in another visible split focuses that split and preserves
+both drafts.
+
 ## Interface and input
 
 Only the focused composer consumes completion, history, and paste shortcuts.
@@ -137,6 +168,34 @@ Historical messages, suppressed mirrors, and background-channel activity do not
 generate active-channel event toasts. Moderation rows keep their detailed text
 when rendered.
 
+Shortcuts match their modifiers exactly, so reverse navigation and shifted
+moderation shortcuts are no longer consumed by their unshifted bindings.
+Composer Cut and Copy use the selected Unicode text. A rejected send keeps the
+draft and reply, and settings rows have visible remove buttons with tooltips.
+Completion replaces the token at the caret, preserves the following text, and
+supports repeated Tab and Shift+Tab cycling without losing focus.
+
+UI zoom multiplies the display's native density, including density changes when
+moving the window between monitors. It no longer replaces the operating system's
+scale with an absolute pixel density.
+
+The Windows Yu Gothic fallback has a baseline adjustment for mixed Japanese and
+Latin/Greek text. Its larger line gap previously placed glyphs above their row
+and into the preceding line. A geometry regression covers two font families,
+four sizes, and three display densities; native screenshots confirm the spacing.
+
+The UI never waits for capacity in the runtime command channel. A shared FIFO
+keeps account changes, chat, and widget actions in submission order, with at most
+128 deferred commands and 32 MiB of deferred upload data. Each frame flushes at
+most 64 commands after reading runtime events. A full queue reports the problem
+without discarding the current composer draft.
+
+Message measurements are invalidated when width, display scale, font sizes,
+spacing, or relevant controls change. Entries for discarded messages are pruned,
+and prefix sums follow the visible message sequence. Jumping to an older search
+result expands the history window and pauses live following so the target stays
+visible.
+
 ## Images and rendering cost
 
 Image responses must succeed over HTTP and contain decodable image data before
@@ -149,14 +208,58 @@ request owner releases its waiters. The application retries transient failures
 with bounded backoff, queues one request during cooldown, and limits concurrent
 downloads across loaders to 20. Retry sleeps do not occupy download slots.
 
+Successful downloads retain their slot until the UI event queue accepts the
+image. This also covers avatar/profile fetches, preventing completed image
+buffers from accumulating behind a full queue. Cancelling delivery or closing
+the receiver releases the slot and leaves the URL retryable.
+
 The failure state is published before the empty completion event, allowing a UI
 caller to request another attempt immediately without losing it to an obsolete
 in-flight marker.
+
+Image downloads stop at 32 MiB of encoded data, including responses without a
+Content-Length header. Oversized and failed responses do not enter the cache.
+
+The UI shares image storage across chat, menus, avatars, and thumbnails. Its
+retained caches have separate limits:
+
+| Cache | Byte limit | Entry limit |
+| --- | ---: | ---: |
+| Encoded image data | 128 MiB | 4,096 images |
+| Frozen first frames and paint samples | 64 MiB | 1,024 images |
+| Decoded images and animation frames | 128 MiB | 4,096 source URLs |
+| Uploaded textures | 128 MiB | 4,096 frame/texture-option pairs |
+
+Assets used in the current paint pass stay available until that pass finishes.
+Evicting an animation releases its uploaded frames as well as its source data.
+If only decoded frames are evicted, reusing a surviving texture restores animation
+timings so the image continues to advance.
+Visible cache misses can request an image again even after a previous download
+succeeded; background prefetches still deduplicate successful requests. Retries
+remain eligible when the command queue is full, and automatic image requests
+wait behind queued user actions without producing repeated action-failure notices.
+
+Decoded canvas size and GIF/WebP frame counts are checked before the UI invokes
+the decoder. These cache limits describe retained image data, not total process
+memory. Runtime image-request bookkeeping is also capped at 16,384 URLs.
 
 Shared badges use borrowed references instead of building a cloned vector and
 hash set for every visible message. Existing chatter names avoid repeated
 allocation. Spellcheck word scanning uses one Unicode pass, and unfocused
 composers avoid completion scans.
+
+## External commands and uploads
+
+External-player templates are split before channel names, paths, and URLs are
+substituted. Windows drive paths, UNC paths, quoted directories, and empty quoted
+arguments retain their intended argument boundaries. Placeholder-like text in a
+replacement value is literal. Child stdout and stderr drain concurrently while
+retaining only the last 64 KiB of each stream, so a verbose process does not keep
+growing the client's memory or block on a full pipe.
+
+Upload response templates expand in one pass over the original template.
+Response values containing placeholders cannot recurse indefinitely, and JSON
+is parsed once for the image and deletion URLs.
 
 ## Plugins and test reliability
 
@@ -208,7 +311,7 @@ synthetic chat events, and headless egui interaction/layout checks. They cover
 malformed input, repeated events, cancellation, logout during requests, image
 failures, history boundaries, and narrow controls.
 
-The final Windows workspace run passed 685 tests, with nine benchmark/soak tests
+The final Windows workspace run passed 804 tests, with nine benchmark/soak tests
 ignored by the normal run. The isolated measurements above were run separately.
 Both application binaries built successfully, and Clippy passed with correctness
 errors enabled. Nonblocking lints remain for large enum/error layouts, plus two
@@ -230,10 +333,16 @@ accepted by the service. A signed-in points balance and an active live Hype Trai
 were not exercised. These reads use the web client's schema, which can change
 independently of Helix.
 
-Native-window visual inspection, real-account moderation, Linux packaging, and
-release-performance profiling are outside the completed automated checks.
-Headless layout tests verify control geometry and input routing; they do not
-replace checking the running application at different DPI settings.
+A native Windows fixture runs the production interface with synthetic channels,
+messages, static images, and animations. Screenshots were inspected at 1,200 × 950
+and 600 × 800 pixels, using the display's 1.25 native density and UI zoom factors
+of 1.0 and 1.5. The checks covered toolbar and channel controls, narrow chat
+wrapping, mixed Japanese text, emote rendering, and the unsent-message panel.
+The fixture uses local data and does not sign in or send chat.
+
+Real-account sign-in, switching, and moderation, Linux packaging, and release
+performance profiling remain unverified. Automated account-transition tests
+exercise the state changes and delayed callbacks without a live account.
 
 ## Documentation
 

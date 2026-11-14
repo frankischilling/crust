@@ -369,6 +369,7 @@ mod tests {
             timestamp: Utc::now(),
             channel: ChannelId("somech".into()),
             sender: Sender {
+                original_display_name: None,
                 user_id: UserId("99".into()),
                 login: "alice".into(),
                 display_name: "Alice".into(),

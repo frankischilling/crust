@@ -2,8 +2,7 @@ use serde::{Deserialize, Serialize};
 
 /// User login -> custom display name mapping.
 ///
-/// Mirrors chatterino's `Nickname` entries but scoped per-field to the subset
-/// the rest of crust needs.  A nickname whose `channel` is `None` applies
+/// A nickname whose `channel` is `None` applies
 /// globally; when `Some(channel)`, it only applies in that channel.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Nickname {
@@ -87,6 +86,25 @@ pub fn apply_nickname(
     }
 }
 
+/// Apply the current alias while preserving the server's display name.
+/// Removing an alias or changing its channel scope restores the original.
+pub fn apply_sender_nickname(
+    nicknames: &[Nickname],
+    channel_login: &str,
+    sender: &mut super::Sender,
+) {
+    if let Some(nickname) = lookup_nickname(nicknames, &sender.login, channel_login) {
+        if sender.original_display_name.is_none() {
+            sender.original_display_name = Some(sender.display_name.clone());
+        }
+        if sender.display_name != nickname.nickname {
+            sender.display_name.clone_from(&nickname.nickname);
+        }
+    } else if let Some(original) = sender.original_display_name.take() {
+        sender.display_name = original;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +157,54 @@ mod tests {
         let mut d = "AngelOfMalice".to_owned();
         apply_nickname(&list, "angel_of_malice", "anychan", &mut d);
         assert_eq!(d, "AngelOfMalice");
+    }
+
+    fn sender() -> super::super::Sender {
+        super::super::Sender {
+            user_id: super::super::UserId("42".to_owned()),
+            login: "alice".to_owned(),
+            display_name: "AliceFromServer".to_owned(),
+            original_display_name: None,
+            color: None,
+            name_paint: None,
+            badges: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn changing_and_removing_aliases_restores_the_original_name() {
+        let mut sender = sender();
+        apply_sender_nickname(&[Nickname::new("alice", "First alias")], "room", &mut sender);
+        apply_sender_nickname(&[Nickname::new("alice", "Second alias")], "room", &mut sender);
+        assert_eq!(sender.display_name, "Second alias");
+        assert_eq!(sender.original_display_name.as_deref(), Some("AliceFromServer"));
+        apply_sender_nickname(&[], "room", &mut sender);
+        assert_eq!(sender.display_name, "AliceFromServer");
+        assert!(sender.original_display_name.is_none());
+    }
+
+    #[test]
+    fn moving_out_of_alias_scope_restores_the_original_name() {
+        let mut nickname = Nickname::new("alice", "Local alias");
+        nickname.channel = Some("first".to_owned());
+        let mut sender = sender();
+        apply_sender_nickname(std::slice::from_ref(&nickname), "first", &mut sender);
+        assert_eq!(sender.display_name, "Local alias");
+        apply_sender_nickname(&[nickname], "second", &mut sender);
+        assert_eq!(sender.display_name, "AliceFromServer");
+    }
+
+    #[test]
+    fn saved_aliases_keep_original_names_and_old_senders_still_load() {
+        let mut sender = sender();
+        let original_json = serde_json::to_value(&sender).unwrap();
+        assert!(original_json.get("original_display_name").is_none());
+        let old_sender: super::super::Sender = serde_json::from_value(original_json).unwrap();
+        assert!(old_sender.original_display_name.is_none());
+        apply_sender_nickname(&[Nickname::new("alice", "Local alias")], "room", &mut sender);
+        let mut restored: super::super::Sender =
+            serde_json::from_str(&serde_json::to_string(&sender).unwrap()).unwrap();
+        apply_sender_nickname(&[], "room", &mut restored);
+        assert_eq!(restored.display_name, "AliceFromServer");
     }
 }

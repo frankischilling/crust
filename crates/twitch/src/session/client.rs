@@ -24,6 +24,22 @@ use super::{
 
 const WS_URL: &str = "wss://irc-ws.chat.twitch.tv:443";
 const BACKOFF_SECS: &[u64] = &[1, 2, 5, 10, 30];
+const IRC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const IRC_REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
+const IRC_IDLE_INTERVAL: Duration = Duration::from_secs(5);
+const IRC_PONG_TIMEOUT: Duration = Duration::from_secs(5);
+const IRC_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, PartialEq, Eq)]
+enum RetryAction {
+    Wait,
+    Reconnect,
+    Stop,
+}
+
+fn session_timeout(message: &str) -> TwitchError {
+    TwitchError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, message))
+}
 
 // Events emitted by the session
 
@@ -65,6 +81,11 @@ pub enum TwitchEvent {
     Authenticated {
         username: String,
         user_id: String,
+        generation: u64,
+    },
+    AuthenticationFailed {
+        generation: u64,
+        message: String,
     },
     SystemNotice(SystemNotice),
     Error(String),
@@ -89,6 +110,7 @@ pub enum TwitchEvent {
         is_mod: bool,
         badges: Vec<Badge>,
         color: Option<String>,
+        generation: u64,
     },
     /// Sub / resub / giftsub notification (USERNOTICE).
     SubAlert {
@@ -124,6 +146,7 @@ pub enum SessionCommand {
     Authenticate {
         token: String,
         nick: String,
+        generation: u64,
     },
     /// Drop auth and reconnect anonymously.
     LogoutAndReconnect,
@@ -145,6 +168,7 @@ pub struct TwitchSession {
     /// If set, we connect with authentication.
     auth_token: Option<String>,
     auth_nick: Option<String>,
+    auth_generation: u64,
     connection_nick: Option<String>,
     /// Set to true when Twitch explicitly rejects our auth credentials via NOTICE.
     /// Used by `run()` to break the reconnect loop rather than retrying with a
@@ -155,6 +179,8 @@ pub struct TwitchSession {
     /// the exponential backoff counter to zero instead of treating it as a
     /// network failure.
     voluntary_reconnect: bool,
+    registered: bool,
+    pending_joins: OutboundQueue,
 }
 
 impl TwitchSession {
@@ -171,9 +197,12 @@ impl TwitchSession {
             next_msg_id: 1,
             auth_token: None,
             auth_nick: None,
+            auth_generation: 0,
             connection_nick: None,
             auth_failed: false,
             voluntary_reconnect: false,
+            registered: false,
+            pending_joins: OutboundQueue::default(),
         }
     }
 
@@ -199,18 +228,18 @@ impl TwitchSession {
     }
 
     /// Main entry point: runs the connect/reconnect loop.
-    pub async fn run(mut self) {
+    pub async fn run(self) {
+        self.run_at(WS_URL).await;
+    }
+
+    async fn run_at(mut self, url: &str) {
         let mut attempt: u32 = 0;
         // Count consecutive quick failures (connection established but reset before
         // getting any IRC data). Several in a row often indicates an auth problem.
         let mut quick_fail_streak: u32 = 0;
         loop {
-            if attempt > 0 {
-                self.emit(TwitchEvent::Reconnecting { attempt }).await;
-            }
-
             let started = std::time::Instant::now();
-            match self.connect_once().await {
+            match self.connect_to(url).await {
                 Ok(should_reconnect) => {
                     // If Twitch explicitly rejected our credentials via NOTICE,
                     // stop retrying - the token is definitively invalid.
@@ -221,7 +250,10 @@ impl TwitchSession {
                         self.auth_failed = false;
                         self.auth_token = None;
                         self.auth_nick = None;
-                        self.emit(TwitchEvent::Error(msg.to_owned())).await;
+                        self.emit(TwitchEvent::AuthenticationFailed {
+                            generation: self.auth_generation,
+                            message: msg.to_owned(),
+                        }).await;
                         // Fall through to reconnect loop but now anonymous.
                     }
                     quick_fail_streak = 0;
@@ -254,7 +286,10 @@ impl TwitchSession {
                         self.auth_token = None;
                         self.auth_nick = None;
                         quick_fail_streak = 0;
-                        self.emit(TwitchEvent::Error(msg.to_owned())).await;
+                        self.emit(TwitchEvent::AuthenticationFailed {
+                            generation: self.auth_generation,
+                            message: msg.to_owned(),
+                        }).await;
                         // Continue loop; next attempt will be anonymous.
                     } else {
                         // Classify: transient IO errors (network drop, server-side RST)
@@ -292,21 +327,86 @@ impl TwitchSession {
                 }
             }
 
+            if self.registered {
+                attempt = 0;
+                quick_fail_streak = 0;
+            }
             let delay = BACKOFF_SECS
                 .get(attempt as usize)
                 .copied()
                 .unwrap_or(*BACKOFF_SECS.last().unwrap());
             warn!("Reconnecting in {delay}s…");
-            tokio::time::sleep(Duration::from_secs(delay)).await;
-            attempt += 1;
+            self.emit(TwitchEvent::Reconnecting { attempt: attempt.saturating_add(1) }).await;
+            match self.wait_for_reconnect(Duration::from_secs(delay)).await {
+                RetryAction::Wait => attempt = attempt.saturating_add(1),
+                RetryAction::Reconnect => {
+                    self.voluntary_reconnect = false;
+                    attempt = 0;
+                    quick_fail_streak = 0;
+                }
+                RetryAction::Stop => {
+                    self.emit(TwitchEvent::Disconnected).await;
+                    return;
+                }
+            }
         }
     }
 
-    async fn connect_once(&mut self) -> Result<bool, TwitchError> {
-        self.connect_to(WS_URL).await
+    async fn handle_offline_command(&mut self, command: Option<SessionCommand>) -> RetryAction {
+        match command {
+            None | Some(SessionCommand::Disconnect) => RetryAction::Stop,
+            Some(SessionCommand::Authenticate { token, nick, generation }) => {
+                self.auth_token = Some(token);
+                self.auth_nick = Some(nick);
+                self.auth_generation = generation;
+                self.auth_failed = false;
+                self.voluntary_reconnect = true;
+                RetryAction::Reconnect
+            }
+            Some(SessionCommand::LogoutAndReconnect) => {
+                self.auth_token = None;
+                self.auth_nick = None;
+                self.auth_failed = false;
+                self.voluntary_reconnect = true;
+                RetryAction::Reconnect
+            }
+            Some(SessionCommand::JoinChannel(channel)) => {
+                let channel = ChannelId::new(channel.as_str());
+                if !is_valid_twitch_channel(&channel) {
+                    self.outbound_notice(channel, "Channel not joined: invalid Twitch channel.").await;
+                } else if self.pending_joins.join(channel.clone()).is_err() {
+                    self.outbound_notice(channel, "Channel not joined: too many joins are waiting. Try again shortly.").await;
+                }
+                RetryAction::Wait
+            }
+            Some(SessionCommand::LeaveChannel(channel)) => {
+                self.pending_joins.leave(&ChannelId::new(channel.as_str()));
+                RetryAction::Wait
+            }
+            Some(SessionCommand::SendMessage(channel, _, _)) => {
+                self.outbound_notice(channel, "Message not sent: chat is reconnecting. Try again once connected.").await;
+                RetryAction::Wait
+            }
+        }
+    }
+
+    async fn wait_for_reconnect(&mut self, delay: Duration) -> RetryAction {
+        let deadline = tokio::time::Instant::now() + delay;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => return RetryAction::Wait,
+                command = self.cmd_rx.recv() => {
+                    let action = self.handle_offline_command(command).await;
+                    if action != RetryAction::Wait {
+                        return action;
+                    }
+                }
+            }
+        }
     }
 
     async fn connect_to(&mut self, url: &str) -> Result<bool, TwitchError> {
+        self.registered = false;
         let is_authed = self.auth_token.is_some();
         if is_authed {
             info!(
@@ -316,19 +416,29 @@ impl TwitchSession {
         } else {
             info!("Connecting anonymously to {WS_URL}");
         }
-        let (ws_stream, _) = tokio::time::timeout(Duration::from_secs(10), connect_async(url))
-            .await
-            .map_err(|_| {
-                TwitchError::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "Twitch IRC connection timed out after 10 seconds",
-                ))
-            })??;
+        let connecting = tokio::time::timeout(IRC_CONNECT_TIMEOUT, connect_async(url));
+        tokio::pin!(connecting);
+        let (ws_stream, _) = loop {
+            tokio::select! {
+                result = &mut connecting => {
+                    break result.map_err(|_| session_timeout("Twitch IRC connection timed out"))??;
+                }
+                command = self.cmd_rx.recv() => {
+                    match self.handle_offline_command(command).await {
+                        RetryAction::Wait => {}
+                        RetryAction::Reconnect => return Ok(true),
+                        RetryAction::Stop => return Ok(false),
+                    }
+                }
+            }
+        };
         let (mut sink, mut stream) = ws_stream.split();
 
         macro_rules! send_raw {
             ($line:expr) => {
-                sink.send(Message::Text($line.into())).await?
+                tokio::time::timeout(IRC_WRITE_TIMEOUT, sink.send(Message::Text($line.into())))
+                    .await
+                    .map_err(|_| session_timeout("Twitch IRC write timed out"))??
             };
         }
 
@@ -367,7 +477,10 @@ impl TwitchSession {
                 }
             }
         }
-        let mut outbound = OutboundQueue::default();
+        let mut outbound = std::mem::take(&mut self.pending_joins);
+        let registration_deadline = tokio::time::Instant::now() + IRC_REGISTER_TIMEOUT;
+        let mut heartbeat_deadline = tokio::time::Instant::now() + IRC_IDLE_INTERVAL;
+        let mut awaiting_pong = false;
 
         // Rate waits are a select branch, so incoming PINGs and account/control
         // commands remain responsive while output is queued.
@@ -397,6 +510,8 @@ impl TwitchSession {
                                 match result {
                                     Err(e) => warn!("IRC parse: {e}"),
                                     Ok(msg) => {
+                                        heartbeat_deadline = tokio::time::Instant::now() + IRC_IDLE_INTERVAL;
+                                        awaiting_pong = false;
                                         if msg.command == "RECONNECT" {
                                             info!("Server requested a reconnect");
                                             self.voluntary_reconnect = true;
@@ -417,7 +532,9 @@ impl TwitchSession {
                             return Ok(true);
                         }
                         Some(Ok(Message::Ping(payload))) => {
-                            sink.send(Message::Pong(payload)).await?;
+                            tokio::time::timeout(IRC_WRITE_TIMEOUT, sink.send(Message::Pong(payload)))
+                                .await
+                                .map_err(|_| session_timeout("Twitch IRC write timed out"))??;
                         }
                         Some(Ok(_)) => {}
                     }
@@ -430,7 +547,7 @@ impl TwitchSession {
                             return Ok(false);
                         }
                         Some(SessionCommand::Disconnect) => {
-                            let _ = sink.send(Message::Text("QUIT".into())).await;
+                            let _ = tokio::time::timeout(Duration::from_millis(250), sink.send(Message::Text("QUIT".into()))).await;
                             return Ok(false);
                         }
                         Some(SessionCommand::JoinChannel(ch)) => {
@@ -470,14 +587,15 @@ impl TwitchSession {
                                 warn!("Cannot send message: not authenticated");
                             }
                         }
-                        Some(SessionCommand::Authenticate { token, nick }) => {
+                        Some(SessionCommand::Authenticate { token, nick, generation }) => {
                             info!("Auth requested, reconnecting as {nick}");
                             self.auth_token = Some(token);
                             self.auth_nick = Some(nick);
+                            self.auth_generation = generation;
                             self.auth_failed = false; // fresh credentials, clear any previous rejection
                             self.voluntary_reconnect = true; // tell run() to reset backoff
                             // Close current connection; the run() loop will reconnect with auth
-                            let _ = sink.send(Message::Text("QUIT".into())).await;
+                            let _ = tokio::time::timeout(Duration::from_millis(250), sink.send(Message::Text("QUIT".into()))).await;
                             return Ok(true); // triggers reconnect
                         }
                         Some(SessionCommand::LogoutAndReconnect) => {
@@ -486,7 +604,7 @@ impl TwitchSession {
                             self.auth_nick = None;
                             self.auth_failed = false;
                             self.voluntary_reconnect = true; // tell run() to reset backoff
-                            let _ = sink.send(Message::Text("QUIT".into())).await;
+                            let _ = tokio::time::timeout(Duration::from_millis(250), sink.send(Message::Text("QUIT".into()))).await;
                             return Ok(true); // triggers reconnect
                         }
                     }
@@ -502,6 +620,17 @@ impl TwitchSession {
                         send_raw!(line);
                     }
                 }
+                _ = tokio::time::sleep_until(registration_deadline), if !self.registered => {
+                    return Err(session_timeout("Twitch IRC registration timed out"));
+                }
+                _ = tokio::time::sleep_until(heartbeat_deadline), if self.registered => {
+                    if awaiting_pong {
+                        return Err(session_timeout("Twitch IRC heartbeat timed out"));
+                    }
+                    send_raw!("PING :crust");
+                    awaiting_pong = true;
+                    heartbeat_deadline = tokio::time::Instant::now() + IRC_PONG_TIMEOUT;
+                }
             }
         }
     }
@@ -515,6 +644,10 @@ impl TwitchSession {
                 return Some(format!("PONG :{server}"));
             }
             "001" => {
+                if self.registered {
+                    return None;
+                }
+                self.registered = true;
                 let mode = if self.auth_token.is_some() {
                     "authenticated"
                 } else {
@@ -539,6 +672,7 @@ impl TwitchSession {
                     self.emit(TwitchEvent::Authenticated {
                         username: display_name,
                         user_id,
+                        generation: self.auth_generation,
                     })
                     .await;
                 }
@@ -710,6 +844,7 @@ impl TwitchSession {
                         is_mod,
                         badges,
                         color,
+                        generation: self.auth_generation,
                     })
                     .await;
                 }
@@ -995,6 +1130,7 @@ pub fn parse_privmsg_irc(
         user_id: UserId(user_id),
         login: login.clone(),
         display_name,
+        original_display_name: None,
         color,
         name_paint: None,
         badges,
@@ -1454,21 +1590,21 @@ mod tests {
         let mut session = TwitchSession::new(event_tx, cmd_rx);
         session.auth_token = Some("test-token".into());
         session.auth_nick = Some("alice".into());
-        for text in ["first", "second", "third"] {
-            cmd_tx
-                .send(SessionCommand::SendMessage(
-                    ChannelId::new("room"),
-                    text.to_owned(),
-                    None,
-                ))
-                .await
-                .unwrap();
-        }
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
             for _ in 0..3 {
                 server_text(&mut socket).await;
+            }
+            for text in ["first", "second", "third"] {
+                cmd_tx
+                    .send(SessionCommand::SendMessage(
+                        ChannelId::new("room"),
+                        text.to_owned(),
+                        None,
+                    ))
+                    .await
+                    .unwrap();
             }
             for text in ["first", "second", "third"] {
                 assert_eq!(
@@ -1538,6 +1674,7 @@ mod tests {
                     SessionCommand::Authenticate {
                         token: "new-token".to_owned(),
                         nick: "bob".to_owned(),
+                        generation: 1,
                     }
                 } else {
                     SessionCommand::LogoutAndReconnect
@@ -1698,5 +1835,195 @@ mod tests {
             events.try_recv().unwrap(),
             TwitchEvent::SystemNotice(_)
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_wait_applies_channel_changes_and_wakes_for_account_changes() {
+        let (event_tx, mut events) = mpsc::channel(8);
+        let (commands, command_rx) = mpsc::channel(8);
+        let mut session = TwitchSession::new(event_tx, command_rx);
+        let producer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            for command in [
+                SessionCommand::JoinChannel(ChannelId::new("removed")),
+                SessionCommand::JoinChannel(ChannelId::new("kept")),
+                SessionCommand::LeaveChannel(ChannelId::new("removed")),
+                SessionCommand::SendMessage(ChannelId::new("kept"), "offline".into(), None),
+                SessionCommand::Authenticate { token: "new-token".into(), nick: "bob".into(), generation: 7 },
+            ] {
+                commands.send(command).await.unwrap();
+            }
+        });
+        let start = tokio::time::Instant::now();
+        assert_eq!(session.wait_for_reconnect(Duration::from_secs(30)).await, RetryAction::Reconnect);
+        assert_eq!(start.elapsed(), Duration::from_secs(5));
+        assert_eq!(session.auth_generation, 7);
+        assert_eq!(session.auth_nick.as_deref(), Some("bob"));
+        assert_eq!(session.pending_joins.pop_ready(
+            &mut session.chat_limiter, &mut session.join_limiter,
+            &session.elevated_channels, Instant::now(),
+        ).as_deref(), Some("JOIN #kept"));
+        assert!(session.pending_joins.next_send_at(
+            &mut session.chat_limiter, &mut session.join_limiter,
+            &session.elevated_channels, Instant::now(),
+        ).is_none());
+        assert!(matches!(events.try_recv(), Ok(TwitchEvent::SystemNotice(notice)) if notice.text.contains("Message not sent")));
+        producer.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn channel_commands_do_not_extend_the_reconnect_deadline() {
+        let (event_tx, _events) = mpsc::channel(8);
+        let (commands, command_rx) = mpsc::channel(8);
+        let mut session = TwitchSession::new(event_tx, command_rx);
+        let sender = commands.clone();
+        let producer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            sender.send(SessionCommand::JoinChannel(ChannelId::new("room"))).await.unwrap();
+        });
+        let start = tokio::time::Instant::now();
+        assert_eq!(session.wait_for_reconnect(Duration::from_secs(30)).await, RetryAction::Wait);
+        assert_eq!(start.elapsed(), Duration::from_secs(30));
+        producer.await.unwrap();
+        drop(commands);
+        let start = tokio::time::Instant::now();
+        assert_eq!(session.wait_for_reconnect(Duration::from_secs(30)).await, RetryAction::Stop);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn stalled_websocket_handshakes_allow_disconnect_logout_and_account_switch() {
+        for command in [
+            SessionCommand::Disconnect,
+            SessionCommand::LogoutAndReconnect,
+            SessionCommand::Authenticate { token: "new-token".into(), nick: "bob".into(), generation: 9 },
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let (event_tx, _events) = mpsc::channel(8);
+            let (commands, command_rx) = mpsc::channel(8);
+            let mut session = TwitchSession::new(event_tx, command_rx);
+            session.auth_token = Some("old-token".into());
+            session.auth_nick = Some("alice".into());
+            let client = tokio::spawn(async move {
+                let result = session.connect_to(&url).await;
+                (session, result)
+            });
+            let (_socket, _) = listener.accept().await.unwrap();
+            let stop = matches!(command, SessionCommand::Disconnect);
+            let switch = matches!(command, SessionCommand::Authenticate { .. });
+            commands.send(command).await.unwrap();
+            let (session, result) = tokio::time::timeout(Duration::from_secs(2), client).await.unwrap().unwrap();
+            assert_eq!(result.unwrap(), !stop);
+            if !stop {
+                assert_eq!(session.auth_nick.as_deref(), switch.then_some("bob"));
+                assert!(session.voluntary_reconnect);
+            }
+        }
+    }
+
+    async fn open_test_connection() -> (
+        tokio::task::JoinHandle<Result<bool, TwitchError>>,
+        tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        mpsc::Sender<SessionCommand>,
+        mpsc::Receiver<TwitchEvent>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (event_tx, events) = mpsc::channel(8);
+        let (commands, command_rx) = mpsc::channel(8);
+        let mut session = TwitchSession::new(event_tx, command_rx);
+        let client = tokio::spawn(async move { session.connect_to(&url).await });
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        for _ in 0..2 {
+            server_text(&mut socket).await;
+        }
+        (client, socket, commands, events)
+    }
+
+    #[tokio::test]
+    async fn an_open_socket_without_irc_registration_times_out() {
+        let (client, mut socket, _commands, _events) = open_test_connection().await;
+        socket.send(Message::Ping(vec![1])).await.unwrap();
+        assert!(matches!(socket.next().await.unwrap().unwrap(), Message::Pong(_)));
+        tokio::time::pause();
+        tokio::time::advance(IRC_REGISTER_TIMEOUT + Duration::from_millis(1)).await;
+        tokio::time::resume();
+        let result = tokio::time::timeout(Duration::from_secs(2), client).await.unwrap().unwrap();
+        assert!(matches!(result, Err(TwitchError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut && error.to_string().contains("registration")));
+    }
+
+    #[tokio::test]
+    async fn silent_registered_connections_are_probed_and_reconnected() {
+        let (client, mut socket, _commands, mut events) = open_test_connection().await;
+        socket.send(Message::Text(":tmi.twitch.tv 001 guest :Welcome\r\n".into())).await.unwrap();
+        assert!(matches!(events.recv().await, Some(TwitchEvent::Connected)));
+        tokio::time::pause();
+        tokio::time::advance(IRC_IDLE_INTERVAL).await;
+        tokio::time::resume();
+        assert_eq!(server_text(&mut socket).await, "PING :crust");
+        tokio::time::pause();
+        tokio::time::advance(IRC_PONG_TIMEOUT + Duration::from_millis(1)).await;
+        tokio::time::resume();
+        let result = tokio::time::timeout(Duration::from_secs(2), client).await.unwrap().unwrap();
+        assert!(matches!(result, Err(TwitchError::Io(error)) if error.to_string().contains("heartbeat")));
+    }
+
+    #[tokio::test]
+    async fn irc_activity_keeps_an_idle_connection_usable() {
+        let (client, mut socket, commands, mut events) = open_test_connection().await;
+        socket.send(Message::Text(":tmi.twitch.tv 001 guest :Welcome\r\n".into())).await.unwrap();
+        assert!(matches!(events.recv().await, Some(TwitchEvent::Connected)));
+        for _ in 0..2 {
+            tokio::time::pause();
+            tokio::time::advance(IRC_IDLE_INTERVAL).await;
+            tokio::time::resume();
+            assert_eq!(server_text(&mut socket).await, "PING :crust");
+            socket.send(Message::Text(":tmi.twitch.tv PONG :crust\r\nPING :barrier\r\n".into())).await.unwrap();
+            assert_eq!(server_text(&mut socket).await, "PONG :barrier");
+        }
+        commands.send(SessionCommand::Disconnect).await.unwrap();
+        assert_eq!(server_text(&mut socket).await, "QUIT");
+        assert!(!client.await.unwrap().unwrap());
+    }
+
+    #[tokio::test]
+    async fn authentication_and_role_events_keep_the_account_generation() {
+        let (mut session, mut events) = session();
+        session.auth_generation = 42;
+        session.handle_irc(&parse_line("@user-id=123;display-name=Alice :tmi.twitch.tv GLOBALUSERSTATE").unwrap()).await;
+        assert!(matches!(events.try_recv(), Ok(TwitchEvent::Authenticated { generation: 42, user_id, .. }) if user_id == "123"));
+        session.handle_irc(&parse_line("@mod=1;badges=moderator/1 :tmi.twitch.tv USERSTATE #room").unwrap()).await;
+        assert!(matches!(events.try_recv(), Ok(TwitchEvent::UserStateUpdated { generation: 42, is_mod: true, .. })));
+    }
+
+    #[tokio::test]
+    async fn rejected_tokens_report_the_attempted_account_generation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (event_tx, mut events) = mpsc::channel(8);
+        let (commands, command_rx) = mpsc::channel(8);
+        let mut session = TwitchSession::new(event_tx, command_rx);
+        session.auth_token = Some("rejected-token".into());
+        session.auth_nick = Some("alice".into());
+        session.auth_generation = 23;
+        let client = tokio::spawn(async move { session.run_at(&url).await });
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        for _ in 0..3 {
+            server_text(&mut socket).await;
+        }
+        socket.send(Message::Text(":tmi.twitch.tv NOTICE * :Login authentication failed\r\n".into())).await.unwrap();
+        let failure = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(TwitchEvent::AuthenticationFailed { generation, .. }) = events.recv().await {
+                    break generation;
+                }
+            }
+        }).await.unwrap();
+        assert_eq!(failure, 23);
+        commands.send(SessionCommand::Disconnect).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), client).await.unwrap().unwrap();
     }
 }

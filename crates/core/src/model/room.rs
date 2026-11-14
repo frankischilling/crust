@@ -717,6 +717,7 @@ mod tests {
             timestamp: Utc.timestamp_opt(timestamp_seconds, 0).unwrap(),
             channel: super::super::ChannelId::new("rustlang"),
             sender: super::super::Sender {
+                original_display_name: None,
                 user_id: super::super::UserId("1".to_owned()),
                 login: sender_login.to_owned(),
                 display_name: sender_login.to_owned(),

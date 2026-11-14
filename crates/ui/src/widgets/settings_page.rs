@@ -723,7 +723,7 @@ fn render_commands_section(ui: &mut egui::Ui, state: &mut SettingsPageState, com
                 if ui
                     .add(
                         egui::Button::new(
-                            RichText::new("").font(t::tiny()).color(t::red()),
+                            RichText::new("×").font(t::tiny()).color(t::red()),
                         )
                         .min_size(action_btn_size),
                     )
@@ -1366,10 +1366,11 @@ fn render_settings_content(
                                 if ui
                                     .add(
                                         egui::Button::new(
-                                            RichText::new("").font(t::tiny()).color(t::red()),
+                                            RichText::new("×").font(t::tiny()).color(t::red()),
                                         )
                                         .min_size(egui::vec2(24.0, 20.0)),
                                     )
+                                    .on_hover_text("Delete moderation preset")
                                     .clicked()
                                 {
                                     delete_preset_idx = Some(i);
@@ -2168,10 +2169,11 @@ fn render_settings_content(
                                 if ui
                                     .add(
                                         egui::Button::new(
-                                            RichText::new("").font(t::tiny()).color(t::red()),
+                                            RichText::new("×").font(t::tiny()).color(t::red()),
                                         )
                                         .min_size(action_btn_size),
                                     )
+                                    .on_hover_text("Delete nickname alias")
                                     .clicked()
                                 {
                                     delete_nick_idx = Some(i);
@@ -2278,10 +2280,11 @@ fn render_settings_content(
                                 if ui
                                     .add(
                                         egui::Button::new(
-                                            RichText::new("").font(t::tiny()).color(t::red()),
+                                            RichText::new("×").font(t::tiny()).color(t::red()),
                                         )
                                         .min_size(action_btn_size),
                                     )
+                                    .on_hover_text("Remove ignored user")
                                     .clicked()
                                 {
                                     delete_user_idx = Some(i);
@@ -2421,10 +2424,11 @@ fn render_settings_content(
                                 if ui
                                     .add(
                                         egui::Button::new(
-                                            RichText::new("").font(t::tiny()).color(t::red()),
+                                            RichText::new("×").font(t::tiny()).color(t::red()),
                                         )
                                         .min_size(action_btn_size),
                                     )
+                                    .on_hover_text("Remove ignored phrase")
                                     .clicked()
                                 {
                                     delete_phrase_idx = Some(i);

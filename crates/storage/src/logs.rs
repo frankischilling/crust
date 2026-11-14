@@ -306,6 +306,7 @@ impl LogStore {
             timestamp: ts,
             channel: ChannelId::new(channel),
             sender: Sender {
+                original_display_name: None,
                 user_id: UserId(sender.to_owned()),
                 login: sender.to_lowercase(),
                 display_name: sender.to_owned(),
@@ -407,6 +408,7 @@ mod tests {
             timestamp: Utc.timestamp_millis_opt(timestamp_ms).unwrap(),
             channel: ChannelId::new(channel),
             sender: Sender {
+                original_display_name: None,
                 user_id: UserId("1".to_owned()),
                 login: "alice".to_owned(),
                 display_name: "Alice".to_owned(),
@@ -691,6 +693,7 @@ mod tests {
             timestamp: Utc.timestamp_opt(1_700_000_000 + sec, 0).single().unwrap(),
             channel: channel.clone(),
             sender: Sender {
+                original_display_name: None,
                 user_id: UserId("1".to_owned()),
                 login: "alice".to_owned(),
                 display_name: "Alice".to_owned(),
@@ -740,6 +743,7 @@ mod tests {
             timestamp: Utc.timestamp_opt(1_700_000_000 + sec, 0).single().unwrap(),
             channel: ch,
             sender: Sender {
+                original_display_name: None,
                 user_id: UserId("1".to_owned()),
                 login: "alice".to_owned(),
                 display_name: "Alice".to_owned(),

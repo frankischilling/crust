@@ -266,15 +266,20 @@ palette navigation also use the widget shortcuts listed below.
 | --- | --- |
 | Enter | Send message (when input is valid and autocomplete did not consume Enter) |
 | Tab | Accept/cycle autocomplete suggestion |
+| Shift+Tab | Cycle autocomplete suggestions backward |
 | Up / Down | Navigate autocomplete suggestions; if no autocomplete is active, navigate message history |
 
 Notes:
 
 - Autocomplete supports emotes, usernames, slash commands, and IRC /join channel suggestions.
-- Bare-word Tab completion cycles emote/username matches.
+- Completion replaces the word at the caret and preserves the text after it.
+- Tab cycles emote and username matches; Shift+Tab reverses the cycle.
 - History starts with the newest sent message. Pressing Down past it restores
   the draft you were writing.
 - Autocomplete and history keys affect the focused chat input.
+- A rejected send keeps the draft and reply. If a later runtime rejection arrives
+  after a new draft was started, the unsent message remains available to copy or
+  restore without replacing that draft.
 - The Twitch character count and message limit behavior depend on the configured overflow mode.
 - Pasting an image from the clipboard or dropping an image file onto the chat input triggers the configured uploader; the returned URL is inserted at the caret.
 

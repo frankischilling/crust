@@ -439,7 +439,7 @@ fn normalize_oauth_token(token: Option<&str>) -> Option<String> {
 
 async fn helix_auth_from_token(oauth_token: Option<&str>) -> Option<(String, String)> {
     let bearer = normalize_oauth_token(oauth_token)?;
-    match crate::validate_token(&bearer).await {
+    match super::auth::validate_token(&bearer).await {
         Ok(info) => Some((info.client_id, bearer)),
         Err(e) => {
             warn!("Helix auth setup failed while validating token: {e}");

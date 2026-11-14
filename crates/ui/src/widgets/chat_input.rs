@@ -1,11 +1,12 @@
+use crate::image_cache::UiImageCache;
 use std::collections::HashMap;
+#[cfg(test)]
 use std::sync::Arc;
 
 use egui::{Color32, Id, Key, LayerId, Order, Pos2, RichText, Stroke, Ui, Vec2};
-use image::DynamicImage;
 
 use crate::commands::{
-    extract_slash_query, replace_slash_token, slash_command_matches_ranked, SlashCommandSuggestion,
+    extract_slash_query, slash_command_matches_ranked, SlashCommandSuggestion,
 };
 use crate::theme as t;
 use crust_core::model::{ChannelId, EmoteCatalogEntry, ReplyInfo, IRC_SERVER_CONTROL_CHANNEL};
@@ -35,12 +36,29 @@ struct SpellCtx {
 struct TabState {
     /// Text before the word being completed.
     prefix: String,
+    /// Text after the completed word, including its original whitespace.
+    suffix: String,
     /// Matching emote codes.
     matches: Vec<String>,
     /// Current index in `matches`.
     index: usize,
     /// The buffer content we last set (to detect external changes).
     expected_buf: String,
+    expected_cursor: usize,
+}
+
+impl TabState {
+    fn apply(&mut self, buf: &mut String) -> usize {
+        let word = &self.matches[self.index];
+        let separator = if self.suffix.is_empty() { " " } else { "" };
+        *buf = format!("{}{}{}{}", self.prefix, word, separator, self.suffix);
+        let following_space = self.suffix.chars().next()
+            .filter(|ch| ch.is_whitespace()).map_or(separator.len(), char::len_utf8);
+        let cursor = self.prefix.len() + word.len() + following_space;
+        self.expected_buf.clone_from(buf);
+        self.expected_cursor = buf[..cursor].chars().count();
+        self.expected_cursor
+    }
 }
 
 /// Message-history recall state (Up / Down arrows).
@@ -75,7 +93,7 @@ pub struct ChatInput<'a> {
     /// Full emote catalog for autocomplete.
     pub emote_catalog: &'a [EmoteCatalogEntry],
     /// Loaded emote image bytes for rendering previews.
-    pub emote_bytes: &'a HashMap<String, (u32, u32, Arc<[u8]>)>,
+    pub emote_bytes: &'a UiImageCache,
     /// If set, show a dismissable "Replying to @name" banner above the input.
     pub pending_reply: Option<&'a ReplyInfo>,
     /// Previously-sent messages for Up/Down recall.
@@ -108,7 +126,7 @@ pub struct PendingUpload {
 
 /// Result from showing the chat input.
 pub struct ChatInputResult {
-    /// The message text to send, if any.
+    /// The original draft to submit, retained verbatim if dispatch fails.
     pub send: Option<String>,
     /// Whether the emote picker button was clicked.
     pub toggle_emote_picker: bool,
@@ -135,6 +153,7 @@ impl<'a> ChatInput<'a> {
 
         let text_edit_id = ui.id().with("chat_input");
         let input_had_focus = ui.memory(|m| m.has_focus(text_edit_id));
+        let mut retain_keyboard_focus = false;
 
         // Clipboard image paste (Ctrl/Cmd+V)
         // egui-winit 0.31's keyboard handler early-returns from a Ctrl+V
@@ -279,14 +298,17 @@ impl<'a> ChatInput<'a> {
                         }
                     }
 
+                    // Queries stop at the caret, so editing an earlier word leaves the suffix intact.
+                    let pre_cursor = cursor_byte_index(ui.ctx(), text_edit_id, buf);
+                    let pre_query = &buf[..pre_cursor];
                     // Pre-check autocompletes before TextEdit consumes keys.
                     let pre_emote_matches = if input_had_focus {
-                        find_autocomplete_matches(buf, self.emote_catalog)
+                        find_autocomplete_matches(pre_query, self.emote_catalog)
                     } else {
                         Vec::new()
                     };
                     let pre_username_matches = if input_had_focus && pre_emote_matches.is_empty() {
-                        find_username_matches(buf, self.chatters)
+                        find_username_matches(pre_query, self.chatters)
                     } else {
                         Vec::new()
                     };
@@ -294,7 +316,7 @@ impl<'a> ChatInput<'a> {
                         && pre_emote_matches.is_empty()
                         && pre_username_matches.is_empty()
                     {
-                        find_slash_matches(buf, self.slash_usage_counts)
+                        find_slash_matches(pre_query, self.slash_usage_counts)
                     } else {
                         Vec::new()
                     };
@@ -303,7 +325,7 @@ impl<'a> ChatInput<'a> {
                         && pre_username_matches.is_empty()
                         && pre_slash_matches.is_empty()
                     {
-                        find_join_channel_matches(buf, self.channel, self.known_channels)
+                        find_join_channel_matches(pre_query, self.channel, self.known_channels)
                     } else {
                         Vec::new()
                     };
@@ -315,20 +337,23 @@ impl<'a> ChatInput<'a> {
                     // Consume shortcuts only for the focused composer, before
                     // TextEdit handles cursor movement or focus navigation.
                     let mut consumed_tab = false;
+                    let mut reverse_tab = false;
                     let mut consumed_enter = false;
                     let mut consumed_up = false;
                     let mut consumed_down = false;
 
                     if input_had_focus {
                         ui.input_mut(|i| {
-                            consumed_tab = i.consume_key(egui::Modifiers::NONE, Key::Tab);
-                            consumed_up = i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
-                            consumed_down = i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
+                            reverse_tab = crate::app::consume_exact_key(i, egui::Modifiers::SHIFT, Key::Tab);
+                            consumed_tab = reverse_tab || crate::app::consume_exact_key(i, egui::Modifiers::NONE, Key::Tab);
+                            consumed_up = crate::app::consume_exact_key(i, egui::Modifiers::NONE, Key::ArrowUp);
+                            consumed_down = crate::app::consume_exact_key(i, egui::Modifiers::NONE, Key::ArrowDown);
                             if autocomplete_active {
-                                consumed_enter = i.consume_key(egui::Modifiers::NONE, Key::Enter);
+                                consumed_enter = crate::app::consume_exact_key(i, egui::Modifiers::NONE, Key::Enter);
                             }
                         });
                     }
+                    retain_keyboard_focus |= consumed_tab || consumed_enter || consumed_up || consumed_down;
 
                     // Text input - reserve space for emote button + Send button + gaps
                     // At narrow widths, hide Send button and emote picker to maximise input
@@ -410,19 +435,21 @@ impl<'a> ChatInput<'a> {
                     // Recompute matches after TextEdit may have changed buf.
                     // Emote autocomplete takes priority, then @username, then slash, then /join.
                     let input_active = resp.has_focus() || input_had_focus;
-                    let reuse_matches = input_had_focus && !resp.changed();
+                    let cursor_byte = cursor_byte_index(ui.ctx(), text_edit_id, buf);
+                    let query = &buf[..cursor_byte];
+                    let reuse_matches = input_had_focus && !resp.changed() && cursor_byte == pre_cursor;
                     let matches = if !input_active {
                         Vec::new()
                     } else if reuse_matches {
                         pre_emote_matches
                     } else {
-                        find_autocomplete_matches(buf, self.emote_catalog)
+                        find_autocomplete_matches(query, self.emote_catalog)
                     };
                     let username_matches = if input_active && matches.is_empty() {
                         if reuse_matches {
                             pre_username_matches
                         } else {
-                            find_username_matches(buf, self.chatters)
+                            find_username_matches(query, self.chatters)
                         }
                     } else {
                         Vec::new()
@@ -432,7 +459,7 @@ impl<'a> ChatInput<'a> {
                             if reuse_matches {
                                 pre_slash_matches
                             } else {
-                                find_slash_matches(buf, self.slash_usage_counts)
+                                find_slash_matches(query, self.slash_usage_counts)
                             }
                         } else {
                             Vec::new()
@@ -445,7 +472,7 @@ impl<'a> ChatInput<'a> {
                         if reuse_matches {
                             pre_join_matches
                         } else {
-                            find_join_channel_matches(buf, self.channel, self.known_channels)
+                            find_join_channel_matches(query, self.channel, self.known_channels)
                         }
                     } else {
                         Vec::new()
@@ -467,6 +494,9 @@ impl<'a> ChatInput<'a> {
                         if consumed_down {
                             ac_sel = (ac_sel + 1).rem_euclid(n);
                         }
+                        if consumed_tab && reverse_tab {
+                            ac_sel = (ac_sel - 1).rem_euclid(n);
+                        }
                         if consumed_tab || consumed_enter {
                             accepted_emote = Some(matches[ac_sel as usize].code.clone());
                         }
@@ -485,6 +515,9 @@ impl<'a> ChatInput<'a> {
                         if consumed_down {
                             ac_sel = (ac_sel + 1).rem_euclid(n);
                         }
+                        if consumed_tab && reverse_tab {
+                            ac_sel = (ac_sel - 1).rem_euclid(n);
+                        }
                         if consumed_tab || consumed_enter {
                             accepted_username = Some(username_matches[ac_sel as usize].clone());
                         }
@@ -501,6 +534,9 @@ impl<'a> ChatInput<'a> {
                         }
                         if consumed_down {
                             ac_sel = (ac_sel + 1).min(n - 1);
+                        }
+                        if consumed_tab && reverse_tab {
+                            ac_sel = (ac_sel - 1).rem_euclid(n);
                         }
                         if consumed_tab || consumed_enter {
                             accepted_slash_cmd =
@@ -520,6 +556,9 @@ impl<'a> ChatInput<'a> {
                         if consumed_down {
                             ac_sel = (ac_sel + 1).rem_euclid(n);
                         }
+                        if consumed_tab && reverse_tab {
+                            ac_sel = (ac_sel - 1).rem_euclid(n);
+                        }
                         if consumed_tab || consumed_enter {
                             accepted_join_channel = Some(join_matches[ac_sel as usize].clone());
                         }
@@ -531,98 +570,36 @@ impl<'a> ChatInput<'a> {
 
                         // Bare-word Tab completion (emotes + usernames)
                         if consumed_tab {
-                            let mut ts: TabState = ui
-                                .ctx()
-                                .data_mut(|d| d.get_temp(tab_id).unwrap_or_default());
-
-                            let continuing = !ts.matches.is_empty() && ts.expected_buf == *buf;
-
+                            let mut session: TabState = ui.ctx()
+                                .data(|data| data.get_temp(tab_id).unwrap_or_default());
+                            let cursor = buf[..cursor_byte].chars().count();
+                            let continuing = !session.matches.is_empty()
+                                && session.expected_buf == *buf
+                                && session.expected_cursor == cursor;
                             if continuing {
-                                // Cycle to next match
-                                ts.index = (ts.index + 1) % ts.matches.len();
-                            } else {
-                                // Start new tab session
-                                let (pfx, word) = extract_last_word(buf);
-                                if !word.is_empty() {
-                                    // Check if the word starts with @ for mention completion
-                                    let (is_mention, search_word) =
-                                        if let Some(stripped) = word.strip_prefix('@') {
-                                            (true, stripped)
-                                        } else {
-                                            (false, word)
-                                        };
-                                    let wl = search_word.to_lowercase();
-                                    // Zero-alloc case-insensitive prefix test.
-                                    // Avoids `.to_lowercase()` per-entry allocations
-                                    // (1000+ per keystroke frame on large channels).
-                                    let starts_ci = |hay: &str| -> bool {
-                                        let h = hay.as_bytes();
-                                        let n = wl.as_bytes();
-                                        if h.len() < n.len() {
-                                            return false;
-                                        }
-                                        h[..n.len()]
-                                            .iter()
-                                            .zip(n.iter())
-                                            .all(|(a, b)| a.eq_ignore_ascii_case(b))
-                                    };
-
-                                    // Collect emote matches (only for non-mention words)
-                                    let mut m: Vec<String> = if !is_mention {
-                                        self.emote_catalog
-                                            .iter()
-                                            .filter(|e| starts_ci(&e.code))
-                                            .map(|e| e.code.clone())
-                                            .collect()
-                                    } else {
-                                        Vec::new()
-                                    };
-
-                                    // Collect username matches
-                                    let user_matches: Vec<String> = self
-                                        .chatters
-                                        .iter()
-                                        .filter(|u| starts_ci(u))
-                                        .map(|u| {
-                                            if is_mention {
-                                                format!("@{u}")
-                                            } else {
-                                                u.clone()
-                                            }
-                                        })
-                                        .collect();
-                                    m.extend(user_matches);
-
-                                    m.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
-                                    m.dedup();
-                                    m.truncate(TAB_COMPLETE_MAX);
-                                    if !m.is_empty() {
-                                        ts = TabState {
-                                            prefix: pfx.to_owned(),
-                                            matches: m,
-                                            index: 0,
-                                            expected_buf: String::new(),
-                                        };
-                                    } else {
-                                        ts = TabState::default();
-                                    }
+                                session.index = if reverse_tab {
+                                    (session.index + session.matches.len() - 1) % session.matches.len()
                                 } else {
-                                    ts = TabState::default();
+                                    (session.index + 1) % session.matches.len()
+                                };
+                                let cursor = session.apply(buf);
+                                move_cursor_to_end(ui.ctx(), text_edit_id, cursor);
+                                ui.ctx().data_mut(|data| data.insert_temp(tab_id, session));
+                            } else {
+                                let range = completion_token_range(buf, cursor_byte);
+                                let word = &buf[range.start..cursor_byte];
+                                let choices = bare_completion_matches(word, self.emote_catalog, self.chatters);
+                                if choices.is_empty() {
+                                    ui.ctx().data_mut(|data| data.insert_temp(tab_id, TabState::default()));
+                                } else {
+                                    let selected = if reverse_tab { choices.len() - 1 } else { 0 };
+                                    apply_completion(ui.ctx(), text_edit_id, buf, cursor_byte, choices, selected, true);
                                 }
                             }
-
-                            if !ts.matches.is_empty() {
-                                let code = &ts.matches[ts.index];
-                                *buf = format!("{}{} ", ts.prefix, code);
-                                ts.expected_buf = buf.clone();
-                                move_cursor_to_end(ui.ctx(), text_edit_id, buf.chars().count());
-                                ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
-                            }
-
-                            ui.ctx().data_mut(|d| d.insert_temp(tab_id, ts));
+                            ui.ctx().memory_mut(|memory| memory.request_focus(text_edit_id));
                         } else {
                             // Any non-Tab keystroke invalidates the tab session
-                            if consumed_up || consumed_down || resp.changed() {
+                            if consumed_up || consumed_down || resp.changed() || cursor_byte != pre_cursor {
                                 ui.ctx()
                                     .data_mut(|d| d.insert_temp(tab_id, TabState::default()));
                             }
@@ -671,26 +648,29 @@ impl<'a> ChatInput<'a> {
 
                     // Replace the :query token with the accepted emote
                     if let Some(ref code) = accepted_emote {
-                        replace_autocomplete_token(buf, code);
-                        move_cursor_to_end(ui.ctx(), text_edit_id, buf.chars().count());
+                        let choices: Vec<String> = matches.iter().map(|entry| entry.code.clone()).collect();
+                        let selected = choices.iter().position(|candidate| candidate == code).unwrap_or(0);
+                        apply_completion(ui.ctx(), text_edit_id, buf, cursor_byte, choices, selected, consumed_tab);
                         ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                         ac_sel = 0;
                     }
                     if let Some(ref username) = accepted_username {
-                        replace_mention_token(buf, username);
-                        move_cursor_to_end(ui.ctx(), text_edit_id, buf.chars().count());
+                        let choices: Vec<String> = username_matches.iter().map(|name| format!("@{name}")).collect();
+                        let selected = username_matches.iter().position(|candidate| candidate == username).unwrap_or(0);
+                        apply_completion(ui.ctx(), text_edit_id, buf, cursor_byte, choices, selected, consumed_tab);
                         ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                         ac_sel = 0;
                     }
                     if let Some(ref command) = accepted_slash_cmd {
-                        replace_slash_token(buf, command);
-                        move_cursor_to_end(ui.ctx(), text_edit_id, buf.chars().count());
+                        let choices: Vec<String> = slash_matches.iter().map(|entry| format!("/{}", entry.name)).collect();
+                        let selected = slash_matches.iter().position(|candidate| &candidate.name == command).unwrap_or(0);
+                        apply_completion(ui.ctx(), text_edit_id, buf, cursor_byte, choices, selected, consumed_tab);
                         ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                         ac_sel = 0;
                     }
                     if let Some(ref channel_name) = accepted_join_channel {
-                        replace_join_arg_token(buf, channel_name);
-                        move_cursor_to_end(ui.ctx(), text_edit_id, buf.chars().count());
+                        let selected = join_matches.iter().position(|candidate| candidate == channel_name).unwrap_or(0);
+                        apply_completion(ui.ctx(), text_edit_id, buf, cursor_byte, join_matches.clone(), selected, consumed_tab);
                         ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                         ac_sel = 0;
                     }
@@ -724,15 +704,15 @@ impl<'a> ChatInput<'a> {
                     let enter_pressed =
                         resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
 
-                    if enter_pressed && can_submit {
-                        result.send = Some(buf.trim().to_owned());
-                        buf.clear();
-                        // Reset history navigation on send
-                        ui.ctx()
-                            .data_mut(|d| d.insert_temp(hist_id, HistState::default()));
-                        ui.ctx()
-                            .data_mut(|d| d.insert_temp(tab_id, TabState::default()));
+                    if enter_pressed {
                         resp.request_focus();
+                        if can_submit {
+                            result.send = Some(std::mem::take(buf));
+                            ui.ctx()
+                                .data_mut(|d| d.insert_temp(hist_id, HistState::default()));
+                            ui.ctx()
+                                .data_mut(|d| d.insert_temp(tab_id, TabState::default()));
+                        }
                     }
 
                     // Emote picker button - hidden at very narrow widths
@@ -765,8 +745,7 @@ impl<'a> ChatInput<'a> {
                             send_btn
                         };
                         if send_btn.clicked() && can_submit {
-                            result.send = Some(buf.trim().to_owned());
-                            buf.clear();
+                            result.send = Some(std::mem::take(buf));
                             ui.ctx()
                                 .data_mut(|d| d.insert_temp(hist_id, HistState::default()));
                             ui.ctx()
@@ -828,8 +807,7 @@ impl<'a> ChatInput<'a> {
                             if let Some(clicked) =
                                 self.show_autocomplete_popup(ui, &resp, &matches, ac_sel)
                             {
-                                replace_autocomplete_token(buf, &clicked);
-                                move_cursor_to_end(ui.ctx(), text_edit_id, buf.chars().count());
+                                apply_completion(ui.ctx(), text_edit_id, buf, cursor_byte, vec![clicked], 0, false);
                                 ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                                 ui.ctx().data_mut(|d| d.insert_temp(ac_id, 0i32));
                             }
@@ -840,23 +818,20 @@ impl<'a> ChatInput<'a> {
                                 &username_matches,
                                 ac_sel,
                             ) {
-                                replace_mention_token(buf, &clicked);
-                                move_cursor_to_end(ui.ctx(), text_edit_id, buf.chars().count());
+                                apply_completion(ui.ctx(), text_edit_id, buf, cursor_byte, vec![format!("@{clicked}")], 0, false);
                                 ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                                 ui.ctx().data_mut(|d| d.insert_temp(ac_id, 0i32));
                             }
                         } else if let Some(clicked) =
                             self.show_slash_autocomplete_popup(ui, &resp, &slash_matches, ac_sel)
                         {
-                            replace_slash_token(buf, &clicked);
-                            move_cursor_to_end(ui.ctx(), text_edit_id, buf.chars().count());
+                            apply_completion(ui.ctx(), text_edit_id, buf, cursor_byte, vec![format!("/{clicked}")], 0, false);
                             ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                             ui.ctx().data_mut(|d| d.insert_temp(ac_id, 0i32));
                         } else if let Some(clicked) =
                             self.show_join_autocomplete_popup(ui, &resp, &join_matches, ac_sel)
                         {
-                            replace_join_arg_token(buf, &clicked);
-                            move_cursor_to_end(ui.ctx(), text_edit_id, buf.chars().count());
+                            apply_completion(ui.ctx(), text_edit_id, buf, cursor_byte, vec![clicked], 0, false);
                             ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                             ui.ctx().data_mut(|d| d.insert_temp(ac_id, 0i32));
                         }
@@ -898,15 +873,17 @@ impl<'a> ChatInput<'a> {
                     let mut spell_add_word: Option<String> = None;
                     let mut context_send_now = false;
                     let mut context_cut_input = false;
+                    let mut context_copy_selection = false;
                     let mut context_copy_input = false;
                     let mut context_paste_input = false;
                     let mut context_select_all = false;
                     let mut context_clear_input = false;
                     let mut context_insert_help = false;
+                    let has_selection = selected_input_range(ui.ctx(), text_edit_id, buf).is_some();
                     resp.context_menu(|ui| {
                         if ui
                             .add_enabled(
-                                !buf.is_empty(),
+                                has_selection,
                                 egui::Button::new(RichText::new("Cut").font(t::small())),
                             )
                             .clicked()
@@ -917,12 +894,12 @@ impl<'a> ChatInput<'a> {
 
                         if ui
                             .add_enabled(
-                                !buf.is_empty(),
+                                has_selection,
                                 egui::Button::new(RichText::new("Copy").font(t::small())),
                             )
                             .clicked()
                         {
-                            context_copy_input = true;
+                            context_copy_selection = true;
                             ui.close_menu();
                         }
 
@@ -1037,11 +1014,8 @@ impl<'a> ChatInput<'a> {
                         ui.ctx().copy_text(buf.clone());
                     }
 
-                    if context_cut_input {
-                        ui.ctx().copy_text(buf.clone());
-                        buf.clear();
-                        move_cursor_to_end(ui.ctx(), text_edit_id, 0);
-                        ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
+                    if context_copy_selection || context_cut_input {
+                        copy_or_cut_selection(ui.ctx(), text_edit_id, buf, context_cut_input);
                     }
 
                     if context_paste_input {
@@ -1056,8 +1030,7 @@ impl<'a> ChatInput<'a> {
                     }
 
                     if context_send_now && can_submit {
-                        result.send = Some(buf.trim().to_owned());
-                        buf.clear();
+                        result.send = Some(std::mem::take(buf));
                         ui.ctx()
                             .data_mut(|d| d.insert_temp(hist_id, HistState::default()));
                         ui.ctx()
@@ -1099,6 +1072,22 @@ impl<'a> ChatInput<'a> {
                     }
                 });
             });
+
+        // request_focus resets egui's key filter. Reapply it after every child
+        // control has registered so Tab completion cannot move focus to Send.
+        ui.ctx().memory_mut(|memory| {
+            if retain_keyboard_focus && !memory.has_focus(text_edit_id) {
+                memory.request_focus(text_edit_id);
+            }
+            if memory.has_focus(text_edit_id) {
+                memory.set_focus_lock_filter(text_edit_id, egui::EventFilter {
+                    tab: true,
+                    horizontal_arrows: true,
+                    vertical_arrows: true,
+                    ..Default::default()
+                });
+            }
+        });
 
         result
     }
@@ -1145,12 +1134,6 @@ impl<'a> ChatInput<'a> {
 
         let mut clicked_emote: Option<String> = None;
         let mut has_animated_preview = false;
-        let static_id = text_resp.id.with("ac_static_frames");
-        // Use remove_temp (ownership transfer) to avoid cloning the texture
-        // handle map per-frame while autocomplete is open.
-        let mut static_frames: HashMap<String, egui::TextureHandle> = ui
-            .ctx()
-            .data_mut(|d| d.remove_temp(static_id).unwrap_or_default());
 
         egui::ScrollArea::vertical()
             .id_salt(text_resp.id.with("emote_ac_scroll"))
@@ -1189,18 +1172,7 @@ impl<'a> ChatInput<'a> {
                                     );
 
                                     if animated && !should_animate {
-                                        if !static_frames.contains_key(&entry.url) {
-                                            if let Some(img) = decode_static_frame(raw) {
-                                                let tex = ui.ctx().load_texture(
-                                                    format!("ac-static://{}", entry.url),
-                                                    img,
-                                                    egui::TextureOptions::LINEAR,
-                                                );
-                                                static_frames.insert(entry.url.clone(), tex);
-                                            }
-                                        }
-
-                                        if let Some(tex) = static_frames.get(&entry.url) {
+                                        if let Some(tex) = self.emote_bytes.static_texture(ui.ctx(), &entry.url) {
                                             let size = fit_size(w, h, AUTOCOMPLETE_EMOTE_SIZE);
                                             let image_rect = egui::Rect::from_center_size(
                                                 slot_rect.center(),
@@ -1305,8 +1277,6 @@ impl<'a> ChatInput<'a> {
                 }
             });
 
-        ui.ctx()
-            .data_mut(|d| d.insert_temp(static_id, static_frames));
         if has_animated_preview {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(33));
@@ -1869,63 +1839,107 @@ fn select_all_text(ctx: &egui::Context, id: egui::Id, total_chars: usize) {
     }
 }
 
-/// Replace the `:query` at the end of the buffer with the emote code.
-fn replace_autocomplete_token(buf: &mut String, code: &str) {
-    let trimmed_len = buf.trim_end().len();
-    let bytes = buf.as_bytes();
-
-    for i in (0..trimmed_len).rev() {
-        if bytes[i] == b':' {
-            if i == 0 || bytes[i - 1] == b' ' {
-                buf.replace_range(i..trimmed_len, code);
-                buf.push(' ');
-                return;
-            }
-        }
-    }
+fn selected_input_range(
+    ctx: &egui::Context,
+    id: egui::Id,
+    text: &str,
+) -> Option<std::ops::Range<usize>> {
+    let range = egui::TextEdit::load_state(ctx, id)?.cursor.char_range()?;
+    let start = range.primary.index.min(range.secondary.index);
+    let end = range.primary.index.max(range.secondary.index);
+    let byte_index = |index| {
+        text.char_indices()
+            .nth(index)
+            .map_or(text.len(), |(byte, _)| byte)
+    };
+    let selection = byte_index(start)..byte_index(end);
+    (!selection.is_empty()).then_some(selection)
 }
 
-/// Replace the `@query` at the end of the buffer with `@username `.
-fn replace_mention_token(buf: &mut String, username: &str) {
-    let trimmed_len = buf.trim_end().len();
-    let bytes = buf.as_bytes();
-
-    for i in (0..trimmed_len).rev() {
-        if bytes[i] == b'@' {
-            if i == 0 || bytes[i - 1] == b' ' {
-                buf.replace_range(i..trimmed_len, &format!("@{username}"));
-                buf.push(' ');
-                return;
-            }
-        }
-    }
-}
-
-/// Replace the argument token of `/join` with the selected `#channel`.
-fn replace_join_arg_token(buf: &mut String, channel: &str) {
-    let leading_len = buf.len() - buf.trim_start().len();
-    let trimmed = &buf[leading_len..];
-    if !trimmed.starts_with('/') {
-        *buf = format!("/join {channel} ");
+fn copy_or_cut_selection(
+    ctx: &egui::Context,
+    id: egui::Id,
+    text: &mut String,
+    cut: bool,
+) {
+    let Some(selection) = selected_input_range(ctx, id, text) else {
         return;
+    };
+    ctx.copy_text(text[selection.clone()].to_owned());
+    if cut {
+        let cursor = text[..selection.start].chars().count();
+        text.replace_range(selection, "");
+        move_cursor_to_end(ctx, id, cursor);
     }
+    ctx.memory_mut(|memory| memory.request_focus(id));
+}
 
-    let without_slash = &trimmed[1..];
-    if let Some((cmd, _rest)) = without_slash.split_once(char::is_whitespace) {
-        if cmd.eq_ignore_ascii_case("join") {
-            let mut out = String::with_capacity(buf.len() + channel.len() + 4);
-            out.push_str(&buf[..leading_len]);
-            out.push('/');
-            out.push_str(cmd);
-            out.push(' ');
-            out.push_str(channel);
-            out.push(' ');
-            *buf = out;
-            return;
-        }
+fn cursor_byte_index(ctx: &egui::Context, id: Id, buf: &str) -> usize {
+    let cursor = egui::TextEdit::load_state(ctx, id)
+        .and_then(|state| state.cursor.char_range())
+        .map(|range| range.primary.index);
+    cursor.and_then(|cursor| buf.char_indices().nth(cursor).map(|(index, _)| index))
+        .unwrap_or(buf.len())
+}
+
+/// The word containing the caret; all offsets are valid UTF-8 byte boundaries.
+fn completion_token_range(buf: &str, caret: usize) -> std::ops::Range<usize> {
+    let start = buf[..caret].char_indices().rev()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map_or(0, |(index, ch)| index + ch.len_utf8());
+    let end = buf[caret..].find(char::is_whitespace).map_or(buf.len(), |index| caret + index);
+    start..end
+}
+
+fn apply_completion(
+    ctx: &egui::Context,
+    id: Id,
+    buf: &mut String,
+    caret: usize,
+    matches: Vec<String>,
+    index: usize,
+    keep_cycle: bool,
+) {
+    let range = completion_token_range(buf, caret);
+    let mut session = TabState {
+        prefix: buf[..range.start].to_owned(),
+        suffix: buf[range.end..].to_owned(),
+        matches,
+        index,
+        ..Default::default()
+    };
+    let cursor = session.apply(buf);
+    move_cursor_to_end(ctx, id, cursor);
+    ctx.data_mut(|data| data.insert_temp(
+        id.with("tab_complete_state"),
+        if keep_cycle { session } else { TabState::default() },
+    ));
+}
+
+fn bare_completion_matches(
+    word: &str,
+    catalog: &[EmoteCatalogEntry],
+    chatters: &[String],
+) -> Vec<String> {
+    if word.is_empty() {
+        return Vec::new();
     }
-
-    *buf = format!("/join {channel} ");
+    let (mention, query) = word.strip_prefix('@').map_or((false, word), |query| (true, query));
+    let query = query.to_ascii_lowercase();
+    let starts_with = |candidate: &str| candidate.as_bytes().get(..query.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(query.as_bytes()));
+    let mut matches: Vec<String> = if mention {
+        Vec::new()
+    } else {
+        catalog.iter().filter(|entry| starts_with(&entry.code)).map(|entry| entry.code.clone()).collect()
+    };
+    matches.extend(chatters.iter().filter(|name| starts_with(name)).map(|name| {
+        if mention { format!("@{name}") } else { name.clone() }
+    }));
+    matches.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+    matches.dedup();
+    matches.truncate(TAB_COMPLETE_MAX);
+    matches
 }
 
 fn provider_label(provider: &str) -> &'static str {
@@ -1954,19 +1968,6 @@ fn is_likely_animated_url(url: &str) -> bool {
     lower.contains(".gif") || lower.contains(".webp")
 }
 
-fn decode_static_frame(raw: &[u8]) -> Option<egui::ColorImage> {
-    let img = image::load_from_memory(raw).ok()?;
-    dynamic_image_to_color_image(img)
-}
-
-fn dynamic_image_to_color_image(img: DynamicImage) -> Option<egui::ColorImage> {
-    let rgba = img.to_rgba8();
-    let w = usize::try_from(rgba.width()).ok()?;
-    let h = usize::try_from(rgba.height()).ok()?;
-    let pixels = rgba.into_raw();
-    Some(egui::ColorImage::from_rgba_unmultiplied([w, h], &pixels))
-}
-
 fn truncate_to_max_chars(buf: &mut String, max_chars: usize) {
     if buf.chars().count() <= max_chars {
         return;
@@ -1977,20 +1978,6 @@ fn truncate_to_max_chars(buf: &mut String, max_chars: usize) {
         .map(|(idx, _)| idx)
         .unwrap_or(buf.len());
     buf.truncate(cut);
-}
-
-/// Extract the last whitespace-delimited word from the buffer.
-/// Returns `(prefix_before_word, word)`.
-fn extract_last_word(buf: &str) -> (&str, &str) {
-    let trimmed = buf.trim_end_matches(' ');
-    if trimmed.is_empty() {
-        return (buf, "");
-    }
-    if let Some(pos) = trimmed.rfind(' ') {
-        (&buf[..pos + 1], &trimmed[pos + 1..])
-    } else {
-        ("", trimmed)
-    }
 }
 
 /// Iterate over alphabetic words in `buf`.
@@ -2182,6 +2169,18 @@ mod tests {
         focus: bool,
         accept_dropped_files: bool,
     ) -> ChatInputResult {
+        show_test_input_with_completions(ui, buf, history, focus, accept_dropped_files, &[], &[])
+    }
+
+    fn show_test_input_with_completions(
+        ui: &mut Ui,
+        buf: &mut String,
+        history: &[String],
+        focus: bool,
+        accept_dropped_files: bool,
+        catalog: &[EmoteCatalogEntry],
+        chatters: &[String],
+    ) -> ChatInputResult {
         if focus {
             let id = ui.id().with("chat_input");
             ui.memory_mut(|m| m.request_focus(id));
@@ -2190,18 +2189,109 @@ mod tests {
             channel: &ChannelId::new("example"),
             logged_in: true,
             username: None,
-            emote_catalog: &[],
-            emote_bytes: &HashMap::new(),
+            emote_catalog: catalog,
+            emote_bytes: &UiImageCache::default(),
             pending_reply: None,
             message_history: history,
             slash_usage_counts: &HashMap::new(),
             known_channels: &[],
-            chatters: &[],
+            chatters,
             prevent_overlong_twitch_messages: false,
             animate_emotes: false,
             accept_dropped_files,
         }
         .show(ui, buf)
+    }
+
+    #[test]
+    fn completion_cycles_at_the_unicode_caret_and_preserves_the_suffix() {
+        let ctx = egui::Context::default();
+        let mut buf = "é🙂 kaXYZ  tail🙂".to_owned();
+        let id = completion_frame(&ctx, &mut buf, Vec::new(), Some("é🙂 ka".chars().count()));
+        for (modifiers, word) in [
+            (egui::Modifiers::NONE, "Kappa"),
+            (egui::Modifiers::NONE, "KappaHD"),
+            (egui::Modifiers::SHIFT, "Kappa"),
+            (egui::Modifiers::SHIFT, "KappaHD"),
+        ] {
+            assert!(ctx.memory(|memory| memory.has_focus(id)), "before {word}: completion must keep the composer focused; expected={id:?}, focused={:?}", ctx.memory(|memory| memory.focused()));
+            completion_frame(&ctx, &mut buf, vec![key(Key::Tab, true, modifiers)], None);
+            let cursor = egui::TextEdit::load_state(&ctx, id).unwrap().cursor.char_range().unwrap();
+            let session: TabState = ctx.data(|data| data.get_temp(id.with("tab_complete_state")).unwrap_or_default());
+            assert_eq!(buf, format!("é🙂 {word}  tail🙂"), "modifiers={modifiers:?}, cursor={}, expected_cursor={}, index={}, matches={:?}", cursor.primary.index, session.expected_cursor, session.index, session.matches);
+            assert_eq!(cursor.primary.index, format!("é🙂 {word} ").chars().count());
+            assert_eq!(cursor.primary.index, cursor.secondary.index);
+        }
+    }
+
+    #[test]
+    fn shift_tab_starts_with_the_last_completion() {
+        let ctx = egui::Context::default();
+        let mut buf = "ka tail".to_owned();
+        completion_frame(&ctx, &mut buf, Vec::new(), Some(2));
+        completion_frame(&ctx, &mut buf, vec![key(Key::Tab, true, egui::Modifiers::SHIFT)], None);
+        assert_eq!(buf, "KappaHD tail");
+    }
+
+    #[test]
+    fn moving_the_caret_starts_a_new_completion_session() {
+        let ctx = egui::Context::default();
+        let mut buf = "ka tail".to_owned();
+        completion_frame(&ctx, &mut buf, Vec::new(), Some(2));
+        completion_frame(&ctx, &mut buf, vec![key(Key::Tab, true, egui::Modifiers::NONE)], None);
+        assert_eq!(buf, "Kappa tail");
+        let end = buf.chars().count();
+        completion_frame(&ctx, &mut buf, Vec::new(), Some(end));
+        completion_frame(&ctx, &mut buf, vec![key(Key::Tab, true, egui::Modifiers::NONE)], None);
+        assert_eq!(buf, "Kappa TailEmote ");
+    }
+
+    #[test]
+    fn popup_completions_replace_the_caret_token_without_removing_arguments() {
+        for (initial, prefix, expected) in [
+            ("é🙂 :kaXXX tail", "é🙂 :ka", "é🙂 Kappa tail"),
+            ("é🙂 @alXXX tail", "é🙂 @al", "é🙂 @alice tail"),
+            ("/heXXX argument", "/he", "/help argument"),
+        ] {
+            let ctx = egui::Context::default();
+            let mut buf = initial.to_owned();
+            completion_frame(&ctx, &mut buf, Vec::new(), Some(prefix.chars().count()));
+            completion_frame(&ctx, &mut buf, vec![key(Key::Tab, true, egui::Modifiers::NONE)], None);
+            assert_eq!(buf, expected);
+        }
+    }
+
+    fn completion_frame(
+        ctx: &egui::Context,
+        buf: &mut String,
+        mut events: Vec<egui::Event>,
+        caret: Option<usize>,
+    ) -> Id {
+        let releases: Vec<_> = events.iter().filter_map(|event| match event {
+            egui::Event::Key { key: Key::Tab, pressed: true, modifiers, .. } => {
+                Some(key(Key::Tab, false, *modifiers))
+            }
+            _ => None,
+        }).collect();
+        events.extend(releases);
+        let catalog: Vec<EmoteCatalogEntry> = ["Kappa", "KappaHD", "TailEmote"].into_iter().map(|code| EmoteCatalogEntry {
+            code: code.to_owned(),
+            provider: "test".to_owned(),
+            url: format!("https://example.test/{code}.png"),
+            scope: "global".to_owned(),
+        }).collect();
+        let chatters = ["alice".to_owned(), "alexander".to_owned()];
+        let mut id = Id::NULL;
+        let _ = ctx.run(raw_input(events), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                id = ui.id().with("chat_input");
+                show_test_input_with_completions(ui, buf, &[], caret.is_some(), false, &catalog, &chatters);
+                if let Some(caret) = caret {
+                    move_cursor_to_end(ctx, id, caret);
+                }
+            });
+        });
+        id
     }
 
     #[test]
@@ -2283,6 +2373,151 @@ mod tests {
         }
         assert!(first.is_empty());
         assert_eq!(second, "newest");
+    }
+
+    #[test]
+    fn rejected_enter_keeps_focus_and_preserves_the_draft() {
+        for initial in [String::new(), "  ".to_owned(), "x".repeat(501)] {
+            let ctx = egui::Context::default();
+            let mut buf = initial.clone();
+            let mut input_id = Id::NULL;
+            let _ = ctx.run(raw_input(Vec::new()), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    input_id = ui.id().with("chat_input");
+                    show_test_input(ui, &mut buf, &[], true, false);
+                });
+            });
+            let _ = ctx.run(raw_input(vec![key(Key::Enter, true, egui::Modifiers::NONE)]), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    assert!(show_test_input(ui, &mut buf, &[], false, false).send.is_none());
+                });
+            });
+            assert_eq!(buf, initial);
+            assert!(ctx.memory(|memory| memory.has_focus(input_id)));
+        }
+    }
+
+    #[test]
+    fn submitted_draft_retains_whitespace_for_recovery_if_dispatch_fails() {
+        let ctx = egui::Context::default();
+        let original = "  hello 🦀  ";
+        let mut buf = original.to_owned();
+        let _ = ctx.run(raw_input(Vec::new()), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_test_input(ui, &mut buf, &[], true, false);
+            });
+        });
+        let mut submitted = None;
+        let _ = ctx.run(raw_input(vec![key(Key::Enter, true, egui::Modifiers::NONE)]), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                submitted = show_test_input(ui, &mut buf, &[], false, false).send;
+            });
+        });
+        assert_eq!(submitted.as_deref(), Some(original));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn context_menu_submission_retains_the_original_draft() {
+        let ctx = egui::Context::default();
+        let original = "  hello 🦀  ";
+        let mut buf = original.to_owned();
+        let mut input_rect = egui::Rect::NOTHING;
+        let _ = ctx.run(raw_input(Vec::new()), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let id = ui.id().with("chat_input");
+                show_test_input(ui, &mut buf, &[], true, false);
+                input_rect = ctx.read_response(id).unwrap().rect;
+            });
+        });
+        let pointer_event = |position, button, pressed| vec![
+            egui::Event::PointerMoved(position),
+            egui::Event::PointerButton {
+                pos: position,
+                button,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        for pressed in [true, false] {
+            let _ = ctx.run(raw_input(pointer_event(
+                input_rect.center(), egui::PointerButton::Secondary, pressed,
+            )), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_test_input(ui, &mut buf, &[], false, false);
+                });
+            });
+        }
+        let shapes = ctx.run(raw_input(Vec::new()), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_test_input(ui, &mut buf, &[], false, false);
+            });
+        }).shapes;
+        let position = shapes.iter().find_map(|shape| match &shape.shape {
+            egui::epaint::Shape::Text(text) if text.galley.text() == "Send now" => {
+                Some(text.pos + text.galley.size() * 0.5)
+            }
+            _ => None,
+        }).expect("context menu should offer Send now");
+        let mut submitted = None;
+        for pressed in [true, false] {
+            let _ = ctx.run(raw_input(pointer_event(
+                position, egui::PointerButton::Primary, pressed,
+            )), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if let Some(text) = show_test_input(ui, &mut buf, &[], false, false).send {
+                        submitted = Some(text);
+                    }
+                });
+            });
+        }
+        assert_eq!(submitted.as_deref(), Some(original));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn context_copy_and_cut_respect_unicode_selection() {
+        for (primary, secondary) in [(1, 3), (3, 1)] {
+            let ctx = egui::Context::default();
+            let id = Id::new("selection_test");
+            let mut buf = "Aé🙂Z tail".to_owned();
+            let output = ctx.run(raw_input(Vec::new()), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::TextEdit::singleline(&mut buf).id(id).show(ui);
+                    let mut state = egui::TextEdit::load_state(ctx, id).unwrap();
+                    state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                        egui::text::CCursor::new(primary),
+                        egui::text::CCursor::new(secondary),
+                    )));
+                    egui::TextEdit::store_state(ctx, id, state);
+                    copy_or_cut_selection(ctx, id, &mut buf, false);
+                    assert_eq!(buf, "Aé🙂Z tail");
+                    copy_or_cut_selection(ctx, id, &mut buf, true);
+                    assert_eq!(buf, "AZ tail");
+                    let cursor = egui::TextEdit::load_state(ctx, id).unwrap().cursor.char_range().unwrap();
+                    assert_eq!(cursor.primary.index, 1);
+                    assert_eq!(cursor.secondary.index, 1);
+                });
+            });
+            assert_eq!(output.platform_output.commands.iter().filter(|command| {
+                matches!(command, egui::OutputCommand::CopyText(text) if text == "é🙂")
+            }).count(), 2);
+        }
+    }
+
+    #[test]
+    fn context_cut_without_selection_keeps_the_draft() {
+        let ctx = egui::Context::default();
+        let id = Id::new("selection_test");
+        let mut buf = "keep this draft".to_owned();
+        let _ = ctx.run(raw_input(Vec::new()), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                egui::TextEdit::singleline(&mut buf).id(id).show(ui);
+                move_cursor_to_end(ctx, id, 4);
+                copy_or_cut_selection(ctx, id, &mut buf, true);
+            });
+        });
+        assert_eq!(buf, "keep this draft");
     }
 
     #[test]

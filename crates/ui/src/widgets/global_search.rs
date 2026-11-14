@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 
+use crust_core::events::AppEvent;
 use crust_core::search::{matches, parse, ParseOutcome, Predicate};
 use crust_core::{ChannelId, ChannelState, ChatMessage, MessageId};
 
@@ -24,8 +26,9 @@ pub struct GlobalSearchState {
     pub focus_input: bool,
 
     last_parsed_input: String,
-    last_seen_fingerprint: u64,
+    last_seen_fingerprint: Option<u64>,
     parsed: Vec<Predicate>,
+    scroll_to_selected: bool,
     pub load_older_pending: HashMap<ChannelId, std::time::Instant>,
 }
 
@@ -33,6 +36,7 @@ impl GlobalSearchState {
     pub fn request_open(&mut self) {
         self.open = true;
         self.focus_input = true;
+        self.invalidate();
     }
 
     pub fn close(&mut self) {
@@ -49,23 +53,56 @@ impl GlobalSearchState {
         self.parsed.clear();
         self.focus_input = true;
     }
+
+    pub fn invalidate(&mut self) {
+        self.last_seen_fingerprint = None;
+    }
+
+    /// In-place message edits need a refresh even when the buffer size is unchanged.
+    pub fn on_event(&mut self, event: &AppEvent) {
+        if matches!(
+            event,
+            AppEvent::ChannelJoined { .. }
+                | AppEvent::ChannelParted { .. }
+                | AppEvent::ChannelRedirected { .. }
+                | AppEvent::MessageReceived { .. }
+                | AppEvent::MessageDeleted { .. }
+                | AppEvent::EmoteCatalogUpdated { .. }
+                | AppEvent::HistoryLoaded { .. }
+                | AppEvent::UserMessagesCleared { .. }
+                | AppEvent::ClearUserMessagesLocally { .. }
+                | AppEvent::ChannelMessagesCleared { .. }
+                | AppEvent::ChannelChatCleared { .. }
+                | AppEvent::SharedChannelResolved { .. }
+                | AppEvent::NicknamesUpdated { .. }
+                | AppEvent::SenderCosmeticsUpdated { .. }
+        ) {
+            self.invalidate();
+        }
+    }
 }
 
-/// Compute a cheap fingerprint of the current buffer state.
-///
-/// Used to decide whether the search result cache needs to be rebuilt.
-/// Collisions are acceptablea missed refresh shows stale hits for one frame.
+/// Track channel identity and buffer rotation without scanning every message.
+/// In-place changes are invalidated by [`GlobalSearchState::on_event`].
 pub fn fingerprint(channels: &HashMap<ChannelId, ChannelState>) -> u64 {
-    let mut n: u64 = channels.len() as u64;
+    let mut fingerprint = channels.len() as u64;
     for (id, state) in channels {
-        n = n
-            .wrapping_mul(1469598103934665603)
-            .wrapping_add(state.messages.len() as u64);
-        n = n
-            .wrapping_mul(1469598103934665603)
-            .wrapping_add(id.as_str().len() as u64);
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        id.hash(&mut hash);
+        state.messages.len().hash(&mut hash);
+        state
+            .messages
+            .front()
+            .map(|message| message.id)
+            .hash(&mut hash);
+        state
+            .messages
+            .back()
+            .map(|message| message.id)
+            .hash(&mut hash);
+        fingerprint ^= hash.finish();
     }
-    n
+    fingerprint
 }
 
 /// Re-run parser + filter if either the input or the buffer fingerprint changed.
@@ -84,7 +121,7 @@ pub fn refresh_if_stale(
 
     let fp = fingerprint(channels);
     let input_changed = state.input != state.last_parsed_input;
-    let buffer_changed = fp != state.last_seen_fingerprint;
+    let buffer_changed = Some(fp) != state.last_seen_fingerprint;
     if !input_changed && !buffer_changed {
         return false;
     }
@@ -98,11 +135,26 @@ pub fn refresh_if_stale(
         state.regex_error = regex_error;
         state.last_parsed_input = state.input.clone();
     }
-    state.last_seen_fingerprint = fp;
+    let selected = if input_changed {
+        None
+    } else {
+        state
+            .results
+            .get(state.selected_idx)
+            .map(|hit| (hit.channel.clone(), hit.message.id))
+    };
+    state.last_seen_fingerprint = Some(fp);
     state.results = run_search(&state.parsed, channels);
-    if state.selected_idx >= state.results.len() {
-        state.selected_idx = state.results.len().saturating_sub(1);
-    }
+    group_results_by_channel(&mut state.results);
+    state.selected_idx = selected
+        .and_then(|(channel, id)| {
+            state
+                .results
+                .iter()
+                .position(|hit| hit.channel == channel && hit.message.id == id)
+        })
+        .unwrap_or(0);
+    state.scroll_to_selected |= input_changed;
     true
 }
 
@@ -117,24 +169,44 @@ pub fn run_search(
     if preds.is_empty() {
         return Vec::new();
     }
-    let mut hits: Vec<SearchHit> = channels
+    let mut hits: Vec<(&ChannelId, &ChatMessage)> = channels
         .iter()
         .flat_map(|(id, st)| {
             st.messages.iter().filter_map(move |m| {
                 if matches(preds, m, id) {
-                    Some(SearchHit {
-                        channel: id.clone(),
-                        message: m.clone(),
-                    })
+                    Some((id, m))
                 } else {
                     None
                 }
             })
         })
         .collect();
-    hits.sort_by(|a, b| b.message.timestamp.cmp(&a.message.timestamp));
-    hits.truncate(MAX_HITS);
-    hits
+    let newest_first = |a: &(&ChannelId, &ChatMessage), b: &(&ChannelId, &ChatMessage)| {
+        b.1.timestamp
+            .cmp(&a.1.timestamp)
+            .then_with(|| a.0.as_str().cmp(b.0.as_str()))
+            .then_with(|| b.1.id.0.cmp(&a.1.id.0))
+    };
+    if hits.len() > MAX_HITS {
+        hits.select_nth_unstable_by(MAX_HITS, newest_first);
+        hits.truncate(MAX_HITS);
+    }
+    hits.sort_unstable_by(newest_first);
+    hits.into_iter()
+        .map(|(channel, message)| SearchHit {
+            channel: channel.clone(),
+            message: message.clone(),
+        })
+        .collect()
+}
+
+fn group_results_by_channel(hits: &mut [SearchHit]) {
+    let mut order = HashMap::new();
+    for hit in hits.iter() {
+        let next = order.len();
+        order.entry(hit.channel.clone()).or_insert(next);
+    }
+    hits.sort_by_key(|hit| order[&hit.channel]);
 }
 
 use egui::{
@@ -222,7 +294,7 @@ pub fn show_global_search_window(
                     .show(child_ctx, |ui| {
                         render_body(ui, channels, state, &mut output);
                     });
-                state.open = open;
+                state.open &= open;
             }
             _ => {
                 CentralPanel::default()
@@ -247,6 +319,7 @@ fn render_body(
     state: &mut GlobalSearchState,
     output: &mut GlobalSearchOutput,
 ) {
+    handle_keyboard(ui.ctx(), state, output);
     render_header(ui, state, output);
     ui.add_space(4.0);
     ui.separator();
@@ -264,41 +337,40 @@ fn render_body(
 }
 
 fn render_header(ui: &mut Ui, state: &mut GlobalSearchState, output: &mut GlobalSearchOutput) {
-    ui.horizontal(|ui| {
-        chrome::dialog_header(
-            ui,
-            "Search all channels",
-            Some("Predicates: from: in: has: is: regex: badge: subtier:  |  !pred negates"),
-        );
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui
-                .add(Button::new(RichText::new("Close").font(t::small())))
-                .on_hover_text("Close (Esc)")
-                .clicked()
-            {
-                state.close();
-                output.close_requested = true;
-            }
-            if ui
-                .add(Button::new(RichText::new("Clear").font(t::small())))
-                .on_hover_text("Clear input and results")
-                .clicked()
-            {
-                state.clear();
-            }
-            let channel_count = state
-                .results
-                .iter()
-                .map(|h| &h.channel)
-                .collect::<std::collections::HashSet<_>>()
-                .len();
-            let pill_text = if state.results.is_empty() {
-                "no hits".to_string()
-            } else {
-                format!("{} hits • {} channels", state.results.len(), channel_count)
-            };
-            stat_pill(ui, pill_text);
-        });
+    chrome::dialog_header(ui, "Search all channels", None);
+    ui.label(
+        RichText::new("Predicates: from: in: has: is: regex: badge: subtier:  |  !pred negates")
+            .font(t::small())
+            .color(t::text_muted()),
+    );
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .add(Button::new(RichText::new("Close").font(t::small())))
+            .on_hover_text("Close (Esc)")
+            .clicked()
+        {
+            state.close();
+            output.close_requested = true;
+        }
+        if ui
+            .add(Button::new(RichText::new("Clear").font(t::small())))
+            .on_hover_text("Clear input and results")
+            .clicked()
+        {
+            state.clear();
+        }
+        let channel_count = state
+            .results
+            .iter()
+            .map(|h| &h.channel)
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let pill_text = if state.results.is_empty() {
+            "no hits".to_string()
+        } else {
+            format!("{} hits • {} channels", state.results.len(), channel_count)
+        };
+        stat_pill(ui, pill_text);
     });
 }
 
@@ -322,7 +394,7 @@ fn render_results(
     output: &mut GlobalSearchOutput,
 ) {
     let hit_count = state.results.len();
-    handle_keyboard(ui.ctx(), state, output);
+    let scroll_to_selected = std::mem::take(&mut state.scroll_to_selected);
 
     ScrollArea::vertical()
         .auto_shrink([false, false])
@@ -341,22 +413,25 @@ fn render_results(
                 return;
             }
 
-            let groups = group_hits_by_channel(&state.results);
             let mut running_idx = 0usize;
-            for (channel, hits_in_group) in groups {
+            for hits_in_group in state.results.chunk_by(|a, b| a.channel == b.channel) {
+                let channel = &hits_in_group[0].channel;
                 let group_len = hits_in_group.len();
                 render_group_header(
                     ui,
-                    &channel,
+                    channel,
                     group_len,
                     &mut state.load_older_pending,
                     output,
                 );
                 for hit in hits_in_group {
                     let selected = running_idx == state.selected_idx;
-                    render_hit_row(ui, hit, selected, |hit_ref| {
+                    let response = render_hit_row(ui, hit, selected, |hit_ref| {
                         output.jump_to = Some((hit_ref.channel.clone(), hit_ref.message.id));
                     });
+                    if selected && scroll_to_selected {
+                        response.scroll_to_me(Some(Align::Center));
+                    }
                     running_idx += 1;
                 }
                 ui.add_space(4.0);
@@ -367,24 +442,6 @@ fn render_results(
         state.selected_idx = hit_count - 1;
     }
     let _ = channels;
-}
-
-fn group_hits_by_channel(hits: &[SearchHit]) -> Vec<(ChannelId, Vec<&SearchHit>)> {
-    let mut order: Vec<ChannelId> = Vec::new();
-    let mut buckets: HashMap<ChannelId, Vec<&SearchHit>> = HashMap::new();
-    for h in hits {
-        if !buckets.contains_key(&h.channel) {
-            order.push(h.channel.clone());
-        }
-        buckets.entry(h.channel.clone()).or_default().push(h);
-    }
-    order
-        .into_iter()
-        .map(|c| {
-            let v = buckets.remove(&c).unwrap_or_default();
-            (c, v)
-        })
-        .collect()
 }
 
 fn render_group_header(
@@ -423,7 +480,7 @@ fn render_hit_row(
     hit: &SearchHit,
     selected: bool,
     mut on_jump: impl FnMut(&SearchHit),
-) {
+) -> egui::Response {
     let bg = if selected {
         t::bg_raised()
     } else {
@@ -455,10 +512,12 @@ fn render_hit_row(
                 ui.label(RichText::new(body).font(t::small()));
             });
         })
-        .response;
-    if resp.interact(egui::Sense::click()).clicked() {
+        .response
+        .interact(egui::Sense::click());
+    if resp.clicked() {
         on_jump(hit);
     }
+    resp
 }
 
 fn parse_hex_color(s: &str) -> Option<egui::Color32> {
@@ -466,10 +525,12 @@ fn parse_hex_color(s: &str) -> Option<egui::Color32> {
     if s.len() != 6 {
         return None;
     }
-    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
-    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
-    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
-    Some(egui::Color32::from_rgb(r, g, b))
+    let rgb = u32::from_str_radix(s, 16).ok()?;
+    Some(egui::Color32::from_rgb(
+        (rgb >> 16) as u8,
+        (rgb >> 8) as u8,
+        rgb as u8,
+    ))
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -487,31 +548,34 @@ fn handle_keyboard(ctx: &Context, state: &mut GlobalSearchState, output: &mut Gl
         return;
     }
     let max = state.results.len() - 1;
+    let previous = state.selected_idx;
+    let editing = ctx.memory(|memory| memory.has_focus(Id::new("global_search_input")));
     ctx.input_mut(|i| {
-        if i.consume_key(egui::Modifiers::NONE, Key::ArrowDown) {
+        if crate::app::consume_exact_key(i, egui::Modifiers::NONE, Key::ArrowDown) {
             state.selected_idx = (state.selected_idx + 1).min(max);
         }
-        if i.consume_key(egui::Modifiers::NONE, Key::ArrowUp) {
+        if crate::app::consume_exact_key(i, egui::Modifiers::NONE, Key::ArrowUp) {
             state.selected_idx = state.selected_idx.saturating_sub(1);
         }
-        if i.consume_key(egui::Modifiers::NONE, Key::PageDown) {
+        if crate::app::consume_exact_key(i, egui::Modifiers::NONE, Key::PageDown) {
             state.selected_idx = (state.selected_idx + 10).min(max);
         }
-        if i.consume_key(egui::Modifiers::NONE, Key::PageUp) {
+        if crate::app::consume_exact_key(i, egui::Modifiers::NONE, Key::PageUp) {
             state.selected_idx = state.selected_idx.saturating_sub(10);
         }
-        if i.consume_key(egui::Modifiers::NONE, Key::Home) {
+        if !editing && crate::app::consume_exact_key(i, egui::Modifiers::NONE, Key::Home) {
             state.selected_idx = 0;
         }
-        if i.consume_key(egui::Modifiers::NONE, Key::End) {
+        if !editing && crate::app::consume_exact_key(i, egui::Modifiers::NONE, Key::End) {
             state.selected_idx = max;
         }
-        if i.consume_key(egui::Modifiers::NONE, Key::Enter) {
+        if crate::app::consume_exact_key(i, egui::Modifiers::NONE, Key::Enter) {
             if let Some(hit) = state.results.get(state.selected_idx) {
                 output.jump_to = Some((hit.channel.clone(), hit.message.id));
             }
         }
     });
+    state.scroll_to_selected |= state.selected_idx != previous;
 }
 
 fn stat_pill(ui: &mut Ui, text: String) {
@@ -554,6 +618,7 @@ mod tests {
                 user_id: UserId("1".to_string()),
                 login: login.into(),
                 display_name: login.into(),
+                original_display_name: None,
                 color: None,
                 name_paint: None,
                 badges: vec![],
@@ -612,5 +677,182 @@ mod tests {
             .push_back(mk_msg(1, "a", "b", 0));
         let fp1 = fingerprint(&channels);
         assert_ne!(fp0, fp1);
+    }
+
+    #[test]
+    fn embedded_close_button_keeps_the_search_window_closed() {
+        let ctx = Context::default();
+        let channels = HashMap::new();
+        let mut search = GlobalSearchState::default();
+        search.request_open();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let mut shapes = Vec::new();
+        for _ in 0..2 {
+            shapes = ctx.run(input(), |ctx| {
+                show_global_search_window(ctx, &channels, &mut search, false);
+            }).shapes;
+        }
+        let close_position = shapes.iter().find_map(|shape| match &shape.shape {
+            egui::epaint::Shape::Text(text) if text.galley.text() == "Close" => {
+                Some(text.pos + text.galley.size() * 0.5)
+            }
+            _ => None,
+        }).expect("Close button should be visible in the embedded search window");
+        let mut close_requested = false;
+        for pressed in [true, false] {
+            let mut frame_input = input();
+            frame_input.events = vec![
+                egui::Event::PointerMoved(close_position),
+                egui::Event::PointerButton {
+                    pos: close_position,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ];
+            let _ = ctx.run(frame_input, |ctx| {
+                close_requested |= show_global_search_window(
+                    ctx, &channels, &mut search, false,
+                ).close_requested;
+            });
+        }
+        assert!(close_requested);
+        assert!(!search.open);
+    }
+
+    #[test]
+    fn full_buffer_rotation_refreshes_search_results() {
+        let (channel, mut messages) = mk_channel("foo");
+        for id in 0..1500 {
+            messages.push_message(mk_msg(id, "alice", "needle", 1500 - id as i64));
+        }
+        let mut channels = HashMap::from([(channel.clone(), messages)]);
+        let mut search = GlobalSearchState {
+            input: "needle".to_owned(),
+            ..Default::default()
+        };
+        assert!(refresh_if_stale(&mut search, &channels));
+        assert!(!refresh_if_stale(&mut search, &channels));
+        channels.get_mut(&channel).unwrap().push_message(mk_msg(1500, "alice", "needle", 0));
+        assert!(refresh_if_stale(&mut search, &channels));
+        assert_eq!(search.results.len(), 1500);
+        assert!(search.results.iter().any(|hit| hit.message.id == MessageId(1500)));
+        assert!(!search.results.iter().any(|hit| hit.message.id == MessageId(0)));
+    }
+
+    #[test]
+    fn message_edits_refresh_filters_without_changing_buffer_length() {
+        let (channel, mut messages) = mk_channel("foo");
+        let mut message = mk_msg(1, "alice", "needle", 0);
+        message.server_id = Some("server-id".to_owned());
+        messages.push_message(message);
+        let mut channels = HashMap::from([(channel.clone(), messages)]);
+        let mut search = GlobalSearchState {
+            input: "is:deleted".to_owned(),
+            ..Default::default()
+        };
+        refresh_if_stale(&mut search, &channels);
+        assert!(search.results.is_empty());
+        channels.get_mut(&channel).unwrap().delete_message("server-id");
+        search.on_event(&AppEvent::MessageDeleted {
+            channel,
+            server_id: "server-id".to_owned(),
+        });
+        assert!(refresh_if_stale(&mut search, &channels));
+        assert_eq!(search.results.len(), 1);
+        assert!(search.results[0].message.flags.is_deleted);
+        assert!(!refresh_if_stale(&mut search, &channels));
+    }
+
+    #[test]
+    fn replacement_channel_with_equal_name_length_refreshes_search() {
+        let (old, messages) = mk_channel("foo");
+        let mut channels = HashMap::from([(old.clone(), messages)]);
+        let before = fingerprint(&channels);
+        channels.remove(&old);
+        let (new, messages) = mk_channel("bar");
+        channels.insert(new, messages);
+        assert_ne!(fingerprint(&channels), before);
+    }
+
+    #[test]
+    fn keyboard_jump_uses_the_visually_selected_grouped_row() {
+        let (first, mut first_messages) = mk_channel("first");
+        first_messages.push_message(mk_msg(1, "alice", "needle", 0));
+        first_messages.push_message(mk_msg(3, "alice", "needle", 20));
+        let (second, mut second_messages) = mk_channel("second");
+        second_messages.push_message(mk_msg(2, "alice", "needle", 10));
+        let channels = HashMap::from([(first.clone(), first_messages), (second, second_messages)]);
+        let mut search = GlobalSearchState {
+            input: "needle".to_owned(),
+            ..Default::default()
+        };
+        refresh_if_stale(&mut search, &channels);
+        assert_eq!(search.results.iter().map(|hit| hit.message.id.0).collect::<Vec<_>>(), vec![1, 3, 2]);
+        let ctx = Context::default();
+        let mut output = GlobalSearchOutput::default();
+        for key in [Key::ArrowDown, Key::Enter] {
+            let input = egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| handle_keyboard(ctx, &mut search, &mut output));
+        }
+        assert_eq!(search.selected_idx, 1);
+        assert_eq!(output.jump_to, Some((first, MessageId(3))));
+    }
+
+    #[test]
+    fn new_hits_preserve_the_selected_message() {
+        let (channel, mut messages) = mk_channel("foo");
+        messages.push_message(mk_msg(1, "alice", "needle", 10));
+        messages.push_message(mk_msg(2, "alice", "needle", 20));
+        let mut channels = HashMap::from([(channel.clone(), messages)]);
+        let mut search = GlobalSearchState {
+            input: "needle".to_owned(),
+            ..Default::default()
+        };
+        refresh_if_stale(&mut search, &channels);
+        search.selected_idx = 1;
+        channels.get_mut(&channel).unwrap().push_message(mk_msg(3, "alice", "needle", 0));
+        refresh_if_stale(&mut search, &channels);
+        assert_eq!(search.results[search.selected_idx].message.id, MessageId(2));
+    }
+
+    #[test]
+    fn search_limit_retains_only_the_newest_matches() {
+        let mut channels = HashMap::new();
+        for channel_index in 0..4 {
+            let (channel, mut messages) = mk_channel(&format!("channel{channel_index}"));
+            for row in 0..1500 {
+                let id = channel_index * 1500 + row;
+                messages.push_message(mk_msg(id, "alice", "needle", 6000 - id as i64));
+            }
+            channels.insert(channel, messages);
+        }
+        let hits = run_search(&parse("needle").predicates, &channels);
+        assert_eq!(hits.len(), MAX_HITS);
+        assert_eq!(hits.first().unwrap().message.id, MessageId(5999));
+        assert_eq!(hits.last().unwrap().message.id, MessageId(1000));
+    }
+
+    #[test]
+    fn invalid_unicode_colors_do_not_panic() {
+        assert_eq!(parse_hex_color("#12Ab34"), Some(egui::Color32::from_rgb(0x12, 0xab, 0x34)));
+        for color in ["€abc", "ab€c", "abc€", "ééé", "12345g", "12345"] {
+            assert_eq!(parse_hex_color(color), None);
+        }
     }
 }

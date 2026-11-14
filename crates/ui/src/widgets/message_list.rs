@@ -1,10 +1,10 @@
+use crate::app::UiCommandSender;
+use crate::image_cache::UiImageCache;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use egui::{Color32, Id, Label, RichText, ScrollArea, Ui, Vec2};
-use image::DynamicImage;
-use tokio::sync::mpsc;
 
 use crust_core::{
     events::{AppCommand, LinkPreview},
@@ -96,12 +96,6 @@ struct ReplyScrollHint {
     child_msg_local_id: u64,
 }
 
-#[derive(Clone)]
-enum StaticFrameCacheEntry {
-    Loaded(egui::TextureHandle),
-    Unavailable,
-}
-
 /// Pre-computed per-frame values passed to `render_message` to avoid
 /// redundant `data_mut` lock acquisitions and `Id::new` constructions.
 struct RenderCtx {
@@ -122,6 +116,7 @@ const TOOLTIP_EMOTE_SIZE: f32 = 112.0;
 const BADGE_SIZE: f32 = 18.0;
 const TOOLTIP_BADGE_SIZE: f32 = 72.0;
 const MAX_CACHED_USERNAME_COLORS: usize = 8192;
+const ROW_HEIGHT_CACHE_SLACK: usize = 256;
 /// Row left/right padding (px)
 const ROW_PAD_X: f32 = 6.0;
 /// Row top/bottom padding (px)
@@ -176,6 +171,31 @@ const TWITCH_USERNAME_COLORS: [Color32; 15] = [
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct HotWindowState {
     active_rows: usize,
+}
+
+#[derive(Clone, PartialEq)]
+struct RowLayoutKey {
+    width: f32,
+    pixels_per_point: f32,
+    body_font: egui::FontId,
+    chat_font_size: f32,
+    timestamp_font_size: f32,
+    chip_font_size: f32,
+    item_spacing: Vec2,
+    interact_size: Vec2,
+    collapse_lines: Option<usize>,
+    show_timestamps: bool,
+    show_timestamp_seconds: bool,
+    use_24h_timestamps: bool,
+    can_moderate: bool,
+}
+
+fn prune_row_heights(heights: &mut HashMap<u64, f32>, messages: &VecDeque<ChatMessage>) {
+    // Prune in batches so a full chat buffer does not require a scan every frame.
+    if heights.len() > messages.len().saturating_add(ROW_HEIGHT_CACHE_SLACK) {
+        let retained: HashSet<u64> = messages.iter().map(|message| message.id.0).collect();
+        heights.retain(|id, _| retained.contains(id));
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -305,9 +325,9 @@ pub struct KeywordHighlightMatch {
 pub struct MessageList<'a> {
     messages: &'a VecDeque<ChatMessage>,
     /// Raw image bytes keyed by CDN URL: CDN url -> (width, height, raw_bytes)
-    emote_bytes: &'a HashMap<String, (u32, u32, Arc<[u8]>)>,
+    emote_bytes: &'a UiImageCache,
     /// For sending on-demand image-fetch requests (e.g. HD emote on hover).
-    cmd_tx: &'a mpsc::Sender<AppCommand>,
+    cmd_tx: &'a UiCommandSender,
     /// Channel identifier - used for per-channel scroll state.
     channel: &'a ChannelId,
     /// Cached link previews keyed by URL.
@@ -370,8 +390,8 @@ impl<'a> MessageList<'a> {
 
     pub(crate) fn new(
         messages: &'a VecDeque<ChatMessage>,
-        emote_bytes: &'a HashMap<String, (u32, u32, Arc<[u8]>)>,
-        cmd_tx: &'a mpsc::Sender<AppCommand>,
+        emote_bytes: &'a UiImageCache,
+        cmd_tx: &'a UiCommandSender,
         channel: &'a ChannelId,
         link_previews: &'a HashMap<String, LinkPreview>,
         search: Option<&'a MessageSearchState>,
@@ -546,7 +566,10 @@ impl<'a> MessageList<'a> {
         // Paused snapshot behavior:
         // freeze the rendered message-id set while paused so incoming chat does
         // not keep shifting the lines the user is reading.
-        let visible_indices: VisibleIndices = if paused_before_show && !search_filtering {
+        let visible_indices: VisibleIndices = if paused_before_show
+            && !search_filtering
+            && self.scroll_to.is_none()
+        {
             let mut snapshot_ids: Vec<u64> = ui
                 .ctx()
                 .data_mut(|d| d.get_temp(paused_snapshot_key).unwrap_or_default());
@@ -658,20 +681,38 @@ impl<'a> MessageList<'a> {
         let mut height_cache: std::collections::HashMap<u64, f32> = ui
             .ctx()
             .data_mut(|d| d.remove_temp(hc_id).unwrap_or_default());
-        let static_id = egui::Id::new("ml_static_frames").with(self.channel.as_str());
-        let mut static_frames: HashMap<String, StaticFrameCacheEntry> = ui
-            .ctx()
-            .data_mut(|d| d.remove_temp(static_id).unwrap_or_default());
 
-        // Invalidate height cache when available width changes significantly
-        // (e.g. window resize or sidebar drag), since messages re-wrap to
-        // different heights at different widths.
-        let avail_width = ui.available_width();
-        let width_key = egui::Id::new("msg_list_width").with(self.channel.as_str());
-        let prev_width: f32 = ui.ctx().data_mut(|d| d.get_temp(width_key).unwrap_or(0.0));
-        if (avail_width - prev_width).abs() > 2.0 {
+        let layout_key = egui::Id::new("msg_row_layout").with(self.channel.as_str());
+        let layout = RowLayoutKey {
+            width: ui.available_width(),
+            pixels_per_point: ui.ctx().pixels_per_point(),
+            body_font: ui.style().override_font_id.clone().unwrap_or_else(|| {
+                ui.style()
+                    .override_text_style
+                    .clone()
+                    .unwrap_or(egui::TextStyle::Body)
+                    .resolve(ui.style())
+            }),
+            chat_font_size: t::chat_font_size(),
+            timestamp_font_size: t::timestamps_font_size(),
+            chip_font_size: t::chips_font_size(),
+            item_spacing: ui.spacing().item_spacing,
+            interact_size: ui.spacing().interact_size,
+            collapse_lines: self.collapse_long_messages.then_some(self.collapse_long_message_lines),
+            show_timestamps: self.show_timestamps,
+            show_timestamp_seconds: self.show_timestamp_seconds,
+            use_24h_timestamps: self.use_24h_timestamps,
+            can_moderate: self.can_moderate,
+        };
+        let layout_changed = ui.ctx().data_mut(|d| {
+            let changed = d.get_temp::<RowLayoutKey>(layout_key).as_ref() != Some(&layout);
+            if changed {
+                d.insert_temp(layout_key, layout);
+            }
+            changed
+        });
+        if layout_changed {
             height_cache.clear();
-            ui.ctx().data_mut(|d| d.insert_temp(width_key, avail_width));
         }
 
         // Clear stale height cache when the channel has no messages
@@ -710,6 +751,8 @@ impl<'a> MessageList<'a> {
                 })
             });
             idx.map(|idx| {
+                // A requested row must stay in view when new chat arrives.
+                ui.ctx().data_mut(|d| d.insert_temp(paused_key, true));
                 // Store the target server_id + time for a brief highlight flash.
                 let now = ui.input(|i| i.time);
                 if let Some(tgt_id) = target {
@@ -738,17 +781,23 @@ impl<'a> MessageList<'a> {
         }
         let hot_plan = compute_hot_window_plan(
             n,
-            search_filtering || scroll_target_pending,
+            search_filtering || scroll_target_pending || self.scroll_to.is_some(),
             !paused_before_show,
             hot_state.active_rows,
         );
-        let active_ids: Vec<u64> = (0..hot_plan.active_len)
-            .map(|i| {
-                self.messages[visible_indices.get(hot_plan.active_start + i)]
-                    .id
-                    .0
-            })
-            .collect();
+        let active_ids_key = egui::Id::new("msg_active_ids").with(self.channel.as_str());
+        let mut active_ids: Vec<u64> = ui
+            .ctx()
+            .data_mut(|d| d.remove_temp(active_ids_key).unwrap_or_default());
+        let active_id = |i: usize| {
+            self.messages[visible_indices.get(hot_plan.active_start + i)].id.0
+        };
+        let active_ids_changed = active_ids.len() != hot_plan.active_len
+            || active_ids.iter().enumerate().any(|(i, id)| *id != active_id(i));
+        if active_ids_changed {
+            active_ids.clear();
+            active_ids.extend((0..hot_plan.active_len).map(active_id));
+        }
         let paused_offset_compensation = if paused_before_show {
             ui.ctx()
                 .data_mut(|d| d.get_temp::<ScrollAnchor>(anchor_key))
@@ -843,9 +892,9 @@ impl<'a> MessageList<'a> {
             });
             ui.ctx().data_mut(|d| {
                 d.insert_temp(hc_id, height_cache);
-                d.insert_temp(static_id, static_frames);
                 d.insert_temp(hot_state_key, HotWindowState { active_rows: 0 });
                 d.insert_temp(user_color_cache_key, user_color_cache);
+                d.insert_temp(active_ids_key, active_ids);
                 d.remove_temp::<ScrollAnchor>(anchor_key);
             });
             self.show_resume_button(ui, &output, panel_rect, paused_snapshot_new_rows);
@@ -902,7 +951,6 @@ impl<'a> MessageList<'a> {
                         msg,
                         dimmed,
                         &rctx,
-                        &mut static_frames,
                         &mut user_color_cache,
                     );
                     let measured = ui.next_widget_position().y - top_y;
@@ -932,11 +980,12 @@ impl<'a> MessageList<'a> {
                 0.0,
                 output.state.offset.y,
             );
+            prune_row_heights(&mut height_cache, self.messages);
             ui.ctx().data_mut(|d| {
                 d.insert_temp(hc_id, height_cache);
-                d.insert_temp(static_id, static_frames);
                 d.insert_temp(hot_state_key, HotWindowState { active_rows: 0 });
                 d.insert_temp(user_color_cache_key, user_color_cache);
+                d.insert_temp(active_ids_key, active_ids);
             });
             perf_stats.rendered_rows = hot_plan.active_len;
             return MessageListResult {
@@ -946,36 +995,21 @@ impl<'a> MessageList<'a> {
             };
         }
 
-        // Build prefix-sum array.  prefix[i] = y-offset of the top of message i.
-        // PERF: reuse the previous Vec allocation via remove_temp (ownership
-        // transfer) so we don't hit the allocator every frame.  We also cache
-        // the previous message count so we can skip the rebuild when nothing
-        // changed (the common steady-state case).
+        // prefix[i] is the y-offset of row i. Reuse both vectors and compare the
+        // complete row order: filters can change interior rows without changing
+        // the count or either endpoint.
         let ps_id = egui::Id::new("msg_prefix_sum").with(self.channel.as_str());
-        let ps_gen_id = egui::Id::new("msg_prefix_gen").with(self.channel.as_str());
+        let ps_dirty_id = egui::Id::new("msg_prefix_dirty").with(self.channel.as_str());
         let mut prefix: Vec<f32> = ui
             .ctx()
             .data_mut(|d| d.remove_temp(ps_id).unwrap_or_default());
-
-        // Build a lightweight generation key from count + first/last message IDs
-        // so we detect content changes even when the count stays the same
-        // (e.g. ring-buffer eviction: pop_front + push_back at MAX_MESSAGES).
-        let cur_gen: (usize, u64, u64, usize) = if hot_plan.active_len > 0 {
-            let first_id = self.messages[visible_indices.get(hot_plan.active_start)]
-                .id
-                .0;
-            let last_id = self.messages
-                [visible_indices.get(hot_plan.active_start + hot_plan.active_len - 1)]
-            .id
-            .0;
-            (hot_plan.active_len, first_id, last_id, hot_plan.hidden_rows)
-        } else {
-            (0, 0, 0, 0)
-        };
-        let prev_gen: (usize, u64, u64, usize) = ui
+        let heights_changed: bool = ui
             .ctx()
-            .data_mut(|d| d.get_temp(ps_gen_id).unwrap_or((0, 0, 0, 0)));
-        let prefix_stale = prefix.len() != hot_plan.active_len + 1 || cur_gen != prev_gen;
+            .data_mut(|d| d.remove_temp(ps_dirty_id).unwrap_or(false));
+        let prefix_stale = layout_changed
+            || active_ids_changed
+            || heights_changed
+            || prefix.len() != hot_plan.active_len + 1;
         if prefix_stale {
             prefix.clear();
             prefix.reserve(hot_plan.active_len + 1);
@@ -992,7 +1026,6 @@ impl<'a> MessageList<'a> {
                 };
                 prefix.push(prefix.last().unwrap() + h);
             }
-            ui.ctx().data_mut(|d| d.insert_temp(ps_gen_id, cur_gen));
         }
         perf_stats.prefix_rebuilt = prefix_stale;
         let boundary_h = hot_plan.boundary_height();
@@ -1096,7 +1129,6 @@ impl<'a> MessageList<'a> {
                     msg,
                     dimmed,
                     &rctx,
-                    &mut static_frames,
                     &mut user_color_cache,
                 );
 
@@ -1114,9 +1146,8 @@ impl<'a> MessageList<'a> {
             // If any visible row's measured height changed, force prefix
             // rebuild next frame so the scroll bar and dead-space are correct.
             if any_height_changed {
-                // Invalidate the generation key so the prefix sum is rebuilt next frame.
                 ui.ctx()
-                    .data_mut(|d| d.insert_temp(ps_gen_id, (0usize, 0u64, 0u64, 0usize)));
+                    .data_mut(|d| d.insert_temp(ps_dirty_id, true));
             }
 
             // Dead space below the visible window.
@@ -1161,12 +1192,13 @@ impl<'a> MessageList<'a> {
         );
         ui.ctx()
             .data_mut(|d| d.insert_temp(hot_state_key, hot_state));
+        prune_row_heights(&mut height_cache, self.messages);
         // Persist height cache and prefix-sum Vec for next frame.
         ui.ctx().data_mut(|d| {
             d.insert_temp(hc_id, height_cache);
             d.insert_temp(ps_id, prefix);
-            d.insert_temp(static_id, static_frames);
             d.insert_temp(user_color_cache_key, user_color_cache);
+            d.insert_temp(active_ids_key, active_ids);
         });
         MessageListResult {
             reply: self.take_reply(ui, rctx.reply_key),
@@ -2045,7 +2077,6 @@ impl<'a> MessageList<'a> {
         msg: &ChatMessage,
         dimmed: bool,
         rctx: &RenderCtx,
-        static_frames: &mut HashMap<String, StaticFrameCacheEntry>,
         user_color_cache: &mut HashMap<String, Color32>,
     ) {
         // Dispatch non-chat (and non-bits) events to the compact system-event renderer.
@@ -2057,13 +2088,12 @@ impl<'a> MessageList<'a> {
                     msg,
                     dimmed,
                     rctx,
-                    static_frames,
                     user_color_cache,
                 );
                 return;
             }
             _ => {
-                self.render_system_event(ui, msg, static_frames);
+                self.render_system_event(ui, msg);
                 return;
             }
         }
@@ -2291,7 +2321,6 @@ impl<'a> MessageList<'a> {
                                         raw,
                                         size,
                                         Some(url.as_str()),
-                                        static_frames,
                                     )
                                     .on_hover_ui_at_pointer(|ui| {
                                         ui.set_max_width(200.0);
@@ -2452,7 +2481,6 @@ impl<'a> MessageList<'a> {
                                         msg.flags.is_action,
                                         msg,
                                         reply_key,
-                                        static_frames,
                                     );
                                 }
                             }
@@ -2509,7 +2537,6 @@ impl<'a> MessageList<'a> {
         &self,
         ui: &mut Ui,
         msg: &ChatMessage,
-        static_frames: &mut HashMap<String, StaticFrameCacheEntry>,
     ) {
         let automod_row = msg.sender.login.eq_ignore_ascii_case("automod")
             && msg.raw_text.starts_with("AutoMod:");
@@ -2547,7 +2574,6 @@ impl<'a> MessageList<'a> {
                                 raw,
                                 size,
                                 Some(url.as_str()),
-                                static_frames,
                             )
                             .on_hover_ui_at_pointer(|ui| {
                                 ui.set_max_width(200.0);
@@ -2873,7 +2899,6 @@ impl<'a> MessageList<'a> {
         is_action: bool,
         msg: &ChatMessage,
         reply_key: Id,
-        static_frames: &mut HashMap<String, StaticFrameCacheEntry>,
     ) {
         let action_color = t::text_secondary();
         match span {
@@ -2903,22 +2928,12 @@ impl<'a> MessageList<'a> {
 
                     // Capture shared references - string/Arc clones only
                     // happen when the tooltip is actually shown (on hover).
-                    let emote_bytes = self.emote_bytes; // &HashMap - Copy
-                    let cmd_tx = self.cmd_tx; // &Sender  - Copy
+                    let emote_bytes = self.emote_bytes;
 
-                    self.show_image(ui, &url_key, raw, size, Some(url.as_str()), static_frames)
+                    self.show_image(ui, &url_key, raw, size, Some(url.as_str()))
                         .on_hover_ui_at_pointer(|ui| {
                             // Check HD availability at hover time, not every frame.
                             let hd_entry = url_hd.as_deref().and_then(|u| emote_bytes.get(u));
-
-                            // Fire HD fetch once on first hover if not yet loaded.
-                            if hd_entry.is_none() {
-                                if let Some(hd_url) = url_hd.as_deref() {
-                                    let _ = cmd_tx.try_send(AppCommand::FetchImage {
-                                        url: hd_url.to_owned(),
-                                    });
-                                }
-                            }
 
                             let (tt_key, tt_raw, tt_w, tt_h) = match hd_entry {
                                 Some(&(hw, hh, ref href)) => (
@@ -2967,7 +2982,7 @@ impl<'a> MessageList<'a> {
                     let size = fit_size(w, h, EMOTE_SIZE);
                     let tooltip_size = fit_size(w, h, TOOLTIP_EMOTE_SIZE);
                     let url_key = super::bytes_uri(url, raw);
-                    self.show_image(ui, &url_key, raw, size, Some(url.as_str()), static_frames)
+                    self.show_image(ui, &url_key, raw, size, Some(url.as_str()))
                         .on_hover_ui_at_pointer(|ui| {
                             ui.set_max_width(200.0);
                             ui.vertical_centered(|ui| {
@@ -3073,7 +3088,6 @@ impl<'a> MessageList<'a> {
                                                     raw,
                                                     size,
                                                     Some(thumb.as_str()),
-                                                    static_frames,
                                                 );
                                             });
                                         ui.add_space(4.0);
@@ -3135,7 +3149,6 @@ impl<'a> MessageList<'a> {
         msg: &ChatMessage,
         dimmed: bool,
         rctx: &RenderCtx,
-        static_frames: &mut HashMap<String, StaticFrameCacheEntry>,
         user_color_cache: &mut HashMap<String, Color32>,
     ) {
         let reply_key = rctx.reply_key;
@@ -3359,7 +3372,6 @@ impl<'a> MessageList<'a> {
                                         msg.flags.is_action,
                                         msg,
                                         reply_key,
-                                        static_frames,
                                     );
                                 }
                             }
@@ -3400,40 +3412,23 @@ impl<'a> MessageList<'a> {
         raw: &Arc<[u8]>,
         size: Vec2,
         url_hint: Option<&str>,
-        static_frames: &mut HashMap<String, StaticFrameCacheEntry>,
     ) -> egui::Response {
         let cache_key = url_hint.unwrap_or(uri);
         let is_animated =
             url_hint.map(is_likely_animated_url).unwrap_or(false) || is_likely_animated_bytes(raw);
 
         if is_animated && !self.animate_emotes {
-            if !static_frames.contains_key(cache_key) {
-                let entry = if let Some(img) = decode_static_frame(raw) {
-                    let tex = ui.ctx().load_texture(
-                        format!("ml-static://{cache_key}"),
-                        img,
-                        egui::TextureOptions::LINEAR,
-                    );
-                    StaticFrameCacheEntry::Loaded(tex)
-                } else {
-                    StaticFrameCacheEntry::Unavailable
-                };
-                static_frames.insert(cache_key.to_owned(), entry);
+            if let Some(tex) = self.emote_bytes.static_texture(ui.ctx(), cache_key) {
+                let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+                ui.painter().image(
+                    tex.id(),
+                    rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    t::text_on_accent(),
+                );
+                return resp;
             }
-
-            if let Some(entry) = static_frames.get(cache_key) {
-                if let StaticFrameCacheEntry::Loaded(tex) = entry {
-                    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
-                    ui.painter().image(
-                        tex.id(),
-                        rect,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        t::text_on_accent(),
-                    );
-                    return resp;
-                }
-                return show_image_placeholder(ui, size);
-            }
+            return show_image_placeholder(ui, size);
         }
 
         if is_animated && self.animate_emotes {
@@ -3670,19 +3665,6 @@ fn is_likely_animated_bytes(raw: &[u8]) -> bool {
     is_webp && raw.windows(4).any(|w| w == b"ANIM")
 }
 
-fn decode_static_frame(raw: &[u8]) -> Option<egui::ColorImage> {
-    let img = image::load_from_memory(raw).ok()?;
-    dynamic_image_to_color_image(img)
-}
-
-fn dynamic_image_to_color_image(img: DynamicImage) -> Option<egui::ColorImage> {
-    let rgba = img.to_rgba8();
-    let w = usize::try_from(rgba.width()).ok()?;
-    let h = usize::try_from(rgba.height()).ok()?;
-    let pixels = rgba.into_raw();
-    Some(egui::ColorImage::from_rgba_unmultiplied([w, h], &pixels))
-}
-
 fn show_image_placeholder(ui: &mut Ui, size: Vec2) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
     ui.painter()
@@ -3754,8 +3736,8 @@ fn show_sender_name(
     name: &str,
     fallback_color: Color32,
     paint: Option<&SenderNamePaint>,
-    emote_bytes: &HashMap<String, (u32, u32, Arc<[u8]>)>,
-    cmd_tx: &mpsc::Sender<AppCommand>,
+    emote_bytes: &UiImageCache,
+    cmd_tx: &UiCommandSender,
 ) -> egui::Response {
     let fallback_color =
         Color32::from_rgb(fallback_color.r(), fallback_color.g(), fallback_color.b());
@@ -3833,50 +3815,21 @@ fn show_sender_name(
     )
 }
 
-#[derive(Clone)]
-struct UrlPaintSampler {
-    width: u32,
-    height: u32,
-    rgba: Arc<[u8]>,
-}
+type UrlPaintSampler = crate::image_cache::RgbaImage;
 
 fn url_paint_sampler(
-    ui: &Ui,
+    _ui: &Ui,
     paint: &SenderNamePaint,
-    emote_bytes: &HashMap<String, (u32, u32, Arc<[u8]>)>,
-    cmd_tx: &mpsc::Sender<AppCommand>,
-) -> Option<UrlPaintSampler> {
+    emote_bytes: &UiImageCache,
+    _cmd_tx: &UiCommandSender,
+) -> Option<Arc<UrlPaintSampler>> {
     let function = paint.function.trim();
     if !function.eq_ignore_ascii_case("url") && !function.eq_ignore_ascii_case("image") {
         return None;
     }
     let raw_url = paint.image_url.as_ref()?;
     let url = normalize_external_image_url(raw_url)?;
-    if !emote_bytes.contains_key(url.as_str()) {
-        let _ = cmd_tx.try_send(AppCommand::FetchImage { url: url.clone() });
-        return None;
-    }
-
-    let cache_key = Id::new("ml_url_paint_sampler").with(url.as_str());
-    if let Some(cached) = ui
-        .ctx()
-        .data_mut(|d| d.get_temp::<UrlPaintSampler>(cache_key))
-    {
-        return Some(cached);
-    }
-
-    let (_w, _h, raw) = emote_bytes.get(url.as_str())?;
-    let decoded = image::load_from_memory(raw).ok()?.to_rgba8();
-    let (dw, dh) = decoded.dimensions();
-    let rgba: Arc<[u8]> = decoded.into_raw().into();
-    let sampler = UrlPaintSampler {
-        width: dw.max(1),
-        height: dh.max(1),
-        rgba,
-    };
-    ui.ctx()
-        .data_mut(|d| d.insert_temp(cache_key, sampler.clone()));
-    Some(sampler)
+    emote_bytes.rgba_image(&url)
 }
 
 fn normalize_external_image_url(url: &str) -> Option<String> {
@@ -4306,7 +4259,7 @@ fn message_badges(msg: &ChatMessage) -> impl Iterator<Item = (&Badge, bool)> {
 fn render_shared_chat_chip(
     ui: &mut Ui,
     shared: &crust_core::model::SharedChatSource,
-    emote_bytes: &HashMap<String, (u32, u32, Arc<[u8]>)>,
+    emote_bytes: &UiImageCache,
 ) {
     let who = shared
         .display_name
@@ -4981,6 +4934,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             channel: ChannelId::new("rustlang"),
             sender: Sender {
+                original_display_name: None,
                 user_id: UserId(user_id.to_owned()),
                 login: login.to_owned(),
                 display_name: login.to_owned(),
@@ -5003,23 +4957,35 @@ mod tests {
         messages: &VecDeque<ChatMessage>,
         filters: &[crust_core::model::filters::CompiledFilter],
     ) -> MessageListPerfStats {
+        render_test_messages_with(ctx, messages, filters, 500.0, |_| {})
+    }
+
+    fn render_test_messages_with(
+        ctx: &egui::Context,
+        messages: &VecDeque<ChatMessage>,
+        filters: &[crust_core::model::filters::CompiledFilter],
+        width: f32,
+        configure: impl FnOnce(&mut MessageList<'_>),
+    ) -> MessageListPerfStats {
         let channel = ChannelId::new("rustlang");
-        let images = HashMap::new();
+        let images = UiImageCache::default();
         let previews = HashMap::new();
         let ignored_logins = HashSet::new();
         let ignored_users = crust_core::ignores::CompiledIgnoredUsers::new(&[]);
         let low_trust = HashMap::new();
-        let (tx, _rx) = mpsc::channel(1);
-        let list = MessageList::new(
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let tx = UiCommandSender::new(tx);
+        let mut list = MessageList::new(
             messages, &images, &tx, &channel, &previews, None,
             false, 3, false, false, false, true, false,
             &ignored_logins, &ignored_users, &[], filters, &[], &low_trust,
         );
+        configure(&mut list);
         let mut stats = MessageListPerfStats::default();
         let _ = ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO, egui::vec2(500.0, 400.0),
+                    egui::Pos2::ZERO, egui::vec2(width, 400.0),
                 )),
                 ..Default::default()
             },
@@ -5030,6 +4996,140 @@ mod tests {
             },
         );
         stats
+    }
+
+    fn test_buffer(first_id: u64, count: usize) -> VecDeque<ChatMessage> {
+        (first_id..first_id + count as u64)
+            .map(|id| {
+                let mut message = test_msg("sender", "1", None);
+                message.id = MessageId(id);
+                message
+            })
+            .collect()
+    }
+
+    #[test]
+    fn row_height_cache_stays_bounded_as_old_messages_leave_the_buffer() {
+        let ctx = egui::Context::default();
+        let cache_key = Id::new("msg_row_h").with("rustlang");
+        for batch in 0..32 {
+            let messages = test_buffer(1 + batch * 64, 64);
+            render_test_messages(&ctx, &messages, &[]);
+            render_test_messages(&ctx, &messages, &[]);
+            let heights: HashMap<u64, f32> = ctx.data_mut(|d| d.get_temp(cache_key).unwrap());
+            assert!(heights.len() <= messages.len() + ROW_HEIGHT_CACHE_SLACK);
+            assert!(messages.iter().any(|message| heights.contains_key(&message.id.0)));
+        }
+    }
+
+    #[test]
+    fn unchanged_virtual_rows_reuse_the_prefix_and_id_storage() {
+        let ctx = egui::Context::default();
+        let messages = test_buffer(1, 100);
+        for _ in 0..6 {
+            render_test_messages(&ctx, &messages, &[]);
+        }
+        let ids_key = Id::new("msg_active_ids").with("rustlang");
+        let original = ctx.data_mut(|d| {
+            let ids: Vec<u64> = d.remove_temp(ids_key).unwrap();
+            let pointer = ids.as_ptr();
+            d.insert_temp(ids_key, ids);
+            pointer
+        });
+        assert!(!render_test_messages(&ctx, &messages, &[]).prefix_rebuilt);
+        ctx.data_mut(|d| {
+            let ids: Vec<u64> = d.remove_temp(ids_key).unwrap();
+            assert_eq!(ids.as_ptr(), original);
+            d.insert_temp(ids_key, ids);
+        });
+    }
+
+    #[test]
+    fn width_changes_invalidate_the_prefix_in_the_same_frame() {
+        let ctx = egui::Context::default();
+        let messages = test_buffer(1, 100);
+        for _ in 0..6 {
+            render_test_messages(&ctx, &messages, &[]);
+        }
+        assert!(!render_test_messages(&ctx, &messages, &[]).prefix_rebuilt);
+        assert!(render_test_messages_with(&ctx, &messages, &[], 499.0, |_| {}).prefix_rebuilt);
+    }
+
+    #[test]
+    fn font_changes_discard_offscreen_row_measurements() {
+        let ctx = egui::Context::default();
+        let messages = test_buffer(1, 100);
+        let cache_key = Id::new("msg_row_h").with("rustlang");
+        for target in [1, 100] {
+            for _ in 0..4 {
+                render_test_messages_with(&ctx, &messages, &[], 500.0, |list| {
+                    list.scroll_to = Some(MessageId(target));
+                });
+            }
+        }
+        assert!(ctx.data_mut(|d| d.get_temp::<HashMap<u64, f32>>(cache_key).unwrap().contains_key(&1)));
+        ctx.style_mut(|style| {
+            style.text_styles.get_mut(&egui::TextStyle::Body).unwrap().size += 8.0;
+        });
+        let stats = render_test_messages_with(&ctx, &messages, &[], 500.0, |list| {
+            list.scroll_to = Some(MessageId(100));
+        });
+        assert!(stats.prefix_rebuilt);
+        assert!(!ctx.data_mut(|d| d.get_temp::<HashMap<u64, f32>>(cache_key).unwrap().contains_key(&1)));
+    }
+
+    #[test]
+    fn row_display_settings_invalidate_the_prefix() {
+        let ctx = egui::Context::default();
+        let messages = test_buffer(1, 100);
+        for _ in 0..6 {
+            render_test_messages(&ctx, &messages, &[]);
+        }
+        assert!(render_test_messages_with(&ctx, &messages, &[], 500.0, |list| {
+            list.show_timestamps = true;
+        }).prefix_rebuilt);
+        assert!(render_test_messages_with(&ctx, &messages, &[], 500.0, |list| {
+            list.show_timestamps = true;
+            list.show_timestamp_seconds = true;
+            list.collapse_long_messages = true;
+        }).prefix_rebuilt);
+    }
+
+    #[test]
+    fn interior_filter_changes_rebuild_the_prefix_with_unchanged_endpoints() {
+        use crust_core::model::filters::{compile_filters, FilterRecord, FilterScope};
+
+        let ctx = egui::Context::default();
+        let mut messages = test_buffer(1, 100);
+        messages[9].raw_text = "hide-first".to_owned();
+        messages[10].raw_text = "hide-second".to_owned();
+        let first = compile_filters(&[FilterRecord::new("first", "hide-first", FilterScope::Global)]);
+        let second = compile_filters(&[FilterRecord::new("second", "hide-second", FilterScope::Global)]);
+        for _ in 0..6 {
+            render_test_messages(&ctx, &messages, &first);
+        }
+        assert!(!render_test_messages(&ctx, &messages, &first).prefix_rebuilt);
+        let stats = render_test_messages(&ctx, &messages, &second);
+        assert_eq!(stats.retained_rows, 99);
+        assert!(stats.prefix_rebuilt);
+    }
+
+    #[test]
+    fn external_message_jump_opens_the_older_history_window() {
+        let ctx = egui::Context::default();
+        let messages = test_buffer(1, 900);
+        let stats = render_test_messages_with(&ctx, &messages, &[], 500.0, |list| {
+            list.scroll_to = Some(MessageId(10));
+        });
+        assert_eq!(stats.active_rows, messages.len());
+        assert_eq!(stats.boundary_hidden_rows, 0);
+        let heights: HashMap<u64, f32> = ctx.data_mut(|d| {
+            d.get_temp(Id::new("msg_row_h").with("rustlang")).unwrap()
+        });
+        assert!(heights.contains_key(&10));
+        let next_frame = render_test_messages(&ctx, &messages, &[]);
+        assert_eq!(next_frame.active_rows, messages.len());
+        assert_eq!(next_frame.boundary_hidden_rows, 0);
     }
 
     #[test]

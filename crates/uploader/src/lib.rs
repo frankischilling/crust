@@ -1,10 +1,11 @@
 //! Image upload engine.
 //!
-//! Chatterino-compatible: POSTs a multipart form to a configurable endpoint,
-//! then uses dotted-path JSON extraction on the response to interpolate a
+//! POSTs a multipart form to a configurable endpoint, then uses dotted-path
+//! JSON extraction on the response to interpolate a
 //! pattern into the final image link and (optional) deletion link.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use directories::ProjectDirs;
@@ -48,7 +49,7 @@ pub struct UploaderConfig {
 
 impl Default for UploaderConfig {
     fn default() -> Self {
-        // Chatterino default: Nuuls. No auth, no deletion URL.
+        // Nuuls accepts uploads without authentication or a deletion URL.
         Self {
             endpoint: "https://i.nuuls.com/upload".to_owned(),
             request_form_field: "attachment".to_owned(),
@@ -110,18 +111,15 @@ pub fn get_json_value(root: &Value, pattern: &str) -> String {
 }
 
 /// Replace `{foo.bar.1}` placeholders in `pattern` with values pulled from
-/// `root` via [`get_json_value`].
+/// `root` via [`get_json_value`]. Response values are inserted literally.
 pub fn interpolate(pattern: &str, root: &Value) -> String {
-    let re = Regex::new(r"\{([^{}]+?)\}").expect("static regex");
-    let mut out = pattern.to_owned();
-    loop {
-        let Some(m) = re.find(&out) else { break };
-        let range = m.range();
-        let path = &out[range.start + 1..range.end - 1].to_owned();
-        let repl = get_json_value(root, path);
-        out.replace_range(range, &repl);
-    }
-    out
+    static PLACEHOLDER: OnceLock<Regex> = OnceLock::new();
+    PLACEHOLDER
+        .get_or_init(|| Regex::new(r"\{([^{}]+?)\}").expect("static regex"))
+        .replace_all(pattern, |captures: &regex::Captures<'_>| {
+            get_json_value(root, &captures[1])
+        })
+        .into_owned()
 }
 
 /// Parse a freeform `Name: value` per-line string into header tuples.
@@ -189,12 +187,17 @@ pub async fn upload_image(
         });
     }
 
+    let root = if cfg.image_link_json_path.trim().is_empty()
+        && cfg.deletion_link_json_path.trim().is_empty()
+    {
+        None
+    } else {
+        Some(serde_json::from_str::<Value>(&body).map_err(|e| UploadError::Json(e.to_string()))?)
+    };
     let image_url = if cfg.image_link_json_path.trim().is_empty() {
         body.trim().to_owned()
     } else {
-        let root: Value =
-            serde_json::from_str(&body).map_err(|e| UploadError::Json(e.to_string()))?;
-        interpolate(&cfg.image_link_json_path, &root)
+        interpolate(&cfg.image_link_json_path, root.as_ref().expect("JSON pattern"))
     };
     if image_url.is_empty() {
         return Err(UploadError::EmptyLink);
@@ -203,9 +206,10 @@ pub async fn upload_image(
     let deletion_url = if cfg.deletion_link_json_path.trim().is_empty() {
         None
     } else {
-        let root: Value =
-            serde_json::from_str(&body).map_err(|e| UploadError::Json(e.to_string()))?;
-        let d = interpolate(&cfg.deletion_link_json_path, &root);
+        let d = interpolate(
+            &cfg.deletion_link_json_path,
+            root.as_ref().expect("JSON pattern"),
+        );
         if d.is_empty() {
             None
         } else {
@@ -254,6 +258,27 @@ mod tests {
         let v = json!({"foo": {"bar": [1, "baz", "qox"]}});
         let out = interpolate("https://x.y/{foo.bar.1}.{foo.bar.2}", &v);
         assert_eq!(out, "https://x.y/baz.qox");
+    }
+
+    #[test]
+    fn interpolate_keeps_response_placeholders_literal() {
+        let v = json!({"link": "https://example.test/{link}.png"});
+        assert_eq!(interpolate("{link}", &v), "https://example.test/{link}.png");
+    }
+
+    #[test]
+    fn interpolate_does_not_follow_response_cycles_or_expand_dollars() {
+        let v = json!({"a": "{b}", "b": "{a}", "literal": "$1 ${name}"});
+        assert_eq!(interpolate("{a}/{b}/{literal}", &v), "{b}/{a}/$1 ${name}");
+    }
+
+    #[test]
+    fn interpolate_preserves_repeated_patterns_and_missing_fields() {
+        let v = json!({"id": "abc", "name": "café"});
+        assert_eq!(
+            interpolate("/{id}/{missing}/{id}/{name}", &v),
+            "/abc//abc/café"
+        );
     }
 
     #[test]

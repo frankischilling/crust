@@ -832,6 +832,7 @@ mod tests {
             timestamp,
             channel: ChannelId::new("test"),
             sender: Sender {
+                original_display_name: None,
                 user_id: UserId(login.to_owned()),
                 login: login.to_owned(),
                 display_name: login.to_owned(),

@@ -1,9 +1,10 @@
+use crate::image_cache::UiImageCache;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use chrono::{DateTime, Local, Utc};
 use egui::{CentralPanel, Color32, Context, Frame, Margin, RichText, SidePanel, TopBottomPanel};
-use image::DynamicImage;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tracing::warn;
@@ -59,6 +60,7 @@ use crate::widgets::{
     },
     split_header::{show_split_header, split_header_height},
     user_profile_popup::{PopupAction, UserProfilePopup},
+    unsent_messages::{UnsentMessage, UnsentMessages},
 };
 
 // Channel layout mode
@@ -102,6 +104,146 @@ const LOCAL_HISTORY_SEARCH_PAGE: usize = 800;
 const MAX_WHISPERS_PER_THREAD: usize = 250;
 const WHISPER_EMOTE_SIZE: f32 = 20.0;
 const QUICK_SWITCH_MAX_ROWS: usize = 10;
+const MAX_DEFERRED_COMMANDS: usize = 128;
+const MAX_DEFERRED_UPLOAD_BYTES: usize = 32 * 1024 * 1024;
+const MAX_COMMANDS_PER_FRAME: usize = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandQueueError {
+    Full,
+    Closed,
+}
+
+impl CommandQueueError {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Full => "Crust is busy. The last action was not queued; try again in a moment.",
+            Self::Closed => "The background service stopped. Pending actions could not be completed.",
+        }
+    }
+}
+
+/// A small UI-owned backlog keeps a full runtime channel from blocking a frame.
+/// New actions join the back until older actions have reached the runtime.
+#[derive(Default)]
+struct DeferredCommands {
+    commands: VecDeque<AppCommand>,
+    upload_bytes: usize,
+    error: Option<CommandQueueError>,
+}
+
+impl DeferredCommands {
+    fn upload_size(command: &AppCommand) -> usize {
+        match command {
+            AppCommand::UploadImage { bytes, .. } => bytes.len(),
+            _ => 0,
+        }
+    }
+
+    fn closed(&mut self) {
+        self.commands.clear();
+        self.upload_bytes = 0;
+        self.error = Some(CommandQueueError::Closed);
+    }
+
+    fn send(&mut self, sender: &mpsc::Sender<AppCommand>, command: AppCommand) -> bool {
+        if sender.is_closed() {
+            self.closed();
+            return false;
+        }
+        let command = if self.commands.is_empty() {
+            match sender.try_send(command) {
+                Ok(()) => return true,
+                Err(TrySendError::Full(command)) => command,
+                Err(TrySendError::Closed(_)) => {
+                    self.closed();
+                    return false;
+                }
+            }
+        } else {
+            command
+        };
+        let upload_size = Self::upload_size(&command);
+        if self.commands.len() >= MAX_DEFERRED_COMMANDS
+            || upload_size > MAX_DEFERRED_UPLOAD_BYTES.saturating_sub(self.upload_bytes)
+        {
+            self.error = Some(CommandQueueError::Full);
+            return false;
+        }
+        self.upload_bytes += upload_size;
+        self.commands.push_back(command);
+        true
+    }
+
+    fn flush(&mut self, sender: &mpsc::Sender<AppCommand>) {
+        for _ in 0..MAX_COMMANDS_PER_FRAME {
+            let Some(command) = self.commands.pop_front() else {
+                break;
+            };
+            let upload_size = Self::upload_size(&command);
+            match sender.try_send(command) {
+                Ok(()) => self.upload_bytes -= upload_size,
+                Err(TrySendError::Full(command)) => {
+                    self.commands.push_front(command);
+                    break;
+                }
+                Err(TrySendError::Closed(_)) => {
+                    self.closed();
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Shared by the app and its widgets so every UI action joins the same FIFO.
+pub struct UiCommandSender {
+    sender: mpsc::Sender<AppCommand>,
+    deferred: RefCell<DeferredCommands>,
+    repaint_context: RefCell<Option<Context>>,
+}
+
+impl UiCommandSender {
+    pub fn new(sender: mpsc::Sender<AppCommand>) -> Self {
+        Self {
+            sender,
+            deferred: RefCell::new(DeferredCommands::default()),
+            repaint_context: RefCell::new(None),
+        }
+    }
+
+    pub fn try_send(&self, command: AppCommand) -> Result<(), CommandQueueError> {
+        let mut queue = self.deferred.borrow_mut();
+        let accepted = queue.send(&self.sender, command);
+        if let Some(ctx) = self.repaint_context.borrow().as_ref() {
+            if !accepted {
+                ctx.request_repaint();
+            } else if !queue.commands.is_empty() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(REPAINT_ANIM_MS));
+            }
+        }
+        if accepted {
+            Ok(())
+        } else {
+            Err(queue.error.expect("a rejected command records its reason"))
+        }
+    }
+
+    /// Retryable background work waits until user actions have reached the runtime.
+    pub fn try_send_background(&self, command: AppCommand) -> bool {
+        self.deferred.borrow().commands.is_empty() && self.sender.try_send(command).is_ok()
+    }
+
+    fn flush(&mut self, ctx: &Context) -> Option<CommandQueueError> {
+        self.repaint_context.get_mut().get_or_insert_with(|| ctx.clone());
+        let queue = self.deferred.get_mut();
+        queue.flush(&self.sender);
+        if !queue.commands.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(REPAINT_ANIM_MS));
+        }
+        queue.error.take()
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ResponsiveLayout {
@@ -869,9 +1011,11 @@ const MAX_TRACKED_CHATTERS: usize = 5_000;
 
 pub struct CrustApp {
     pub state: AppState,
-    cmd_tx: mpsc::Sender<AppCommand>,
+    cmd_tx: UiCommandSender,
     event_rx: mpsc::Receiver<AppEvent>,
-    emote_bytes: HashMap<String, (u32, u32, Arc<[u8]>)>,
+    pending_auth: Option<String>,
+    unsent_messages: UnsentMessages,
+    emote_bytes: UiImageCache,
     join_dialog: JoinDialog,
     login_dialog: LoginDialog,
     quick_switch: ChannelQuickSwitch,
@@ -885,9 +1029,6 @@ pub struct CrustApp {
     user_profile_popup: UserProfilePopup,
     /// Cached link previews (Open-Graph metadata) keyed by URL.
     link_previews: HashMap<String, LinkPreview>,
-    /// Running total of raw emote bytes - updated incrementally on EmoteImageReady
-    /// so we don't iterate the entire map every frame.
-    emote_ram_bytes: usize,
     /// Chat message history for Up/Down arrow recall.
     message_history: Vec<String>,
     /// Slash command usage frequency for autocomplete ranking.
@@ -998,8 +1139,8 @@ pub struct CrustApp {
     usercard_font_size: f32,
     /// Login / dialog helper-text size (pt). 0.0 = auto.
     dialog_font_size: f32,
-    /// Tracks the `pixels_per_point` we last pushed to the ctx so we don't spam it.
-    applied_pixels_per_point: f32,
+    /// UI zoom last applied on top of the monitor's native pixel density.
+    applied_ui_zoom: f32,
     /// Channel key persisted from the previous session. Activated once the
     /// channel finishes joining and appears in `state.channels`.
     pending_restore_channel: Option<String>,
@@ -1155,8 +1296,6 @@ pub struct CrustApp {
     auto_join_buf: String,
     /// 7TV animated avatar URLs keyed by Twitch user ID.
     stv_avatars: HashMap<String, String>,
-    /// Cached static avatar textures used to freeze animated avatars in always-visible UI.
-    static_avatar_frames: HashMap<String, egui::TextureHandle>,
     /// Split-pane state for multi-channel side-by-side view.
     split_panes: SplitPanes,
     /// Per-channel message search and filter state.
@@ -1412,7 +1551,26 @@ fn consume_binding(input: &mut egui::InputState, binding: &crust_core::KeyBindin
     let Some(key) = egui_key_from_name(&binding.key) else {
         return false;
     };
-    input.consume_key(binding_modifiers(binding), key)
+    consume_exact_key(input, binding_modifiers(binding), key)
+}
+
+pub(crate) fn consume_exact_key(
+    input: &mut egui::InputState,
+    modifiers: egui::Modifiers,
+    key: egui::Key,
+) -> bool {
+    let mut consumed = false;
+    input.events.retain(|event| {
+        let matches = matches!(event, egui::Event::Key {
+            key: event_key,
+            pressed: true,
+            modifiers: event_modifiers,
+            ..
+        } if *event_key == key && event_modifiers.matches_exact(modifiers));
+        consumed |= matches;
+        !matches
+    });
+    consumed
 }
 
 impl CrustApp {
@@ -1432,11 +1590,20 @@ impl CrustApp {
         // right-click context menu doesn't stall.
         crate::spellcheck::init();
 
+        Self::with_event_channels(cmd_tx, event_rx)
+    }
+
+    fn with_event_channels(
+        cmd_tx: mpsc::Sender<AppCommand>,
+        event_rx: mpsc::Receiver<AppEvent>,
+    ) -> Self {
         Self {
             state: AppState::default(),
-            cmd_tx,
+            cmd_tx: UiCommandSender::new(cmd_tx),
             event_rx,
-            emote_bytes: HashMap::new(),
+            pending_auth: None,
+            unsent_messages: UnsentMessages::default(),
+            emote_bytes: UiImageCache::default(),
             join_dialog: JoinDialog::default(),
             login_dialog: LoginDialog::default(),
             quick_switch: ChannelQuickSwitch::default(),
@@ -1447,7 +1614,6 @@ impl CrustApp {
             pending_reply: None,
             user_profile_popup: UserProfilePopup::default(),
             link_previews: HashMap::new(),
-            emote_ram_bytes: 0,
             message_history: Vec::new(),
             slash_usage_counts: HashMap::new(),
             sidebar_visible: true,
@@ -1501,7 +1667,7 @@ impl CrustApp {
             chips_font_size: t::chips_font_size_raw(),
             usercard_font_size: t::usercard_font_size_raw(),
             dialog_font_size: t::dialog_font_size_raw(),
-            applied_pixels_per_point: 0.0,
+            applied_ui_zoom: 0.0,
             pending_restore_channel: None,
             last_saved_active_channel: None,
             pending_restore_channel_order: Vec::new(),
@@ -1571,7 +1737,6 @@ impl CrustApp {
             ignores_buf: String::new(),
             auto_join_buf: String::new(),
             stv_avatars: HashMap::new(),
-            static_avatar_frames: HashMap::new(),
             split_panes: SplitPanes::default(),
             message_search: HashMap::new(),
             global_search: GlobalSearchState::default(),
@@ -3153,24 +3318,25 @@ exit 1
     /// Re-apply the current nickname alias list to every cached message, so a
     /// newly added/removed alias takes effect without needing a reconnect.
     fn reapply_nicknames_to_cached_messages(&mut self) {
-        // Fast path: no aliases configured (including the empty event at
-        // startup), so there's nothing to rewrite and we skip the full
-        // cross-channel message walk.
-        if self.nicknames.is_empty() {
-            return;
-        }
+        self.global_search.invalidate();
         let nicknames = &self.nicknames;
         for (channel, ch_state) in self.state.channels.iter_mut() {
-            let channel_login = channel.display_name().to_owned();
             for msg in ch_state.messages.iter_mut() {
-                crust_core::model::apply_nickname(
+                crust_core::model::apply_sender_nickname(
                     nicknames,
-                    &msg.sender.login,
-                    &channel_login,
-                    &mut msg.sender.display_name,
+                    channel.display_name(),
+                    &mut msg.sender,
                 );
             }
         }
+        for msg in &mut self.state.mentions {
+            crust_core::model::apply_sender_nickname(
+                nicknames,
+                msg.channel.display_name(),
+                &mut msg.sender,
+            );
+        }
+        self.user_profile_popup.apply_nicknames(nicknames);
     }
 
     fn whisper_message_mentions_current_user(&self, spans: &[Span], text: &str) -> bool {
@@ -3731,6 +3897,7 @@ exit 1
 
     fn apply_event(&mut self, evt: AppEvent, ctx: &Context) {
         self.irc_status_panel.on_event(&evt);
+        self.global_search.on_event(&evt);
 
         // Feed the loading screen before the main state update.
         match &evt {
@@ -3970,6 +4137,11 @@ exit 1
                     }
                 }
                 let is_active = self.state.active_channel.as_ref() == Some(&channel);
+                crust_core::model::apply_sender_nickname(
+                    &self.nicknames,
+                    channel.display_name(),
+                    &mut message.sender,
+                );
 
                 let channel_live = self
                     .live_map_cache
@@ -4308,15 +4480,7 @@ exit 1
             } => {
                 self.whisper_pending_images.remove(&uri);
                 self.live_feed_pending_thumbnails.remove(&uri);
-                // Stub events (empty bytes) are emitted by failed fetches just
-                // to advance the loading-screen image counter; skip actual insert.
-                if !raw_bytes.is_empty() {
-                    let byte_len = raw_bytes.len();
-                    self.emote_bytes.entry(uri).or_insert_with(|| {
-                        self.emote_ram_bytes += byte_len;
-                        (width, height, Arc::from(raw_bytes.as_slice()))
-                    });
-                }
+                self.emote_bytes.complete(ctx, uri, width, height, raw_bytes);
             }
             AppEvent::EmoteCatalogUpdated { mut emotes } => {
                 // `sort_by_cached_key` evaluates the key once per element (O(n))
@@ -4407,7 +4571,27 @@ exit 1
                     }
                 }
             }
+            AppEvent::AuthenticationPending { username } => {
+                self.pending_auth = Some(username.unwrap_or_default());
+            }
+            AppEvent::MessageSendRejected { channel, text, reply_to_msg_id, reply, reason } => {
+                let message = UnsentMessage { channel, text, reply_to_msg_id, reply, reason };
+                let editing_this_frame = ctx.input(|input| input.events.iter().any(|event| {
+                    matches!(event, egui::Event::Text(_) | egui::Event::Paste(_)
+                        | egui::Event::Key { pressed: true, .. })
+                }));
+                if !editing_this_frame && self.restore_unsent_message(&message) {
+                    self.push_event_toast(
+                        format!("Message to #{} was not sent. Your draft was restored. {}", message.channel.display_name(), message.reason),
+                        t::red(),
+                        false,
+                    );
+                } else {
+                    self.unsent_messages.push(message);
+                }
+            }
             AppEvent::Authenticated { username, user_id } => {
+                self.pending_auth = None;
                 self.auth_refresh_inflight = false;
                 // Clear the previous account's avatar so it doesn't flash
                 // while the new one is fetched.
@@ -4425,6 +4609,7 @@ exit 1
                 }
             }
             AppEvent::LoggedOut => {
+                self.pending_auth = None;
                 self.auth_refresh_inflight = false;
                 self.state.auth.logged_in = false;
                 self.state.auth.username = None;
@@ -4443,6 +4628,12 @@ exit 1
                 }
             }
             AppEvent::Error { context, message } => {
+                if matches!(context.as_str(), "Login" | "AddAccount" | "SwitchAccount") {
+                    self.pending_auth = None;
+                }
+                if context == "RefreshAuth" {
+                    self.auth_refresh_inflight = false;
+                }
                 tracing::error!("[{context}] {message}");
                 // Inject a visible error notice into the active channel so the
                 // user doesn't have to watch the terminal to see what went wrong.
@@ -4539,13 +4730,27 @@ exit 1
                 };
                 self.push_event_toast(text, Color32::from_rgb(219, 116, 116), false);
             }
-            AppEvent::MentionsLoaded { messages } => {
+            AppEvent::MentionsLoaded { mut messages } => {
                 // Backfill the cross-channel Mentions pseudo-tab from the
                 // SQLite log on startup. Merge by timestamp so live mentions
                 // already accumulated during startup interleave correctly.
+                for message in &mut messages {
+                    crust_core::model::apply_sender_nickname(
+                        &self.nicknames,
+                        message.channel.display_name(),
+                        &mut message.sender,
+                    );
+                }
                 self.state.prepend_mentions_history(messages);
             }
-            AppEvent::HistoryLoaded { channel, messages } => {
+            AppEvent::HistoryLoaded { channel, mut messages } => {
+                for message in &mut messages {
+                    crust_core::model::apply_sender_nickname(
+                        &self.nicknames,
+                        channel.display_name(),
+                        &mut message.sender,
+                    );
+                }
                 if let Some(ch) = self.state.channels.get_mut(&channel) {
                     // Scroll to the seam between history and live chat so the
                     // user sees context instead of waking up at the bottom.
@@ -4572,20 +4777,7 @@ exit 1
                     }
                 }
             }
-            AppEvent::UserProfileLoaded { mut profile } => {
-                // Apply nickname alias so the user card shows the custom name.
-                let channel_scope = self
-                    .user_profile_popup
-                    .channel
-                    .as_ref()
-                    .map(|c| c.display_name().to_owned())
-                    .unwrap_or_default();
-                crust_core::model::apply_nickname(
-                    &self.nicknames,
-                    &profile.login,
-                    &channel_scope,
-                    &mut profile.display_name,
-                );
+            AppEvent::UserProfileLoaded { profile } => {
                 // Cache stream status.
                 let login = profile.login.to_lowercase();
                 self.stream_statuses.insert(
@@ -4713,6 +4905,7 @@ exit 1
                     let popup_login = profile.login.clone();
                     let popup_channel = self.user_profile_popup.channel.clone();
                     self.user_profile_popup.set_profile(profile);
+                    self.user_profile_popup.apply_nicknames(&self.nicknames);
 
                     // Silently fetch follow age via Helix when this is a Twitch
                     // tab so the usercard can show "Follow age" or "Not
@@ -5538,31 +5731,171 @@ exit 1
     /// Prefers a matching split pane; falls back to the classic single-channel
     /// input buffer.
     fn input_buf_for_channel_mut(&mut self, channel: &ChannelId) -> &mut String {
-        if let Some(pane) = self
-            .split_panes
-            .panes
-            .iter_mut()
-            .find(|p| &p.channel == channel)
-        {
-            return &mut pane.input_buf;
+        if self.split_panes.panes.len() > 1 {
+            if let Some(pane) = self.split_panes.panes.iter_mut().find(|p| &p.channel == channel) {
+                return &mut pane.input_buf;
+            }
         }
         &mut self.chat_input_buf
     }
 
     fn send_cmd(&self, cmd: AppCommand) {
-        match self.cmd_tx.try_send(cmd) {
-            Ok(()) => {}
-            Err(TrySendError::Full(cmd)) => {
-                // User actions (send message/slash commands) should not be
-                // silently dropped under transient command bursts.
-                if self.cmd_tx.blocking_send(cmd).is_err() {
-                    warn!("Command channel closed");
+        self.try_send_cmd(cmd);
+    }
+
+    /// Returns false when the action was rejected, so editors can keep drafts.
+    fn try_send_cmd(&self, cmd: AppCommand) -> bool {
+        self.cmd_tx.try_send(cmd).is_ok()
+    }
+
+    fn service_runtime_channels(&mut self, ctx: &Context) -> u32 {
+        // Events can enqueue more commands. Drain events first so a runtime
+        // waiting to publish one can resume and consume its command channel.
+        let events = self.drain_events(ctx);
+        if let Some(error) = self.cmd_tx.flush(ctx) {
+            warn!("{}", error.message());
+            self.push_event_toast(error.message().to_owned(), t::red(), false);
+        }
+        events
+    }
+
+    fn reply_for_composer(&self, channel: &ChannelId, pane: Option<usize>) -> Option<ReplyInfo> {
+        if pane.is_some_and(|pane| pane != self.split_panes.focused) {
+            return None;
+        }
+        self.pending_reply.as_ref().filter(|reply| &reply.channel == channel)
+            .map(|reply| reply.info.clone())
+    }
+
+    fn unsent_input_pane(&self, message: &UnsentMessage) -> Option<Option<usize>> {
+        if self.pending_reply.is_some() {
+            return None;
+        }
+        if self.split_panes.panes.len() <= 1 {
+            return (self.state.active_channel.as_ref() == Some(&message.channel)
+                && self.chat_input_buf.is_empty()).then_some(None);
+        }
+        self.split_panes.panes.iter().enumerate()
+            .filter(|(index, pane)| pane.channel == message.channel
+                && pane.input_buf.is_empty()
+                && ((message.reply.is_none() && message.reply_to_msg_id.is_none())
+                    || *index == self.split_panes.focused))
+            .min_by_key(|(index, _)| usize::from(*index != self.split_panes.focused))
+            .map(|(index, _)| Some(index))
+    }
+
+    fn restore_unsent_message(&mut self, message: &UnsentMessage) -> bool {
+        let Some(pane) = self.unsent_input_pane(message) else {
+            return false;
+        };
+        if let Some(pane) = pane {
+            self.split_panes.panes[pane].input_buf.clone_from(&message.text);
+        } else {
+            self.chat_input_buf.clone_from(&message.text);
+        }
+        self.pending_reply = message.reply_info().map(|info| PendingReply {
+            channel: message.channel.clone(),
+            info,
+        });
+        true
+    }
+
+    /// Dispatch either composer through the same validation and queue path.
+    /// A rejected submission restores the exact draft in its original pane.
+    fn submit_chat_input(
+        &mut self,
+        channel: &ChannelId,
+        draft: String,
+        reply: Option<ReplyInfo>,
+        input_pane: Option<usize>,
+    ) -> bool {
+        let text = draft.trim();
+        let can_moderate = self.state.channels.get(channel).is_some_and(|ch| ch.is_mod)
+            || self.state.auth.username.as_deref().is_some_and(|login| {
+                login.eq_ignore_ascii_case(channel.display_name())
+            });
+        let chatters_count = self.state.channels.get(channel).map_or(0, |ch| {
+            ch.chatters.len().max(estimate_chatter_count(ch))
+        });
+        let command = match self.expand_outgoing_aliases(text, channel) {
+            Err(error) => error,
+            Ok(expanded) => {
+                let outgoing = expanded.as_deref().unwrap_or(text);
+                let live_channels = collect_live_channel_entries(&self.stream_statuses);
+                let parsed = parse_slash_command(
+                    outgoing,
+                    channel,
+                    reply.as_ref().map(|reply| reply.parent_msg_id.clone()),
+                    reply.clone(),
+                    can_moderate,
+                    chatters_count,
+                    self.kick_beta_enabled,
+                    self.irc_beta_enabled,
+                    self.state.auth.username.as_deref(),
+                    &live_channels,
+                );
+                if self.state.auth.logged_in {
+                    parsed.unwrap_or_else(|| AppCommand::SendMessage {
+                        channel: channel.clone(),
+                        text: outgoing.to_owned(),
+                        reply_to_msg_id: reply.as_ref().map(|reply| reply.parent_msg_id.clone()),
+                        reply: reply.clone(),
+                    })
+                } else {
+                    match parsed {
+                        Some(command) if is_anonymous_local_command(&command) => command,
+                        Some(_) => AppCommand::InjectLocalMessage {
+                            channel: channel.clone(),
+                            text: "Anonymous mode allows local slash commands only. Log in to run server commands or send chat messages. Try /help.".to_owned(),
+                        },
+                        None => AppCommand::InjectLocalMessage {
+                            channel: channel.clone(),
+                            text: if outgoing.trim_start().starts_with('/') {
+                                "That slash command is not available in anonymous mode. Use /help for local commands."
+                            } else {
+                                "Anonymous mode cannot send chat messages. Log in to chat, or run local commands like /help."
+                            }.to_owned(),
+                        },
+                    }
                 }
             }
-            Err(TrySendError::Closed(_)) => {
-                warn!("Command channel closed");
+        };
+
+        let irc_text = match &command {
+            AppCommand::SendMessage { text, .. } if channel.is_irc() => Some(text.clone()),
+            _ => None,
+        };
+        let user_card = match &command {
+            AppCommand::ShowUserCard { login, channel } => Some((login.clone(), channel.clone())),
+            _ => None,
+        };
+        if !self.try_send_cmd(command) {
+            if let Some(pane) = input_pane {
+                self.split_panes.panes[pane].input_buf = draft;
+            } else {
+                self.chat_input_buf = draft;
+            }
+            return false;
+        }
+
+        if reply.is_some() {
+            self.pending_reply = None;
+        }
+        if self.message_history.last().map(String::as_str) != Some(text) {
+            self.message_history.push(text.to_owned());
+            if self.message_history.len() > 100 {
+                self.message_history.remove(0);
             }
         }
+        self.record_slash_usage_from_text(text);
+        if let Some(text) = irc_text {
+            self.irc_status_panel.note_outgoing(channel, &text);
+        }
+        if let Some((login, channel)) = user_card {
+            self.user_profile_popup
+                .set_loading(&login, vec![], Some(channel), can_moderate);
+        }
+        true
     }
 
     /// Apply the user's custom command aliases to `text` before it hits the
@@ -5656,8 +5989,8 @@ exit 1
             );
             return;
         }
-        self.state.active_channel = Some(channel.clone());
-        self.pending_scroll_to_message.insert(channel, msg_id);
+        self.pending_scroll_to_message.insert(channel.clone(), msg_id);
+        self.activate_channel(channel);
     }
 
     fn static_avatar_texture_for(
@@ -5671,19 +6004,7 @@ exit 1
             return None;
         }
 
-        if let Some(tex) = self.static_avatar_frames.get(url) {
-            return Some(tex.clone());
-        }
-
-        let img = decode_static_image_frame(raw)?;
-        let tex = ui.ctx().load_texture(
-            format!("app-avatar-static://{url}"),
-            img,
-            egui::TextureOptions::LINEAR,
-        );
-        self.static_avatar_frames
-            .insert(url.to_owned(), tex.clone());
-        Some(tex)
+        self.emote_bytes.static_texture(ui.ctx(), url)
     }
 
     fn show_topbar_account_button(
@@ -5692,6 +6013,26 @@ exit 1
         compact_account: bool,
         ultra_compact: bool,
     ) {
+        if let Some(username) = self.pending_auth.as_ref() {
+            let tooltip = if username.is_empty() {
+                "Validating your account...".to_owned()
+            } else {
+                format!("Signing in as @{username}...")
+            };
+            let response = if compact_account {
+                chrome::icon_button(ui, ChromeIcon::Account, &tooltip, IconButtonState {
+                    compact: ultra_compact,
+                    ..Default::default()
+                })
+            } else {
+                ui.add(egui::Button::new(RichText::new("Signing in...").font(t::topbar_font())))
+                    .on_hover_text(tooltip)
+            };
+            if response.clicked() {
+                self.login_dialog.toggle();
+            }
+            return;
+        }
         if self.state.auth.logged_in {
             let name = self
                 .state
@@ -5879,9 +6220,9 @@ exit 1
         self.chat_font_size = chat;
         self.ui_font_size = ui;
 
-        if (ui - self.applied_pixels_per_point).abs() > f32::EPSILON {
-            ctx.set_pixels_per_point(ui);
-            self.applied_pixels_per_point = ui;
+        if (ui - self.applied_ui_zoom).abs() > f32::EPSILON {
+            ctx.set_zoom_factor(ui);
+            self.applied_ui_zoom = ui;
         }
     }
 
@@ -5981,10 +6322,6 @@ exit 1
     }
 
     fn handle_search_shortcuts(&mut self, ctx: &Context) {
-        // IMPORTANT: check the global (Ctrl+Shift+F by default) BEFORE the
-        // per-channel search. egui's `consume_key` uses
-        // `matches_logically`, so a binding like Ctrl+Shift+F satisfies a
-        // plain Ctrl+F check. Run the more specific shortcut first.
         let toggle_global = self
             .hotkey_bindings
             .get(crust_core::HotkeyAction::ToggleGlobalSearch);
@@ -6002,10 +6339,6 @@ exit 1
         }
 
         let open_search = ctx.input_mut(|i| consume_binding(i, &open_msg_search));
-        // Escape is a fixed overlay-close gesture: not remappable because
-        // too many overlays rely on it.
-        let close_search =
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         let Some(channel) = self.active_search_target() else {
             return;
         };
@@ -6013,9 +6346,10 @@ exit 1
         if open_search {
             self.message_search_mut(&channel).request_open();
         }
-        if close_search {
-            let search = self.message_search_mut(&channel);
-            if search.open {
+        if let Some(search) = self.message_search.get_mut(&channel) {
+            if search.open
+                && ctx.input_mut(|i| consume_exact_key(i, egui::Modifiers::NONE, egui::Key::Escape))
+            {
                 search.close();
             }
         }
@@ -6731,16 +7065,16 @@ exit 1
         ) = ctx.input_mut(|i| {
             let mut next = consume_binding(i, &next_b);
             if next_legacy {
-                if i.consume_key(egui::Modifiers::CTRL, egui::Key::PageDown)
-                    || i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowRight)
+                if consume_exact_key(i, egui::Modifiers::CTRL, egui::Key::PageDown)
+                    || consume_exact_key(i, egui::Modifiers::ALT, egui::Key::ArrowRight)
                 {
                     next = true;
                 }
             }
             let mut prev = consume_binding(i, &prev_b);
             if prev_legacy {
-                if i.consume_key(egui::Modifiers::CTRL, egui::Key::PageUp)
-                    || i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowLeft)
+                if consume_exact_key(i, egui::Modifiers::CTRL, egui::Key::PageUp)
+                    || consume_exact_key(i, egui::Modifiers::ALT, egui::Key::ArrowLeft)
                 {
                     prev = true;
                 }
@@ -6899,15 +7233,13 @@ exit 1
             if self.emote_bytes.contains_key(&snap.thumbnail_url) {
                 continue;
             }
-            if self
-                .live_feed_pending_thumbnails
-                .insert(snap.thumbnail_url.clone())
+            if !self.live_feed_pending_thumbnails.contains(&snap.thumbnail_url)
+                && self.try_send_cmd(AppCommand::FetchImage {
+                    url: snap.thumbnail_url.clone(),
+                })
             {
-                let _ = self
-                    .cmd_tx
-                    .try_send(crust_core::events::AppCommand::FetchImage {
-                        url: snap.thumbnail_url.clone(),
-                    });
+                self.live_feed_pending_thumbnails
+                    .insert(snap.thumbnail_url.clone());
             }
         }
     }
@@ -6919,32 +7251,23 @@ exit 1
             LiveFeedAction::OpenChannel(login) => {
                 let id = crust_core::ChannelId::new(&login);
                 if self.state.channel_order.contains(&id) {
-                    self.state.active_channel = Some(id);
-                } else {
+                    self.activate_channel(id);
+                } else if self.try_send_cmd(AppCommand::JoinChannel { channel: id.clone() }) {
                     // Navigate to the new tab immediately; the JoinChannel
                     // command's ChannelJoined event arrives later but won't
                     // change `active_channel` since join_channel only sets it
                     // when active_channel is None.
-                    self.state.active_channel = Some(id.clone());
-                    let _ = self
-                        .cmd_tx
-                        .try_send(crust_core::events::AppCommand::JoinChannel { channel: id });
+                    self.state.active_channel = Some(id);
                 }
             }
             LiveFeedAction::Refresh => {
-                let _ = self
-                    .cmd_tx
-                    .try_send(crust_core::events::AppCommand::LiveFeedRefresh);
+                self.send_cmd(AppCommand::LiveFeedRefresh);
             }
             LiveFeedAction::OpenStreamlink(login) => {
-                let _ = self
-                    .cmd_tx
-                    .try_send(crust_core::events::AppCommand::OpenStreamlink { channel: login });
+                self.send_cmd(AppCommand::OpenStreamlink { channel: login });
             }
             LiveFeedAction::OpenInPlayer(login) => {
-                let _ = self
-                    .cmd_tx
-                    .try_send(crust_core::events::AppCommand::OpenPlayer { channel: login });
+                self.send_cmd(AppCommand::OpenPlayer { channel: login });
             }
         }
     }
@@ -6977,6 +7300,7 @@ impl eframe::App for CrustApp {
         // `CRUST_SLOW_FRAME_MS` to an integer (default 100ms) to tune, or a
         // value over 10000 to disable.
         let frame_start = std::time::Instant::now();
+        self.emote_bytes.begin_frame(ctx);
 
         // Keep a cloned ctx handle so non-UI code paths (e.g. activate_channel
         // when triggered by events) can write to egui temp storage and
@@ -7065,7 +7389,7 @@ impl eframe::App for CrustApp {
             self.handle_font_zoom_shortcuts(ctx);
         }
 
-        let events = self.drain_events(ctx);
+        let events = self.service_runtime_channels(ctx);
         let had_events = events > 0;
 
         // Repaint policy:
@@ -7116,7 +7440,7 @@ impl eframe::App for CrustApp {
         let appearance_before = self.appearance_snapshot();
 
         self.perf.emote_count = self.emote_bytes.len();
-        self.perf.emote_ram_kb = self.emote_ram_bytes / 1024;
+        self.perf.emote_ram_kb = self.emote_bytes.byte_len() / 1024;
         self.perf.record_frame(events, had_events);
         let mut frame_chat_stats = ChatPerfStats::default();
 
@@ -7869,8 +8193,11 @@ impl eframe::App for CrustApp {
                 let compact_account = visibility.compact_account;
                 let sidebar_open =
                     self.channel_layout == ChannelLayout::Sidebar && self.sidebar_visible;
-                let (dot_color, conn_label) =
-                    connection_indicator(&self.state.connection, self.state.auth.logged_in);
+                let (dot_color, conn_label) = if self.pending_auth.is_some() {
+                    (t::yellow(), "Signing in...")
+                } else {
+                    connection_indicator(&self.state.connection, self.state.auth.logged_in)
+                };
                 let row_size = ui.available_size_before_wrap();
                 ui.allocate_ui_with_layout(
                     row_size,
@@ -9497,10 +9824,12 @@ impl eframe::App for CrustApp {
                         }
 
                         // Pane chat input (bottom)
+                        let pane_reply = self.reply_for_composer(&ch, Some(pi));
                         let input_h = (t::chat_font_size() + 16.0).max(t::bar_h())
                             + (t::INPUT_MARGIN.top + t::INPUT_MARGIN.bottom)
                                 as f32
-                            + pane_inner_pad;
+                            + pane_inner_pad
+                            + if pane_reply.is_some() { 36.0 } else { 0.0 };
                         let input_rect = egui::Rect::from_min_max(
                             egui::pos2(
                                 pane_rect.left() + pane_inner_pad,
@@ -9527,7 +9856,7 @@ impl eframe::App for CrustApp {
                             egui::UiBuilder::new()
                                 .id_salt("chat_input_tray")
                                 .max_rect(input_rect)
-                                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                                .layout(egui::Layout::top_down(egui::Align::Min)),
                         );
                         inp_ui.set_clip_rect(input_rect);
                             let chatters_sorted: &[String] = self
@@ -9545,7 +9874,7 @@ impl eframe::App for CrustApp {
                                     .as_deref(),
                                 emote_catalog: &self.emote_catalog,
                                 emote_bytes: &self.emote_bytes,
-                                pending_reply: None,
+                                pending_reply: pane_reply.as_ref(),
                                 message_history: &self.message_history,
                                 slash_usage_counts: &self.slash_usage_counts,
                                 known_channels: &self.state.channel_order,
@@ -9573,118 +9902,11 @@ impl eframe::App for CrustApp {
                             if let Some(word) = inp.add_to_dictionary {
                                 self.send_cmd(AppCommand::AddWordToDictionary { word });
                             }
+                            if inp.dismiss_reply && pane_reply.is_some() {
+                                self.pending_reply = None;
+                            }
                             if let Some(text) = inp.send {
-                                if self
-                                    .message_history
-                                    .last()
-                                    .map(|s| s.as_str())
-                                    != Some(&text)
-                                {
-                                    self.message_history
-                                        .push(text.clone());
-                                    if self.message_history.len() > 100 {
-                                        self.message_history.remove(0);
-                                    }
-                                }
-                                self.record_slash_usage_from_text(&text);
-                                let is_mod = self
-                                    .state
-                                    .channels
-                                    .get(&ch)
-                                    .map(|c| c.is_mod)
-                                    .unwrap_or(false);
-                                let is_bc = self
-                                    .state
-                                    .auth
-                                    .username
-                                    .as_deref()
-                                    .map(|u| {
-                                        u.eq_ignore_ascii_case(
-                                            ch.display_name(),
-                                        )
-                                    })
-                                    .unwrap_or(false);
-                                let can_mod = is_mod || is_bc;
-                                let cc = self
-                                    .state
-                                    .channels
-                                    .get(&ch)
-                                    .map(|c| {
-                                        c.chatters.len().max(
-                                            estimate_chatter_count(c),
-                                        )
-                                    })
-                                    .unwrap_or(0);
-                                let active_login =
-                                    self.state.auth.username.clone();
-                                let live_channels = collect_live_channel_entries(
-                                    &self.stream_statuses,
-                                );
-                                // Apply user-defined command aliases before
-                                // dispatch so they compose with built-in
-                                // slash commands and the IRC fall-through.
-                                let alias_result = self
-                                    .expand_outgoing_aliases(&text, &ch);
-                                let (text, alias_error) = match alias_result {
-                                    Ok(Some(expanded)) => (expanded, None),
-                                    Ok(None) => (text, None),
-                                    Err(err_cmd) => (text, Some(err_cmd)),
-                                };
-                                let pcmd = if alias_error.is_some() {
-                                    None
-                                } else {
-                                    parse_slash_command(
-                                        &text,
-                                        &ch,
-                                        None,
-                                        None,
-                                        can_mod,
-                                        cc,
-                                        self.kick_beta_enabled,
-                                        self.irc_beta_enabled,
-                                        active_login.as_deref(),
-                                        &live_channels,
-                                    )
-                                };
-                                if let Some(err_cmd) = alias_error {
-                                    self.send_cmd(err_cmd);
-                                } else if let Some(cmd) = pcmd {
-                                    if let AppCommand::SendMessage {
-                                        text: ref out,
-                                        ..
-                                    } = cmd
-                                    {
-                                        if ch.is_irc() {
-                                            self.irc_status_panel
-                                                .note_outgoing(&ch, out);
-                                        }
-                                    }
-                                    if let AppCommand::ShowUserCard {
-                                        ref login,
-                                        ref channel,
-                                    } = cmd
-                                    {
-                                        self.user_profile_popup
-                                            .set_loading(
-                                                login,
-                                                vec![],
-                                                Some(channel.clone()),
-                                                can_mod,
-                                            );
-                                    }
-                                    self.send_cmd(cmd);
-                                } else {
-                                    if ch.is_irc() {
-                                        self.irc_status_panel
-                                            .note_outgoing(&ch, &text);
-                                    }
-                                    self.send_cmd(AppCommand::SendMessage {
-                                        channel: ch.clone(),
-                                        text,
-                                        reply_to_msg_id: None,
-                                        reply: None,
-                                    });
-                                }
+                                self.submit_chat_input(&ch, text, pane_reply, Some(pi));
                             }
                             if inp.toggle_emote_picker {
                                 self.emote_picker.toggle();
@@ -10015,142 +10237,7 @@ impl eframe::App for CrustApp {
                                 self.pending_reply = None;
                             }
                             if let Some(text) = result.send {
-                                // Push to history (cap at 100)
-                                if self.message_history.last().map(|s| s.as_str()) != Some(&text) {
-                                    self.message_history.push(text.clone());
-                                    if self.message_history.len() > 100 {
-                                        self.message_history.remove(0);
-                                    }
-                                }
-                                self.record_slash_usage_from_text(&text);
-                                let reply_to_msg_id =
-                                    active_reply.as_ref().map(|r| r.parent_msg_id.clone());
-                                if active_reply.is_some() {
-                                    self.pending_reply = None;
-                                }
-                                let is_mod = self
-                                    .state
-                                    .channels
-                                    .get(&active_ch)
-                                    .map(|c| c.is_mod)
-                                    .unwrap_or(false);
-                                // Broadcaster has full mod powers in their own channel.
-                                let is_broadcaster = self
-                                    .state
-                                    .auth
-                                    .username
-                                    .as_deref()
-                                    .map(|u| u.eq_ignore_ascii_case(active_ch.display_name()))
-                                    .unwrap_or(false);
-                                let can_moderate = is_mod || is_broadcaster;
-                                let chatters_count = self
-                                    .state
-                                    .channels
-                                    .get(&active_ch)
-                                    .map(|c| c.chatters.len().max(estimate_chatter_count(c)))
-                                    .unwrap_or(0);
-
-                                let active_login =
-                                    self.state.auth.username.clone();
-                                let live_channels = collect_live_channel_entries(
-                                    &self.stream_statuses,
-                                );
-                                // Expand user command aliases first; if the
-                                // chain cycles, emit the error and skip the
-                                // normal slash/send path.
-                                let alias_result = self
-                                    .expand_outgoing_aliases(&text, &active_ch);
-                                let (text, alias_error) = match alias_result {
-                                    Ok(Some(expanded)) => (expanded, None),
-                                    Ok(None) => (text, None),
-                                    Err(err_cmd) => (text, Some(err_cmd)),
-                                };
-                                let parsed_cmd = if alias_error.is_some() {
-                                    None
-                                } else {
-                                    parse_slash_command(
-                                        &text,
-                                        &active_ch,
-                                        reply_to_msg_id.clone(),
-                                        active_reply.clone(),
-                                        can_moderate,
-                                        chatters_count,
-                                        self.kick_beta_enabled,
-                                        self.irc_beta_enabled,
-                                        active_login.as_deref(),
-                                        &live_channels,
-                                    )
-                                };
-
-                                if let Some(err_cmd) = alias_error {
-                                    self.send_cmd(err_cmd);
-                                } else if !self.state.auth.logged_in {
-                                    match parsed_cmd {
-                                        Some(cmd) if is_anonymous_local_command(&cmd) => {
-                                            // Some slash commands manipulate the popup directly.
-                                            if let AppCommand::ShowUserCard {
-                                                ref login,
-                                                ref channel,
-                                            } = cmd
-                                            {
-                                                self.user_profile_popup.set_loading(
-                                                    login,
-                                                    vec![],
-                                                    Some(channel.clone()),
-                                                    can_moderate,
-                                                );
-                                            }
-                                            self.send_cmd(cmd);
-                                        }
-                                        Some(_) => {
-                                            self.send_cmd(AppCommand::InjectLocalMessage {
-                                                channel: active_ch.clone(),
-                                                text: "Anonymous mode allows local slash commands only. Log in to run server commands or send chat messages. Try /help.".to_owned(),
-                                            });
-                                        }
-                                        None => {
-                                            let text = if text.trim_start().starts_with('/') {
-                                                "That slash command is not available in anonymous mode. Use /help for local commands.".to_owned()
-                                            } else {
-                                                "Anonymous mode cannot send chat messages. Log in to chat, or run local commands like /help.".to_owned()
-                                            };
-                                            self.send_cmd(AppCommand::InjectLocalMessage {
-                                                channel: active_ch.clone(),
-                                                text,
-                                            });
-                                        }
-                                    }
-                                } else if let Some(cmd) = parsed_cmd {
-                                    if let AppCommand::SendMessage { text: ref outgoing_text, .. } = cmd {
-                                        if active_ch.is_irc() {
-                                            self.irc_status_panel.note_outgoing(&active_ch, outgoing_text);
-                                        }
-                                    }
-                                    // Some slash commands manipulate the popup directly.
-                                    if let AppCommand::ShowUserCard {
-                                        ref login,
-                                        ref channel,
-                                    } = cmd
-                                    {
-                                        self.user_profile_popup.set_loading(
-                                            login,
-                                            vec![],
-                                            Some(channel.clone()),
-                                            can_moderate,
-                                        );
-                                    }
-                                    self.send_cmd(cmd);
-                                } else {
-                                    if active_ch.is_irc() {
-                                        self.irc_status_panel.note_outgoing(&active_ch, &text);
-                                    }
-                                    self.send_cmd(AppCommand::SendMessage {
-                                        channel: active_ch.clone(),
-                                        text,
-                                        reply_to_msg_id,
-                                        reply: active_reply,
-                                    });
-                                }
+                                self.submit_chat_input(&active_ch, text, active_reply, None);
                             }
                             if result.toggle_emote_picker {
                                 self.emote_picker.toggle();
@@ -10368,6 +10455,14 @@ impl eframe::App for CrustApp {
             ctx.request_repaint();
         }
 
+        let can_restore_unsent = self.unsent_messages.front()
+            .is_some_and(|message| self.unsent_input_pane(message).is_some());
+        if let Some(message) = self.unsent_messages.show(ctx, can_restore_unsent) {
+            if !self.restore_unsent_message(&message) {
+                self.unsent_messages.push(message);
+            }
+        }
+
         // Event toast overlay
         // Expire toasts older than 5 s, then render remaining ones as stacked
         // floating banners anchored to the top-right of the screen.
@@ -10471,6 +10566,7 @@ impl eframe::App for CrustApp {
 
         self.perf.set_chat_stats(frame_chat_stats);
         self.perf.show(ctx);
+        self.emote_bytes.end_frame(ctx, |command| self.cmd_tx.try_send_background(command));
 
         // Slow-frame warning - emit once per slow frame with context so we
         // can diagnose UI-thread hitches from user reports.
@@ -10753,19 +10849,6 @@ fn is_likely_animated_image_bytes(raw: &[u8]) -> bool {
     is_webp && raw.windows(4).any(|w| w == b"ANIM")
 }
 
-fn decode_static_image_frame(raw: &[u8]) -> Option<egui::ColorImage> {
-    let img = image::load_from_memory(raw).ok()?;
-    dynamic_image_to_color_image(img)
-}
-
-fn dynamic_image_to_color_image(img: DynamicImage) -> Option<egui::ColorImage> {
-    let rgba = img.to_rgba8();
-    let w = usize::try_from(rgba.width()).ok()?;
-    let h = usize::try_from(rgba.height()).ok()?;
-    let pixels = rgba.into_raw();
-    Some(egui::ColorImage::from_rgba_unmultiplied([w, h], &pixels))
-}
-
 fn is_valid_twitch_login(login: &str) -> bool {
     let len = login.len();
     if !(3..=25).contains(&len) {
@@ -10777,6 +10860,17 @@ fn is_valid_twitch_login(login: &str) -> bool {
     login
         .bytes()
         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+fn fallback_font_data(path: &str, bytes: Vec<u8>) -> egui::FontData {
+    let mut data = egui::FontData::from_owned(bytes);
+    if path.ends_with("YuGothR.ttc") || path.ends_with("YuGothM.ttc") {
+        // Yu Gothic includes a large line gap. egui centers that gap when the
+        // font is used as a fallback, lifting CJK glyphs into the previous row.
+        // Restore their baseline relative to the default body font.
+        data.tweak.baseline_offset_factor = 0.26;
+    }
+    data
 }
 
 fn install_system_fallback_fonts(ctx: &Context) {
@@ -10866,7 +10960,7 @@ fn install_system_fallback_fonts(ctx: &Context) {
             let key = format!("fallback_{name}");
             fonts
                 .font_data
-                .insert(key.clone(), egui::FontData::from_owned(bytes).into());
+                .insert(key.clone(), fallback_font_data(path, bytes).into());
             fonts
                 .families
                 .entry(egui::FontFamily::Proportional)
@@ -10886,6 +10980,45 @@ fn install_system_fallback_fonts(ctx: &Context) {
         tracing::warn!("No system fallback fonts found; some Unicode glyphs may render as boxes");
     }
     ctx.set_fonts(fonts);
+}
+
+#[cfg(all(test, windows))]
+mod font_tests {
+    #[test]
+    fn yu_gothic_fallback_fits_message_lines_at_multiple_sizes_and_densities() {
+        let font = ["C:\\Windows\\Fonts\\YuGothR.ttc", "C:\\Windows\\Fonts\\YuGothM.ttc"]
+            .into_iter().find_map(|path| std::fs::read(path).ok().map(|bytes| (path, bytes)));
+        // The Japanese language font is optional on Windows installations.
+        let Some((path, bytes)) = font else { return };
+        let mut definitions = egui::FontDefinitions::default();
+        definitions.font_data.insert("japanese".to_owned(), super::fallback_font_data(path, bytes).into());
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            definitions.families.entry(family).or_default().push("japanese".to_owned());
+        }
+        for density in [1.0, 1.25, 1.875] {
+            for size in [9.0, 13.5, 20.0, 32.0] {
+                for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                    let ctx = egui::Context::default();
+                    ctx.set_fonts(definitions.clone());
+                    ctx.set_pixels_per_point(density);
+                    let _ = ctx.run(Default::default(), |ctx| {
+                        let galley = ctx.fonts(|fonts| fonts.layout_job(egui::text::LayoutJob::simple(
+                            "Latin text\nLatin 日本語\nLatin text".to_owned(),
+                            egui::FontId::new(size, family.clone()), egui::Color32::WHITE, 1000.0,
+                        )));
+                        for rows in galley.rows.windows(2) {
+                            assert!(rows[0].visuals.mesh_bounds.max.y <= rows[1].visuals.mesh_bounds.min.y + 1.0 / density,
+                                "overlapping lines at {size}pt/{density}dpi/{family:?}: {:?} and {:?}",
+                                rows[0].visuals.mesh_bounds, rows[1].visuals.mesh_bounds);
+                        }
+                        let row = &galley.rows[1];
+                        assert!(row.visuals.mesh_bounds.min.y >= row.rect.min.y - 1.0 / density,
+                            "fallback extends into the preceding line at {size}pt/{density}dpi/{family:?}");
+                    });
+                }
+            }
+        }
+    }
 }
 
 // Slash-command parser
@@ -12470,6 +12603,677 @@ mod tests {
     use crust_core::events::AppCommand;
     use crust_core::model::ChannelId;
 
+    fn test_app() -> (super::CrustApp, tokio::sync::mpsc::Receiver<AppCommand>) {
+        let (commands, receiver) = tokio::sync::mpsc::channel(64);
+        let (_, events) = tokio::sync::mpsc::channel(64);
+        (super::CrustApp::with_event_channels(commands, events), receiver)
+    }
+
+    fn saturated_app() -> (super::CrustApp, tokio::sync::mpsc::Receiver<AppCommand>) {
+        let (commands, receiver) = tokio::sync::mpsc::channel(1);
+        let (_, events) = tokio::sync::mpsc::channel(1);
+        let app = super::CrustApp::with_event_channels(commands, events);
+        for _ in 0..=super::MAX_DEFERRED_COMMANDS {
+            assert!(app.try_send_cmd(AppCommand::LiveFeedRefresh));
+        }
+        (app, receiver)
+    }
+
+    fn reply_context() -> crust_core::ReplyInfo {
+        crust_core::ReplyInfo {
+            parent_msg_id: "parent-message".to_owned(),
+            parent_user_login: "viewer".to_owned(),
+            parent_display_name: "Viewer".to_owned(),
+            parent_msg_body: "original message".to_owned(),
+        }
+    }
+
+    #[test]
+    fn saturated_runtime_and_event_channels_do_not_block_rendering_or_reorder_actions() {
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(1);
+        commands.try_send(AppCommand::Logout).unwrap();
+        let (events, event_receiver) = tokio::sync::mpsc::channel(1);
+        events.try_send(crust_core::AppEvent::Error {
+            context: "QueueTest".to_owned(),
+            message: "event while both channels are full".to_owned(),
+        }).unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        let (resume, resumed) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut app = super::CrustApp::with_event_channels(commands, event_receiver);
+            let channel = ChannelId::new("queued");
+            app.state.join_channel(channel.clone());
+            app.send_cmd(AppCommand::JoinChannel { channel: channel.clone() });
+            let ctx = egui::Context::default();
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                app.service_runtime_channels(ctx);
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.label("The UI remains responsive.");
+                });
+            });
+            assert!(!output.shapes.is_empty());
+            app.send_cmd(AppCommand::LeaveChannel { channel });
+            done.send(()).unwrap();
+            for _ in 0..3 {
+                if resumed.recv_timeout(std::time::Duration::from_secs(2)).is_err() {
+                    return;
+                }
+                app.service_runtime_channels(&ctx);
+                done.send(()).unwrap();
+            }
+            assert!(app.cmd_tx.deferred.borrow().commands.is_empty());
+        });
+
+        // A blocking send cannot reach this notification until a receiver
+        // drains a channel. Neither receiver is drained before this assertion.
+        finished.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("rendering blocked on a full runtime queue");
+        assert!(matches!(receiver.try_recv().unwrap(), AppCommand::Logout));
+        for expected in 0..3 {
+            resume.send(()).unwrap();
+            finished.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            let command = receiver.try_recv().unwrap();
+            match expected {
+                0 => assert!(matches!(command, AppCommand::JoinChannel { .. })),
+                1 => assert!(matches!(command, AppCommand::InjectLocalMessage { .. })),
+                _ => assert!(matches!(command, AppCommand::LeaveChannel { .. })),
+            }
+        }
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn widget_actions_cannot_overtake_a_deferred_account_change() {
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(1);
+        let mut sender = super::UiCommandSender::new(commands);
+        sender.try_send(AppCommand::LiveFeedRefresh).unwrap();
+        sender.try_send(AppCommand::Logout).unwrap();
+        receiver.try_recv().unwrap();
+
+        // This is the same sender API used by message menus and widgets.
+        sender.try_send(AppCommand::SendMessage {
+            channel: ChannelId::new("channel"),
+            text: "later action".to_owned(),
+            reply_to_msg_id: None,
+            reply: None,
+        }).unwrap();
+        assert!(receiver.try_recv().is_err());
+        let ctx = egui::Context::default();
+        sender.flush(&ctx);
+        assert!(matches!(receiver.try_recv().unwrap(), AppCommand::Logout));
+        sender.flush(&ctx);
+        assert!(matches!(receiver.try_recv().unwrap(), AppCommand::SendMessage { .. }));
+    }
+
+    #[test]
+    fn background_requests_wait_for_user_actions_without_failure_toasts() {
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(1);
+        let mut sender = super::UiCommandSender::new(commands);
+        let image = || AppCommand::FetchImage { url: "https://example.test/image.png".to_owned() };
+        sender.try_send(AppCommand::LiveFeedRefresh).unwrap();
+        assert!(!sender.try_send_background(image()));
+        sender.try_send(AppCommand::Logout).unwrap();
+        receiver.try_recv().unwrap();
+        assert!(!sender.try_send_background(image()));
+        assert!(sender.deferred.borrow().error.is_none());
+        sender.flush(&egui::Context::default());
+        assert!(matches!(receiver.try_recv().unwrap(), AppCommand::Logout));
+        assert!(sender.try_send_background(image()));
+        assert!(matches!(receiver.try_recv().unwrap(), AppCommand::FetchImage { .. }));
+    }
+
+    #[test]
+    fn command_overflow_preserves_the_draft_reply_and_history() {
+        let (mut app, _receiver) = saturated_app();
+        let channel = ChannelId::new("channel");
+        let reply = reply_context();
+        app.state.auth.logged_in = true;
+        app.pending_reply = Some(super::PendingReply {
+            channel: channel.clone(),
+            info: reply.clone(),
+        });
+        let draft = "  /me  keeps this draft 🦀  ";
+        assert!(!app.submit_chat_input(&channel, draft.to_owned(), Some(reply), None));
+        assert_eq!(app.chat_input_buf, draft);
+        assert_eq!(app.pending_reply.as_ref().unwrap().info.parent_msg_id, "parent-message");
+        assert!(app.message_history.is_empty());
+        assert!(app.slash_usage_counts.is_empty());
+        assert_eq!(app.cmd_tx.deferred.borrow().commands.len(), super::MAX_DEFERRED_COMMANDS);
+        app.service_runtime_channels(&egui::Context::default());
+        assert!(app.event_toasts.iter().any(|toast| toast.text.contains("not queued")));
+    }
+
+    #[test]
+    fn rejected_split_submission_restores_only_its_own_composer() {
+        let (mut app, _receiver) = saturated_app();
+        let channel = ChannelId::new("channel");
+        app.state.auth.logged_in = true;
+        app.split_panes.add_pane(channel.clone(), None);
+        app.split_panes.add_pane(channel.clone(), None);
+        app.split_panes.panes[0].input_buf = "first split draft".to_owned();
+        app.chat_input_buf = "single pane draft".to_owned();
+        assert!(!app.submit_chat_input(&channel, "second split draft".to_owned(), None, Some(1)));
+        assert_eq!(app.split_panes.panes[0].input_buf, "first split draft");
+        assert_eq!(app.split_panes.panes[1].input_buf, "second split draft");
+        assert_eq!(app.chat_input_buf, "single pane draft");
+    }
+
+    #[test]
+    fn deferred_chat_submission_keeps_reply_context_until_delivery() {
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(1);
+        commands.try_send(AppCommand::Logout).unwrap();
+        let (_, events) = tokio::sync::mpsc::channel(1);
+        let mut app = super::CrustApp::with_event_channels(commands, events);
+        let channel = ChannelId::new("channel");
+        let reply = reply_context();
+        app.state.auth.logged_in = true;
+        app.pending_reply = Some(super::PendingReply {
+            channel: channel.clone(),
+            info: reply.clone(),
+        });
+        assert!(app.submit_chat_input(&channel, "  queued reply  ".to_owned(), Some(reply), None));
+        assert!(app.pending_reply.is_none());
+        assert_eq!(app.message_history, ["queued reply"]);
+        assert!(matches!(receiver.try_recv().unwrap(), AppCommand::Logout));
+        app.service_runtime_channels(&egui::Context::default());
+        match receiver.try_recv().unwrap() {
+            AppCommand::SendMessage { text, reply_to_msg_id, reply, .. } => {
+                assert_eq!(text, "queued reply");
+                assert_eq!(reply_to_msg_id.as_deref(), Some("parent-message"));
+                assert_eq!(reply.unwrap().parent_msg_body, "original message");
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+    }
+
+    #[test]
+    fn a_closed_runtime_preserves_the_chat_draft_and_reports_failure() {
+        let (mut app, receiver) = test_app();
+        drop(receiver);
+        app.state.auth.logged_in = true;
+        assert!(!app.submit_chat_input(&ChannelId::new("channel"), "unsent".to_owned(), None, None));
+        assert_eq!(app.chat_input_buf, "unsent");
+        app.service_runtime_channels(&egui::Context::default());
+        assert!(app.event_toasts.iter().any(|toast| toast.text.contains("background service stopped")));
+    }
+
+    #[test]
+    fn deferred_uploads_have_a_byte_limit_and_release_it_on_delivery() {
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(1);
+        commands.try_send(AppCommand::Logout).unwrap();
+        let mut queue = super::DeferredCommands::default();
+        let upload = |size| AppCommand::UploadImage {
+            channel: ChannelId::new("channel"),
+            bytes: vec![0; size],
+            format: "png".to_owned(),
+            source_path: None,
+        };
+        assert!(queue.send(&commands, upload(super::MAX_DEFERRED_UPLOAD_BYTES)));
+        assert!(!queue.send(&commands, upload(1)));
+        assert_eq!(queue.commands.len(), 1);
+        assert_eq!(queue.error, Some(super::CommandQueueError::Full));
+        receiver.try_recv().unwrap();
+        queue.flush(&commands);
+        assert_eq!(queue.upload_bytes, 0);
+        assert!(queue.send(&commands, upload(1)));
+        assert_eq!(queue.upload_bytes, 1);
+    }
+
+    #[test]
+    fn rejected_thumbnail_requests_can_be_retried() {
+        let (mut app, mut receiver) = saturated_app();
+        let snapshot = crust_core::model::LiveChannelSnapshot {
+            user_id: "1".to_owned(),
+            user_login: "channel".to_owned(),
+            user_name: "Channel".to_owned(),
+            viewer_count: 1,
+            thumbnail_url: "https://example.test/thumbnail.png".to_owned(),
+            started_at: String::new(),
+        };
+        app.request_live_feed_thumbnails(std::slice::from_ref(&snapshot));
+        assert!(!app.live_feed_pending_thumbnails.contains(&snapshot.thumbnail_url));
+        receiver.try_recv().unwrap();
+        app.service_runtime_channels(&egui::Context::default());
+        app.request_live_feed_thumbnails(std::slice::from_ref(&snapshot));
+        assert!(app.live_feed_pending_thumbnails.contains(&snapshot.thumbnail_url));
+    }
+
+    #[test]
+    fn runtime_rejection_restores_an_empty_matching_composer_and_reply() {
+        let (mut app, _receiver) = test_app();
+        let channel = ChannelId::new("channel");
+        app.state.join_channel(channel.clone());
+        app.apply_event(crust_core::AppEvent::MessageSendRejected {
+            channel,
+            text: "unsent reply".to_owned(),
+            reply_to_msg_id: Some("parent-message".to_owned()),
+            reply: Some(reply_context()),
+            reason: "The account is still connecting.".to_owned(),
+        }, &egui::Context::default());
+        assert_eq!(app.chat_input_buf, "unsent reply");
+        assert_eq!(app.pending_reply.as_ref().unwrap().info.parent_msg_id, "parent-message");
+        assert!(app.unsent_messages.front().is_none());
+    }
+
+    #[test]
+    fn single_persisted_pane_restores_into_the_visible_composer() {
+        let (mut app, _receiver) = test_app();
+        let channel = ChannelId::new("channel");
+        app.state.join_channel(channel.clone());
+        app.split_panes.add_pane(channel.clone(), None);
+        app.apply_event(crust_core::AppEvent::MessageSendRejected {
+            channel: channel.clone(),
+            text: "visible draft".to_owned(),
+            reply_to_msg_id: None,
+            reply: None,
+            reason: "The account changed.".to_owned(),
+        }, &egui::Context::default());
+        assert_eq!(app.chat_input_buf, "visible draft");
+        assert!(app.split_panes.panes[0].input_buf.is_empty());
+        app.input_buf_for_channel_mut(&channel).push_str(" with upload");
+        assert_eq!(app.chat_input_buf, "visible draft with upload");
+    }
+
+    #[test]
+    fn rejected_split_reply_keeps_its_target_when_resubmitted() {
+        let (mut app, mut receiver) = test_app();
+        let first = ChannelId::new("first");
+        let second = ChannelId::new("second");
+        for channel in [&first, &second] {
+            app.state.join_channel(channel.clone());
+            app.split_panes.add_pane(channel.clone(), None);
+        }
+        app.state.auth.logged_in = true;
+        app.split_panes.focused = 1;
+        app.state.active_channel = Some(second.clone());
+        app.apply_event(crust_core::AppEvent::MessageSendRejected {
+            channel: second.clone(),
+            text: "reply from split".to_owned(),
+            reply_to_msg_id: Some("parent-message".to_owned()),
+            reply: Some(reply_context()),
+            reason: "The account was connecting.".to_owned(),
+        }, &egui::Context::default());
+        assert!(app.split_panes.panes[0].input_buf.is_empty());
+        assert!(app.reply_for_composer(&first, Some(0)).is_none());
+        let reply = app.reply_for_composer(&second, Some(1));
+        let draft = std::mem::take(&mut app.split_panes.panes[1].input_buf);
+        assert!(app.submit_chat_input(&second, draft, reply, Some(1)));
+        assert!(app.pending_reply.is_none());
+        match receiver.try_recv().unwrap() {
+            AppCommand::SendMessage { channel, text, reply_to_msg_id, reply } => {
+                assert_eq!(channel, second);
+                assert_eq!(text, "reply from split");
+                assert_eq!(reply_to_msg_id.as_deref(), Some("parent-message"));
+                assert_eq!(reply.unwrap().parent_msg_body, "original message");
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+    }
+
+    #[test]
+    fn rejected_reply_cannot_attach_to_a_newer_draft_in_a_duplicate_channel_pane() {
+        let (mut app, _receiver) = test_app();
+        let channel = ChannelId::new("channel");
+        app.state.join_channel(channel.clone());
+        app.split_panes.add_pane(channel.clone(), None);
+        app.split_panes.add_pane(channel.clone(), None);
+        app.split_panes.focused = 0;
+        app.split_panes.panes[0].input_buf = "newer draft".to_owned();
+        app.apply_event(crust_core::AppEvent::MessageSendRejected {
+            channel: channel.clone(),
+            text: "older reply".to_owned(),
+            reply_to_msg_id: Some("parent-message".to_owned()),
+            reply: Some(reply_context()),
+            reason: "The account changed.".to_owned(),
+        }, &egui::Context::default());
+        assert_eq!(app.split_panes.panes[0].input_buf, "newer draft");
+        assert!(app.split_panes.panes[1].input_buf.is_empty());
+        assert!(app.pending_reply.is_none());
+        let rejected = app.unsent_messages.front().unwrap().clone();
+        assert!(!app.restore_unsent_message(&rejected));
+        app.split_panes.focused = 1;
+        assert!(app.restore_unsent_message(&rejected));
+        assert_eq!(app.split_panes.panes[0].input_buf, "newer draft");
+        assert_eq!(app.split_panes.panes[1].input_buf, "older reply");
+        assert!(app.reply_for_composer(&channel, Some(0)).is_none());
+        assert_eq!(app.reply_for_composer(&channel, Some(1)).unwrap().parent_msg_id, "parent-message");
+    }
+
+    #[test]
+    fn runtime_rejection_does_not_restore_under_a_new_keypress() {
+        let (mut app, _receiver) = test_app();
+        let channel = ChannelId::new("channel");
+        app.state.join_channel(channel.clone());
+        let ctx = egui::Context::default();
+        let _ = ctx.run(shortcut_input(egui::Key::Enter, egui::Modifiers::NONE), |ctx| {
+            app.apply_event(crust_core::AppEvent::MessageSendRejected {
+                channel: channel.clone(),
+                text: "unsent".to_owned(),
+                reply_to_msg_id: None,
+                reply: None,
+                reason: "The account changed.".to_owned(),
+            }, ctx);
+        });
+        assert!(app.chat_input_buf.is_empty());
+        assert_eq!(app.unsent_messages.front().unwrap().text, "unsent");
+    }
+
+    #[test]
+    fn runtime_rejection_retains_recovery_without_overwriting_a_newer_draft_or_reply() {
+        let (mut app, _receiver) = test_app();
+        let channel = ChannelId::new("channel");
+        app.state.join_channel(channel.clone());
+        app.chat_input_buf = "newer draft".to_owned();
+        let mut new_reply = reply_context();
+        new_reply.parent_msg_id = "newer-parent".to_owned();
+        app.pending_reply = Some(super::PendingReply { channel: channel.clone(), info: new_reply });
+        app.apply_event(crust_core::AppEvent::MessageSendRejected {
+            channel,
+            text: "older rejected message".to_owned(),
+            reply_to_msg_id: Some("parent-message".to_owned()),
+            reply: Some(reply_context()),
+            reason: "The account is still connecting.".to_owned(),
+        }, &egui::Context::default());
+        assert_eq!(app.chat_input_buf, "newer draft");
+        assert_eq!(app.pending_reply.as_ref().unwrap().info.parent_msg_id, "newer-parent");
+        let rejected = app.unsent_messages.front().unwrap().clone();
+        assert_eq!(rejected.text, "older rejected message");
+        assert_eq!(rejected.reply.as_ref().unwrap().parent_msg_id, "parent-message");
+        assert!(!app.restore_unsent_message(&rejected));
+        app.chat_input_buf.clear();
+        assert!(!app.restore_unsent_message(&rejected));
+        app.pending_reply = None;
+        assert!(app.restore_unsent_message(&rejected));
+        assert_eq!(app.chat_input_buf, "older rejected message");
+        assert_eq!(app.pending_reply.as_ref().unwrap().info.parent_msg_id, "parent-message");
+    }
+
+    #[test]
+    fn runtime_rejection_does_not_insert_into_an_unrelated_channel() {
+        let (mut app, _receiver) = test_app();
+        app.state.join_channel(ChannelId::new("active"));
+        app.apply_event(crust_core::AppEvent::MessageSendRejected {
+            channel: ChannelId::new("background"),
+            text: "unsent".to_owned(),
+            reply_to_msg_id: Some("parent-without-metadata".to_owned()),
+            reply: None,
+            reason: "The account changed.".to_owned(),
+        }, &egui::Context::default());
+        assert!(app.chat_input_buf.is_empty());
+        let rejected = app.unsent_messages.front().unwrap();
+        assert_eq!(rejected.channel, ChannelId::new("background"));
+        assert_eq!(rejected.reply_info().unwrap().parent_msg_id, "parent-without-metadata");
+    }
+
+    #[test]
+    fn authentication_progress_clears_on_completion_logout_and_failure() {
+        let (mut app, _receiver) = test_app();
+        let ctx = egui::Context::default();
+        for outcome in [
+            crust_core::AppEvent::Authenticated { username: "new-account".to_owned(), user_id: "42".to_owned() },
+            crust_core::AppEvent::LoggedOut,
+            crust_core::AppEvent::Error { context: "SwitchAccount".to_owned(), message: "unavailable".to_owned() },
+        ] {
+            app.apply_event(crust_core::AppEvent::AuthenticationPending { username: Some("new-account".to_owned()) }, &ctx);
+            assert_eq!(app.pending_auth.as_deref(), Some("new-account"));
+            app.apply_event(outcome, &ctx);
+            assert!(app.pending_auth.is_none());
+        }
+    }
+
+    #[test]
+    fn transient_refresh_errors_allow_retry_without_signing_out() {
+        let (mut app, _receiver) = test_app();
+        app.state.auth.logged_in = true;
+        app.auth_refresh_inflight = true;
+        app.pending_auth = Some("new-account".to_owned());
+        app.apply_event(crust_core::AppEvent::Error {
+            context: "RefreshAuth".to_owned(),
+            message: "temporarily unavailable".to_owned(),
+        }, &egui::Context::default());
+        assert!(!app.auth_refresh_inflight);
+        assert!(app.state.auth.logged_in);
+        assert_eq!(app.pending_auth.as_deref(), Some("new-account"));
+    }
+
+    fn shortcut_input(key: egui::Key, modifiers: egui::Modifiers) -> egui::RawInput {
+        egui::RawInput {
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn search_message(channel: ChannelId) -> crust_core::ChatMessage {
+        crust_core::ChatMessage {
+            id: crust_core::MessageId(1),
+            server_id: Some("search-server-id".to_owned()),
+            timestamp: chrono::Utc::now(),
+            channel,
+            sender: crust_core::model::Sender {
+                user_id: crust_core::model::UserId("1".to_owned()),
+                login: "alice".to_owned(),
+                display_name: "Alice".to_owned(),
+                original_display_name: None,
+                color: None,
+                name_paint: None,
+                badges: Vec::new(),
+            },
+            raw_text: "search target".to_owned(),
+            spans: Default::default(),
+            twitch_emotes: Vec::new(),
+            flags: Default::default(),
+            reply: None,
+            msg_kind: crust_core::model::MsgKind::Chat,
+            shared: None,
+        }
+    }
+
+    #[test]
+    fn ui_zoom_preserves_native_density_and_monitor_changes() {
+        let (mut app, _receiver) = test_app();
+        let original_ui_size = t::ui_font_size();
+        let ctx = egui::Context::default();
+        for (native_density, zoom) in [(1.25, 1.0), (2.0, 1.0), (1.5, 1.25), (1.0, 1.25), (2.0, 0.75)] {
+            app.ui_font_size = zoom;
+            for _ in 0..2 {
+                let mut input = egui::RawInput::default();
+                input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap()
+                    .native_pixels_per_point = Some(native_density);
+                let _ = ctx.run(input, |ctx| app.apply_font_scale(ctx));
+            }
+            assert!((ctx.zoom_factor() - zoom).abs() < 0.001);
+            assert!((ctx.pixels_per_point() - native_density * zoom).abs() < 0.001);
+        }
+        t::set_ui_font_size(original_ui_size);
+    }
+
+    #[test]
+    fn previous_tab_shortcut_is_not_consumed_as_next_tab() {
+        let (mut app, _commands) = test_app();
+        for channel in ["first", "second", "third"] {
+            app.state.join_channel(ChannelId::new(channel));
+        }
+        app.state.active_channel = Some(ChannelId::new("second"));
+        let ctx = egui::Context::default();
+        let _ = ctx.run(shortcut_input(egui::Key::Tab, egui::Modifiers::CTRL | egui::Modifiers::SHIFT), |ctx| {
+            app.handle_channel_shortcuts(ctx);
+        });
+        assert_eq!(app.state.active_channel, Some(ChannelId::new("first")));
+    }
+
+    #[test]
+    fn tab_and_split_movement_do_not_trigger_navigation_aliases() {
+        let (mut app, _commands) = test_app();
+        let first = ChannelId::new("first");
+        let second = ChannelId::new("second");
+        app.state.join_channel(first.clone());
+        app.state.join_channel(second.clone());
+        app.state.active_channel = Some(second.clone());
+        let ctx = egui::Context::default();
+        let _ = ctx.run(shortcut_input(egui::Key::ArrowLeft, egui::Modifiers::ALT | egui::Modifiers::SHIFT), |ctx| {
+            app.handle_channel_shortcuts(ctx);
+        });
+        assert_eq!(app.state.active_channel, Some(second.clone()));
+        assert_eq!(app.state.channel_order, vec![second.clone(), first.clone()]);
+
+        app.split_panes.add_pane(first.clone(), None);
+        app.split_panes.add_pane(second.clone(), None);
+        let _ = ctx.run(shortcut_input(egui::Key::PageDown, egui::Modifiers::CTRL | egui::Modifiers::ALT), |ctx| {
+            app.handle_channel_shortcuts(ctx);
+        });
+        assert_eq!(app.split_panes.focused, 1);
+        assert_eq!(app.split_panes.panes[0].channel, first);
+        assert_eq!(app.split_panes.panes[1].channel, second);
+    }
+
+    #[test]
+    fn shifted_moderation_shortcuts_keep_their_distinct_actions() {
+        let (mut app, _commands) = test_app();
+        app.mod_tools_open = true;
+        let ctx = egui::Context::default();
+        let _ = ctx.run(shortcut_input(egui::Key::A, egui::Modifiers::SHIFT), |ctx| {
+            assert!(matches!(app.consume_mod_hotkey_input(ctx), super::ModHotkey::BulkApprove));
+        });
+        let _ = ctx.run(shortcut_input(egui::Key::D, egui::Modifiers::SHIFT), |ctx| {
+            assert!(matches!(app.consume_mod_hotkey_input(ctx), super::ModHotkey::BulkDeny));
+        });
+        let _ = ctx.run(shortcut_input(egui::Key::Tab, egui::Modifiers::SHIFT), |ctx| {
+            assert!(matches!(app.consume_mod_hotkey_input(ctx), super::ModHotkey::PrevTab));
+        });
+    }
+
+    #[test]
+    fn exact_shortcuts_preserve_platform_command_aliases() {
+        for modifiers in [
+            egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+            egui::Modifiers::MAC_CMD | egui::Modifiers::COMMAND,
+        ] {
+            let ctx = egui::Context::default();
+            let mut binding = crust_core::KeyBinding::new("F");
+            binding.command = true;
+            let _ = ctx.run(shortcut_input(egui::Key::F, modifiers), |ctx| {
+                assert!(ctx.input_mut(|input| super::consume_binding(input, &binding)));
+            });
+            let _ = ctx.run(shortcut_input(egui::Key::F, modifiers | egui::Modifiers::SHIFT), |ctx| {
+                assert!(!ctx.input_mut(|input| super::consume_binding(input, &binding)));
+                binding.shift = true;
+                assert!(ctx.input_mut(|input| super::consume_binding(input, &binding)));
+            });
+        }
+    }
+
+    #[test]
+    fn search_jump_focuses_the_existing_split_and_preserves_drafts() {
+        let (mut app, _commands) = test_app();
+        let first = ChannelId::new("first");
+        let second = ChannelId::new("second");
+        for channel in [&first, &second] {
+            app.state.join_channel(channel.clone());
+            app.split_panes.add_pane(channel.clone(), None);
+        }
+        app.state.channels.get_mut(&second).unwrap().push_message(search_message(second.clone()));
+        app.split_panes.panes[0].input_buf = "first draft".to_owned();
+        app.split_panes.panes[1].input_buf = "second draft".to_owned();
+        app.jump_to_message(second.clone(), crust_core::MessageId(1));
+        assert_eq!(app.state.active_channel, Some(second.clone()));
+        assert_eq!(app.split_panes.focused, 1);
+        assert_eq!(app.split_panes.panes[0].channel, first);
+        assert_eq!(app.split_panes.panes[0].input_buf, "first draft");
+        assert_eq!(app.split_panes.panes[1].input_buf, "second draft");
+        assert_eq!(app.pending_scroll_to_message.get(&second), Some(&crust_core::MessageId(1)));
+    }
+
+    #[test]
+    fn deleted_message_events_refresh_an_open_search() {
+        let (mut app, _commands) = test_app();
+        let channel = ChannelId::new("first");
+        app.state.join_channel(channel.clone());
+        app.state.channels.get_mut(&channel).unwrap().push_message(search_message(channel.clone()));
+        app.global_search.input = "is:deleted".to_owned();
+        super::refresh_if_stale(&mut app.global_search, &app.state.channels);
+        assert!(app.global_search.results.is_empty());
+        app.apply_event(crust_core::events::AppEvent::MessageDeleted {
+            channel,
+            server_id: "search-server-id".to_owned(),
+        }, &egui::Context::default());
+        assert!(super::refresh_if_stale(&mut app.global_search, &app.state.channels));
+        assert_eq!(app.global_search.results.len(), 1);
+    }
+
+    #[test]
+    fn inactive_search_does_not_consume_escape_from_other_controls() {
+        let (mut app, _commands) = test_app();
+        app.state.join_channel(ChannelId::new("first"));
+        let ctx = egui::Context::default();
+        let _ = ctx.run(shortcut_input(egui::Key::Escape, egui::Modifiers::NONE), |ctx| {
+            app.handle_search_shortcuts(ctx);
+            assert!(ctx.input_mut(|input| super::consume_exact_key(input, egui::Modifiers::NONE, egui::Key::Escape)));
+        });
+    }
+
+    #[test]
+    fn nickname_updates_restore_chat_mentions_and_search_names() {
+        let (mut app, _commands) = test_app();
+        let first = ChannelId::new("first");
+        let second = ChannelId::new("second");
+        for channel in [&first, &second] {
+            app.state.join_channel(channel.clone());
+            app.state.channels.get_mut(channel).unwrap().push_message(search_message(channel.clone()));
+        }
+        app.state.mentions.push_back(search_message(first.clone()));
+        let ctx = egui::Context::default();
+        app.apply_event(crust_core::events::AppEvent::NicknamesUpdated {
+            nicknames: vec![crust_core::model::Nickname::new("alice", "Custom name")],
+        }, &ctx);
+        assert_eq!(app.state.channels[&first].messages[0].sender.display_name, "Custom name");
+        assert_eq!(app.state.mentions[0].sender.display_name, "Custom name");
+        app.global_search.input = "from:\"Custom name\"".to_owned();
+        super::refresh_if_stale(&mut app.global_search, &app.state.channels);
+        assert_eq!(app.global_search.results.len(), 2);
+
+        let mut scoped = crust_core::model::Nickname::new("alice", "Scoped name");
+        scoped.channel = Some("first".to_owned());
+        app.apply_event(crust_core::events::AppEvent::NicknamesUpdated { nicknames: vec![scoped] }, &ctx);
+        assert_eq!(app.state.channels[&first].messages[0].sender.display_name, "Scoped name");
+        assert_eq!(app.state.channels[&second].messages[0].sender.display_name, "Alice");
+        app.apply_event(crust_core::events::AppEvent::NicknamesUpdated { nicknames: Vec::new() }, &ctx);
+        for channel in [&first, &second] {
+            assert_eq!(app.state.channels[channel].messages[0].sender.display_name, "Alice");
+            assert!(app.state.channels[channel].messages[0].sender.original_display_name.is_none());
+        }
+        assert_eq!(app.state.mentions[0].sender.display_name, "Alice");
+        assert!(super::refresh_if_stale(&mut app.global_search, &app.state.channels));
+        assert!(app.global_search.results.is_empty());
+    }
+
+    #[test]
+    fn loaded_history_restores_stored_aliases_when_the_rule_was_removed() {
+        let (mut app, _commands) = test_app();
+        let channel = ChannelId::new("first");
+        app.state.join_channel(channel.clone());
+        let mut message = search_message(channel.clone());
+        crust_core::model::apply_sender_nickname(
+            &[crust_core::model::Nickname::new("alice", "Previous alias")],
+            channel.display_name(),
+            &mut message.sender,
+        );
+        message.flags.is_mention = true;
+        let ctx = egui::Context::default();
+        app.apply_event(crust_core::events::AppEvent::HistoryLoaded {
+            channel: channel.clone(),
+            messages: vec![message.clone()],
+        }, &ctx);
+        app.apply_event(crust_core::events::AppEvent::MentionsLoaded { messages: vec![message] }, &ctx);
+        assert_eq!(app.state.channels[&channel].messages[0].sender.display_name, "Alice");
+        assert_eq!(app.state.mentions[0].sender.display_name, "Alice");
+    }
+
     #[test]
     fn redirecting_splits_preserves_both_drafts_and_focused_pane() {
         let old = ChannelId::irc("irc.example", 6697, true, "old");
@@ -12534,6 +13338,7 @@ mod tests {
                 user_id: UserId("1".to_owned()),
                 login: "sender".to_owned(),
                 display_name: "Sender".to_owned(),
+                original_display_name: None,
                 color: None,
                 name_paint: None,
                 badges: Vec::new(),

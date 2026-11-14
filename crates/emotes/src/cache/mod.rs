@@ -13,7 +13,7 @@ use directories::ProjectDirs;
 use lru::LruCache;
 use tracing::debug;
 
-use crate::{EmoteError, EmoteInfo};
+use crate::{read_image_response, EmoteError, EmoteInfo};
 
 const IN_MEMORY_CAPACITY: usize = 256;
 const DISK_TTL: Duration = Duration::from_secs(24 * 3600); // 24 h for global
@@ -144,8 +144,8 @@ impl EmoteCache {
 
         // 3. Network
         debug!("Fetching emote from {url}");
-        let resp = self.client.get(url).send().await?.error_for_status()?;
-        let bytes: Bytes = resp.bytes().await?;
+        let resp = self.client.get(url).send().await?;
+        let bytes: Bytes = read_image_response(resp).await?.into();
         validate_image(bytes.clone()).await?;
 
         // Persist to disk
@@ -230,8 +230,8 @@ impl EmoteCache {
                 cached
             } else {
                 debug!("Fetching emote image: {url}");
-                let resp = self.client.get(url).send().await?.error_for_status()?;
-                let bytes = resp.bytes().await?;
+                let resp = self.client.get(url).send().await?;
+                let bytes: Bytes = read_image_response(resp).await?.into();
                 validate_image(bytes.clone()).await?;
                 if let Some(parent) = disk_path.parent() {
                     let _ = tokio::fs::create_dir_all(parent).await;
@@ -362,6 +362,10 @@ mod tests {
     }
 
     async fn respond(stream: &mut TcpStream, status: &str, bytes: &[u8]) {
+        respond_with_length(stream, status, bytes, bytes.len()).await;
+    }
+
+    async fn respond_with_length(stream: &mut TcpStream, status: &str, bytes: &[u8], length: usize) {
         let mut request = Vec::new();
         while !request.windows(4).any(|part| part == b"\r\n\r\n") {
             let mut chunk = [0; 1024];
@@ -371,8 +375,7 @@ mod tests {
             assert!(request.len() <= 16 * 1024, "request headers too large");
         }
         let headers = format!(
-            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            bytes.len()
+            "HTTP/1.1 {status}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
         );
         stream.write_all(headers.as_bytes()).await.unwrap();
         stream.write_all(bytes).await.unwrap();
@@ -409,6 +412,64 @@ mod tests {
         assert!(!cache.url_path(&url).exists());
         assert!(cache.0.inner.lock().unwrap().in_flight.is_empty());
         assert_eq!(cache.0.fetch_and_decode(&url).await.unwrap(), (2, 1, bytes));
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_image_releases_coalesced_waiters_and_can_retry() {
+        let cache = TestCache::new();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/emote", listener.local_addr().unwrap());
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            accepted_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            respond_with_length(&mut first, "200 OK", &[], crate::MAX_IMAGE_DOWNLOAD_BYTES + 1).await;
+            let (mut retry, _) = listener.accept().await.unwrap();
+            respond(&mut retry, "200 OK", &png(2)).await;
+        });
+        let leader_cache = cache.0.clone();
+        let leader_url = url.clone();
+        let leader = tokio::spawn(async move { leader_cache.fetch_and_decode(&leader_url).await });
+        tokio::time::timeout(Duration::from_secs(3), accepted_rx).await.unwrap().unwrap();
+        let waiter_cache = cache.0.clone();
+        let waiter_url = url.clone();
+        let waiter = tokio::spawn(async move { waiter_cache.fetch_and_decode(&waiter_url).await });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if cache.0.inner.lock().unwrap().in_flight.get(&url)
+                    .is_some_and(|tx| tx.receiver_count() > 0)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        release_tx.send(()).unwrap();
+        assert!(matches!(leader.await.unwrap(), Err(EmoteError::ImageTooLarge { .. })));
+        assert!(waiter.await.unwrap().is_err());
+        assert!(!cache.url_path(&url).exists());
+        assert!(cache.0.inner.lock().unwrap().bytes.is_empty());
+        assert!(cache.0.inner.lock().unwrap().in_flight.is_empty());
+        assert_eq!(cache.0.fetch_and_decode(&url).await.unwrap(), (2, 1, png(2)));
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn asset_key_fetch_rejects_oversized_response_before_cache_write() {
+        let cache = TestCache::new();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/emote", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            respond_with_length(&mut stream, "200 OK", &[], crate::MAX_IMAGE_DOWNLOAD_BYTES + 1).await;
+        });
+        let key = AssetKey { provider: "test".into(), id: "large".into(), scale: 1 };
+        assert!(matches!(cache.0.get_bytes(&key, &url).await, Err(EmoteError::ImageTooLarge { .. })));
+        assert!(cache.0.inner.lock().unwrap().bytes.is_empty());
+        assert!(!cache.0.disk_dir.join("test/large_1.bin").exists());
         task.await.unwrap();
     }
 

@@ -484,6 +484,7 @@ impl KickSession {
             timestamp,
             channel: channel.clone(),
             sender: Sender {
+                original_display_name: None,
                 user_id: UserId(user_id_str),
                 login,
                 display_name,
@@ -605,6 +606,7 @@ impl KickSession {
             timestamp,
             channel: channel.clone(),
             sender: Sender {
+                original_display_name: None,
                 user_id: UserId(creator_user_id),
                 login: creator_login,
                 display_name: creator,

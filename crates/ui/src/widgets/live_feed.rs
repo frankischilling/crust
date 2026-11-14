@@ -1,5 +1,5 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use crate::image_cache::UiImageCache;
+use std::collections::HashSet;
 use std::time::Instant;
 
 use egui::{CornerRadius, Frame, Layout, Margin, RichText, ScrollArea, Sense, Ui, Vec2};
@@ -27,7 +27,7 @@ pub struct LiveFeed<'a> {
     pub joined_logins: &'a HashSet<String>,
     /// URL -> (width, height, bytes) cache for thumbnails. Entries populated
     /// by the app after `AppCommand::FetchImage` -> `AppEvent::EmoteImageReady`.
-    pub thumbnail_bytes: &'a HashMap<String, (u32, u32, Arc<[u8]>)>,
+    pub thumbnail_bytes: &'a UiImageCache,
 }
 
 const ROW_CORNER: u8 = 6;
@@ -212,7 +212,7 @@ impl<'a> LiveFeed<'a> {
             thumb_ui.put(
                 thumb_rect,
                 egui::Image::from_bytes(
-                    snap.thumbnail_url.clone(),
+                    super::bytes_uri(&snap.thumbnail_url, raw),
                     egui::load::Bytes::Shared(raw.clone()),
                 )
                 .fit_to_exact_size(Vec2::new(m.thumb_w, m.thumb_h))

@@ -583,6 +583,15 @@ pub enum AppEvent {
         channel: ChannelId,
         message: ChatMessage,
     },
+    /// A message was rejected before reaching the chat service. Keep its draft
+    /// and reply available so the user can retry without replacing newer input.
+    MessageSendRejected {
+        channel: ChannelId,
+        text: String,
+        reply_to_msg_id: Option<String>,
+        reply: Option<ReplyInfo>,
+        reason: String,
+    },
     /// Incoming Twitch whisper delivered out-of-band from channel chat.
     WhisperReceived {
         /// Login of the whisper sender.
@@ -619,6 +628,8 @@ pub enum AppEvent {
         username: String,
         user_id: String,
     },
+    /// The old account is detached while a new token or chat session is checked.
+    AuthenticationPending { username: Option<String> },
     /// Full snapshot of the emote catalog (sent after each load).
     EmoteCatalogUpdated {
         emotes: Vec<EmoteCatalogEntry>,

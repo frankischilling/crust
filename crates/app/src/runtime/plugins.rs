@@ -5108,7 +5108,8 @@ fn event_kind(event: &AppEvent) -> Option<PluginEventKind> {
         AppEvent::WhisperReceived { .. } => PluginEventKind::WhisperReceived,
         AppEvent::MessageDeleted { .. } => PluginEventKind::MessageDeleted,
         AppEvent::SystemNotice(_) => PluginEventKind::SystemNotice,
-        AppEvent::Error { .. } => PluginEventKind::Error,
+        AppEvent::Error { .. } | AppEvent::MessageSendRejected { .. } => PluginEventKind::Error,
+        AppEvent::AuthenticationPending { .. } => return None,
         AppEvent::HistoryLoaded { .. } => PluginEventKind::HistoryLoaded,
         AppEvent::UserProfileLoaded { .. } => PluginEventKind::UserProfileLoaded,
         AppEvent::UserProfileUnavailable { .. } => PluginEventKind::UserProfileUnavailable,
@@ -5367,6 +5368,12 @@ unsafe fn make_event_table(L: *mut lua_State, event: &AppEvent) -> c_int {
             set_field_string(L, -1, "context", context);
             set_field_string(L, -1, "message", message);
         }
+        AppEvent::MessageSendRejected { reason, .. } => {
+            // Drafts and reply context stay in the UI's recovery path.
+            set_field_string(L, -1, "context", "SendMessage");
+            set_field_string(L, -1, "message", reason);
+        }
+        AppEvent::AuthenticationPending { .. } => {}
         AppEvent::HistoryLoaded { channel, messages } => {
             push_channel_table(L, channel);
             lua_setfield(L, -2, cstring("channel").as_ptr());
@@ -6279,6 +6286,37 @@ mod tests {
             lua_get_string_field(lua.ptr(), idx, "user_id").as_deref(),
             Some("42")
         );
+    }
+
+    #[test]
+    fn rejected_message_reports_plugin_error_without_exposing_the_draft() {
+        let _guard = test_scope();
+        let lua = LuaStateGuard::new();
+        let event = AppEvent::MessageSendRejected {
+            channel: ChannelId::new("room"),
+            text: "private unsent draft".to_owned(),
+            reply_to_msg_id: Some("parent-id".to_owned()),
+            reply: Some(crust_core::ReplyInfo {
+                parent_msg_id: "parent-id".to_owned(),
+                parent_user_login: "viewer".to_owned(),
+                parent_display_name: "Viewer".to_owned(),
+                parent_msg_body: "quoted message".to_owned(),
+            }),
+            reason: "Message was not sent. Sign-in is still in progress.".to_owned(),
+        };
+        assert_eq!(event_kind(&event), Some(PluginEventKind::Error));
+        let idx = unsafe { make_event_table(lua.ptr(), &event) };
+        assert_eq!(lua_get_string_field(lua.ptr(), idx, "type").as_deref(), Some("Error"));
+        assert_eq!(lua_get_string_field(lua.ptr(), idx, "context").as_deref(), Some("SendMessage"));
+        assert_eq!(lua_get_string_field(lua.ptr(), idx, "message").as_deref(), Some("Message was not sent. Sign-in is still in progress."));
+        for field in ["text", "channel", "reply", "reply_to_msg_id"] {
+            unsafe {
+                lua_getfield(lua.ptr(), idx, cstring(field).as_ptr());
+                assert_eq!(lua_type(lua.ptr(), -1), LUA_TNIL);
+                lua_pop(lua.ptr(), 1);
+            }
+        }
+        assert!(event_kind(&AppEvent::AuthenticationPending { username: Some("alice".to_owned()) }).is_none());
     }
 
     #[test]

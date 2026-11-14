@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use crate::image_cache::UiImageCache;
 
 use egui::RichText;
 
@@ -74,7 +73,7 @@ impl LoginDialog {
         logged_in: bool,
         username: Option<&str>,
         avatar_url: Option<&str>,
-        emote_bytes: &HashMap<String, (u32, u32, Arc<[u8]>)>,
+        emote_bytes: &UiImageCache,
     ) -> Option<LoginAction> {
         if !self.open {
             return None;
@@ -261,7 +260,7 @@ fn draw_account_row(
     is_active: bool,
     is_default: bool,
     avatar_url: Option<&str>,
-    emote_bytes: &HashMap<String, (u32, u32, Arc<[u8]>)>,
+    emote_bytes: &UiImageCache,
     result: &mut Option<LoginAction>,
     dialog_open: &mut bool,
 ) {

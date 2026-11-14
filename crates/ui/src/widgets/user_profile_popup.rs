@@ -1,5 +1,5 @@
+use crate::image_cache::UiImageCache;
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use egui::{Color32, CornerRadius, RichText, Vec2};
 
@@ -102,6 +102,7 @@ enum ProfileTab {
 pub struct UserProfilePopup {
     pub open: bool,
     profile: Option<UserProfile>,
+    original_profile_display_name: Option<String>,
     /// Show a spinner while the network request is in flight.
     loading: bool,
     /// Login name of whoever is being fetched (shown while loading).
@@ -157,6 +158,7 @@ impl UserProfilePopup {
         self.loading = true;
         self.open = true;
         self.profile = None;
+        self.original_profile_display_name = None;
         self.badges = badges;
         self.channel = channel;
         self.is_mod = is_mod;
@@ -262,7 +264,33 @@ impl UserProfilePopup {
         }
         self.loading = false;
         self.open = true;
+        self.original_profile_display_name = Some(profile.display_name.clone());
         self.profile = Some(profile);
+    }
+
+    pub fn apply_nicknames(&mut self, nicknames: &[crust_core::model::Nickname]) {
+        if let Some(profile) = self.profile.as_mut() {
+            if let Some(original) = self.original_profile_display_name.as_ref() {
+                profile.display_name.clone_from(original);
+            }
+            let channel = self
+                .channel
+                .as_ref()
+                .map_or("", |channel| channel.display_name());
+            crust_core::model::apply_nickname(
+                nicknames,
+                &profile.login,
+                channel,
+                &mut profile.display_name,
+            );
+        }
+        for message in self.logs.iter_mut().chain(self.mod_logs.iter_mut()) {
+            crust_core::model::apply_sender_nickname(
+                nicknames,
+                message.channel.display_name(),
+                &mut message.sender,
+            );
+        }
     }
 
     /// Called when `AppEvent::UserPronounsLoaded` arrives.  If the popup is
@@ -303,6 +331,7 @@ impl UserProfilePopup {
         self.open = true;
         self.loading_login = login.to_owned();
         self.profile = None;
+        self.original_profile_display_name = None;
     }
 
     /// Returns true when this popup is currently expecting a profile for
@@ -363,7 +392,7 @@ impl UserProfilePopup {
         &self,
         ui: &mut egui::Ui,
         profile: &UserProfile,
-        emote_bytes: &HashMap<String, (u32, u32, Arc<[u8]>)>,
+        emote_bytes: &UiImageCache,
         stv_avatars: &HashMap<String, String>,
     ) {
         ui.horizontal(|ui| {
@@ -1404,7 +1433,7 @@ impl UserProfilePopup {
     pub fn show(
         &mut self,
         ctx: &egui::Context,
-        emote_bytes: &HashMap<String, (u32, u32, Arc<[u8]>)>,
+        emote_bytes: &UiImageCache,
         stv_avatars: &HashMap<String, String>,
         presets: &[crust_core::model::mod_actions::ModActionPreset],
     ) -> Vec<PopupAction> {
@@ -1807,4 +1836,89 @@ fn iso_to_unix_secs(ts: &str) -> Option<u64> {
         return None;
     }
     Some(unix_days as u64 * 86_400 + hour * 3_600 + min * 60 + sec)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn profile(display_name: &str) -> UserProfile {
+        UserProfile {
+            id: "1".to_owned(),
+            login: "alice".to_owned(),
+            display_name: display_name.to_owned(),
+            description: String::new(),
+            created_at: None,
+            avatar_url: None,
+            followers: None,
+            is_partner: false,
+            is_affiliate: false,
+            pronouns: Some("she/her".to_owned()),
+            followed_at: None,
+            chat_color: None,
+            is_live: false,
+            stream_title: None,
+            stream_game: None,
+            stream_viewers: None,
+            last_broadcast_at: None,
+            is_banned: false,
+            ban_reason: None,
+        }
+    }
+
+    #[test]
+    fn open_profile_restores_the_server_name_after_alias_changes() {
+        let mut popup = UserProfilePopup::default();
+        popup.channel = Some(ChannelId::new("first"));
+        popup.set_profile(profile("Alice"));
+        popup.apply_nicknames(&[crust_core::model::Nickname::new("alice", "Custom")]);
+        assert_eq!(popup.profile.as_ref().unwrap().display_name, "Custom");
+        let mut scoped = crust_core::model::Nickname::new("alice", "Elsewhere");
+        scoped.channel = Some("second".to_owned());
+        popup.apply_nicknames(&[scoped]);
+        assert_eq!(popup.profile.as_ref().unwrap().display_name, "Alice");
+        popup.apply_nicknames(&[crust_core::model::Nickname::new("alice", "Another")]);
+        popup.apply_nicknames(&[]);
+        assert_eq!(popup.profile.as_ref().unwrap().display_name, "Alice");
+        popup.set_profile(profile("New server name"));
+        popup.apply_nicknames(&[crust_core::model::Nickname::new("alice", "Custom")]);
+        popup.apply_nicknames(&[]);
+        assert_eq!(popup.profile.as_ref().unwrap().display_name, "New server name");
+    }
+
+    #[test]
+    fn profile_log_snapshots_restore_original_sender_names() {
+        let channel = ChannelId::new("first");
+        let message = ChatMessage {
+            id: crust_core::MessageId(1),
+            server_id: None,
+            timestamp: chrono::Utc::now(),
+            channel,
+            sender: crust_core::model::Sender {
+                user_id: crust_core::model::UserId("1".to_owned()),
+                login: "alice".to_owned(),
+                display_name: "Alice".to_owned(),
+                original_display_name: None,
+                color: None,
+                name_paint: None,
+                badges: Vec::new(),
+            },
+            raw_text: "example".to_owned(),
+            spans: Default::default(),
+            twitch_emotes: Vec::new(),
+            flags: Default::default(),
+            reply: None,
+            msg_kind: crust_core::model::MsgKind::Chat,
+            shared: None,
+        };
+        let mut popup = UserProfilePopup::default();
+        popup.set_logs(vec![message.clone()]);
+        popup.set_mod_logs(vec![message]);
+        popup.apply_nicknames(&[crust_core::model::Nickname::new("alice", "Custom")]);
+        assert_eq!(popup.logs[0].sender.display_name, "Custom");
+        assert_eq!(popup.mod_logs[0].sender.display_name, "Custom");
+        popup.apply_nicknames(&[]);
+        assert_eq!(popup.logs[0].sender.display_name, "Alice");
+        assert_eq!(popup.mod_logs[0].sender.display_name, "Alice");
+    }
 }

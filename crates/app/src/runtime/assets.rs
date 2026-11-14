@@ -3,13 +3,50 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crust_core::events::AppEvent;
-use crust_emotes::{cache::EmoteCache, EmoteError};
-use tokio::sync::{mpsc, Semaphore};
+use crust_emotes::{cache::EmoteCache, read_image_response, EmoteError};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tracing::debug;
 
 type ImageResult = Result<(u32, u32, Vec<u8>), EmoteError>;
 
+/// A successful fetch keeps its slot until the bounded event channel accepts
+/// its bytes. Otherwise a stalled UI could leave arbitrarily many completed
+/// image buffers waiting outside the download and UI cache limits.
+#[derive(Debug)]
+struct DownloadedImage {
+    image: (u32, u32, Vec<u8>),
+    slot: OwnedSemaphorePermit,
+}
+
+impl DownloadedImage {
+    async fn send(
+        self,
+        url: &str,
+        evt_tx: &mpsc::Sender<AppEvent>,
+        before_send: impl FnOnce(),
+    ) -> bool {
+        let Ok(permit) = evt_tx.reserve().await else {
+            return false;
+        };
+        let Self {
+            image: (width, height, raw_bytes),
+            slot,
+        } = self;
+        // The tracked request publishes Ready before the UI sees its event.
+        before_send();
+        permit.send(AppEvent::EmoteImageReady {
+            uri: url.to_owned(),
+            width,
+            height,
+            raw_bytes,
+        });
+        drop(slot);
+        true
+    }
+}
+
 const MAX_IMAGE_DOWNLOADS: usize = 20;
+const MAX_TRACKED_IMAGE_REQUESTS: usize = 16_384;
 const IMAGE_RETRY_POLICY: RetryPolicy = RetryPolicy {
     attempts: 3,
     initial_delay: Duration::from_secs(1),
@@ -26,7 +63,7 @@ struct RetryPolicy {
 #[derive(Clone, Copy)]
 enum ImageRequestState {
     InFlight,
-    Ready,
+    Ready(Instant),
     RetryAfter(Instant),
 }
 
@@ -55,10 +92,31 @@ impl ImageRequests {
         cache: &Option<EmoteCache>,
         evt_tx: &mpsc::Sender<AppEvent>,
     ) -> bool {
+        self.request_inner(url, cache, evt_tx, false)
+    }
+
+    /// A visible cache miss must be delivered again after the UI evicts an asset.
+    /// Background prefetches still suppress URLs that completed successfully.
+    pub(crate) fn request_visible(
+        &self,
+        url: &str,
+        cache: &Option<EmoteCache>,
+        evt_tx: &mpsc::Sender<AppEvent>,
+    ) -> bool {
+        self.request_inner(url, cache, evt_tx, true)
+    }
+
+    fn request_inner(
+        &self,
+        url: &str,
+        cache: &Option<EmoteCache>,
+        evt_tx: &mpsc::Sender<AppEvent>,
+        redeliver: bool,
+    ) -> bool {
         if evt_tx.is_closed() || url.trim().is_empty() {
             return false;
         }
-        let Some(request) = self.begin(url, Instant::now()) else {
+        let Some(request) = self.begin_with_redelivery(url, Instant::now(), redeliver) else {
             return false;
         };
         let url = url.to_owned();
@@ -70,26 +128,55 @@ impl ImageRequests {
             // Keep one delayed request for callers that only ask once during cooldown.
             tokio::time::sleep_until(tokio::time::Instant::from_std(request.not_before)).await;
             let result = fetch_image_with_retry(&url, &cache, policy, &slots).await;
-            if result.is_err() {
-                // A completion can make a one-shot UI caller retry immediately.
-                // Publish the cooldown first so that retry is queued, not lost.
-                request.finish(false, Instant::now());
-                send_image_result(&url, result, &evt_tx).await;
-            } else {
-                let delivered = send_image_result(&url, result, &evt_tx).await;
-                request.finish(delivered, Instant::now());
+            match result {
+                Err(error) => {
+                    // Publish cooldown before a failure completion can trigger
+                    // another visible request. No download slot is held here.
+                    request.finish(false, Instant::now());
+                    send_image_result(&url, Err(error), &evt_tx).await;
+                }
+                Ok(image) => {
+                    // Cancellation or a closed event channel drops both guards:
+                    // release the slot and make this URL retryable.
+                    image
+                        .send(&url, &evt_tx, move || request.finish(true, Instant::now()))
+                        .await;
+                }
             }
         });
         true
     }
 
+    #[cfg(test)]
     fn begin(&self, url: &str, now: Instant) -> Option<ImageRequest> {
+        self.begin_with_redelivery(url, now, false)
+    }
+
+    fn begin_with_redelivery(
+        &self,
+        url: &str,
+        now: Instant,
+        redeliver: bool,
+    ) -> Option<ImageRequest> {
         let mut states = self.states.lock().unwrap();
         let not_before = match states.get(url) {
-            Some(ImageRequestState::InFlight | ImageRequestState::Ready) => return None,
+            Some(ImageRequestState::InFlight) => return None,
+            Some(ImageRequestState::Ready(_)) if !redeliver => return None,
             Some(ImageRequestState::RetryAfter(retry_at)) => (*retry_at).max(now),
-            None => now,
+            Some(ImageRequestState::Ready(_)) | None => now,
         };
+        if !states.contains_key(url) && states.len() >= MAX_TRACKED_IMAGE_REQUESTS {
+            let oldest = states
+                .iter()
+                .filter_map(|(url, state)| match state {
+                    ImageRequestState::Ready(at) => Some((url, *at)),
+                    ImageRequestState::RetryAfter(at) if *at <= now => Some((url, *at)),
+                    _ => None,
+                })
+                .min_by_key(|(_, at)| *at)
+                .map(|(url, _)| url.clone());
+            states.remove(&oldest?);
+        }
         states.insert(url.to_owned(), ImageRequestState::InFlight);
         Some(ImageRequest {
             states: self.states.clone(),
@@ -115,7 +202,7 @@ impl ImageRequest {
     fn settle(&mut self, succeeded: bool, now: Instant) {
         if let Some(url) = self.url.take() {
             let state = if succeeded {
-                ImageRequestState::Ready
+                ImageRequestState::Ready(now)
             } else {
                 ImageRequestState::RetryAfter(now + self.failure_cooldown)
             };
@@ -142,8 +229,24 @@ pub(crate) async fn fetch_emote_image(
     cache: &Option<EmoteCache>,
     evt_tx: &mpsc::Sender<AppEvent>,
 ) {
-    let result =
-        fetch_image_with_retry(url, cache, IMAGE_RETRY_POLICY, image_download_slots()).await;
+    fetch_and_publish_image(
+        url,
+        cache,
+        evt_tx,
+        IMAGE_RETRY_POLICY,
+        image_download_slots(),
+    )
+    .await;
+}
+
+async fn fetch_and_publish_image(
+    url: &str,
+    cache: &Option<EmoteCache>,
+    evt_tx: &mpsc::Sender<AppEvent>,
+    policy: RetryPolicy,
+    slots: &Arc<Semaphore>,
+) {
+    let result = fetch_image_with_retry(url, cache, policy, slots).await;
     send_image_result(url, result, evt_tx).await;
 }
 
@@ -151,8 +254,8 @@ async fn fetch_image_with_retry(
     url: &str,
     cache: &Option<EmoteCache>,
     policy: RetryPolicy,
-    slots: &Semaphore,
-) -> ImageResult {
+    slots: &Arc<Semaphore>,
+) -> Result<DownloadedImage, EmoteError> {
     let mut attempts = 0;
     let mut delay = policy.initial_delay;
     loop {
@@ -167,46 +270,55 @@ async fn fetch_image_with_retry(
     }
 }
 
-async fn fetch_image_once(url: &str, cache: &Option<EmoteCache>, slots: &Semaphore) -> ImageResult {
-    let _permit = slots
-        .acquire()
+async fn fetch_image_once(
+    url: &str,
+    cache: &Option<EmoteCache>,
+    slots: &Arc<Semaphore>,
+) -> Result<DownloadedImage, EmoteError> {
+    let slot = slots
+        .clone()
+        .acquire_owned()
         .await
         .map_err(|error| EmoteError::Io(std::io::Error::other(error.to_string())))?;
-    if let Some(cache) = cache {
+    let image = if let Some(cache) = cache {
         cache.fetch_and_decode(url).await
     } else {
-        fetch_and_decode_raw_unlimited(url).await
-    }
+        fetch_and_decode_uncached(url).await
+    }?;
+    Ok(DownloadedImage { image, slot })
 }
 
 async fn send_image_result(
     url: &str,
-    result: ImageResult,
+    result: Result<DownloadedImage, EmoteError>,
     evt_tx: &mpsc::Sender<AppEvent>,
 ) -> bool {
-    let succeeded = result.is_ok();
-    let (width, height, raw_bytes) = result.unwrap_or_else(|error| {
-        debug!("Failed to fetch emote image {url}: {error}");
-        // One empty completion settles the loading counter after all retries fail.
-        (0, 0, Vec::new())
-    });
-    evt_tx
-        .send(AppEvent::EmoteImageReady {
-            uri: url.to_owned(),
-            width,
-            height,
-            raw_bytes,
-        })
-        .await
-        .is_ok()
-        && succeeded
+    match result {
+        Ok(image) => image.send(url, evt_tx, || {}).await,
+        Err(error) => {
+            debug!("Failed to fetch emote image {url}: {error}");
+            // One empty completion settles the loading counter after all retries fail.
+            let _ = evt_tx
+                .send(AppEvent::EmoteImageReady {
+                    uri: url.to_owned(),
+                    width: 0,
+                    height: 0,
+                    raw_bytes: Vec::new(),
+                })
+                .await;
+            false
+        }
+    }
 }
 
-pub(crate) async fn fetch_and_decode_raw(url: &str) -> ImageResult {
-    fetch_image_once(url, &None, image_download_slots()).await
+/// Avatar/profile lookups use one attempt and skip failed image completions.
+pub(crate) async fn fetch_profile_image(url: &str, evt_tx: &mpsc::Sender<AppEvent>) {
+    if let Ok(image) = fetch_image_once(url, &None, image_download_slots()).await {
+        image.send(url, evt_tx, || {}).await;
+    }
 }
 
-async fn fetch_and_decode_raw_unlimited(url: &str) -> ImageResult {
+async fn fetch_and_decode_uncached(url: &str) -> ImageResult {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     if CLIENT.get().is_none() {
         let client = reqwest::Client::builder()
@@ -215,16 +327,13 @@ async fn fetch_and_decode_raw_unlimited(url: &str) -> ImageResult {
             .build()?;
         let _ = CLIENT.set(client);
     }
-    let raw = CLIENT
+    let response = CLIENT
         .get()
         .expect("image client initialized")
         .get(url)
         .send()
-        .await?
-        .error_for_status()?
-        .bytes()
-        .await?
-        .to_vec();
+        .await?;
+    let raw = read_image_response(response).await?;
     tokio::task::spawn_blocking(move || {
         let decoded = image::ImageReader::new(std::io::Cursor::new(&raw))
             .with_guessed_format()?
@@ -262,10 +371,30 @@ mod tests {
     }
 
     async fn server(responses: Vec<(u16, Vec<u8>)>) -> (String, tokio::task::JoinHandle<()>) {
+        server_with_lengths(
+            responses
+                .into_iter()
+                .map(|(status, bytes)| (status, bytes.len(), bytes))
+                .collect(),
+        )
+        .await
+    }
+
+    async fn server_with_lengths(
+        responses: Vec<(u16, usize, Vec<u8>)>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let (url, _, task) = counted_server(responses).await;
+        (url, task)
+    }
+
+    async fn counted_server(
+        responses: Vec<(u16, usize, Vec<u8>)>,
+    ) -> (String, mpsc::Receiver<()>, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/image", listener.local_addr().unwrap());
+        let (finished_tx, finished_rx) = mpsc::channel(responses.len().max(1));
         let task = tokio::spawn(async move {
-            for (status, bytes) in responses {
+            for (status, length, bytes) in responses {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
                 while !request.windows(4).any(|part| part == b"\r\n\r\n") {
@@ -276,15 +405,217 @@ mod tests {
                     assert!(request.len() <= 16 * 1024, "request headers too large");
                 }
                 let headers = format!(
-                    "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    bytes.len()
+                    "HTTP/1.1 {status} Test\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
                 );
                 stream.write_all(headers.as_bytes()).await.unwrap();
                 stream.write_all(&bytes).await.unwrap();
                 stream.shutdown().await.unwrap();
+                let _ = finished_tx.try_send(());
             }
         });
-        (url, task)
+        (url, finished_rx, task)
+    }
+
+    async fn image_completion_backpressure(tracked: bool) {
+        let valid = png();
+        let (url, mut finished, server) = counted_server(vec![
+            (200, valid.len(), valid.clone()),
+            (200, valid.len(), valid.clone()),
+        ])
+        .await;
+        let urls = [format!("{url}/first"), format!("{url}/second")];
+        let slots = Arc::new(Semaphore::new(1));
+        let mut requests = requests(1);
+        requests.slots = slots.clone();
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(AppEvent::EmoteImageReady {
+            uri: "occupied".to_owned(),
+            width: 0,
+            height: 0,
+            raw_bytes: Vec::new(),
+        })
+        .unwrap();
+        let mut tasks = Vec::new();
+        for url in &urls {
+            if tracked {
+                assert!(requests.request(url, &None, &tx));
+            } else {
+                let tx = tx.clone();
+                let url = url.clone();
+                let slots = slots.clone();
+                let policy = requests.policy;
+                tasks.push(tokio::spawn(async move {
+                    fetch_and_publish_image(&url, &None, &tx, policy, &slots).await;
+                }));
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(2), finished.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), finished.recv())
+                .await
+                .is_err(),
+            "a second image downloaded while the first was waiting for event capacity"
+        );
+        assert_eq!(slots.available_permits(), 0);
+        assert!(
+            matches!(rx.recv().await, Some(AppEvent::EmoteImageReady { uri, .. }) if uri == "occupied")
+        );
+        let mut delivered = std::collections::HashSet::new();
+        for _ in 0..2 {
+            let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let AppEvent::EmoteImageReady { uri, raw_bytes, .. } = event else {
+                panic!("unexpected event")
+            };
+            assert_eq!(raw_bytes, valid);
+            delivered.insert(uri);
+        }
+        assert_eq!(delivered, urls.iter().cloned().collect());
+        for task in tasks {
+            task.await.unwrap();
+        }
+        server.await.unwrap();
+        assert_eq!(slots.available_permits(), 1);
+        if tracked {
+            for url in &urls {
+                assert!(matches!(
+                    requests.states.lock().unwrap().get(url),
+                    Some(ImageRequestState::Ready(_))
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tracked_downloads_wait_for_event_admission_before_releasing_slots() {
+        image_completion_backpressure(true).await;
+    }
+
+    #[tokio::test]
+    async fn direct_prefetches_wait_for_event_admission_before_releasing_slots() {
+        image_completion_backpressure(false).await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_blocked_completion_releases_the_slot_and_request() {
+        let (url, server) = server(vec![(200, png())]).await;
+        let requests = requests(1);
+        let guard = requests.begin(&url, Instant::now()).unwrap();
+        let slots = Arc::new(Semaphore::new(1));
+        let image = fetch_image_once(&url, &None, &slots).await.unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(AppEvent::EmoteImageReady {
+            uri: "occupied".to_owned(),
+            width: 0,
+            height: 0,
+            raw_bytes: Vec::new(),
+        })
+        .unwrap();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let task_url = url.clone();
+        let task = tokio::spawn(async move {
+            let _ = started.send(());
+            image
+                .send(&task_url, &tx, move || guard.finish(true, Instant::now()))
+                .await
+        });
+        ready.await.unwrap();
+        assert_eq!(slots.available_permits(), 0);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(slots.available_permits(), 1);
+        assert!(matches!(
+            requests.states.lock().unwrap().get(&url),
+            Some(ImageRequestState::RetryAfter(_))
+        ));
+        assert!(
+            matches!(rx.try_recv(), Ok(AppEvent::EmoteImageReady { uri, .. }) if uri == "occupied")
+        );
+        assert!(rx.try_recv().is_err());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_closed_completion_channel_releases_successful_download_ownership() {
+        let (url, server) = server(vec![(200, png())]).await;
+        let requests = requests(1);
+        let guard = requests.begin(&url, Instant::now()).unwrap();
+        let slots = Arc::new(Semaphore::new(1));
+        let image = fetch_image_once(&url, &None, &slots).await.unwrap();
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        assert!(
+            !image
+                .send(&url, &tx, move || guard.finish(true, Instant::now()))
+                .await
+        );
+        assert_eq!(slots.available_permits(), 1);
+        assert!(matches!(
+            requests.states.lock().unwrap().get(&url),
+            Some(ImageRequestState::RetryAfter(_))
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn visible_miss_redelivers_ready_images_without_reenabling_prefetch_duplicates() {
+        let valid = png();
+        let (url, server) = server(vec![(200, valid.clone()), (200, valid.clone())]).await;
+        let requests = requests(1);
+        let (tx, mut rx) = mpsc::channel(1);
+        assert!(requests.request(&url, &None, &tx));
+        let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(first, AppEvent::EmoteImageReady { raw_bytes, .. } if raw_bytes == valid));
+        assert!(matches!(
+            requests.states.lock().unwrap().get(&url),
+            Some(ImageRequestState::Ready(_))
+        ));
+        assert!(!requests.request(&url, &None, &tx));
+        assert!(requests.request_visible(&url, &None, &tx));
+        assert!(!requests.request_visible(&url, &None, &tx));
+        let second = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(second, AppEvent::EmoteImageReady { raw_bytes, .. } if raw_bytes == valid)
+        );
+        assert!(!requests.request(&url, &None, &tx));
+        assert!(rx.try_recv().is_err());
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn request_metadata_is_bounded_without_evicting_inflight_work() {
+        let requests = requests(1);
+        let now = Instant::now();
+        {
+            let mut states = requests.states.lock().unwrap();
+            for index in 0..MAX_TRACKED_IMAGE_REQUESTS {
+                states.insert(index.to_string(), ImageRequestState::InFlight);
+            }
+        }
+        assert!(requests.begin_with_redelivery("new", now, true).is_none());
+        requests
+            .states
+            .lock()
+            .unwrap()
+            .insert("0".to_owned(), ImageRequestState::Ready(now));
+        let request = requests.begin_with_redelivery("new", now, true).unwrap();
+        assert_eq!(
+            requests.states.lock().unwrap().len(),
+            MAX_TRACKED_IMAGE_REQUESTS
+        );
+        assert!(!requests.states.lock().unwrap().contains_key("0"));
+        request.finish(true, now);
     }
 
     #[tokio::test]
@@ -317,7 +648,34 @@ mod tests {
         assert!(!requests.request(&url, &None, &tx));
         assert!(matches!(
             requests.states.lock().unwrap().get(&url),
-            Some(ImageRequestState::Ready)
+            Some(ImageRequestState::Ready(_))
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_response_retries_and_emits_one_valid_completion() {
+        let valid = png();
+        let (url, server) = server_with_lengths(vec![
+            (200, crust_emotes::MAX_IMAGE_DOWNLOAD_BYTES + 1, Vec::new()),
+            (200, valid.len(), valid.clone()),
+        ])
+        .await;
+        let requests = requests(2);
+        let (tx, mut rx) = mpsc::channel(8);
+        assert!(requests.request(&url, &None, &tx));
+        let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event,
+            AppEvent::EmoteImageReady { width: 2, height: 1, raw_bytes, .. } if raw_bytes == valid
+        ));
+        assert!(rx.try_recv().is_err());
+        assert!(matches!(
+            requests.states.lock().unwrap().get(&url),
+            Some(ImageRequestState::Ready(_))
         ));
         server.await.unwrap();
     }

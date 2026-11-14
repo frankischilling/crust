@@ -1315,6 +1315,7 @@ fn parse_irc_privmsg(msg: &IrcMessage, key: &ServerKey, my_nick: &str) -> Option
         timestamp: Utc::now(),
         channel,
         sender: Sender {
+            original_display_name: None,
             user_id: UserId(user_id),
             login: login.clone(),
             display_name,
