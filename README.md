@@ -43,7 +43,7 @@ packaging, WSL setup, and the workspace layout.
 - Anonymous mode works for read-only chat.
 - To send messages, log in with a Twitch OAuth token in-app.
 - Multiple accounts are supported; switch accounts without restarting.
-- Tokens use the OS keyring when available, with a settings-file fallback.
+- Tokens are saved in the settings file and also in the OS keyring when available.
 
 ## Screenshot
 
@@ -56,10 +56,10 @@ for current settings and account-dialog captures.
 
 - [Documentation index](docs/HOME.md)
 - [Features and keybinds](docs/FEATURES_AND_KEYBINDS.md)
-- [UI, chat, and performance audit](docs/AUDIT_UI_PERFORMANCE.md)
+- [Chat controls and performance audit](docs/AUDIT_STABILITY.md)
 - [Plugin API reference](docs/API.md)
 - [Example plugins](plugins/)
-- [Release notes v0.5.4](docs/releases/Release_v0.5.4.md)
+- [Release notes v0.5.5](docs/releases/Release_v0.5.5.md)
 
 ## Data paths
 

@@ -199,7 +199,11 @@ buffer of `channel` by the host.
 Replace the full per-event sound settings map. `events` is keyed by
 event name (`mention`, `whisper`, `subscribe`, `raid`,
 `custom_highlight`); each value is a table of `{ enabled, path, volume }`.
-Missing keys fall back to the host default.
+Missing event keys use the host defaults. A table with no recognized event
+entries leaves the current settings unchanged.
+
+To change one sound and preserve the others, edit the table returned by
+`c2.get_sound_settings()` and pass it here.
 
 Subscribe to `c2.EventType.SoundSettingsUpdated` to observe the current
 snapshot (emitted on startup and after every successful change).
@@ -217,8 +221,12 @@ defaults.
 
 Replace the full hotkey binding map. `bindings` is keyed by action key
 (`zoom_in`, `open_quick_switcher`, `next_tab`, ...); each value is a table
-of `{ ctrl, shift, alt, command, key }`. Missing keys keep their prior
-(or default) binding.
+of `{ ctrl, shift, alt, command, key }`. Missing action keys revert to their
+default bindings. A table with no recognized action entries leaves the current
+bindings unchanged.
+
+To change one shortcut and preserve the others, edit the table returned by
+`c2.get_hotkey_bindings()` and pass it here.
 
 Subscribe to `c2.EventType.HotkeyBindingsUpdated` to observe the current
 snapshot (emitted on startup and after every successful change).

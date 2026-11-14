@@ -188,7 +188,7 @@ cached-snapshot behavior, and the measured rendering workloads.
   - add/switch/remove accounts
   - set default startup account
 - Auth refresh flow for expired/invalid sessions
-- OS keyring-backed token storage with settings-file fallback
+- Tokens saved in the settings file, with OS keyring storage when available
 - IRC identity settings (nick and NickServ credentials)
 - Settings persistence for:
   - general behavior (timestamps, local log indexing, auto-join, ignores/highlights)
@@ -259,7 +259,8 @@ messages; ordinary live chat keeps its 1,500-message limit.
 ### Reliability
 
 - Crash handler with persistent reports under `{data_dir}/logs/crashes/`:
-  - structured panic reports (version, target triple, run id, OS / arch / display server, pid, thread, payload, force-captured backtrace, last ~512 tracing events, live settings snapshot)
+  - structured panic reports (version, target triple, run id, OS / arch / display server, pid, thread, payload, force-captured backtrace, last ~512 tracing events, live settings summary)
+  - settings summaries exclude credentials and free-form settings such as commands, URLs, and headers
   - synthetic "abnormal exit" reports on SIGKILL / power loss / native crash detected via session sentinel
   - rolling 20-report + 40-sentinel retention
   - in-app crash viewer with View / Copy / Show on disk / Delete / Dismiss / Restart actions
@@ -355,7 +356,6 @@ are passed to the chat server.
 - /clearmessages
 - /reloadplugins
 - /pluginsreload
-- /chatters
 - /fakemsg <text>
 - /openurl <url>
 - /logs open the Crust log/data folder in the system file manager
