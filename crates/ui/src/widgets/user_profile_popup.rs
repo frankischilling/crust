@@ -131,6 +131,8 @@ pub struct UserProfilePopup {
     ivr_logs_error: Option<String>,
     /// Whether IVR logs have been requested for the current popup session.
     ivr_logs_requested: bool,
+    /// Distinguishes refreshes and reopened cards from earlier requests.
+    ivr_logs_request_id: u64,
     /// Channels where this user appears in local state (chatters or recent messages).
     shared_channels: Vec<String>,
     /// Pronouns resolved via alejo.io before the profile itself arrived.
@@ -227,24 +229,58 @@ impl UserProfilePopup {
         self.shared_channels = channels;
     }
 
-    /// Store external IVR chat logs.
-    pub fn set_ivr_logs(&mut self, logs: Vec<IvrLogEntry>) {
-        self.ivr_logs = logs;
-        self.ivr_logs_loading = false;
-        self.ivr_logs_error = None;
-    }
-
-    /// Mark IVR log fetch as failed.
-    pub fn set_ivr_logs_error(&mut self, error: String) {
-        self.ivr_logs_loading = false;
-        self.ivr_logs_error = Some(error);
-    }
-
-    /// Mark IVR logs as currently loading.
-    pub fn set_ivr_logs_loading(&mut self) {
+    /// Start a log request for the card that is still open.
+    pub fn begin_ivr_logs_request(&mut self, channel: &str, username: &str) -> Option<u64> {
+        if !self.accepts_profile(username)
+            || !self.channel.as_ref().is_some_and(|current| {
+                current.as_str().eq_ignore_ascii_case(channel)
+            })
+        {
+            return None;
+        }
+        self.ivr_logs_request_id = self.ivr_logs_request_id.wrapping_add(1);
         self.ivr_logs_loading = true;
         self.ivr_logs_error = None;
         self.ivr_logs_requested = true;
+        Some(self.ivr_logs_request_id)
+    }
+
+    /// Apply only the result of this card's current log request.
+    pub fn apply_ivr_logs_result(
+        &mut self,
+        channel: &str,
+        username: &str,
+        request_id: Option<u64>,
+        result: Result<Vec<IvrLogEntry>, String>,
+    ) -> bool {
+        if !self.ivr_logs_loading
+            || request_id != Some(self.ivr_logs_request_id)
+            || !self.accepts_profile(username)
+            || !self.channel.as_ref().is_some_and(|current| {
+                current.as_str().eq_ignore_ascii_case(channel)
+            })
+        {
+            return false;
+        }
+        self.ivr_logs_loading = false;
+        match result {
+            Ok(logs) => {
+                self.ivr_logs = logs;
+                self.ivr_logs_error = None;
+            }
+            Err(error) => self.ivr_logs_error = Some(error),
+        }
+        true
+    }
+
+    /// End a pending log request when the background service cannot complete it.
+    pub fn abort_ivr_logs_request(&mut self, error: &str) -> bool {
+        if !self.ivr_logs_loading {
+            return false;
+        }
+        self.ivr_logs_loading = false;
+        self.ivr_logs_error = Some(error.to_owned());
+        true
     }
 
     /// Called when `AppEvent::UserProfileLoaded` arrives.
@@ -1667,14 +1703,7 @@ fn chat_message_text(msg: &ChatMessage) -> String {
 
 /// Parse a CSS hex color string (`#RRGGBB`) into an egui Color32.
 fn parse_hex_color(hex: &str) -> Option<Color32> {
-    let h = hex.trim_start_matches('#');
-    if h.len() != 6 {
-        return None;
-    }
-    let r = u8::from_str_radix(&h[0..2], 16).ok()?;
-    let g = u8::from_str_radix(&h[2..4], 16).ok()?;
-    let b = u8::from_str_radix(&h[4..6], 16).ok()?;
-    Some(Color32::from_rgb(r, g, b))
+    t::parse_hex_rgb(hex)
 }
 
 /// Convert a badge name + version to a human-readable label.
@@ -2175,6 +2204,78 @@ mod tests {
         assert!(popup.open);
         assert!(!popup.loading);
         assert!(popup.profile.is_none());
+    }
+
+    fn ivr_log(text: &str) -> IvrLogEntry {
+        IvrLogEntry {
+            text: text.to_owned(),
+            timestamp: "2026-11-14T12:00:00Z".to_owned(),
+            display_name: "Alice".to_owned(),
+            msg_type: 1,
+        }
+    }
+
+    #[test]
+    fn ivr_logs_reject_other_channels_users_and_unscoped_results() {
+        let mut popup = UserProfilePopup::default();
+        popup.set_loading("alice", vec![], Some(ChannelId::new("first")), false);
+        popup.set_profile(profile("Alice"));
+        let first = popup.begin_ivr_logs_request("first", "alice").unwrap();
+
+        popup.set_loading("alice", vec![], Some(ChannelId::new("second")), false);
+        popup.set_profile(profile("Alice"));
+        let second = popup.begin_ivr_logs_request("second", "alice").unwrap();
+        assert_ne!(first, second);
+        for (channel, user, request) in [
+            ("first", "alice", Some(first)),
+            ("first", "alice", Some(second)),
+            ("second", "bob", Some(second)),
+            ("second", "alice", None),
+        ] {
+            assert!(!popup.apply_ivr_logs_result(channel, user, request, Ok(vec![ivr_log("stale")])));
+            assert!(!popup.apply_ivr_logs_result(channel, user, request, Err("stale error".into())));
+            assert!(popup.ivr_logs_loading);
+            assert!(popup.ivr_logs.is_empty());
+            assert!(popup.ivr_logs_error.is_none());
+        }
+        assert!(popup.apply_ivr_logs_result(
+            "SECOND", "ALICE", Some(second), Ok(vec![ivr_log("current")]),
+        ));
+        assert!(!popup.ivr_logs_loading);
+        assert_eq!(popup.ivr_logs[0].text, "current");
+        assert!(!popup.apply_ivr_logs_result(
+            "second", "alice", Some(second), Err("duplicate completion".into()),
+        ));
+        assert!(popup.ivr_logs_error.is_none());
+    }
+
+    #[test]
+    fn ivr_logs_reject_closed_reopened_and_superseded_requests() {
+        let mut popup = UserProfilePopup::default();
+        popup.set_loading("alice", vec![], Some(ChannelId::new("room")), false);
+        popup.set_profile(profile("Alice"));
+        let closed = popup.begin_ivr_logs_request("room", "alice").unwrap();
+        popup.close();
+        assert!(!popup.apply_ivr_logs_result("room", "alice", Some(closed), Ok(vec![ivr_log("closed")])));
+        assert!(popup.begin_ivr_logs_request("room", "alice").is_none());
+
+        popup.set_loading("alice", vec![], Some(ChannelId::new("room")), false);
+        popup.set_profile(profile("Alice"));
+        let reopened = popup.begin_ivr_logs_request("room", "alice").unwrap();
+        assert!(popup.begin_ivr_logs_request("other", "alice").is_none());
+        assert!(popup.begin_ivr_logs_request("room", "bob").is_none());
+        assert!(!popup.apply_ivr_logs_result("room", "alice", Some(closed), Err("closed request".into())));
+        assert!(popup.ivr_logs_loading);
+        assert!(popup.apply_ivr_logs_result("room", "alice", Some(reopened), Ok(vec![ivr_log("loaded")])));
+
+        let refresh = popup.begin_ivr_logs_request("room", "alice").unwrap();
+        assert!(!popup.apply_ivr_logs_result("room", "alice", Some(reopened), Err("old refresh".into())));
+        assert!(popup.ivr_logs_loading);
+        assert_eq!(popup.ivr_logs[0].text, "loaded");
+        assert!(popup.apply_ivr_logs_result("room", "alice", Some(refresh), Err("current failure".into())));
+        assert!(!popup.ivr_logs_loading);
+        assert_eq!(popup.ivr_logs_error.as_deref(), Some("current failure"));
+        assert_eq!(popup.ivr_logs[0].text, "loaded");
     }
 
     #[test]

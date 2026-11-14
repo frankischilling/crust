@@ -1039,23 +1039,7 @@ fn color_from_style(style: &PluginUiStyle, ui: &Ui) -> Option<Color32> {
 }
 
 fn parse_hex_color(input: &str) -> Option<Color32> {
-    let value = input.trim().trim_start_matches('#');
-    match value.len() {
-        6 => {
-            let r = u8::from_str_radix(&value[0..2], 16).ok()?;
-            let g = u8::from_str_radix(&value[2..4], 16).ok()?;
-            let b = u8::from_str_radix(&value[4..6], 16).ok()?;
-            Some(Color32::from_rgb(r, g, b))
-        }
-        8 => {
-            let r = u8::from_str_radix(&value[0..2], 16).ok()?;
-            let g = u8::from_str_radix(&value[2..4], 16).ok()?;
-            let b = u8::from_str_radix(&value[4..6], 16).ok()?;
-            let a = u8::from_str_radix(&value[6..8], 16).ok()?;
-            Some(Color32::from_rgba_unmultiplied(r, g, b, a))
-        }
-        _ => None,
-    }
+    crate::theme::parse_hex_rgba(input.trim())
 }
 
 #[cfg(test)]

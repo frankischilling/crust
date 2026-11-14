@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
@@ -11,6 +11,45 @@ use tracing::{info, warn};
 /// `scope` is "" for global badges, or the channel name for channel-specific badges.
 pub(crate) type BadgeDefinitions = HashMap<(String, String, String), String>;
 pub(crate) type BadgeMap = Arc<RwLock<BadgeDefinitions>>;
+
+fn badge_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(10))
+            .user_agent("crust-badges/1.0")
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
+/// Credentials from the reducer's current validated account. Each request owns
+/// its snapshot; the HTTP client stores no account or authorization state.
+#[derive(Clone)]
+pub(crate) struct BadgeAuth {
+    client_id: String,
+    bearer: String,
+}
+
+impl BadgeAuth {
+    pub(crate) fn from_validated(client_id: Option<&str>, token: &str) -> Option<Self> {
+        let client_id = client_id?.trim();
+        let token = token.trim();
+        let bearer = token.strip_prefix("oauth:").unwrap_or(token).trim();
+        if client_id.is_empty() || bearer.is_empty() {
+            return None;
+        }
+        Some(Self {
+            client_id: client_id.to_owned(),
+            bearer: bearer.to_owned(),
+        })
+    }
+
+    fn headers(&self) -> (&str, &str) {
+        (&self.client_id, &self.bearer)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BadgeCacheEntry {
@@ -487,25 +526,6 @@ fn parse_helix_badge_response(
     true
 }
 
-fn normalize_oauth_token(token: Option<&str>) -> Option<String> {
-    let raw = token?.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    Some(raw.strip_prefix("oauth:").unwrap_or(raw).to_owned())
-}
-
-async fn helix_auth_from_token(oauth_token: Option<&str>) -> Option<(String, String)> {
-    let bearer = normalize_oauth_token(oauth_token)?;
-    match super::auth::validate_token(&bearer).await {
-        Ok(info) => Some((info.client_id, bearer)),
-        Err(e) => {
-            warn!("Helix auth setup failed while validating token: {e}");
-            None
-        }
-    }
-}
-
 fn parse_badge_snapshot(
     body: &str,
     scope: &str,
@@ -573,13 +593,8 @@ async fn load_global_badges_v1_fallback(badge_map: &BadgeMap) {
         return;
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .user_agent("crust-badges/1.0")
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
     if let Some(text) = fetch_badge_payload_with_retries(
-        &client,
+        badge_client(),
         &["https://badges.twitch.tv/v1/badges/global/display"],
         "badges.twitch.tv global fallback",
         None,
@@ -599,22 +614,16 @@ async fn load_global_badges_v1_fallback(badge_map: &BadgeMap) {
     }
 }
 
-async fn load_global_badges_helix(badge_map: &BadgeMap, oauth_token: Option<&str>) {
-    let Some((client_id, token)) = helix_auth_from_token(oauth_token).await else {
+async fn load_global_badges_helix(badge_map: &BadgeMap, auth: Option<&BadgeAuth>) {
+    let Some(auth) = auth else {
         return;
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .user_agent("crust-badges/1.0")
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-
     if let Some(text) = fetch_badge_payload_with_retries(
-        &client,
+        badge_client(),
         &["https://api.twitch.tv/helix/chat/badges/global"],
         "Helix global badges",
-        Some((client_id.as_str(), token.as_str())),
+        Some(auth.headers()),
     )
     .await
     {
@@ -632,14 +641,8 @@ async fn load_global_badges_helix(badge_map: &BadgeMap, oauth_token: Option<&str
 }
 
 async fn load_global_badges_ivr_fallback(badge_map: &BadgeMap) {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .user_agent("crust-badges/1.0")
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-
     if let Some(text) = fetch_badge_payload_with_retries(
-        &client,
+        badge_client(),
         &["https://api.ivr.fi/v2/twitch/badges/global"],
         "IVR global badges",
         None,
@@ -665,14 +668,9 @@ async fn load_channel_badges_v1_fallback(room_id: &str, channel: &str) -> Option
         return None;
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .user_agent("crust-badges/1.0")
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
     let url = format!("https://badges.twitch.tv/v1/badges/channels/{room_id}/display");
     if let Some(text) = fetch_badge_payload_with_retries(
-        &client,
+        badge_client(),
         &[url.as_str()],
         &format!("badges.twitch.tv channel fallback (room={room_id})"),
         None,
@@ -695,8 +693,52 @@ async fn load_channel_badges_v1_fallback(room_id: &str, channel: &str) -> Option
     None
 }
 
-/// Load global Twitch badges via Helix/IVR with bundled fallback.
-pub(crate) async fn load_global_badges(badge_map: &BadgeMap, oauth_token: Option<String>) {
+/// Own the global refresh so account changes and shutdown cancel its requests.
+#[derive(Default)]
+pub(crate) struct GlobalBadgeRefresh {
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl GlobalBadgeRefresh {
+    pub(crate) fn request(&mut self, badge_map: &BadgeMap, auth: Option<BadgeAuth>) {
+        let badge_map = badge_map.clone();
+        self.replace_with(async move {
+            load_global_badges_helix(&badge_map, auth.as_ref()).await;
+            load_global_badges_ivr_fallback(&badge_map).await;
+            load_global_badges_v1_fallback(&badge_map).await;
+        });
+    }
+
+    pub(crate) fn ensure_started(&mut self, badge_map: &BadgeMap, auth: Option<BadgeAuth>) {
+        // The first connection can reuse startup work. After a disconnect the
+        // cleared owner starts a new refresh with the current account snapshot.
+        if self.task.is_none() {
+            self.request(badge_map, auth);
+        }
+    }
+
+    fn replace_with<F>(&mut self, refresh: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.clear();
+        self.task = Some(tokio::spawn(refresh));
+    }
+
+    pub(crate) fn clear(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for GlobalBadgeRefresh {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+pub(crate) fn load_bundled_global_badges(badge_map: &BadgeMap) {
     let badge_map_for_parse = badge_map.clone();
     let changed = parse_badges_on_large_stack("badge-global-bundled-parse", move || {
         merge_badge_response(
@@ -713,13 +755,6 @@ pub(crate) async fn load_global_badges(badge_map: &BadgeMap, oauth_token: Option
         info!("Updated {changed} global badge definitions from bundled Twitch snapshot");
         persist_badge_map_cache(badge_map);
     }
-
-    let badge_map_for_refresh = badge_map.clone();
-    tokio::spawn(async move {
-        load_global_badges_helix(&badge_map_for_refresh, oauth_token.as_deref()).await;
-        load_global_badges_ivr_fallback(&badge_map_for_refresh).await;
-        load_global_badges_v1_fallback(&badge_map_for_refresh).await;
-    });
 }
 
 /// Fetch an owned channel snapshot without changing shared state. A valid empty
@@ -727,21 +762,39 @@ pub(crate) async fn load_global_badges(badge_map: &BadgeMap, oauth_token: Option
 pub(crate) async fn load_channel_badges(
     room_id: &str,
     channel: &str,
-    oauth_token: Option<String>,
+    auth: Option<BadgeAuth>,
 ) -> Option<BadgeDefinitions> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .user_agent("crust-badges/1.0")
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-    let helix_auth = helix_auth_from_token(oauth_token.as_deref()).await;
-    if let Some((ref client_id, ref token)) = helix_auth {
-        let helix = format!("https://api.twitch.tv/helix/chat/badges?broadcaster_id={room_id}");
+    let urls = ChannelBadgeUrls {
+        helix: format!("https://api.twitch.tv/helix/chat/badges?broadcaster_id={room_id}"),
+        ivr_by_id: format!("https://api.ivr.fi/v2/twitch/badges/channel?id={room_id}"),
+        ivr_by_login: format!("https://api.ivr.fi/v2/twitch/badges/channel?login={channel}"),
+    };
+    if let Some(definitions) =
+        load_channel_badges_from(badge_client(), channel, auth.as_ref(), &urls).await
+    {
+        return Some(definitions);
+    }
+    load_channel_badges_v1_fallback(room_id, channel).await
+}
+
+struct ChannelBadgeUrls {
+    helix: String,
+    ivr_by_id: String,
+    ivr_by_login: String,
+}
+
+async fn load_channel_badges_from(
+    client: &reqwest::Client,
+    channel: &str,
+    auth: Option<&BadgeAuth>,
+    urls: &ChannelBadgeUrls,
+) -> Option<BadgeDefinitions> {
+    if let Some(auth) = auth {
         if let Some(text) = fetch_badge_payload_with_retries(
-            &client,
-            &[helix.as_str()],
-            &format!("Helix channel badges (room={room_id}, login={channel})"),
-            Some((client_id.as_str(), token.as_str())),
+            client,
+            &[&urls.helix],
+            &format!("Helix channel badges (login={channel})"),
+            Some(auth.headers()),
         )
         .await
         {
@@ -752,7 +805,7 @@ pub(crate) async fn load_channel_badges(
             .flatten();
             if let Some(definitions) = definitions {
                 info!(
-                    "Loaded {} channel badge definitions for room {room_id} via Helix",
+                    "Loaded {} channel badge definitions via Helix",
                     definitions.len()
                 );
                 return Some(definitions);
@@ -760,12 +813,10 @@ pub(crate) async fn load_channel_badges(
         }
     }
 
-    let ivr_by_id = format!("https://api.ivr.fi/v2/twitch/badges/channel?id={room_id}");
-    let ivr_by_login = format!("https://api.ivr.fi/v2/twitch/badges/channel?login={channel}");
     if let Some(text) = fetch_badge_payload_with_retries(
-        &client,
-        &[ivr_by_id.as_str(), ivr_by_login.as_str()],
-        &format!("IVR channel badges (room={room_id}, login={channel})"),
+        client,
+        &[&urls.ivr_by_id, &urls.ivr_by_login],
+        &format!("IVR channel badges (login={channel})"),
         None,
     )
     .await
@@ -777,13 +828,13 @@ pub(crate) async fn load_channel_badges(
         .flatten();
         if let Some(definitions) = definitions {
             info!(
-                "Loaded {} channel badge definitions for room {room_id} via IVR",
+                "Loaded {} channel badge definitions via IVR",
                 definitions.len()
             );
             return Some(definitions);
         }
     }
-    load_channel_badges_v1_fallback(room_id, channel).await
+    None
 }
 
 async fn fetch_badge_payload_with_retries(
@@ -793,8 +844,12 @@ async fn fetch_badge_payload_with_retries(
     auth: Option<(&str, &str)>,
 ) -> Option<String> {
     const ATTEMPTS: usize = 3;
+    let mut retryable = vec![true; urls.len()];
     for attempt in 0..ATTEMPTS {
-        for url in urls {
+        for (index, url) in urls.iter().enumerate() {
+            if !retryable[index] {
+                continue;
+            }
             let mut req = client.get(*url);
             if let Some((client_id, bearer)) = auth {
                 req = req
@@ -806,9 +861,21 @@ async fn fetch_badge_payload_with_retries(
                     Ok(text) => return Some(text),
                     Err(e) => warn!("{label} body-read failed for {url}: {e}"),
                 },
-                Ok(resp) => warn!("{label} returned HTTP {} for {url}", resp.status()),
+                Ok(resp) => {
+                    let status = resp.status();
+                    warn!("{label} returned HTTP {status} for {url}");
+                    if status.is_client_error()
+                        && status != reqwest::StatusCode::REQUEST_TIMEOUT
+                        && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+                    {
+                        retryable[index] = false;
+                    }
+                }
                 Err(e) => warn!("{label} request failed for {url}: {e}"),
             }
+        }
+        if !retryable.iter().any(|retry| *retry) {
+            break;
         }
         if attempt + 1 < ATTEMPTS {
             let delay_ms = 300 * (attempt as u64 + 1);
@@ -835,6 +902,224 @@ fn warn_badges_twitch_unresolved_once() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const HELIX_BADGES: &str = r#"{"data":[{"set_id":"subscriber","versions":[{"id":"1","image_url_1x":"https://example.test/badge.png"}]}]}"#;
+    const IVR_BADGES: &str = r#"[{"set_id":"subscriber","versions":[{"id":"1","image_url_1x":"https://example.test/badge.png"}]}]"#;
+
+    async fn serve_badges(
+        replies: Vec<(u16, &'static str)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            // All sequential loads must reuse this connection, including after
+            // account changes. Authorization belongs to each request header.
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut requests = Vec::new();
+            for (status, body) in replies {
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut bytes = [0; 1024];
+                    let received = socket.read(&mut bytes).await.unwrap();
+                    assert_ne!(received, 0, "badge HTTP connection closed between requests");
+                    request.extend_from_slice(&bytes[..received]);
+                    assert!(request.len() <= 16 * 1024);
+                }
+                requests.push(String::from_utf8(request).unwrap());
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: keep-alive\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        (base, task)
+    }
+
+    fn badge_urls(base: &str, room: usize) -> ChannelBadgeUrls {
+        ChannelBadgeUrls {
+            helix: format!("{base}/helix?room={room}"),
+            ivr_by_id: format!("{base}/ivr?id={room}"),
+            ivr_by_login: format!("{base}/ivr?login=room{room}"),
+        }
+    }
+
+    fn paused_global_refresh(
+        refresh: &mut GlobalBadgeRefresh,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let (started, observed_start) = tokio::sync::oneshot::channel();
+        let (release, pending) = tokio::sync::oneshot::channel();
+        let (completed, observed_completion) = tokio::sync::oneshot::channel();
+        refresh.replace_with(async move {
+            let _ = started.send(());
+            let _ = pending.await;
+            let _ = completed.send(());
+        });
+        (observed_start, release, observed_completion)
+    }
+
+    #[tokio::test]
+    async fn global_badge_refresh_replaces_pending_work() {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let mut refresh = GlobalBadgeRefresh::default();
+            let (started, mut old_release, old_completion) = paused_global_refresh(&mut refresh);
+            started.await.unwrap();
+
+            let (started, release, completion) = paused_global_refresh(&mut refresh);
+            started.await.unwrap();
+            old_release.closed().await;
+            assert!(old_completion.await.is_err());
+            release.send(()).unwrap();
+            completion.await.unwrap();
+        })
+        .await
+        .expect("replacing a global refresh must cancel the previous request");
+    }
+
+    #[tokio::test]
+    async fn global_badge_refresh_cancels_on_clear_and_drop() {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let mut refresh = GlobalBadgeRefresh::default();
+            let (started, mut release, completion) = paused_global_refresh(&mut refresh);
+            started.await.unwrap();
+            refresh.clear();
+            refresh.clear();
+            release.closed().await;
+            assert!(completion.await.is_err());
+
+            let (started, mut release, completion) = paused_global_refresh(&mut refresh);
+            started.await.unwrap();
+            drop(refresh);
+            release.closed().await;
+            assert!(completion.await.is_err());
+        })
+        .await
+        .expect("clearing or dropping a global refresh must cancel its request");
+    }
+
+    #[tokio::test]
+    async fn badge_loads_reuse_http_connection_and_current_validated_account() {
+        let (base, server) = serve_badges(vec![
+            (200, HELIX_BADGES),
+            (200, HELIX_BADGES),
+            (200, HELIX_BADGES),
+            (200, IVR_BADGES),
+            (200, IVR_BADGES),
+        ])
+        .await;
+        let first = BadgeAuth::from_validated(Some("first-client"), " oauth:first-token ").unwrap();
+        let next = BadgeAuth::from_validated(Some("next-client"), "next-token").unwrap();
+        let credentials = [
+            Some(first.clone()),
+            Some(first),
+            Some(next),
+            BadgeAuth::from_validated(None, "old-saved-token"),
+            BadgeAuth::from_validated(Some("next-client"), "oauth:"),
+        ];
+        let requests = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for (index, auth) in credentials.iter().enumerate() {
+                let channel = format!("room{index}");
+                let definitions = load_channel_badges_from(
+                    badge_client(),
+                    &channel,
+                    auth.as_ref(),
+                    &badge_urls(&base, index),
+                )
+                .await
+                .unwrap();
+                assert_eq!(definitions.len(), 1);
+                assert!(definitions.keys().all(|(scope, _, _)| scope == &channel));
+            }
+            server.await.unwrap()
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            requests.len(),
+            5,
+            "one badge request per channel, no validation requests"
+        );
+        for request in &requests[..2] {
+            let request = request.to_ascii_lowercase();
+            assert!(request.starts_with("get /helix?"));
+            assert!(request.contains("client-id: first-client\r\n"));
+            assert!(request.contains("authorization: bearer first-token\r\n"));
+        }
+        let switched = requests[2].to_ascii_lowercase();
+        assert!(switched.contains("client-id: next-client\r\n"));
+        assert!(switched.contains("authorization: bearer next-token\r\n"));
+        assert!(!switched.contains("first-token"));
+        for request in &requests[3..] {
+            let request = request.to_ascii_lowercase();
+            assert!(request.starts_with("get /ivr?"));
+            assert!(!request.contains("authorization:"));
+            assert!(!request.contains("client-id:"));
+            assert!(!request.contains("old-saved-token"));
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_badge_auth_falls_back_without_retries_or_forwarded_credentials() {
+        for status in [400, 401, 403, 404, 410, 422] {
+            let (base, server) = serve_badges(vec![(status, ""), (200, IVR_BADGES)]).await;
+            let auth = BadgeAuth::from_validated(Some("client"), "private-token").unwrap();
+            let requests = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let definitions = load_channel_badges_from(
+                    badge_client(),
+                    "room",
+                    Some(&auth),
+                    &badge_urls(&base, 1),
+                )
+                .await
+                .unwrap();
+                assert_eq!(definitions.len(), 1);
+                server.await.unwrap()
+            })
+            .await
+            .unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(requests[0].starts_with("GET /helix?"));
+            let fallback = requests[1].to_ascii_lowercase();
+            assert!(fallback.starts_with("get /ivr?"));
+            assert!(!fallback.contains("authorization:"));
+            assert!(!fallback.contains("client-id:"));
+            assert!(!fallback.contains("private-token"));
+        }
+    }
+
+    #[tokio::test]
+    async fn badge_retries_skip_permanent_urls_and_recover_transient_alternatives() {
+        for status in [408, 429, 503] {
+            let (base, server) =
+                serve_badges(vec![(404, ""), (status, ""), (200, IVR_BADGES)]).await;
+            let missing = format!("{base}/missing");
+            let temporary = format!("{base}/temporary");
+            let requests = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let payload = fetch_badge_payload_with_retries(
+                    badge_client(),
+                    &[&missing, &temporary],
+                    "test badges",
+                    None,
+                )
+                .await;
+                assert_eq!(payload.as_deref(), Some(IVR_BADGES));
+                server.await.unwrap()
+            })
+            .await
+            .unwrap();
+            assert_eq!(requests.len(), 3);
+            assert!(requests[0].starts_with("GET /missing "));
+            assert!(requests[1].starts_with("GET /temporary "));
+            assert!(requests[2].starts_with("GET /temporary "));
+        }
+    }
 
     #[test]
     fn badge_cache_writes_coalesce_updates_while_a_save_is_running() {

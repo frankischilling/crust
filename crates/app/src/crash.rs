@@ -21,9 +21,8 @@
 //! * the last ~512 tracing events (INFO and above by default) via a
 //!   lock-free in-memory ring buffer pushed from a custom
 //!   `tracing_subscriber::Layer`.
-//! * a snapshot of [`crust_storage::AppSettings`] (no secrets - tokens
-//!   are kept in the OS keyring and `AppSettings` stores only a
-//!   fallback blob that we also scrub before serializing).
+//! * an allowlisted settings snapshot containing layout values, feature flags,
+//!   and collection counts. Credentials and freeform settings are omitted.
 //!
 //! ## Abnormal shutdown detection
 //!
@@ -210,10 +209,11 @@ pub fn clear_session_sentinel() {
 /// [`crust_storage::set_persist_hook`] to call this on every
 /// subsequent save so the next crash report captures the current
 /// settings, not a stale startup copy.
-pub fn update_settings_snapshot(text: impl Into<String>) {
+pub fn update_settings_snapshot(settings: &crust_storage::AppSettings) {
+    let text = settings.diagnostic_snapshot();
     let m = SETTINGS_SNAPSHOT.get_or_init(|| Mutex::new(String::new()));
     if let Ok(mut g) = m.lock() {
-        *g = text.into();
+        *g = text;
     }
 }
 
@@ -756,11 +756,40 @@ mod tests {
     }
 
     #[test]
-    fn settings_snapshot_roundtrips() {
-        update_settings_snapshot("hello = 1\n");
-        assert!(current_settings_snapshot().contains("hello = 1"));
-        update_settings_snapshot("hello = 2\n");
-        assert!(current_settings_snapshot().contains("hello = 2"));
+    fn settings_snapshot_updates_without_credentials() {
+        let mut settings = crust_storage::AppSettings {
+            font_size: 17.0,
+            oauth_token: "crash-active-secret".to_owned(),
+            accounts: vec![crust_storage::AccountEntry {
+                username: "private-account".to_owned(),
+                oauth_token: "crash-saved-secret".to_owned(),
+            }],
+            irc_nickserv_pass: "crash-nickserv-secret".to_owned(),
+            ..Default::default()
+        };
+        settings.external_tools.streamlink_session_token = "crash-player-secret".to_owned();
+        settings.image_uploader.extra_headers =
+            "Authorization: Bearer crash-uploader-secret".to_owned();
+        update_settings_snapshot(&settings);
+        let snapshot = current_settings_snapshot();
+        assert!(snapshot.contains("font_size: 17.0"));
+        assert!(snapshot.contains("account_count: 1"));
+        for secret in [
+            "crash-active-secret",
+            "crash-saved-secret",
+            "crash-nickserv-secret",
+            "crash-player-secret",
+            "crash-uploader-secret",
+            "private-account",
+        ] {
+            assert!(!snapshot.contains(secret));
+        }
+
+        settings.font_size = 23.0;
+        update_settings_snapshot(&settings);
+        let snapshot = current_settings_snapshot();
+        assert!(snapshot.contains("font_size: 23.0"));
+        assert!(!snapshot.contains("font_size: 17.0"));
     }
 
     #[test]

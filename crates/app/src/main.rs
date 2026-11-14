@@ -40,7 +40,8 @@ use runtime::auth::{
     TokenValidationResult, ValidateError, ValidationKind,
 };
 use runtime::badges::{
-    load_badge_map_cache_into, load_channel_badges, load_global_badges, resolve_badge_url, BadgeMap,
+    load_badge_map_cache_into, load_bundled_global_badges, load_channel_badges, resolve_badge_url,
+    BadgeAuth, BadgeMap, GlobalBadgeRefresh,
 };
 use runtime::emote_loading::{
     clear_personal_emotes, drain_7tv_user_lookups, load_channel_emotes, load_global_emotes, load_kick_channel_emotes,
@@ -292,16 +293,13 @@ fn main() -> Result<()> {
         .as_ref()
         .map(|s| s.load())
         .unwrap_or_default();
-    // Register the loaded settings with the crash handler so any
-    // subsequent panic writes them alongside the backtrace.  We format
-    // via `Debug` (AppSettings contains no secrets) so the report is
-    // safe to share for triage.
-    crash::update_settings_snapshot(format!("{initial_settings:#?}"));
+    // Crash diagnostics include only reviewed settings fields and collection counts.
+    crash::update_settings_snapshot(&initial_settings);
     // Keep the snapshot live - every subsequent `SettingsStore::save`
     // fires this hook so the most recent settings are always bundled
     // into the next crash report, not just the startup copy.
     crust_storage::set_persist_hook(Some(std::sync::Arc::new(|settings: &AppSettings| {
-        crash::update_settings_snapshot(format!("{settings:#?}"));
+        crash::update_settings_snapshot(settings);
     })));
     let kick_runtime_enabled = initial_settings.enable_kick_beta;
     let irc_runtime_enabled = initial_settings.enable_irc_beta;
@@ -488,16 +486,19 @@ fn main() -> Result<()> {
     // Run the initial catalog bootstrap on the main thread instead of a
     // worker thread. The provider constructors and TLS setup involved here
     // can consume a lot of stack on some libc/OpenSSL combinations.
-    {
+    let global_badges = {
         let idx = emote_index.clone();
         let etx = evt_tx.clone();
         let bm = badge_map.clone();
-        let token = saved_token.clone();
         rt.block_on(async move {
             load_global_emotes(&idx, &etx).await;
-            load_global_badges(&bm, token).await;
-        });
-    }
+            load_bundled_global_badges(&bm);
+            // Authenticated badge refresh starts after account validation.
+            let mut refresh = GlobalBadgeRefresh::default();
+            refresh.request(&bm, None);
+            refresh
+        })
+    };
     let _global_emote_refresh = {
         let _runtime_scope = rt.enter();
         runtime::emote_loading::spawn_global_refresh(&emote_index, &evt_tx)
@@ -530,6 +531,7 @@ fn main() -> Result<()> {
             idx,
             cache,
             bm,
+            global_badges,
             settings_store,
             chat_logs,
             saved_token,
@@ -720,6 +722,7 @@ async fn reducer_loop(
     emote_index: EmoteIndex,
     emote_cache: Option<EmoteCache>,
     badge_map: BadgeMap,
+    mut global_badges: GlobalBadgeRefresh,
     settings_store: Option<SettingsStore>,
     chat_logs: Option<LogStore>,
     saved_token: Option<String>,
@@ -1311,6 +1314,9 @@ async fn reducer_loop(
                         room_snapshots.reconnect();
                         shared_session_last_fetch.clear();
                         badge_requests.clear();
+                        global_badges.ensure_started(&badge_map, BadgeAuth::from_validated(
+                            helix_client_id.as_deref(), &settings.oauth_token,
+                        ));
                         let _ = evt_tx.send(AppEvent::ConnectionStateChanged {
                             state: ConnectionState::Connected,
                         }).await;
@@ -1329,6 +1335,8 @@ async fn reducer_loop(
                     }
                     TwitchEvent::Disconnected => {
                         room_snapshots.reconnect();
+                        badge_requests.clear();
+                        global_badges.clear();
                         shared_session_last_fetch.clear();
                         let _ = evt_tx.send(AppEvent::ConnectionStateChanged {
                             state: ConnectionState::Disconnected,
@@ -1336,6 +1344,8 @@ async fn reducer_loop(
                     }
                     TwitchEvent::Reconnecting { attempt } => {
                         room_snapshots.reconnect();
+                        badge_requests.clear();
+                        global_badges.clear();
                         shared_session_last_fetch.clear();
                         let _ = evt_tx.send(AppEvent::ConnectionStateChanged {
                             state: ConnectionState::Reconnecting { attempt },
@@ -1359,6 +1369,8 @@ async fn reducer_loop(
                         expected_irc_identity = None;
                         auth_username = None;
                         auth_user_id = None;
+                        badge_requests.clear();
+                        global_badges.clear();
                         twitch_inventory.clear();
                         clear_personal_emotes(&emote_index, &evt_tx).await;
                         auth_scopes.clear();
@@ -1422,10 +1434,11 @@ async fn reducer_loop(
                         // Badge retries are independent of history and pinned snapshots.
                         let ch_badge = channel.0.clone();
                         let badge_room_id = room_id.clone();
-                        let badge_token = (!settings.oauth_token.trim().is_empty())
-                            .then(|| settings.oauth_token.clone());
+                        let badge_auth = BadgeAuth::from_validated(
+                            helix_client_id.as_deref(), &settings.oauth_token,
+                        );
                         badge_requests.request(&channel, &room_id, false, &badge_map, async move {
-                            load_channel_badges(&badge_room_id, &ch_badge, badge_token).await
+                            load_channel_badges(&badge_room_id, &ch_badge, badge_auth).await
                         });
                         let Some(snapshot) = room_snapshots.begin(&channel, &room_id, &evt_tx) else {
                             continue;
@@ -1508,15 +1521,16 @@ async fn reducer_loop(
                         if account_changed {
                             whisper_sends.clear();
                             badge_requests.clear();
-                            let bm = badge_map.clone();
-                            let token = Some(settings.oauth_token.clone());
-                            tokio::spawn(async move { load_global_badges(&bm, token).await; });
+                            let badge_auth = BadgeAuth::from_validated(
+                                helix_client_id.as_deref(), &settings.oauth_token,
+                            );
+                            global_badges.request(&badge_map, badge_auth.clone());
                             for (channel, room_id) in &channel_room_ids {
-                                let token = Some(settings.oauth_token.clone());
+                                let badge_auth = badge_auth.clone();
                                 let rid = room_id.clone();
                                 let scope = channel.0.clone();
                                 badge_requests.request(channel, room_id, false, &badge_map, async move {
-                                    load_channel_badges(&rid, &scope, token).await
+                                    load_channel_badges(&rid, &scope, badge_auth).await
                                 });
                             }
                         }
@@ -3140,6 +3154,8 @@ async fn reducer_loop(
                 // could use the old account after a failed switch completes.
                 if matches!(&cmd, AppCommand::Login { .. } | AppCommand::AddAccount { .. } | AppCommand::SwitchAccount { .. }) {
                     auth_requests.cancel();
+                    badge_requests.clear();
+                    global_badges.clear();
                     detach_active_account(
                         &mut settings, &mut auth_username, &mut auth_user_id,
                         &mut auth_scopes, &mut helix_client_id, &mut expected_irc_identity,
@@ -3333,9 +3349,11 @@ async fn reducer_loop(
                         let Some(channel) = channel else { continue; };
                         let rid = channel_twitch_id.clone();
                         let scope = channel.0.clone();
-                        let token = (!settings.oauth_token.trim().is_empty()).then(|| settings.oauth_token.clone());
+                        let badge_auth = BadgeAuth::from_validated(
+                            helix_client_id.as_deref(), &settings.oauth_token,
+                        );
                         badge_requests.request(&channel, &channel_twitch_id, true, &badge_map, async move {
-                            load_channel_badges(&rid, &scope, token).await
+                            load_channel_badges(&rid, &scope, badge_auth).await
                         });
                         let idx = emote_index.clone();
                         let etx = evt_tx.clone();
@@ -3374,6 +3392,8 @@ async fn reducer_loop(
                     AppCommand::Logout => {
                         info!("Logout requested");
                         auth_requests.cancel();
+                        badge_requests.clear();
+                        global_badges.clear();
                         expected_irc_identity = None;
                         // Delete saved token and clear saved username
                         if let Some(store) = &settings_store {
@@ -3440,6 +3460,8 @@ async fn reducer_loop(
                             settings.default_account = String::new();
                         }
                         if was_active || cancelled_sign_in {
+                            badge_requests.clear();
+                            global_badges.clear();
                             detach_active_account(
                                 &mut settings, &mut auth_username, &mut auth_user_id,
                                 &mut auth_scopes, &mut helix_client_id, &mut expected_irc_identity,
@@ -5690,10 +5712,10 @@ async fn reducer_loop(
                                 .await;
                         }
                     }
-                    AppCommand::FetchIvrLogs { channel, username } => {
+                    AppCommand::FetchIvrLogs { channel, username, request_id } => {
                         let etx = evt_tx.clone();
                         tokio::spawn(async move {
-                            fetch_ivr_logs(&channel, &username, etx).await;
+                            fetch_ivr_logs(&channel, &username, request_id, etx).await;
                         });
                     }
                     AppCommand::LoadOlderLocalHistory {
@@ -5977,6 +5999,8 @@ async fn reducer_loop(
                         if request.kind == ValidationKind::Startup
                             || (request.kind == ValidationKind::Refresh && revoked)
                         {
+                            badge_requests.clear();
+                            global_badges.clear();
                             expected_irc_identity = None;
                             auth_username = None;
                             auth_user_id = None;

@@ -555,6 +555,44 @@ pub fn alpha(color: Color32, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), a)
 }
 
+/// Parse six hexadecimal digits, with an optional leading hash.
+pub(crate) fn parse_hex_rgb(value: &str) -> Option<Color32> {
+    if value.trim_start_matches('#').len() != 6 {
+        return None;
+    }
+    parse_hex_rgb_opaque(value)
+}
+
+/// Parse RGB or RGBA while preserving the supplied alpha.
+pub(crate) fn parse_hex_rgba(value: &str) -> Option<Color32> {
+    let [r, g, b, a] = parse_hex_channels(value)?;
+    Some(Color32::from_rgba_unmultiplied(r, g, b, a))
+}
+
+/// Parse RGB or RGBA for text that must remain opaque.
+pub(crate) fn parse_hex_rgb_opaque(value: &str) -> Option<Color32> {
+    let [r, g, b, _] = parse_hex_channels(value)?;
+    Some(Color32::from_rgb(r, g, b))
+}
+
+fn parse_hex_channels(value: &str) -> Option<[u8; 4]> {
+    let bytes = value.trim_start_matches('#').as_bytes();
+    if !matches!(bytes.len(), 6 | 8) {
+        return None;
+    }
+    let digit = |byte: u8| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    };
+    let mut channels = [0, 0, 0, 255];
+    for (channel, pair) in channels.iter_mut().zip(bytes.chunks_exact(2)) {
+        *channel = (digit(pair[0])? << 4) | digit(pair[1])?;
+    }
+    Some(channels)
+}
+
 // Stroke styles
 
 #[inline]
@@ -943,4 +981,52 @@ pub fn heading() -> FontId {
 /// Tiny label - badges, room-state pills, character count.
 pub fn tiny() -> FontId {
     FontId::proportional((chat_font_size() - 3.0).max(MIN_CHAT_FONT_SIZE))
+}
+
+#[cfg(test)]
+mod color_tests {
+    use super::*;
+
+    #[test]
+    fn hex_colors_preserve_rgb_and_alpha_contracts() {
+        let rgb = Color32::from_rgb(0x12, 0xab, 0x34);
+        assert_eq!(parse_hex_rgb("#12Ab34"), Some(rgb));
+        assert_eq!(parse_hex_rgba("12Ab34"), Some(rgb));
+        assert_eq!(parse_hex_rgb("12ab3480"), None);
+        assert_eq!(
+            parse_hex_rgba("#12ab3480"),
+            Some(Color32::from_rgba_unmultiplied(0x12, 0xab, 0x34, 0x80))
+        );
+        assert_eq!(parse_hex_rgb_opaque("#12ab3400"), Some(rgb));
+        assert_eq!(parse_hex_rgba("#12ab3400"), Some(Color32::TRANSPARENT));
+    }
+
+    #[test]
+    fn hex_colors_reject_malformed_unicode_and_non_hex_bytes() {
+        for value in [
+            "",
+            "#fff",
+            "1234567",
+            "123456789",
+            "zzzzzz",
+            "+1abcd",
+            "12345+",
+            "12ab34gg",
+            "€abc",
+            "a€bc",
+            "ab€c",
+            "abc€",
+            "€abcde",
+            "12€abc",
+            "1234€a",
+            "12345€",
+            "ééé",
+            "🦀ab",
+            "12🦀ab",
+        ] {
+            assert_eq!(parse_hex_rgb(value), None, "RGB: {value:?}");
+            assert_eq!(parse_hex_rgba(value), None, "RGBA: {value:?}");
+            assert_eq!(parse_hex_rgb_opaque(value), None, "opaque: {value:?}");
+        }
+    }
 }

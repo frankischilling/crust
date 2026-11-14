@@ -576,7 +576,12 @@ pub(crate) async fn fetch_twitch_user_profile(
 
 /// Fetch external chat logs from the IVR logs API (logs.ivr.fi).
 /// Fetches the current month's logs in reverse chronological order.
-pub(crate) async fn fetch_ivr_logs(channel: &str, username: &str, evt_tx: mpsc::Sender<AppEvent>) {
+pub(crate) async fn fetch_ivr_logs(
+    channel: &str,
+    username: &str,
+    request_id: Option<u64>,
+    evt_tx: mpsc::Sender<AppEvent>,
+) {
     use crust_core::events::IvrLogEntry;
 
     #[derive(serde::Deserialize)]
@@ -631,7 +636,9 @@ pub(crate) async fn fetch_ivr_logs(channel: &str, username: &str, evt_tx: mpsc::
             warn!("{msg}");
             let _ = evt_tx
                 .send(AppEvent::IvrLogsFailed {
+                    channel: channel.to_owned(),
                     username: username.to_owned(),
+                    request_id,
                     error: msg,
                 })
                 .await;
@@ -641,7 +648,9 @@ pub(crate) async fn fetch_ivr_logs(channel: &str, username: &str, evt_tx: mpsc::
             warn!("IVR logs fetch failed for {username} in {channel}: {e}");
             let _ = evt_tx
                 .send(AppEvent::IvrLogsFailed {
+                    channel: channel.to_owned(),
                     username: username.to_owned(),
+                    request_id,
                     error: format!("Network error: {e}"),
                 })
                 .await;
@@ -658,7 +667,9 @@ pub(crate) async fn fetch_ivr_logs(channel: &str, username: &str, evt_tx: mpsc::
             warn!("IVR logs: failed to read response body for {username}: {e}");
             let _ = evt_tx
                 .send(AppEvent::IvrLogsFailed {
+                    channel: channel.to_owned(),
                     username: username.to_owned(),
+                    request_id,
                     error: format!("Failed to read response: {e}"),
                 })
                 .await;
@@ -675,7 +686,9 @@ pub(crate) async fn fetch_ivr_logs(channel: &str, username: &str, evt_tx: mpsc::
             );
             let _ = evt_tx
                 .send(AppEvent::IvrLogsFailed {
+                    channel: channel.to_owned(),
                     username: username.to_owned(),
+                    request_id,
                     error: format!("Failed to parse response: {e}"),
                 })
                 .await;
@@ -700,7 +713,9 @@ pub(crate) async fn fetch_ivr_logs(channel: &str, username: &str, evt_tx: mpsc::
     );
     let _ = evt_tx
         .send(AppEvent::IvrLogsLoaded {
+            channel: channel.to_owned(),
             username: username.to_owned(),
+            request_id,
             messages: entries,
         })
         .await;

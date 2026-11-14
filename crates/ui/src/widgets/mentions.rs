@@ -1,4 +1,7 @@
-use std::collections::VecDeque;
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+};
 
 use egui::{
     Align, Color32, CornerRadius, Frame, Label, Layout, Margin, RichText, ScrollArea, Sense,
@@ -36,6 +39,102 @@ pub struct MentionsList<'a> {
     pub use_24h_timestamps: bool,
 }
 
+#[derive(Clone, PartialEq)]
+struct MentionLayout {
+    width: f32,
+    horizontal_padding: i8,
+    pixels_per_point: f32,
+    chat_font_size: f32,
+    style: Arc<egui::Style>,
+    show_timestamps: bool,
+    show_timestamp_seconds: bool,
+    use_24h_timestamps: bool,
+}
+
+#[derive(Clone)]
+struct MentionRowHeight {
+    text: String,
+    display_name: String,
+    timestamp: chrono::DateTime<chrono::Utc>,
+    stride: f32,
+    generation: u64,
+}
+
+impl MentionRowHeight {
+    fn matches(&self, message: &ChatMessage) -> bool {
+        self.text == message.raw_text
+            && self.display_name == sender_name(message)
+            && self.timestamp == message.timestamp
+    }
+}
+
+#[derive(Clone, Default)]
+struct MentionLayoutCache {
+    layout: Option<MentionLayout>,
+    fonts: Option<egui::FontDefinitions>,
+    rows: HashMap<egui::Id, MentionRowHeight>,
+    generation: u64,
+    rendered_rows: usize,
+    measured_rows: usize,
+}
+
+const MAX_CACHED_MENTION_VIEWS: usize = 5;
+
+#[derive(Clone, Default)]
+struct MentionViewCaches {
+    views: HashMap<egui::Id, (u64, MentionLayoutCache)>,
+    sequence: u64,
+}
+
+impl MentionViewCaches {
+    fn store(&mut self, id: egui::Id, cache: MentionLayoutCache) {
+        if self.views.len() >= MAX_CACHED_MENTION_VIEWS {
+            if let Some(oldest) = self
+                .views
+                .iter()
+                .min_by_key(|(_, (used, _))| *used)
+                .map(|(id, _)| *id)
+            {
+                self.views.remove(&oldest);
+            }
+        }
+        self.sequence = self.sequence.wrapping_add(1);
+        self.views.insert(id, (self.sequence, cache));
+    }
+}
+
+fn mention_view_caches_id() -> egui::Id {
+    egui::Id::new("mentions_view_caches")
+}
+
+fn same_font_definitions(left: &egui::FontDefinitions, right: &egui::FontDefinitions) -> bool {
+    left.families == right.families
+        && left.font_data.len() == right.font_data.len()
+        && left.font_data.iter().zip(&right.font_data).all(
+            |((left_name, left_font), (right_name, right_font))| {
+                left_name == right_name && Arc::ptr_eq(left_font, right_font)
+            },
+        )
+}
+
+fn sender_name(message: &ChatMessage) -> &str {
+    if message.sender.display_name.trim().is_empty() {
+        &message.sender.login
+    } else {
+        &message.sender.display_name
+    }
+}
+
+fn skip_measured_rows(ui: &mut Ui, stride: f32) {
+    if stride > 0.0 {
+        // One allocation replaces several rows, including their spacing.
+        ui.allocate_space(egui::vec2(
+            0.0,
+            (stride - ui.spacing().item_spacing.y).max(0.0),
+        ));
+    }
+}
+
 impl<'a> MentionsList<'a> {
     pub fn show(&self, ui: &mut Ui) -> Option<MentionJumpTarget> {
         // Upstream `pane_ui` in split-pane mode zeroes item_spacing; restore
@@ -50,6 +149,16 @@ impl<'a> MentionsList<'a> {
         let bottom_pad = (10.0 * scale).max(8.0);
 
         let mut action: Option<MentionJumpTarget> = None;
+        let cache_id = ui.id().with("mentions_row_heights");
+        let mut caches = ui.ctx().data_mut(|data| {
+            data.remove_temp::<MentionViewCaches>(mention_view_caches_id())
+                .unwrap_or_default()
+        });
+        let mut cache = caches
+            .views
+            .remove(&cache_id)
+            .map(|(_, cache)| cache)
+            .unwrap_or_default();
 
         // Fill the whole pane with `bg_base` so the sidebar / central-panel
         // background doesn't peek through around the scrollbar or along
@@ -91,6 +200,7 @@ impl<'a> MentionsList<'a> {
 
                 // Empty state
                 if self.mentions.is_empty() {
+                    cache = MentionLayoutCache::default();
                     ui.vertical_centered(|ui| {
                         ui.add_space(40.0);
                         ui.label(
@@ -125,28 +235,119 @@ impl<'a> MentionsList<'a> {
                     .auto_shrink([false; 2])
                     .stick_to_bottom(true)
                     .max_height(scroll_h)
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 1.0;
-                        // Oldest -> newest; `stick_to_bottom` keeps the
-                        // newest visible on arrival, matching the rest
-                        // of the chat UI.
-                        for msg in self.mentions.iter() {
-                            if let Some(t) = render_row(
-                                ui,
-                                msg,
-                                pad_x,
-                                self.show_timestamps,
-                                self.show_timestamp_seconds,
-                                self.use_24h_timestamps,
-                            ) {
-                                action = Some(t);
-                            }
-                        }
+                    .show_viewport(ui, |ui, viewport| {
+                        action = self.render_rows(ui, viewport, pad_x, &mut cache);
                     });
 
                 ui.add_space(bottom_pad);
             });
 
+        caches.store(cache_id, cache);
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(mention_view_caches_id(), caches));
+        action
+    }
+
+    fn render_rows(
+        &self,
+        ui: &mut Ui,
+        viewport: egui::Rect,
+        pad_x: i8,
+        cache: &mut MentionLayoutCache,
+    ) -> Option<MentionJumpTarget> {
+        ui.spacing_mut().item_spacing.y = 1.0;
+        let width = ui.available_width();
+        ui.set_min_width(width);
+        let layout = MentionLayout {
+            width,
+            horizontal_padding: pad_x,
+            pixels_per_point: ui.ctx().pixels_per_point(),
+            chat_font_size: t::chat_font_size(),
+            style: ui.style().clone(),
+            show_timestamps: self.show_timestamps,
+            show_timestamp_seconds: self.show_timestamp_seconds,
+            use_24h_timestamps: self.use_24h_timestamps,
+        };
+        let fonts_changed = ui.ctx().fonts(|fonts| {
+            let font_cache = fonts.lock();
+            let definitions = font_cache.fonts.definitions();
+            if cache
+                .fonts
+                .as_ref()
+                .is_some_and(|cached| same_font_definitions(cached, definitions))
+            {
+                false
+            } else {
+                cache.fonts = Some(definitions.clone());
+                true
+            }
+        });
+        if fonts_changed || cache.layout.as_ref() != Some(&layout) {
+            cache.rows.clear();
+            cache.layout = Some(layout);
+        }
+        cache.generation = cache.generation.wrapping_add(1);
+        cache.rendered_rows = 0;
+        cache.measured_rows = 0;
+        let generation = cache.generation;
+        let origin_y = ui.next_widget_position().y;
+        let mut skipped_stride = 0.0;
+        let mut action = None;
+
+        for message in self.mentions {
+            let row_id = egui::Id::new((&message.channel, message.id.0));
+            let cached_stride = cache
+                .rows
+                .get_mut(&row_id)
+                .filter(|row| row.matches(message))
+                .map(|row| {
+                    row.generation = generation;
+                    row.stride
+                });
+            let top = ui.next_widget_position().y - origin_y + skipped_stride;
+            if cached_stride
+                .is_some_and(|stride| top + stride < viewport.min.y || top > viewport.max.y)
+            {
+                skipped_stride += cached_stride.unwrap_or_default();
+                continue;
+            }
+
+            skip_measured_rows(ui, skipped_stride);
+            skipped_stride = 0.0;
+            let top = ui.next_widget_position().y;
+            let response = ui.push_id(row_id, |ui| {
+                render_row(
+                    ui,
+                    message,
+                    pad_x,
+                    self.show_timestamps,
+                    self.show_timestamp_seconds,
+                    self.use_24h_timestamps,
+                )
+            });
+            if response.inner.is_some() {
+                action = response.inner;
+            }
+            let stride = ui.next_widget_position().y - top;
+            cache.rendered_rows += 1;
+            if cached_stride.is_none() {
+                cache.measured_rows += 1;
+                cache.rows.insert(
+                    row_id,
+                    MentionRowHeight {
+                        text: message.raw_text.clone(),
+                        display_name: sender_name(message).to_owned(),
+                        timestamp: message.timestamp,
+                        stride,
+                        generation,
+                    },
+                );
+            } else if let Some(row) = cache.rows.get_mut(&row_id) {
+                row.stride = stride;
+            }
+        }
+        skip_measured_rows(ui, skipped_stride);
+        cache.rows.retain(|_, row| row.generation == generation);
         action
     }
 }
@@ -161,8 +362,8 @@ fn render_row(
 ) -> Option<MentionJumpTarget> {
     let mut jump: Option<MentionJumpTarget> = None;
 
-    let row_id = egui::Id::new("mention_row").with(msg.id.0);
-    let pill_id = egui::Id::new("mention_pill").with(msg.id.0);
+    let row_id = ui.make_persistent_id(("mention_row", &msg.channel, msg.id.0));
+    let pill_id = ui.make_persistent_id(("mention_pill", &msg.channel, msg.id.0));
 
     // Capture the viewport width BEFORE entering the Frame. We'll pass
     // this as an explicit `max_width` to every sub-layout so nothing
@@ -182,11 +383,7 @@ fn render_row(
         .as_deref()
         .and_then(parse_hex_color)
         .unwrap_or(t::text_primary());
-    let display_name = if msg.sender.display_name.trim().is_empty() {
-        msg.sender.login.as_str()
-    } else {
-        msg.sender.display_name.as_str()
-    };
+    let display_name = sender_name(msg);
 
     let body_color = if msg.flags.is_deleted {
         t::text_muted()
@@ -266,11 +463,8 @@ fn render_row(
                                     .selectable(false),
                                 );
                             });
-                        let pill_click = ui.interact(
-                            pill_resp.response.rect,
-                            pill_id,
-                            Sense::click(),
-                        );
+                        let pill_click =
+                            ui.interact(pill_resp.response.rect, pill_id, Sense::click());
                         if pill_click.hovered() {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                         }
@@ -300,12 +494,7 @@ fn render_row(
                 // `Label::wrap()` for word-level breaks so long URLs
                 // or walls of text don't overflow the viewport.
                 ui.add(
-                    Label::new(
-                        RichText::new(body_text)
-                            .font(t::body())
-                            .color(body_color),
-                    )
-                    .wrap(),
+                    Label::new(RichText::new(body_text).font(t::body()).color(body_color)).wrap(),
                 );
             });
         });
@@ -361,24 +550,538 @@ fn channel_pill_color(ch: &ChannelId) -> Color32 {
 /// Parse `#rrggbb` / `rrggbb` into a `Color32`. Returns `None` for any
 /// malformed input so callers can fall back to a theme colour.
 fn parse_hex_color(s: &str) -> Option<Color32> {
-    let s = s.trim().trim_start_matches('#');
-    if s.len() != 6 {
-        return None;
-    }
-    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
-    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
-    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
-    Some(Color32::from_rgb(r, g, b))
+    t::parse_hex_rgb(s.trim())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crust_core::model::{MessageFlags, MsgKind, Sender, UserId};
+
+    fn messages(count: usize) -> VecDeque<ChatMessage> {
+        (0..count)
+            .map(|index| ChatMessage {
+                id: MessageId(index as u64),
+                server_id: None,
+                timestamp: chrono::DateTime::from_timestamp(1_700_000_000 + index as i64, 0)
+                    .unwrap(),
+                channel: ChannelId::new(if index % 2 == 0 {
+                    "firstchannel"
+                } else {
+                    "secondchannel"
+                }),
+                sender: Sender {
+                    user_id: UserId(format!("{index}")),
+                    login: format!("viewer{index}"),
+                    display_name: format!("Viewer{index}"),
+                    original_display_name: None,
+                    color: Some("#12ab34".into()),
+                    name_paint: None,
+                    badges: Vec::new(),
+                },
+                raw_text: format!(
+                    "Message {index}: {}",
+                    "Wrapped words, café, and punctuation. ".repeat(index % 8 + 1)
+                ),
+                spans: smallvec::SmallVec::new(),
+                twitch_emotes: Vec::new(),
+                flags: MessageFlags::default(),
+                reply: None,
+                msg_kind: MsgKind::Chat,
+                shared: None,
+            })
+            .collect()
+    }
+
+    struct RenderedFrame {
+        output: egui::FullOutput,
+        content_height: f32,
+        action: Option<MentionJumpTarget>,
+        rendered_rows: usize,
+        measured_rows: usize,
+    }
+
+    fn frame(
+        ctx: &egui::Context,
+        list: &MentionsList<'_>,
+        cache: &mut MentionLayoutCache,
+        cached: bool,
+        width: f32,
+        offset: f32,
+        events: Vec<egui::Event>,
+    ) -> RenderedFrame {
+        let mut content_height = 0.0;
+        let mut action = None;
+        let mut rendered_rows = 0;
+        let mut measured_rows = 0;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 320.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let scroll = ScrollArea::vertical()
+                        .id_salt("mentions_test")
+                        .scroll_bar_visibility(
+                            egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                        )
+                        .auto_shrink([false; 2])
+                        .vertical_scroll_offset(offset)
+                        .show_viewport(ui, |ui, viewport| {
+                            if cached {
+                                action = list.render_rows(ui, viewport, 10, cache);
+                                rendered_rows += cache.rendered_rows;
+                                measured_rows += cache.measured_rows;
+                            } else {
+                                ui.spacing_mut().item_spacing.y = 1.0;
+                                ui.set_min_width(ui.available_width());
+                                for message in list.mentions {
+                                    let row_id = egui::Id::new((&message.channel, message.id.0));
+                                    let response = ui.push_id(row_id, |ui| {
+                                        render_row(
+                                            ui,
+                                            message,
+                                            10,
+                                            list.show_timestamps,
+                                            list.show_timestamp_seconds,
+                                            list.use_24h_timestamps,
+                                        )
+                                    });
+                                    if response.inner.is_some() {
+                                        action = response.inner;
+                                    }
+                                    rendered_rows += 1;
+                                }
+                            }
+                        });
+                    content_height = scroll.content_size.y;
+                });
+            },
+        );
+        RenderedFrame {
+            output,
+            content_height,
+            action,
+            rendered_rows,
+            measured_rows,
+        }
+    }
+
+    fn visible_text(output: &egui::FullOutput) -> Vec<(String, egui::Rect, Vec<Color32>)> {
+        fn collect(
+            shape: &egui::epaint::Shape,
+            clip: egui::Rect,
+            rows: &mut Vec<(String, egui::Rect, Vec<Color32>)>,
+        ) {
+            match shape {
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, clip, rows);
+                    }
+                }
+                egui::epaint::Shape::Text(shape) => {
+                    let bounds = egui::Rect::from_min_size(shape.pos, shape.galley.size());
+                    if bounds.intersects(clip) {
+                        rows.push((
+                            shape.galley.text().to_owned(),
+                            bounds.intersect(clip),
+                            shape
+                                .galley
+                                .job
+                                .sections
+                                .iter()
+                                .map(|section| section.format.color)
+                                .collect(),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut rows = Vec::new();
+        for shape in &output.shapes {
+            collect(&shape.shape, shape.clip_rect, &mut rows);
+        }
+        rows
+    }
+
+    fn assert_same_layout(actual: &RenderedFrame, expected: &RenderedFrame) {
+        assert!(
+            (actual.content_height - expected.content_height).abs() <= 0.5,
+            "content height {} != {}",
+            actual.content_height,
+            expected.content_height
+        );
+        let actual = visible_text(&actual.output);
+        let expected = visible_text(&expected.output);
+        assert_eq!(actual.len(), expected.len(), "visible text differs");
+        for (actual, expected) in actual.iter().zip(&expected) {
+            assert_eq!(actual.0, expected.0);
+            assert_eq!(actual.2, expected.2);
+            assert!(
+                (actual.1.min - expected.1.min).length() <= 0.5
+                    && (actual.1.max - expected.1.max).length() <= 0.5,
+                "bounds differ for {:?}: {:?} != {:?}",
+                actual.0,
+                actual.1,
+                expected.1
+            );
+        }
+    }
+
+    #[test]
+    fn mentions_cache_keeps_wrapped_rows_and_scroll_extent_exact() {
+        let messages = messages(2_000);
+        let list = MentionsList {
+            mentions: &messages,
+            show_timestamps: true,
+            show_timestamp_seconds: true,
+            use_24h_timestamps: false,
+        };
+        for width in [240.0, 480.0, 800.0] {
+            let cached_ctx = egui::Context::default();
+            let full_ctx = egui::Context::default();
+            let mut cache = MentionLayoutCache::default();
+            let mut unused = MentionLayoutCache::default();
+            let initial = frame(&cached_ctx, &list, &mut cache, true, width, 0.0, Vec::new());
+            frame(&full_ctx, &list, &mut unused, false, width, 0.0, Vec::new());
+            assert_eq!(cache.rows.len(), messages.len());
+            for offset in [
+                0.0,
+                initial.content_height * 0.4,
+                (initial.content_height - 304.0).max(0.0),
+            ] {
+                let cached = frame(
+                    &cached_ctx,
+                    &list,
+                    &mut cache,
+                    true,
+                    width,
+                    offset,
+                    Vec::new(),
+                );
+                let full = frame(
+                    &full_ctx,
+                    &list,
+                    &mut unused,
+                    false,
+                    width,
+                    offset,
+                    Vec::new(),
+                );
+                assert_same_layout(&cached, &full);
+                assert_eq!(cached.measured_rows, 0);
+                assert!(
+                    cached.rendered_rows < 30,
+                    "laid out {} rows",
+                    cached.rendered_rows
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mentions_cache_tracks_text_names_options_and_retained_rows() {
+        let ctx = egui::Context::default();
+        let mut messages = messages(200);
+        let mut cache = MentionLayoutCache::default();
+        let render =
+            |messages: &VecDeque<ChatMessage>, cache: &mut MentionLayoutCache, width, seconds| {
+                frame(
+                    &ctx,
+                    &MentionsList {
+                        mentions: messages,
+                        show_timestamps: true,
+                        show_timestamp_seconds: seconds,
+                        use_24h_timestamps: true,
+                    },
+                    cache,
+                    true,
+                    width,
+                    0.0,
+                    Vec::new(),
+                )
+            };
+        let initial = render(&messages, &mut cache, 480.0, false);
+        assert_eq!(render(&messages, &mut cache, 480.0, false).measured_rows, 0);
+        messages[150].raw_text = "A changed offscreen body wraps to many more lines. ".repeat(40);
+        let changed = render(&messages, &mut cache, 480.0, false);
+        assert_eq!(changed.measured_rows, 1);
+        assert!(changed.content_height > initial.content_height);
+        messages[160].sender.display_name = "a much longer display name ".repeat(20);
+        assert_eq!(render(&messages, &mut cache, 480.0, false).measured_rows, 1);
+        assert_eq!(
+            render(&messages, &mut cache, 240.0, false).measured_rows,
+            messages.len()
+        );
+        assert_eq!(
+            render(&messages, &mut cache, 240.0, true).measured_rows,
+            messages.len()
+        );
+        ctx.style_mut(|style| style.spacing.interact_size.y += 10.0);
+        assert_eq!(
+            render(&messages, &mut cache, 240.0, true).measured_rows,
+            messages.len()
+        );
+        let mut fonts = egui::FontDefinitions::default();
+        let monospace = fonts.families[&egui::FontFamily::Monospace].clone();
+        fonts
+            .families
+            .insert(egui::FontFamily::Proportional, monospace);
+        ctx.set_fonts(fonts);
+        assert_eq!(
+            render(&messages, &mut cache, 240.0, true).measured_rows,
+            messages.len()
+        );
+        let mut fonts = ctx.fonts(|fonts| fonts.lock().fonts.definitions().clone());
+        let primary = fonts.families[&egui::FontFamily::Proportional][0].clone();
+        Arc::make_mut(fonts.font_data.get_mut(&primary).unwrap())
+            .tweak
+            .scale *= 1.1;
+        ctx.set_fonts(fonts);
+        assert_eq!(
+            render(&messages, &mut cache, 240.0, true).measured_rows,
+            messages.len()
+        );
+        messages.drain(..150);
+        render(&messages, &mut cache, 240.0, true);
+        assert_eq!(cache.rows.len(), messages.len());
+        messages.clear();
+        render(&messages, &mut cache, 240.0, true);
+        assert!(cache.rows.is_empty());
+    }
+
+    #[test]
+    fn mentions_cached_rows_keep_click_targets_and_current_colors() {
+        fn list(messages: &VecDeque<ChatMessage>) -> MentionsList<'_> {
+            MentionsList {
+                mentions: messages,
+                show_timestamps: false,
+                show_timestamp_seconds: false,
+                use_24h_timestamps: true,
+            }
+        }
+        let cached_ctx = egui::Context::default();
+        let full_ctx = egui::Context::default();
+        let mut messages = messages(200);
+        let mut cache = MentionLayoutCache::default();
+        let mut unused = MentionLayoutCache::default();
+        frame(
+            &cached_ctx,
+            &list(&messages),
+            &mut cache,
+            true,
+            480.0,
+            0.0,
+            Vec::new(),
+        );
+        frame(
+            &full_ctx,
+            &list(&messages),
+            &mut unused,
+            false,
+            480.0,
+            0.0,
+            Vec::new(),
+        );
+        messages[0].flags.is_deleted = true;
+        messages[0].sender.color = Some("€abc".into());
+        let rendered = frame(
+            &cached_ctx,
+            &list(&messages),
+            &mut cache,
+            true,
+            480.0,
+            0.0,
+            Vec::new(),
+        );
+        let expected = frame(
+            &full_ctx,
+            &list(&messages),
+            &mut unused,
+            false,
+            480.0,
+            0.0,
+            Vec::new(),
+        );
+        assert_same_layout(&rendered, &expected);
+        assert_eq!(rendered.measured_rows, 0);
+        let position = visible_text(&rendered.output)
+            .into_iter()
+            .find(|(text, _, _)| text.starts_with("Message 0:"))
+            .expect("first message is visible")
+            .1
+            .center();
+        for pressed in [true, false] {
+            let result = frame(
+                &cached_ctx,
+                &list(&messages),
+                &mut cache,
+                true,
+                480.0,
+                0.0,
+                vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            if !pressed {
+                let action = result
+                    .action
+                    .expect("a cached row still opens its source message");
+                assert_eq!(action.channel, messages[0].channel);
+                assert_eq!(action.message, messages[0].id);
+            }
+        }
+    }
+
+    #[test]
+    fn mentions_view_caches_are_bounded_when_split_panes_are_replaced() {
+        let ctx = egui::Context::default();
+        let messages = messages(40);
+        let list = MentionsList {
+            mentions: &messages,
+            show_timestamps: true,
+            show_timestamp_seconds: false,
+            use_24h_timestamps: true,
+        };
+        let mut active_id = egui::Id::NULL;
+        let mut rotating_id = egui::Id::NULL;
+        let mut first_rotating = None;
+        for pane in 0..30 {
+            for _ in 0..3 {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(800.0, 500.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            ui.columns(2, |columns| {
+                                columns[0].push_id("persistent_pane", |ui| {
+                                    active_id = ui.id().with("mentions_row_heights");
+                                    list.show(ui);
+                                });
+                                columns[1].push_id(("rotating_pane", pane), |ui| {
+                                    rotating_id = ui.id().with("mentions_row_heights");
+                                    list.show(ui);
+                                });
+                            });
+                        });
+                    },
+                );
+            }
+            first_rotating.get_or_insert(rotating_id);
+            let caches = ctx
+                .data(|data| data.get_temp::<MentionViewCaches>(mention_view_caches_id()))
+                .unwrap();
+            assert!(caches.views.len() <= MAX_CACHED_MENTION_VIEWS);
+            assert_eq!(
+                caches.views[&active_id].1.measured_rows, 0,
+                "active pane cache was discarded"
+            );
+            assert_eq!(caches.views[&active_id].1.rows.len(), messages.len());
+            assert_eq!(caches.views[&rotating_id].1.rows.len(), messages.len());
+            assert_ne!(active_id, rotating_id);
+        }
+        let caches = ctx
+            .data(|data| data.get_temp::<MentionViewCaches>(mention_view_caches_id()))
+            .unwrap();
+        assert!(!caches.views.contains_key(&first_rotating.unwrap()));
+        assert_eq!(caches.views.len(), MAX_CACHED_MENTION_VIEWS);
+    }
+
+    #[test]
+    #[ignore = "release benchmark"]
+    fn mentions_cached_viewport_benchmark() {
+        let messages = messages(2_000);
+        let list = MentionsList {
+            mentions: &messages,
+            show_timestamps: true,
+            show_timestamp_seconds: true,
+            use_24h_timestamps: false,
+        };
+        let cached_ctx = egui::Context::default();
+        let full_ctx = egui::Context::default();
+        let mut cache = MentionLayoutCache::default();
+        let mut unused = MentionLayoutCache::default();
+        for _ in 0..3 {
+            frame(
+                &cached_ctx,
+                &list,
+                &mut cache,
+                true,
+                480.0,
+                6_000.0,
+                Vec::new(),
+            );
+            frame(
+                &full_ctx,
+                &list,
+                &mut unused,
+                false,
+                480.0,
+                6_000.0,
+                Vec::new(),
+            );
+        }
+        let mut cached_ms = Vec::new();
+        let mut full_ms = Vec::new();
+        let mut cached_rows = 0;
+        for _ in 0..31 {
+            let started = std::time::Instant::now();
+            let full = frame(
+                &full_ctx,
+                &list,
+                &mut unused,
+                false,
+                480.0,
+                6_000.0,
+                Vec::new(),
+            );
+            full_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+            let started = std::time::Instant::now();
+            let cached = frame(
+                &cached_ctx,
+                &list,
+                &mut cache,
+                true,
+                480.0,
+                6_000.0,
+                Vec::new(),
+            );
+            cached_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+            assert_same_layout(&cached, &full);
+            cached_rows = cached.rendered_rows;
+        }
+        cached_ms.sort_by(f64::total_cmp);
+        full_ms.sort_by(f64::total_cmp);
+        println!("Mentions: retained=2000 rendered={cached_rows}; full median={:.3}ms p95={:.3}ms; cached median={:.3}ms p95={:.3}ms", full_ms[15], full_ms[29], cached_ms[15], cached_ms[29]);
+    }
 
     #[test]
     fn parse_hex_color_accepts_leading_hash() {
-        assert_eq!(parse_hex_color("#ff0000"), Some(Color32::from_rgb(255, 0, 0)));
-        assert_eq!(parse_hex_color("00ff00"), Some(Color32::from_rgb(0, 255, 0)));
+        assert_eq!(
+            parse_hex_color("#ff0000"),
+            Some(Color32::from_rgb(255, 0, 0))
+        );
+        assert_eq!(
+            parse_hex_color("00ff00"),
+            Some(Color32::from_rgb(0, 255, 0))
+        );
     }
 
     #[test]

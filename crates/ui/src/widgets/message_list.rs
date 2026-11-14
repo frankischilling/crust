@@ -4264,30 +4264,11 @@ fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
 }
 
 fn parse_hex_color(s: &str) -> Option<Color32> {
-    let s = s.trim_start_matches('#');
-    if s.len() != 6 && s.len() != 8 {
-        return None;
-    }
-    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
-    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
-    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
-    let a = if s.len() == 8 {
-        u8::from_str_radix(&s[6..8], 16).ok()?
-    } else {
-        255
-    };
-    Some(Color32::from_rgba_unmultiplied(r, g, b, a))
+    t::parse_hex_rgba(s)
 }
 
 fn parse_hex_color_opaque_rgb(s: &str) -> Option<Color32> {
-    let s = s.trim_start_matches('#');
-    if s.len() != 6 && s.len() != 8 {
-        return None;
-    }
-    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
-    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
-    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
-    Some(Color32::from_rgb(r, g, b))
+    t::parse_hex_rgb_opaque(s)
 }
 
 fn normalized_badge_name(name: &str) -> Cow<'_, str> {

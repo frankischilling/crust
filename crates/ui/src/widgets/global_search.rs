@@ -568,16 +568,7 @@ fn render_hit_row(
 }
 
 fn parse_hex_color(s: &str) -> Option<egui::Color32> {
-    let s = s.trim_start_matches('#');
-    if s.len() != 6 {
-        return None;
-    }
-    let rgb = u32::from_str_radix(s, 16).ok()?;
-    Some(egui::Color32::from_rgb(
-        (rgb >> 16) as u8,
-        (rgb >> 8) as u8,
-        rgb as u8,
-    ))
+    crate::theme::parse_hex_rgb(s)
 }
 
 fn truncate(s: &str, max: usize) -> String {

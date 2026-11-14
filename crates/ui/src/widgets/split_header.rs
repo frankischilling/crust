@@ -35,6 +35,7 @@ pub fn show_split_header(
     let pane_w = pane_rect.width();
     let compact = pane_w < 240.0;
     let ultra_compact = pane_w < 165.0;
+    let can_search = !channel.is_virtual();
 
     let hdr_rect =
         egui::Rect::from_min_size(pane_rect.min, egui::vec2(pane_w, split_header_height()));
@@ -68,7 +69,7 @@ pub fn show_split_header(
         + ui.spacing().button_padding.x * 2.0;
     let controls_w = HEADER_PAD_X * 2.0
         + icon_size
-        + if ultra_compact {
+        + if ultra_compact || !can_search {
             0.0
         } else {
             icon_size + HEADER_CTRL_GAP
@@ -120,17 +121,19 @@ pub fn show_split_header(
         controls_ui.menu_button(
             RichText::new("...").font(t::small()).color(t::text_muted()),
             |ui| {
-                let search_label = if search_open {
-                    "Hide search"
-                } else {
-                    "Show search"
-                };
-                if ui
-                    .button(RichText::new(search_label).font(t::small()))
-                    .clicked()
-                {
-                    result.toggle_search_clicked = true;
-                    ui.close_menu();
+                if can_search {
+                    let search_label = if search_open {
+                        "Hide search"
+                    } else {
+                        "Show search"
+                    };
+                    if ui
+                        .button(RichText::new(search_label).font(t::small()))
+                        .clicked()
+                    {
+                        result.toggle_search_clicked = true;
+                        ui.close_menu();
+                    }
                 }
                 if ui
                     .button(RichText::new("Close split").font(t::small()))
@@ -150,7 +153,7 @@ pub fn show_split_header(
         );
     }
 
-    if !ultra_compact {
+    if !ultra_compact && can_search {
         let search = chrome::icon_button(
             &mut controls_ui,
             ChromeIcon::Search,
@@ -174,25 +177,32 @@ pub fn show_split_header(
     } else {
         "# "
     };
+    let display_name = if channel.is_live_feed() {
+        "Live"
+    } else if channel.is_mentions() {
+        "Mentions"
+    } else {
+        channel.display_name()
+    };
     let mut title = if !ultra_compact && unread_mentions > 0 {
         format!(
             "{}{} [{}]",
             prefix,
-            channel.display_name(),
+            display_name,
             badge_count_label(unread_mentions)
         )
     } else if !ultra_compact && unread_count > 0 {
         format!(
             "{}{} ({})",
             prefix,
-            channel.display_name(),
+            display_name,
             badge_count_label(unread_count)
         )
     } else {
         format!(
             "{}{}",
             prefix,
-            channel.display_name()
+            display_name
         )
     };
     if !compact {

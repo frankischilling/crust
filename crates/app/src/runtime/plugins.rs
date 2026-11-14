@@ -2833,7 +2833,7 @@ unsafe extern "C" fn native_fetch_ivr_logs(L: *mut lua_State) -> c_int {
     let Some(username) = lua_value_string(L, 2) else {
         return 0;
     };
-    send_lua_command(AppCommand::FetchIvrLogs { channel, username });
+    send_lua_command(AppCommand::FetchIvrLogs { channel, username, request_id: None });
     0
 }
 
@@ -5439,7 +5439,8 @@ unsafe fn make_event_table(L: *mut lua_State, event: &AppEvent) -> c_int {
                 set_field_int(L, -1, "viewers", *viewers as i64);
             }
         }
-        AppEvent::IvrLogsLoaded { username, messages } => {
+        AppEvent::IvrLogsLoaded { channel, username, messages, .. } => {
+            set_field_string(L, -1, "channel", channel);
             set_field_string(L, -1, "username", username);
             lua_createtable(L, messages.len() as c_int, 0);
             for (idx, entry) in messages.iter().enumerate() {
@@ -5448,7 +5449,8 @@ unsafe fn make_event_table(L: *mut lua_State, event: &AppEvent) -> c_int {
             }
             lua_setfield(L, -2, cstring("messages").as_ptr());
         }
-        AppEvent::IvrLogsFailed { username, error } => {
+        AppEvent::IvrLogsFailed { channel, username, error, .. } => {
+            set_field_string(L, -1, "channel", channel);
             set_field_string(L, -1, "username", username);
             set_field_string(L, -1, "error", error);
         }

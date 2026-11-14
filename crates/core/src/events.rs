@@ -394,7 +394,13 @@ pub enum AppCommand {
         split_header_show_viewer_count: bool,
     },
     /// Fetch external chat logs for a user from the IVR logs API.
-    FetchIvrLogs { channel: String, username: String },
+    FetchIvrLogs {
+        channel: String,
+        username: String,
+        /// Identifies the popup request; absent for plugin requests.
+        #[serde(default)]
+        request_id: Option<u64>,
+    },
     /// Load older locally persisted chat history (SQLite) before the oldest
     /// currently loaded message timestamp.
     LoadOlderLocalHistory {
@@ -945,12 +951,16 @@ pub enum AppEvent {
     },
     /// External IVR chat logs loaded for a user.
     IvrLogsLoaded {
+        channel: String,
         username: String,
+        request_id: Option<u64>,
         messages: Vec<IvrLogEntry>,
     },
     /// External IVR log fetch failed.
     IvrLogsFailed {
+        channel: String,
         username: String,
+        request_id: Option<u64>,
         error: String,
     },
     /// A held AutoMod message has entered the moderation queue.

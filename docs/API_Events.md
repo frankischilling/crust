@@ -531,6 +531,7 @@ Fields:
 
 Fields:
 
+- `channel`: channel login used for the request
 - `username`
 - `messages`
 
@@ -550,6 +551,7 @@ Each `messages` entry includes:
 
 Fields:
 
+- `channel`: channel login used for the request
 - `username`
 - `error`
 

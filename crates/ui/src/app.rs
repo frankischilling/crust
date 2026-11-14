@@ -5488,15 +5488,15 @@ exit 1
                     self.user_profile_popup.set_unavailable(&login);
                 }
             }
-            AppEvent::IvrLogsLoaded { username, messages } => {
-                if self.user_profile_popup.accepts_profile(&username) {
-                    self.user_profile_popup.set_ivr_logs(messages);
-                }
+            AppEvent::IvrLogsLoaded { channel, username, request_id, messages } => {
+                self.user_profile_popup.apply_ivr_logs_result(
+                    &channel, &username, request_id, Ok(messages),
+                );
             }
-            AppEvent::IvrLogsFailed { username, error } => {
-                if self.user_profile_popup.accepts_profile(&username) {
-                    self.user_profile_popup.set_ivr_logs_error(error);
-                }
+            AppEvent::IvrLogsFailed { channel, username, request_id, error } => {
+                self.user_profile_popup.apply_ivr_logs_result(
+                    &channel, &username, request_id, Err(error),
+                );
             }
             AppEvent::UserMessagesCleared { channel, login } => {
                 if let Some(ch) = self.state.channels.get_mut(&channel) {
@@ -6270,12 +6270,31 @@ exit 1
         self.cmd_tx.try_send(cmd).is_ok()
     }
 
+    fn request_ivr_logs(&mut self, channel: String, username: String) -> bool {
+        let Some(request_id) = self.user_profile_popup
+            .begin_ivr_logs_request(&channel, &username) else {
+            return false;
+        };
+        if let Err(error) = self.cmd_tx.try_send(AppCommand::FetchIvrLogs {
+            channel: channel.clone(),
+            username: username.clone(),
+            request_id: Some(request_id),
+        }) {
+            self.user_profile_popup.apply_ivr_logs_result(
+                &channel, &username, Some(request_id), Err(error.message().to_owned()),
+            );
+            return false;
+        }
+        true
+    }
+
     fn service_runtime_channels(&mut self, ctx: &Context) -> u32 {
         // Events can enqueue more commands. Drain events first so a runtime
         // waiting to publish one can resume and consume its command channel.
         let events = self.drain_events(ctx);
         if self.cmd_tx.sender.is_closed() {
             self.fail_pending_whispers(CommandQueueError::Closed.message());
+            self.user_profile_popup.abort_ivr_logs_request(CommandQueueError::Closed.message());
         }
         if let Some(error) = self.cmd_tx.flush(ctx) {
             if error == CommandQueueError::Closed {
@@ -8306,8 +8325,7 @@ impl CrustApp {
                     self.send_cmd(AppCommand::ClearUserMessagesLocally { channel, login });
                 }
                 PopupAction::FetchIvrLogs { channel, username } => {
-                    self.user_profile_popup.set_ivr_logs_loading();
-                    self.send_cmd(AppCommand::FetchIvrLogs { channel, username });
+                    self.request_ivr_logs(channel, username);
                 }
                 PopupAction::OpenUrl { url } => {
                     self.send_cmd(AppCommand::OpenUrl { url });
@@ -10311,49 +10329,6 @@ impl CrustApp {
                         pane_ui.set_clip_rect(pane_rect);
                         pane_ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
 
-                        if ch.is_live_feed() {
-                            use crate::widgets::live_feed::LiveFeed;
-                            use std::collections::HashSet;
-                            let joined: HashSet<String> = self
-                                .state
-                                .channel_order
-                                .iter()
-                                .filter(|c| {
-                                    c.platform() == crust_core::model::Platform::Twitch
-                                        && !c.is_live_feed()
-                                })
-                                .map(|c| c.0.clone())
-                                .collect();
-                            let action = LiveFeed {
-                                snapshots: &self.state.live_channels,
-                                loaded: self.state.live_feed_loaded,
-                                error: self.state.live_feed_error.as_deref(),
-                                last_updated: self.state.live_feed_last_updated,
-                                joined_logins: &joined,
-                                thumbnail_bytes: &self.emote_bytes,
-                            }
-                            .show(&mut pane_ui);
-                            if let Some(act) = action {
-                                self.handle_live_feed_action(act);
-                            }
-                            continue; // skip the rest of this pane iteration
-                        }
-
-                        if ch.is_mentions() {
-                            use crate::widgets::mentions::MentionsList;
-                            let action = MentionsList {
-                                mentions: &self.state.mentions,
-                                show_timestamps: self.show_timestamps,
-                                show_timestamp_seconds: self.show_timestamp_seconds,
-                                use_24h_timestamps: self.use_24h_timestamps,
-                            }
-                            .show(&mut pane_ui);
-                            if let Some(target) = action {
-                                self.jump_to_mention(target);
-                            }
-                            continue;
-                        }
-
                         // Pane header
                         let (unread_count, unread_mentions) = self
                             .state
@@ -10366,7 +10341,7 @@ impl CrustApp {
                             .get(&ch)
                             .map(|s| s.open)
                             .unwrap_or(false);
-                        let split_meta = if ch.is_twitch() {
+                        let split_meta = if ch.is_twitch() && !ch.is_virtual() {
                             let login = ch.display_name().to_ascii_lowercase();
                             let show_viewers = self.split_header_show_viewer_count
                                 && !(self.streamer_mode_active
@@ -10404,6 +10379,46 @@ impl CrustApp {
                             } else {
                                 search.request_open();
                             }
+                        }
+
+                        if ch.is_live_feed() {
+                            use crate::widgets::live_feed::LiveFeed;
+                            use std::collections::HashSet;
+                            let joined: HashSet<String> = self
+                                .state
+                                .channel_order
+                                .iter()
+                                .filter(|c| c.is_twitch() && !c.is_virtual())
+                                .map(|c| c.0.clone())
+                                .collect();
+                            let action = LiveFeed {
+                                snapshots: &self.state.live_channels,
+                                loaded: self.state.live_feed_loaded,
+                                error: self.state.live_feed_error.as_deref(),
+                                last_updated: self.state.live_feed_last_updated,
+                                joined_logins: &joined,
+                                thumbnail_bytes: &self.emote_bytes,
+                            }
+                            .show(&mut pane_ui);
+                            if let Some(action) = action {
+                                self.handle_live_feed_action(action);
+                            }
+                            continue;
+                        }
+
+                        if ch.is_mentions() {
+                            use crate::widgets::mentions::MentionsList;
+                            let action = MentionsList {
+                                mentions: &self.state.mentions,
+                                show_timestamps: self.show_timestamps,
+                                show_timestamp_seconds: self.show_timestamp_seconds,
+                                use_24h_timestamps: self.use_24h_timestamps,
+                            }
+                            .show(&mut pane_ui);
+                            if let Some(target) = action {
+                                self.jump_to_mention(target);
+                            }
+                            continue;
                         }
 
                         // Pane chat input (bottom)
@@ -13698,6 +13713,41 @@ mod tests {
     }
 
     #[test]
+    fn rejected_ivr_log_requests_end_loading_and_allow_retry() {
+        let (mut app, mut receiver) = saturated_app();
+        app.user_profile_popup.set_loading("alice", vec![], Some(ChannelId::new("room")), false);
+        assert!(!app.request_ivr_logs("room".into(), "alice".into()));
+        assert!(!app.user_profile_popup.abort_ivr_logs_request("already rejected"));
+
+        while receiver.try_recv().is_ok() {}
+        while !app.cmd_tx.deferred.borrow().commands.is_empty() {
+            app.cmd_tx.flush(&egui::Context::default());
+            while receiver.try_recv().is_ok() {}
+        }
+        assert!(app.request_ivr_logs("room".into(), "alice".into()));
+        let AppCommand::FetchIvrLogs { channel, username, request_id } = receiver.try_recv().unwrap()
+            else { panic!("retry did not queue the log request") };
+        assert!(app.user_profile_popup.apply_ivr_logs_result(&channel, &username, request_id, Ok(vec![])));
+
+        drop(receiver);
+        assert!(!app.request_ivr_logs("room".into(), "alice".into()));
+        assert!(!app.user_profile_popup.abort_ivr_logs_request("already rejected"));
+    }
+
+    #[test]
+    fn losing_the_runtime_ends_pending_ivr_log_requests() {
+        let (mut app, mut receiver) = test_app();
+        app.user_profile_popup.set_loading("alice", vec![], Some(ChannelId::new("room")), false);
+        assert!(app.request_ivr_logs("room".into(), "alice".into()));
+        let AppCommand::FetchIvrLogs { channel, username, request_id } = receiver.try_recv().unwrap()
+            else { panic!("log request was not queued") };
+        drop(receiver);
+        app.service_runtime_channels(&egui::Context::default());
+        assert!(!app.user_profile_popup.abort_ivr_logs_request("already stopped"));
+        assert!(!app.user_profile_popup.apply_ivr_logs_result(&channel, &username, request_id, Ok(vec![])));
+    }
+
+    #[test]
     fn command_overflow_preserves_the_draft_reply_and_history() {
         let (mut app, _receiver) = saturated_app();
         let channel = ChannelId::new("channel");
@@ -15267,6 +15317,119 @@ mod tests {
                 let pane = &app.split_panes.panes[app.split_panes.focused];
                 assert!(ctx.memory(|memory| memory.has_focus(super::chat_composer_id(Some(pane.id)))));
             }
+        }
+    }
+
+    #[test]
+    fn virtual_split_close_buttons_preserve_the_other_chat_and_draft() {
+        for virtual_channel in [ChannelId::live_feed(), ChannelId::mentions()] {
+            for virtual_index in 0..2 {
+                let (mut app, _commands) = test_app();
+                let ctx = egui::Context::default();
+                let room = ChannelId::new("room");
+                app.state.join_channel(room.clone());
+                app.split_panes.add_pane(room.clone(), None);
+                app.split_panes.panes[0].input_buf = "kept draft".to_owned();
+                app.split_panes.add_pane(virtual_channel.clone(), Some(virtual_index));
+                app.split_panes.focused = virtual_index;
+                app.state.active_channel = Some(virtual_channel.clone());
+                let pane_id = app.split_panes.panes[virtual_index].id;
+                for _ in 0..3 {
+                    production_ui_frame(&ctx, &mut app, Vec::new());
+                }
+                let pane = ctx.read_response(egui::Id::new("split_pane_bg").with(pane_id))
+                    .expect("virtual pane is visible").rect;
+                let close = egui::pos2(
+                    pane.right() - 6.0 - t::icon_btn_sm() / 2.0,
+                    pane.top() + crate::widgets::split_header::split_header_height() / 2.0,
+                );
+                for pressed in [true, false] {
+                    production_ui_frame(&ctx, &mut app, vec![
+                        egui::Event::PointerMoved(close),
+                        egui::Event::PointerButton {
+                            pos: close,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ]);
+                }
+                assert!(app.split_panes.panes.is_empty(), "virtual split close did not respond");
+                assert_eq!(app.state.active_channel.as_ref(), Some(&room));
+                assert_eq!(app.chat_input_buf, "kept draft");
+                assert!(app.state.channels.contains_key(&room));
+                production_ui_frame(&ctx, &mut app, vec![egui::Event::Text(" continued".to_owned())]);
+                assert_eq!(app.chat_input_buf, "kept draft continued");
+                assert!(!app.message_search.contains_key(&virtual_channel));
+            }
+        }
+    }
+
+    #[test]
+    fn virtual_split_menus_can_close_other_panes_without_offering_search() {
+        for virtual_channel in [ChannelId::live_feed(), ChannelId::mentions()] {
+            let (mut app, _commands) = test_app();
+            let ctx = egui::Context::default();
+            let room = ChannelId::new("room");
+            app.state.join_channel(room.clone());
+            app.split_panes.add_pane(virtual_channel.clone(), None);
+            app.split_panes.add_pane(room.clone(), None);
+            app.state.active_channel = Some(room.clone());
+            app.split_panes.focused = 1;
+            app.split_panes.panes[0].input_buf = "retained pane draft".to_owned();
+            let pane_id = app.split_panes.panes[0].id;
+            let mut output = egui::FullOutput::default();
+            for _ in 0..3 {
+                output = production_ui_frame(&ctx, &mut app, Vec::new());
+            }
+            let pane = ctx.read_response(egui::Id::new("split_pane_bg").with(pane_id))
+                .expect("virtual pane is visible").rect;
+            let menu = output.shapes.iter().find_map(|shape| {
+                let egui::epaint::Shape::Text(text) = &shape.shape else { return None };
+                let rect = text.galley.rect.translate(text.pos.to_vec2());
+                (text.galley.text() == "..." && pane.contains_rect(rect)).then_some(rect.center())
+            }).expect("virtual split has a menu");
+            for pressed in [true, false] {
+                production_ui_frame(&ctx, &mut app, vec![
+                    egui::Event::PointerMoved(menu),
+                    egui::Event::PointerButton {
+                        pos: menu,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]);
+            }
+            output = production_ui_frame(&ctx, &mut app, Vec::new());
+            assert!(visible_text_rect(&output, "Show search").is_none());
+            assert!(visible_text_rect(&output, "Hide search").is_none());
+            let keep = visible_text_rect(&output, "Close other splits")
+                .unwrap_or_else(|| {
+                    let labels: Vec<_> = output.shapes.iter().filter_map(|shape| {
+                        if let egui::epaint::Shape::Text(text) = &shape.shape {
+                            Some(text.galley.text())
+                        } else {
+                            None
+                        }
+                    }).collect();
+                    panic!("virtual split offers Close other splits; rendered labels: {labels:?}")
+                }).center();
+            for pressed in [true, false] {
+                production_ui_frame(&ctx, &mut app, vec![
+                    egui::Event::PointerMoved(keep),
+                    egui::Event::PointerButton {
+                        pos: keep,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]);
+            }
+            assert!(app.split_panes.panes.is_empty());
+            assert_eq!(app.state.active_channel.as_ref(), Some(&virtual_channel));
+            assert_eq!(app.chat_input_buf, "retained pane draft");
+            assert!(app.state.channels.contains_key(&room));
+            assert!(!app.message_search.contains_key(&virtual_channel));
         }
     }
 

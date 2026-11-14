@@ -46,7 +46,7 @@ fn invoke_persist_hook(settings: &AppSettings) {
 // AccountEntry: one saved Twitch account
 
 /// A single saved Twitch account (username + optional fallback token).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct AccountEntry {
     pub username: String,
     /// OAuth token stored as fallback when the OS keyring is unavailable.
@@ -54,11 +54,20 @@ pub struct AccountEntry {
     pub oauth_token: String,
 }
 
+impl std::fmt::Debug for AccountEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccountEntry")
+            .field("username_configured", &!self.username.is_empty())
+            .field("token_configured", &!self.oauth_token.is_empty())
+            .finish_non_exhaustive()
+    }
+}
+
 // ExternalToolsConfig: Streamlink + custom-player integration
 
 /// Config for external tool launches (Streamlink, custom player) from the
 /// channel context menu.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ExternalToolsConfig {
     /// Absolute path to the `streamlink`/`streamlink.exe` binary.  Empty =
@@ -88,6 +97,30 @@ pub struct ExternalToolsConfig {
     pub streamlink_session_token: String,
 }
 
+impl std::fmt::Debug for ExternalToolsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExternalToolsConfig")
+            .field(
+                "streamlink_path_configured",
+                &!self.streamlink_path.is_empty(),
+            )
+            .field(
+                "extra_args_configured",
+                &!self.streamlink_extra_args.is_empty(),
+            )
+            .field(
+                "player_template_configured",
+                &!self.player_template.is_empty(),
+            )
+            .field("mpv_path_configured", &!self.mpv_path.is_empty())
+            .field(
+                "session_token_configured",
+                &!self.streamlink_session_token.is_empty(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for ExternalToolsConfig {
     fn default() -> Self {
         Self {
@@ -106,7 +139,7 @@ impl Default for ExternalToolsConfig {
 
 // AppSettings: user configuration structure
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     #[serde(default = "default_theme")]
     pub theme: String,
@@ -384,6 +417,135 @@ pub struct AppSettings {
     pub split_panes_focused: usize,
 }
 
+/// Only known setting values may enter diagnostic output. Other strings can
+/// contain credentials, account names, URLs, or custom command bodies.
+fn diagnostic_choice(value: &str, choices: &[&'static str]) -> &'static str {
+    choices
+        .iter()
+        .copied()
+        .find(|choice| value.eq_ignore_ascii_case(choice))
+        .unwrap_or("other")
+}
+
+impl std::fmt::Debug for AppSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Keep this allowlist independent of serialization. New settings stay
+        // private until their diagnostic representation is reviewed explicitly.
+        f.debug_struct("AppSettings")
+            .field("theme", &diagnostic_choice(&self.theme, &["dark", "light"]))
+            .field("font_size", &self.font_size)
+            .field("ui_font_size", &self.ui_font_size)
+            .field("topbar_font_size", &self.topbar_font_size)
+            .field("tabs_font_size", &self.tabs_font_size)
+            .field("timestamps_font_size", &self.timestamps_font_size)
+            .field("pills_font_size", &self.pills_font_size)
+            .field("popups_font_size", &self.popups_font_size)
+            .field("chips_font_size", &self.chips_font_size)
+            .field("usercard_font_size", &self.usercard_font_size)
+            .field("dialog_font_size", &self.dialog_font_size)
+            .field("account_count", &self.accounts.len())
+            .field("active_account_configured", &!self.username.is_empty())
+            .field(
+                "default_account_configured",
+                &!self.default_account.is_empty(),
+            )
+            .field("auto_join_count", &self.auto_join.len())
+            .field("show_timestamps", &self.show_timestamps)
+            .field("show_timestamp_seconds", &self.show_timestamp_seconds)
+            .field("use_24h_timestamps", &self.use_24h_timestamps)
+            .field(
+                "local_log_indexing_enabled",
+                &self.local_log_indexing_enabled,
+            )
+            .field("enable_kick_beta", &self.enable_kick_beta)
+            .field("enable_irc_beta", &self.enable_irc_beta)
+            .field("always_on_top", &self.always_on_top)
+            .field(
+                "prevent_overlong_twitch_messages",
+                &self.prevent_overlong_twitch_messages,
+            )
+            .field("collapse_long_messages", &self.collapse_long_messages)
+            .field(
+                "collapse_long_message_lines",
+                &self.collapse_long_message_lines,
+            )
+            .field("animations_when_focused", &self.animations_when_focused)
+            .field(
+                "channel_layout",
+                &diagnostic_choice(&self.channel_layout, &["sidebar", "top_tabs"]),
+            )
+            .field("sidebar_visible", &self.sidebar_visible)
+            .field("analytics_visible", &self.analytics_visible)
+            .field("irc_status_visible", &self.irc_status_visible)
+            .field(
+                "tab_style",
+                &diagnostic_choice(&self.tab_style, &["compact", "normal"]),
+            )
+            .field("show_tab_close_buttons", &self.show_tab_close_buttons)
+            .field("show_tab_live_indicators", &self.show_tab_live_indicators)
+            .field("split_header_show_title", &self.split_header_show_title)
+            .field("split_header_show_game", &self.split_header_show_game)
+            .field(
+                "split_header_show_viewer_count",
+                &self.split_header_show_viewer_count,
+            )
+            .field("highlight_rule_count", &self.highlight_rules.len())
+            .field("filter_count", &self.filter_records.len())
+            .field("moderation_preset_count", &self.mod_action_presets.len())
+            .field("nickname_count", &self.nicknames.len())
+            .field("ignored_user_count", &self.ignored_users.len())
+            .field("ignored_phrase_count", &self.ignored_phrases.len())
+            .field("show_pronouns_in_usercard", &self.show_pronouns_in_usercard)
+            .field("auto_claim_bonus_points", &self.auto_claim_bonus_points)
+            .field(
+                "desktop_notifications_enabled",
+                &self.desktop_notifications_enabled,
+            )
+            .field("watched_channel_count", &self.watched_channels.len())
+            .field("update_checks_enabled", &self.update_checks_enabled)
+            .field(
+                "streamer_mode",
+                &diagnostic_choice(&self.streamer_mode, &["off", "auto", "on"]),
+            )
+            .field(
+                "streamer_hide_link_previews",
+                &self.streamer_hide_link_previews,
+            )
+            .field(
+                "streamer_hide_viewer_counts",
+                &self.streamer_hide_viewer_counts,
+            )
+            .field("streamer_suppress_sounds", &self.streamer_suppress_sounds)
+            .field(
+                "uploader_configured",
+                &!self.image_uploader.endpoint.is_empty(),
+            )
+            .field(
+                "uploader_headers_configured",
+                &!self.image_uploader.extra_headers.is_empty(),
+            )
+            .field("external_tools", &self.external_tools)
+            .field("command_alias_count", &self.command_aliases.len())
+            .field("hotkey_count", &self.hotkey_bindings.len())
+            .field("spellcheck_enabled", &self.spellcheck_enabled)
+            .field("custom_dictionary_count", &self.custom_spell_dict.len())
+            .field("window_pos", &self.window_pos)
+            .field("window_size", &self.window_size)
+            .field("window_maximized", &self.window_maximized)
+            .field("whispers_panel_visible", &self.whispers_panel_visible)
+            .field("split_pane_count", &self.split_panes.len())
+            .field("split_panes_focused", &self.split_panes_focused)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AppSettings {
+    /// Format only the diagnostic allowlist; persisted settings keep their values.
+    pub fn diagnostic_snapshot(&self) -> String {
+        format!("{self:#?}")
+    }
+}
+
 /// A single split-pane slot persisted across sessions.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PersistedPane {
@@ -581,6 +743,28 @@ fn remove_account_from_settings(settings: &mut AppSettings, username: &str) {
     }
 }
 
+fn settings_parse_error(error: &toml::de::Error, source: &str) -> String {
+    // Both Display and message() may contain a rejected value. Report only its
+    // position so malformed credentials cannot enter logs or crash reports.
+    let Some(span) = error.span() else {
+        return "Failed to parse settings; using defaults".to_owned();
+    };
+    let mut offset = span.start.min(source.len());
+    while !source.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    let prefix = &source[..offset];
+    let line = prefix.bytes().filter(|&byte| byte == b'\n').count() + 1;
+    let column = prefix
+        .rsplit('\n')
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .count()
+        + 1;
+    format!("Failed to parse settings at line {line}, column {column}; using defaults")
+}
+
 impl SettingsStore {
     /// Directory that holds `settings.toml`. Useful for siblings like the
     /// webview's persistent user-data dir.
@@ -603,7 +787,7 @@ impl SettingsStore {
         match std::fs::read_to_string(&self.config_path) {
             Ok(s) => {
                 let mut cfg: AppSettings = toml::from_str(&s).unwrap_or_else(|e| {
-                    error!("Failed to parse settings ({e}), using defaults");
+                    error!("{}", settings_parse_error(&e, &s));
                     AppSettings::default()
                 });
                 // Migration: if `accounts` is empty but the legacy single-account
@@ -826,6 +1010,130 @@ mod tests {
     use super::sanitize_custom_spell_dict;
     use super::AccountEntry;
     use super::AppSettings;
+
+    #[test]
+    fn diagnostic_output_omits_credentials_and_freeform_settings() {
+        const PRIVATE: &str = "diagnostic-private-value";
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        let fields = value.as_object_mut().unwrap();
+        for value in fields.values_mut() {
+            if value.is_string() {
+                *value = PRIVATE.into();
+            }
+        }
+        for name in ["external_tools", "image_uploader"] {
+            for value in fields
+                .get_mut(name)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .values_mut()
+            {
+                if value.is_string() {
+                    *value = PRIVATE.into();
+                }
+            }
+        }
+        let mut settings: AppSettings = serde_json::from_value(value).unwrap();
+        settings.accounts.push(AccountEntry {
+            username: PRIVATE.to_owned(),
+            oauth_token: PRIVATE.to_owned(),
+        });
+        settings.auto_join.push(PRIVATE.to_owned());
+        settings.highlights.push(PRIVATE.to_owned());
+        settings.ignores.push(PRIVATE.to_owned());
+        settings.emote_picker_favorites.push(PRIVATE.to_owned());
+        settings.emote_picker_recent.push(PRIVATE.to_owned());
+        settings.emote_picker_provider_boost = Some(PRIVATE.to_owned());
+        settings.updater_last_checked_at = Some(PRIVATE.to_owned());
+        settings.custom_spell_dict.push(PRIVATE.to_owned());
+        settings.channel_order.push(PRIVATE.to_owned());
+        settings
+            .tab_visibility_rules
+            .insert(PRIVATE.to_owned(), PRIVATE.to_owned());
+        settings.slash_usage_counts.insert(PRIVATE.to_owned(), 1);
+        settings
+            .command_aliases
+            .push(crust_core::commands::CommandAlias::new(PRIVATE, PRIVATE));
+        settings
+            .mod_action_presets
+            .push(crust_core::model::ModActionPreset {
+                label: PRIVATE.to_owned(),
+                command_template: PRIVATE.to_owned(),
+                icon_url: Some(PRIVATE.to_owned()),
+            });
+        settings.split_panes.push(super::PersistedPane {
+            channel: PRIVATE.to_owned(),
+            frac: 0.5,
+        });
+
+        for diagnostic in [
+            settings.diagnostic_snapshot(),
+            format!("{settings:?}"),
+            format!("{:?}", settings.accounts),
+            format!("{:?}", settings.external_tools),
+        ] {
+            assert!(!diagnostic.contains(PRIVATE));
+        }
+        let snapshot = settings.diagnostic_snapshot();
+        assert!(snapshot.contains("account_count: 1"));
+        assert!(snapshot.contains("auto_join_count: 1"));
+        assert!(snapshot.contains("command_alias_count: 1"));
+        assert!(snapshot.contains("theme: \"other\""));
+
+        // Diagnostics must not change the stored format or erase credentials.
+        let saved = toml::to_string(&settings).unwrap();
+        let restored: AppSettings = toml::from_str(&saved).unwrap();
+        assert_eq!(
+            serde_json::to_value(restored).unwrap(),
+            serde_json::to_value(settings).unwrap()
+        );
+    }
+
+    #[test]
+    fn diagnostic_snapshot_keeps_layout_and_feature_state() {
+        let settings = AppSettings {
+            theme: "light".to_owned(),
+            font_size: 21.5,
+            ui_font_size: 1.5,
+            channel_layout: "top_tabs".to_owned(),
+            local_log_indexing_enabled: false,
+            window_size: Some([900.0, 600.0]),
+            ..Default::default()
+        };
+        let snapshot = settings.diagnostic_snapshot();
+        for expected in [
+            "theme: \"light\"",
+            "font_size: 21.5",
+            "ui_font_size: 1.5",
+            "channel_layout: \"top_tabs\"",
+            "local_log_indexing_enabled: false",
+            "900.0",
+            "600.0",
+        ] {
+            assert!(snapshot.contains(expected));
+        }
+    }
+
+    #[test]
+    fn settings_parse_diagnostics_omit_source_and_rejected_values() {
+        for source in [
+            "oauth_token = \"parser-private-value\n",
+            "# Unicode π\nfont_size = \"parser-private-value\"\n",
+        ] {
+            let error = toml::from_str::<AppSettings>(source).unwrap_err();
+            assert!(error.to_string().contains("parser-private-value"));
+            let diagnostic = super::settings_parse_error(&error, source);
+            assert!(diagnostic.starts_with("Failed to parse settings at line "));
+            assert!(diagnostic.ends_with("; using defaults"));
+            assert!(!diagnostic.contains("parser-private-value"));
+            assert!(!diagnostic.contains("oauth_token"));
+            assert!(!diagnostic.contains("font_size"));
+            if source.starts_with('#') {
+                assert!(diagnostic.contains("at line 2,"));
+            }
+        }
+    }
 
     #[test]
     fn sanitize_custom_spell_dict_drops_invalid_entries() {
