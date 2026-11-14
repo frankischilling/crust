@@ -1,9 +1,8 @@
-# Example Plugins
+# Example plugins
 
-The repository includes focused example plugins you can copy into your local
-plugin directory.
+Copy an example from the repository into your local plugin directory to try it.
 
-## Included Examples
+## Included examples
 
 - `hello_plugin`
 - `timer_plugin`
@@ -17,7 +16,7 @@ plugin directory.
 - `ui_settings_demo_plugin`
 - `ui_host_panels_demo_plugin`
 
-## What They Show
+## What the examples do
 
 - `hello_plugin`: the smallest possible command registration and completion example
 - `timer_plugin`: delayed local work with `c2.later`
@@ -27,11 +26,11 @@ plugin directory.
 - `loader_progress_demo_plugin`: low-level loader notifications, including `ImagePrefetchQueued`, `EmoteImageReady`, and `EmoteCatalogUpdated`
 - `stateful_counter_plugin`: persistent plugin state and completion hooks
 - `channel_toolbox_plugin`: channel lookup, sending messages, local notes, and clearing message buffers
-- `ui_window_showcase_plugin`: floating plugin window, host-form fields, submit events, retained updates, and a `link_button` that still emits callbacks; see [UI](./API_UI)
-- `ui_settings_demo_plugin`: plugin-owned settings page in the shared Plugins area of the Settings window with host-form submit handling; see [UI](./API_UI)
-- `ui_host_panels_demo_plugin`: plugin-owned host panels rendered in `settings.appearance`, `sidebar.top`, and `channel_header`; see [UI](./API_UI)
+- `ui_window_showcase_plugin`: floating plugin window, host-form fields, submit events, retained updates, and a `link_button` that still emits callbacks; see [UI](./API_UI.md)
+- `ui_settings_demo_plugin`: plugin-owned settings page in the shared Plugins area of the Settings window with host-form submit handling; see [UI](./API_UI.md)
+- `ui_host_panels_demo_plugin`: plugin-owned host panels rendered in `settings.appearance`, `sidebar.top`, and `channel_header`; see [UI](./API_UI.md)
 
-## Suggested Reading Order
+## Suggested reading order
 
 1. `hello_plugin`
 2. `timer_plugin`
@@ -45,10 +44,10 @@ plugin directory.
 
 ## Install
 
-See [Installation](./Installation).
+See [Installation](./Installation.md).
 
-## Related Docs
+## Related docs
 
-1. [Plugin Installation](./Installation)
-2. [Plugin Lifecycle](./Lifecycle)
-3. [API Reference](./API)
+1. [Plugin Installation](./Installation.md)
+2. [Plugin Lifecycle](./Lifecycle.md)
+3. [API Reference](./API.md)

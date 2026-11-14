@@ -1,9 +1,9 @@
-# Chat And Channels
+# Chat and channels
 
-These helpers cover sending messages, navigating channels, and starting
-fetch-style work that resolves through event callbacks.
+These helpers send messages, navigate channels, and request data. Fetch results
+arrive through event callbacks.
 
-## Message Helpers
+## Message helpers
 
 ## `c2.send_message(channel, text, opts?)`
 
@@ -29,12 +29,9 @@ Send a chat message.
 message id. `reply` is optional local-echo/context metadata used to describe
 the replied-to message in Lua and the UI.
 
-Backward compatibility:
-
-- `c2.send_message(channel, text)` still works unchanged
-- malformed `opts` fields are ignored and the message is still sent normally
-- malformed `channel` or `text` still prevent the send, just like the original
-  two-argument form
+The two-argument form, `c2.send_message(channel, text)`, is also supported.
+Malformed `opts` fields are ignored. A malformed `channel` or `text` prevents
+the send.
 
 ## `c2.send_whisper(target_login, text)`
 
@@ -45,20 +42,16 @@ Send a Twitch whisper.
 
 ## `c2.add_system_message(channel, text)`
 
-Inject a local-only message into a channel feed.
-
-This is the Lua-facing wrapper around the Rust-side local message injection
-command. It does not send anything to Twitch or another upstream service.
+Add a local system message to a channel feed. The message appears only in
+Crust and is not sent to the chat service.
 
 - `channel`: channel name string or channel table
 - `text`: local message body
 
 ## `c2.clear_messages(channel)`
 
-Clear the visible local message buffer for a channel.
-
-This is the Lua-facing wrapper around the Rust-side local channel clear command.
-It only affects Crust's local chat view.
+Clear a channel's visible message buffer in Crust. This affects only the local
+chat view.
 
 ## `c2.clear_user_messages_locally(channel, login)`
 
@@ -69,7 +62,7 @@ Remove one user's visible messages from the local chat view.
 
 The matching callback event is `c2.EventType.ClearUserMessagesLocally`.
 
-## Channel Actions
+## Channel actions
 
 ## `c2.join_channel(channel)`
 
@@ -94,10 +87,9 @@ Open the user card for `login` in the given channel context.
 
 Open a URL in the system browser.
 
-## Fetch Helpers
+## Fetch helpers
 
-These calls do not return fetched data directly. They trigger host work and the
-result arrives through a later callback.
+These calls start a fetch. The result arrives in a later callback.
 
 ## `c2.fetch_image(url)`
 

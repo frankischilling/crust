@@ -1,6 +1,7 @@
-# Channel Toolbox Plugin
+# Channel toolbox plugin
 
-This example shows:
+Adds `/chatbox` commands for channel lookup, chat messages, local notes, and
+clearing the local message buffer. It uses:
 
 - `c2.channel_by_name()`
 - `c2.send_message()`
@@ -8,7 +9,7 @@ This example shows:
 - `c2.clear_messages()`
 - `c2.register_callback()` for command completions
 
-Try:
+Try these commands:
 
 - `/chatbox info`
 - `/chatbox note`

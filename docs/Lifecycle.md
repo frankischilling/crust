@@ -1,6 +1,6 @@
 # Lifecycle
 
-Plugin load order:
+Crust loads each plugin in this order:
 
 1. Crust scans the plugin directory.
 2. Each direct child directory is treated as a plugin candidate.
@@ -26,7 +26,7 @@ Notes:
 
 - `entry` defaults to `init.lua`.
 - `permissions` are metadata only for now.
-- Plugins reload as a whole directory, not file-by-file.
+- A reload replaces the plugin's whole directory.
 - Use `plugin_data_dir()` for writable state.
 
 Directory layout:

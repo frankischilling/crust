@@ -1,10 +1,10 @@
-# Crust v0.4.5 Release Notes
+# Crust v0.4.5 release notes
 
 Date: 2026-04-08
 
-v0.4.5 adds Debian Linux support to the built-in auto-updater flow.
-
-This release extends updater selection and install logic beyond Windows so Debian-style package artifacts can be discovered, verified, and installed from GitHub Releases.
+v0.4.5 adds Debian Linux updates from GitHub Releases. The updater selects a
+package for the current architecture, verifies its digest, and starts the system
+installer.
 
 ## Highlights
 
@@ -14,7 +14,7 @@ This release extends updater selection and install logic beyond Windows so Debia
 - New Debian release build script for producing updater-compatible .deb packages
 - Workspace and internal crate versions bumped to 0.4.5
 
-## Debian Updater Support
+## Debian updater
 
 On Debian-like Linux systems, Crust now:
 
@@ -25,7 +25,7 @@ On Debian-like Linux systems, Crust now:
 4. Verifies the downloaded package digest using the release asset `sha256:<hex>` metadata.
 5. Stages the package and launches the system installer via desktop openers.
 
-## Release Packaging Requirements
+## Release packaging requirements
 
 To remain compatible with automatic update installs:
 
@@ -34,7 +34,7 @@ To remain compatible with automatic update installs:
   - `crust-v<version>-debian-<arch>.deb`
 - Updater-consumed assets must expose a valid SHA256 digest in release metadata.
 
-## New Debian Build Script
+## Debian build script
 
 The repository now includes a Debian packaging helper script:
 
@@ -46,4 +46,4 @@ It builds the release binary, creates a Debian package artifact, and writes a ma
 
 - Auto-update install is now supported on Windows and Debian Linux systems.
 - Stable-only checks remain in effect (draft/prerelease ignored).
-- Unsupported Linux distributions continue to fail safely for updater operations.
+- Unsupported Linux distributions cannot install updates through the updater.

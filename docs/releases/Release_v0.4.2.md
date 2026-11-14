@@ -1,18 +1,17 @@
-# Crust v0.4.2 Release Notes
+# Crust v0.4.2 release notes
 
 Date: 2026-04-06
 
-v0.4.2 is a focused stability release for the Windows auto-updater.
-
-This release fixes update installs failing with an installer launch error on some systems.
+v0.4.2 fixes Windows updates that failed because the installer could not find
+PowerShell.
 
 ## Highlights
 
 - Fixed Windows updater installer launch reliability
-- Added robust PowerShell executable resolution and fallbacks
+- Added an absolute PowerShell path and fallback executable names
 - Improved error reporting when installer launch cannot start
 
-## Auto-Updater Fix
+## Installer launch fix
 
 Some Windows environments reported:
 
@@ -34,7 +33,7 @@ Fix in v0.4.2:
    - pwsh
 3. If all launch attempts fail, the error now includes the full candidate list that was tried.
 
-## Behavior Impact
+## Other updater behavior
 
 - Update detection behavior is unchanged.
 - SHA256 verification and staging flow are unchanged.

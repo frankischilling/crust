@@ -1,9 +1,9 @@
-# Moderation And Creator Tools
+# Moderation and creator tools
 
-These helpers trigger moderation actions, creator tools, and live-control
-operations.
+Use these helpers to moderate chat, manage reward redemptions, and run polls,
+predictions, commercials, or announcements.
 
-## Moderation Actions
+## Moderation actions
 
 ## `c2.timeout_user(channel, login, user_id, seconds, reason?)`
 
@@ -64,7 +64,7 @@ Matching event:
 
 - `c2.EventType.OpenModerationTools`
 
-## Reward Redemptions
+## Reward redemptions
 
 ## `c2.update_reward_redemption_status(channel, reward_id, redemption_id, status, user_login, reward_title)`
 
@@ -76,7 +76,7 @@ Update a channel-points reward redemption.
 - `user_login`: login used for status messages and moderation context
 - `reward_title`: human-readable reward title
 
-## Message Cleanup
+## Message cleanup
 
 ## `c2.delete_message(channel, message_id)`
 
@@ -98,7 +98,7 @@ Matching events:
 `c2.EventType.UserMessagesCleared` is different: it reports a moderation-driven
 clear from upstream runtime state.
 
-## Creator Tools
+## Creator tools
 
 ## `c2.create_poll(channel, title, choices, duration_secs, channel_points_per_vote?)`
 

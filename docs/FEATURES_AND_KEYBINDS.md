@@ -1,112 +1,227 @@
-# Features And Keybinds
+# Features and keybinds
 
-Last updated: 2026-04-22 (v0.5.0)
+This reference covers chat features, default shortcuts, mouse actions, and slash
+commands. Kick and generic IRC support remain beta features.
 
-This page is a practical reference for what crust can do today: major features, keyboard shortcuts, high-use mouse actions, and built-in slash commands.
-
-## Feature Overview
+## Feature overview
 
 ### Platforms and transports
 
-- Twitch chat via IRC over WebSocket (anonymous and authenticated)
-- Kick integration (beta, incomplete)
-- Generic IRC integration (beta)
-- IRC server tabs and keyed IRC joins
-- IRC channel redirect handling
+- Twitch chat via IRC over WebSocket (anonymous and authenticated modes)
+- Twitch EventSub events: subs / gift subs / raids / channel-points redemptions / poll + prediction lifecycle / stream `online` + `offline` / hype-train begin/progress/end / moderator + AutoMod + suspicious-user + whisper topics, with `session_reconnect` continuity, deduplication across 10,000 recent event IDs, and backfill after reconnect
+- Kick chat integration (beta / currently incomplete)
+- Generic IRC integration (beta), including IRC server tabs and keyed channel joins
+- IRC channel redirect handling (old channel target -> new channel target)
 
-### Channels, tabs, and layouts
+### Channels, tabs, and navigation
 
-- Join, leave, reorder, and close channel tabs
-- Sidebar layout and top-tabs layout
-- Compact and normal tab styles
-- Optional tab close buttons and live indicators
-- Channel unread and mention counters
-- Quick switch palette with unified channels + whisper threads
-- Mention-first quick switch ordering (mentions, then unread, then others)
-- Split-pane view (up to 4 panes)
-- Tab visibility rules: right-click any Twitch tab to "Hide when offline"; tab reappears automatically when the stream goes live
-- Live / followed-channels feed tab (aggregated list of every followed channel currently live)
-- Persistent cross-channel Mentions tab (ring buffer, restored from local log on startup)
+- Multi-channel management: join, leave, reorder, and close channels
+- Sidebar and top-tab channel layouts
+- Tab style controls (compact/normal), optional close buttons, and optional live indicators
+- Unread and mention counters for channels
+- Quick switch palette (Ctrl+K):
+  - mention-first ordering (mentions -> unread -> others)
+  - unified channel + whisper-thread list
+  - query aliases for platforms and whispers
+  - keyboard navigation and activation
+- Split-pane chat view (up to 4 panes):
+  - drag channel to split
+  - focused-pane tracking
+  - split header controls and per-pane search toggle
+  - split keyboard navigation and pane reordering shortcuts
+
+### Desktop UI shell
+
+- Join dialog and account/login switcher dialogs
+- User profile popup and dedicated moderation tools window
+- Whisper management window
+- Optional analytics side panel
+- Optional IRC status diagnostics panel
+- Optional performance overlay for chat rendering stats
+- Startup loading screen for initial prefetch visibility
 
 ### Messages and rendering
 
-- Chat, action, sub, raid, bits, channel points, timeout/ban/clear/system message rendering
-- Reply/thread metadata and reply flow
-- Span rendering for text, emotes, badges, mentions, URLs, and emoji
-- URL detection and link preview metadata (Open Graph / Twitter card)
-- Message deletion and user-message clearing states
-- Optional timestamps (12h/24h, optional seconds)
-- Optional long-message collapse
+- Message types rendered in chat include:
+  - standard chat and actions
+  - subscriptions, raids, bits, channel points redemptions
+  - hype train begin/progress/end with progress bar + level + top contributor (`channel.hype_train.*` EventSub)
+  - shared chat (cross-channel mirror) with source-channel chip, source mod/vip badges, and notification suppression for already-open source channels
+  - timeout/ban/clear notices and system notices
+  - first-message and pinned-message indicators
+- Inline reply/thread support with reply metadata
+- Rich span/token rendering:
+  - text
+  - emotes
+  - badges
+  - mentions
+  - URLs
+  - emoji
+- URL detection and Open Graph/Twitter card preview metadata
+- Message deletion and user-message clear handling in UI
+- Optional timestamp rendering (12h/24h, with/without seconds)
+- Optional long-message collapse with configurable line limits
+
+### Input and command UX
+
+- Message input history recall (arrow keys)
+- `:` emote autocomplete and Tab completion
+- Slash command handling for chat, moderation, and creator workflows
+- Command usage tracking for ranking/autocomplete improvements
+- Custom command aliases (`/hi = /me says hi {1}`) with `{channel}`, `{user}`, `{input}`, `{streamer}` variables
+- Spellcheck on the input box (Norvig + Soundex + QWERTY proximity), with up to five right-click suggestions and a persistent personal dictionary
+- Image paste / drag-drop uploader (Imgur, Nuuls, ShareX SXCU, or any custom multipart endpoint), with deletion URLs logged locally
 
 ### Emotes, badges, and cosmetics
 
-- Providers: Twitch, BTTV, FFZ, 7TV, Kick
+- Emote providers:
+  - Twitch native
+  - BTTV
+  - FFZ
+  - 7TV
+  - Kick
+- Emote resolution by provider and configured priority
 - Animated emote support (GIF/WebP)
-- Provider-priority resolution
-- Badge rendering (global/channel sources)
-- 7TV cosmetics updates (including name paint data)
-- Emote picker with favorites, recents, and provider boost preferences
+- Emoji tokenization/rendering via Twemoji URLs
+- Badge rendering from global/channel badge sources
+- 7TV sender cosmetics support (name paints/badge updates)
+- Emote picker features:
+  - favorites
+  - recents
+  - provider preference boost
+- Emote image caching in memory and on disk
 
 ### Whispers
 
-- Twitch whisper receive/send flow
-- Threaded whisper list with recency ordering
-- Per-thread unread counters and mention counters
-- Whisper compose/open workflow
-- Whisper notifications (when enabled)
+- Twitch whisper sending and receiving
+- Whisper thread list with recency ordering
+- Per-thread unread counts and mention counts
+- Whisper compose/open workflow from thread context
+- Whisper desktop notifications (when enabled)
 
 ### Moderation and creator tools
 
-- Message-row quick actions: Quick Delete, Quick Timeout 10m, Quick Ban, Quick Warn
-- Full moderation actions: timeout, ban, unban, warn, suspicious-user controls
-- AutoMod queue approve/deny
-- Unban request fetch/resolve
-- Moderation presets
-- Moderation tools window and workflow links
-- Creator tools: polls, predictions, commercials, stream markers, announcements, shoutouts
-- Reward redemption status updates
+- Message-row right-click moderation quick actions:
+  - Quick Delete
+  - Quick Timeout 10m
+  - Quick Ban
+  - Quick Warn
+- Full moderation actions:
+  - timeout/ban/unban/warn
+  - delete message
+  - clear user messages locally
+  - suspicious-user / low-trust monitor + restrict + clear
+  - AutoMod message approve/deny
+  - unban request fetch/resolve
+- Moderation presets for reusable actions
+- Moderation tools window with dedicated AutoMod / Low-trust / Unban-requests tabs:
+  - per-tab item-count badges
+  - shared filter strip (login or message text)
+  - per-row approve / deny actions and bulk approve / bulk deny
+  - keyboard nav: `J` / `K` focus, `A` / `D` approve / deny, `Shift+A` / `Shift+D` bulk, `Tab` / `Shift+Tab` switch tab
+- Creator tools:
+  - polls (create/end/cancel)
+  - predictions (create/lock/resolve/cancel)
+  - commercials
+  - stream markers
+  - announcements
+  - shoutouts
+  - reward redemption status updates
+  - optional automatic claiming of channel-points "Bonus Points" through the embedded Twitch webview
+
+### Profiles, stream state, and notifications
+
+- User profile popup with account metadata, avatar/badges, recent messages, follow age, account age, shared-channels list, and prior-timeouts log in moderator view
+- Optional pronoun lookup when opening a user card
+- Stream status fetch and live/offline updates
+- Stream tracking for channel presence indicators
+- Live / followed-channels feed virtual tab fed by `stream.online` / `stream.offline` EventSub
+- Mentions-only cross-channel feed tab with restart-survival via local SQLite log
+- Tab visibility rules ("Hide when offline" per-channel)
+- Desktop notifications for mentions/highlights/whispers (configurable)
+- In-app event toast banners for high-visibility events
+- Per-event sound notifications (mention / whisper / subscribe / raid / custom highlight) with file-path + volume sliders, baked-in synthetic ping fallback, and streamer-mode mute integration
 
 ### Accounts, auth, and settings
 
-- Multi-account add/switch/remove/default
-- Auth refresh path
-- Keyring-backed token storage with fallback
-- IRC identity settings (nick and NickServ auth)
-- Persisted settings for appearance, behavior, notifications, rules, filters, presets, and beta flags
-- Remappable keyboard shortcuts: every binding routes through a central hotkey registry; rebind from Settings -> Hotkeys with conflict detection
-- Custom command aliases: user-defined `/trigger = body` pairs with `{1}`, `{1+}`, `{channel}`, `{user}`, `{input}`, `{streamer}` variables
-- Spellcheck with personal dictionary: underlines misspelled words in the chat input, right-click for top 5 suggestions or "Add to dictionary"
-- Sound event system: per-event ping sounds for mention / whisper / subscribe / raid / highlight, with per-event volume and streamer-mode muting
-- Image uploader: clipboard paste or drag-drop to a configurable host (Imgur, Nuuls, ShareX SXCU, or any custom multipart endpoint); deletion URLs logged locally
-- External tools: Streamlink integration with configurable path / quality / extra args, plus a custom player template (`{channel}`)
-- Crash handler: structured panic reports with backtrace, tracing log tail, and live settings snapshot; abnormal-shutdown detection via session sentinels; in-app crash viewer on next launch
+- Multi-account support:
+  - add/switch/remove accounts
+  - set default startup account
+- Auth refresh flow for expired/invalid sessions
+- OS keyring-backed token storage with settings-file fallback
+- IRC identity settings (nick and NickServ credentials)
+- Settings persistence for:
+  - general behavior (timestamps, local log indexing, auto-join, ignores/highlights)
+  - appearance/layout
+  - per-section font sizes (chat body, UI scale, topbar, tabs, timestamps, pills, popups, chips, usercard, dialog)
+  - chat UI behavior
+  - notification preferences
+  - emote picker preferences (favorites, recents, provider boost)
+  - highlight rules
+  - filter records (typed expression DSL with `author.*`, `message.*`, `channel.*`, `flags.*`, `has.*`)
+  - user nicknames
+  - ignored users + ignored phrases
+  - mod action presets
+  - sound events (per-event enabled / file path / volume)
+  - hotkey bindings (rebindable, conflict detection)
+  - command aliases
+  - tab visibility rules
+  - image uploader endpoint config
+  - external tools (Streamlink path, quality, extra args, custom player template)
+  - streamer mode (link previews, viewer counts, sound suppression while live)
+  - beta feature flags
+
+Expression filters can match shared chat and whispers with `flags.shared` and
+`flags.whisper`. Hide rules remove matching messages from chat; dim rules leave
+them visible with reduced emphasis.
 
 ### Search, history, and local data
 
+- Recent-message history load on join (recent-messages API with IVR fallback)
+- Per-channel local append-only log indexing (SQLite)
+- Older local history paging support
 - Per-channel message search/filter UI
-- Join-time history fetch
-- Older local history paging
-- Local append-only chat log indexing (SQLite)
-- App data under platform-specific config/cache/log directories
+- Cross-channel search with predicates such as `from:<user>`, `has:link`, `in:<channel>`, and `regex:"<pattern>"`
+- Data directories via `directories::ProjectDirs` for config/cache/logs
 
 ### Plugin platform (Lua)
 
-- Plugin runtime and lifecycle
-- Plugin command registration
-- Event callback registration
-- Plugin UI surfaces: custom windows, settings pages, host panels
-- Host callbacks for image/profile/link preview/IVR-log fetch workflows
+- Lua plugin runtime with plugin lifecycle management
+- Plugin command registration and execution
+- Event callback registration across account/chat/settings/moderation/UI events including `SoundSettingsUpdated`, `HotkeyBindingsUpdated`, `UploadStarted`, `UploadFinished`, `FontSettingsUpdated`
+- Plugin UI surfaces:
+  - custom windows
+  - settings pages
+  - host-panel extensions
+- Host callback helpers for image fetch, profile fetch, link preview fetch, and IVR log fetch
+- Filter engine bridge: `c2.filters_parse(expr)` / `c2.filters_evaluate(expr, ctx)` for the typed expression DSL
+- Image uploader bridge: `c2.upload_image(channel, bytes_b64, format, source_path?)`
+- Sound + hotkey bridges: `c2.set_sound_settings(events)` / `c2.get_sound_settings()` and `c2.set_hotkey_bindings(bindings)` / `c2.get_hotkey_bindings()`
+- Example plugins in [plugins](../plugins/), including `c9_api_expansion_demo` for the filter, uploader, sound, and shortcut APIs
 
-### Updater
+### Updater and release flow
 
-- Windows auto-updater via GitHub Releases
-- Stable-only checks, SHA256 verification, staged install prompts
-- Background/manual update checks
-- Version skip support
+- Windows and Debian Linux auto-updater via GitHub Releases:
+  - stable-only checks
+  - SHA256 verification
+  - staged install prompt flow
+  - version skip support
+- Background and manual update check flows
+- PowerShell launch fallback chain for installer reliability
+
+### Reliability
+
+- Crash handler with persistent reports under `{data_dir}/logs/crashes/`:
+  - structured panic reports (version, target triple, run id, OS / arch / display server, pid, thread, payload, force-captured backtrace, last ~512 tracing events, live settings snapshot)
+  - synthetic "abnormal exit" reports on SIGKILL / power loss / native crash detected via session sentinel
+  - rolling 20-report + 40-sentinel retention
+  - in-app crash viewer with View / Copy / Show on disk / Delete / Dismiss / Restart actions
 
 ## Keybinds
 
-All shortcuts below are defaults. Every binding can be remapped from Settings -> Hotkeys; conflicts are flagged inline.
+The tables below show default shortcuts. Settings > Hotkeys lets you rebind
+registered app actions and reports conflicts. Text editing, autocomplete, and
+palette navigation also use the widget shortcuts listed below.
 
 ### Global and navigation
 
@@ -157,7 +272,10 @@ Notes:
 
 - Autocomplete supports emotes, usernames, slash commands, and IRC /join channel suggestions.
 - Bare-word Tab completion cycles emote/username matches.
-- Twitch character count and over-limit behavior depends on the configured overflow mode.
+- History starts with the newest sent message. Pressing Down past it restores
+  the draft you were writing.
+- Autocomplete and history keys affect the focused chat input.
+- The Twitch character count and message limit behavior depend on the configured overflow mode.
 - Pasting an image from the clipboard or dropping an image file onto the chat input triggers the configured uploader; the returned URL is inserted at the caret.
 
 ## Common mouse and context actions
@@ -172,7 +290,8 @@ Notes:
 
 ## Built-in slash commands
 
-This is the built-in command surface in the UI parser. Unknown commands are passed through to the backend/server path when applicable.
+These commands are handled by the UI parser. When supported, unknown commands
+are passed to the chat server.
 
 ### General/local
 
@@ -265,6 +384,7 @@ User-defined command aliases (Settings -> Commands) dispatch after the built-in 
 - [UI API](API_UI.md)
 - [Events API](API_Events.md)
 - [Plugin API reference](API.md)
+- [Release notes v0.5.1](releases/Release_v0.5.1.md)
 - [Release notes v0.5.0](releases/Release_v0.5.0.md)
 - [Release notes v0.4.9](releases/Release_v0.4.9.md)
 - [Release notes v0.4.3](releases/Release_v0.4.3.md)

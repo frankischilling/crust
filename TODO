@@ -1,41 +1,44 @@
-crust
+Crust development areas
 
+This list records areas to review and improve. It is not a list of wholly missing
+features; many already have an implementation. Check docs/FEATURES_AND_KEYBINDS.md
+for the current feature reference.
 
+Plugins and accounts
+- Plugin lifecycle, multi-account behavior, moderation tools, chatter analytics,
+  and configurable stream delay.
 
+Live events
+- Follows, subscriptions, gift subscriptions, raids, channel points, poll and
+  prediction lifecycles, stream status, and reconnect/backfill handling.
 
+Channel points
+- Redemption messages, reward metadata, moderator actions, and redemption UI.
 
-plugin system
+Moderation
+- Fast right-click actions, timeout presets, moderation logs, AutoMod queues,
+  low-trust controls, and unban requests.
 
-multi account sytem, better modderation, chatter anyalitcs, custom stream dealy
+Filters and highlights
+- Per-channel and global rules, regular expressions, user and content filters,
+  highlight sounds and colors, and mention rules.
 
-Start implementation bing bang
+User cards
+- Follow age, account age, pronouns, shared channels, recent messages, badges,
+  and role context.
 
-EventSub realtime pipeline
-Follows, subs, gift subs, raids, channel points, poll/prediction lifecycle, stream online/offline, reconnect/backfill handling.
+Messages
+- Replies and threads, deleted and cleared messages, consistent system notices,
+  and timestamp settings.
 
-Channel points parity
-Redemption messages, reward metadata, moderator handling actions, better redemption UI.
+Commands and input
+- Twitch command coverage, slash-command help, suggestion ranking, and history.
 
-Moderation UX parity
-Right-click user menu with fast actions, timeout presets, mod logs, AutoMod queue, unban request workflow.
+Tabs and splits
+- Split controls, unread and mention counts, and keyboard navigation.
 
-Filter/highlight engine
-Per-channel and global rules, regex support, user/content filters, highlight sounds/colors, mention rules.
+Emotes
+- Favorites, recent emotes, provider priority, picker search, and usage ranking.
 
-Usercard depth
-Follow age, account age, pronouns, shared channels, recent messages, richer badge/role context.
-
-Message behavior parity
-Reply/thread polish, clearer deleted/cleared rendering, system notice consistency, better timestamp/settings granularity.
-
-Command and input parity
-Full Twitch command coverage, better slash help/discovery, smarter ranking/history in command suggestions.
-
-Tab/split/navigation polish
-More Chatterino-like split workflows, tab unread/mention behavior parity, keyboard channel navigation improvements.
-
-Emote UX parity
-Favorites/recent emotes, provider priority controls, richer picker/search behavior and usage-based ranking.
-
-History/search tooling
-Reliable recent-message fetch on join, stronger in-channel search, optional local log indexing.
+History and search
+- Recent-message fetching on join, in-channel search, and local log indexing.

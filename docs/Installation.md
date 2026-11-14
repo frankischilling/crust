@@ -8,7 +8,7 @@ Typical locations:
 - Windows: `%APPDATA%\crust\crust\data\plugins`
 - macOS: `~/Library/Application Support/crust/plugins`
 
-Each direct child directory is treated as a plugin candidate.
+Crust checks each direct child directory for a plugin manifest.
 
 Example layout:
 
@@ -20,7 +20,8 @@ plugins/
     └-- data/
 ```
 
-Install the bundled examples:
+On Linux, run these commands from the repository root to install the bundled
+examples:
 
 ```text
 mkdir -p ~/.local/share/crust/plugins

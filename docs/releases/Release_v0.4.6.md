@@ -1,8 +1,9 @@
-# Crust v0.4.6 Release Notes
+# Crust v0.4.6 release notes
 
 Date: 2026-04-08
 
-v0.4.6 focuses on updater compatibility and release metadata alignment.
+v0.4.6 adds detection for Debian-based distributions and shows updater controls
+on Linux.
 
 ## Highlights
 
@@ -12,9 +13,10 @@ v0.4.6 focuses on updater compatibility and release metadata alignment.
 - Added updater unit tests for Debian-family distro detection and os-release parsing behavior.
 - Workspace and internal crate versions bumped to 0.4.6.
 
-## Updater Behavior Notes
+## Updater behavior
 
-On Linux, auto-update checks/install remain gated to Debian-family distributions and require:
+On Linux, automatic update checks and installation support Debian-family
+distributions and require:
 
 1. A matching artifact name format: `crust-v<version>-debian-<arch>.deb`
 2. Architecture compatibility with the running build
@@ -25,4 +27,4 @@ Installer handoff continues to use desktop opener fallbacks (`xdg-open`, then `g
 ## Notes
 
 - Stable-only release checks remain in effect (draft and prerelease tags are ignored).
-- Unsupported distributions still fail safely with user-facing updater messages.
+- The updater reports when a distribution is unsupported.

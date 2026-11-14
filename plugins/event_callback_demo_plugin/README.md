@@ -1,16 +1,14 @@
-# Event Callback Demo Plugin
+# Event callback demo
 
-This example focuses on `c2.register_callback()` and the async fetch/event flow.
-
-It shows:
+Requests profiles, link previews, and stream status, then handles the responses
+in Lua callbacks. The example uses:
 
 - `c2.register_callback()`
 - `c2.fetch_user_profile()`
 - `c2.fetch_link_preview()`
 - `c2.fetch_stream_status()`
-- maintaining lightweight Lua-side state from callbacks
 
-Try:
+Try these commands:
 
 - `/eventdemo`
 - `/eventdemo profile some_login`
