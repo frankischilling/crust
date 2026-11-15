@@ -292,6 +292,8 @@ impl ChatMessage {
                 .as_ref()
                 .is_some_and(|id| !id.is_empty())
             && self.channel == confirmed.channel
+            && self.shared.as_ref().map(|source| source.room_id.as_str())
+                == confirmed.shared.as_ref().map(|source| source.room_id.as_str())
             && self.flags.is_action == confirmed.flags.is_action
             && self.reply.as_ref().map(|reply| reply.parent_msg_id.as_str())
                 == confirmed.reply.as_ref().map(|reply| reply.parent_msg_id.as_str())
@@ -300,6 +302,19 @@ impl ChatMessage {
                 .login
                 .eq_ignore_ascii_case(&confirmed.sender.login)
             && self.raw_text == confirmed.raw_text
+    }
+
+    /// Import server metadata while keeping local identity and accumulated UI state.
+    pub(crate) fn apply_confirmation(&mut self, confirmed: &Self) {
+        let local_id = self.id;
+        let local_flags = self.flags.clone();
+        *self = confirmed.clone();
+        self.id = local_id;
+        self.flags.is_history = local_flags.is_history;
+        self.flags.is_deleted |= local_flags.is_deleted;
+        self.flags.is_highlighted |= local_flags.is_highlighted;
+        self.flags.is_mention |= local_flags.is_mention;
+        self.flags.suppress_notification |= local_flags.suppress_notification;
     }
 }
 
@@ -421,6 +436,29 @@ mod tests {
         confirmed.flags.is_self = true;
         assert!(!pending.is_pending_own_echo_of(&confirmed));
         confirmed.msg_kind = MsgKind::Chat;
+        assert!(pending.is_pending_own_echo_of(&confirmed));
+    }
+
+    #[test]
+    fn shared_mirrors_cannot_confirm_identical_sends_from_another_source() {
+        let mut pending = subscription_message("hello", "");
+        pending.msg_kind = MsgKind::Chat;
+        pending.server_id = None;
+        pending.flags.is_self = true;
+        let mut confirmed = pending.clone();
+        confirmed.server_id = Some("confirmed".into());
+        confirmed.shared = Some(super::SharedChatSource {
+            room_id: "other-room".into(),
+            source_message_id: Some("original".into()),
+            ..Default::default()
+        });
+        assert!(!pending.is_pending_own_echo_of(&confirmed));
+        pending.shared = confirmed.shared.clone();
+        assert!(pending.is_pending_own_echo_of(&confirmed));
+        pending.shared.as_mut().unwrap().room_id = "third-room".into();
+        assert!(!pending.is_pending_own_echo_of(&confirmed));
+        pending.shared = None;
+        confirmed.shared = None;
         assert!(pending.is_pending_own_echo_of(&confirmed));
     }
 

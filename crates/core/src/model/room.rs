@@ -223,7 +223,6 @@ impl ChannelState {
         if !msg.flags.is_self || msg.channel != self.id {
             return None;
         }
-        let echo_id = msg.server_id.as_ref().filter(|id| !id.is_empty())?;
         // Match pending local echoes in the same order they were sent.
         // The sender and text identify the first unconfirmed candidate.
         // History rows cannot be waiting for a live socket confirmation.
@@ -233,24 +232,7 @@ impl ChannelState {
             .find(|m| m.is_pending_own_echo_of(msg))
         {
             let original = (existing.id, existing.timestamp);
-            // Stamp the local echo with the real server id and any Twitch-side
-            // metadata we now know (badges, colour, timestamp, ...).
-            existing.server_id = Some(echo_id.clone());
-            existing.timestamp = msg.timestamp;
-            existing.sender = msg.sender.clone();
-            existing.twitch_emotes = msg.twitch_emotes.clone();
-            existing.spans = msg.spans.clone();
-            existing.reply = msg.reply.clone();
-            existing.msg_kind = msg.msg_kind.clone();
-
-            // Preserve local echo invariants while importing server metadata.
-            existing.flags.is_self = true;
-            existing.flags.is_history = false;
-            existing.flags.is_action = msg.flags.is_action;
-            existing.flags.is_highlighted |= msg.flags.is_highlighted;
-            existing.flags.is_mention |= msg.flags.is_mention;
-            existing.flags.is_deleted |= msg.flags.is_deleted;
-            existing.flags.custom_reward_id = msg.flags.custom_reward_id.clone();
+            existing.apply_confirmation(msg);
             return Some(original);
         }
         None
@@ -643,6 +625,73 @@ mod tests {
         message.timestamp = Utc.timestamp_millis_opt(1000).unwrap();
         message.msg_kind = super::super::MsgKind::Chat;
         message
+    }
+
+    #[test]
+    fn own_echo_confirmation_imports_server_flags_without_losing_local_state() {
+        let mut room = ChannelState::new(super::super::ChannelId::new("rustlang"));
+        let mut pending = local_history_test_message(41);
+        pending.flags.is_self = true;
+        pending.flags.is_deleted = true;
+        pending.flags.is_highlighted = true;
+        pending.flags.is_mention = true;
+        pending.flags.suppress_notification = true;
+        pending.shared = Some(super::super::SharedChatSource {
+            room_id: "source-room".into(),
+            ..Default::default()
+        });
+        room.push_message(pending.clone());
+
+        let mut confirmed = pending.clone();
+        confirmed.id = super::super::MessageId(99);
+        confirmed.server_id = Some("confirmed".into());
+        confirmed.timestamp += chrono::Duration::seconds(1);
+        confirmed.flags = super::super::MessageFlags {
+            is_self: true,
+            is_first_msg: true,
+            is_pinned: true,
+            custom_reward_id: Some("reward".into()),
+            ..Default::default()
+        };
+        confirmed.sender.color = Some("#123456".into());
+        confirmed.shared.as_mut().unwrap().source_message_id = Some("source-message".into());
+        assert_eq!(room.absorb_own_echo(&confirmed), Some((pending.id, pending.timestamp)));
+        assert_eq!(room.messages.len(), 1);
+        let stored = &room.messages[0];
+        assert_eq!(stored.id, pending.id);
+        assert_eq!(stored.server_id, confirmed.server_id);
+        assert_eq!(stored.timestamp, confirmed.timestamp);
+        assert_eq!(stored.sender.color, confirmed.sender.color);
+        assert_eq!(stored.shared.as_ref().unwrap().source_message_id.as_deref(), Some("source-message"));
+        assert!(stored.flags.is_first_msg && stored.flags.is_pinned);
+        assert!(stored.flags.is_deleted && stored.flags.is_highlighted && stored.flags.is_mention);
+        assert!(stored.flags.suppress_notification);
+        assert!(stored.flags.is_self && !stored.flags.is_history);
+        assert_eq!(stored.flags.custom_reward_id.as_deref(), Some("reward"));
+    }
+
+    #[test]
+    fn own_echo_confirmation_does_not_consume_historical_or_shared_rows() {
+        let mut room = ChannelState::new(super::super::ChannelId::new("rustlang"));
+        let mut pending = local_history_test_message(41);
+        pending.flags.is_self = true;
+        room.push_message(pending.clone());
+        let mut confirmed = pending.clone();
+        confirmed.server_id = Some("confirmed".into());
+        confirmed.shared = Some(super::super::SharedChatSource {
+            room_id: "another-room".into(),
+            ..Default::default()
+        });
+        assert_eq!(room.absorb_own_echo(&confirmed), None);
+        assert!(room.messages[0].server_id.is_none());
+        confirmed.shared = None;
+        confirmed.flags.is_history = true;
+        assert_eq!(room.absorb_own_echo(&confirmed), None);
+        confirmed.flags.is_history = false;
+        room.messages[0].flags.is_history = true;
+        assert_eq!(room.absorb_own_echo(&confirmed), None);
+        assert!(room.messages[0].server_id.is_none());
+        assert!(room.messages[0].flags.is_history);
     }
 
     fn local_history_test_page(

@@ -508,20 +508,19 @@ impl AppState {
     }
 
     /// Keep the Mentions copy attached to the confirmed identity of a local echo.
-    /// Replacing metadata does not add a row or change unread counts.
-    pub fn sync_mention_echo(&mut self, confirmed: &ChatMessage) {
+    /// Returns whether an existing row was updated, without changing unread counts.
+    pub fn sync_mention_echo(&mut self, confirmed: &ChatMessage) -> bool {
         let Some(mention) = self
             .mentions
             .iter_mut()
             .find(|message| message.channel == confirmed.channel && message.id == confirmed.id)
         else {
-            return;
+            return false;
         };
-        let was_deleted = mention.flags.is_deleted;
-        *mention = confirmed.clone();
-        mention.flags.is_deleted |= was_deleted;
+        mention.apply_confirmation(confirmed);
         self.moderation.apply(mention);
         self.moderation.observe_deleted(mention);
+        true
     }
 
     /// Clear the Mentions-tab unread counter. Call when the user activates
@@ -918,19 +917,22 @@ mod mentions_state_tests {
         server.server_id = Some("confirmed-message".into());
         server.timestamp = Utc.timestamp_opt(11, 0).unwrap();
         server.sender.color = Some("#123456".into());
+        server.flags.is_first_msg = true;
+        server.flags.is_pinned = true;
         let room = state.channels.get_mut(&channel).unwrap();
         assert_eq!(
             room.absorb_own_echo(&server),
             Some((MessageId(10), Utc.timestamp_opt(10, 0).unwrap()))
         );
         let confirmed = room.messages.back().unwrap().clone();
-        state.sync_mention_echo(&confirmed);
+        assert!(state.sync_mention_echo(&confirmed));
         assert_eq!(state.mentions.len(), 2);
         assert_eq!(state.mentions_unread, 1);
         assert_eq!(state.mentions[0].id, MessageId(10));
         assert_eq!(state.mentions[0].timestamp, server.timestamp);
         assert_eq!(state.mentions[0].sender.color, server.sender.color);
         assert_eq!(state.mentions[0].server_id, server.server_id);
+        assert!(state.mentions[0].flags.is_first_msg && state.mentions[0].flags.is_pinned);
         assert!(state.mentions[1].server_id.is_none());
 
         state.apply_moderation(&crate::model::ModerationAction::message(
@@ -954,13 +956,41 @@ mod mentions_state_tests {
         confirmed.flags.is_deleted = false;
         confirmed.server_id = Some("confirmed".into());
         confirmed.timestamp = Utc.timestamp_opt(11, 0).unwrap();
-        state.sync_mention_echo(&confirmed);
+        assert!(state.sync_mention_echo(&confirmed));
         assert!(state.mentions[0].flags.is_deleted);
         assert!(state.moderation.is_deleted(&confirmed));
         confirmed.id = MessageId(999);
-        state.sync_mention_echo(&confirmed);
+        assert!(!state.sync_mention_echo(&confirmed));
         assert_eq!(state.mentions.len(), 1);
         assert_eq!(state.mentions_unread, 0);
+    }
+
+    #[test]
+    fn mention_confirmation_keeps_history_and_accumulated_local_flags() {
+        let mut state = AppState::default();
+        let mut historical = mention("", 10, true);
+        historical.server_id = None;
+        historical.flags.is_history = true;
+        historical.flags.is_deleted = true;
+        historical.flags.is_mention = true;
+        historical.flags.suppress_notification = true;
+        state.push_mention(historical.clone(), true);
+        let mut confirmed = historical;
+        confirmed.server_id = Some("confirmed".into());
+        confirmed.flags = MessageFlags {
+            is_self: true,
+            is_first_msg: true,
+            is_pinned: true,
+            ..Default::default()
+        };
+        assert!(state.sync_mention_echo(&confirmed));
+        let stored = &state.mentions[0];
+        assert!(stored.flags.is_history && stored.flags.is_deleted);
+        assert!(stored.flags.is_highlighted && stored.flags.is_mention);
+        assert!(stored.flags.suppress_notification);
+        assert!(stored.flags.is_first_msg && stored.flags.is_pinned);
+        assert_eq!(state.mentions_unread, 0);
+        assert_eq!(state.mentions.len(), 1);
     }
 
     #[test]

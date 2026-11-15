@@ -4743,6 +4743,11 @@ exit 1
                     channel: channel.as_str().to_owned(),
                 })
             }
+            AppEvent::ChannelParted { channel } => {
+                self.loading_screen.on_event(LoadEvent::ChannelParted {
+                    channel: channel.as_str().to_owned(),
+                })
+            }
             AppEvent::EmoteCatalogUpdated { emotes } => {
                 self.loading_screen.on_event(LoadEvent::CatalogLoaded {
                     count: emotes.len(),
@@ -5127,10 +5132,8 @@ exit 1
                             let recent: Vec<_> = ch.messages.iter().rev().take(400).map(|row| row.id).collect();
                             crate::widgets::message_list::invalidate_message_layouts(ctx, &channel, &recent);
                         }
-                        // Echo landed on an existing local copy; the mention
-                        // (if any) was already recorded when that local copy
-                        // was first pushed. Skip the mirror to avoid
-                        // double-counting in the Mentions tab.
+                        // Reconcile an own-message confirmation with its local
+                        // identity after releasing the channel borrow.
                         mention_pushable = false;
                     }
                     if !absorbed {
@@ -5214,7 +5217,16 @@ exit 1
                     }
                 }
                 if let Some((confirmed, original_timestamp_ms)) = confirmed_mention_echo {
-                    self.state.sync_mention_echo(&confirmed);
+                    let had_mention = self.state.sync_mention_echo(&confirmed);
+                    if !had_mention
+                        && !confirmed.flags.suppress_notification
+                        && (confirmed.flags.is_highlighted
+                            || confirmed.flags.is_mention
+                            || confirmed.flags.is_first_msg
+                            || confirmed.flags.is_pinned)
+                    {
+                        self.state.push_mention(confirmed.clone(), false);
+                    }
                     crate::widgets::message_list::invalidate_message_layouts(
                         ctx, &ChannelId::mentions(), &[confirmed.id]);
                     crate::widgets::message_list::invalidate_reply_sender_index(ctx, &ChannelId::mentions());
@@ -19121,6 +19133,77 @@ mod tests {
         assert!(app.state.channels[&channel].messages[0].flags.is_deleted);
         assert!(app.state.mentions[0].flags.is_deleted);
         assert_eq!(app.state.mentions_unread, unread_before);
+    }
+
+    #[test]
+    fn confirmed_own_echo_adds_newly_qualified_mentions_without_another_unread() {
+        let (mut app, _commands) = test_app();
+        let mut updates = attach_history_updates(&mut app, 4);
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("first");
+        app.state.join_channel(channel.clone());
+        let mut local = search_message(channel.clone());
+        local.id = crust_core::MessageId(42);
+        local.server_id = None;
+        local.flags.is_self = true;
+        let original_timestamp_ms = local.timestamp.timestamp_millis();
+        app.apply_event(AppEvent::MessageReceived {
+            channel: channel.clone(), message: local.clone(),
+        }, &ctx);
+        assert!(app.state.mentions.is_empty());
+        assert_eq!(app.state.mentions_unread, 0);
+
+        let mut confirmed = local;
+        confirmed.id = crust_core::MessageId(99);
+        confirmed.server_id = Some("confirmed-first-message".into());
+        confirmed.timestamp += chrono::Duration::seconds(1);
+        confirmed.sender.display_name = "Confirmed name".into();
+        confirmed.flags.is_first_msg = true;
+        confirmed.flags.is_pinned = true;
+        app.apply_event(AppEvent::MessageReceived {
+            channel: channel.clone(), message: confirmed.clone(),
+        }, &ctx);
+
+        assert_eq!(app.state.channels[&channel].messages.len(), 1);
+        assert_eq!(app.state.mentions.len(), 1);
+        let mention = &app.state.mentions[0];
+        assert_eq!(mention.id, crust_core::MessageId(42));
+        assert_eq!(mention.server_id.as_deref(), Some("confirmed-first-message"));
+        assert_eq!(mention.sender.display_name, "Confirmed name");
+        assert!(mention.flags.is_first_msg && mention.flags.is_pinned);
+        assert_eq!(app.state.mentions_unread, 0);
+        let HistoryUpdate::Confirmation { message: saved, original_timestamp_ms: timestamp } =
+            updates.try_recv().unwrap() else { panic!("confirmation was not persisted") };
+        assert_eq!(saved.id, crust_core::MessageId(42));
+        assert!(saved.flags.is_first_msg && saved.flags.is_pinned);
+        assert_eq!(timestamp, original_timestamp_ms);
+
+        app.apply_event(AppEvent::MessageReceived { channel, message: confirmed }, &ctx);
+        assert_eq!(app.state.mentions.len(), 1);
+        assert_eq!(app.state.mentions_unread, 0);
+        assert!(updates.try_recv().is_err());
+    }
+
+    #[test]
+    fn suppressed_confirmation_does_not_add_a_mentions_row() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("first");
+        app.state.join_channel(channel.clone());
+        let mut local = search_message(channel.clone());
+        local.server_id = None;
+        local.flags.is_self = true;
+        app.apply_event(AppEvent::MessageReceived {
+            channel: channel.clone(), message: local.clone(),
+        }, &ctx);
+        local.server_id = Some("suppressed-confirmation".into());
+        local.flags.is_first_msg = true;
+        local.flags.suppress_notification = true;
+        app.apply_event(AppEvent::MessageReceived { channel: channel.clone(), message: local }, &ctx);
+        assert!(app.state.channels[&channel].messages[0].flags.is_first_msg);
+        assert!(app.state.channels[&channel].messages[0].flags.suppress_notification);
+        assert!(app.state.mentions.is_empty());
+        assert_eq!(app.state.mentions_unread, 0);
     }
 
     #[test]

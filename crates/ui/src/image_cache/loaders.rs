@@ -116,15 +116,15 @@ pub(super) fn color_frame(
     animate: bool,
 ) -> Option<(Arc<egui::ColorImage>, usize)> {
     ensure_installed(ctx);
-    let animated = animate
-        && matches!(
-            image::guess_format(&raw),
-            Ok(image::ImageFormat::Gif | image::ImageFormat::WebP)
-        );
-    let source = if animated {
-        source.to_owned()
-    } else {
+    let animation_format = matches!(
+        image::guess_format(&raw),
+        Ok(image::ImageFormat::Gif | image::ImageFormat::WebP)
+    );
+    let animated = animate && animation_format;
+    let source = if animation_format && !animate {
         first_frame_uri(source)
+    } else {
+        source.to_owned()
     };
     ctx.include_bytes(source.clone(), raw);
     let mut frame = if animated {
@@ -132,10 +132,12 @@ pub(super) fn color_frame(
     } else {
         0
     };
-    let ImagePoll::Ready { mut image } = ctx
-        .try_load_image(&format!("{source}#{frame}"), SizeHint::default())
-        .ok()?
-    else {
+    let uri = if animation_format {
+        format!("{source}#{frame}")
+    } else {
+        source.clone()
+    };
+    let ImagePoll::Ready { mut image } = ctx.try_load_image(&uri, SizeHint::default()).ok()? else {
         return None;
     };
     if animated {
@@ -214,16 +216,22 @@ impl ImageLoader for BoundedImageLoader {
             if let Some(reason) = &entry.rejected {
                 return Err(LoadError::Loading(reason.clone()));
             }
-            if !entry.pending {
-                // Decoder byte_size walks its entire cache. Avoid that work for
-                // ordinary repaint hits, including later frames of an animation.
-                let result = self.inner[entry.decoder].load(ctx, uri, size_hint);
-                if matches!(result, Ok(ImagePoll::Ready { .. })) {
+            let decoder = &self.inner[entry.decoder];
+            if !entry.pending || decoder.id() == animation::LOADER_ID {
+                let result = decoder.load(ctx, uri, size_hint);
+                if !entry.pending && matches!(result, Ok(ImagePoll::Ready { .. })) {
+                    // Decoder byte_size walks its entire cache. Avoid that work for
+                    // ordinary repaint hits, including later frames of an animation.
                     return result;
                 }
-                // A decoder may have evicted this source independently. A new
-                // pending decode must rejoin the combined cache budget below.
-                selected = Some((entry.decoder, result));
+                // The background decoder preflights its own queued work. Other
+                // pending loaders need the wrapper check when their bytes arrive.
+                if !matches!(
+                    result,
+                    Err(LoadError::NotSupported | LoadError::FormatNotSupported { .. })
+                ) {
+                    selected = Some((entry.decoder, result));
+                }
             }
         }
         let mut detected_format = None;
@@ -781,9 +789,8 @@ pub(super) mod tests {
             unsupported_format: true,
         }));
         install(&ctx, 1024, 10);
-        ctx.include_bytes("bytes://test.png", png());
         assert!(matches!(
-            ctx.try_load_image("bytes://test.png", SizeHint::default()),
+            ctx.try_load_image("custom://test.png", SizeHint::default()),
             Ok(ImagePoll::Ready { .. })
         ));
         assert_eq!(unsupported.load(Ordering::Relaxed), 1);
@@ -795,11 +802,119 @@ pub(super) mod tests {
             unsupported_format: true,
         }));
         install(&ctx, 1024, 10);
-        ctx.include_bytes("bytes://test.png", png());
         assert!(
-            matches!(ctx.try_load_image("bytes://test.png", SizeHint::default()),
+            matches!(ctx.try_load_image("custom://test.png", SizeHint::default()),
             Err(LoadError::NoMatchingImageLoader { detected_format: Some(format) }) if format == "png")
         );
+    }
+
+    #[test]
+    fn a_pending_byte_source_can_fall_through_to_a_custom_decoder() {
+        use egui::load::{BytesLoadResult, BytesLoader, BytesPoll};
+        use std::sync::atomic::AtomicBool;
+
+        #[derive(Default)]
+        struct DelayedBytes(AtomicBool);
+
+        impl BytesLoader for DelayedBytes {
+            fn id(&self) -> &str {
+                "delayed_bytes_fixture"
+            }
+            fn load(&self, _: &egui::Context, _: &str) -> BytesLoadResult {
+                if self.0.load(Ordering::Relaxed) {
+                    Ok(BytesPoll::Ready {
+                        size: None,
+                        bytes: vec![0].into(),
+                        mime: None,
+                    })
+                } else {
+                    Ok(BytesPoll::Pending { size: None })
+                }
+            }
+            fn forget(&self, _: &str) {}
+            fn forget_all(&self) {}
+            fn byte_size(&self) -> usize {
+                0
+            }
+        }
+
+        let ctx = egui::Context::default();
+        let bytes = Arc::new(DelayedBytes::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        ctx.add_bytes_loader(bytes.clone());
+        ctx.add_image_loader(Arc::new(ProbeDecoder {
+            calls: calls.clone(),
+            unsupported_format: false,
+        }));
+        install(&ctx, 1024, 10);
+        assert!(matches!(
+            ctx.try_load_image("custom://pending-image", SizeHint::default()),
+            Ok(ImagePoll::Pending { .. })
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        bytes.0.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            ctx.try_load_image("custom://pending-image", SizeHint::default()),
+            Ok(ImagePoll::Ready { .. })
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn static_color_sampling_reuses_the_regular_decoded_image() {
+        let ctx = context(8, 1);
+        let source = "bytes://shared.png";
+        let raw: Arc<[u8]> = png().into();
+        ctx.include_bytes(source, raw.clone());
+        ready_image(&ctx, source);
+        let ImagePoll::Ready { image } = ctx.try_load_image(source, SizeHint::default()).unwrap()
+        else {
+            panic!("the ordinary static image must be ready");
+        };
+        for animate in [true, false] {
+            let (sample, index) = color_frame(&ctx, source, raw.clone(), animate).unwrap();
+            assert_eq!(index, 0);
+            assert!(Arc::ptr_eq(&image, &sample));
+        }
+        assert_eq!(work_stats(&ctx).completed_decodes, 1);
+        assert_eq!(work_stats(&ctx).animation_bytes, 8);
+    }
+
+    #[test]
+    fn pending_custom_decoders_recheck_size_when_image_bytes_arrive() {
+        struct WaitingDecoder(Arc<AtomicUsize>);
+
+        impl ImageLoader for WaitingDecoder {
+            fn id(&self) -> &str {
+                "waiting_decoder_fixture"
+            }
+            fn load(&self, _: &egui::Context, _: &str, _: SizeHint) -> ImageLoadResult {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(ImagePoll::Pending { size: None })
+            }
+            fn forget(&self, _: &str) {}
+            fn forget_all(&self) {}
+            fn byte_size(&self) -> usize {
+                0
+            }
+        }
+
+        let ctx = egui::Context::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        ctx.add_image_loader(Arc::new(WaitingDecoder(calls.clone())));
+        install(&ctx, 4, 10);
+        let source = "bytes://pending-custom";
+        ctx.include_bytes(source, vec![0]);
+        assert!(matches!(
+            ctx.try_load_image(source, SizeHint::default()),
+            Ok(ImagePoll::Pending { .. })
+        ));
+        ctx.include_bytes(source, png());
+        assert!(matches!(
+            ctx.try_load_image(source, SizeHint::default()),
+            Err(LoadError::Loading(_))
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -857,7 +972,9 @@ pub(super) mod tests {
         ctx.include_bytes("bytes://second.png", png());
         let mut first_id = None;
         let _ = ctx.run(Default::default(), |ctx| {
-            first_id = texture(ctx, "bytes://first.png").unwrap().texture_id();
+            first_id = ready_texture(ctx, "bytes://first.png")
+                .unwrap()
+                .texture_id();
             assert!(texture(ctx, "bytes://second.png").is_err());
             assert_eq!(
                 texture(ctx, "bytes://first.png").unwrap().texture_id(),
@@ -866,12 +983,14 @@ pub(super) mod tests {
         });
         let _ = ctx.run(Default::default(), |ctx| {
             assert!(matches!(
-                texture(ctx, "bytes://second.png"),
+                ready_texture(ctx, "bytes://second.png"),
                 Ok(TexturePoll::Ready { .. })
             ));
         });
         let _ = ctx.run(Default::default(), |ctx| {
-            let reloaded = texture(ctx, "bytes://first.png").unwrap().texture_id();
+            let reloaded = ready_texture(ctx, "bytes://first.png")
+                .unwrap()
+                .texture_id();
             assert_ne!(first_id, reloaded);
         });
     }
@@ -955,6 +1074,7 @@ pub(super) mod tests {
             assert!(first_id.is_some());
             ctx.include_bytes("bytes://decoder-pressure.png", png());
             let _ = ctx.run(at(0.05), |ctx| {
+                ready_image(ctx, "bytes://decoder-pressure.png");
                 assert!(matches!(
                     ctx.try_load_image("bytes://decoder-pressure.png", SizeHint::default()),
                     Ok(ImagePoll::Ready { .. })
@@ -1002,6 +1122,54 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn ordinary_image_widgets_cycle_extensionless_animations_without_static_duplicates() {
+        for raw in [gif(), animated_webp()] {
+            let ctx = context(16, 4);
+            let image = egui::Image::from_bytes("bytes://extensionless-animation", raw);
+            let at = |time| egui::RawInput {
+                time: Some(time),
+                ..Default::default()
+            };
+            let mut first = None;
+            let _ = ctx.run(at(0.0), |ctx| {
+                let mut result = image.load_for_size(ctx, egui::vec2(2.0, 1.0));
+                assert!(matches!(result, Ok(TexturePoll::Pending { .. })));
+                let deadline = Instant::now() + std::time::Duration::from_secs(5);
+                while matches!(result, Ok(TexturePoll::Pending { .. })) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "animation did not finish decoding"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    result = image.load_for_size(ctx, egui::vec2(2.0, 1.0));
+                }
+                first = result.unwrap().texture_id();
+            });
+            assert!(first.is_some());
+            let _ = ctx.run(at(0.15), |ctx| {
+                let second = image
+                    .load_for_size(ctx, egui::vec2(2.0, 1.0))
+                    .unwrap()
+                    .texture_id();
+                assert!(second.is_some());
+                assert_ne!(first, second, "the image widget must advance to frame one");
+            });
+            let _ = ctx.run(at(0.25), |ctx| {
+                assert_eq!(
+                    image
+                        .load_for_size(ctx, egui::vec2(2.0, 1.0))
+                        .unwrap()
+                        .texture_id(),
+                    first,
+                    "the image widget must loop to its retained first texture"
+                );
+            });
+            assert_eq!(work_stats(&ctx).completed_decodes, 1);
+            assert_eq!(work_stats(&ctx).animation_bytes, 16);
+        }
+    }
+
+    #[test]
     fn animated_webp_passes_preflight_and_uploads_distinct_frames() {
         let raw = animated_webp();
         assert!(preflight_decoded_size(&raw, 16).is_ok());
@@ -1043,6 +1211,60 @@ pub(super) mod tests {
                 .sum::<usize>(),
             0
         );
+    }
+
+    #[test]
+    #[ignore = "isolated cold static-image decode timing"]
+    fn perf_static_image_cold_load() {
+        use std::time::{Duration, Instant};
+
+        let pixels = image::RgbaImage::from_fn(1024, 1024, |x, y| {
+            image::Rgba([
+                ((x * 17 + y * 31) % 256) as u8,
+                ((x * x + y * 7) % 256) as u8,
+                ((x * 3 + y * y) % 256) as u8,
+                255,
+            ])
+        });
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        pixels
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let raw = encoded.into_inner();
+        let mut first_calls = [Vec::new(), Vec::new()];
+        let mut totals = [Vec::new(), Vec::new()];
+        for _ in 0..7 {
+            for bounded in [false, true] {
+                let ctx = if bounded {
+                    context(128 * 1024 * 1024, 4096)
+                } else {
+                    let ctx = egui::Context::default();
+                    egui_extras::install_image_loaders(&ctx);
+                    ctx
+                };
+                ctx.include_bytes("bytes://cold.png", raw.clone());
+                let started = Instant::now();
+                let mut result = texture(&ctx, "bytes://cold.png");
+                let mode = usize::from(bounded);
+                first_calls[mode].push(started.elapsed().as_secs_f64() * 1000.0);
+                assert_eq!(matches!(result, Ok(TexturePoll::Pending { .. })), bounded);
+                while matches!(result, Ok(TexturePoll::Pending { .. })) {
+                    assert!(started.elapsed() < Duration::from_secs(10));
+                    std::thread::sleep(Duration::from_millis(1));
+                    result = texture(&ctx, "bytes://cold.png");
+                }
+                assert!(matches!(result, Ok(TexturePoll::Ready { .. })));
+                totals[mode].push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+        for (mode, label) in ["synchronous", "background"].into_iter().enumerate() {
+            first_calls[mode].sort_by(f64::total_cmp);
+            totals[mode].sort_by(f64::total_cmp);
+            eprintln!(
+                "cold PNG 1024x1024, mode={label}, encoded_bytes={}, first_call_ms={:?}, complete_ms={:?}",
+                raw.len(), first_calls[mode], totals[mode],
+            );
+        }
     }
 
     #[test]

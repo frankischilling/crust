@@ -693,6 +693,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_mirrors_do_not_consume_or_delete_identical_local_sends() {
+        let store = LogStore::with_db_path(":memory:".into()).unwrap();
+        let (events, _received) = mpsc::channel(4);
+        let writer = LogWriter::new(&tokio::runtime::Handle::current(), store.clone(), events);
+        let mut local = message(1);
+        local.server_id = None;
+        local.flags.is_self = true;
+        writer.append(&local).await.unwrap();
+
+        let mut mirror = local.clone();
+        mirror.id = MessageId(100);
+        mirror.server_id = Some("mirrored-message".into());
+        mirror.timestamp += chrono::Duration::seconds(1);
+        mirror.shared = Some(crust_core::model::SharedChatSource {
+            room_id: "other-room".into(),
+            source_message_id: Some("source-message".into()),
+            ..Default::default()
+        });
+        writer.append(&mirror).await.unwrap();
+        writer.append(&mirror).await.unwrap();
+        let mut server = local.clone();
+        server.id = MessageId(101);
+        server.server_id = Some("local-confirmed".into());
+        server.timestamp += chrono::Duration::seconds(2);
+        server.flags.is_first_msg = true;
+        writer.append(&server).await.unwrap();
+        writer.moderate(ModerationAction::message(
+            local.channel.clone(), "mirrored-message".into(),
+        )).await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        let rows = store.recent_messages(&local.channel, 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        let mirrored = rows.iter().find(|row| row.server_id == mirror.server_id).unwrap();
+        assert_eq!(mirrored.id, mirror.id);
+        assert!(mirrored.flags.is_deleted);
+        assert_eq!(mirrored.shared.as_ref().unwrap().room_id, "other-room");
+        let confirmed = rows.iter().find(|row| row.server_id == server.server_id).unwrap();
+        assert_eq!(confirmed.id, local.id);
+        assert!(confirmed.shared.is_none());
+        assert!(!confirmed.flags.is_deleted);
+        assert!(confirmed.flags.is_first_msg);
+    }
+
+    #[tokio::test]
     async fn successful_ui_confirmation_retires_its_exact_pending_candidate() {
         let store = LogStore::with_db_path(":memory:".into()).unwrap();
         let (events, _received) = mpsc::channel(4);

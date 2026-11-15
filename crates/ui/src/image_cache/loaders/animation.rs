@@ -1,4 +1,4 @@
-//! Decode animation frames on a shared bounded worker queue.
+//! Decode images and animation frames on a shared bounded worker queue.
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -12,7 +12,7 @@ use image::{AnimationDecoder, ImageDecoder, ImageFormat};
 
 use super::{frame, preflight_decoded_size, LoaderMetrics};
 
-const LOADER_ID: &str = "crust::background_animation_loader";
+pub(super) const LOADER_ID: &str = "crust::background_animation_loader";
 const WORKERS: usize = 2;
 const QUEUED_JOBS: usize = 32;
 
@@ -291,12 +291,21 @@ impl AnimationLoader {
             drop(cache);
             return Self::poll(ctx, source, index, first_frame, &slot);
         }
-        let raw = match ctx.try_load_bytes(source)? {
-            BytesPoll::Pending { size } => return Ok(ImagePoll::Pending { size }),
-            BytesPoll::Ready { bytes, .. } => bytes,
+        let raw = match ctx.try_load_bytes(source) {
+            Ok(BytesPoll::Pending { size }) => return Ok(ImagePoll::Pending { size }),
+            Ok(BytesPoll::Ready { bytes, .. }) => bytes,
+            Err(_) if first_frame && !source.starts_with(super::FIRST_FRAME_PREFIX) => {
+                return Err(LoadError::NotSupported);
+            }
+            Err(error) => return Err(error),
         };
         let format = match image::guess_format(&raw) {
-            Ok(format) if first_frame => format,
+            Ok(
+                format @ (ImageFormat::Png
+                | ImageFormat::Jpeg
+                | ImageFormat::Gif
+                | ImageFormat::WebP),
+            ) if first_frame => format,
             Ok(format @ (ImageFormat::Gif | ImageFormat::WebP)) => format,
             _ => return Err(LoadError::NotSupported),
         };
@@ -378,14 +387,17 @@ impl ImageLoader for AnimationLoader {
     }
 
     fn load(&self, ctx: &egui::Context, uri: &str, _: SizeHint) -> ImageLoadResult {
-        let (source, index) =
-            egui::decode_animated_image_uri(uri).map_err(|_| LoadError::NotSupported)?;
-        self.load_source(
-            ctx,
-            source,
-            index,
-            source.starts_with(super::FIRST_FRAME_PREFIX),
-        )
+        if let Ok((source, index)) = egui::decode_animated_image_uri(uri) {
+            return self.load_source(
+                ctx,
+                source,
+                index,
+                source.starts_with(super::FIRST_FRAME_PREFIX),
+            );
+        }
+        // Ordinary PNG/JPEG requests have no animation suffix. Decode their
+        // pixels on the same bounded queue, leaving custom sources to their loaders.
+        self.load_source(ctx, uri, 0, true)
     }
 
     fn forget(&self, uri: &str) {
@@ -521,7 +533,12 @@ fn decode(
             [image.width() as usize, image.height() as usize],
             image.as_raw(),
         )));
-        durations.push(frame.delay().into());
+        let duration: Duration = frame.delay().into();
+        durations.push(if duration <= Duration::from_millis(10) {
+            Duration::from_millis(100)
+        } else {
+            duration.max(Duration::from_millis(20))
+        });
     }
     if images.is_empty() {
         return Err("Animation contains no frames".to_owned());
@@ -536,6 +553,41 @@ fn decode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct SinglePixelDecoder(Mutex<HashMap<String, Arc<egui::ColorImage>>>);
+
+    impl ImageLoader for SinglePixelDecoder {
+        fn id(&self) -> &str {
+            "single_pixel_fixture"
+        }
+
+        fn load(&self, _: &egui::Context, uri: &str, _: SizeHint) -> ImageLoadResult {
+            if !uri.ends_with(".fixture") {
+                return Err(LoadError::NotSupported);
+            }
+            let image = self
+                .0
+                .lock()
+                .unwrap()
+                .entry(uri.to_owned())
+                .or_insert_with(|| Arc::new(egui::ColorImage::new([1, 1], egui::Color32::RED)))
+                .clone();
+            Ok(ImagePoll::Ready { image })
+        }
+
+        fn forget(&self, uri: &str) {
+            self.0.lock().unwrap().remove(uri);
+        }
+
+        fn forget_all(&self) {
+            self.0.lock().unwrap().clear();
+        }
+
+        fn byte_size(&self) -> usize {
+            self.0.lock().unwrap().len() * 4
+        }
+    }
 
     fn gif(first: [u8; 4]) -> Vec<u8> {
         let mut raw = Vec::new();
@@ -581,6 +633,7 @@ mod tests {
     fn evicted_first_frames_reenter_the_combined_decoder_budget() {
         let ctx = egui::Context::default();
         egui_extras::install_image_loaders(&ctx);
+        ctx.add_image_loader(Arc::new(SinglePixelDecoder::default()));
         let (background, queue) = controlled(128, 16, 4);
         let background = Arc::new(background);
         let loaders = ctx.loaders();
@@ -601,13 +654,17 @@ mod tests {
         let first_c = super::super::first_frame_uri("bytes://c.png");
         let first_d = super::super::first_frame_uri("bytes://d.png");
         for (uri, width) in [
-            ("bytes://old-static.png", 1),
+            ("bytes://old-static.fixture", 1),
             (first_a.as_str(), 2),
             (first_b.as_str(), 1),
             (first_c.as_str(), 27),
-            ("bytes://recent-static.png", 1),
+            ("bytes://recent-static.fixture", 1),
             (first_d.as_str(), 3),
         ] {
+            if uri.ends_with(".fixture") {
+                ctx.include_bytes(uri.to_owned(), vec![0]);
+                continue;
+            }
             let mut raw = Cursor::new(Vec::new());
             image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
                 width,
@@ -632,14 +689,14 @@ mod tests {
         };
         let _ = ctx.run(Default::default(), |ctx| {
             assert!(matches!(
-                ctx.try_load_image("bytes://old-static.png", SizeHint::default()),
+                ctx.try_load_image("bytes://old-static.fixture", SizeHint::default()),
                 Ok(ImagePoll::Ready { .. })
             ));
             for source in [&first_a, &first_b, &first_c] {
                 finish(ctx, source);
             }
             assert!(matches!(
-                ctx.try_load_image("bytes://recent-static.png", SizeHint::default()),
+                ctx.try_load_image("bytes://recent-static.fixture", SizeHint::default()),
                 Ok(ImagePoll::Ready { .. })
             ));
             assert_eq!(wrapper.inner_bytes(), 128);
@@ -719,6 +776,167 @@ mod tests {
         assert!(ctx
             .data(|data| data.get_temp::<egui::FrameDurations>(egui::Id::new("bytes://one.gif")))
             .is_some());
+    }
+
+    #[test]
+    fn short_gif_and_webp_delays_keep_frames_visible_and_animations_advancing() {
+        for (format, delays) in [
+            (ImageFormat::Gif, vec![0u32, 10, 20, 30]),
+            (ImageFormat::WebP, vec![0u32, 10, 11, 19, 20, 125]),
+        ] {
+            for delay in delays {
+                let raw = if format == ImageFormat::Gif {
+                    let mut raw = Vec::new();
+                    let mut encoder = image::codecs::gif::GifEncoder::new(&mut raw);
+                    for color in [[255, 0, 0, 255], [0, 255, 0, 255]] {
+                        encoder
+                            .encode_frame(image::Frame::from_parts(
+                                image::RgbaImage::from_pixel(2, 1, image::Rgba(color)),
+                                0,
+                                0,
+                                image::Delay::from_numer_denom_ms(delay, 1),
+                            ))
+                            .unwrap();
+                    }
+                    drop(encoder);
+                    raw
+                } else {
+                    let mut raw = super::super::tests::animated_webp();
+                    let mut cursor = 12;
+                    while cursor < raw.len() {
+                        let size =
+                            u32::from_le_bytes(raw[cursor + 4..cursor + 8].try_into().unwrap())
+                                as usize;
+                        if &raw[cursor..cursor + 4] == b"ANMF" {
+                            raw[cursor + 20..cursor + 23]
+                                .copy_from_slice(&delay.to_le_bytes()[..3]);
+                        }
+                        cursor += 8 + size + (size & 1);
+                    }
+                    raw
+                };
+                let expected = match delay {
+                    0..=10 => 100,
+                    11..=19 => 20,
+                    _ => delay,
+                };
+                let ctx = egui::Context::default();
+                let (loader, queue) = controlled(16, 1, 1);
+                let source = "bytes://short-animation";
+                ctx.include_bytes(source, raw);
+                assert!(matches!(
+                    load(&loader, &ctx, &format!("{source}#0")),
+                    Ok(ImagePoll::Pending { .. })
+                ));
+                queue.try_recv().unwrap().run();
+                expect_ready(
+                    load(&loader, &ctx, &format!("{source}#0")),
+                    egui::Color32::RED,
+                );
+                let durations = ctx
+                    .data(|data| data.get_temp::<egui::FrameDurations>(egui::Id::new(source)))
+                    .unwrap();
+                assert_eq!(
+                    durations.all().copied().collect::<Vec<_>>(),
+                    vec![Duration::from_millis(u64::from(expected)); 2],
+                    "{format:?} delay {delay}"
+                );
+                let _ = ctx.run(
+                    egui::RawInput {
+                        time: Some(f64::from(expected) / 1000.0 + 0.001),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        let index = frame_index(ctx, source);
+                        assert_eq!(index, 1, "{format:?} delay {delay}");
+                        expect_ready(
+                            load(&loader, ctx, &format!("{source}#{index}")),
+                            egui::Color32::GREEN,
+                        );
+                    },
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_png_and_jpeg_requests_wait_for_one_background_decode() {
+        use egui::load::BytesLoader;
+
+        for format in [ImageFormat::Png, ImageFormat::Jpeg] {
+            let ctx = egui::Context::default();
+            let (loader, queue) = controlled(8, 1, 1);
+            let mut raw = Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                2,
+                1,
+                image::Rgb([255, 0, 0]),
+            ))
+            .write_to(&mut raw, format)
+            .unwrap();
+            let source = "bytes://ordinary-image";
+            ctx.include_bytes(source, raw.into_inner());
+            assert!(matches!(
+                load(&loader, &ctx, source),
+                Ok(ImagePoll::Pending { size: Some(size) }) if size == egui::vec2(2.0, 1.0)
+            ));
+            let job = queue.try_recv().unwrap();
+            assert!(matches!(
+                load(&loader, &ctx, source),
+                Ok(ImagePoll::Pending { .. })
+            ));
+            assert!(queue.try_recv().is_err());
+            assert_eq!(loader.byte_size(), 8);
+            job.run();
+            let ImagePoll::Ready { image } = load(&loader, &ctx, source).unwrap() else {
+                panic!("static image remained pending after its decode");
+            };
+            assert_eq!(image.size, [2, 1]);
+            assert!(image.pixels.iter().all(|pixel| {
+                let [red, green, blue, alpha] = pixel.to_array();
+                red >= 250 && green <= 5 && blue <= 5 && alpha == 255
+            }));
+            assert_eq!(loader.metrics.completed_decodes.load(Ordering::Relaxed), 1);
+            assert_eq!(loader.metrics.pending_decodes.load(Ordering::Relaxed), 0);
+            assert!(ctx
+                .data(|data| data.get_temp::<egui::FrameDurations>(egui::Id::new(source)))
+                .is_none());
+            ctx.loaders().include.forget(source);
+            let ImagePoll::Ready { image: cached } = load(&loader, &ctx, source).unwrap() else {
+                panic!("decoded pixels must survive eviction from the bytes loader");
+            };
+            assert!(Arc::ptr_eq(&image, &cached));
+            loader.forget(source);
+            assert_eq!(loader.byte_size(), 0);
+        }
+    }
+
+    #[test]
+    fn failed_static_decode_releases_its_reservation_without_repeating_work() {
+        let ctx = egui::Context::default();
+        let (loader, queue) = controlled(8, 1, 1);
+        let mut raw = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(2, 1)
+            .write_to(&mut raw, ImageFormat::Png)
+            .unwrap();
+        let mut raw = raw.into_inner();
+        let data = raw.windows(4).position(|tag| tag == b"IDAT").unwrap();
+        raw[data + 4] ^= 0xff;
+        let source = "bytes://broken.png";
+        ctx.include_bytes(source, raw);
+        assert!(matches!(
+            load(&loader, &ctx, source),
+            Ok(ImagePoll::Pending { .. })
+        ));
+        queue.try_recv().unwrap().run();
+        assert!(matches!(
+            load(&loader, &ctx, source),
+            Err(LoadError::Loading(_))
+        ));
+        assert!(load(&loader, &ctx, source).is_err());
+        assert!(queue.try_recv().is_err());
+        assert_eq!(loader.byte_size(), 0);
+        assert_eq!(loader.metrics.pending_decodes.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1002,24 +1220,31 @@ mod tests {
             raw.into_inner()
         };
         ctx.include_bytes(source, png([255, 0, 0, 255]));
-        assert!(loader.color_frame(&ctx, source, false).is_none());
+        assert!(matches!(
+            load(&loader, &ctx, source),
+            Ok(ImagePoll::Pending { .. })
+        ));
         let old = queue.try_recv().unwrap();
-        assert!(loader.color_frame(&ctx, source, false).is_none());
+        assert!(matches!(
+            load(&loader, &ctx, source),
+            Ok(ImagePoll::Pending { .. })
+        ));
         assert!(queue.try_recv().is_err());
         loader.forget(source);
         ctx.forget_image(source);
         ctx.include_bytes(source, png([0, 0, 255, 255]));
-        assert!(loader.color_frame(&ctx, source, false).is_none());
+        assert!(matches!(
+            load(&loader, &ctx, source),
+            Ok(ImagePoll::Pending { .. })
+        ));
         let current = queue.try_recv().unwrap();
         old.run();
-        assert!(loader.color_frame(&ctx, source, false).is_none());
+        assert!(matches!(
+            load(&loader, &ctx, source),
+            Ok(ImagePoll::Pending { .. })
+        ));
         current.run();
-        let (image, frame) = loader.color_frame(&ctx, source, false).unwrap();
-        assert_eq!(frame, 0);
-        assert!(image
-            .pixels
-            .iter()
-            .all(|pixel| *pixel == egui::Color32::BLUE));
+        expect_ready(load(&loader, &ctx, source), egui::Color32::BLUE);
         assert_eq!(loader.byte_size(), 8);
     }
 }

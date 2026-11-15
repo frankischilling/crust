@@ -16,6 +16,7 @@ pub enum LoadEvent {
     Disconnected,
     Authenticated { username: String },
     ChannelJoined { channel: String },
+    ChannelParted { channel: String },
     StartupChannelsConfigured { channels: Vec<String> },
     CatalogLoaded { count: usize },
     HistoryLoaded { channel: String, count: usize },
@@ -96,6 +97,14 @@ impl LoadingScreen {
                     self.joined_channels
                         .entry(channel)
                         .or_insert_with(Instant::now);
+                }
+            }
+            LoadEvent::ChannelParted { channel } => {
+                if let Some(channel) = twitch_channel(&channel) {
+                    self.configured_channels.remove(&channel);
+                    self.joined_channels.remove(&channel);
+                    self.history_channels.remove(&channel);
+                    self.emote_channels.remove(&channel);
                 }
             }
             LoadEvent::CatalogLoaded { count } => {
@@ -253,6 +262,53 @@ mod tests {
         status.dismissed = true;
         status.on_event(LoadEvent::Connecting);
         assert!(!status.is_active());
+    }
+
+    #[test]
+    fn closing_a_pending_startup_channel_allows_ready_chats_to_complete() {
+        for cancelled_joined in [false, true] {
+            let mut status = LoadingScreen::default();
+            status.on_event(LoadEvent::StartupChannelsConfigured {
+                channels: vec!["room".into(), "cancelled".into()],
+            });
+            status.on_event(LoadEvent::Connected);
+            status.on_event(LoadEvent::CatalogLoaded { count: 20 });
+            status.on_event(LoadEvent::ChannelJoined {
+                channel: "room".into(),
+            });
+            status.on_event(LoadEvent::HistoryLoaded {
+                channel: "room".into(),
+                count: 10,
+            });
+            status.on_event(LoadEvent::ChannelEmotesLoaded {
+                channel: "room".into(),
+                count: 5,
+            });
+            if cancelled_joined {
+                status.on_event(LoadEvent::ChannelJoined {
+                    channel: "cancelled".into(),
+                });
+                status.on_event(LoadEvent::HistoryLoaded {
+                    channel: "cancelled".into(),
+                    count: 0,
+                });
+            }
+            status.on_event(LoadEvent::ChannelParted {
+                channel: "unrelated".into(),
+            });
+            assert!(
+                status.ready_at.is_none(),
+                "pending startup chat still needs to settle"
+            );
+            status.on_event(LoadEvent::ChannelParted {
+                channel: "#CANCELLED".into(),
+            });
+            let ready = status
+                .ready_at
+                .expect("closed chats no longer delay readiness");
+            status.tick_at(ready + READY_DURATION);
+            assert!(!status.is_active());
+        }
     }
 
     #[test]

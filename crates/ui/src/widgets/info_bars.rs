@@ -320,9 +320,8 @@ pub fn show_channel_info_bars(
                     }
                 });
 
-            // Room state pills (sub-only, slow, emote-only, etc.)
-            // Shown as a thin strip below the stream info bar when any mode
-            // is active - Twitch channels only.
+            // Twitch room modes wrap below the stream information when the
+            // active labels need more than one row.
             let room = state.channels.get(active_ch).map(|ch| &ch.room_state);
             let live_viewers = status.and_then(|s| if s.is_live { s.viewers } else { None });
             let has_active_modes = room
@@ -337,7 +336,7 @@ pub fn show_channel_info_bars(
                 || live_viewers.is_some();
             if has_active_modes {
                 TopBottomPanel::top("room_state_bar")
-                    .exact_height((t::pills_font_size() + 10.0).max(20.0 * t::font_scale()))
+                    .min_height((t::pills_font_size() + 10.0).max(20.0 * t::font_scale()))
                     .frame(
                         Frame::new()
                             .fill(t::bg_base())
@@ -345,8 +344,9 @@ pub fn show_channel_info_bars(
                             .stroke(egui::Stroke::NONE),
                     )
                     .show(ctx, |ui| {
-                        ui.horizontal_centered(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.spacing_mut().item_spacing.y = 4.0;
                             if let Some(rs) = room {
                                 if rs.emote_only {
                                     room_state_pill(ui, "Emote Only", t::accent());
@@ -468,11 +468,14 @@ fn room_state_pill(ui: &mut egui::Ui, text: &str, color: Color32) {
         .corner_radius(t::RADIUS_SM)
         .inner_margin(egui::Margin::symmetric(5, 0))
         .show(ui, |ui| {
-            ui.label(
-                RichText::new(text)
-                    .font(t::pills_font())
-                    .color(color)
-                    .strong(),
+            ui.add(
+                egui::Label::new(
+                    RichText::new(text)
+                        .font(t::pills_font())
+                        .color(color)
+                        .strong(),
+                )
+                .wrap(),
             );
         });
 }
@@ -517,6 +520,70 @@ fn format_followers_only_label(minutes: i32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_room_modes_wrap_without_clipping_the_chat_header() {
+        let channel = ChannelId::new("room");
+        let mut state = AppState::default();
+        state.join_channel(channel.clone());
+        state.channels.get_mut(&channel).unwrap().room_state = crust_core::model::RoomState {
+            emote_only: true,
+            subscribers_only: true,
+            slow_mode: Some(120),
+            followers_only: Some(10_000),
+            r9k: true,
+        };
+        let expected = [
+            "Emote Only",
+            "Sub Only",
+            "Slow 120s",
+            "Followers-only 6d 22h",
+            "R9K",
+        ];
+        for width in [150.0, 280.0, 480.0] {
+            let ctx = Context::default();
+            for _ in 0..3 {
+                let mut header_bottom = 0.0;
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 600.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        show_channel_info_bars(
+                            ctx,
+                            &state,
+                            &HashMap::new(),
+                            &HashMap::new(),
+                            &PluginUiSnapshot::default(),
+                            &mut PluginUiSessionState::default(),
+                        );
+                        header_bottom = ctx.available_rect().top();
+                    },
+                );
+                for label in expected {
+                    let text = output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            egui::Shape::Text(text) if text.galley.text() == label => Some(text),
+                            _ => None,
+                        })
+                        .expect("every active room mode remains visible");
+                    let rect = text.galley.rect.translate(text.pos.to_vec2());
+                    assert!(
+                        rect.left() >= 0.0 && rect.right() <= width + 1.0,
+                        "{label} escapes a {width}-point header: {rect:?}"
+                    );
+                    assert!(rect.bottom() <= header_bottom + 1.0,
+                        "{label} overlaps chat below the header: {rect:?}, header bottom {header_bottom}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn virtual_views_do_not_render_channel_status_bars() {
