@@ -97,11 +97,80 @@ const NARROW_STATUS_BAR_HEIGHT: f32 = 40.0;
 const VERY_NARROW_STATUS_BAR_HEIGHT: f32 = 40.0;
 const ANALYTICS_DEFAULT_W: f32 = 220.0;
 const ANALYTICS_MIN_W: f32 = 180.0;
-const ANALYTICS_MAX_W: f32 = 340.0;
+const ANALYTICS_MAX_W: f32 = 480.0;
 const ANALYTICS_COMPACT_DEFAULT_W: f32 = 176.0;
 const ANALYTICS_COMPACT_MIN_W: f32 = 140.0;
-const ANALYTICS_COMPACT_MAX_W: f32 = 260.0;
+const ANALYTICS_COMPACT_MAX_W: f32 = 360.0;
 const LOCAL_HISTORY_SEARCH_PAGE: usize = 800;
+
+/// AccessKit requires the focused node to be present in every tree update.
+/// A channel switch can remove the focused navigation button in the same
+/// frame that a new editor is being mounted. Keep that frame's focus valid
+/// before egui builds the accessibility tree at the end of the pass.
+fn guard_accessibility_focus(ctx: &Context) {
+    if let Some(focused) = ctx.memory(|memory| memory.focused()) {
+        // A navigation action may request focus on a composer being mounted
+        // next frame. Preserve keyboard focus and ensure the matching
+        // accessibility node exists, even during that brief transition.
+        ctx.accesskit_node_builder(focused, |_| {});
+    }
+}
+
+#[cfg(test)]
+mod accessibility_focus_tests {
+    use super::*;
+
+    #[test]
+    fn removed_live_navigation_focus_cannot_reference_a_missing_accessibility_node() {
+        let ctx = Context::default();
+        ctx.enable_accesskit();
+        ctx.on_end_pass(
+            "test_accessibility_focus_guard",
+            Arc::new(guard_accessibility_focus),
+        );
+
+        let mut live_button = None;
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(640.0, 480.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input(), |ctx| {
+            CentralPanel::default().show(ctx, |ui| {
+                live_button = Some(ui.button("Open live channel").id);
+            });
+        });
+
+        // The clicked live row disappears when a channel opens. For one pass,
+        // egui can still expose its last response as a valid focus candidate.
+        let old_button = live_button.unwrap();
+        let switched = ctx.run(input(), |ctx| {
+            ctx.memory_mut(|memory| memory.request_focus(old_button));
+            CentralPanel::default().show(ctx, |ui| {
+                ui.label("Channel chat");
+            });
+        });
+        let update = switched.platform_output.accesskit_update.unwrap();
+        assert!(
+            update.nodes.iter().any(|(id, _)| *id == update.focus),
+            "focused navigation node must be included in the accessibility tree",
+        );
+
+        // A newly requested focus ID must not break accessibility updates,
+        // even when its editor is about to be mounted.
+        let missing = ctx.run(input(), |ctx| {
+            ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("missing_editor")));
+            CentralPanel::default().show(ctx, |ui| {
+                ui.label("Channel chat");
+            });
+        });
+        let update = missing.platform_output.accesskit_update.unwrap();
+        assert!(update.nodes.iter().any(|(id, _)| *id == update.focus));
+    }
+}
+
 const MAX_WHISPERS_PER_THREAD: usize = 250;
 const WHISPER_EMOTE_SIZE: f32 = 20.0;
 const QUICK_SWITCH_MAX_ROWS: usize = 10;
@@ -7977,6 +8046,7 @@ impl CrustApp {
         // request repaints directly.  egui::Context is internally Arc-based
         // so cloning is cheap.
         if self.egui_ctx.is_none() {
+            ctx.on_end_pass("accessibility_focus_guard", Arc::new(guard_accessibility_focus));
             self.egui_ctx = Some(ctx.clone());
         }
 
@@ -10174,11 +10244,15 @@ impl CrustApp {
         if self.analytics_visible {
             if let Some(active_ch) = self.state.active_channel.clone() {
                 if let Some(ch_state) = self.state.channels.get(&active_ch) {
+                    let max_width = responsive.analytics_max_width.min(
+                        (ctx.available_rect().width() - responsive.min_central_width)
+                            .max(responsive.analytics_min_width),
+                    );
                     SidePanel::right("analytics_panel")
                         .resizable(true)
-                        .default_width(responsive.analytics_default_width)
-                        .min_width(responsive.analytics_min_width)
-                        .max_width(responsive.analytics_max_width)
+                        .default_width(responsive.analytics_default_width.min(max_width))
+                        .min_width(responsive.analytics_min_width.min(max_width))
+                        .max_width(max_width)
                         .frame(
                             Frame::new()
                                 .fill(t::bg_surface())

@@ -361,8 +361,9 @@ impl<'a> ChatInput<'a> {
                     let is_twitch_channel = !self.channel.is_irc() && !self.channel.is_kick();
                     let show_counter = is_twitch_channel && !buf.is_empty();
                     let layout = ComposerLayout::new(input_width, show_counter);
+                    let input_h = (t::chat_font_size() + 16.0).max(t::bar_h());
                     if input_width > 300.0 {
-                        if let Some(name) = self.username {
+                        if let Some(name) = self.username.filter(|name| !name.trim().is_empty()) {
                             let label = format!("{name}:");
                             let label_width = ui.fonts(|fonts| {
                                 fonts
@@ -376,12 +377,20 @@ impl<'a> ChatInput<'a> {
                                 - t::TOOLBAR_SPACING.x
                                 >= layout.minimum_text_width
                             {
-                                ui.label(
-                                    RichText::new(label)
-                                        .color(t::accent())
-                                        .strong()
-                                        .font(t::small()),
+                                // Reserve the same height as the editor so the
+                                // username stays vertically centered.
+                                let (label_rect, label_response) = ui.allocate_exact_size(
+                                    egui::vec2(label_width, input_h),
+                                    egui::Sense::hover(),
                                 );
+                                ui.painter().text(
+                                    label_rect.left_center(),
+                                    egui::Align2::LEFT_CENTER,
+                                    label,
+                                    t::small(),
+                                    t::accent(),
+                                );
+                                label_response.on_hover_text(format!("Chatting as {name}"));
                             }
                         }
                     }
@@ -475,7 +484,6 @@ impl<'a> ChatInput<'a> {
                     };
                     let text_width = (ui.available_width() - layout.controls_width).max(40.0);
                     // Input box grows with chat font so text never clips.
-                    let input_h = (t::chat_font_size() + 16.0).max(t::bar_h());
                     let te_output = ui
                         .allocate_ui(egui::vec2(text_width, input_h), |ui| {
                             egui::TextEdit::singleline(buf)
@@ -2501,6 +2509,52 @@ mod tests {
             let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
             (text.galley.text() == label && shape.clip_rect.contains_rect(rect)).then_some(rect)
         })
+    }
+
+    #[test]
+    fn username_label_is_vertically_centered_on_the_editor() {
+        let ctx = egui::Context::default();
+        let mut buf = String::new();
+        let mut editor = egui::Rect::NOTHING;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    Pos2::ZERO,
+                    egui::vec2(640.0, 220.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let id = Id::new("aligned_username_composer");
+                    ChatInput {
+                        id: Some(id),
+                        channel: &ChannelId::new("example"),
+                        logged_in: true,
+                        username: Some("tester"),
+                        emote_catalog: &[],
+                        emote_bytes: &UiImageCache::default(),
+                        pending_reply: None,
+                        message_history: &[],
+                        slash_usage_counts: &HashMap::new(),
+                        known_channels: &[],
+                        chatters: &[],
+                        prevent_overlong_twitch_messages: false,
+                        animate_emotes: false,
+                        accept_dropped_files: false,
+                    }
+                    .show(ui, &mut buf);
+                    editor = ctx.read_response(id).expect("editor exists").rect;
+                });
+            },
+        );
+        let label = visible_input_text(&output, "tester:").expect("username is drawn");
+        assert!(
+            (label.center().y - editor.center().y).abs() <= 1.0,
+            "username center {} differs from editor center {}",
+            label.center().y,
+            editor.center().y,
+        );
     }
 
     #[test]
