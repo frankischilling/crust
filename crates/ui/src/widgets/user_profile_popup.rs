@@ -1686,8 +1686,9 @@ fn reason_opt(buf: &str) -> Option<String> {
 
 /// Resolve user log row text, reconstructing from spans when raw_text is absent.
 fn chat_message_text(msg: &ChatMessage) -> String {
-    if !msg.raw_text.is_empty() {
-        return msg.raw_text.clone();
+    let text = msg.plain_text();
+    if !text.is_empty() {
+        return text.into_owned();
     }
 
     msg.spans

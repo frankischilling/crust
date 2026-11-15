@@ -1,12 +1,13 @@
 use std::collections::VecDeque;
 
 use egui::{
-    Align, Button, CentralPanel, Context, Frame, Id, Key, Layout, RichText, Stroke, Ui,
+    Align, Button, CentralPanel, Context, Frame, Id, Key, Layout, RichText, ScrollArea, Stroke, Ui,
     ViewportBuilder, ViewportClass, ViewportCommand, ViewportId,
 };
 use regex::{Regex, RegexBuilder};
 
 use crust_core::model::{ChannelId, ChatMessage};
+use crust_core::search::contains_ignore_case;
 
 use crate::theme as t;
 
@@ -103,7 +104,11 @@ impl MessageSearchState {
 
     pub fn stats(&mut self, messages: &VecDeque<ChatMessage>) -> SearchMatchStats {
         self.ensure_regex();
-        let matched = messages.iter().filter(|msg| self.matches(msg)).count();
+        let matched = if self.active_filter_count() == 0 {
+            messages.len()
+        } else {
+            messages.iter().filter(|msg| self.matches(msg)).count()
+        };
         SearchMatchStats {
             matched,
             total: messages.len(),
@@ -112,30 +117,29 @@ impl MessageSearchState {
 
     pub fn matches(&self, msg: &ChatMessage) -> bool {
         let username = self.username.trim();
-        if !username.is_empty() {
-            let username = username.to_lowercase();
-            let login = msg.sender.login.to_lowercase();
-            let display = msg.sender.display_name.to_lowercase();
-            if !login.contains(&username) && !display.contains(&username) {
-                return false;
-            }
+        if !username.is_empty()
+            && !contains_ignore_case(&msg.sender.login, username)
+            && !contains_ignore_case(&msg.sender.display_name, username)
+        {
+            return false;
         }
 
         let keyword = self.keyword.trim();
-        if !keyword.is_empty() {
-            let keyword = keyword.to_lowercase();
-            if !msg.raw_text.to_lowercase().contains(&keyword) {
-                return false;
-            }
+        let regex = self.regex.trim();
+        if keyword.is_empty() && regex.is_empty() {
+            return true;
+        }
+        let text = msg.plain_text();
+        if !keyword.is_empty() && !contains_ignore_case(&text, keyword) {
+            return false;
         }
 
-        let regex = self.regex.trim();
         if regex.is_empty() {
             return true;
         }
 
         match &self.compiled_regex {
-            Some(re) => re.is_match(&msg.raw_text),
+            Some(re) => re.is_match(&text),
             None => false,
         }
     }
@@ -175,7 +179,6 @@ pub fn show_message_search_inline(
     messages: &VecDeque<ChatMessage>,
     search: &mut MessageSearchState,
 ) -> f32 {
-    let mut height = 0.0;
     let stroke = if search.is_filtering() {
         Stroke::new(1.0_f32, t::border_accent())
     } else {
@@ -188,9 +191,10 @@ pub fn show_message_search_inline(
         .stroke(stroke)
         .show(ui, |ui| {
             show_message_search_contents(ui, channel, messages, search, false, false);
-            height = ui.min_rect().height();
-        });
-    height
+        })
+        .response
+        .rect
+        .height()
 }
 
 pub fn show_message_search_window(
@@ -221,6 +225,13 @@ pub fn show_message_search_window(
     ctx.show_viewport_immediate(viewport_id, builder, |child_ctx, class| {
         let owns_escape = !matches!(class, ViewportClass::Embedded)
             || search.owns_keyboard(child_ctx);
+        if owns_escape && !child_ctx.is_context_menu_open()
+            && child_ctx.input_mut(|input| crate::app::consume_exact_key(
+                input, egui::Modifiers::CTRL, Key::F,
+            ))
+        {
+            search.request_open();
+        }
         let esc = owns_escape && !child_ctx.is_context_menu_open()
             && child_ctx.input_mut(|i| crate::app::consume_exact_key(i, egui::Modifiers::NONE, Key::Escape));
         let close_requested = child_ctx.input(|i| i.viewport().close_requested());
@@ -244,6 +255,7 @@ pub fn show_message_search_window(
                 egui::Window::new(title.clone())
                     .id(Id::new("message_search_window").with(channel.as_str()))
                     .default_width(SEARCH_WINDOW_DEFAULT_WIDTH)
+                    .default_height(SEARCH_WINDOW_DEFAULT_HEIGHT)
                     .min_width(320.0)
                     .resizable(true)
                     .collapsible(false)
@@ -260,7 +272,7 @@ pub fn show_message_search_window(
                         ui.set_min_width(
                             SEARCH_WINDOW_DEFAULT_WIDTH.min(child_ctx.screen_rect().width() - 24.0),
                         );
-                        show_message_search_contents(ui, channel, messages, search, true, true);
+                        show_message_search_scroll_area(ui, channel, messages, search);
                     });
                 search.open = open;
             }
@@ -273,11 +285,25 @@ pub fn show_message_search_window(
                             .inner_margin(egui::Margin::same(12)),
                     )
                     .show(child_ctx, |ui| {
-                        show_message_search_contents(ui, channel, messages, search, true, true);
+                        show_message_search_scroll_area(ui, channel, messages, search);
                     });
             }
         }
     });
+}
+
+fn show_message_search_scroll_area(
+    ui: &mut Ui,
+    channel: &ChannelId,
+    messages: &VecDeque<ChatMessage>,
+    search: &mut MessageSearchState,
+) {
+    ScrollArea::vertical()
+        .id_salt(("message_search_scroll", channel.as_str()))
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            show_message_search_contents(ui, channel, messages, search, true, true);
+        });
 }
 
 fn show_message_search_contents(
@@ -484,13 +510,28 @@ fn search_field(
         }
         let response = ui.add_sized([ui.available_width(), 28.0], edit);
         if request_focus {
-            response.request_focus();
+            focus_search_field(ui.ctx(), &response, value);
         }
     });
 }
 
 fn search_field_id(channel: &ChannelId, key: &str) -> Id {
     Id::new("message_search_field").with(channel.as_str()).with(key)
+}
+
+fn focus_search_field(ctx: &Context, response: &egui::Response, value: &str) {
+    response.request_focus();
+    // TextEdit returns its inner text rectangle. Scroll the registered outer
+    // bounds so the field's frame and padding are visible too.
+    let field = ctx.read_response(response.id).unwrap_or_else(|| response.clone());
+    field.scroll_to_me(None);
+    if let Some(mut state) = egui::TextEdit::load_state(ctx, response.id) {
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(0),
+            egui::text::CCursor::new(value.chars().count()),
+        )));
+        egui::TextEdit::store_state(ctx, response.id, state);
+    }
 }
 
 fn search_field_row(
@@ -519,7 +560,7 @@ fn search_field_row(
         }
         let response = ui.add_sized([ui.available_width(), 28.0], edit);
         if request_focus {
-            response.request_focus();
+            focus_search_field(ui.ctx(), &response, value);
         }
     });
 }
@@ -539,6 +580,68 @@ mod tests {
                 show_message_search_contents(ui, &ChannelId::new("rustlang"), &VecDeque::new(), search, false, false);
             });
         });
+    }
+
+    #[test]
+    fn inline_search_reserves_its_border_and_padding() {
+        for width in [680.0, 900.0, 1200.0] {
+            let ctx = Context::default();
+            let mut search = MessageSearchState::default();
+            search.request_open();
+            let _ = ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO, egui::vec2(width, 600.0),
+                )),
+                ..Default::default()
+            }, |ctx| {
+                CentralPanel::default().show(ctx, |ui| {
+                    let mut search_ui = ui.new_child(egui::UiBuilder::new()
+                        .max_rect(ui.available_rect_before_wrap())
+                        .layout(Layout::top_down(Align::LEFT)));
+                    let reserved = show_message_search_inline(
+                        &mut search_ui, &ChannelId::new("example"),
+                        &VecDeque::new(), &mut search,
+                    );
+                    let painted = search_ui.min_rect().height();
+                    assert!(reserved >= painted - 0.1,
+                        "search reserves {reserved}px but occupies {painted}px at {width}px width");
+                });
+            });
+        }
+    }
+
+    #[test]
+    fn short_search_windows_scroll_to_all_fields_without_expanding() {
+        let ctx = Context::default();
+        let channel = ChannelId::new("example");
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 210.0));
+        let mut search = MessageSearchState::default();
+        search.request_open();
+        search.regex = format!("({}", "x".repeat(400));
+        for pass in 0..5 {
+            let events = if pass == 2 {
+                vec![egui::Event::PointerMoved(screen.center()), egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -80.0),
+                    modifiers: egui::Modifiers::NONE,
+                }]
+            } else {
+                Vec::new()
+            };
+            let _ = ctx.run(egui::RawInput {
+                screen_rect: Some(screen), events, time: Some(pass as f64 * 0.1),
+                ..Default::default()
+            }, |ctx| {
+                CentralPanel::default().show(ctx, |ui| {
+                    show_message_search_scroll_area(ui, &channel, &VecDeque::new(), &mut search);
+                    assert!(screen.expand(0.5).contains_rect(ui.min_rect()),
+                        "search expanded beyond its window: {:?}", ui.min_rect());
+                });
+            });
+        }
+        assert!(search.regex_error().is_some());
+        let field = ctx.read_response(search_field_id(&channel, "regex")).unwrap();
+        assert!(screen.contains_rect(field.rect), "regex field cannot be reached by scrolling: {:?}", field.rect);
     }
 
     #[test]
@@ -615,6 +718,93 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn reopening_search_selects_the_existing_keyword() {
+        let ctx = Context::default();
+        let mut search = MessageSearchState::default();
+        search.keyword = "café 🙂".into();
+        search.request_open();
+        frame(&ctx, &mut search, 1000.0, Vec::new());
+        frame(&ctx, &mut search, 1000.0, vec![egui::Event::Text("replacement".into())]);
+        assert_eq!(search.keyword, "replacement");
+        search.request_open();
+        frame(&ctx, &mut search, 420.0, Vec::new());
+        frame(&ctx, &mut search, 420.0, vec![egui::Event::Text("updated".into())]);
+        assert_eq!(search.keyword, "updated");
+    }
+
+    #[test]
+    fn reopening_short_search_scrolls_the_keyword_into_view() {
+        for embedded in [false, true] {
+            let ctx = Context::default();
+            ctx.style_mut(|style| {
+                style.animation_time = 0.0;
+                style.scroll_animation = egui::style::ScrollAnimation::none();
+            });
+            let channel = ChannelId::new("example");
+            let keyword_id = search_field_id(&channel, "keyword");
+            let window_id = Id::new("message_search_window").with(channel.as_str());
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO,
+                if embedded { egui::vec2(640.0, 480.0) } else { egui::vec2(360.0, 210.0) });
+            let mut search = MessageSearchState::default();
+            search.keyword = "café 🙂".into();
+            search.regex = format!("({}", "x".repeat(400));
+            search.request_open();
+            let frame = |search: &mut MessageSearchState, events| {
+                let mut field = None;
+                let _ = ctx.run(egui::RawInput {
+                    screen_rect: Some(screen), events,
+                    time: Some(ctx.cumulative_pass_nr() as f64 * 0.2),
+                    ..Default::default()
+                }, |ctx| {
+                    if embedded {
+                        show_message_search_window(ctx, &channel, &VecDeque::new(), search, false);
+                    } else {
+                        CentralPanel::default().show(ctx, |ui| {
+                            show_message_search_scroll_area(ui, &channel, &VecDeque::new(), search);
+                        });
+                    }
+                    // Capture the current pass before egui rotates its widget
+                    // history at the end of the frame.
+                    field = ctx.read_response(keyword_id);
+                });
+                field.unwrap()
+            };
+            for _ in 0..3 { let _ = frame(&mut search, Vec::new()); }
+            let pointer = if embedded {
+                ctx.memory(|memory| memory.area_rect(window_id)).unwrap().center()
+            } else {
+                screen.center()
+            };
+            let _ = frame(&mut search, vec![egui::Event::PointerMoved(pointer), egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -600.0),
+                modifiers: egui::Modifiers::NONE,
+            }]);
+            // Finish the wheel gesture before refocusing. Its smoothed input
+            // would otherwise keep scrolling after the focus request.
+            for _ in 0..60 {
+                let _ = frame(&mut search, Vec::new());
+                if ctx.input(|input| input.time_since_last_scroll() > 0.0) {
+                    break;
+                }
+            }
+            assert!(ctx.input(|input| input.time_since_last_scroll() > 0.0),
+                "the wheel gesture must finish before refocusing (embedded={embedded})");
+            let field = frame(&mut search, Vec::new());
+            assert!(!field.interact_rect.contains_rect(field.rect),
+                "the test must scroll the keyword out of view (embedded={embedded})");
+            search.request_open();
+            for _ in 0..2 { let _ = frame(&mut search, Vec::new()); }
+            let field = frame(&mut search, Vec::new());
+            assert!(field.interact_rect.contains_rect(field.rect),
+                "the requested keyword must be fully visible (embedded={embedded}): {:?} in {:?}", field.rect, field.interact_rect);
+            assert!(ctx.memory(|memory| memory.has_focus(keyword_id)));
+            let _ = frame(&mut search, vec![egui::Event::Text("replacement".into())]);
+            assert_eq!(search.keyword, "replacement");
         }
     }
 

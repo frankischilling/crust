@@ -29,7 +29,7 @@ use crust_twitch::{
 use crust_ui::CrustApp;
 use crust_uploader::{upload_image as uploader_upload, RawImage, UploaderConfig};
 use seventv::{
-    apply_7tv_cosmetics_to_sender, complete_7tv_user_profile, load_7tv_cosmetics_catalog,
+    apply_7tv_cosmetics_to_sender, complete_7tv_user_profile, load_initial_7tv_cosmetics_catalog,
     SevenTvCosmeticUpdate, SevenTvCosmetics,
 };
 
@@ -68,7 +68,7 @@ use runtime::profiles::{
 };
 use runtime::snapshots::{BadgeRequests, RoomSnapshots};
 use runtime::system_messages::{
-    build_sub_text, extract_irc_msg_echo, format_timeout_text, is_twitch_pinned_notice,
+    extract_irc_msg_echo, format_timeout_text, is_twitch_pinned_notice,
     make_custom_message, make_system_message,
 };
 use runtime::twitch_emotes::TwitchEmoteInventory;
@@ -795,17 +795,10 @@ async fn reducer_loop(
     let mut personal_catalog_tick = tokio::time::interval(Duration::from_millis(250));
     personal_catalog_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    {
-        let tx = stv_update_tx.clone();
-        let client = stv_http_client.clone();
-        tokio::spawn(async move {
-            if let Some((badges, paints)) = load_7tv_cosmetics_catalog(&client).await {
-                let _ = tx
-                    .send(SevenTvCosmeticUpdate::Catalog { badges, paints })
-                    .await;
-            }
-        });
-    }
+    tokio::spawn(load_initial_7tv_cosmetics_catalog(
+        stv_http_client.clone(),
+        stv_update_tx.clone(),
+    ));
 
     // Track authenticated user info for local echo messages
     let mut auth_username: Option<String> = None;
@@ -1965,27 +1958,6 @@ async fn reducer_loop(
                             message: msg,
                         }).await;
                     }
-                    TwitchEvent::SubAlert { channel, display_name, months, plan, is_gift, sub_msg } => {
-                        let gifted_to_me = is_gift
-                            && auth_username
-                                .as_deref()
-                                .map(|u| u.eq_ignore_ascii_case(display_name.as_str()))
-                                .unwrap_or(false);
-                        let text = build_sub_text(&display_name, months, &plan, is_gift);
-                        let mut msg = make_system_message(
-                            local_msg_id, channel.clone(), text, Utc::now(),
-                            MsgKind::Sub { display_name, months, plan, is_gift, sub_msg },
-                        );
-                        if gifted_to_me {
-                            msg.flags.is_mention = true;
-                            msg.flags.is_highlighted = true;
-                        }
-                        local_msg_id += 1;
-                        let _ = evt_tx.send(AppEvent::MessageReceived {
-                            channel,
-                            message: msg,
-                        }).await;
-                    }
                     TwitchEvent::Raid { channel, display_name, viewer_count, source_login } => {
                         let text = format!("{display_name} is raiding with {viewer_count} viewers!");
                         let msg = make_system_message(
@@ -3045,14 +3017,6 @@ async fn reducer_loop(
             // Resolve HTTP and live cosmetics in one ordered cache.
             Some(stv_update) = stv_update_rx.recv() => {
                 let changed = match stv_update {
-                    SevenTvCosmeticUpdate::Catalog { badges, paints } => {
-                        info!(
-                            "7TV catalog received: {} badges, {} paints",
-                            badges.len(),
-                            paints.len()
-                        );
-                        stv_cosmetics.catalog(badges, paints)
-                    }
                     SevenTvCosmeticUpdate::UserStyle {
                         twitch_user_id,
                         generation,

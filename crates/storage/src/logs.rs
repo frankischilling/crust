@@ -35,7 +35,8 @@ const MODERATION_MATCH: &str = "
         (?2 = 'message' AND server_id = ?3)
         OR (?2 != 'message' AND (?6 IS NULL OR ts_ms <= ?6)
             AND (COALESCE(json_extract(payload_json, '$.msg_kind'), 'Chat') IN ('Chat', 'SuspiciousUserMessage')
-                 OR json_type(payload_json, '$.msg_kind.Bits') = 'object')
+                 OR json_type(payload_json, '$.msg_kind.Bits') = 'object'
+                 OR COALESCE(json_extract(payload_json, '$.msg_kind.Sub.sub_msg'), '') != '')
             AND (?2 = 'channel' OR
                 CASE WHEN ?5 IS NOT NULL AND COALESCE(json_extract(payload_json, '$.sender.user_id'), '') != ''
                     THEN json_extract(payload_json, '$.sender.user_id') = ?5
@@ -53,7 +54,8 @@ fn moderation_insert_predicate(row: &str) -> String {
                 WHERE rule.channel = {row}.channel AND rule.target = 'message'
                     AND rule.target_key = {row}.server_id)
             OR ((COALESCE(json_extract({row}.payload_json, '$.msg_kind'), 'Chat') IN ('Chat', 'SuspiciousUserMessage')
-                 OR json_type({row}.payload_json, '$.msg_kind.Bits') = 'object') AND (
+                 OR json_type({row}.payload_json, '$.msg_kind.Bits') = 'object'
+                 OR COALESCE(json_extract({row}.payload_json, '$.msg_kind.Sub.sub_msg'), '') != '') AND (
                 EXISTS(SELECT 1 FROM chat_moderation AS rule
                     WHERE rule.channel = {row}.channel AND rule.target = 'channel'
                         AND rule.target_key = '' AND rule.cutoff_ms >= {row}.ts_ms)
@@ -830,7 +832,7 @@ impl LogStore {
                     "[{}] <{}> {}\n",
                     msg.timestamp.with_timezone(&Utc).format("%H:%M:%S"),
                     msg.sender.display_name,
-                    msg.raw_text
+                    msg.plain_text()
                 );
                 text.push_str(&line);
             }
@@ -1107,6 +1109,39 @@ mod tests {
                 .flags
                 .is_deleted
         );
+    }
+
+    #[test]
+    fn subscription_moderation_matches_retained_and_late_history_bodies() {
+        let channel = ChannelId::new("room");
+        for action in [
+            ModerationAction::user(channel.clone(), "alice".into(), Some("1".into()),
+                Some(Utc.timestamp_millis_opt(1000).unwrap())),
+            ModerationAction::channel(channel.clone(), Some(Utc.timestamp_millis_opt(1000).unwrap())),
+        ] {
+            let store = LogStore::with_db_path(":memory:".into()).unwrap();
+            let subscription = |id, body: &str, timestamp| {
+                let mut row = message(id, timestamp, "room");
+                row.raw_text = body.into();
+                row.msg_kind = MsgKind::Sub { display_name: "Alice".into(), months: 1,
+                    plan: "Tier 1".into(), is_gift: false, sub_msg: body.into() };
+                row
+            };
+            for row in [subscription(1, "old subscriber text", 999),
+                subscription(2, "", 999), subscription(3, "new subscriber text", 1001)] {
+                store.append_message(&row).unwrap();
+            }
+            store.apply_moderation(&action).unwrap();
+            for row in [subscription(4, "late subscriber text", 999), subscription(5, "", 999)] {
+                store.append_message(&row).unwrap();
+            }
+            let rows = store.recent_messages(&channel, 10).unwrap();
+            assert_eq!(rows.len(), 5);
+            for row in rows {
+                assert_eq!(row.flags.is_deleted, matches!(row.id.0, 1 | 4), "row {}", row.id.0);
+                assert!(matches!(row.msg_kind, MsgKind::Sub { .. }));
+            }
+        }
     }
 
     #[test]

@@ -251,7 +251,19 @@ impl CompiledIgnoredPhrases {
 
     /// Apply rules to original message text while retaining native emote identities.
     pub fn apply_to_message(&self, message: &mut ChatMessage) -> PhraseApplyOutcome {
+        if let crate::model::MsgKind::Sub { sub_msg, .. } = &message.msg_kind {
+            if !sub_msg.is_empty() && message.raw_text != *sub_msg {
+                message.raw_text.clone_from(sub_msg);
+                message.spans.clear();
+                message.twitch_emotes.clear();
+            }
+        }
         let outcome = self.apply_with_emotes(&mut message.raw_text, &mut message.twitch_emotes);
+        if let crate::model::MsgKind::Sub { sub_msg, .. } = &mut message.msg_kind {
+            if !sub_msg.is_empty() {
+                sub_msg.clone_from(&message.raw_text);
+            }
+        }
         message.flags.is_highlighted |= outcome.highlight_only;
         message.flags.is_mention |= outcome.mention_only;
         outcome
@@ -399,6 +411,37 @@ impl<'a> PhraseReplacement<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscription_phrase_rules_filter_and_replace_the_body_in_new_and_legacy_rows() {
+        use crate::model::{ChannelId, MessageId, MsgKind, Sender, UserId};
+        for legacy in [false, true] {
+            let mut message = ChatMessage {
+                id: MessageId(1), server_id: Some("subscription-1".into()),
+                timestamp: chrono::Utc::now(), channel: ChannelId::new("room"),
+                sender: Sender { user_id: UserId("10".into()), login: "alice".into(),
+                    display_name: "Alice".into(), original_display_name: None,
+                    color: None, name_paint: None, badges: Vec::new() },
+                raw_text: if legacy { "Alice subscribed with Tier 1!" } else { "spam Kappa" }.into(),
+                spans: Default::default(),
+                twitch_emotes: if legacy { Vec::new() } else { vec![native_emote("25", 5, 9)] },
+                flags: Default::default(), reply: None, shared: None,
+                msg_kind: MsgKind::Sub { display_name: "Alice".into(), months: 1,
+                    plan: "Tier 1".into(), is_gift: false, sub_msg: "spam Kappa".into() },
+            };
+            let mut blocked = message.clone();
+            assert!(CompiledIgnoredPhrases::new(&[IgnoredPhrase::new("spam")])
+                .apply_to_message(&mut blocked).blocked);
+            let replacement = CompiledIgnoredPhrases::new(&[replacement("spam", "ok", false)]);
+            assert!(replacement.apply_to_message(&mut message).replaced);
+            assert_eq!(message.raw_text, "ok Kappa");
+            assert_eq!(message.plain_text(), "Alice subscribed with Tier 1!\nok Kappa");
+            assert!(matches!(&message.msg_kind, MsgKind::Sub { sub_msg, .. } if sub_msg == "ok Kappa"));
+            if !legacy {
+                assert_eq!(emote_ranges(&message.twitch_emotes), [("25", 3, 7)]);
+            }
+        }
+    }
 
     #[test]
     fn exact_user_ignore() {

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use crust_core::events::AppEvent;
 use crust_core::search::{matches, parse, ParseOutcome, Predicate};
@@ -13,6 +14,68 @@ pub const MAX_HITS: usize = 5000;
 pub struct SearchHit {
     pub channel: ChannelId,
     pub message: ChatMessage,
+}
+
+#[derive(PartialEq)]
+struct SearchLayout {
+    width: f32,
+    pixels_per_point: f32,
+    small_font: egui::FontId,
+    tiny_font: egui::FontId,
+    style: Arc<egui::Style>,
+}
+
+struct SearchRowHeight {
+    signature: u64,
+    stride: f32,
+    generation: u64,
+}
+
+#[derive(Default)]
+struct SearchLayoutCache {
+    layout: Option<SearchLayout>,
+    fonts: Option<egui::FontDefinitions>,
+    rows: HashMap<egui::Id, SearchRowHeight>,
+    generation: u64,
+    rendered_rows: usize,
+    measured_rows: usize,
+    content_height: f32,
+}
+
+impl SearchLayoutCache {
+    fn prepare(&mut self, ui: &egui::Ui) {
+        let layout = SearchLayout {
+            width: ui.available_width(),
+            pixels_per_point: ui.ctx().pixels_per_point(),
+            small_font: t::small(),
+            tiny_font: t::tiny(),
+            style: ui.style().clone(),
+        };
+        let fonts_changed = ui.ctx().fonts(|fonts| {
+            let font_cache = fonts.lock();
+            let definitions = font_cache.fonts.definitions();
+            let unchanged = self.fonts.as_ref().is_some_and(|cached| {
+                cached.families == definitions.families
+                    && cached.font_data.len() == definitions.font_data.len()
+                    && cached.font_data.iter().zip(&definitions.font_data).all(
+                        |((left_name, left_font), (right_name, right_font))| {
+                            left_name == right_name && Arc::ptr_eq(left_font, right_font)
+                        },
+                    )
+            });
+            if !unchanged {
+                self.fonts = Some(definitions.clone());
+            }
+            !unchanged
+        });
+        if fonts_changed || self.layout.as_ref() != Some(&layout) {
+            self.rows.clear();
+            self.layout = Some(layout);
+        }
+        self.generation = self.generation.wrapping_add(1);
+        self.rendered_rows = 0;
+        self.measured_rows = 0;
+    }
 }
 
 /// Persistent state for the global search popup.
@@ -31,6 +94,7 @@ pub struct GlobalSearchState {
     scroll_to_selected: bool,
     focused_control: Option<Id>,
     focused_result: Option<Id>,
+    layout_cache: SearchLayoutCache,
     pub load_older_pending: HashMap<ChannelId, std::time::Instant>,
 }
 
@@ -48,7 +112,7 @@ impl GlobalSearchState {
         self.focused_result = None;
     }
 
-    fn owns_keyboard(&self, ctx: &Context) -> bool {
+    pub(crate) fn owns_keyboard(&self, ctx: &Context) -> bool {
         self.open && self.focused_control.is_some_and(|id| {
             ctx.memory(|memory| {
                 memory.has_focus(id)
@@ -61,6 +125,7 @@ impl GlobalSearchState {
         self.input.clear();
         self.regex_error = None;
         self.results.clear();
+        self.layout_cache = SearchLayoutCache::default();
         self.selected_idx = 0;
         self.last_parsed_input.clear();
         self.parsed.clear();
@@ -395,10 +460,8 @@ fn render_header(ui: &mut Ui, state: &mut GlobalSearchState, output: &mut Global
         }
         let channel_count = state
             .results
-            .iter()
-            .map(|h| &h.channel)
-            .collect::<std::collections::HashSet<_>>()
-            .len();
+            .chunk_by(|left, right| left.channel == right.channel)
+            .count();
         let pill_text = if state.results.is_empty() {
             "no hits".to_string()
         } else {
@@ -417,6 +480,13 @@ fn render_input(ui: &mut Ui, state: &mut GlobalSearchState) {
     let response = ui.add_sized([ui.available_width(), 30.0], edit);
     if state.focus_input {
         response.request_focus();
+        if let Some(mut editor) = egui::TextEdit::load_state(ui.ctx(), response.id) {
+            editor.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(0),
+                egui::text::CCursor::new(state.input.chars().count()),
+            )));
+            egui::TextEdit::store_state(ui.ctx(), response.id, editor);
+        }
         state.focus_input = false;
     }
 }
@@ -431,12 +501,16 @@ fn render_results(
 ) {
     let hit_count = state.results.len();
     let scroll_to_selected = std::mem::take(&mut state.scroll_to_selected);
+    let focused = ui.ctx().memory(|memory| memory.focused());
     state.focused_result = None;
+    let mut cache = std::mem::take(&mut state.layout_cache);
 
-    ScrollArea::vertical()
+    let scroll = ScrollArea::vertical()
         .auto_shrink([false, false])
-        .show(ui, |ui| {
+        .show_viewport(ui, |ui, viewport| {
+            cache.prepare(ui);
             if state.results.is_empty() {
+                cache.rows.clear();
                 ui.add_space(12.0);
                 ui.label(
                     RichText::new(if state.input.trim().is_empty() {
@@ -458,7 +532,11 @@ fn render_results(
             }
 
             let mut running_idx = 0usize;
+            let origin_y = ui.next_widget_position().y;
+            let mut skipped_stride = 0.0;
             for hits_in_group in state.results.chunk_by(|a, b| a.channel == b.channel) {
+                skip_measured_rows(ui, skipped_stride);
+                skipped_stride = 0.0;
                 let channel = &hits_in_group[0].channel;
                 let group_len = hits_in_group.len();
                 render_group_header(
@@ -471,8 +549,35 @@ fn render_results(
                 );
                 for hit in hits_in_group {
                     let selected = running_idx == state.selected_idx;
+                    let row_id = search_hit_id(hit);
+                    let signature = search_hit_signature(hit);
+                    let cached_stride = cache.rows.get_mut(&row_id)
+                        .filter(|row| row.signature == signature)
+                        .map(|row| {
+                            row.generation = cache.generation;
+                            row.stride
+                        });
+                    let top = ui.next_widget_position().y - origin_y + skipped_stride;
+                    let force_render = (selected && scroll_to_selected) || focused == Some(row_id);
+                    if !force_render && cached_stride.is_some_and(|stride| {
+                        top + stride < viewport.min.y || top > viewport.max.y
+                    }) {
+                        skipped_stride += cached_stride.unwrap_or_default();
+                        running_idx += 1;
+                        continue;
+                    }
+                    skip_measured_rows(ui, skipped_stride);
+                    skipped_stride = 0.0;
+                    let top = ui.next_widget_position().y;
                     let response = render_hit_row(ui, hit, selected, images, animate, |hit_ref| {
                         output.jump_to = Some((hit_ref.channel.clone(), hit_ref.message.id));
+                    });
+                    cache.rendered_rows += 1;
+                    cache.measured_rows += usize::from(cached_stride.is_none());
+                    cache.rows.insert(row_id, SearchRowHeight {
+                        signature,
+                        stride: ui.next_widget_position().y - top,
+                        generation: cache.generation,
                     });
                     if selected && scroll_to_selected {
                         response.scroll_to_me(Some(Align::Center));
@@ -483,13 +588,40 @@ fn render_results(
                     }
                     running_idx += 1;
                 }
+                skip_measured_rows(ui, skipped_stride);
+                skipped_stride = 0.0;
                 ui.add_space(4.0);
             }
         });
+    cache.rows.retain(|_, row| row.generation == cache.generation);
+    cache.content_height = scroll.content_size.y;
+    state.layout_cache = cache;
 
     if hit_count > 0 && state.selected_idx >= hit_count {
         state.selected_idx = hit_count - 1;
     }
+}
+
+fn skip_measured_rows(ui: &mut Ui, stride: f32) {
+    if stride > 0.0 {
+        ui.allocate_space(egui::vec2(
+            0.0,
+            (stride - ui.spacing().item_spacing.y).max(0.0),
+        ));
+    }
+}
+
+fn search_hit_signature(hit: &SearchHit) -> u64 {
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    let text = hit.message.plain_text();
+    let text = text.trim();
+    let cutoff = text.char_indices().nth(160).map(|(index, _)| index);
+    text[..cutoff.unwrap_or(text.len())].hash(&mut hash);
+    cutoff.is_some().hash(&mut hash);
+    hit.message.timestamp.hash(&mut hash);
+    hit.message.sender.login.hash(&mut hash);
+    hit.message.sender.display_name.hash(&mut hash);
+    hash.finish()
 }
 
 fn render_group_header(
@@ -499,7 +631,7 @@ fn render_group_header(
     exhausted: bool,
     load_older_pending: &mut HashMap<ChannelId, std::time::Instant>,
     output: &mut GlobalSearchOutput,
-) {
+) -> egui::Response {
     let pending = load_older_pending
         .get(channel)
         .map(|ts| ts.elapsed() < std::time::Duration::from_secs(10))
@@ -507,7 +639,8 @@ fn render_group_header(
     if !pending {
         load_older_pending.remove(channel);
     }
-    ui.horizontal_top(|ui| {
+    ui.push_id(("global_search_group", channel.as_str()), |ui| {
+        ui.horizontal_top(|ui| {
         let label = if exhausted { "No older logs" } else if pending { "Loading..." } else { "Load older" };
         let button_width = ui.fonts(|fonts| {
             fonts
@@ -532,12 +665,40 @@ fn render_group_header(
                 );
             },
         );
-        let btn = ui.add_enabled(!pending && !exhausted, Button::new(RichText::new(label).font(t::tiny())));
+        let btn = ui.add_enabled_ui(!pending && !exhausted, |ui| {
+            load_older_button(ui, channel, label)
+        }).inner;
         if btn.clicked() {
             load_older_pending.insert(channel.clone(), std::time::Instant::now());
             output.load_older_requests.push(channel.clone());
         }
+        btn
+        }).inner
+    }).inner
+}
+
+fn load_older_button(ui: &mut Ui, channel: &ChannelId, label: &str) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(), t::tiny(), egui::Color32::PLACEHOLDER,
+    );
+    let mut size = galley.size() + ui.spacing().button_padding * 2.0;
+    size.y = size.y.max(ui.spacing().interact_size.y);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let response = ui.interact(
+        rect, Id::new("global_search_load_older").with(channel), egui::Sense::click(),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
     });
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&response);
+        ui.painter().rect(
+            rect.expand(visuals.expansion), visuals.corner_radius,
+            visuals.weak_bg_fill, visuals.bg_stroke, egui::StrokeKind::Inside,
+        );
+        ui.painter().galley(rect.center() - galley.size() * 0.5, galley, visuals.text_color());
+    }
+    response
 }
 
 fn render_hit_row(
@@ -548,6 +709,7 @@ fn render_hit_row(
     animate: bool,
     mut on_jump: impl FnMut(&SearchHit),
 ) -> egui::Response {
+    let plain_text = hit.message.plain_text();
     let bg = if selected {
         t::bg_raised()
     } else {
@@ -601,7 +763,7 @@ fn render_hit_row(
                         egui::Label::new(
                             RichText::new(format!(
                                 " {}",
-                                truncate(hit.message.raw_text.trim(), 160)
+                                truncate(plain_text.trim(), 160)
                             ))
                             .font(t::small())
                             .color(t::text_primary()),
@@ -619,7 +781,7 @@ fn render_hit_row(
             egui::WidgetType::SelectableLabel,
             ui.is_enabled(),
             selected,
-            format!("{}: {}", hit.message.sender.login, hit.message.raw_text),
+            format!("{}: {}", hit.message.sender.login, plain_text),
         )
     });
     if resp.clicked() {
@@ -638,16 +800,25 @@ fn parse_hex_color(s: &str) -> Option<egui::Color32> {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(max).collect();
+    if let Some((cutoff, _)) = s.char_indices().nth(max) {
+        let mut out = String::with_capacity(cutoff + 3);
+        out.push_str(&s[..cutoff]);
         out.push_str("...");
         out
+    } else {
+        s.to_owned()
     }
 }
 
 fn handle_keyboard(ctx: &Context, state: &mut GlobalSearchState, output: &mut GlobalSearchOutput) {
+    if ctx.is_context_menu_open() {
+        return;
+    }
+    if state.owns_keyboard(ctx)
+        && ctx.input_mut(|input| crate::app::consume_exact_key(input, egui::Modifiers::CTRL, Key::F))
+    {
+        state.focus_input = true;
+    }
     if state.results.is_empty() {
         return;
     }
@@ -1370,6 +1541,343 @@ mod tests {
             });
             assert!(output.jump_to.is_none());
         }
+        let _ = ctx.run(egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: Key::F, physical_key: None, pressed: true, repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            }],
+            ..Default::default()
+        }, |ctx| {
+            ctx.memory_mut(|memory| memory.request_focus(Id::new("another_control")));
+            handle_keyboard(ctx, &mut search, &mut GlobalSearchOutput::default());
+            assert!(ctx.input(|input| input.key_pressed(Key::F)));
+        });
+        assert!(!search.focus_input);
+    }
+
+    #[test]
+    fn popup_search_shortcut_selects_the_existing_query_from_another_control() {
+        let ctx = Context::default();
+        let (channel, messages) = mk_channel("room");
+        let channels = HashMap::from([(channel, messages)]);
+        let mut search = GlobalSearchState {
+            open: true, input: "original café🙂".to_owned(), focus_input: true,
+            ..Default::default()
+        };
+        for _ in 0..3 { search_widget_frame(&ctx, &mut search, &channels, Vec::new()); }
+        let input_id = Id::new("global_search_input");
+        let range = egui::TextEdit::load_state(&ctx, input_id).unwrap().cursor.char_range().unwrap();
+        assert_eq!(range.primary.index.min(range.secondary.index), 0);
+        assert_eq!(range.primary.index.max(range.secondary.index), search.input.chars().count());
+        search_widget_frame(&ctx, &mut search, &channels, vec![search_key(Key::Tab)]);
+        search_widget_frame(&ctx, &mut search, &channels, Vec::new());
+        assert!(search.focused_control.is_some());
+        assert_ne!(search.focused_control, Some(input_id));
+        let (_, action) = search_widget_frame(&ctx, &mut search, &channels, vec![egui::Event::Key {
+            key: Key::F, physical_key: None, pressed: true, repeat: false,
+            modifiers: egui::Modifiers::CTRL,
+        }]);
+        assert!(action.jump_to.is_none());
+        assert!(action.load_older_requests.is_empty());
+        assert!(ctx.memory(|memory| memory.has_focus(input_id)));
+        assert!(!ctx.input(|input| input.key_pressed(Key::F)));
+        search_widget_frame(&ctx, &mut search, &channels,
+            vec![egui::Event::Text("replacement".to_owned())]);
+        assert_eq!(search.input, "replacement");
+    }
+
+    fn result_fixture(count: usize) -> (GlobalSearchState, HashMap<ChannelId, ChannelState>) {
+        let mut channels = HashMap::new();
+        let mut results = Vec::with_capacity(count);
+        for index in 0..count {
+            let (channel, channel_state) = mk_channel(&format!("room{}", index / 1250));
+            channels.entry(channel.clone()).or_insert(channel_state);
+            let text = if index % 3 == 0 {
+                format!("Result {index}: café 🙂 with a longer message and https://example.test/a/path that wraps across narrow search windows. ").repeat(2)
+            } else {
+                format!("Result {index}: short message")
+            };
+            let mut message = mk_msg(index as u64 + 1, &format!("viewer{index}"), &text, index as i64);
+            message.channel = channel.clone();
+            results.push(SearchHit { channel, message });
+        }
+        (GlobalSearchState { open: true, results, ..Default::default() }, channels)
+    }
+
+    struct ResultFrame {
+        output: egui::FullOutput,
+        action: GlobalSearchOutput,
+        content_height: f32,
+    }
+
+    // Draw every row as a reference for geometry and the controlled benchmark.
+    fn render_all_results(
+        ui: &mut Ui,
+        channels: &HashMap<ChannelId, ChannelState>,
+        state: &mut GlobalSearchState,
+        output: &mut GlobalSearchOutput,
+    ) -> f32 {
+        let scroll_to_selected = std::mem::take(&mut state.scroll_to_selected);
+        state.focused_result = None;
+        ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            let images = UiImageCache::default();
+            let mut index = 0;
+            for group in state.results.chunk_by(|left, right| left.channel == right.channel) {
+                let channel = &group[0].channel;
+                render_group_header(
+                    ui, channel, group.len(),
+                    channels.get(channel).is_some_and(|state| state.local_history_exhausted),
+                    &mut state.load_older_pending, output,
+                );
+                for hit in group {
+                    let selected = index == state.selected_idx;
+                    let response = render_hit_row(ui, hit, selected, &images, false, |hit| {
+                        output.jump_to = Some((hit.channel.clone(), hit.message.id));
+                    });
+                    if selected && scroll_to_selected {
+                        response.scroll_to_me(Some(Align::Center));
+                    }
+                    if response.has_focus() {
+                        state.focused_result = Some(response.id);
+                        state.selected_idx = index;
+                    }
+                    index += 1;
+                }
+                ui.add_space(4.0);
+            }
+        }).content_size.y
+    }
+
+    fn result_frame(
+        ctx: &Context,
+        state: &mut GlobalSearchState,
+        channels: &HashMap<ChannelId, ChannelState>,
+        width: f32,
+        cached: bool,
+        events: Vec<egui::Event>,
+    ) -> ResultFrame {
+        let mut action = GlobalSearchOutput::default();
+        let mut content_height = 0.0;
+        let output = ctx.run(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO, egui::vec2(width, 320.0),
+            )),
+            time: Some(ctx.cumulative_pass_nr() as f64 * 0.2),
+            events,
+            ..Default::default()
+        }, |ctx| {
+            handle_keyboard(ctx, state, &mut action);
+            CentralPanel::default().show(ctx, |ui| {
+                if cached {
+                    render_results(ui, channels, state, &mut action, &UiImageCache::default(), false);
+                    content_height = state.layout_cache.content_height;
+                } else {
+                    content_height = render_all_results(ui, channels, state, &mut action);
+                }
+            });
+        });
+        ResultFrame { output, action, content_height }
+    }
+
+    fn visible_result_text(output: &egui::FullOutput) -> Vec<(String, egui::Pos2)> {
+        output.shapes.iter().filter_map(|shape| {
+            let egui::Shape::Text(text) = &shape.shape else { return None };
+            let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+            shape.clip_rect.intersects(rect).then(|| (text.galley.text().to_owned(), text.pos))
+        }).collect()
+    }
+
+    #[test]
+    fn cached_search_results_match_all_rows_at_the_top_middle_and_end() {
+        let (mut cached, channels) = result_fixture(MAX_HITS);
+        let mut all = GlobalSearchState { open: true, results: cached.results.clone(), ..Default::default() };
+        let cached_ctx = Context::default();
+        let all_ctx = Context::default();
+        for selected in [0, 2499, MAX_HITS - 1] {
+            cached.selected_idx = selected;
+            cached.scroll_to_selected = true;
+            all.selected_idx = selected;
+            all.scroll_to_selected = true;
+            for _ in 0..4 {
+                result_frame(&cached_ctx, &mut cached, &channels, 360.0, true, Vec::new());
+                result_frame(&all_ctx, &mut all, &channels, 360.0, false, Vec::new());
+            }
+            let actual = result_frame(&cached_ctx, &mut cached, &channels, 360.0, true, Vec::new());
+            let expected = result_frame(&all_ctx, &mut all, &channels, 360.0, false, Vec::new());
+            assert!((actual.content_height - expected.content_height).abs() < 1.0);
+            let actual_text = visible_result_text(&actual.output);
+            let expected_text = visible_result_text(&expected.output);
+            assert_eq!(actual_text.len(), expected_text.len(), "visible text count at {selected}");
+            for ((actual_text, actual_pos), (expected_text, expected_pos)) in actual_text.iter().zip(&expected_text) {
+                assert_eq!(actual_text, expected_text, "visible text at {selected}");
+                assert!((*actual_pos - *expected_pos).length() < 1.0,
+                    "text moved at {selected}: {actual_pos:?} vs {expected_pos:?}");
+            }
+            assert_eq!(cached.layout_cache.measured_rows, 0);
+            assert!(cached.layout_cache.rendered_rows < 30,
+                "{} rows rendered at {selected}", cached.layout_cache.rendered_rows);
+            assert_eq!(cached.layout_cache.rows.len(), MAX_HITS);
+        }
+    }
+
+    #[test]
+    fn result_height_cache_tracks_content_layout_and_removed_results() {
+        let (mut search, channels) = result_fixture(200);
+        let ctx = Context::default();
+        for _ in 0..3 { result_frame(&ctx, &mut search, &channels, 480.0, true, Vec::new()); }
+        assert_eq!(search.layout_cache.measured_rows, 0);
+        let original_height = search.layout_cache.content_height;
+        search.results[151].message.raw_text = "A changed offscreen result has a much longer preview with café and 🙂. ".repeat(4);
+        result_frame(&ctx, &mut search, &channels, 480.0, true, Vec::new());
+        assert_eq!(search.layout_cache.measured_rows, 1);
+        assert!(search.layout_cache.content_height > original_height);
+        search.results[152].message.sender.display_name = "A substantially longer displayed name".repeat(4);
+        result_frame(&ctx, &mut search, &channels, 480.0, true, Vec::new());
+        assert_eq!(search.layout_cache.measured_rows, 1);
+        result_frame(&ctx, &mut search, &channels, 240.0, true, Vec::new());
+        assert_eq!(search.layout_cache.measured_rows, search.results.len());
+        ctx.style_mut(|style| style.spacing.item_spacing.y += 3.0);
+        result_frame(&ctx, &mut search, &channels, 240.0, true, Vec::new());
+        assert_eq!(search.layout_cache.measured_rows, search.results.len());
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.families.insert(egui::FontFamily::Proportional,
+            fonts.families[&egui::FontFamily::Monospace].clone());
+        ctx.set_fonts(fonts);
+        result_frame(&ctx, &mut search, &channels, 240.0, true, Vec::new());
+        assert_eq!(search.layout_cache.measured_rows, search.results.len());
+        let mut fonts = ctx.fonts(|fonts| fonts.lock().fonts.definitions().clone());
+        let primary = fonts.families[&egui::FontFamily::Proportional][0].clone();
+        Arc::make_mut(fonts.font_data.get_mut(&primary).unwrap()).tweak.scale *= 1.1;
+        ctx.set_fonts(fonts);
+        result_frame(&ctx, &mut search, &channels, 240.0, true, Vec::new());
+        assert_eq!(search.layout_cache.measured_rows, search.results.len());
+        search.results.drain(..150);
+        result_frame(&ctx, &mut search, &channels, 240.0, true, Vec::new());
+        assert_eq!(search.layout_cache.rows.len(), search.results.len());
+        search.clear();
+        assert!(search.layout_cache.rows.is_empty());
+    }
+
+    #[test]
+    fn cached_results_preserve_end_key_focus_jump_and_load_older() {
+        let (mut search, channels) = result_fixture(MAX_HITS);
+        let ctx = Context::default();
+        for _ in 0..3 { result_frame(&ctx, &mut search, &channels, 480.0, true, Vec::new()); }
+        let first = search_hit_id(&search.results[0]);
+        ctx.memory_mut(|memory| memory.request_focus(first));
+        result_frame(&ctx, &mut search, &channels, 480.0, true, Vec::new());
+        assert_eq!(search.focused_result, Some(first));
+        result_frame(&ctx, &mut search, &channels, 480.0, true, vec![search_key(Key::End)]);
+        assert_eq!(search.selected_idx, MAX_HITS - 1);
+        let last = search_hit_id(search.results.last().unwrap());
+        assert_eq!(search.focused_result, Some(last));
+        for _ in 0..3 { result_frame(&ctx, &mut search, &channels, 480.0, true, Vec::new()); }
+        let shown = result_frame(&ctx, &mut search, &channels, 480.0, true, Vec::new());
+        let last_rect = ctx.read_response(last).unwrap().rect;
+        assert!(ctx.screen_rect().intersects(last_rect),
+            "End scrolls the focused row into view: row={last_rect:?}, visible={:?}",
+            visible_result_text(&shown.output));
+        let jumped = result_frame(&ctx, &mut search, &channels, 480.0, true, vec![search_key(Key::Enter)]);
+        assert_eq!(jumped.action.jump_to, Some((ChannelId::new("room3"), MessageId(MAX_HITS as u64))));
+
+        ctx.memory_mut(|memory| memory.surrender_focus(last));
+        search.selected_idx = 2500;
+        search.scroll_to_selected = true;
+        for _ in 0..4 { result_frame(&ctx, &mut search, &channels, 480.0, true, Vec::new()); }
+        let shown = result_frame(&ctx, &mut search, &channels, 480.0, true, Vec::new());
+        let target = shown.output.shapes.iter().find_map(|shape| {
+            let egui::Shape::Text(text) = &shape.shape else { return None };
+            let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+            (text.galley.text() == "Load older" && shape.clip_rect.contains_rect(rect)).then_some(rect.center())
+        }).expect("the selected group's load-older control remains visible");
+        let mut action = GlobalSearchOutput::default();
+        for pressed in [true, false] {
+            action = result_frame(&ctx, &mut search, &channels, 480.0, true, vec![
+                egui::Event::PointerMoved(target),
+                egui::Event::PointerButton { pos: target, button: egui::PointerButton::Primary,
+                    pressed, modifiers: egui::Modifiers::NONE },
+            ]).action;
+        }
+        assert_eq!(action.load_older_requests, vec![ChannelId::new("room2")]);
+        assert!(search.load_older_pending.contains_key(&ChannelId::new("room2")));
+    }
+
+    #[test]
+    fn search_preview_truncation_preserves_unicode_and_exact_limits() {
+        assert_eq!(truncate("café🙂", 5), "café🙂");
+        assert_eq!(truncate("café🙂 more", 5), "café🙂...");
+        assert_eq!(truncate("", 0), "");
+        assert_eq!(truncate("🙂", 0), "...");
+    }
+
+    #[test]
+    fn load_older_keeps_its_focus_when_preceding_row_counts_change() {
+        let ctx = Context::default();
+        let channel = ChannelId::new("target");
+        let mut pending = HashMap::new();
+        let mut button_id = Id::NULL;
+        let mut show = |preceding_rows, events| {
+            let mut output = GlobalSearchOutput::default();
+            let _ = ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO, egui::vec2(480.0, 320.0),
+                )),
+                events,
+                ..Default::default()
+            }, |ctx| {
+                CentralPanel::default().show(ctx, |ui| {
+                    for _ in 0..preceding_rows {
+                        ui.label("A preceding result");
+                    }
+                    button_id = render_group_header(
+                        ui, &channel, 200, false, &mut pending, &mut output,
+                    ).id;
+                });
+            });
+            (button_id, output)
+        };
+        let (original, _) = show(1, Vec::new());
+        ctx.memory_mut(|memory| memory.request_focus(original));
+        let (after, _) = show(6, Vec::new());
+        assert_eq!(after, original);
+        assert!(ctx.memory(|memory| memory.has_focus(original)));
+        let (_, output) = show(3, vec![search_key(Key::Enter)]);
+        assert_eq!(output.load_older_requests, vec![channel]);
+    }
+
+    #[test]
+    #[ignore = "controlled 5000-result CPU layout benchmark"]
+    fn benchmark_global_search_results_cache() {
+        let (mut cached, channels) = result_fixture(MAX_HITS);
+        let mut all = GlobalSearchState { open: true, results: cached.results.clone(), ..Default::default() };
+        let cached_ctx = Context::default();
+        let all_ctx = Context::default();
+        let start = std::time::Instant::now();
+        std::hint::black_box(result_frame(&cached_ctx, &mut cached, &channels, 480.0, true, Vec::new()));
+        let cold_cached = start.elapsed();
+        let start = std::time::Instant::now();
+        std::hint::black_box(result_frame(&all_ctx, &mut all, &channels, 480.0, false, Vec::new()));
+        let cold_all = start.elapsed();
+        for _ in 0..4 {
+            result_frame(&cached_ctx, &mut cached, &channels, 480.0, true, Vec::new());
+            result_frame(&all_ctx, &mut all, &channels, 480.0, false, Vec::new());
+        }
+        let mut cached_times = Vec::new();
+        let mut all_times = Vec::new();
+        for _ in 0..25 {
+            let start = std::time::Instant::now();
+            std::hint::black_box(result_frame(&cached_ctx, &mut cached, &channels, 480.0, true, Vec::new()));
+            cached_times.push(start.elapsed());
+            let start = std::time::Instant::now();
+            std::hint::black_box(result_frame(&all_ctx, &mut all, &channels, 480.0, false, Vec::new()));
+            all_times.push(start.elapsed());
+        }
+        cached_times.sort();
+        all_times.sort();
+        println!("global search {MAX_HITS} results; cold cached={cold_cached:?}; cold all={cold_all:?}; warm cached median={:?}; warm all median={:?}; cached rows={}; measured rows={}",
+            cached_times[12], all_times[12], cached.layout_cache.rendered_rows, cached.layout_cache.measured_rows);
+        assert_eq!(cached.layout_cache.measured_rows, 0);
+        assert!(cached.layout_cache.rendered_rows < 30);
     }
 
     #[test]

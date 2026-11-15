@@ -61,7 +61,7 @@ fn message_layout_signature(
     images: &crate::image_cache::UiImageCache,
 ) -> u64 {
     let mut hash = DefaultHasher::new();
-    message.raw_text.hash(&mut hash);
+    message.plain_text().hash(&mut hash);
     sender_name(message).hash(&mut hash);
     message.timestamp.hash(&mut hash);
     message.flags.is_deleted.hash(&mut hash);
@@ -548,7 +548,7 @@ fn render_row(
 
 fn mention_context_menu(ui: &mut Ui, msg: &ChatMessage, jump: &mut Option<MentionJumpTarget>) {
     if ui.button("Copy message").clicked() {
-        ui.ctx().copy_text(msg.raw_text.clone());
+        ui.ctx().copy_text(msg.plain_text().into_owned());
         ui.close_menu();
     }
     if ui.button("Open in channel").clicked() {

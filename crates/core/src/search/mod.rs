@@ -7,4 +7,4 @@ pub mod parser;
 pub mod predicate;
 
 pub use parser::{parse, ParseOutcome};
-pub use predicate::{matches, FlagKind, Predicate};
+pub use predicate::{contains_ignore_case, matches, FlagKind, Predicate};

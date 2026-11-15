@@ -7190,6 +7190,10 @@ exit 1
         }
 
         let open_search = ctx.input_mut(|i| consume_binding(i, &open_msg_search));
+        if open_search && self.global_search.owns_keyboard(ctx) {
+            self.global_search.focus_input = true;
+            return;
+        }
         let Some(channel) = self.active_search_target() else {
             return;
         };
@@ -15008,6 +15012,29 @@ mod tests {
             assert_eq!(app.hotkey_bindings, previous);
             assert!(app.quick_switch.open);
         }
+    }
+
+    #[test]
+    fn find_shortcut_refocuses_global_search_without_opening_channel_search() {
+        let (mut app, mut commands) = test_app();
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("channel");
+        app.state.join_channel(channel.clone());
+        app.chat_input_buf = "draft stays here".into();
+        app.global_search.input = "café 🙂".into();
+        app.global_search.request_open();
+        for _ in 0..3 {
+            production_ui_frame(&ctx, &mut app, Vec::new());
+        }
+        assert!(ctx.memory(|memory| memory.has_focus(egui::Id::new("global_search_input"))));
+        production_ui_frame(&ctx, &mut app,
+            shortcut_input(egui::Key::F, egui::Modifiers::CTRL).events);
+        production_ui_frame(&ctx, &mut app, vec![egui::Event::Text("replacement".into())]);
+        assert_eq!(app.global_search.input, "replacement");
+        assert!(!app.message_search.get(&channel).is_some_and(|search| search.open));
+        assert_eq!(app.chat_input_buf, "draft stays here");
+        assert!(!std::iter::from_fn(|| commands.try_recv().ok())
+            .any(|command| matches!(command, AppCommand::SendMessage { .. })));
     }
 
     #[test]

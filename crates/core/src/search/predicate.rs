@@ -23,7 +23,7 @@ pub enum FlagKind {
 /// All predicates in a query are AND-combined when evaluated via [`matches`].
 #[derive(Debug, Clone)]
 pub enum Predicate {
-    /// Case-insensitive substring match on `raw_text`.
+    /// Case-insensitive substring match on the complete message text.
     Substring(String),
     /// Sender login OR display name matches any entry (case-insensitive).
     Author(Vec<String>),
@@ -35,7 +35,7 @@ pub enum Predicate {
     Mention,
     /// Message contains at least one `Span::Emote` or `Span::Emoji`.
     Emote,
-    /// Message `raw_text` matches compiled regex.
+    /// Complete message text matches the compiled regex.
     Regex(regex::Regex),
     /// Sender badge `name` matches any entry (case-insensitive).
     Badge(Vec<String>),
@@ -56,25 +56,40 @@ pub fn matches(preds: &[Predicate], msg: &ChatMessage, channel: &ChannelId) -> b
     preds.iter().all(|p| p.matches(msg, channel))
 }
 
+/// Compare ASCII chat text without allocating lowercase copies. Unicode uses
+/// the same lowercase mapping as the search parser.
+pub fn contains_ignore_case(text: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if text.is_ascii() && needle.is_ascii() {
+        text.as_bytes()
+            .windows(needle.len())
+            .any(|part| part.eq_ignore_ascii_case(needle.as_bytes()))
+    } else {
+        text.to_lowercase().contains(&needle.to_lowercase())
+    }
+}
+
+fn equals_ignore_case(left: &str, right: &str) -> bool {
+    if left.is_ascii() && right.is_ascii() {
+        left.eq_ignore_ascii_case(right)
+    } else {
+        left.to_lowercase() == right.to_lowercase()
+    }
+}
+
 impl Predicate {
     pub fn matches(&self, msg: &ChatMessage, channel: &ChannelId) -> bool {
         match self {
-            Self::Substring(needle) => {
-                let needle = needle.to_lowercase();
-                msg.raw_text.to_lowercase().contains(&needle)
-            }
-            Self::Author(names) => {
-                let login = msg.sender.login.to_lowercase();
-                let display = msg.sender.display_name.to_lowercase();
-                names.iter().any(|n| {
-                    let n = n.to_lowercase();
-                    login == n || display == n
-                })
-            }
-            Self::Channel(names) => {
-                let display = channel.display_name().to_lowercase();
-                names.iter().any(|n| n.to_lowercase() == display)
-            }
+            Self::Substring(needle) => contains_ignore_case(&msg.plain_text(), needle),
+            Self::Author(names) => names.iter().any(|name| {
+                equals_ignore_case(&msg.sender.login, name)
+                    || equals_ignore_case(&msg.sender.display_name, name)
+            }),
+            Self::Channel(names) => names
+                .iter()
+                .any(|name| equals_ignore_case(channel.display_name(), name)),
             Self::Link => msg
                 .spans
                 .iter()
@@ -93,14 +108,13 @@ impl Predicate {
                     crate::model::Span::Emote { .. } | crate::model::Span::Emoji { .. }
                 )
             }),
-            Self::Regex(re) => re.is_match(&msg.raw_text),
+            Self::Regex(re) => re.is_match(&msg.plain_text()),
             Self::Negated(inner) => !inner.matches(msg, channel),
             Self::AnyFlag(flags) => flags
                 .iter()
                 .any(|flag| Self::Flag(*flag).matches(msg, channel)),
-            Self::Badge(names) => msg.sender.badges.iter().any(|b| {
-                let b_name = b.name.to_lowercase();
-                names.iter().any(|n| n.to_lowercase() == b_name)
+            Self::Badge(names) => msg.sender.badges.iter().any(|badge| {
+                names.iter().any(|name| equals_ignore_case(&badge.name, name))
             }),
             Self::Subtier(tiers) => msg
                 .sender
@@ -183,6 +197,74 @@ mod tests {
             reply: None,
             msg_kind: MsgKind::Chat,
             shared: None,
+        }
+    }
+
+    #[test]
+    fn case_insensitive_comparisons_preserve_unicode_lowercase_semantics() {
+        for text in ["", "A short CHAT line", "ALICE", "Straße", "İSTANBUL", "Kelvin", "ΟΣ", "猫 😀"] {
+            for needle in ["", "chat", "Alice", "ß", "ss", "i", "i\u{307}", "k", "ος", "οσ", "😀", "longer than any message here"] {
+                assert_eq!(contains_ignore_case(text, needle),
+                    text.to_lowercase().contains(&needle.to_lowercase()),
+                    "contains({text:?}, {needle:?})");
+                assert_eq!(equals_ignore_case(text, needle),
+                    text.to_lowercase() == needle.to_lowercase(),
+                    "equals({text:?}, {needle:?})");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "controlled search comparison benchmark"]
+    fn benchmark_case_insensitive_search() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let lines: Vec<_> = (0..20_000).map(|index| {
+            format!("viewer{index}: That was a great stream today! {} See you next time.",
+                if index % 5 == 0 { "Needle Kappa" } else { "Thanks everyone" })
+        }).collect();
+        let mut baseline = Vec::new();
+        let mut candidate = Vec::new();
+        for _ in 0..11 {
+            let started = Instant::now();
+            let before = lines.iter().filter(|text| {
+                black_box(text.as_str()).to_lowercase().contains(&black_box("NEEDLE").to_lowercase())
+            }).count();
+            baseline.push(started.elapsed());
+            let started = Instant::now();
+            let after = lines.iter().filter(|text| {
+                contains_ignore_case(black_box(text.as_str()), black_box("NEEDLE"))
+            }).count();
+            candidate.push(started.elapsed());
+            assert_eq!(before, after);
+            assert_eq!(after, 4_000);
+        }
+        baseline.sort();
+        candidate.sort();
+        eprintln!("20,000 ASCII chat lines: lowercase median {:?}, comparison median {:?}",
+            baseline[5], candidate[5]);
+    }
+
+    #[test]
+    fn subscription_search_matches_notices_and_bodies_from_new_and_legacy_logs() {
+        let notice = "Alice resubscribed with Tier 1! (2 months)";
+        let body = "Thank you café 🙂";
+        let joined = format!("{notice}\n{body}");
+        let channel = make_channel("room");
+        for text in [notice, body, joined.as_str()] {
+            let mut message = make_msg("alice", "Alice", text);
+            message.msg_kind = MsgKind::Sub {
+                display_name: "Alice".into(), months: 2, plan: "Tier 1".into(),
+                is_gift: false, sub_msg: body.into(),
+            };
+            assert!(matches(&[
+                Predicate::Flag(FlagKind::Sub),
+                Predicate::Author(vec!["ALICE".into()]),
+                Predicate::Substring("RESUBSCRIBED".into()),
+                Predicate::Substring("CAFÉ".into()),
+                Predicate::Regex(regex::Regex::new(r"Thank you café 🙂$").unwrap()),
+            ], &message, &channel));
         }
     }
 

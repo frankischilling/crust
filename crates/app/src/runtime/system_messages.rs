@@ -136,17 +136,6 @@ pub(crate) fn is_twitch_pinned_notice(text: &str) -> bool {
         || (lower.contains("pinned") && lower.contains(" sent at "))
 }
 
-/// Build a human-readable sub alert text.
-pub(crate) fn build_sub_text(display_name: &str, months: u32, plan: &str, is_gift: bool) -> String {
-    if is_gift {
-        format!("{display_name} received a gifted {plan} subscription! ({months} months total)")
-    } else if months <= 1 {
-        format!("{display_name} subscribed with {plan}!")
-    } else {
-        format!("{display_name} resubscribed with {plan}! ({months} months)")
-    }
-}
-
 #[cfg(test)]
 mod echo_tests {
     use super::*;
@@ -163,5 +152,62 @@ mod echo_tests {
         for command in ["/msg NickServ IDENTIFY secret", "/msg ChanServ IDENTIFY secret", "/msg alice,bob hello", "/msg :alice hello"] {
             assert!(extract_irc_msg_echo(command, &source).is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod subscription_tests {
+    use super::*;
+    use crate::runtime::{log_writer::LogWriter, outgoing::ChatSendPublisher};
+    use crust_core::{AppEvent, model::TwitchEmotePos};
+    use crust_storage::LogStore;
+
+    #[tokio::test]
+    async fn subscription_chat_rows_keep_body_and_emotes_after_history_reload() {
+        struct DatabaseFile(std::path::PathBuf);
+        impl Drop for DatabaseFile {
+            fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+        }
+        let file = DatabaseFile(std::env::temp_dir().join(format!(
+            "crust-subscription-{}-{}.sqlite3", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        )));
+        let store = LogStore::with_db_path(file.0.clone()).unwrap();
+        let (events, mut received) = tokio::sync::mpsc::channel(4);
+        let writer = LogWriter::new(&tokio::runtime::Handle::current(), store.clone(), events.clone());
+        let channel = ChannelId::new("room");
+        let mut message = make_system_message(42, channel.clone(), "🦀 Kappa".into(), Utc::now(),
+            MsgKind::Sub { display_name: "Alice".into(), months: 2, plan: "Tier 1".into(),
+                is_gift: false, sub_msg: "🦀 Kappa".into() });
+        message.server_id = Some("subscription-42".into());
+        message.sender.login = "alice".into();
+        message.sender.display_name = "Alice".into();
+        message.sender.user_id = UserId("10".into());
+        message.twitch_emotes.push(TwitchEmotePos { id: "25".into(), start: 2, end: 6 });
+        message.spans = crust_core::format::tokenize_with_flags(
+            &message.raw_text, false, &message.twitch_emotes, &|_| None,
+        );
+        ChatSendPublisher::default().publish_incoming(message, Some(&writer), events).await;
+        assert!(matches!(received.try_recv().unwrap(), AppEvent::MessageReceived { message, .. }
+            if matches!(message.msg_kind, MsgKind::Sub { .. }) && !message.flags.is_history));
+        writer.shutdown().await.unwrap();
+        drop(writer);
+        drop(store);
+
+        let reopened = LogStore::with_db_path(file.0.clone()).unwrap();
+        let rows = reopened.recent_messages(&channel, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].server_id.as_deref(), Some("subscription-42"));
+        assert_eq!(rows[0].sender.login, "alice");
+        assert_eq!(rows[0].raw_text, "🦀 Kappa");
+        assert_eq!(rows[0].plain_text(), "Alice resubscribed with Tier 1! (2 months)\n🦀 Kappa");
+        assert_eq!(rows[0].twitch_emotes[0].start, 2);
+        assert_eq!(rows[0].twitch_emotes[0].end, 6);
+        assert!(rows[0].spans.iter().any(|span| matches!(span,
+            crust_core::model::Span::Emote { id, code, .. } if id == "25" && code == "Kappa")));
+        let date = rows[0].timestamp.format("%Y-%m-%d").to_string();
+        let text = reopened.read(channel.as_str(), &date).await.unwrap();
+        assert!(text.contains("Alice resubscribed with Tier 1! (2 months)\n🦀 Kappa"));
+        assert_eq!(text.matches("🦀 Kappa").count(), 1);
     }
 }

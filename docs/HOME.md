@@ -12,6 +12,7 @@
 - [Chat loading, emotes, and navigation](./AUDIT_CHAT_RELIABILITY.md)
 - [Chat rendering, input, and saved layouts](./AUDIT_CHAT_POLISH.md)
 - [7TV paints, image loading, and chat controls](./AUDIT_NAME_PAINTS.md)
+- [Search, subscriber messages, and live updates](./AUDIT_SEARCH_AND_LIVE_UPDATES.md)
 
 ## Plugins
 
@@ -28,6 +29,7 @@
 
 ## Release notes
 
+- [v0.5.9](./releases/Release_v0.5.9.md)
 - [v0.5.8](./releases/Release_v0.5.8.md)
 - [v0.5.7](./releases/Release_v0.5.7.md)
 - [v0.5.6](./releases/Release_v0.5.6.md)

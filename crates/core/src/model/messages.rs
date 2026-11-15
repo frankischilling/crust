@@ -106,6 +106,21 @@ pub enum MsgKind {
     Bits { amount: u32 },
 }
 
+impl MsgKind {
+    pub fn subscription_notice_text(&self) -> Option<String> {
+        let Self::Sub { display_name, months, plan, is_gift, .. } = self else {
+            return None;
+        };
+        Some(if *is_gift {
+            format!("{display_name} received a gifted {plan} subscription! ({months} months total)")
+        } else if *months <= 1 {
+            format!("{display_name} subscribed with {plan}!")
+        } else {
+            format!("{display_name} resubscribed with {plan}! ({months} months)")
+        })
+    }
+}
+
 /// One occurrence of a Twitch-native emote parsed from the `emotes` IRC tag.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TwitchEmotePos {
@@ -205,10 +220,35 @@ pub struct ChatMessage {
 }
 
 impl ChatMessage {
+    /// Text for search and copying, including subscription messages in older logs.
+    pub fn plain_text(&self) -> std::borrow::Cow<'_, str> {
+        use std::borrow::Cow;
+
+        let MsgKind::Sub { sub_msg, .. } = &self.msg_kind else {
+            return Cow::Borrowed(&self.raw_text);
+        };
+        if sub_msg.trim().is_empty() {
+            if self.raw_text.trim().is_empty() {
+                return Cow::Owned(self.msg_kind.subscription_notice_text().unwrap_or_default());
+            }
+            return Cow::Borrowed(&self.raw_text);
+        }
+        if self.raw_text == *sub_msg || self.raw_text.is_empty() {
+            let notice = self.msg_kind.subscription_notice_text().unwrap_or_default();
+            return Cow::Owned(format!("{notice}\n{sub_msg}"));
+        }
+        if self.raw_text.strip_suffix(sub_msg).is_some_and(|prefix| prefix.ends_with('\n')) {
+            return Cow::Borrowed(&self.raw_text);
+        }
+        Cow::Owned(format!("{}\n{sub_msg}", self.raw_text.trim_end()))
+    }
+
     /// Match a live pending own echo without consulting historical messages.
     /// Callers take the oldest matching candidate to preserve repeated sends.
     pub fn is_pending_own_echo_of(&self, confirmed: &Self) -> bool {
         self.server_id.is_none()
+            && matches!(self.msg_kind, MsgKind::Chat | MsgKind::Bits { .. })
+            && matches!(confirmed.msg_kind, MsgKind::Chat | MsgKind::Bits { .. })
             && self.flags.is_self
             && !self.flags.is_history
             && confirmed.flags.is_self
@@ -284,6 +324,56 @@ impl EmoteCatalogEntry {
 #[cfg(test)]
 mod tests {
     use super::MsgKind;
+
+    fn subscription_message(raw_text: &str, sub_msg: &str) -> super::ChatMessage {
+        super::ChatMessage {
+            id: super::super::MessageId(1),
+            server_id: Some("subscription-1".into()),
+            timestamp: chrono::Utc::now(),
+            channel: super::super::ChannelId::new("room"),
+            sender: super::super::Sender {
+                user_id: super::super::UserId("10".into()), login: "alice".into(),
+                display_name: "Alice".into(), original_display_name: None,
+                color: None, name_paint: None, badges: Vec::new(),
+            },
+            raw_text: raw_text.into(), spans: Default::default(), twitch_emotes: Vec::new(),
+            flags: Default::default(), reply: None, shared: None,
+            msg_kind: MsgKind::Sub { display_name: "Alice".into(), months: 2,
+                plan: "Tier 1".into(), is_gift: false, sub_msg: sub_msg.into() },
+        }
+    }
+
+    #[test]
+    fn subscription_plain_text_preserves_new_and_legacy_bodies_once() {
+        let notice = "Alice resubscribed with Tier 1! (2 months)";
+        let body = "  hello 🦀 Kappa  ";
+        let complete = format!("{notice}\n{body}");
+        for raw_text in [notice, body, complete.as_str()] {
+            let message = subscription_message(raw_text, body);
+            let stored = serde_json::to_string(&message).unwrap();
+            let restored: super::ChatMessage = serde_json::from_str(&stored).unwrap();
+            assert_eq!(restored.plain_text(), complete);
+            assert_eq!(restored.plain_text().matches(body).count(), 1);
+        }
+        assert_eq!(subscription_message(notice, "").plain_text(), notice);
+        assert_eq!(subscription_message("", "").plain_text(), notice);
+        let mut ordinary = subscription_message("ordinary chat", "unused");
+        ordinary.msg_kind = MsgKind::Chat;
+        assert!(matches!(ordinary.plain_text(), std::borrow::Cow::Borrowed("ordinary chat")));
+    }
+
+    #[test]
+    fn own_subscription_body_cannot_confirm_an_outgoing_chat_with_the_same_text() {
+        let mut pending = subscription_message("hello", "hello");
+        pending.msg_kind = MsgKind::Chat;
+        pending.server_id = None;
+        pending.flags.is_self = true;
+        let mut confirmed = subscription_message("hello", "hello");
+        confirmed.flags.is_self = true;
+        assert!(!pending.is_pending_own_echo_of(&confirmed));
+        confirmed.msg_kind = MsgKind::Chat;
+        assert!(pending.is_pending_own_echo_of(&confirmed));
+    }
 
     #[test]
     fn old_emote_metadata_defaults_to_normal_and_overlays_round_trip() {

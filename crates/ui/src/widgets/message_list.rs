@@ -1899,7 +1899,7 @@ impl<'a> MessageList<'a> {
         ui.separator();
         ui.label(RichText::new("Message").small().color(t::text_muted()));
         if ui.button("Copy message text").clicked() {
-            ui.ctx().copy_text(msg.raw_text.clone());
+            ui.ctx().copy_text(msg.plain_text().into_owned());
             ui.close_menu();
         }
         if let Some(server_id) = resolved_server_id.as_deref() {
@@ -2548,7 +2548,7 @@ impl<'a> MessageList<'a> {
                 return;
             }
             _ => {
-                self.render_system_event(ui, msg);
+                self.render_system_event(ui, msg, rctx.reply_key);
                 return;
             }
         }
@@ -2941,12 +2941,12 @@ impl<'a> MessageList<'a> {
         )
     }
 
-    /// Render a compact system-event row (mod action, sub alert, raid, notice).
-    /// These rows are centered italic lines with a colored left stripe and icon.
+    /// Render a notice card, followed by a subscriber's message when present.
     fn render_system_event(
         &self,
         ui: &mut Ui,
         msg: &ChatMessage,
+        reply_key: Id,
     ) {
         let automod_row = msg.sender.login.eq_ignore_ascii_case("automod")
             && msg.raw_text.starts_with("AutoMod:");
@@ -3118,13 +3118,19 @@ impl<'a> MessageList<'a> {
         // range moves, causing egui to report widget ID clashes for every
         // system event in the loaded history.
         ui.push_id(msg.id.0, |ui| {
-            egui::Frame::new()
+            let frame = egui::Frame::new()
                 .fill(t::alpha(accent, 10))
                 .inner_margin(egui::Margin::symmetric(
                     ROW_PAD_X as i8,
                     ROW_PAD_Y as i8 + 1,
                 ))
                 .show(ui, |ui| {
+                    if matches!(msg.msg_kind, MsgKind::Sub { .. }) {
+                        let placeholder = egui::Rect::from_min_size(
+                            ui.max_rect().left_top(), egui::Vec2::ZERO,
+                        );
+                        ui.interact(placeholder, self.state_id("msg_bg_click").with(msg.id.0), egui::Sense::click());
+                    }
                     if msg.flags.is_history {
                         ui.set_opacity(opacity);
                     }
@@ -3297,8 +3303,22 @@ impl<'a> MessageList<'a> {
                             };
                             ui.add(Label::new(rich).wrap());
                         });
+                        if matches!(&msg.msg_kind, MsgKind::Sub { sub_msg, .. } if !sub_msg.trim().is_empty()) {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                self.render_spans(ui, msg, reply_key);
+                            });
+                        }
                     }
                 });
+            if matches!(msg.msg_kind, MsgKind::Sub { .. }) {
+                let response = ui.interact(
+                    frame.response.rect,
+                    self.state_id("msg_bg_click").with(msg.id.0),
+                    egui::Sense::click(),
+                );
+                response.context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
+            }
         }); // end push_id
     }
 
@@ -3611,11 +3631,18 @@ impl MessageBody<'_> {
         msg: &ChatMessage,
         context_menu: &mut dyn FnMut(&mut Ui),
     ) -> bool {
-        if msg.flags.is_deleted || msg.spans.is_empty() {
-            let text = if msg.raw_text.trim().is_empty() {
+        let (raw_text, spans) = match &msg.msg_kind {
+            MsgKind::Sub { sub_msg, .. } if !sub_msg.trim().is_empty() => {
+                let spans = if msg.raw_text == *sub_msg { msg.spans.as_slice() } else { &[] };
+                (sub_msg.as_str(), spans)
+            }
+            _ => (msg.raw_text.as_str(), msg.spans.as_slice()),
+        };
+        if msg.flags.is_deleted || spans.is_empty() {
+            let text = if raw_text.trim().is_empty() {
                 "(no text)"
             } else {
-                &msg.raw_text
+                raw_text
             };
             let rich = if msg.flags.is_deleted {
                 RichText::new(format!("✂ {text}"))
@@ -3632,7 +3659,7 @@ impl MessageBody<'_> {
             return response.clicked();
         }
         let mut clicked = false;
-        for item in crust_core::format::display_spans(&msg.spans) {
+        for item in crust_core::format::display_spans(spans) {
             match item {
                 crust_core::format::DisplaySpan::Single(span) => {
                     clicked |= self.render_span(
@@ -5166,15 +5193,25 @@ mod tests {
         ctx.include_bytes(uri.clone(), egui::load::Bytes::Shared(raw.clone()));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            match ctx.try_load_texture(&format!("{uri}#0"), egui::TextureOptions::LINEAR,
-                egui::load::SizeHint::default()) {
-                Ok(egui::load::TexturePoll::Ready { .. }) => break,
-                Ok(egui::load::TexturePoll::Pending { .. }) => {
-                    assert!(std::time::Instant::now() < deadline, "fixture decode timed out");
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+            // Paused rendering has its own first-frame decoder and texture cache.
+            // Warming the animated URI does not settle that separate request.
+            let ready = if !animate && is_animation_format(&raw) {
+                images.static_texture(&ctx, url).is_some()
+            } else {
+                match ctx.try_load_texture(&format!("{uri}#0"), egui::TextureOptions::LINEAR,
+                    egui::load::SizeHint::default()) {
+                    Ok(egui::load::TexturePoll::Ready { .. }) => true,
+                    Ok(egui::load::TexturePoll::Pending { .. }) => false,
+                    Err(error) => panic!("fixture decode failed: {error}"),
                 }
-                Err(error) => panic!("fixture decode failed: {error}"),
+            };
+            // A decoder publishes its pixels before requesting the completion
+            // repaint. Wait for the job to finish before measuring idle frames.
+            if ready && images.work_stats(&ctx).pending_decodes == 0 {
+                break;
             }
+            assert!(std::time::Instant::now() < deadline, "fixture decode timed out");
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         let messages = VecDeque::new();
         let channel = ChannelId::new("room");
@@ -5518,6 +5555,100 @@ mod tests {
         (output, response, row_spacing)
     }
 
+    #[test]
+    fn subscription_rows_wrap_and_copy_new_and_legacy_subscriber_text_once() {
+        let body = "subscriber-start alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa quebec romeo sierra tango uniform victor whiskey xray yankee zulu subscriber-end";
+        let notice = "Alice resubscribed with Tier 1! (12 months)";
+        for legacy in [false, true] {
+            let ctx = egui::Context::default();
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+            let sender = UiCommandSender::new(sender);
+            let mut message = test_msg("alice", "10", None);
+            message.server_id = Some("subscription-1".into());
+            message.raw_text = if legacy { notice } else { body }.into();
+            message.spans.push(Span::Text { text: message.raw_text.clone(), is_action: false });
+            message.msg_kind = MsgKind::Sub {
+                display_name: "Alice".into(), months: 12, plan: "Tier 1".into(),
+                is_gift: false, sub_msg: body.into(),
+            };
+            let messages = VecDeque::from([message]);
+            for _ in 0..3 {
+                wrapping_message_frame(&ctx, &messages, &sender, Vec::new());
+            }
+            let (output, response, _) = wrapping_message_frame(&ctx, &messages, &sender, Vec::new());
+            let body_shapes: Vec<_> = output.shapes.iter().filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == body => Some(text),
+                _ => None,
+            }).collect();
+            assert_eq!(body_shapes.len(), 1, "subscriber body must appear once (legacy={legacy})");
+            let text = body_shapes[0];
+            assert!(text.galley.rows.len() > 1, "long subscriber text must wrap");
+            let row = response.expect("subscription row is interactive").rect;
+            for line in &text.galley.rows {
+                let rect = line.visuals.mesh_bounds.translate(text.pos.to_vec2());
+                assert!(row.expand(1.0).contains_rect(rect), "subscriber text escaped its row: {rect:?} vs {row:?}");
+            }
+            let headers: Vec<_> = output.shapes.iter().filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text().contains("Alice resubscribed") => Some(text),
+                _ => None,
+            }).collect();
+            assert_eq!(headers.len(), 1, "subscription notice must appear once");
+            assert!(headers[0].pos.y + headers[0].galley.size().y <= text.pos.y + 1.0);
+
+            let body_point = text.pos + egui::vec2(12.0, 8.0);
+            for pressed in [true, false] {
+                wrapping_message_frame(&ctx, &messages, &sender, vec![
+                    egui::Event::PointerMoved(body_point),
+                    egui::Event::PointerButton { pos: body_point, button: egui::PointerButton::Secondary,
+                        pressed, modifiers: egui::Modifiers::NONE },
+                ]);
+            }
+            assert!(ctx.is_context_menu_open());
+            let output = wrapping_message_frame(&ctx, &messages, &sender, Vec::new()).0;
+            let copy = body_text_rect(&output, "Copy message text").unwrap().center();
+            let pointer = |pressed| vec![
+                egui::Event::PointerMoved(copy),
+                egui::Event::PointerButton { pos: copy, button: egui::PointerButton::Primary,
+                    pressed, modifiers: egui::Modifiers::NONE },
+            ];
+            wrapping_message_frame(&ctx, &messages, &sender, pointer(true));
+            let output = wrapping_message_frame(&ctx, &messages, &sender, pointer(false)).0;
+            let expected = format!("{notice}\n{body}");
+            assert!(output.platform_output.commands.iter().any(|command| {
+                matches!(command, egui::OutputCommand::CopyText(text) if text == &expected)
+            }));
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn subscription_body_links_keep_click_priority_over_the_card() {
+        let ctx = egui::Context::default();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let sender = UiCommandSender::new(sender);
+        let mut message = test_msg("alice", "10", None);
+        message.raw_text = "thanks https://example.test/".into();
+        message.spans = crust_core::format::tokenize_with_flags(&message.raw_text, false, &[], &|_| None);
+        message.msg_kind = MsgKind::Sub {
+            display_name: "Alice".into(), months: 1, plan: "Tier 1".into(),
+            is_gift: false, sub_msg: message.raw_text.clone(),
+        };
+        let messages = VecDeque::from([message]);
+        for _ in 0..3 { wrapping_message_frame(&ctx, &messages, &sender, Vec::new()); }
+        let output = wrapping_message_frame(&ctx, &messages, &sender, Vec::new()).0;
+        let link = body_text_rect(&output, "https://example.test/").unwrap().center();
+        for pressed in [true, false] {
+            wrapping_message_frame(&ctx, &messages, &sender, vec![
+                egui::Event::PointerMoved(link),
+                egui::Event::PointerButton { pos: link, button: egui::PointerButton::Primary,
+                    pressed, modifiers: egui::Modifiers::NONE },
+            ]);
+        }
+        assert!(matches!(receiver.try_recv().unwrap(), AppCommand::OpenUrl { url }
+            if url == "https://example.test/"));
+        assert!(receiver.try_recv().is_err());
+    }
+
     fn wrapping_body_rects(
         output: &egui::FullOutput,
         wanted: &HashSet<&str>,
@@ -5617,7 +5748,7 @@ mod tests {
             )[0]
             .center();
             for pressed in [true, false] {
-                rendered = wrapping_message_frame(
+                let _ = wrapping_message_frame(
                     &ctx,
                     &messages,
                     &sender,
@@ -5637,7 +5768,7 @@ mod tests {
             );
             assert!(receiver.try_recv().is_err());
             for pressed in [true, false] {
-                rendered = wrapping_message_frame(
+                let _ = wrapping_message_frame(
                     &ctx,
                     &messages,
                     &sender,

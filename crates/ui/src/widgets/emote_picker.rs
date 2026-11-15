@@ -96,6 +96,7 @@ pub struct EmotePicker {
     focus_search: bool,
     accept_search: bool,
     restore_search_focus_after: Option<u64>,
+    focused_control: Option<egui::Id>,
 }
 
 impl Default for EmotePicker {
@@ -116,6 +117,7 @@ impl Default for EmotePicker {
             focus_search: false,
             accept_search: false,
             restore_search_focus_after: None,
+            focused_control: None,
         }
     }
 }
@@ -125,6 +127,7 @@ impl EmotePicker {
         self.open = !self.open;
         self.accept_search = false;
         self.restore_search_focus_after = None;
+        self.focused_control = None;
         if self.open {
             self.filter.clear();
             self.cache = None;
@@ -144,6 +147,14 @@ impl EmotePicker {
         egui::Id::new("emote_picker_search")
     }
 
+    fn window_id() -> egui::Id {
+        egui::Id::new("Emotes")
+    }
+
+    fn window_layer() -> egui::LayerId {
+        egui::LayerId::new(egui::Order::Middle, Self::window_id())
+    }
+
     /// Run before the application's shortcuts so this window owns its focused keys.
     pub fn handle_shortcuts(&mut self, ctx: &Context) {
         if !self.open {
@@ -157,14 +168,22 @@ impl EmotePicker {
             self.restore_search_focus_after = None;
             ctx.memory_mut(|memory| memory.request_focus(Self::search_id()));
         }
-        let search_owns_keys = ctx.memory(|memory| {
-            memory.has_focus(Self::search_id())
-                || (memory.focused().is_none() && memory.had_focus_last_frame(Self::search_id()))
+        // Escape clears egui's focus before widgets run. Retain the previous
+        // control only while it still owned focus at the start of this pass.
+        let focused = ctx.memory(|memory| {
+            memory.focused().or_else(|| {
+                self.focused_control
+                    .filter(|id| memory.had_focus_last_frame(*id))
+            })
         });
-        if ctx.is_context_menu_open() || !search_owns_keys {
+        let owns_keys = focused
+            .and_then(|id| ctx.read_response(id))
+            .is_some_and(|response| response.layer_id == Self::window_layer());
+        if ctx.is_context_menu_open() || !owns_keys {
             return;
         }
-        let (close, next, previous, direct, accept) = ctx.input_mut(|input| {
+        let search_owns_keys = focused == Some(Self::search_id());
+        let (close, next, previous, direct, accept, search) = ctx.input_mut(|input| {
             use crate::app::consume_exact_key;
             use egui::{Key, Modifiers};
 
@@ -186,14 +205,28 @@ impl EmotePicker {
             ]
             .iter()
             .position(|key| consume_exact_key(input, Modifiers::ALT | Modifiers::CTRL, *key));
-            let accept = consume_exact_key(input, Modifiers::NONE, Key::Enter);
-            (close, next, previous, direct, accept)
+            let accept = search_owns_keys
+                && consume_exact_key(input, Modifiers::NONE, Key::Enter);
+            let search = consume_exact_key(input, Modifiers::CTRL, Key::F);
+            (close, next, previous, direct, accept, search)
         });
         if close {
             self.open = false;
             self.accept_search = false;
             self.restore_search_focus_after = None;
+            self.focused_control = None;
             return;
+        }
+        if search {
+            self.focus_search = true;
+            let id = Self::search_id();
+            if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
+                state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    egui::text::CCursor::new(self.filter.chars().count()),
+                )));
+                egui::TextEdit::store_state(ctx, id, state);
+            }
         }
         if previous || next {
             // egui decides Tab focus traversal before shortcuts are consumed,
@@ -579,6 +612,7 @@ impl EmotePicker {
         let max_size = (bounds.size() - frame.total_margin().sum() - egui::vec2(0.0, title_height))
             .max(egui::Vec2::splat(1.0));
         let window_resp = egui::Window::new("Emotes")
+            .id(Self::window_id())
             .open(&mut still_open)
             .default_size(egui::vec2(320.0, 380.0).min(max_size))
             .min_size(egui::vec2(200.0, 180.0).min(max_size))
@@ -744,6 +778,13 @@ impl EmotePicker {
                                         .with((entry.url.as_str(), cat_idx)),
                                     egui::Sense::click(),
                                 );
+                                cell_response.widget_info(|| {
+                                    egui::WidgetInfo::labeled(
+                                        egui::WidgetType::Button,
+                                        ui.is_enabled(),
+                                        &entry.code,
+                                    )
+                                });
                                 let is_hovered = cell_response.hovered();
                                 if cell_response.clicked() {
                                     picked = Some(entry.code.clone());
@@ -793,6 +834,15 @@ impl EmotePicker {
                                         "★",
                                         t::tiny(),
                                         t::gold(),
+                                    );
+                                }
+
+                                if cell_response.has_focus() {
+                                    ui.painter().rect_stroke(
+                                        cell_rect.expand(2.0),
+                                        4.0,
+                                        egui::Stroke::new(2.0_f32, t::accent()),
+                                        egui::epaint::StrokeKind::Outside,
                                     );
                                 }
 
@@ -903,6 +953,16 @@ impl EmotePicker {
             // window, so restore it after those controls have been registered.
             ctx.memory_mut(|memory| memory.request_focus(Self::search_id()));
         }
+        self.focused_control = if self.open {
+            ctx.memory(|memory| memory.focused()).filter(|id| {
+                ctx.read_response(*id)
+                    .is_some_and(|response| response.layer_id == Self::window_layer())
+            })
+        } else {
+            self.focus_search = false;
+            self.restore_search_focus_after = None;
+            None
+        };
         picked
     }
 }
@@ -1226,6 +1286,197 @@ mod tests {
         assert!(!ctx.memory(|memory| memory.has_focus(EmotePicker::search_id())));
         assert!(picker.active_view == PickerView::All);
         assert!(picker.open);
+    }
+
+    #[test]
+    fn picker_controls_keep_navigation_shortcuts_inside_the_window() {
+        use egui::{Key, Modifiers};
+
+        for (key_code, modifiers, expected) in [
+            (Key::Tab, Modifiers::CTRL, PickerView::Favorites),
+            (Key::PageDown, Modifiers::CTRL, PickerView::Favorites),
+            (
+                Key::Tab,
+                Modifiers::CTRL | Modifiers::SHIFT,
+                PickerView::Provider(TABS.len() - 1),
+            ),
+            (
+                Key::PageUp,
+                Modifiers::CTRL,
+                PickerView::Provider(TABS.len() - 1),
+            ),
+            (
+                Key::Num5,
+                Modifiers::CTRL | Modifiers::ALT,
+                PickerView::Provider(1),
+            ),
+        ] {
+            let ctx = Context::default();
+            let mut picker = EmotePicker::default();
+            picker.toggle();
+            frame(&ctx, &mut picker, &[], Vec::new(), false);
+            frame(
+                &ctx,
+                &mut picker,
+                &[],
+                vec![key(Key::Tab, Modifiers::NONE)],
+                false,
+            );
+            frame(&ctx, &mut picker, &[], Vec::new(), false);
+            assert!(picker.focused_control.is_some());
+            assert_ne!(picker.focused_control, Some(EmotePicker::search_id()));
+
+            let (picked, _) = frame(
+                &ctx,
+                &mut picker,
+                &[],
+                vec![key(key_code, modifiers)],
+                false,
+            );
+            assert!(picked.is_none());
+            assert!(picker.open);
+            assert!(picker.active_view == expected, "{modifiers:?}+{key_code:?}");
+            assert!(!ctx.input(|input| input.key_pressed(key_code)));
+        }
+    }
+
+    #[test]
+    fn escape_closes_picker_after_tabbing_to_its_controls() {
+        let ctx = Context::default();
+        let mut picker = EmotePicker::default();
+        picker.toggle();
+        frame(&ctx, &mut picker, &[], Vec::new(), false);
+        frame(
+            &ctx,
+            &mut picker,
+            &[],
+            vec![key(egui::Key::Tab, egui::Modifiers::NONE)],
+            false,
+        );
+        frame(&ctx, &mut picker, &[], Vec::new(), false);
+        assert!(picker.focused_control.is_some());
+        assert_ne!(picker.focused_control, Some(EmotePicker::search_id()));
+        let (picked, _) = frame(
+            &ctx,
+            &mut picker,
+            &[],
+            vec![key(egui::Key::Escape, egui::Modifiers::NONE)],
+            false,
+        );
+        assert!(picked.is_none());
+        assert!(!picker.open);
+        assert!(picker.focused_control.is_none());
+    }
+
+    #[test]
+    fn search_shortcut_refocuses_picker_and_selects_existing_text() {
+        let ctx = Context::default();
+        let mut picker = EmotePicker::default();
+        picker.toggle();
+        frame(&ctx, &mut picker, &[], Vec::new(), false);
+        frame(
+            &ctx,
+            &mut picker,
+            &[],
+            vec![egui::Event::Text("Kåppa🙂".to_owned())],
+            false,
+        );
+        frame(
+            &ctx,
+            &mut picker,
+            &[],
+            vec![key(egui::Key::Tab, egui::Modifiers::NONE)],
+            false,
+        );
+        frame(&ctx, &mut picker, &[], Vec::new(), false);
+        assert_ne!(picker.focused_control, Some(EmotePicker::search_id()));
+        frame(
+            &ctx,
+            &mut picker,
+            &[],
+            vec![key(egui::Key::F, egui::Modifiers::CTRL)],
+            false,
+        );
+        assert!(ctx.memory(|memory| memory.has_focus(EmotePicker::search_id())));
+        assert!(!ctx.input(|input| input.key_pressed(egui::Key::F)));
+        let range = egui::TextEdit::load_state(&ctx, EmotePicker::search_id())
+            .unwrap()
+            .cursor
+            .char_range()
+            .unwrap();
+        let start = range.primary.index.min(range.secondary.index);
+        let end = range.primary.index.max(range.secondary.index);
+        assert_eq!(start, 0);
+        assert_eq!(end, "Kåppa🙂".chars().count());
+        frame(
+            &ctx,
+            &mut picker,
+            &[],
+            vec![egui::Event::Text("Kappa".to_owned())],
+            false,
+        );
+        assert_eq!(picker.filter, "Kappa");
+    }
+
+    #[test]
+    fn focused_emote_cells_show_focus_and_accept_their_own_entry() {
+        let ctx = Context::default();
+        ctx.style_mut(|style| style.animation_time = 0.0);
+        let mut picker = EmotePicker::default();
+        picker.emoji_entries.clear();
+        picker.toggle();
+        let catalog = [
+            entry("Kappa", "twitch", "https://example.test/kappa.png"),
+            entry("PogChamp", "twitch", "https://example.test/pogchamp.png"),
+        ];
+        frame(&ctx, &mut picker, &catalog, Vec::new(), false);
+        let id = egui::Id::new("emote_picker_cell").with((catalog[1].url.as_str(), 1usize));
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        let (_, output) = frame(&ctx, &mut picker, &catalog, Vec::new(), false);
+        let cell = ctx.read_response(id).unwrap();
+        assert!(cell.has_focus());
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Rect(rect) if rect.rect == cell.rect.expand(2.0)
+                && rect.stroke.width == 2.0 && rect.stroke.color == t::accent())));
+        let (picked, output) = frame(
+            &ctx,
+            &mut picker,
+            &catalog,
+            vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+            false,
+        );
+        assert_eq!(picked.as_deref(), Some("PogChamp"));
+        assert!(!picker.open);
+        assert!(output.platform_output.events.iter().any(|event| matches!(event,
+            egui::output::OutputEvent::Clicked(info)
+                if info.typ == egui::WidgetType::Button
+                    && info.label.as_deref() == Some("PogChamp"))));
+    }
+
+    #[test]
+    fn picker_shortcuts_leave_external_composer_keys_available() {
+        for (key_code, modifiers) in [
+            (egui::Key::Tab, egui::Modifiers::CTRL),
+            (egui::Key::F, egui::Modifiers::CTRL),
+            (egui::Key::Escape, egui::Modifiers::NONE),
+        ] {
+            let ctx = Context::default();
+            let mut picker = EmotePicker::default();
+            picker.toggle();
+            frame(&ctx, &mut picker, &[], Vec::new(), false);
+            frame(&ctx, &mut picker, &[], Vec::new(), true);
+            let (picked, _) = frame(
+                &ctx,
+                &mut picker,
+                &[],
+                vec![key(key_code, modifiers)],
+                false,
+            );
+            assert!(picked.is_none());
+            assert!(picker.open);
+            assert!(picker.active_view == PickerView::All);
+            assert!(ctx.input(|input| input.key_pressed(key_code)));
+        }
     }
 
     #[test]
