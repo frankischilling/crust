@@ -2129,6 +2129,7 @@ unsafe extern "C" fn native_send_message(L: *mut lua_State) -> c_int {
         text,
         reply_to_msg_id,
         reply,
+        composer: None,
     })
 }
 
@@ -2470,6 +2471,7 @@ unsafe extern "C" fn native_upload_image(L: *mut lua_State) -> c_int {
         bytes,
         format,
         source_path,
+        composer: None,
     })
 }
 
@@ -3612,11 +3614,7 @@ fn make_command_context(
             set_field_string(L, -1, "reply_to_msg_id", reply_to_msg_id);
         }
         if let Some(reply) = &invocation.reply {
-            lua_createtable(L, 0, 0);
-            set_field_string(L, -1, "parent_msg_id", &reply.parent_msg_id);
-            set_field_string(L, -1, "parent_user_login", &reply.parent_user_login);
-            set_field_string(L, -1, "parent_display_name", &reply.parent_display_name);
-            set_field_string(L, -1, "parent_msg_body", &reply.parent_msg_body);
+            push_reply_info_table(L, reply);
             lua_setfield(L, -2, cstring("reply").as_ptr());
         }
         lua_gettop(L)
@@ -3909,6 +3907,12 @@ fn push_reply_info_table(L: *mut lua_State, reply: &ReplyInfo) {
         set_field_string(L, -1, "parent_user_login", &reply.parent_user_login);
         set_field_string(L, -1, "parent_display_name", &reply.parent_display_name);
         set_field_string(L, -1, "parent_msg_body", &reply.parent_msg_body);
+        if let Some(id) = &reply.thread_parent_msg_id {
+            set_field_string(L, -1, "thread_parent_msg_id", id);
+        }
+        if let Some(login) = &reply.thread_parent_user_login {
+            set_field_string(L, -1, "thread_parent_user_login", login);
+        }
     }
 }
 
@@ -4414,12 +4418,16 @@ fn lua_table_reply_info(L: *mut lua_State, idx: c_int, field: &str) -> Option<Re
         let parent_user_login = lua_table_string_strict(L, -1, "parent_user_login");
         let parent_display_name = lua_table_string_strict(L, -1, "parent_display_name");
         let parent_msg_body = lua_table_string_strict(L, -1, "parent_msg_body");
+        let thread_parent_msg_id = lua_table_string_strict(L, -1, "thread_parent_msg_id");
+        let thread_parent_user_login = lua_table_string_strict(L, -1, "thread_parent_user_login");
         lua_pop(L, 1);
         Some(ReplyInfo {
             parent_msg_id: parent_msg_id?,
             parent_user_login: parent_user_login?,
             parent_display_name: parent_display_name?,
             parent_msg_body: parent_msg_body?,
+            thread_parent_msg_id,
+            thread_parent_user_login,
         })
     }
 }
@@ -6037,7 +6045,7 @@ unsafe fn make_event_table(L: *mut lua_State, event: &AppEvent) -> c_int {
             push_channel_table(L, channel);
             lua_setfield(L, -2, cstring("channel").as_ptr());
         }
-        AppEvent::UploadFinished { channel, result } => {
+        AppEvent::UploadFinished { channel, result, .. } => {
             push_channel_table(L, channel);
             lua_setfield(L, -2, cstring("channel").as_ptr());
             match result {
@@ -6314,15 +6322,17 @@ mod tests {
                 parent_user_login: "viewer".to_owned(),
                 parent_display_name: "Viewer".to_owned(),
                 parent_msg_body: "quoted message".to_owned(),
+                ..Default::default()
             }),
             reason: "Message was not sent. Sign-in is still in progress.".to_owned(),
+            composer: None,
         };
         assert_eq!(event_kind(&event), Some(PluginEventKind::Error));
         let idx = unsafe { make_event_table(lua.ptr(), &event) };
         assert_eq!(lua_get_string_field(lua.ptr(), idx, "type").as_deref(), Some("Error"));
         assert_eq!(lua_get_string_field(lua.ptr(), idx, "context").as_deref(), Some("SendMessage"));
         assert_eq!(lua_get_string_field(lua.ptr(), idx, "message").as_deref(), Some("Message was not sent. Sign-in is still in progress."));
-        for field in ["text", "channel", "reply", "reply_to_msg_id"] {
+        for field in ["text", "channel", "reply", "reply_to_msg_id", "composer"] {
             unsafe {
                 lua_getfield(lua.ptr(), idx, cstring(field).as_ptr());
                 assert_eq!(lua_type(lua.ptr(), -1), LUA_TNIL);
@@ -7620,7 +7630,7 @@ end)
             host.dispatch_event(&event);
             assert_eq!(outcome(), (Some(true), None, true));
             match received.try_recv().unwrap() {
-                AppCommand::SendMessage { channel, text, reply_to_msg_id, reply } => {
+                AppCommand::SendMessage { channel, text, reply_to_msg_id, reply, .. } => {
                     assert_eq!(action, "message");
                     assert_eq!(channel, ChannelId::new("room"));
                     assert_eq!(text, "keep this draft");
@@ -7686,6 +7696,7 @@ c2.send_message("some_channel", "hello", {
                 text,
                 reply_to_msg_id,
                 reply,
+                ..
             } => {
                 assert_eq!(channel, ChannelId::new("some_channel"));
                 assert_eq!(text, "hello");
@@ -7740,6 +7751,7 @@ c2.send_message("some_channel", "hello", {
                 text,
                 reply_to_msg_id,
                 reply,
+                ..
             } => {
                 assert_eq!(channel, ChannelId::new("some_channel"));
                 assert_eq!(text, "hello");
@@ -7796,6 +7808,7 @@ c2.send_message("some_channel", "hello", {
                 text,
                 reply_to_msg_id,
                 reply,
+                ..
             } => {
                 assert_eq!(channel, ChannelId::new("some_channel"));
                 assert_eq!(text, "hello");

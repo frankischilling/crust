@@ -73,6 +73,7 @@ struct CachedDisplay {
 /// Floating emote picker window with provider tabs.
 pub struct EmotePicker {
     pub open: bool,
+    id_namespace: Option<egui::Id>,
     filter: String,
     active_view: PickerView,
     /// Cached filtered/grouped view.
@@ -103,6 +104,7 @@ impl Default for EmotePicker {
     fn default() -> Self {
         Self {
             open: false,
+            id_namespace: None,
             filter: String::new(),
             active_view: PickerView::All,
             cache: None,
@@ -123,6 +125,12 @@ impl Default for EmotePicker {
 }
 
 impl EmotePicker {
+    /// Give a separate composer its own picker focus and window state.
+    pub fn with_namespace(mut self, namespace: impl std::hash::Hash) -> Self {
+        self.id_namespace = Some(egui::Id::new(namespace));
+        self
+    }
+
     pub fn toggle(&mut self) {
         self.open = !self.open;
         self.accept_search = false;
@@ -143,16 +151,43 @@ impl EmotePicker {
         self.display_cache = None;
     }
 
-    fn search_id() -> egui::Id {
-        egui::Id::new("emote_picker_search")
+    fn scoped_id(&self, name: &'static str) -> egui::Id {
+        let id = egui::Id::new(name);
+        self.id_namespace.map_or(id, |namespace| id.with(namespace))
     }
 
-    fn window_id() -> egui::Id {
-        egui::Id::new("Emotes")
+    fn search_id(&self) -> egui::Id {
+        self.scoped_id("emote_picker_search")
     }
 
-    fn window_layer() -> egui::LayerId {
-        egui::LayerId::new(egui::Order::Middle, Self::window_id())
+    fn window_id(&self) -> egui::Id {
+        self.scoped_id("Emotes")
+    }
+
+    fn window_layer(&self) -> egui::LayerId {
+        egui::LayerId::new(egui::Order::Middle, self.window_id())
+    }
+
+    fn focused_widget(&self, ctx: &Context) -> Option<egui::Id> {
+        if !self.open {
+            return None;
+        }
+        // Escape clears egui's focus before widgets run. Retain the previous
+        // control only while it still owned focus at the start of this pass.
+        ctx.memory(|memory| {
+            memory.focused().or_else(|| {
+                self.focused_control
+                    .filter(|id| memory.had_focus_last_frame(*id))
+            })
+        })
+        .filter(|id| {
+            ctx.read_response(*id)
+                .is_some_and(|response| response.layer_id == self.window_layer())
+        })
+    }
+
+    pub(crate) fn owns_keyboard(&self, ctx: &Context) -> bool {
+        self.focused_widget(ctx).is_some()
     }
 
     /// Run before the application's shortcuts so this window owns its focused keys.
@@ -166,23 +201,13 @@ impl EmotePicker {
             .is_some_and(|previous| previous < pass)
         {
             self.restore_search_focus_after = None;
-            ctx.memory_mut(|memory| memory.request_focus(Self::search_id()));
+            ctx.memory_mut(|memory| memory.request_focus(self.search_id()));
         }
-        // Escape clears egui's focus before widgets run. Retain the previous
-        // control only while it still owned focus at the start of this pass.
-        let focused = ctx.memory(|memory| {
-            memory.focused().or_else(|| {
-                self.focused_control
-                    .filter(|id| memory.had_focus_last_frame(*id))
-            })
-        });
-        let owns_keys = focused
-            .and_then(|id| ctx.read_response(id))
-            .is_some_and(|response| response.layer_id == Self::window_layer());
-        if ctx.is_context_menu_open() || !owns_keys {
+        let focused = self.focused_widget(ctx);
+        if ctx.is_context_menu_open() || focused.is_none() {
             return;
         }
-        let search_owns_keys = focused == Some(Self::search_id());
+        let search_owns_keys = focused == Some(self.search_id());
         let (close, next, previous, direct, accept, search) = ctx.input_mut(|input| {
             use crate::app::consume_exact_key;
             use egui::{Key, Modifiers};
@@ -219,7 +244,7 @@ impl EmotePicker {
         }
         if search {
             self.focus_search = true;
-            let id = Self::search_id();
+            let id = self.search_id();
             if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
                 state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
                     egui::text::CCursor::new(0),
@@ -593,6 +618,9 @@ impl EmotePicker {
             return None;
         }
         let accept_search = std::mem::take(&mut self.accept_search);
+        let search_id = self.search_id();
+        let window_id = self.window_id();
+        let cell_id = self.scoped_id("emote_picker_cell");
 
         let mut picked: Option<String> = None;
         let mut picked_entry: Option<EmoteCatalogEntry> = None;
@@ -612,7 +640,7 @@ impl EmotePicker {
         let max_size = (bounds.size() - frame.total_margin().sum() - egui::vec2(0.0, title_height))
             .max(egui::Vec2::splat(1.0));
         let window_resp = egui::Window::new("Emotes")
-            .id(Self::window_id())
+            .id(window_id)
             .open(&mut still_open)
             .default_size(egui::vec2(320.0, 380.0).min(max_size))
             .min_size(egui::vec2(200.0, 180.0).min(max_size))
@@ -626,7 +654,7 @@ impl EmotePicker {
                 ui.horizontal(|ui| {
                     let search = ui.add(
                         egui::TextEdit::singleline(&mut self.filter)
-                            .id(Self::search_id())
+                            .id(search_id)
                             .hint_text("Search emotes...")
                             .desired_width(ui.available_width()),
                     );
@@ -774,8 +802,7 @@ impl EmotePicker {
 
                                 let cell_response = ui.interact(
                                     cell_rect,
-                                    egui::Id::new("emote_picker_cell")
-                                        .with((entry.url.as_str(), cat_idx)),
+                                    cell_id.with((entry.url.as_str(), cat_idx)),
                                     egui::Sense::click(),
                                 );
                                 cell_response.widget_info(|| {
@@ -951,12 +978,12 @@ impl EmotePicker {
         if self.open && self.restore_search_focus_after == Some(ctx.cumulative_pass_nr()) {
             // Forward Tab gives focus to the next button while laying out the
             // window, so restore it after those controls have been registered.
-            ctx.memory_mut(|memory| memory.request_focus(Self::search_id()));
+            ctx.memory_mut(|memory| memory.request_focus(search_id));
         }
         self.focused_control = if self.open {
             ctx.memory(|memory| memory.focused()).filter(|id| {
                 ctx.read_response(*id)
-                    .is_some_and(|response| response.layer_id == Self::window_layer())
+                    .is_some_and(|response| response.layer_id == self.window_layer())
             })
         } else {
             self.focus_search = false;
@@ -1068,6 +1095,112 @@ mod tests {
             },
         );
         (picked, output)
+    }
+
+    #[test]
+    fn separate_pickers_keep_queries_navigation_and_identical_cells_independent() {
+        let ctx = Context::default();
+        ctx.style_mut(|style| style.animation_time = 0.0);
+        let mut main = EmotePicker::default();
+        let mut thread = EmotePicker::default().with_namespace(("thread", "account", "root"));
+        main.emoji_entries.clear();
+        thread.emoji_entries.clear();
+        main.toggle();
+        thread.toggle();
+        let catalog = [entry("Kappa", "twitch", "https://example.test/kappa.png")];
+        let (sender, _receiver) = tokio::sync::mpsc::channel(4);
+        let sender = UiCommandSender::new(sender);
+        let images = UiImageCache::default();
+        let run = |main: &mut EmotePicker, thread: &mut EmotePicker, events| {
+            let mut picks = (None, None);
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1100.0, 750.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    main.handle_shortcuts(ctx);
+                    thread.handle_shortcuts(ctx);
+                    if let Some(code) = main.show(ctx, &catalog, &images, &sender, false) {
+                        picks.0 = Some(code);
+                    }
+                    if let Some(code) = thread.show(ctx, &catalog, &images, &sender, false) {
+                        picks.1 = Some(code);
+                    }
+                },
+            );
+            picks
+        };
+        for _ in 0..3 {
+            run(&mut main, &mut thread, Vec::new());
+        }
+        assert_eq!(main.search_id(), egui::Id::new("emote_picker_search"));
+        assert_eq!(main.window_id(), egui::Id::new("Emotes"));
+        assert_ne!(main.window_id(), thread.window_id());
+        assert_ne!(main.search_id(), thread.search_id());
+
+        ctx.memory_mut(|memory| memory.request_focus(thread.search_id()));
+        run(
+            &mut main,
+            &mut thread,
+            vec![egui::Event::Text("Ka".into())],
+        );
+        assert_eq!(thread.filter, "Ka");
+        assert!(main.filter.is_empty());
+        assert!(thread.owns_keyboard(&ctx));
+        assert!(!main.owns_keyboard(&ctx));
+        run(
+            &mut main,
+            &mut thread,
+            vec![key(egui::Key::Tab, egui::Modifiers::CTRL)],
+        );
+        assert!(thread.active_view == PickerView::Favorites);
+        assert!(main.active_view == PickerView::All);
+        run(
+            &mut main,
+            &mut thread,
+            vec![key(
+                egui::Key::Tab,
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            )],
+        );
+        run(&mut main, &mut thread, Vec::new());
+        assert!(thread.active_view == PickerView::All);
+        assert!(main.filter.is_empty());
+        assert_eq!(thread.filter, "Ka");
+
+        let main_cell = main
+            .scoped_id("emote_picker_cell")
+            .with((catalog[0].url.as_str(), 0usize));
+        let thread_cell = thread
+            .scoped_id("emote_picker_cell")
+            .with((catalog[0].url.as_str(), 0usize));
+        assert_ne!(main_cell, thread_cell);
+        assert_eq!(
+            ctx.read_response(main_cell).unwrap().layer_id,
+            main.window_layer()
+        );
+        assert_eq!(
+            ctx.read_response(thread_cell).unwrap().layer_id,
+            thread.window_layer()
+        );
+        ctx.memory_mut(|memory| memory.request_focus(main_cell));
+        run(&mut main, &mut thread, Vec::new());
+        assert!(main.owns_keyboard(&ctx));
+        assert!(!thread.owns_keyboard(&ctx));
+        let picked = run(
+            &mut main,
+            &mut thread,
+            vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        assert_eq!(picked, (Some("Kappa".into()), None));
+        assert!(!main.open);
+        assert!(thread.open);
+        assert_eq!(thread.filter, "Ka");
     }
 
     fn picker_repaint_delay(raw: Vec<u8>, animate: bool) -> std::time::Duration {
@@ -1238,7 +1371,7 @@ mod tests {
         picker.toggle();
         let catalog = [entry("Kappa", "twitch", "https://example.test/kappa.png")];
         frame(&ctx, &mut picker, &catalog, Vec::new(), false);
-        assert!(ctx.memory(|memory| memory.has_focus(EmotePicker::search_id())));
+        assert!(ctx.memory(|memory| memory.has_focus(picker.search_id())));
         frame(
             &ctx,
             &mut picker,
@@ -1258,7 +1391,7 @@ mod tests {
             false,
         );
         assert!(picker.active_view == PickerView::All);
-        assert!(ctx.memory(|memory| memory.has_focus(EmotePicker::search_id())));
+        assert!(ctx.memory(|memory| memory.has_focus(picker.search_id())));
         let (picked, _) = frame(
             &ctx,
             &mut picker,
@@ -1283,7 +1416,7 @@ mod tests {
             vec![key(egui::Key::Tab, egui::Modifiers::NONE)],
             false,
         );
-        assert!(!ctx.memory(|memory| memory.has_focus(EmotePicker::search_id())));
+        assert!(!ctx.memory(|memory| memory.has_focus(picker.search_id())));
         assert!(picker.active_view == PickerView::All);
         assert!(picker.open);
     }
@@ -1324,7 +1457,7 @@ mod tests {
             );
             frame(&ctx, &mut picker, &[], Vec::new(), false);
             assert!(picker.focused_control.is_some());
-            assert_ne!(picker.focused_control, Some(EmotePicker::search_id()));
+            assert_ne!(picker.focused_control, Some(picker.search_id()));
 
             let (picked, _) = frame(
                 &ctx,
@@ -1355,7 +1488,7 @@ mod tests {
         );
         frame(&ctx, &mut picker, &[], Vec::new(), false);
         assert!(picker.focused_control.is_some());
-        assert_ne!(picker.focused_control, Some(EmotePicker::search_id()));
+        assert_ne!(picker.focused_control, Some(picker.search_id()));
         let (picked, _) = frame(
             &ctx,
             &mut picker,
@@ -1389,7 +1522,7 @@ mod tests {
             false,
         );
         frame(&ctx, &mut picker, &[], Vec::new(), false);
-        assert_ne!(picker.focused_control, Some(EmotePicker::search_id()));
+        assert_ne!(picker.focused_control, Some(picker.search_id()));
         frame(
             &ctx,
             &mut picker,
@@ -1397,9 +1530,9 @@ mod tests {
             vec![key(egui::Key::F, egui::Modifiers::CTRL)],
             false,
         );
-        assert!(ctx.memory(|memory| memory.has_focus(EmotePicker::search_id())));
+        assert!(ctx.memory(|memory| memory.has_focus(picker.search_id())));
         assert!(!ctx.input(|input| input.key_pressed(egui::Key::F)));
-        let range = egui::TextEdit::load_state(&ctx, EmotePicker::search_id())
+        let range = egui::TextEdit::load_state(&ctx, picker.search_id())
             .unwrap()
             .cursor
             .char_range()

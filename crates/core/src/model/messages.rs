@@ -182,7 +182,7 @@ pub struct SharedChatSource {
 }
 
 /// Metadata for a message that is a reply to another message.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplyInfo {
     /// Server-assigned UUID of the parent message (used to send replies back).
     pub parent_msg_id: String,
@@ -192,6 +192,34 @@ pub struct ReplyInfo {
     pub parent_display_name: String,
     /// Raw text body of the parent message.
     pub parent_msg_body: String,
+    /// Original message at the start of a reply thread, including nested replies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_parent_msg_id: Option<String>,
+    /// Login of the original thread author, when supplied by the server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_parent_user_login: Option<String>,
+}
+
+impl ReplyInfo {
+    pub fn for_message(message: &ChatMessage) -> Option<Self> {
+        if message.flags.is_deleted || !message.channel.is_twitch() {
+            return None;
+        }
+        let parent_msg_id = message.server_id.as_deref()?.trim();
+        if parent_msg_id.is_empty() { return None; }
+        let (thread_parent_msg_id, thread_parent_user_login) = match &message.reply {
+            Some(reply) => (reply.thread_parent_msg_id.clone(), reply.thread_parent_user_login.clone()),
+            None => (Some(parent_msg_id.to_owned()), Some(message.sender.login.clone())),
+        };
+        Some(Self {
+            parent_msg_id: parent_msg_id.to_owned(),
+            parent_user_login: message.sender.login.clone(),
+            parent_display_name: message.sender.display_name.clone(),
+            parent_msg_body: message.raw_text.clone(),
+            thread_parent_msg_id,
+            thread_parent_user_login,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -324,6 +352,21 @@ impl EmoteCatalogEntry {
 #[cfg(test)]
 mod tests {
     use super::MsgKind;
+
+    #[test]
+    fn reply_thread_metadata_round_trips_and_old_history_stays_readable() {
+        let old = serde_json::json!({
+            "parent_msg_id": "parent", "parent_user_login": "alice",
+            "parent_display_name": "Alice", "parent_msg_body": "question"
+        });
+        let mut reply: super::ReplyInfo = serde_json::from_value(old).unwrap();
+        assert_eq!(reply.thread_parent_msg_id, None);
+        assert_eq!(reply.thread_parent_user_login, None);
+        reply.thread_parent_msg_id = Some("root".into());
+        reply.thread_parent_user_login = Some("bob".into());
+        let restored: super::ReplyInfo = serde_json::from_str(&serde_json::to_string(&reply).unwrap()).unwrap();
+        assert_eq!(restored, reply);
+    }
 
     fn subscription_message(raw_text: &str, sub_msg: &str) -> super::ChatMessage {
         super::ChatMessage {

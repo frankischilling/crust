@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use crust_core::events::AppEvent;
-use crust_core::model::ChannelId;
+use crust_core::model::{ChannelId, MAX_CHAT_PANES};
 use crust_storage::AppSettings;
 
 /// Keep channels that this startup can join, including those still connecting.
@@ -55,8 +55,20 @@ pub(crate) fn startup_restore_event(
                 (index, channel.0, frac)
             })
         })
-        .take(4)
+        .take(MAX_CHAT_PANES)
         .collect();
+    let mut indices = vec![None; settings.split_panes.len()];
+    for (new_index, (old_index, _, _)) in panes.iter().enumerate() {
+        indices[*old_index] = Some(new_index);
+    }
+    let split_layout = settings.split_layout.as_ref()
+        .and_then(|layout| layout.remap(&indices))
+        .and_then(|layout| layout.validated(panes.len()));
+    let split_views = if settings.split_panes.is_empty() {
+        settings.split_pane_views.iter().take(1).cloned().collect()
+    } else {
+        panes.iter().map(|(old_index, _, _)| settings.split_pane_views.get(*old_index).cloned().unwrap_or_default()).collect()
+    };
     let focused = panes
         .iter()
         .position(|(index, _, _)| *index >= settings.split_panes_focused)
@@ -70,6 +82,8 @@ pub(crate) fn startup_restore_event(
             .map(|(_, channel, frac)| (channel, frac))
             .collect(),
         split_panes_focused: focused,
+        split_layout,
+        split_views,
         whispers_visible: settings.whispers_panel_visible,
         last_whisper_login: settings.last_whisper_login.clone(),
     }
@@ -129,6 +143,42 @@ mod tests {
         assert_eq!(channel_order, ["bob", "alice"]);
         assert_eq!(split_panes, [("bob".into(), 0.3), ("alice".into(), 0.5)]);
         assert_eq!(split_panes_focused, 1);
+    }
+
+    #[test]
+    fn startup_layout_prunes_nested_unavailable_panes_and_keeps_duplicate_views() {
+        use crust_core::model::{PaneLayout, SplitAxis};
+        let settings = AppSettings {
+            split_panes: vec![pane("gone", 0.2), pane("room", 0.3), pane("room", 0.5)],
+            split_panes_focused: 2,
+            split_pane_views: ["gone query", "first query", "second query"].into_iter().map(|keyword| {
+                crust_core::model::PaneViewSettings {
+                    search: crust_core::model::PaneSearchSettings { open: true, keyword: keyword.into(), ..Default::default() },
+                    filters: Some(vec![keyword.into()]),
+                }
+            }).collect(),
+            split_layout: Some(PaneLayout::Split {
+                axis: SplitAxis::Horizontal, fraction: 0.2,
+                first: Box::new(PaneLayout::Pane { index: 0 }),
+                second: Box::new(PaneLayout::Split {
+                    axis: SplitAxis::Vertical, fraction: 0.35,
+                    first: Box::new(PaneLayout::Pane { index: 1 }),
+                    second: Box::new(PaneLayout::Pane { index: 2 }),
+                }),
+            }),
+            ..Default::default()
+        };
+        let AppEvent::RestoreLastActiveChannel { split_layout, split_panes, split_panes_focused, split_views, .. } =
+            startup_restore_event(&settings, &[ChannelId::new("room")], false, false) else { panic!() };
+        assert_eq!(split_panes.len(), 2);
+        assert_eq!(split_panes_focused, 1);
+        assert_eq!(split_views.iter().map(|view| view.search.keyword.as_str()).collect::<Vec<_>>(), ["first query", "second query"]);
+        assert_eq!(split_views[1].filters.as_ref().unwrap(), &["second query"]);
+        assert_eq!(split_layout, Some(PaneLayout::Split {
+            axis: SplitAxis::Vertical, fraction: 0.35,
+            first: Box::new(PaneLayout::Pane { index: 0 }),
+            second: Box::new(PaneLayout::Pane { index: 1 }),
+        }));
     }
 
     #[test]
@@ -210,13 +260,13 @@ mod tests {
             panic!()
         };
         assert_eq!(channel, ChannelId::mentions().0);
-        assert_eq!(split_panes.len(), 4);
+        assert_eq!(split_panes.len(), 5);
         assert_eq!(split_panes[0], (ChannelId::live_feed().0, 1.0));
         assert_eq!(split_panes[1], (ChannelId::mentions().0, 1.0));
         assert!(split_panes
             .iter()
             .all(|(_, frac)| frac.is_finite() && *frac > 0.0));
-        assert_eq!(split_panes_focused, 3);
+        assert_eq!(split_panes_focused, 4);
         assert!(whispers_visible);
         assert_eq!(last_whisper_login, "friend");
     }

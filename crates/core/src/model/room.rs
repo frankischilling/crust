@@ -1069,6 +1069,7 @@ mod tests {
                 parent_user_login: "parent".to_owned(),
                 parent_display_name: "Parent".to_owned(),
                 parent_msg_body: "parent body".to_owned(),
+                ..Default::default()
             }),
             msg_kind: super::super::MsgKind::HypeTrain {
                 phase: phase.to_owned(),

@@ -78,6 +78,21 @@ pub enum HistoryUpdate {
 
 // Commands (UI to runtime): actions initiated by the UI
 
+/// The composer that owns an asynchronous send or upload result.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ComposerTarget {
+    Chat { account_id: Option<String>, pane_id: u64 },
+    ReplyThread { account_id: Option<String>, root_msg_id: String },
+}
+
+impl ComposerTarget {
+    pub fn account_id(&self) -> Option<&str> {
+        match self {
+            Self::Chat { account_id, .. } | Self::ReplyThread { account_id, .. } => account_id.as_deref(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AppCommand {
     /// Join a channel.
@@ -106,6 +121,8 @@ pub enum AppCommand {
         /// Optional reply context used for local-echo rendering.
         #[serde(default)]
         reply: Option<ReplyInfo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        composer: Option<ComposerTarget>,
     },
     /// Send a Twitch whisper via Helix (`POST /helix/whispers`).
     SendWhisper {
@@ -332,9 +349,13 @@ pub enum AppCommand {
     SetChannelOrder { order: Vec<String> },
     /// Persist split-pane layout.
     SetSplitPanes {
+        /// Owns the classic view when there are no split entries.
+        active_channel: String,
         /// Each entry: (channel_id, frac).
         panes: Vec<(String, f32)>,
         focused: usize,
+        layout: Option<crate::model::PaneLayout>,
+        views: Vec<crate::model::PaneViewSettings>,
     },
     /// Update the per-tab visibility rule for `channel`. Setting the rule
     /// to [`crate::state::TabVisibilityRule::Always`] removes any prior
@@ -583,6 +604,8 @@ pub enum AppCommand {
         format: String,
         /// Original on-disk path if the image came from a file drop.
         source_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        composer: Option<ComposerTarget>,
     },
     /// Force the live-feed poll task to refresh immediately (bypass tick wait).
     LiveFeedRefresh,
@@ -619,6 +642,7 @@ pub enum AppEvent {
         reply_to_msg_id: Option<String>,
         reply: Option<ReplyInfo>,
         reason: String,
+        composer: Option<ComposerTarget>,
     },
     /// Incoming Twitch whisper delivered out-of-band from channel chat.
     WhisperReceived {
@@ -901,6 +925,10 @@ pub enum AppEvent {
         split_panes: Vec<(String, f32)>,
         /// Focused-pane index within `split_panes`.
         split_panes_focused: usize,
+        /// Nested geometry; absent in layouts saved by earlier releases.
+        split_layout: Option<crate::model::PaneLayout>,
+        /// Search and filter choices, indexed alongside panes (one entry for single view).
+        split_views: Vec<crate::model::PaneViewSettings>,
         /// Whispers panel was visible at last shutdown.
         whispers_visible: bool,
         /// Last-focused whisper thread login.
@@ -1215,6 +1243,7 @@ pub enum AppEvent {
     UploadFinished {
         channel: ChannelId,
         result: Result<String, String>,
+        composer: Option<ComposerTarget>,
     },
     /// Hype train lifecycle update from a live notification or status refresh.
     /// The UI keeps the latest banner until it is cleared or the end-phase

@@ -7,6 +7,7 @@ use egui::{Color32, Id, Key, Order, Pos2, RichText, Stroke, Ui, Vec2};
 use crate::commands::{extract_slash_query, slash_command_matches_ranked, SlashCommandSuggestion};
 use crate::theme as t;
 use crust_core::model::{ChannelId, EmoteCatalogEntry, ReplyInfo, IRC_SERVER_CONTROL_CHANNEL};
+use crust_core::{HotkeyAction, HotkeyBindings};
 
 const AUTOCOMPLETE_MAX: usize = 10;
 const AUTOCOMPLETE_EMOTE_SIZE: f32 = 20.0;
@@ -16,6 +17,546 @@ const USERNAME_AUTOCOMPLETE_MAX: usize = 10;
 /// Maximum number of Tab-completion matches to cycle through.
 const TAB_COMPLETE_MAX: usize = 50;
 const TWITCH_MAX_CHARS: usize = 500;
+
+#[derive(Clone, Copy)]
+enum SendShortcut {
+    Primary,
+    Shifted,
+}
+
+fn consume_composer_binding(
+    input: &mut egui::InputState,
+    binding: &crust_core::KeyBinding,
+) -> bool {
+    let Some(key) = crate::app::egui_key_from_name(&binding.key) else {
+        return false;
+    };
+    let modifiers = crate::app::binding_modifiers(binding);
+    let produces_text = printable_shortcut_key(key);
+    let mut consumed = false;
+    let mut skip_text = false;
+    input.events.retain(|event| {
+        match event {
+            egui::Event::Key {
+                key: event_key,
+                pressed,
+                modifiers: event_modifiers,
+                ..
+            } => {
+                skip_text = false;
+                if *pressed && *event_key == key && event_modifiers.matches_exact(modifiers) {
+                    consumed = true;
+                    skip_text = produces_text;
+                    return false;
+                }
+            }
+            egui::Event::Text(_) if skip_text => {
+                // A printable shortcut arrives as a key followed by text.
+                // Consume its text too, without dropping the next key's text.
+                skip_text = false;
+                return false;
+            }
+            _ => {
+                skip_text = false;
+            }
+        }
+        true
+    });
+    consumed
+}
+
+fn printable_shortcut_key(key: Key) -> bool {
+    let name = crate::app::egui_key_name(key);
+    name.len() == 1
+        || name.starts_with("Num")
+        || matches!(
+            key,
+            Key::Space
+                | Key::Minus
+                | Key::Plus
+                | Key::Equals
+                | Key::Comma
+                | Key::Period
+                | Key::Semicolon
+                | Key::Slash
+                | Key::Backslash
+                | Key::OpenBracket
+                | Key::CloseBracket
+                | Key::Backtick
+                | Key::Quote
+        )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct ComposerEventOwner {
+    id: Id,
+    channel: Id,
+}
+
+impl ComposerEventOwner {
+    fn new(id: Id, channel: &ChannelId) -> Self {
+        Self {
+            id,
+            channel: Id::new(channel),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct DeferredComposerEvents {
+    prepared_pass: Option<u64>,
+    account_scope: Option<Id>,
+    pending: HashMap<ComposerEventOwner, Vec<egui::Event>>,
+    editor_states: HashMap<ComposerEventOwner, egui::text_edit::TextEditState>,
+    ready: Option<(ComposerEventOwner, Vec<egui::Event>)>,
+    after_navigation: Vec<egui::Event>,
+}
+
+fn composer_events_id(ctx: &egui::Context) -> Id {
+    Id::new(("composer_deferred_events", ctx.viewport_id()))
+}
+
+fn is_keyboard_event(event: &egui::Event) -> bool {
+    matches!(
+        event,
+        egui::Event::Key { .. }
+            | egui::Event::Text(_)
+            | egui::Event::Paste(_)
+            | egui::Event::Copy
+            | egui::Event::Cut
+            | egui::Event::Ime(_)
+    )
+}
+
+fn event_matches_binding(event: &egui::Event, binding: &crust_core::KeyBinding) -> bool {
+    matches!(event, egui::Event::Key { key, pressed: true, modifiers, .. }
+        if crate::app::egui_key_from_name(&binding.key) == Some(*key)
+            && modifiers.matches_exact(crate::app::binding_modifiers(binding)))
+}
+
+fn is_send_shortcut(event: &egui::Event, bindings: &HotkeyBindings) -> bool {
+    [HotkeyAction::InputSend, HotkeyAction::InputSendKeep]
+        .into_iter()
+        .any(|action| {
+            event_matches_binding(event, &bindings.get(action))
+                || bindings
+                    .shifted_send_binding(action)
+                    .is_some_and(|binding| event_matches_binding(event, &binding))
+        })
+}
+
+fn remove_queued_send_shortcuts(events: &mut Vec<egui::Event>, bindings: &HotkeyBindings) {
+    let mut skip_text = false;
+    events.retain(|event| {
+        if std::mem::take(&mut skip_text) && matches!(event, egui::Event::Text(_)) {
+            return false;
+        }
+        if is_send_shortcut(event, bindings) {
+            skip_text =
+                matches!(event, egui::Event::Key { key, .. } if printable_shortcut_key(*key));
+            return false;
+        }
+        true
+    });
+}
+
+/// Keep deferred edits on account changes, but require a new Send gesture.
+/// Recheck after runtime events as an account can change during a UI pass.
+pub(crate) fn sync_composer_account(
+    ctx: &egui::Context,
+    bindings: &HotkeyBindings,
+    account_id: Option<&str>,
+) {
+    let state_id = composer_events_id(ctx);
+    let account_scope = Id::new(account_id);
+    ctx.data_mut(|data| {
+        let deferred = data.get_temp_mut_or_default::<DeferredComposerEvents>(state_id);
+        if deferred
+            .account_scope
+            .replace(account_scope)
+            .is_some_and(|previous| previous != account_scope)
+        {
+            for events in deferred.pending.values_mut() {
+                remove_queued_send_shortcuts(events, bindings);
+            }
+            if let Some((_, events)) = deferred.ready.as_mut() {
+                remove_queued_send_shortcuts(events, bindings);
+            }
+            remove_queued_send_shortcuts(&mut deferred.after_navigation, bindings);
+        }
+    });
+}
+
+fn is_navigation_shortcut(event: &egui::Event, bindings: &HotkeyBindings) -> bool {
+    use crust_core::{HotkeyCategory, KeyBinding};
+    if !matches!(event, egui::Event::Key { pressed: true, .. }) {
+        return false;
+    }
+    if HotkeyAction::all().into_iter().any(|action| {
+        matches!(
+            action.category(),
+            HotkeyCategory::Window | HotkeyCategory::Tab | HotkeyCategory::Split
+        ) && event_matches_binding(event, &bindings.get(action))
+    }) {
+        return true;
+    }
+    if bindings.get(HotkeyAction::ZoomIn) == KeyBinding::new("Equals").with_ctrl()
+        && matches!(event, egui::Event::Key { key: Key::Plus, modifiers, .. }
+            if modifiers.matches_logically(egui::Modifiers::CTRL))
+    {
+        return true;
+    }
+    // Keep the aliases accepted by handle_channel_shortcuts in the same batch.
+    [
+        (HotkeyAction::NextTab, false),
+        (HotkeyAction::PrevTab, true),
+    ]
+    .into_iter()
+    .any(|(action, reverse)| {
+        let default = if reverse {
+            KeyBinding::new("Tab").with_ctrl().with_shift()
+        } else {
+            KeyBinding::new("Tab").with_ctrl()
+        };
+        bindings.get(action) == default
+            && (event_matches_binding(
+                event,
+                &KeyBinding::new(if reverse { "PageUp" } else { "PageDown" }).with_ctrl(),
+            ) || event_matches_binding(
+                event,
+                &KeyBinding::new(if reverse { "ArrowLeft" } else { "ArrowRight" }).with_alt(),
+            ))
+    })
+}
+
+fn shortcut_end(events: &[egui::Event], index: usize) -> usize {
+    let paired_text = matches!(&events[index], egui::Event::Key { key, .. } if printable_shortcut_key(*key))
+        && matches!(events.get(index + 1), Some(egui::Event::Text(_)));
+    index + 1 + usize::from(paired_text)
+}
+
+/// Return one editor segment, or a single navigation gesture. Each segment uses
+/// the existing visible TextEdit, which keeps selection, undo and IME behavior.
+fn composer_event_boundary(events: &[egui::Event], bindings: &HotkeyBindings) -> (usize, bool) {
+    let mut has_prefix = false;
+    for (index, event) in events.iter().enumerate() {
+        if matches!(event, egui::Event::Key { pressed: false, .. }) {
+            continue;
+        }
+        if is_navigation_shortcut(event, bindings) {
+            return if has_prefix {
+                (index, false)
+            } else {
+                (shortcut_end(events, index), true)
+            };
+        }
+        if event_matches_binding(event, &bindings.get(HotkeyAction::InputClear)) && has_prefix {
+            return (index, false);
+        }
+        if is_send_shortcut(event, bindings) {
+            return (shortcut_end(events, index), false);
+        }
+        has_prefix = true;
+    }
+    (events.len(), false)
+}
+
+/// Keep edits on either side of Send, Clear and navigation in event order.
+/// A hidden editor retains its input until its own channel and draft return.
+pub(crate) fn prepare_composer_events(
+    ctx: &egui::Context,
+    bindings: &HotkeyBindings,
+    focused_owner: Option<(Id, &ChannelId)>,
+    account_id: Option<&str>,
+) {
+    sync_composer_account(ctx, bindings, account_id);
+    let state_id = composer_events_id(ctx);
+    let pass = ctx.cumulative_pass_nr();
+    let mut deferred = ctx
+        .data_mut(|data| data.remove_temp::<DeferredComposerEvents>(state_id))
+        .unwrap_or_default();
+    if deferred.prepared_pass == Some(pass) {
+        ctx.data_mut(|data| data.insert_temp(state_id, deferred));
+        return;
+    }
+    deferred.prepared_pass = Some(pass);
+    // A pointer or an incoming activation can hide the editor after preparation.
+    // Put its unclaimed prefix back before its suffix instead of dropping it.
+    if let Some((owner, mut events)) = deferred.ready.take() {
+        if let Some(mut suffix) = deferred.pending.remove(&owner) {
+            events.append(&mut suffix);
+        }
+        deferred.pending.insert(owner, events);
+    }
+    // Let this pass establish pointer focus before resuming old keyboard input.
+    // Fresh typing follows the clicked control through the normal widget path.
+    if ctx.input(|input| {
+        input
+            .events
+            .iter()
+            .any(|event| matches!(event, egui::Event::PointerButton { pressed: true, .. }))
+    }) {
+        if !deferred.pending.is_empty() || !deferred.after_navigation.is_empty() {
+            ctx.request_repaint();
+        }
+        ctx.data_mut(|data| data.insert_temp(state_id, deferred));
+        return;
+    }
+    let focused = ctx.memory(|memory| memory.focused()).and_then(|id| {
+        focused_owner
+            .filter(|(owner_id, _)| *owner_id == id)
+            .map(|(_, channel)| ComposerEventOwner::new(id, channel))
+    });
+    if focused.is_none() && deferred.after_navigation.is_empty() {
+        ctx.data_mut(|data| data.insert_temp(state_id, deferred));
+        return;
+    }
+    if deferred.after_navigation.is_empty()
+        && focused.is_none_or(|owner| !deferred.pending.contains_key(&owner))
+    {
+        let needs_boundary = ctx.input(|input| {
+            let events: Vec<_> = input
+                .events
+                .iter()
+                .filter(|event| is_keyboard_event(event))
+                .cloned()
+                .collect();
+            composer_event_boundary(&events, bindings).0 < events.len()
+        });
+        if !needs_boundary {
+            ctx.data_mut(|data| data.insert_temp(state_id, deferred));
+            return;
+        }
+    }
+    let mut events = focused
+        .and_then(|owner| deferred.pending.remove(&owner))
+        .unwrap_or_default();
+    events.append(&mut deferred.after_navigation);
+    ctx.input_mut(|input| {
+        input.events.retain(|event| {
+            if is_keyboard_event(event) {
+                events.push(event.clone());
+                false
+            } else {
+                true
+            }
+        });
+    });
+    if let Some(owner) = focused {
+        let (end, navigation) = composer_event_boundary(&events, bindings);
+        let suffix = events.split_off(end);
+        if navigation {
+            // Bare character shortcuts have a paired Text event. It belongs to
+            // the shortcut, not to the control that receives focus afterward.
+            if matches!(events.last(), Some(egui::Event::Text(_))) {
+                events.pop();
+            }
+            ctx.input_mut(|input| input.events.extend(events));
+            deferred.after_navigation = suffix;
+            deferred.editor_states.remove(&owner);
+        } else {
+            if !events.is_empty() {
+                deferred.ready = Some((owner, events));
+            }
+            if !suffix.is_empty() {
+                deferred.pending.insert(owner, suffix);
+            }
+        }
+    } else {
+        // Search boxes and other controls own text after a navigation gesture.
+        ctx.input_mut(|input| input.events.extend(events));
+    }
+    if !deferred.after_navigation.is_empty()
+        || deferred
+            .ready
+            .as_ref()
+            .is_some_and(|(owner, _)| deferred.pending.contains_key(owner))
+    {
+        ctx.request_repaint();
+    }
+    ctx.data_mut(|data| data.insert_temp(state_id, deferred));
+}
+
+fn claim_composer_events(ctx: &egui::Context, owner: ComposerEventOwner) -> bool {
+    if !ctx.memory(|memory| memory.has_focus(owner.id)) {
+        return false;
+    }
+    let state_id = composer_events_id(ctx);
+    let (events, state) = ctx.data_mut(|data| {
+        let deferred = data.get_temp_mut_or_default::<DeferredComposerEvents>(state_id);
+        if deferred
+            .ready
+            .as_ref()
+            .is_some_and(|(ready_owner, _)| *ready_owner == owner)
+        {
+            (
+                deferred.ready.take().map(|(_, events)| events),
+                deferred.editor_states.remove(&owner),
+            )
+        } else {
+            (None, None)
+        }
+    });
+    let Some(events) = events else {
+        return false;
+    };
+    if let Some(state) = state {
+        egui::TextEdit::store_state(ctx, owner.id, state);
+    }
+    ctx.input_mut(|input| input.events.extend(events));
+    true
+}
+
+fn finish_composer_events(ctx: &egui::Context, owner: ComposerEventOwner) {
+    // TextEdit reads text events without consuming them. Do not expose a replay
+    // to another control rendered later in the same pass.
+    ctx.input_mut(|input| {
+        input.events.retain(|event| {
+            !is_keyboard_event(event)
+                || matches!(
+                    event,
+                    egui::Event::Key {
+                        key: Key::Escape,
+                        ..
+                    }
+                )
+        })
+    });
+    let state = egui::TextEdit::load_state(ctx, owner.id);
+    let state_id = composer_events_id(ctx);
+    ctx.data_mut(|data| {
+        let deferred = data.get_temp_mut_or_default::<DeferredComposerEvents>(state_id);
+        if deferred.pending.contains_key(&owner) {
+            if let Some(state) = state {
+                deferred.editor_states.insert(owner, state);
+            }
+        } else {
+            deferred.editor_states.remove(&owner);
+        }
+    });
+}
+
+fn bind_navigation_events(ctx: &egui::Context, owner: ComposerEventOwner) {
+    if !ctx.memory(|memory| memory.has_focus(owner.id)) {
+        return;
+    }
+    let state_id = composer_events_id(ctx);
+    if ctx.data_mut(|data| {
+        data.get_temp_mut_or_default::<DeferredComposerEvents>(state_id)
+            .after_navigation
+            .is_empty()
+    }) {
+        return;
+    }
+    let editor_state = egui::TextEdit::load_state(ctx, owner.id);
+    let bound = ctx.data_mut(|data| {
+        let deferred = data.get_temp_mut_or_default::<DeferredComposerEvents>(state_id);
+        if deferred.after_navigation.is_empty() {
+            return false;
+        }
+        let events = std::mem::take(&mut deferred.after_navigation);
+        let has_pending = deferred.pending.contains_key(&owner);
+        deferred.pending.entry(owner).or_default().extend(events);
+        if !has_pending {
+            if let Some(state) = editor_state {
+                deferred.editor_states.insert(owner, state);
+            }
+        }
+        true
+    });
+    if bound {
+        ctx.request_repaint();
+    }
+}
+
+/// Move queued input with the draft when a pane becomes the classic editor or
+/// the classic editor is moved into a split. Hidden drafts keep their queues.
+pub(crate) fn migrate_composer_events(
+    ctx: &egui::Context,
+    old_id: Id,
+    new_id: Id,
+    channel: &ChannelId,
+) {
+    if old_id == new_id {
+        return;
+    }
+    let old_owner = ComposerEventOwner::new(old_id, channel);
+    let new_owner = ComposerEventOwner::new(new_id, channel);
+    let state_id = composer_events_id(ctx);
+    ctx.data_mut(|data| {
+        let deferred = data.get_temp_mut_or_default::<DeferredComposerEvents>(state_id);
+        if let Some(mut events) = deferred.pending.remove(&old_owner) {
+            if let Some(mut existing) = deferred.pending.remove(&new_owner) {
+                events.append(&mut existing);
+            }
+            deferred.pending.insert(new_owner, events);
+        }
+        if let Some(state) = deferred.editor_states.remove(&old_owner) {
+            deferred.editor_states.insert(new_owner, state);
+        }
+        if let Some((owner, _)) = deferred.ready.as_mut() {
+            if *owner == old_owner {
+                *owner = new_owner;
+            }
+        }
+    });
+}
+
+/// Follow a canonical channel rename without changing which editor owns input.
+pub(crate) fn rename_composer_event_channel(ctx: &egui::Context, old: &ChannelId, new: &ChannelId) {
+    let old_scope = Id::new(old);
+    let new_scope = Id::new(new);
+    if old_scope == new_scope {
+        return;
+    }
+    let state_id = composer_events_id(ctx);
+    ctx.data_mut(|data| {
+        let deferred = data.get_temp_mut_or_default::<DeferredComposerEvents>(state_id);
+        let owners: Vec<_> = deferred
+            .pending
+            .keys()
+            .copied()
+            .filter(|owner| owner.channel == old_scope)
+            .collect();
+        for owner in owners {
+            let target = ComposerEventOwner {
+                channel: new_scope,
+                ..owner
+            };
+            if let Some(events) = deferred.pending.remove(&owner) {
+                deferred.pending.entry(target).or_default().extend(events);
+            }
+        }
+        let owners: Vec<_> = deferred
+            .editor_states
+            .keys()
+            .copied()
+            .filter(|owner| owner.channel == old_scope)
+            .collect();
+        for owner in owners {
+            let target = ComposerEventOwner {
+                channel: new_scope,
+                ..owner
+            };
+            if let Some(state) = deferred.editor_states.remove(&owner) {
+                deferred.editor_states.entry(target).or_insert(state);
+            }
+        }
+        if let Some((owner, _)) = deferred.ready.as_mut() {
+            if owner.channel == old_scope {
+                owner.channel = new_scope;
+            }
+        }
+    });
+}
+
+pub(crate) fn composer_owns_keyboard(ctx: &egui::Context, id: Id) -> bool {
+    let query = id.with("input_history_query");
+    ctx.memory(|memory| match memory.focused() {
+        Some(focused) => focused == id || focused == query,
+        None => memory.had_focus_last_frame(id) || memory.had_focus_last_frame(query),
+    }) || completion_pointer_active(ctx, id)
+}
 
 #[derive(Clone, Default)]
 struct ComposerFocus {
@@ -464,6 +1005,8 @@ fn begin_input_history_search(
 pub struct ChatInput<'a> {
     /// Explicit identity keeps keyboard focus independent of the pane's layout.
     pub id: Option<Id>,
+    /// Shortcuts apply only while this composer owns keyboard focus.
+    pub hotkey_bindings: &'a HotkeyBindings,
     /// The active channel to send messages to.
     pub channel: &'a ChannelId,
     /// Whether the user is authenticated (can send).
@@ -521,6 +1064,30 @@ pub struct ChatInputResult {
 }
 
 impl<'a> ChatInput<'a> {
+    fn consume_action(&self, input: &mut egui::InputState, action: HotkeyAction) -> bool {
+        consume_composer_binding(input, &self.hotkey_bindings.get(action))
+    }
+
+    fn consume_send(&self, input: &mut egui::InputState, keep: bool) -> Option<SendShortcut> {
+        let action = if keep {
+            HotkeyAction::InputSendKeep
+        } else {
+            HotkeyAction::InputSend
+        };
+        let binding = self.hotkey_bindings.get(action);
+        if consume_composer_binding(input, &binding) {
+            return Some(SendShortcut::Primary);
+        }
+        // Shift+Enter follows the default Enter binding. A custom binding or
+        // an unbound action has no hidden Enter shortcut.
+        if let Some(alternative) = self.hotkey_bindings.shifted_send_binding(action) {
+            if consume_composer_binding(input, &alternative) {
+                return Some(SendShortcut::Shifted);
+            }
+        }
+        None
+    }
+
     /// Show the chat input. The `buf` is stored externally so it persists across frames.
     pub fn show(&self, ui: &mut Ui, buf: &mut String) -> ChatInputResult {
         let mut result = ChatInputResult {
@@ -533,6 +1100,8 @@ impl<'a> ChatInput<'a> {
 
         let text_edit_id = self.id.unwrap_or_else(|| ui.id().with("chat_input"));
         prepare_composer_focus(ui.ctx(), text_edit_id);
+        let event_owner = ComposerEventOwner::new(text_edit_id, self.channel);
+        let claimed_events = claim_composer_events(ui.ctx(), event_owner);
         let scope_id = text_edit_id.with("completion_channel");
         let channel_scope = Id::new(self.channel);
         let channel_changed = ui.data_mut(|data| {
@@ -563,13 +1132,9 @@ impl<'a> ChatInput<'a> {
         let composer_had_focus = ui.memory(|m| m.has_focus(text_edit_id)) || popup_pointer_active;
         if composer_had_focus && !history_search_active {
             let direction = ui.input_mut(|input| {
-                if crate::app::consume_exact_key(
-                    input,
-                    egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
-                    Key::R,
-                ) {
+                if self.consume_action(input, HotkeyAction::InputHistorySearchNext) {
                     Some(false)
-                } else if crate::app::consume_exact_key(input, egui::Modifiers::CTRL, Key::R) {
+                } else if self.consume_action(input, HotkeyAction::InputHistorySearchPrev) {
                     Some(true)
                 } else {
                     None
@@ -589,6 +1154,38 @@ impl<'a> ChatInput<'a> {
         }
         let input_had_focus = composer_had_focus && !history_search_active;
         let mut retain_keyboard_focus = popup_pointer_active && !history_search_active;
+        if input_had_focus {
+            let clear = ui.input_mut(|input| self.consume_action(input, HotkeyAction::InputClear));
+            if clear {
+                buf.clear();
+                invalidate_emote_completions(ui.ctx(), text_edit_id);
+                ui.data_mut(|data| {
+                    data.remove::<HistState>(text_edit_id.with("msg_history_state"))
+                });
+                move_cursor_to_end(ui.ctx(), text_edit_id, 0);
+                retain_keyboard_focus = true;
+            }
+            result.toggle_emote_picker =
+                ui.input_mut(|input| self.consume_action(input, HotkeyAction::InputEmotePicker));
+        }
+        let owns_reply_shortcut = composer_had_focus
+            || ui.memory(|memory| {
+                memory.focused().is_none() && memory.had_focus_last_frame(text_edit_id)
+            });
+        let completion_open = ui.data(|data| {
+            data.get_temp::<CompletionPopupState>(text_edit_id.with("completion_popup"))
+                .is_some()
+        });
+        if owns_reply_shortcut
+            && !history_search_active
+            && !completion_open
+            && self.pending_reply.is_some()
+            && !ui.ctx().is_context_menu_open()
+            && ui.input_mut(|input| self.consume_action(input, HotkeyAction::InputCancelReply))
+        {
+            result.dismiss_reply = true;
+            retain_keyboard_focus = true;
+        }
 
         // Clipboard image paste (Ctrl/Cmd+V)
         // egui-winit 0.31's keyboard handler early-returns from a Ctrl+V
@@ -742,9 +1339,10 @@ impl<'a> ChatInput<'a> {
                     });
                     // egui clears current focus on Escape before widgets run.
                     // The still-visible popup belongs to the prior composer.
-                    let completion_owned_focus = input_had_focus || ui.memory(|memory| {
-                        memory.focused().is_none() && memory.had_focus_last_frame(text_edit_id)
-                    });
+                    let completion_owned_focus = input_had_focus
+                        || ui.memory(|memory| {
+                            memory.focused().is_none() && memory.had_focus_last_frame(text_edit_id)
+                        });
                     if completion_owned_focus
                         && popup_was_open
                         && !ui.ctx().is_context_menu_open()
@@ -808,38 +1406,61 @@ impl<'a> ChatInput<'a> {
                     let mut consumed_enter = false;
                     let mut consumed_up = false;
                     let mut consumed_down = false;
+                    let mut send_pressed = false;
+                    let mut send_keep_pressed = false;
+                    let mut unused_enter = false;
 
                     if input_had_focus {
                         ui.input_mut(|i| {
-                            reverse_tab =
-                                crate::app::consume_exact_key(i, egui::Modifiers::SHIFT, Key::Tab);
+                            reverse_tab = self.consume_action(i, HotkeyAction::InputCompletePrev);
                             consumed_tab = reverse_tab
-                                || crate::app::consume_exact_key(
+                                || self.consume_action(i, HotkeyAction::InputCompleteNext);
+                            consumed_up = if autocomplete_active {
+                                crate::app::consume_exact_key(
                                     i,
                                     egui::Modifiers::NONE,
-                                    Key::Tab,
-                                );
-                            consumed_up = crate::app::consume_exact_key(
-                                i,
-                                egui::Modifiers::NONE,
-                                Key::ArrowUp,
-                            );
-                            consumed_down = crate::app::consume_exact_key(
-                                i,
-                                egui::Modifiers::NONE,
-                                Key::ArrowDown,
-                            );
-                            if autocomplete_active {
-                                consumed_enter = crate::app::consume_exact_key(
+                                    Key::ArrowUp,
+                                )
+                            } else {
+                                self.consume_action(i, HotkeyAction::InputHistoryPrev)
+                            };
+                            consumed_down = if autocomplete_active {
+                                crate::app::consume_exact_key(
                                     i,
                                     egui::Modifiers::NONE,
-                                    Key::Enter,
+                                    Key::ArrowDown,
+                                )
+                            } else {
+                                self.consume_action(i, HotkeyAction::InputHistoryNext)
+                            };
+                            send_keep_pressed = self.consume_send(i, true).is_some();
+                            let send = self.consume_send(i, false);
+                            consumed_enter =
+                                matches!(send, Some(SendShortcut::Primary)) && autocomplete_active;
+                            send_pressed = send.is_some() && !consumed_enter;
+                            // Enter has no other operation in a single-line
+                            // composer after its send binding is removed.
+                            i.events.retain(|event| {
+                                let enter = matches!(
+                                    event,
+                                    egui::Event::Key {
+                                        key: Key::Enter,
+                                        pressed: true,
+                                        ..
+                                    }
                                 );
-                            }
+                                unused_enter |= enter;
+                                !enter
+                            });
                         });
                     }
-                    retain_keyboard_focus |=
-                        consumed_tab || consumed_enter || consumed_up || consumed_down;
+                    retain_keyboard_focus |= consumed_tab
+                        || consumed_enter
+                        || consumed_up
+                        || consumed_down
+                        || send_pressed
+                        || send_keep_pressed
+                        || unused_enter;
 
                     let hint_text = if self.logged_in {
                         if let Some(name) = self.username.filter(|n| !n.trim().is_empty()) {
@@ -1248,18 +1869,19 @@ impl<'a> ChatInput<'a> {
                     let twitch_over_limit =
                         is_twitch_channel && twitch_char_count > TWITCH_MAX_CHARS;
                     let is_slash_input = buf.trim_start().starts_with('/');
-                    let can_submit = !history_search_active && !twitch_over_limit
+                    let can_submit = !history_search_active
+                        && !twitch_over_limit
                         && !buf.trim().is_empty()
                         && (self.logged_in || is_slash_input);
 
-                    // Send on Enter (only fires when we did NOT consume it)
-                    let enter_pressed =
-                        resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-
-                    if enter_pressed {
+                    if send_pressed || send_keep_pressed {
                         resp.request_focus();
                         if can_submit {
-                            result.send = Some(std::mem::take(buf));
+                            result.send = Some(if send_keep_pressed {
+                                buf.clone()
+                            } else {
+                                std::mem::take(buf)
+                            });
                             ui.ctx()
                                 .data_mut(|d| d.insert_temp(hist_id, HistState::default()));
                             ui.ctx()
@@ -1513,7 +2135,18 @@ impl<'a> ChatInput<'a> {
 
                         ui.separator();
 
-                        if ui.button(RichText::new("Search input history (Ctrl+R)").font(t::small())).clicked() {
+                        let history_binding = self
+                            .hotkey_bindings
+                            .get(HotkeyAction::InputHistorySearchPrev);
+                        let history_label = if history_binding.is_unbound() {
+                            "Search input history".to_owned()
+                        } else {
+                            format!("Search input history ({})", history_binding.display_label())
+                        };
+                        if ui
+                            .button(RichText::new(history_label).font(t::small()))
+                            .clicked()
+                        {
                             context_search_history = true;
                             ui.close_menu();
                         }
@@ -1636,7 +2269,14 @@ impl<'a> ChatInput<'a> {
                     }
 
                     if context_search_history {
-                        begin_input_history_search(ui.ctx(), text_edit_id, self.channel, buf, self.message_history, true);
+                        begin_input_history_search(
+                            ui.ctx(),
+                            text_edit_id,
+                            self.channel,
+                            buf,
+                            self.message_history,
+                            true,
+                        );
                         retain_keyboard_focus = false;
                     }
 
@@ -1688,6 +2328,10 @@ impl<'a> ChatInput<'a> {
             }
         });
 
+        if claimed_events {
+            finish_composer_events(ui.ctx(), event_owner);
+        }
+        bind_navigation_events(ui.ctx(), event_owner);
         result
     }
 
@@ -1715,14 +2359,11 @@ impl<'a> ChatInput<'a> {
                 accept = crate::app::consume_exact_key(input, egui::Modifiers::NONE, Key::Enter)
                     || crate::app::consume_exact_key(input, egui::Modifiers::NONE, Key::Tab)
                     || crate::app::consume_exact_key(input, egui::Modifiers::SHIFT, Key::Tab);
-                if crate::app::consume_exact_key(
-                    input,
-                    egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
-                    Key::R,
-                ) || crate::app::consume_exact_key(input, egui::Modifiers::NONE, Key::ArrowDown)
+                if self.consume_action(input, HotkeyAction::InputHistorySearchNext)
+                    || crate::app::consume_exact_key(input, egui::Modifiers::NONE, Key::ArrowDown)
                 {
                     direction = Some(false);
-                } else if crate::app::consume_exact_key(input, egui::Modifiers::CTRL, Key::R)
+                } else if self.consume_action(input, HotkeyAction::InputHistorySearchPrev)
                     || crate::app::consume_exact_key(input, egui::Modifiers::NONE, Key::ArrowUp)
                 {
                     direction = Some(true);
@@ -1797,9 +2438,19 @@ impl<'a> ChatInput<'a> {
                     });
                 ui.horizontal_wrapped(|ui| {
                     let has_match = search.selected.is_some();
+                    let older = self
+                        .hotkey_bindings
+                        .get(HotkeyAction::InputHistorySearchPrev);
+                    let newer = self
+                        .hotkey_bindings
+                        .get(HotkeyAction::InputHistorySearchNext);
                     if ui
                         .add_enabled(has_match, egui::Button::new("Older"))
-                        .on_hover_text("Ctrl+R or Up")
+                        .on_hover_text(if older.is_unbound() {
+                            "Up".to_owned()
+                        } else {
+                            format!("{} or Up", older.display_label())
+                        })
                         .clicked()
                     {
                         search.cycle(true);
@@ -1807,7 +2458,11 @@ impl<'a> ChatInput<'a> {
                     }
                     if ui
                         .add_enabled(has_match, egui::Button::new("Newer"))
-                        .on_hover_text("Ctrl+Shift+R or Down")
+                        .on_hover_text(if newer.is_unbound() {
+                            "Down".to_owned()
+                        } else {
+                            format!("{} or Down", newer.display_label())
+                        })
                         .clicked()
                     {
                         search.cycle(false);
@@ -2756,9 +3411,8 @@ pub(crate) fn with_test_clipboard_image<R>(
         }
     }
 
-    let _restore = RestoreClipboardImage(
-        CLIPBOARD_IMAGE_OVERRIDE.with(|slot| slot.replace(Some(image))),
-    );
+    let _restore =
+        RestoreClipboardImage(CLIPBOARD_IMAGE_OVERRIDE.with(|slot| slot.replace(Some(image))));
     run()
 }
 
@@ -2922,6 +3576,7 @@ mod tests {
             ui.memory_mut(|m| m.request_focus(id));
         }
         ChatInput {
+            hotkey_bindings: &HotkeyBindings::defaults(),
             id: None,
             channel: &ChannelId::new("example"),
             logged_in: true,
@@ -3014,6 +3669,7 @@ mod tests {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     let id = Id::new("aligned_username_composer");
                     ChatInput {
+                        hotkey_bindings: &HotkeyBindings::defaults(),
                         id: Some(id),
                         channel: &ChannelId::new("example"),
                         logged_in: true,
@@ -3099,6 +3755,7 @@ mod tests {
                                 }
                                 result = Some(
                                     ChatInput {
+                                        hotkey_bindings: &HotkeyBindings::defaults(),
                                         id: Some(id),
                                         channel: &channel,
                                         logged_in: true,
@@ -3593,6 +4250,7 @@ mod tests {
                 parent_display_name: "A very long display name with 日本語".repeat(3),
                 parent_msg_body: "A reply preview that must fit beside its dismiss control"
                     .repeat(3),
+                ..Default::default()
             };
             let render = |events: Vec<egui::Event>| {
                 let mut dismissed = false;
@@ -3608,6 +4266,7 @@ mod tests {
                     |ctx| {
                         egui::CentralPanel::default().show(ctx, |ui| {
                             dismissed = ChatInput {
+                                hotkey_bindings: &HotkeyBindings::defaults(),
                                 id: None,
                                 channel: &ChannelId::new("example"),
                                 logged_in: true,
@@ -3790,6 +4449,7 @@ mod tests {
                     egui::CentralPanel::default().show(ctx, |ui| {
                         ui.memory_mut(|memory| memory.request_focus(id));
                         ChatInput {
+                            hotkey_bindings: &HotkeyBindings::defaults(),
                             id: Some(id),
                             channel,
                             logged_in: true,
@@ -3994,6 +4654,7 @@ mod tests {
                 }
                 result = Some(
                     ChatInput {
+                        hotkey_bindings: &HotkeyBindings::defaults(),
                         id: Some(id),
                         channel,
                         logged_in: true,
@@ -4018,6 +4679,948 @@ mod tests {
 
     fn input_history_search_state(ctx: &egui::Context) -> Option<InputHistorySearch> {
         ctx.data(|data| data.get_temp(Id::new("history_search_test").with("input_history_search")))
+    }
+
+    fn configured_composer_frame(
+        ctx: &egui::Context,
+        buf: &mut String,
+        bindings: &HotkeyBindings,
+        events: Vec<egui::Event>,
+        focus: bool,
+    ) -> ChatInputResult {
+        owned_composer_frame(
+            ctx,
+            Id::new("configured_composer"),
+            &ChannelId::new("example"),
+            buf,
+            bindings,
+            events,
+            focus,
+        )
+    }
+
+    fn show_configured_composer(
+        ui: &mut Ui,
+        id: Id,
+        channel: &ChannelId,
+        buf: &mut String,
+        bindings: &HotkeyBindings,
+    ) -> ChatInputResult {
+        ChatInput {
+            id: Some(id),
+            hotkey_bindings: bindings,
+            channel,
+            logged_in: true,
+            username: None,
+            emote_catalog: &[],
+            emote_bytes: &UiImageCache::default(),
+            pending_reply: None,
+            message_history: &["older message".to_owned(), "newer message".to_owned()],
+            slash_usage_counts: &HashMap::new(),
+            known_channels: &[],
+            chatters: &[],
+            prevent_overlong_twitch_messages: false,
+            animate_emotes: false,
+            accept_dropped_files: false,
+        }
+        .show(ui, buf)
+    }
+
+    fn owned_composer_frame(
+        ctx: &egui::Context,
+        id: Id,
+        channel: &ChannelId,
+        buf: &mut String,
+        bindings: &HotkeyBindings,
+        events: Vec<egui::Event>,
+        focus: bool,
+    ) -> ChatInputResult {
+        account_composer_frame(
+            ctx,
+            id,
+            channel,
+            buf,
+            bindings,
+            events,
+            focus,
+            Some("first-account"),
+        )
+    }
+
+    fn account_composer_frame(
+        ctx: &egui::Context,
+        id: Id,
+        channel: &ChannelId,
+        buf: &mut String,
+        bindings: &HotkeyBindings,
+        events: Vec<egui::Event>,
+        focus: bool,
+        account_id: Option<&str>,
+    ) -> ChatInputResult {
+        let mut result = None;
+        let _ = ctx.run(raw_input(events), |ctx| {
+            if focus {
+                ctx.memory_mut(|memory| memory.request_focus(id));
+            }
+            prepare_composer_events(ctx, bindings, Some((id, channel)), account_id);
+            egui::TopBottomPanel::bottom("configured_composer_panel").show(ctx, |ui| {
+                result = Some(show_configured_composer(ui, id, channel, buf, bindings));
+            });
+        });
+        result.unwrap()
+    }
+
+    fn split_composer_frame(
+        ctx: &egui::Context,
+        drafts: &mut [String; 2],
+        bindings: &HotkeyBindings,
+        events: Vec<egui::Event>,
+        focus_before: Option<usize>,
+        focus_after: Option<usize>,
+    ) -> Vec<(usize, String)> {
+        let ids = [Id::new(("event_owner", 0)), Id::new(("event_owner", 1))];
+        let channels = [ChannelId::new("first"), ChannelId::new("second")];
+        let mut sent = Vec::new();
+        let _ = ctx.run(raw_input(events), |ctx| {
+            if let Some(index) = focus_before {
+                ctx.memory_mut(|memory| memory.request_focus(ids[index]));
+            }
+            let focused = ctx
+                .memory(|memory| memory.focused())
+                .and_then(|id| ids.iter().position(|candidate| *candidate == id));
+            let owner = focused.map(|index| (ids[index], &channels[index]));
+            prepare_composer_events(ctx, bindings, owner, Some("first-account"));
+            // Repeated preparation in the same pass must not duplicate a replay.
+            prepare_composer_events(ctx, bindings, owner, Some("first-account"));
+            if let Some(index) = focus_after {
+                ctx.memory_mut(|memory| memory.request_focus(ids[index]));
+            }
+            if ctx.input_mut(|input| {
+                crate::app::consume_binding(input, &bindings.get(HotkeyAction::SplitFocusNext))
+            }) {
+                request_composer_focus(ctx, Some(ids[(focused.unwrap_or(0) + 1) % 2]));
+            }
+            egui::CentralPanel::default().show(ctx, |ui| {
+                for index in 0..2 {
+                    let result = show_configured_composer(
+                        ui,
+                        ids[index],
+                        &channels[index],
+                        &mut drafts[index],
+                        bindings,
+                    );
+                    if let Some(text) = result.send {
+                        sent.push((index, text));
+                    }
+                }
+            });
+        });
+        sent
+    }
+
+    #[test]
+    fn configured_send_replaces_enter_and_can_be_unbound() {
+        for binding in [
+            crust_core::KeyBinding::new("F2"),
+            crust_core::KeyBinding::default(),
+        ] {
+            let ctx = egui::Context::default();
+            let mut bindings = HotkeyBindings::defaults();
+            bindings.set(HotkeyAction::InputSend, binding.clone());
+            let mut buf = "draft to send".to_owned();
+            configured_composer_frame(&ctx, &mut buf, &bindings, Vec::new(), true);
+            for modifiers in [egui::Modifiers::NONE, egui::Modifiers::SHIFT] {
+                let result = configured_composer_frame(
+                    &ctx,
+                    &mut buf,
+                    &bindings,
+                    vec![key(Key::Enter, true, modifiers)],
+                    true,
+                );
+                assert!(result.send.is_none());
+                assert_eq!(buf, "draft to send");
+            }
+            let result = configured_composer_frame(
+                &ctx,
+                &mut buf,
+                &bindings,
+                vec![key(Key::F2, true, egui::Modifiers::NONE)],
+                true,
+            );
+            if binding.is_unbound() {
+                assert!(result.send.is_none());
+                assert_eq!(buf, "draft to send");
+            } else {
+                assert_eq!(result.send.as_deref(), Some("draft to send"));
+                assert!(buf.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn send_keep_preserves_text_and_rebinding_removes_ctrl_enter() {
+        let ctx = egui::Context::default();
+        let mut bindings = HotkeyBindings::defaults();
+        let mut buf = "send this twice".to_owned();
+        configured_composer_frame(&ctx, &mut buf, &bindings, Vec::new(), true);
+        let result = configured_composer_frame(
+            &ctx,
+            &mut buf,
+            &bindings,
+            vec![key(Key::Enter, true, egui::Modifiers::CTRL)],
+            false,
+        );
+        assert_eq!(result.send.as_deref(), Some("send this twice"));
+        assert_eq!(buf, "send this twice");
+        bindings.set(
+            HotkeyAction::InputSendKeep,
+            crust_core::KeyBinding::new("F3"),
+        );
+        let result = configured_composer_frame(
+            &ctx,
+            &mut buf,
+            &bindings,
+            vec![key(Key::Enter, true, egui::Modifiers::CTRL)],
+            true,
+        );
+        assert!(result.send.is_none());
+        let result = configured_composer_frame(
+            &ctx,
+            &mut buf,
+            &bindings,
+            vec![key(Key::F3, true, egui::Modifiers::NONE)],
+            true,
+        );
+        assert_eq!(result.send.as_deref(), Some("send this twice"));
+        assert_eq!(buf, "send this twice");
+    }
+
+    #[test]
+    fn shift_enter_sends_the_draft_while_enter_accepts_a_visible_completion() {
+        for shifted in [false, true] {
+            let ctx = egui::Context::default();
+            let bindings = HotkeyBindings::defaults();
+            let mut buf = "/he".to_owned();
+            configured_composer_frame(&ctx, &mut buf, &bindings, Vec::new(), true);
+            let modifiers = if shifted {
+                egui::Modifiers::SHIFT
+            } else {
+                egui::Modifiers::NONE
+            };
+            let result = configured_composer_frame(
+                &ctx,
+                &mut buf,
+                &bindings,
+                vec![key(Key::Enter, true, modifiers)],
+                false,
+            );
+            if shifted {
+                assert_eq!(result.send.as_deref(), Some("/he"));
+                assert!(buf.is_empty());
+            } else {
+                assert!(result.send.is_none());
+                assert_eq!(buf.trim(), "/help");
+            }
+        }
+    }
+
+    #[test]
+    fn configured_history_and_clear_preserve_focus_and_draft() {
+        let ctx = egui::Context::default();
+        let mut bindings = HotkeyBindings::defaults();
+        bindings.set(
+            HotkeyAction::InputHistoryPrev,
+            crust_core::KeyBinding::new("F6"),
+        );
+        bindings.set(
+            HotkeyAction::InputHistoryNext,
+            crust_core::KeyBinding::new("F7"),
+        );
+        bindings.set(HotkeyAction::InputClear, crust_core::KeyBinding::new("F8"));
+        let mut buf = "unfinished draft".to_owned();
+        configured_composer_frame(&ctx, &mut buf, &bindings, Vec::new(), true);
+        for (pressed, expected) in [
+            (Key::ArrowUp, "unfinished draft"),
+            (Key::F6, "newer message"),
+            (Key::F6, "older message"),
+            (Key::F7, "newer message"),
+            (Key::F7, "unfinished draft"),
+            (Key::F8, ""),
+            (Key::F6, "newer message"),
+            (Key::F7, ""),
+        ] {
+            let result = configured_composer_frame(
+                &ctx,
+                &mut buf,
+                &bindings,
+                vec![key(pressed, true, egui::Modifiers::NONE)],
+                false,
+            );
+            assert!(result.send.is_none());
+            assert_eq!(buf, expected);
+            assert!(ctx.memory(|memory| memory.has_focus(Id::new("configured_composer"))));
+        }
+    }
+
+    #[test]
+    fn configured_composer_shortcuts_leave_unfocused_controls_alone() {
+        let ctx = egui::Context::default();
+        let mut bindings = HotkeyBindings::defaults();
+        bindings.set(HotkeyAction::InputSend, crust_core::KeyBinding::new("F2"));
+        bindings.set(
+            HotkeyAction::InputEmotePicker,
+            crust_core::KeyBinding::new("F9"),
+        );
+        let mut buf = "draft".to_owned();
+        configured_composer_frame(&ctx, &mut buf, &bindings, Vec::new(), false);
+        let result = configured_composer_frame(
+            &ctx,
+            &mut buf,
+            &bindings,
+            vec![
+                key(Key::F2, true, egui::Modifiers::NONE),
+                key(Key::F9, true, egui::Modifiers::NONE),
+            ],
+            false,
+        );
+        assert!(result.send.is_none());
+        assert!(!result.toggle_emote_picker);
+        assert_eq!(buf, "draft");
+        let result = configured_composer_frame(
+            &ctx,
+            &mut buf,
+            &bindings,
+            vec![key(Key::F9, true, egui::Modifiers::NONE)],
+            true,
+        );
+        assert!(result.toggle_emote_picker);
+        assert_eq!(buf, "draft");
+    }
+
+    #[test]
+    fn printable_input_shortcuts_consume_their_text_and_preserve_other_typing() {
+        let ctx = egui::Context::default();
+        let mut bindings = HotkeyBindings::defaults();
+        bindings.set(HotkeyAction::InputClear, crust_core::KeyBinding::new("U"));
+        bindings.set(HotkeyAction::InputSend, crust_core::KeyBinding::new("S"));
+        let mut buf = "old draft".to_owned();
+        configured_composer_frame(&ctx, &mut buf, &bindings, Vec::new(), true);
+        let result = configured_composer_frame(
+            &ctx,
+            &mut buf,
+            &bindings,
+            vec![
+                key(Key::U, true, egui::Modifiers::NONE),
+                egui::Event::Text("u".to_owned()),
+                key(Key::A, true, egui::Modifiers::NONE),
+                egui::Event::Text("a".to_owned()),
+            ],
+            false,
+        );
+        assert!(result.send.is_none());
+        assert_eq!(buf, "a");
+        let result = configured_composer_frame(
+            &ctx,
+            &mut buf,
+            &bindings,
+            vec![
+                key(Key::S, true, egui::Modifiers::NONE),
+                egui::Event::Text("s".to_owned()),
+            ],
+            false,
+        );
+        assert_eq!(result.send.as_deref(), Some("a"));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn typing_after_send_edits_the_next_draft_in_event_order() {
+        for keep in [false, true] {
+            let ctx = egui::Context::default();
+            let bindings = HotkeyBindings::defaults();
+            let mut buf = "draft".to_owned();
+            configured_composer_frame(&ctx, &mut buf, &bindings, Vec::new(), true);
+            move_cursor_to_end(&ctx, Id::new("configured_composer"), buf.chars().count());
+            let modifiers = if keep {
+                egui::Modifiers::CTRL
+            } else {
+                egui::Modifiers::NONE
+            };
+            let result = configured_composer_frame(
+                &ctx,
+                &mut buf,
+                &bindings,
+                vec![
+                    egui::Event::Text(" before".to_owned()),
+                    key(Key::Enter, true, modifiers),
+                    key(Key::Enter, false, modifiers),
+                    key(Key::A, true, egui::Modifiers::NONE),
+                    egui::Event::Text(" after".to_owned()),
+                ],
+                false,
+            );
+            assert_eq!(result.send.as_deref(), Some("draft before"));
+            assert_eq!(buf, if keep { "draft before" } else { "" });
+            let result = configured_composer_frame(&ctx, &mut buf, &bindings, Vec::new(), false);
+            assert!(result.send.is_none());
+            assert_eq!(buf, if keep { "draft before after" } else { " after" });
+            configured_composer_frame(&ctx, &mut buf, &bindings, Vec::new(), false);
+            assert_eq!(
+                buf,
+                if keep { "draft before after" } else { " after" },
+                "queued text is applied once"
+            );
+        }
+    }
+
+    #[test]
+    fn clear_preserves_the_order_of_typing_and_send() {
+        for printable in [false, true] {
+            let ctx = egui::Context::default();
+            let mut bindings = HotkeyBindings::defaults();
+            let (clear_key, clear_modifiers, send_key) = if printable {
+                bindings.set(HotkeyAction::InputClear, crust_core::KeyBinding::new("U"));
+                bindings.set(HotkeyAction::InputSend, crust_core::KeyBinding::new("S"));
+                (Key::U, egui::Modifiers::NONE, Key::S)
+            } else {
+                (Key::U, egui::Modifiers::CTRL, Key::Enter)
+            };
+            let mut buf = "old draft".to_owned();
+            configured_composer_frame(&ctx, &mut buf, &bindings, Vec::new(), true);
+            move_cursor_to_end(&ctx, Id::new("configured_composer"), buf.chars().count());
+            let mut events = vec![
+                egui::Event::Text(" before clear".to_owned()),
+                key(clear_key, true, clear_modifiers),
+            ];
+            if printable {
+                events.push(egui::Event::Text("u".to_owned()));
+            }
+            events.extend([
+                key(Key::A, true, egui::Modifiers::NONE),
+                egui::Event::Text("after clear".to_owned()),
+                key(send_key, true, egui::Modifiers::NONE),
+            ]);
+            if printable {
+                events.push(egui::Event::Text("s".to_owned()));
+            }
+            assert!(
+                configured_composer_frame(&ctx, &mut buf, &bindings, events, false)
+                    .send
+                    .is_none()
+            );
+            let sent = configured_composer_frame(&ctx, &mut buf, &bindings, Vec::new(), false);
+            assert_eq!(sent.send.as_deref(), Some("after clear"));
+            assert!(buf.is_empty());
+            assert!(
+                configured_composer_frame(&ctx, &mut buf, &bindings, Vec::new(), false)
+                    .send
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn queued_typing_stays_on_each_side_of_a_pane_navigation_shortcut() {
+        for navigation_arrives_later in [false, true] {
+            let ctx = egui::Context::default();
+            let bindings = HotkeyBindings::defaults();
+            let mut drafts = ["first draft".to_owned(), "second draft".to_owned()];
+            split_composer_frame(&ctx, &mut drafts, &bindings, Vec::new(), Some(0), None);
+            for index in 0..2 {
+                move_cursor_to_end(
+                    &ctx,
+                    Id::new(("event_owner", index)),
+                    drafts[index].chars().count(),
+                );
+            }
+            let mut events = vec![
+                key(Key::Enter, true, egui::Modifiers::NONE),
+                egui::Event::Text("next first".to_owned()),
+            ];
+            let mut navigation = vec![
+                key(
+                    Key::PageDown,
+                    true,
+                    egui::Modifiers::CTRL | egui::Modifiers::ALT,
+                ),
+                egui::Event::Text(" plus second".to_owned()),
+                key(Key::Enter, true, egui::Modifiers::NONE),
+            ];
+            if !navigation_arrives_later {
+                events.append(&mut navigation);
+            }
+            let mut sent = split_composer_frame(&ctx, &mut drafts, &bindings, events, None, None);
+            assert_eq!(sent, vec![(0, "first draft".to_owned())]);
+            sent.extend(split_composer_frame(
+                &ctx,
+                &mut drafts,
+                &bindings,
+                navigation,
+                None,
+                None,
+            ));
+            assert_eq!(drafts, ["next first", "second draft"]);
+            for _ in 0..4 {
+                sent.extend(split_composer_frame(
+                    &ctx,
+                    &mut drafts,
+                    &bindings,
+                    Vec::new(),
+                    None,
+                    None,
+                ));
+            }
+            assert_eq!(
+                sent,
+                vec![
+                    (0, "first draft".to_owned()),
+                    (1, "second draft plus second".to_owned())
+                ]
+            );
+            assert_eq!(drafts, ["next first", ""]);
+        }
+    }
+
+    #[test]
+    fn focus_change_after_preparation_retains_the_original_draft_input() {
+        let ctx = egui::Context::default();
+        let bindings = HotkeyBindings::defaults();
+        let mut drafts = ["sent first".to_owned(), "second draft".to_owned()];
+        split_composer_frame(&ctx, &mut drafts, &bindings, Vec::new(), Some(0), None);
+        let sent = split_composer_frame(
+            &ctx,
+            &mut drafts,
+            &bindings,
+            vec![
+                key(Key::Enter, true, egui::Modifiers::NONE),
+                egui::Event::Text("next first".to_owned()),
+            ],
+            None,
+            None,
+        );
+        assert_eq!(sent, vec![(0, "sent first".to_owned())]);
+        split_composer_frame(&ctx, &mut drafts, &bindings, Vec::new(), None, Some(1));
+        split_composer_frame(&ctx, &mut drafts, &bindings, Vec::new(), None, None);
+        assert_eq!(drafts, ["", "second draft"]);
+        split_composer_frame(&ctx, &mut drafts, &bindings, Vec::new(), Some(0), None);
+        assert_eq!(drafts, ["next first", "second draft"]);
+        split_composer_frame(&ctx, &mut drafts, &bindings, Vec::new(), None, None);
+        assert_eq!(drafts, ["next first", "second draft"]);
+    }
+
+    #[test]
+    fn text_after_navigation_keeps_its_target_when_focus_moves_again() {
+        let ctx = egui::Context::default();
+        let bindings = HotkeyBindings::defaults();
+        let mut drafts = ["first draft".to_owned(), "second draft".to_owned()];
+        split_composer_frame(&ctx, &mut drafts, &bindings, Vec::new(), Some(0), None);
+        for index in 0..2 {
+            move_cursor_to_end(
+                &ctx,
+                Id::new(("event_owner", index)),
+                drafts[index].chars().count(),
+            );
+        }
+        split_composer_frame(
+            &ctx,
+            &mut drafts,
+            &bindings,
+            vec![
+                key(
+                    Key::PageDown,
+                    true,
+                    egui::Modifiers::CTRL | egui::Modifiers::ALT,
+                ),
+                egui::Event::Text(" after navigation".to_owned()),
+            ],
+            None,
+            None,
+        );
+        split_composer_frame(&ctx, &mut drafts, &bindings, Vec::new(), Some(0), None);
+        assert_eq!(drafts, ["first draft", "second draft"]);
+        split_composer_frame(&ctx, &mut drafts, &bindings, Vec::new(), Some(1), None);
+        assert_eq!(drafts, ["first draft", "second draft after navigation"]);
+    }
+
+    #[test]
+    fn reused_composer_id_keeps_hidden_channel_input_until_its_draft_returns() {
+        let ctx = egui::Context::default();
+        let bindings = HotkeyBindings::defaults();
+        let id = Id::new("reused_composer");
+        let first = ChannelId::new("first");
+        let second = ChannelId::new("second");
+        let mut first_draft = "first message".to_owned();
+        let mut second_draft = "second draft".to_owned();
+        owned_composer_frame(
+            &ctx,
+            id,
+            &first,
+            &mut first_draft,
+            &bindings,
+            Vec::new(),
+            true,
+        );
+        let sent = owned_composer_frame(
+            &ctx,
+            id,
+            &first,
+            &mut first_draft,
+            &bindings,
+            vec![
+                key(Key::Enter, true, egui::Modifiers::NONE),
+                egui::Event::Text("next first".to_owned()),
+            ],
+            false,
+        );
+        assert_eq!(sent.send.as_deref(), Some("first message"));
+        owned_composer_frame(
+            &ctx,
+            id,
+            &second,
+            &mut second_draft,
+            &bindings,
+            Vec::new(),
+            false,
+        );
+        move_cursor_to_end(&ctx, id, second_draft.chars().count());
+        owned_composer_frame(
+            &ctx,
+            id,
+            &second,
+            &mut second_draft,
+            &bindings,
+            vec![egui::Event::Text(" edited".to_owned())],
+            false,
+        );
+        assert!(first_draft.is_empty());
+        assert_eq!(second_draft, "second draft edited");
+        owned_composer_frame(
+            &ctx,
+            id,
+            &first,
+            &mut first_draft,
+            &bindings,
+            Vec::new(),
+            false,
+        );
+        assert_eq!(first_draft, "next first");
+        assert_eq!(second_draft, "second draft edited");
+        owned_composer_frame(
+            &ctx,
+            id,
+            &first,
+            &mut first_draft,
+            &bindings,
+            Vec::new(),
+            false,
+        );
+        assert_eq!(first_draft, "next first");
+    }
+
+    #[test]
+    fn queued_input_moves_with_a_draft_between_classic_and_split_editors() {
+        let ctx = egui::Context::default();
+        let bindings = HotkeyBindings::defaults();
+        let channel = ChannelId::new("example");
+        let classic = Id::new("classic_editor");
+        let split = Id::new("split_editor");
+        let mut draft = "sent message".to_owned();
+        owned_composer_frame(
+            &ctx,
+            classic,
+            &channel,
+            &mut draft,
+            &bindings,
+            Vec::new(),
+            true,
+        );
+        let sent = owned_composer_frame(
+            &ctx,
+            classic,
+            &channel,
+            &mut draft,
+            &bindings,
+            vec![
+                key(Key::Enter, true, egui::Modifiers::NONE),
+                egui::Event::Text("next draft".to_owned()),
+            ],
+            false,
+        );
+        assert_eq!(sent.send.as_deref(), Some("sent message"));
+        migrate_composer_events(&ctx, classic, split, &channel);
+        owned_composer_frame(
+            &ctx,
+            split,
+            &channel,
+            &mut draft,
+            &bindings,
+            Vec::new(),
+            true,
+        );
+        assert_eq!(draft, "next draft");
+        migrate_composer_events(&ctx, split, classic, &channel);
+        owned_composer_frame(
+            &ctx,
+            classic,
+            &channel,
+            &mut draft,
+            &bindings,
+            Vec::new(),
+            true,
+        );
+        assert_eq!(draft, "next draft");
+    }
+
+    #[test]
+    fn queued_input_follows_a_channel_redirect_once() {
+        let ctx = egui::Context::default();
+        let bindings = HotkeyBindings::defaults();
+        let old = ChannelId::new("old_name");
+        let new = ChannelId::new("new_name");
+        let id = Id::new("redirected_composer");
+        let mut draft = "sent message".to_owned();
+        owned_composer_frame(&ctx, id, &old, &mut draft, &bindings, Vec::new(), true);
+        owned_composer_frame(
+            &ctx,
+            id,
+            &old,
+            &mut draft,
+            &bindings,
+            vec![
+                key(Key::Enter, true, egui::Modifiers::NONE),
+                egui::Event::Text("next draft".to_owned()),
+            ],
+            false,
+        );
+        rename_composer_event_channel(&ctx, &old, &new);
+        owned_composer_frame(&ctx, id, &new, &mut draft, &bindings, Vec::new(), false);
+        assert_eq!(draft, "next draft");
+        owned_composer_frame(&ctx, id, &new, &mut draft, &bindings, Vec::new(), false);
+        assert_eq!(draft, "next draft");
+    }
+
+    #[test]
+    fn account_changes_keep_queued_text_but_require_a_new_send_gesture() {
+        for (keep, shifted, printable) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, false),
+            (true, true, false),
+            (false, false, true),
+            (true, false, true),
+        ] {
+            let ctx = egui::Context::default();
+            let mut bindings = HotkeyBindings::defaults();
+            if printable {
+                bindings.set(
+                    if keep {
+                        HotkeyAction::InputSendKeep
+                    } else {
+                        HotkeyAction::InputSend
+                    },
+                    crust_core::KeyBinding::new("S"),
+                );
+            }
+            let id = Id::new("account_composer");
+            let channel = ChannelId::new("example");
+            let mut draft = "first message".to_owned();
+            account_composer_frame(
+                &ctx,
+                id,
+                &channel,
+                &mut draft,
+                &bindings,
+                Vec::new(),
+                true,
+                Some("alice-id"),
+            );
+            let first_key = if printable && !keep {
+                Key::S
+            } else {
+                Key::Enter
+            };
+            let mut events = vec![key(first_key, true, egui::Modifiers::NONE)];
+            if first_key == Key::S {
+                events.push(egui::Event::Text("s".to_owned()));
+            }
+            events.push(egui::Event::Text("next draft".to_owned()));
+            let mut modifiers = egui::Modifiers::NONE;
+            if keep && !printable {
+                modifiers |= egui::Modifiers::CTRL;
+            }
+            if shifted {
+                modifiers |= egui::Modifiers::SHIFT;
+            }
+            events.push(key(
+                if printable { Key::S } else { Key::Enter },
+                true,
+                modifiers,
+            ));
+            if printable {
+                events.push(egui::Event::Text("s".to_owned()));
+            }
+            let sent = account_composer_frame(
+                &ctx,
+                id,
+                &channel,
+                &mut draft,
+                &bindings,
+                events,
+                false,
+                Some("alice-id"),
+            );
+            assert_eq!(sent.send.as_deref(), Some("first message"));
+            for _ in 0..2 {
+                let result = account_composer_frame(
+                    &ctx,
+                    id,
+                    &channel,
+                    &mut draft,
+                    &bindings,
+                    Vec::new(),
+                    false,
+                    Some("bob-id"),
+                );
+                assert!(
+                    result.send.is_none(),
+                    "a queued gesture cannot send under the new account"
+                );
+                assert_eq!(draft, "next draft");
+            }
+            let mut fresh_send = vec![key(first_key, true, egui::Modifiers::NONE)];
+            if first_key == Key::S {
+                fresh_send.push(egui::Event::Text("s".to_owned()));
+            }
+            let result = account_composer_frame(
+                &ctx,
+                id,
+                &channel,
+                &mut draft,
+                &bindings,
+                fresh_send,
+                false,
+                Some("bob-id"),
+            );
+            assert_eq!(result.send.as_deref(), Some("next draft"));
+        }
+    }
+
+    #[test]
+    fn an_account_change_after_preparation_cancels_ready_and_pending_send() {
+        let ctx = egui::Context::default();
+        let bindings = HotkeyBindings::defaults();
+        let id = Id::new("account_composer");
+        let channel = ChannelId::new("example");
+        let mut draft = "first message".to_owned();
+        account_composer_frame(
+            &ctx,
+            id,
+            &channel,
+            &mut draft,
+            &bindings,
+            Vec::new(),
+            true,
+            Some("alice-id"),
+        );
+        move_cursor_to_end(&ctx, id, draft.chars().count());
+        let mut sent = None;
+        let _ = ctx.run(
+            raw_input(vec![
+                key(Key::Enter, true, egui::Modifiers::NONE),
+                egui::Event::Text(" next draft".to_owned()),
+                key(Key::Enter, true, egui::Modifiers::CTRL),
+            ]),
+            |ctx| {
+                prepare_composer_events(ctx, &bindings, Some((id, &channel)), Some("alice-id"));
+                // Runtime events can finish an account switch after input was staged.
+                sync_composer_account(ctx, &bindings, Some("bob-id"));
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    sent = show_configured_composer(ui, id, &channel, &mut draft, &bindings).send;
+                });
+            },
+        );
+        assert!(sent.is_none());
+        assert_eq!(draft, "first message");
+        let result = account_composer_frame(
+            &ctx,
+            id,
+            &channel,
+            &mut draft,
+            &bindings,
+            Vec::new(),
+            false,
+            Some("bob-id"),
+        );
+        assert!(result.send.is_none());
+        assert_eq!(draft, "first message next draft");
+    }
+
+    #[test]
+    fn account_changes_cancel_send_in_the_navigation_suffix() {
+        let ctx = egui::Context::default();
+        let bindings = HotkeyBindings::defaults();
+        let first = ChannelId::new("first");
+        let second = ChannelId::new("second");
+        let first_id = Id::new("account_first");
+        let second_id = Id::new("account_second");
+        let mut first_draft = "first draft".to_owned();
+        let mut second_draft = String::new();
+        account_composer_frame(
+            &ctx,
+            first_id,
+            &first,
+            &mut first_draft,
+            &bindings,
+            Vec::new(),
+            true,
+            Some("alice-id"),
+        );
+        let mut sent = None;
+        let _ = ctx.run(
+            raw_input(vec![
+                key(
+                    Key::PageDown,
+                    true,
+                    egui::Modifiers::CTRL | egui::Modifiers::ALT,
+                ),
+                egui::Event::Text("second draft".to_owned()),
+                key(Key::Enter, true, egui::Modifiers::NONE),
+            ]),
+            |ctx| {
+                prepare_composer_events(ctx, &bindings, Some((first_id, &first)), Some("alice-id"));
+                assert!(ctx.input_mut(|input| crate::app::consume_binding(
+                    input,
+                    &bindings.get(HotkeyAction::SplitFocusNext)
+                )));
+                request_composer_focus(ctx, Some(second_id));
+                sync_composer_account(ctx, &bindings, Some("bob-id"));
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_configured_composer(ui, first_id, &first, &mut first_draft, &bindings);
+                    sent = show_configured_composer(
+                        ui,
+                        second_id,
+                        &second,
+                        &mut second_draft,
+                        &bindings,
+                    )
+                    .send;
+                });
+            },
+        );
+        assert!(sent.is_none());
+        let result = account_composer_frame(
+            &ctx,
+            second_id,
+            &second,
+            &mut second_draft,
+            &bindings,
+            Vec::new(),
+            false,
+            Some("bob-id"),
+        );
+        assert!(result.send.is_none());
+        assert_eq!(first_draft, "first draft");
+        assert_eq!(second_draft, "second draft");
     }
 
     #[test]
@@ -4214,6 +5817,7 @@ mod tests {
                             ui.memory_mut(|memory| memory.request_focus(id));
                         }
                         let result = ChatInput {
+                            hotkey_bindings: &HotkeyBindings::defaults(),
                             id: Some(id),
                             channel,
                             logged_in: true,
@@ -4454,6 +6058,7 @@ mod tests {
                     ui.memory_mut(|memory| memory.request_focus(id));
                 }
                 ChatInput {
+                    hotkey_bindings: &HotkeyBindings::defaults(),
                     id: Some(id),
                     channel,
                     logged_in: true,

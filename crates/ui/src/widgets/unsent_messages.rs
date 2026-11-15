@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use crust_core::{ChannelId, ReplyInfo};
+use crust_core::{ChannelId, ComposerTarget, ReplyInfo};
 use egui::{Context, RichText};
 
 use crate::theme as t;
@@ -11,10 +11,16 @@ pub(crate) struct UnsentMessage {
     pub text: String,
     pub reply_to_msg_id: Option<String>,
     pub reply: Option<ReplyInfo>,
+    pub composer: Option<ComposerTarget>,
     pub reason: String,
 }
 
 impl UnsentMessage {
+    pub fn belongs_to(&self, account_id: Option<&str>) -> bool {
+        !self.channel.is_twitch()
+            || self.composer.as_ref().is_none_or(|target| target.account_id() == account_id)
+    }
+
     pub fn reply_info(&self) -> Option<ReplyInfo> {
         self.reply.clone().or_else(|| {
             self.reply_to_msg_id.as_ref().map(|id| ReplyInfo {
@@ -22,6 +28,7 @@ impl UnsentMessage {
                 parent_user_login: String::new(),
                 parent_display_name: "unknown".to_owned(),
                 parent_msg_body: String::new(),
+                ..Default::default()
             })
         })
     }
@@ -38,14 +45,25 @@ impl UnsentMessages {
         self.messages.push_back(message);
     }
 
+    #[cfg(test)]
     pub fn front(&self) -> Option<&UnsentMessage> {
         self.messages.front()
     }
 
+    pub fn front_for_account(&self, account_id: Option<&str>) -> Option<&UnsentMessage> {
+        self.messages.iter().find(|message| message.belongs_to(account_id))
+    }
+
+    #[cfg(test)]
     pub fn show(&mut self, ctx: &Context, can_restore: bool) -> Option<UnsentMessage> {
-        let count = self.messages.len();
+        self.show_for_account(ctx, can_restore, None)
+    }
+
+    pub fn show_for_account(&mut self, ctx: &Context, can_restore: bool, account_id: Option<&str>) -> Option<UnsentMessage> {
+        let index = self.messages.iter().position(|message| message.belongs_to(account_id))?;
+        let count = self.messages.iter().filter(|message| message.belongs_to(account_id)).count();
         let generation = self.front_generation;
-        let message = self.messages.front_mut()?;
+        let message = &mut self.messages[index];
         let mut restore = false;
         let mut dismiss = false;
         let mut copy = false;
@@ -76,7 +94,7 @@ impl UnsentMessages {
                         });
                     });
                 egui::ScrollArea::vertical()
-                    .id_salt(("unsent_messages_body", generation))
+                    .id_salt(("unsent_messages_body", account_id, generation))
                     .max_height(ui.available_height())
                     .min_scrolled_height(0.0)
                     .auto_shrink([false, false])
@@ -93,11 +111,11 @@ impl UnsentMessages {
                                 reply.parent_display_name, reply.parent_msg_body)).wrap());
                         }
                         ui.add(egui::TextEdit::multiline(&mut message.text)
-                            .id(egui::Id::new("unsent_message_draft").with(generation))
+                            .id(egui::Id::new("unsent_message_draft").with((account_id, generation)))
                             .desired_width(f32::INFINITY)
                             .desired_rows(3));
                         if !can_restore {
-                            ui.add(egui::Label::new("Focus this channel with an empty composer and no selected reply to restore the draft.").wrap());
+                            ui.add(egui::Label::new("Open the original channel or thread with an empty composer to restore this draft.").wrap());
                         }
                     });
             });
@@ -108,10 +126,10 @@ impl UnsentMessages {
             self.front_generation = self.front_generation.wrapping_add(1);
         }
         if restore {
-            self.messages.pop_front()
+            self.messages.remove(index)
         } else {
             if dismiss {
-                self.messages.pop_front();
+                self.messages.remove(index);
             }
             None
         }
@@ -129,11 +147,13 @@ mod tests {
                 .map(|line| format!("Draft line {line}: keep 🙂 every word.\n"))
                 .collect(),
             reply_to_msg_id: Some("parent-id".into()),
+            composer: None,
             reply: Some(ReplyInfo {
                 parent_msg_id: "parent-id".into(),
                 parent_user_login: "author".into(),
                 parent_display_name: "Author".into(),
                 parent_msg_body: "Full reply context with several lines.\n".repeat(40),
+                ..Default::default()
             }),
             reason: "The connection is unavailable; this draft has been kept.\n".repeat(30),
         }
@@ -257,6 +277,21 @@ mod tests {
                 message.reply.unwrap().parent_msg_body
             );
         }
+    }
+
+    #[test]
+    fn recovery_queue_only_exposes_the_current_accounts_targeted_drafts() {
+        let mut dialog = UnsentMessages::default();
+        let mut alice = long_message("alice-room");
+        alice.composer = Some(ComposerTarget::ReplyThread { account_id: Some("alice".into()), root_msg_id: "root".into() });
+        dialog.push(alice);
+        assert!(dialog.front_for_account(Some("bob")).is_none());
+        let mut bob = long_message("bob-room");
+        bob.composer = Some(ComposerTarget::Chat { account_id: Some("bob".into()), pane_id: 12 });
+        dialog.push(bob);
+        assert_eq!(dialog.front_for_account(Some("alice")).unwrap().channel, ChannelId::new("alice-room"));
+        assert_eq!(dialog.front_for_account(Some("bob")).unwrap().channel, ChannelId::new("bob-room"));
+        assert!(dialog.front_for_account(None).is_none());
     }
 
     #[test]

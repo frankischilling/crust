@@ -32,6 +32,7 @@ pub struct MessageSearchState {
     regex_error: Option<String>,
     focus_keyword: bool,
     focused_control: Option<Id>,
+    pane: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -41,6 +42,40 @@ pub struct SearchMatchStats {
 }
 
 impl MessageSearchState {
+    pub fn settings(&self) -> crust_core::model::PaneSearchSettings {
+        crust_core::model::PaneSearchSettings {
+            open: self.open, username: self.username.clone(), keyword: self.keyword.clone(), regex: self.regex.clone(),
+        }
+    }
+
+    pub fn from_settings(settings: &crust_core::model::PaneSearchSettings, pane: Option<u64>) -> Self {
+        let mut search = Self {
+            open: settings.open, username: settings.username.clone(), keyword: settings.keyword.clone(),
+            regex: settings.regex.clone(), pane, ..Default::default()
+        };
+        search.ensure_regex();
+        search
+    }
+
+    pub fn for_pane(pane: u64) -> Self {
+        Self { pane: Some(pane), ..Default::default() }
+    }
+
+    pub fn set_pane(&mut self, pane: Option<u64>) {
+        if self.pane != pane {
+            self.pane = pane;
+            self.focused_control = None;
+        }
+    }
+
+    fn scope_id(&self, id: Id) -> Id {
+        self.pane.map_or(id, |pane| id.with(pane))
+    }
+
+    pub(crate) fn field_id(&self, channel: &ChannelId, key: &str) -> Id {
+        self.scope_id(search_field_id(channel, key))
+    }
+
     pub fn request_open(&mut self) {
         self.open = true;
         self.focus_keyword = true;
@@ -204,7 +239,7 @@ pub fn show_message_search_window(
     search: &mut MessageSearchState,
     always_on_top: bool,
 ) {
-    let viewport_id = ViewportId::from_hash_of(("message_search", channel.as_str()));
+    let viewport_id = ViewportId::from_hash_of(search.scope_id(Id::new(("message_search", channel.as_str()))));
     let prefix = if channel.is_irc_query() { "@" } else if channel.is_kick() || channel.is_irc_server_tab() { "" } else { "#" };
     let title = format!("Search {prefix}{}", channel.display_name());
     let level = if always_on_top {
@@ -253,7 +288,7 @@ pub fn show_message_search_window(
             ViewportClass::Embedded => {
                 let mut open = search.open;
                 egui::Window::new(title.clone())
-                    .id(Id::new("message_search_window").with(channel.as_str()))
+                    .id(search.scope_id(Id::new("message_search_window").with(channel.as_str())))
                     .default_width(SEARCH_WINDOW_DEFAULT_WIDTH)
                     .default_height(SEARCH_WINDOW_DEFAULT_HEIGHT)
                     .min_width(320.0)
@@ -299,7 +334,7 @@ fn show_message_search_scroll_area(
     search: &mut MessageSearchState,
 ) {
     ScrollArea::vertical()
-        .id_salt(("message_search_scroll", channel.as_str()))
+        .id_salt(search.scope_id(Id::new(("message_search_scroll", channel.as_str()))))
         .auto_shrink([false, false])
         .show(ui, |ui| {
             show_message_search_contents(ui, channel, messages, search, true, true);
@@ -328,17 +363,20 @@ fn show_message_search_contents(
     ui.add_space(2.0);
 
     let focus_keyword = std::mem::take(&mut search.focus_keyword);
+    let username_id = search.field_id(channel, "username");
+    let keyword_id = search.field_id(channel, "keyword");
+    let regex_id = search.field_id(channel, "regex");
     if compact {
         search_field_row(
-            ui, channel, "Username", "mod, chatter...", "username",
+            ui, username_id, "Username", "mod, chatter...",
             &mut search.username, false, false,
         );
         search_field_row(
-            ui, channel, "Keyword", "giveaway, timeout...", "keyword",
+            ui, keyword_id, "Keyword", "giveaway, timeout...",
             &mut search.keyword, focus_keyword, false,
         );
         search_field_row(
-            ui, channel, "Regex", r"^!|https?://", "regex",
+            ui, regex_id, "Regex", r"^!|https?://",
             &mut search.regex, false, true,
         );
     } else {
@@ -350,7 +388,7 @@ fn show_message_search_contents(
                 &mut cols[0],
                 "Username",
                 "mod, chatter...",
-                search_field_id(channel, "username"),
+                username_id,
                 &mut search.username,
                 false,
                 false,
@@ -359,7 +397,7 @@ fn show_message_search_contents(
                 &mut cols[1],
                 "Keyword",
                 "giveaway, timeout...",
-                search_field_id(channel, "keyword"),
+                keyword_id,
                 &mut search.keyword,
                 focus_keyword,
                 false,
@@ -368,7 +406,7 @@ fn show_message_search_contents(
                 &mut cols[2],
                 "Regex",
                 r"^!|https?://",
-                search_field_id(channel, "regex"),
+                regex_id,
                 &mut search.regex,
                 false,
                 true,
@@ -536,10 +574,9 @@ fn focus_search_field(ctx: &Context, response: &egui::Response, value: &str) {
 
 fn search_field_row(
     ui: &mut Ui,
-    channel: &ChannelId,
+    id: Id,
     label: &str,
     hint: &str,
-    key: &str,
     value: &mut String,
     request_focus: bool,
     code_editor: bool,
@@ -549,7 +586,6 @@ fn search_field_row(
             [SEARCH_LABEL_WIDTH, 28.0],
             egui::Label::new(RichText::new(label).font(t::small()).color(t::text_secondary())),
         );
-        let id = search_field_id(channel, key);
         let mut edit = egui::TextEdit::singleline(value)
             .id(id)
             .hint_text(hint)

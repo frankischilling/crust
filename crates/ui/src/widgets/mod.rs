@@ -20,6 +20,7 @@ pub mod message_list;
 pub mod message_search;
 pub(crate) mod name_paint;
 pub mod plugin_ui;
+pub(crate) mod reply_thread;
 pub(crate) mod sender_cosmetics;
 pub mod settings_page;
 pub mod shared_chat_banner;

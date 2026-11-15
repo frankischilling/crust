@@ -7,12 +7,14 @@ use crust_core::events::IvrLogEntry;
 use crust_core::model::{Badge, ChannelId, ChatMessage, UserProfile};
 
 use crate::theme as t;
+use super::message_list::{MessagePreviewActions, MessagePreviewCache, MessagePreviewContext};
 
 // Public action returned from show()
 
 /// Action emitted by the popup when a moderation button is pressed.
 #[derive(Debug, Clone)]
 pub enum PopupAction {
+    MessageActions(MessagePreviewActions),
     Timeout {
         channel: ChannelId,
         login: String,
@@ -121,8 +123,10 @@ pub struct UserProfilePopup {
     ban_confirm: bool,
     /// Recent messages from this user in the current channel (most-recent first).
     logs: Vec<ChatMessage>,
+    logs_cache: MessagePreviewCache,
     /// Recent moderation actions targeting this user in the current channel.
     mod_logs: Vec<ChatMessage>,
+    mod_logs_cache: MessagePreviewCache,
     /// External IVR chat logs fetched from logs.ivr.fi.
     ivr_logs: Vec<IvrLogEntry>,
     /// Whether IVR logs are currently being fetched.
@@ -168,6 +172,8 @@ impl UserProfilePopup {
         self.ban_confirm = false;
         self.logs.clear();
         self.mod_logs.clear();
+        self.logs_cache = MessagePreviewCache::default();
+        self.mod_logs_cache = MessagePreviewCache::default();
         self.ivr_logs.clear();
         self.ivr_logs_loading = false;
         self.ivr_logs_error = None;
@@ -758,7 +764,12 @@ impl UserProfilePopup {
         ui.add_space(4.0);
     }
 
-    fn render_logs_tab(&self, ui: &mut egui::Ui) {
+    fn render_logs_tab(
+        &mut self,
+        ui: &mut egui::Ui,
+        preview: MessagePreviewContext<'_>,
+        actions: &mut Vec<PopupAction>,
+    ) {
         let log_count = self.logs.len();
         egui::Frame::new()
             .fill(t::scrim_bg())
@@ -781,66 +792,25 @@ impl UserProfilePopup {
 
         ui.add_space(4.0);
 
-        egui::ScrollArea::vertical()
-            .id_salt("user_logs_scroll")
-            .max_height(320.0)
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-                if self.logs.is_empty() {
-                    ui.add_space(8.0);
-                    ui.centered_and_justified(|ui| {
-                        ui.label(
-                            RichText::new("No recent messages.")
-                                .color(t::text_muted())
-                                .small(),
-                        );
-                    });
-                }
-                for msg in &self.logs {
-                    let time_str = msg.timestamp.format("%H:%M:%S").to_string();
-                    let text = chat_message_text(msg);
-
-                    let is_action = msg.flags.is_action;
-                    let is_deleted = msg.flags.is_deleted;
-
-                    egui::Frame::new()
-                        .fill(if is_deleted {
-                            t::alpha(t::red(), 20)
-                        } else {
-                            Color32::TRANSPARENT
-                        })
-                        .inner_margin(egui::Margin::symmetric(4, 2))
-                        .show(ui, |ui| {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.spacing_mut().item_spacing.x = 4.0;
-                                ui.add(egui::Label::new(
-                                    RichText::new(&time_str)
-                                        .color(t::text_muted())
-                                        .small()
-                                        .monospace(),
-                                ));
-                                let msg_color = if is_deleted {
-                                    t::text_muted()
-                                } else if is_action {
-                                    t::alpha(t::mention(), 230)
-                                } else {
-                                    t::text_primary()
-                                };
-                                let rich = RichText::new(&text).color(msg_color).small();
-                                let rich = if is_action || is_deleted {
-                                    rich.italics()
-                                } else {
-                                    rich
-                                };
-                                ui.add(egui::Label::new(rich).wrap());
-                            });
-                        });
-                    ui.add_space(1.0);
-                }
-            });
+        if self.logs.is_empty() {
+            ui.label(RichText::new("No recent messages.").color(t::text_muted()).small());
+            return;
+        }
+        let result = self.logs_cache.show_history(
+            ui, egui::Id::new("user_logs_scroll").with((&self.channel, &self.loading_login)),
+            &self.logs, &preview, self.is_mod,
+        );
+        if !result.is_empty() {
+            actions.push(PopupAction::MessageActions(result));
+        }
     }
 
-    fn render_mod_logs_tab(&self, ui: &mut egui::Ui) {
+    fn render_mod_logs_tab(
+        &mut self,
+        ui: &mut egui::Ui,
+        preview: MessagePreviewContext<'_>,
+        actions: &mut Vec<PopupAction>,
+    ) {
         let log_count = self.mod_logs.len();
         egui::Frame::new()
             .fill(t::scrim_bg())
@@ -863,48 +833,17 @@ impl UserProfilePopup {
 
         ui.add_space(4.0);
 
-        egui::ScrollArea::vertical()
-            .id_salt("user_mod_logs_scroll")
-            .max_height(320.0)
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-                if self.mod_logs.is_empty() {
-                    ui.add_space(8.0);
-                    ui.centered_and_justified(|ui| {
-                        ui.label(
-                            RichText::new("No recent moderation actions.")
-                                .color(t::text_muted())
-                                .small(),
-                        );
-                    });
-                }
-                for msg in &self.mod_logs {
-                    let time_str = msg.timestamp.format("%H:%M:%S").to_string();
-                    egui::Frame::new()
-                        .fill(t::warning_soft_bg())
-                        .inner_margin(egui::Margin::symmetric(4, 2))
-                        .show(ui, |ui| {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.spacing_mut().item_spacing.x = 4.0;
-                                ui.add(egui::Label::new(
-                                    RichText::new(&time_str)
-                                        .color(t::text_muted())
-                                        .small()
-                                        .monospace(),
-                                ));
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(&msg.raw_text)
-                                            .color(t::text_primary())
-                                            .small(),
-                                    )
-                                    .wrap(),
-                                );
-                            });
-                        });
-                    ui.add_space(1.0);
-                }
-            });
+        if self.mod_logs.is_empty() {
+            ui.label(RichText::new("No recent moderation actions.").color(t::text_muted()).small());
+            return;
+        }
+        let result = self.mod_logs_cache.show_history(
+            ui, egui::Id::new("user_mod_logs_scroll").with((&self.channel, &self.loading_login)),
+            &self.mod_logs, &preview, self.is_mod,
+        );
+        if !result.is_empty() {
+            actions.push(PopupAction::MessageActions(result));
+        }
     }
 
     fn render_profile_tab(&self, ui: &mut egui::Ui, profile: &UserProfile) {
@@ -1476,6 +1415,7 @@ impl UserProfilePopup {
         emote_bytes: &UiImageCache,
         stv_avatars: &HashMap<String, String>,
         presets: &[crust_core::model::mod_actions::ModActionPreset],
+        preview: MessagePreviewContext<'_>,
     ) -> Vec<PopupAction> {
         if !self.open {
             self.close();
@@ -1545,8 +1485,8 @@ impl UserProfilePopup {
                             ProfileTab::Moderation if self.is_mod => {
                                 self.render_moderation_tab(ui, &profile, &mut actions, presets)
                             }
-                            ProfileTab::ModLogs if self.is_mod => self.render_mod_logs_tab(ui),
-                            ProfileTab::Logs => self.render_logs_tab(ui),
+                            ProfileTab::ModLogs if self.is_mod => self.render_mod_logs_tab(ui, preview, &mut actions),
+                            ProfileTab::Logs => self.render_logs_tab(ui, preview, &mut actions),
                             ProfileTab::IvrLogs => {
                                 self.render_ivr_logs_tab(ui, &profile, &mut actions)
                             }
@@ -1682,24 +1622,6 @@ fn reason_opt(buf: &str) -> Option<String> {
     } else {
         Some(s.to_owned())
     }
-}
-
-/// Resolve user log row text, reconstructing from spans when raw_text is absent.
-fn chat_message_text(msg: &ChatMessage) -> String {
-    let text = msg.plain_text();
-    if !text.is_empty() {
-        return text.into_owned();
-    }
-
-    msg.spans
-        .iter()
-        .filter_map(|s| match s {
-            crust_core::model::Span::Text { text, .. } => Some(text.as_str()),
-            crust_core::model::Span::Mention { login } => Some(login.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 /// Parse a CSS hex color string (`#RRGGBB`) into an egui Color32.
@@ -1943,6 +1865,7 @@ mod tests {
     ) -> (egui::FullOutput, Vec<PopupAction>) {
         crate::app::apply_theme_visuals(ctx);
         let mut actions = Vec::new();
+        let preview = super::super::message_list::PreviewTestState::default();
         let output = ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
@@ -1951,7 +1874,7 @@ mod tests {
             },
             |ctx| {
                 egui::CentralPanel::default().show(ctx, |_| {});
-                actions = popup.show(ctx, &UiImageCache::default(), &HashMap::new(), presets);
+                actions = popup.show(ctx, &preview.images, &HashMap::new(), presets, preview.context());
             },
         );
         (output, actions)

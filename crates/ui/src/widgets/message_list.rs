@@ -20,10 +20,18 @@ use crate::widgets::message_search::MessageSearchState;
 use crate::widgets::name_paint::show_sender_name;
 use crate::widgets::sender_cosmetics;
 
+mod preview;
+pub use preview::{MessagePreviewActions, MessagePreviewContext};
+pub(crate) use preview::{MessagePreviewCache, MessagePreviewResult};
+#[cfg(test)]
+pub(crate) use preview::PreviewTestState;
+
 /// Returned from [`MessageList::show`].
 pub struct MessageListResult {
     /// Set when the user right-clicked a message and chose "Reply".
     pub reply: Option<ReplyInfo>,
+    /// A message snapshot keeps historical thread roots available after eviction.
+    pub open_thread: Option<ChatMessage>,
     /// Set when a username was clicked: (login, sender_badges).
     pub profile_request: Option<(String, Vec<Badge>)>,
     /// Lightweight per-frame counters for the debug performance overlay.
@@ -661,6 +669,8 @@ pub struct MessageList<'a> {
     /// Whether this channel is the currently-watched stream, exposed to
     /// filter expressions as `channel.watching`.
     channel_watching: bool,
+    /// Search and user-card rows keep their interactions separate from chat panes.
+    preview_id: Option<Id>,
 }
 
 impl<'a> MessageList<'a> {
@@ -726,16 +736,27 @@ impl<'a> MessageList<'a> {
             hide_link_previews: false,
             channel_live: None,
             channel_watching: false,
+            preview_id: None,
         }
     }
 
     fn state_id(&self, name: &str) -> Id {
-        view_state_id(self.channel, self.pane, name)
+        self.preview_id.map_or_else(
+            || view_state_id(self.channel, self.pane, name),
+            |id| id.with(name),
+        )
     }
 
     /// Give duplicate channel panes independent reading positions and measurements.
     pub fn with_pane(mut self, pane: u64, focused: bool) -> Self {
         self.pane = Some(pane);
+        self.focused = focused;
+        self
+    }
+
+    /// Preserve a reading position when a split becomes the only remaining pane.
+    pub fn with_optional_pane(mut self, pane: Option<u64>, focused: bool) -> Self {
+        self.pane = pane;
         self.focused = focused;
         self
     }
@@ -773,7 +794,7 @@ impl<'a> MessageList<'a> {
                 let mut views = data.get_temp::<Vec<MessageListView>>(key).unwrap_or_default();
                 views.retain(|view| view.pane != pane && current_pass.saturating_sub(view.last_pass) <= 2);
                 views.push(MessageListView { pane, last_pass: current_pass });
-                if views.len() > 4 {
+                if views.len() > 64 {
                     views.remove(0);
                 }
                 data.insert_temp(key, views);
@@ -1222,6 +1243,7 @@ impl<'a> MessageList<'a> {
             self.apply_snap(ui, &output);
             return MessageListResult {
                 reply: self.take_reply(ui, rctx.reply_key),
+                open_thread: self.take_thread_request(ui),
                 profile_request: self.take_profile_request(ui),
                 perf_stats,
             };
@@ -1315,6 +1337,7 @@ impl<'a> MessageList<'a> {
             perf_stats.rendered_rows = hot_plan.active_len;
             return MessageListResult {
                 reply: self.take_reply(ui, rctx.reply_key),
+                open_thread: self.take_thread_request(ui),
                 profile_request: self.take_profile_request(ui),
                 perf_stats,
             };
@@ -1531,6 +1554,7 @@ impl<'a> MessageList<'a> {
         });
         MessageListResult {
             reply: self.take_reply(ui, rctx.reply_key),
+            open_thread: self.take_thread_request(ui),
             profile_request: self.take_profile_request(ui),
             perf_stats,
         }
@@ -1659,6 +1683,15 @@ impl<'a> MessageList<'a> {
         })
     }
 
+    fn take_thread_request(&self, ui: &Ui) -> Option<ChatMessage> {
+        let key = self.state_id("open_thread");
+        ui.ctx().data_mut(|data| {
+            let message = data.get_temp::<ChatMessage>(key);
+            data.remove::<ChatMessage>(key);
+            message
+        })
+    }
+
     /// Read and clear the profile-request stored by a username click this frame.
     fn take_profile_request(&self, ui: &Ui) -> Option<(String, Vec<Badge>)> {
         let key = self.state_id("ml_profile_req");
@@ -1672,19 +1705,7 @@ impl<'a> MessageList<'a> {
     }
 
     fn reply_info_for_message(msg: &ChatMessage) -> Option<ReplyInfo> {
-        if msg.flags.is_deleted || !msg.channel.is_twitch() {
-            return None;
-        }
-        let parent_msg_id = msg.server_id.clone()?.trim().to_owned();
-        if parent_msg_id.is_empty() {
-            return None;
-        }
-        Some(ReplyInfo {
-            parent_msg_id,
-            parent_user_login: msg.sender.login.clone(),
-            parent_display_name: msg.sender.display_name.clone(),
-            parent_msg_body: msg.raw_text.clone(),
-        })
+        ReplyInfo::for_message(msg)
     }
 
     fn reply_sender_message(
@@ -1879,6 +1900,13 @@ impl<'a> MessageList<'a> {
     fn show_message_context_menu(&self, ui: &mut Ui, msg: &ChatMessage, reply_key: Id) {
         let resolved_server_id = self.resolve_server_id_for_actions(msg);
 
+        if msg.channel.is_twitch() && resolved_server_id.is_some() && ui.button("Open thread").clicked() {
+            let mut seed = msg.clone();
+            seed.server_id = resolved_server_id.clone();
+            ui.ctx().data_mut(|data| data.insert_temp(self.state_id("open_thread"), seed));
+            ui.close_menu();
+        }
+
         if let Some(info) = Self::reply_info_for_message(msg) {
             if ui.button("Reply").clicked() {
                 ui.ctx().data_mut(|d| d.insert_temp(reply_key, info));
@@ -2050,6 +2078,7 @@ impl<'a> MessageList<'a> {
                         text: format!("/delete {server_id}"),
                         reply_to_msg_id: None,
                         reply: None,
+                        composer: None,
                     });
                     ui.close_menu();
                 }
@@ -2122,6 +2151,7 @@ impl<'a> MessageList<'a> {
                                     text: command,
                                     reply_to_msg_id: None,
                                     reply: None,
+                                    composer: None,
                                 });
                                 ui.close_menu();
                             }
@@ -2573,53 +2603,13 @@ impl<'a> MessageList<'a> {
             keyword_highlight_color,
         );
 
-        // Context-menu approach:
-        //
-        // The Frame is registered FIRST on the layer (before any inner
-        // widgets), so it has the LOWEST hit-test priority.  After
-        // Frame::end(), we augment the frame's response with Sense::click()
-        // via Response::interact().  Egui OR's the Sense and updates the
-        // widget in-place (same index).  Result: inner widgets (username,
-        // URL links) still win primary/secondary clicks in their rects,
-        // but right-clicks on the message body (text, emotes, empty space)
-        // fall through to the frame and open the context menu.
-
-        // Push a stable ID derived from the message's own identifier so that
-        // every inner widget (username label, badge images, emote images, URL
-        // links) keeps the same egui widget-ID across frames.  Without this,
-        // virtual-scrolling shifts the auto-ID counter whenever new messages
-        // arrive and the dead-space allocation above the visible window
-        // changes, causing click-press and click-release to see different IDs
-        // and silently dropping the click event.
-        ui.push_id(msg.id.0, |ui| {
+        let row = message_row_scope(ui, self.state_id("msg_bg_click").with(msg.id.0), self.preview_id.is_none(), |ui| {
             let mut prepared = egui::Frame::new()
                 .fill(bg)
                 .inner_margin(egui::Margin::symmetric(ROW_PAD_X as i8, ROW_PAD_Y as i8))
                 .begin(ui);
-            // Register a background click sensor EARLY - before any inner widgets -
-            // so it gets the lowest idx_in_layer and thus the lowest hit-test
-            // priority.  Inner widgets (reply header, username label, emotes, URLs)
-            // are registered afterwards and therefore *win* the hit test when the
-            // pointer is over them.  Only clicks on "empty" message space (padding,
-            // gaps) fall through to this background widget to open the context menu.
-            //
-            // After Frame::end() we re-register with the SAME id and the actual
-            // frame rect; `WidgetRects::insert` updates the rect in-place while
-            // keeping the original (low) idx_in_layer.
-            let bg_click_id = self.state_id("msg_bg_click").with(msg.id.0);
             {
                 let ui = &mut prepared.content_ui;
-                // Use a zero-size rect for the early placeholder so that the
-                // second interact() (with the real frame rect) doesn't trigger
-                // egui's ID-clash warning.  The zero rect is fully contained
-                // within the final frame rect, so `check_for_id_clash` treats
-                // them as the same widget.  The key property we care about -
-                // low `idx_in_layer` for hit-test priority - is preserved
-                // because the widget is still registered before inner widgets.
-                let placeholder_rect =
-                    egui::Rect::from_min_size(ui.max_rect().left_top(), egui::Vec2::ZERO);
-                ui.interact(placeholder_rect, bg_click_id, egui::Sense::click());
-
                 // Text selection: opt-in ON globally inside the message row
                 // so users can click-drag across timestamp / sender / body to
                 // copy. Widgets that must NOT be selectable (badges, emote
@@ -2722,7 +2712,7 @@ impl<'a> MessageList<'a> {
                                     // Closures capture by reference - clones
                                     // only happen when the tooltip is actually
                                     // shown (on hover), not every frame.
-                                    self.show_image(
+                                    let badge_response = self.show_image(
                                         ui,
                                         &url_key,
                                         raw,
@@ -2742,8 +2732,8 @@ impl<'a> MessageList<'a> {
                                             ui.add_space(4.0);
                                             ui.label(RichText::new(&tooltip_label).strong());
                                         });
-                                    })
-                                    .context_menu(|ui| {
+                                    });
+                                    message_context_menu(&badge_response, |ui| {
                                         self.show_message_context_menu(ui, msg, reply_key);
                                     });
                                     continue;
@@ -2861,15 +2851,20 @@ impl<'a> MessageList<'a> {
                             if msg.flags.is_deleted {
                                 let deleted_text =
                                     collapsed_body.as_deref().unwrap_or(msg.raw_text.as_str());
-                                ui.add(
+                                let response = ui.add(
                                     Label::new(
                                         RichText::new(format!("✂ {}", deleted_text))
                                             .strikethrough()
                                             .italics()
                                             .color(t::text_secondary()),
                                     )
-                                    .wrap(),
+                                    .wrap()
+                                    .sense(pointer_click_sense()),
                                 );
+                                self.record_preview_click(ui, response.clicked());
+                                message_context_menu(&response, |ui| {
+                                    self.show_message_context_menu(ui, msg, reply_key)
+                                });
                             } else if let Some(collapsed_text) = collapsed_body {
                                 // Long-message collapse:
                                 // render a compact text summary instead of
@@ -2879,8 +2874,10 @@ impl<'a> MessageList<'a> {
                                 } else {
                                     RichText::new(collapsed_text)
                                 };
-                                let resp = ui.add(Label::new(rich).wrap().selectable(true));
-                                resp.context_menu(|ui| {
+                                let resp = ui.add(Label::new(rich).wrap().selectable(true)
+                                    .sense(pointer_click_sense()));
+                                self.record_preview_click(ui, resp.clicked());
+                                message_context_menu(&resp, |ui| {
                                     self.show_message_context_menu(ui, msg, reply_key)
                                 });
                                 resp.on_hover_ui(|ui| {
@@ -2900,11 +2897,6 @@ impl<'a> MessageList<'a> {
             }
             let msg_frame_resp = prepared.end(ui);
 
-            // Re-register the background click widget with the actual frame rect.
-            // Same `bg_click_id` -> updates in-place, keeping low hit-test priority.
-            let bg_click = ui.interact(msg_frame_resp.rect, bg_click_id, egui::Sense::click());
-            bg_click.context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
-
             // Left accent strip for mentions and highlights - a vivid 3 px bar on
             // the left edge of the row so the eye finds them instantly in fast chat.
             if let Some(bar_col) = message_left_accent_color(
@@ -2917,7 +2909,9 @@ impl<'a> MessageList<'a> {
                 let strip = egui::Rect::from_min_size(r.left_top(), egui::vec2(3.0, r.height()));
                 ui.painter().rect_filled(strip, 0.0, bar_col);
             }
-        }); // end push_id
+        });
+        self.record_preview_click(ui, row.response.clicked());
+        message_context_menu(&row.response, |ui| self.show_message_context_menu(ui, msg, reply_key));
     }
 
     fn message_keyword_highlight(&self, msg: &ChatMessage) -> Option<KeywordHighlightMatch> {
@@ -3111,26 +3105,14 @@ impl<'a> MessageList<'a> {
         let text = label_override.unwrap_or_else(|| msg.raw_text.clone());
         let opacity = if msg.flags.is_history { 0.55 } else { 1.0 };
 
-        // Push a stable ID derived from the message's own identifier so that
-        // widget IDs inside the system-event row are stable regardless of
-        // where this message falls in the virtual-scroll window.  Without
-        // this, the auto-incremented IDs shift every frame as the visible
-        // range moves, causing egui to report widget ID clashes for every
-        // system event in the loaded history.
-        ui.push_id(msg.id.0, |ui| {
-            let frame = egui::Frame::new()
+        let row = message_row_scope(ui, self.state_id("msg_bg_click").with(msg.id.0), self.preview_id.is_none(), |ui| {
+            egui::Frame::new()
                 .fill(t::alpha(accent, 10))
                 .inner_margin(egui::Margin::symmetric(
                     ROW_PAD_X as i8,
                     ROW_PAD_Y as i8 + 1,
                 ))
                 .show(ui, |ui| {
-                    if matches!(msg.msg_kind, MsgKind::Sub { .. }) {
-                        let placeholder = egui::Rect::from_min_size(
-                            ui.max_rect().left_top(), egui::Vec2::ZERO,
-                        );
-                        ui.interact(placeholder, self.state_id("msg_bg_click").with(msg.id.0), egui::Sense::click());
-                    }
                     if msg.flags.is_history {
                         ui.set_opacity(opacity);
                     }
@@ -3311,19 +3293,13 @@ impl<'a> MessageList<'a> {
                         }
                     }
                 });
-            if matches!(msg.msg_kind, MsgKind::Sub { .. }) {
-                let response = ui.interact(
-                    frame.response.rect,
-                    self.state_id("msg_bg_click").with(msg.id.0),
-                    egui::Sense::click(),
-                );
-                response.context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
-            }
-        }); // end push_id
+        });
+        self.record_preview_click(ui, row.response.clicked());
+        message_context_menu(&row.response, |ui| self.show_message_context_menu(ui, msg, reply_key));
     }
 
     fn render_spans(&self, ui: &mut Ui, msg: &ChatMessage, reply_key: Id) {
-        MessageBody {
+        let clicked = MessageBody {
             emote_bytes: self.emote_bytes,
             cmd_tx: self.cmd_tx,
             link_previews: self.link_previews,
@@ -3333,6 +3309,13 @@ impl<'a> MessageList<'a> {
         .show(ui, msg, &mut |ui| {
             self.show_message_context_menu(ui, msg, reply_key)
         });
+        self.record_preview_click(ui, clicked);
+    }
+
+    fn record_preview_click(&self, ui: &Ui, clicked: bool) {
+        if clicked && self.preview_id.is_some() {
+            ui.ctx().data_mut(|data| data.insert_temp(self.state_id("preview_clicked"), true));
+        }
     }
 
     fn render_suspicious_user_message(
@@ -3359,18 +3342,14 @@ impl<'a> MessageList<'a> {
             keyword_highlight_color,
         );
 
-        ui.push_id(msg.id.0, |ui| {
+        let row = message_row_scope(ui, self.state_id("msg_bg_click").with(msg.id.0), self.preview_id.is_none(), |ui| {
             let mut prepared = egui::Frame::new()
                 .fill(bg)
                 .inner_margin(egui::Margin::symmetric(ROW_PAD_X as i8, ROW_PAD_Y as i8))
                 .begin(ui);
 
-            let bg_click_id = self.state_id("msg_bg_click").with(msg.id.0);
             {
                 let ui = &mut prepared.content_ui;
-                let placeholder_rect =
-                    egui::Rect::from_min_size(ui.max_rect().left_top(), egui::Vec2::ZERO);
-                ui.interact(placeholder_rect, bg_click_id, egui::Sense::click());
                 ui.style_mut().interaction.selectable_labels = false;
 
                 if dimmed {
@@ -3487,6 +3466,7 @@ impl<'a> MessageList<'a> {
                                     text: command,
                                     reply_to_msg_id: None,
                                     reply: None,
+                                    composer: None,
                                 });
                             }
                         }
@@ -3569,9 +3549,6 @@ impl<'a> MessageList<'a> {
                 );
             }
             let msg_frame_resp = prepared.end(ui);
-            let bg_click = ui.interact(msg_frame_resp.rect, bg_click_id, egui::Sense::click());
-            bg_click.context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
-
             if let Some(bar_col) = message_left_accent_color(
                 &msg.flags,
                 &msg.msg_kind,
@@ -3583,6 +3560,8 @@ impl<'a> MessageList<'a> {
                 ui.painter().rect_filled(strip, 0.0, bar_col);
             }
         });
+        self.record_preview_click(ui, row.response.clicked());
+        message_context_menu(&row.response, |ui| self.show_message_context_menu(ui, msg, reply_key));
     }
 
     /// Render an image from raw bytes, freezing animated sources to a cached static frame.
@@ -3612,6 +3591,43 @@ impl<'a> MessageList<'a> {
             self.animate_emotes,
         )
     }
+}
+
+/// Register a row once, before its children, with an ID unaffected by virtual scrolling.
+/// Updating a second click sensor after rendering adds it to Tab order twice.
+fn message_row_scope<R>(ui: &mut Ui, id: Id, focusable: bool, contents: impl FnOnce(&mut Ui) -> R) -> egui::InnerResponse<R> {
+    let mut builder = egui::UiBuilder::new()
+        .layer_id(ui.layer_id())
+        .max_rect(ui.available_rect_before_wrap())
+        .layout(*ui.layout())
+        .style(ui.style().clone())
+        .sense(if focusable { egui::Sense::click() } else { pointer_click_sense() });
+    if !ui.is_enabled() { builder = builder.disabled(); }
+    if !ui.is_visible() { builder = builder.invisible(); }
+    if ui.is_sizing_pass() { builder = builder.sizing_pass(); }
+    let mut row = Ui::new(ui.ctx().clone(), id, builder);
+    row.set_clip_rect(ui.clip_rect());
+    row.set_opacity(ui.opacity());
+    let inner = contents(&mut row);
+    let rect = row.min_rect();
+    // Dropping the UI updates its original widget's rectangle without registering
+    // another focus target, leaving names and links above the background sensor.
+    drop(row);
+    ui.advance_cursor_after_rect(rect);
+    let response = ui.ctx().read_response(id).expect("message row was registered");
+    egui::InnerResponse::new(inner, response)
+}
+
+fn pointer_click_sense() -> egui::Sense {
+    egui::Sense::click().difference(egui::Sense::focusable_noninteractive())
+}
+
+fn message_context_menu(response: &egui::Response, contents: impl FnOnce(&mut Ui)) {
+    // These sensors already handle clicks. Avoid egui 0.31's context-menu
+    // helper registering them again just to add a keyboard focus target.
+    let mut menu_response = response.clone();
+    menu_response.sense |= egui::Sense::click();
+    menu_response.context_menu(contents);
 }
 
 /// Shared body rendering for channel chat and cross-channel history views.
@@ -3654,8 +3670,9 @@ impl MessageBody<'_> {
             } else {
                 RichText::new(text)
             };
-            let response = ui.add(Label::new(rich).wrap().selectable(true));
-            response.context_menu(context_menu);
+            let response = ui.add(Label::new(rich).wrap().selectable(true)
+                .sense(pointer_click_sense()));
+            message_context_menu(&response, context_menu);
             return response.clicked();
         }
         let mut clicked = false;
@@ -3679,7 +3696,7 @@ impl MessageBody<'_> {
                         self.animate_emotes,
                     );
                     clicked |= response.clicked();
-                    response.context_menu(&mut *context_menu);
+                    message_context_menu(&response, &mut *context_menu);
                 }
             }
         }
@@ -3707,9 +3724,10 @@ impl MessageBody<'_> {
                 } else {
                     RichText::new(&*cleaned)
                 };
-                let resp = ui.add(Label::new(rt).wrap().selectable(true));
+                let resp = ui.add(Label::new(rt).wrap().selectable(true)
+                    .sense(pointer_click_sense()));
                 clicked = resp.clicked();
-                resp.context_menu(&mut *context_menu);
+                message_context_menu(&resp, &mut *context_menu);
             }
             Span::Emote {
                 url,
@@ -3757,7 +3775,7 @@ impl MessageBody<'_> {
                             });
                         });
                     clicked = response.clicked();
-                    response.context_menu(&mut *context_menu);
+                    message_context_menu(&response, &mut *context_menu);
                 } else {
                     // Image not yet loaded - show text code as placeholder
                     let response = ui.add(
@@ -3767,13 +3785,14 @@ impl MessageBody<'_> {
                                 .font(t::small())
                                 .color(t::green()),
                         )
-                        .selectable(true),
+                        .selectable(true)
+                        .sense(pointer_click_sense()),
                     );
                     if ui.is_rect_visible(response.rect) {
                         self.emote_bytes.get(url);
                     }
                     clicked = response.clicked();
-                    response.context_menu(&mut *context_menu);
+                    message_context_menu(&response, &mut *context_menu);
                 }
             }
             Span::Emoji { text, url } => {
@@ -3801,14 +3820,15 @@ impl MessageBody<'_> {
                             });
                         });
                     clicked = response.clicked();
-                    response.context_menu(&mut *context_menu);
+                    message_context_menu(&response, &mut *context_menu);
                 } else {
-                    let response = ui.add(Label::new(RichText::new(text)).selectable(true));
+                    let response = ui.add(Label::new(RichText::new(text)).selectable(true)
+                        .sense(pointer_click_sense()));
                     if ui.is_rect_visible(response.rect) {
                         self.emote_bytes.get(url);
                     }
                     clicked = response.clicked();
-                    response.context_menu(&mut *context_menu);
+                    message_context_menu(&response, &mut *context_menu);
                 }
             }
             Span::Mention { login } => {
@@ -3843,10 +3863,11 @@ impl MessageBody<'_> {
                 } else {
                     let response = ui.add(
                         Label::new(RichText::new(name).color(t::mention()).strong())
-                            .selectable(true),
+                            .selectable(true)
+                            .sense(pointer_click_sense()),
                     );
                     clicked = response.clicked();
-                    response.context_menu(&mut *context_menu);
+                    message_context_menu(&response, &mut *context_menu);
                 }
             }
             Span::Url { text, url } => {
@@ -4004,7 +4025,7 @@ fn show_message_image(
     images: &UiImageCache,
     animate: bool,
 ) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let (rect, response) = ui.allocate_exact_size(size, pointer_click_sense());
     response.widget_info(|| egui::WidgetInfo::new(egui::WidgetType::Image));
     if !ui.is_rect_visible(rect) {
         return response;
@@ -4330,7 +4351,7 @@ fn paint_emote_layers(
         }
         return response;
     }
-    let (bounds, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let (bounds, response) = ui.allocate_exact_size(size, pointer_click_sense());
     if !ui.is_rect_visible(bounds) {
         return response;
     }
@@ -6181,6 +6202,7 @@ mod tests {
             parent_display_name: login.to_owned(),
             parent_msg_body: "A quoted message that is long enough to truncate in a narrow pane."
                 .to_owned(),
+            ..Default::default()
         }
     }
 

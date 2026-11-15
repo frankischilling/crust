@@ -19,7 +19,7 @@ pub use commands::{
     expand_command_aliases, find_alias, AliasExpansion, CommandAlias, ExpandAliasError,
     MAX_ALIAS_DEPTH,
 };
-pub use events::{AppCommand, AppEvent, IvrLogEntry};
+pub use events::{AppCommand, AppEvent, ComposerTarget, IvrLogEntry};
 pub use hotkeys::{HotkeyAction, HotkeyBindings, HotkeyCategory, KeyBinding};
 pub use model::{
     Badge, ChannelId, ChannelState, ChatMessage, EmoteCatalogEntry, MessageId, Platform, ReplyInfo,

@@ -22,6 +22,8 @@ pub enum HotkeyCategory {
     Tab,
     /// Split-pane focus and movement.
     Split,
+    /// Actions in the focused chat composer.
+    Input,
     /// Moderation-tools window (AutoMod / low-trust / unban queues).
     Moderation,
 }
@@ -32,6 +34,7 @@ impl HotkeyCategory {
             Self::Window => "window",
             Self::Tab => "tab",
             Self::Split => "split",
+            Self::Input => "input",
             Self::Moderation => "moderation",
         }
     }
@@ -41,13 +44,20 @@ impl HotkeyCategory {
             Self::Window => "Window",
             Self::Tab => "Tabs",
             Self::Split => "Splits",
+            Self::Input => "Chat input",
             Self::Moderation => "Moderation",
         }
     }
 
     /// Stable iteration order for settings UI.
-    pub fn all() -> [HotkeyCategory; 4] {
-        [Self::Window, Self::Tab, Self::Split, Self::Moderation]
+    pub fn all() -> [HotkeyCategory; 5] {
+        [
+            Self::Window,
+            Self::Tab,
+            Self::Split,
+            Self::Input,
+            Self::Moderation,
+        ]
     }
 }
 
@@ -80,6 +90,20 @@ pub enum HotkeyAction {
     SplitFocusNext,
     SplitMoveLeft,
     SplitMoveRight,
+    SplitRight,
+    SplitDown,
+    ReopenClosedSplit,
+    InputSend,
+    InputSendKeep,
+    InputHistoryPrev,
+    InputHistoryNext,
+    InputHistorySearchPrev,
+    InputHistorySearchNext,
+    InputCompletePrev,
+    InputCompleteNext,
+    InputClear,
+    InputCancelReply,
+    InputEmotePicker,
     /// Approve the focused queue entry in the moderation tools window.
     ModApproveFocused,
     /// Deny the focused queue entry in the moderation tools window.
@@ -100,7 +124,7 @@ pub enum HotkeyAction {
 
 impl HotkeyAction {
     /// Stable iteration order matching the settings UI layout.
-    pub fn all() -> [HotkeyAction; 33] {
+    pub fn all() -> [HotkeyAction; 47] {
         [
             Self::ZoomIn,
             Self::ZoomOut,
@@ -127,6 +151,20 @@ impl HotkeyAction {
             Self::SplitFocusNext,
             Self::SplitMoveLeft,
             Self::SplitMoveRight,
+            Self::SplitRight,
+            Self::SplitDown,
+            Self::ReopenClosedSplit,
+            Self::InputSend,
+            Self::InputSendKeep,
+            Self::InputHistoryPrev,
+            Self::InputHistoryNext,
+            Self::InputHistorySearchPrev,
+            Self::InputHistorySearchNext,
+            Self::InputCompletePrev,
+            Self::InputCompleteNext,
+            Self::InputClear,
+            Self::InputCancelReply,
+            Self::InputEmotePicker,
             Self::ModApproveFocused,
             Self::ModDenyFocused,
             Self::ModFocusNext,
@@ -167,6 +205,20 @@ impl HotkeyAction {
             Self::SplitFocusNext => "split_focus_next",
             Self::SplitMoveLeft => "split_move_left",
             Self::SplitMoveRight => "split_move_right",
+            Self::SplitRight => "split_right",
+            Self::SplitDown => "split_down",
+            Self::ReopenClosedSplit => "reopen_closed_split",
+            Self::InputSend => "input_send",
+            Self::InputSendKeep => "input_send_keep",
+            Self::InputHistoryPrev => "input_history_prev",
+            Self::InputHistoryNext => "input_history_next",
+            Self::InputHistorySearchPrev => "input_history_search_prev",
+            Self::InputHistorySearchNext => "input_history_search_next",
+            Self::InputCompletePrev => "input_complete_prev",
+            Self::InputCompleteNext => "input_complete_next",
+            Self::InputClear => "input_clear",
+            Self::InputCancelReply => "input_cancel_reply",
+            Self::InputEmotePicker => "input_emote_picker",
             Self::ModApproveFocused => "mod_approve_focused",
             Self::ModDenyFocused => "mod_deny_focused",
             Self::ModFocusNext => "mod_focus_next",
@@ -208,7 +260,21 @@ impl HotkeyAction {
             Self::SplitFocusPrev
             | Self::SplitFocusNext
             | Self::SplitMoveLeft
-            | Self::SplitMoveRight => HotkeyCategory::Split,
+            | Self::SplitMoveRight
+            | Self::SplitRight
+            | Self::SplitDown
+            | Self::ReopenClosedSplit => HotkeyCategory::Split,
+            Self::InputSend
+            | Self::InputSendKeep
+            | Self::InputHistoryPrev
+            | Self::InputHistoryNext
+            | Self::InputHistorySearchPrev
+            | Self::InputHistorySearchNext
+            | Self::InputCompletePrev
+            | Self::InputCompleteNext
+            | Self::InputClear
+            | Self::InputCancelReply
+            | Self::InputEmotePicker => HotkeyCategory::Input,
             Self::ModApproveFocused
             | Self::ModDenyFocused
             | Self::ModFocusNext
@@ -248,6 +314,20 @@ impl HotkeyAction {
             Self::SplitFocusNext => "Focus next split",
             Self::SplitMoveLeft => "Move focused split left",
             Self::SplitMoveRight => "Move focused split right",
+            Self::SplitRight => "Add a split to the right",
+            Self::SplitDown => "Add a split below",
+            Self::ReopenClosedSplit => "Reopen the last closed split",
+            Self::InputSend => "Send message",
+            Self::InputSendKeep => "Send message and keep text",
+            Self::InputHistoryPrev => "Recall previous message",
+            Self::InputHistoryNext => "Recall next message",
+            Self::InputHistorySearchPrev => "Search older input history",
+            Self::InputHistorySearchNext => "Search newer input history",
+            Self::InputCompletePrev => "Previous completion",
+            Self::InputCompleteNext => "Next completion",
+            Self::InputClear => "Clear input",
+            Self::InputCancelReply => "Cancel reply",
+            Self::InputEmotePicker => "Open emote picker",
             Self::ModApproveFocused => "Approve focused moderation entry",
             Self::ModDenyFocused => "Deny focused moderation entry",
             Self::ModFocusNext => "Focus next moderation entry",
@@ -257,6 +337,16 @@ impl HotkeyAction {
             Self::ModNextTab => "Next moderation tab",
             Self::ModPrevTab => "Previous moderation tab",
         }
+    }
+
+    /// Composer and moderation shortcuts belong to separate focused surfaces.
+    /// Window, tab, and split shortcuts can run while either surface has focus.
+    fn overlaps(self, other: Self) -> bool {
+        !matches!(
+            (self.category(), other.category()),
+            (HotkeyCategory::Input, HotkeyCategory::Moderation)
+                | (HotkeyCategory::Moderation, HotkeyCategory::Input)
+        )
     }
 }
 
@@ -409,21 +499,54 @@ impl HotkeyBindings {
             HotkeyAction::SplitFocusNext,
             KeyBinding::new("PageDown").with_ctrl().with_alt(),
         );
+        map.insert(HotkeyAction::SplitMoveLeft, {
+            let mut b = KeyBinding::new("ArrowLeft").with_ctrl().with_alt();
+            b.shift = true;
+            b
+        });
+        map.insert(HotkeyAction::SplitMoveRight, {
+            let mut b = KeyBinding::new("ArrowRight").with_ctrl().with_alt();
+            b.shift = true;
+            b
+        });
         map.insert(
-            HotkeyAction::SplitMoveLeft,
-            {
-                let mut b = KeyBinding::new("ArrowLeft").with_ctrl().with_alt();
-                b.shift = true;
-                b
-            },
+            HotkeyAction::SplitRight,
+            KeyBinding::new("R").with_ctrl().with_alt(),
         );
         map.insert(
-            HotkeyAction::SplitMoveRight,
-            {
-                let mut b = KeyBinding::new("ArrowRight").with_ctrl().with_alt();
-                b.shift = true;
-                b
-            },
+            HotkeyAction::SplitDown,
+            KeyBinding::new("D").with_ctrl().with_alt(),
+        );
+        map.insert(
+            HotkeyAction::ReopenClosedSplit,
+            KeyBinding::new("T").with_ctrl().with_shift(),
+        );
+        // Chat input
+        map.insert(HotkeyAction::InputSend, KeyBinding::new("Enter"));
+        map.insert(
+            HotkeyAction::InputSendKeep,
+            KeyBinding::new("Enter").with_ctrl(),
+        );
+        map.insert(HotkeyAction::InputHistoryPrev, KeyBinding::new("ArrowUp"));
+        map.insert(HotkeyAction::InputHistoryNext, KeyBinding::new("ArrowDown"));
+        map.insert(
+            HotkeyAction::InputHistorySearchPrev,
+            KeyBinding::new("R").with_ctrl(),
+        );
+        map.insert(
+            HotkeyAction::InputHistorySearchNext,
+            KeyBinding::new("R").with_ctrl().with_shift(),
+        );
+        map.insert(
+            HotkeyAction::InputCompletePrev,
+            KeyBinding::new("Tab").with_shift(),
+        );
+        map.insert(HotkeyAction::InputCompleteNext, KeyBinding::new("Tab"));
+        map.insert(HotkeyAction::InputClear, KeyBinding::new("U").with_ctrl());
+        map.insert(HotkeyAction::InputCancelReply, KeyBinding::new("Escape"));
+        map.insert(
+            HotkeyAction::InputEmotePicker,
+            KeyBinding::new("E").with_ctrl(),
         );
         // Moderation: gated to mod-tools window focus, so single-letter binds
         // don't conflict with global typing.
@@ -464,6 +587,26 @@ impl HotkeyBindings {
         self.map.insert(action, binding);
     }
 
+    /// Shift follows the default Enter send gestures. Rebinding or clearing
+    /// the primary gesture removes this alternative too.
+    pub fn shifted_send_binding(&self, action: HotkeyAction) -> Option<KeyBinding> {
+        Self::shifted_send_alias(action, &self.get(action))
+    }
+
+    fn shifted_send_alias(action: HotkeyAction, binding: &KeyBinding) -> Option<KeyBinding> {
+        let keep = match action {
+            HotkeyAction::InputSend => false,
+            HotkeyAction::InputSendKeep => true,
+            _ => return None,
+        };
+        ((binding.key.eq_ignore_ascii_case("Enter") || binding.key.eq_ignore_ascii_case("Return"))
+            && binding.ctrl == keep
+            && !binding.shift
+            && !binding.alt
+            && !binding.command)
+            .then(|| binding.clone().with_shift())
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (HotkeyAction, &KeyBinding)> {
         HotkeyAction::all()
             .into_iter()
@@ -499,7 +642,7 @@ impl HotkeyBindings {
 
     /// Returns every action whose current binding collides with another.
     /// Two bindings collide when their canonical forms (modifier set +
-    /// case-insensitive key name) are equal.
+    /// case-insensitive key name) are equal and their focus contexts overlap.
     ///
     /// Actions with `key.is_empty()` (i.e. unbound) never collide.
     pub fn conflicts(&self) -> Vec<HotkeyAction> {
@@ -509,14 +652,25 @@ impl HotkeyBindings {
             if let Some(key) = binding.canonical() {
                 buckets.entry(key).or_default().push(action);
             }
+            if let Some(key) =
+                Self::shifted_send_alias(action, binding).and_then(|alias| alias.canonical())
+            {
+                buckets.entry(key).or_default().push(action);
+            }
         }
         let mut out: Vec<HotkeyAction> = Vec::new();
         for (_, actions) in buckets {
-            if actions.len() > 1 {
-                out.extend(actions);
+            for &action in &actions {
+                if actions
+                    .iter()
+                    .any(|&other| action != other && action.overlaps(other))
+                {
+                    out.push(action);
+                }
             }
         }
         out.sort_by_key(|a| a.as_key());
+        out.dedup();
         out
     }
 
@@ -526,11 +680,22 @@ impl HotkeyBindings {
         let Some(target) = needle.canonical() else {
             return None;
         };
+        let alternative =
+            Self::shifted_send_alias(action, needle).and_then(|alias| alias.canonical());
         for (other, binding) in self.iter() {
-            if other == action {
+            if other == action || !action.overlaps(other) {
                 continue;
             }
-            if binding.canonical() == Some(target.clone()) {
+            let other_primary = binding.canonical();
+            let other_alternative =
+                Self::shifted_send_alias(other, binding).and_then(|alias| alias.canonical());
+            if other_primary.as_ref() == Some(&target)
+                || other_alternative.as_ref() == Some(&target)
+                || alternative.as_ref().is_some_and(|alias| {
+                    other_primary.as_ref() == Some(alias)
+                        || other_alternative.as_ref() == Some(alias)
+                })
+            {
                 return Some(other);
             }
         }
@@ -557,6 +722,64 @@ mod tests {
     #[test]
     fn defaults_have_no_conflicts() {
         assert!(HotkeyBindings::defaults().conflicts().is_empty());
+    }
+
+    #[test]
+    fn input_bindings_migrate_without_replacing_existing_choices() {
+        let bindings = HotkeyBindings::from_pairs([
+            ("zoom_in".to_owned(), KeyBinding::new("F6")),
+            ("input_send".to_owned(), KeyBinding::default()),
+        ]);
+        assert_eq!(bindings.get(HotkeyAction::ZoomIn), KeyBinding::new("F6"));
+        assert!(bindings.get(HotkeyAction::InputSend).is_unbound());
+        assert_eq!(
+            bindings.get(HotkeyAction::InputHistoryPrev),
+            KeyBinding::new("ArrowUp")
+        );
+        assert_eq!(bindings, HotkeyBindings::from_pairs(bindings.to_pairs()));
+    }
+
+    #[test]
+    fn conflict_detection_respects_focused_surfaces_and_global_actions() {
+        let mut bindings = HotkeyBindings::defaults();
+        let tab = KeyBinding::new("Tab");
+        assert_eq!(
+            bindings.find_conflict(HotkeyAction::InputCompleteNext, &tab),
+            None
+        );
+        assert_eq!(bindings.find_conflict(HotkeyAction::ModNextTab, &tab), None);
+        bindings.set(HotkeyAction::InputSend, tab.clone());
+        assert!(bindings.conflicts().contains(&HotkeyAction::InputSend));
+        assert!(bindings
+            .conflicts()
+            .contains(&HotkeyAction::InputCompleteNext));
+        assert!(!bindings.conflicts().contains(&HotkeyAction::ModNextTab));
+        bindings.set(HotkeyAction::OpenQuickSwitcher, tab);
+        assert!(bindings.conflicts().contains(&HotkeyAction::ModNextTab));
+        assert!(bindings
+            .conflicts()
+            .contains(&HotkeyAction::OpenQuickSwitcher));
+    }
+
+    #[test]
+    fn default_send_alternatives_are_visible_to_conflict_detection() {
+        let mut bindings = HotkeyBindings::defaults();
+        let shifted_enter = KeyBinding::new("Enter").with_shift();
+        bindings.set(HotkeyAction::InputClear, shifted_enter.clone());
+        assert!(bindings.conflicts().contains(&HotkeyAction::InputSend));
+        assert_eq!(
+            bindings.find_conflict(HotkeyAction::InputSend, &KeyBinding::new("Enter")),
+            Some(HotkeyAction::InputClear)
+        );
+        assert_eq!(
+            bindings.find_conflict(HotkeyAction::InputClear, &shifted_enter),
+            Some(HotkeyAction::InputSend)
+        );
+        bindings.set(HotkeyAction::InputSend, KeyBinding::new("F2"));
+        assert!(bindings
+            .shifted_send_binding(HotkeyAction::InputSend)
+            .is_none());
+        assert!(bindings.conflicts().is_empty());
     }
 
     #[test]
