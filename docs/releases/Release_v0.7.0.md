@@ -54,32 +54,55 @@ controls in small windows.
   available for retry, and the recovery dialog keeps its closing controls visible.
 - Restarting from the recovery dialog now saves through normal shutdown before
   launching the replacement process.
+- Windows release builds request the GUI executable subsystem, and the webview
+  helper starts without creating a console window.
 
 ## Validation and performance
 
-An earlier Windows release run, before the final native and UI patches, passed
-1,566 tests across 20 unit and integration targets, plus one doctest. That run
-skipped 22 opt-in benchmark and fixture tests; the search benchmark was run
-separately. Release correctness linting passed on the same earlier tree. Focused
-checks covered 29 search cases and 20 detached-window cases. Final Windows gates
-and Linux CI remain pending.
+For source revision `07702a7`, Windows checks passed 1,571 tests plus one doctest,
+with 22 opt-in benchmark and fixture tests skipped. The workspace and doctest
+commands used `--config profile.release.package.crust-ui.opt-level=1` to fit the
+host's available memory. Release correctness linting passed with the normal
+release profile. Focused checks covered 29 search cases and 20 detached-window
+cases.
 
-Signed-in Windows checks confirmed desktop transparency in a fresh packaged
-process, overlay interaction and reopening, restored window settings after
-restart, child-window accessibility, direct composer focus, and the same native
-window after closing its picker. Local search fit a 480 × 300-pixel physical
-window at 125% display scaling, and child shortcuts opened cross-channel search
-and settings. The four original main tabs remained; test drafts were cleared
-before normal shutdown.
+The Windows package for `07702a7` was built with the normal optimized release
+profile (`opt-level=3`), without the test override. The archive, all four payload
+files, ZIP CRCs, checksum sidecar, and x64 executable architecture passed
+verification. The main executable's Windows GUI subsystem was also verified.
+Linux [CI run 43754686032](https://github.com/frankischilling/crust/actions/runs/43754686032)
+passed all six gates for source revision `07702a7`.
 
-The native session did not exercise the recovery dialog's Restart Crust button,
-which is available only when reports exist. The later compact-menu, Background
-label, and shared icon changes still need final validation.
+Signed-in Windows checks showed the desktop behind overlay messages in
+a fresh packaged process without external DWM calls. They also confirmed overlay
+interaction and reopening, restored window settings after restart, child-window
+accessibility, direct composer focus, and the same native window after closing
+its picker. Local search fit a 480 × 300-pixel physical window at 125% display
+scaling, and child shortcuts opened cross-channel search and settings. The four
+original main tabs remained; test drafts were cleared before normal shutdown.
+The compact menu fit its labels, its action worked through Windows UI Automation,
+and the child picker reported Off, On, then Off with matching visible state. The
+overlay manager's opacity slider exposed the Background label.
+Both processes shut down normally after the diagnostic capture. A subsequent
+desktop launch reopened the app and helper without visible console windows.
+
+Native testing used OpenGL on Windows. The optional wgpu changes received source
+review only and were not independently compiled or run; Wayland remains untested.
+The recovery dialog's Restart Crust button, which is available only when reports
+exist, was not exercised.
 
 On the controlled 5,000-result fixture, first cached layout fell from 148.07 ms
 to 4.25 ms, with seven rows measured. Warm cached layout had a 1.62 ms median.
 Warm timings varied with the full-layout control, so these results establish the
 cold-layout improvement without claiming a warm-path speedup.
+
+The final 180-second saved-account capture recorded 688 UI updates: median
+1.71 ms, 95th percentile 4.28 ms, and maximum 11.47 ms. No update reached 100 ms;
+there were no event-budget overruns or panic markers. Twitch authentication
+completed in 0.70 seconds, and the native global catalog updated with 310 emotes
+in 0.99 seconds. Windows reported the process as responding at all four
+checkpoints. This is one cached-session observation, not a controlled startup
+comparison; UI update timings exclude presentation and compositor work.
 
 The [chat-window audit](https://github.com/frankischilling/crust/blob/v0.7.0/docs/AUDIT_CHAT_WINDOWS.md)
 records implementation details and validation. The older intermittent update
