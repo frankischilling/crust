@@ -45,6 +45,13 @@ results and user-card history display full chat messages with emotes and badges.
 - Result body clicks navigate to the source message; sender names open user
   cards, and links keep their own actions. Cached rows retain keyboard and
   pointer behavior as the list scrolls.
+- Opening a message, reply, thread, or user card from cross-channel search closes
+  its window and returns focus to chat. Reopening search in the same session
+  restores the query.
+- Open user card from the message menu now opens the card while profile data
+  loads. Previously, it could fetch the data without showing the card.
+- The channel-search popup shows its help text at the default size and keeps
+  its controls reachable when the window is made smaller.
 - Settings > Hotkeys > Chat input exposes Send, Send and keep text, completion,
   history, Clear input, Cancel reply, and the emote picker. Default shortcuts
   include Ctrl+Enter to send while retaining text, Ctrl+U to clear, and Ctrl+E
@@ -64,6 +71,37 @@ results and user-card history display full chat messages with emotes and badges.
 - Queued 7TV user lookups check whether they still belong to the active generation
   before starting HTTP work. Obsolete requests no longer consume the queue after
   a channel or account change.
+
+## Validation and remaining work
+
+The Windows release workspace run passed 1,517 tests across 20 unit and
+integration targets, plus one doctest. The normal run skipped 22 tests, including
+opt-in benchmarks and fixture tests.
+The workspace correctness lint gate also passed.
+
+A native run lasting 180 seconds with a saved account recorded 681 UI updates: median
+0.71 ms, 95th percentile 1.94 ms, and maximum 6.60 ms. No update reached
+100 ms, and no event budget overrun was recorded. The native global catalog
+contained 310 emotes at 1.06 seconds after launch. Three of four requested
+rooms joined; the fourth returned a server notice.
+
+Native checks confirmed draft preservation when switching channels and the
+expected three-pane layout after Ctrl+Alt+R then Ctrl+Alt+D. Closing and reopening
+the lower pane preserved its draft and keyword search; the duplicate sibling's
+search remained independent. Restarting restored the layout and the query edited
+just before shutdown. Native checks also covered thread draft and emote-picker
+isolation, rich user-card history, and search controls at the minimum window size.
+The rebuilt app closed the source search after opening threads and user cards;
+reopening search kept its query.
+
+Live traffic and cache state were not controlled between the baseline and
+candidate launches. The timings exclude presentation and compositor time, so
+they do not establish a controlled speedup.
+[#17](https://github.com/frankischilling/crust/issues/17) remains open for the
+older intermittent stalls. Detached full-chat windows and transparent overlays
+remain in [#37](https://github.com/frankischilling/crust/issues/37); the first
+layout of a large search still measures every result and remains in
+[#45](https://github.com/frankischilling/crust/issues/45).
 
 The [pane and message-view audit](https://github.com/frankischilling/crust/blob/v0.6.0/docs/AUDIT_PANE_VIEWS.md)
 records implementation details, measurements, and remaining work.

@@ -16,7 +16,7 @@ use super::chrome;
 const SEARCH_PANEL_MIN_WIDTH: f32 = 680.0;
 const SEARCH_FIELD_MIN_WIDTH: f32 = 170.0;
 const SEARCH_WINDOW_DEFAULT_WIDTH: f32 = 440.0;
-const SEARCH_WINDOW_DEFAULT_HEIGHT: f32 = 220.0;
+const SEARCH_WINDOW_DEFAULT_HEIGHT: f32 = 280.0;
 const SEARCH_LABEL_WIDTH: f32 = 72.0;
 
 #[derive(Default, Clone)]
@@ -311,20 +311,27 @@ pub fn show_message_search_window(
                     });
                 search.open = open;
             }
-            _ => {
-                CentralPanel::default()
-                    .frame(
-                        chrome::card_frame()
-                            .fill(t::bg_dialog())
-                            .stroke(Stroke::new(1.0_f32, t::border_subtle()))
-                            .inner_margin(egui::Margin::same(12)),
-                    )
-                    .show(child_ctx, |ui| {
-                        show_message_search_scroll_area(ui, channel, messages, search);
-                    });
-            }
+            _ => show_message_search_native_panel(child_ctx, channel, messages, search),
         }
     });
+}
+
+fn show_message_search_native_panel(
+    ctx: &Context,
+    channel: &ChannelId,
+    messages: &VecDeque<ChatMessage>,
+    search: &mut MessageSearchState,
+) {
+    CentralPanel::default()
+        .frame(
+            chrome::card_frame()
+                .fill(t::bg_dialog())
+                .stroke(Stroke::new(1.0_f32, t::border_subtle()))
+                .inner_margin(egui::Margin::same(12)),
+        )
+        .show(ctx, |ui| {
+            show_message_search_scroll_area(ui, channel, messages, search);
+        });
 }
 
 fn show_message_search_scroll_area(
@@ -336,6 +343,8 @@ fn show_message_search_scroll_area(
     ScrollArea::vertical()
         .id_salt(search.scope_id(Id::new(("message_search_scroll", channel.as_str()))))
         .auto_shrink([false, false])
+        .max_height(ui.available_height().max(0.0))
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
         .show(ui, |ui| {
             show_message_search_contents(ui, channel, messages, search, true, true);
         });
@@ -681,6 +690,80 @@ mod tests {
     }
 
     #[test]
+    fn compact_native_search_keeps_help_reachable_and_controls_clickable() {
+        fn find_text(shape: &egui::epaint::Shape, clip: egui::Rect, needle: &str)
+            -> Option<(egui::Rect, egui::Rect)> {
+            match shape {
+                egui::epaint::Shape::Vec(shapes) => shapes.iter().find_map(|shape| find_text(shape, clip, needle)),
+                egui::epaint::Shape::Text(shape) if shape.galley.text().contains(needle) => {
+                    Some((egui::Rect::from_min_size(shape.pos, shape.galley.size()), clip))
+                }
+                _ => None,
+            }
+        }
+        let text_rect = |output: &egui::FullOutput, needle: &str| {
+            output.shapes.iter().find_map(|shape| find_text(&shape.shape, shape.clip_rect, needle))
+                .unwrap_or_else(|| panic!("missing {needle}"))
+        };
+        for size in [egui::vec2(SEARCH_WINDOW_DEFAULT_WIDTH, SEARCH_WINDOW_DEFAULT_HEIGHT), egui::vec2(360.0, 210.0)] {
+            for pixels_per_point in [1.0, 1.25] {
+                let ctx = Context::default();
+                ctx.style_mut(|style| {
+                    style.animation_time = 0.0;
+                    style.scroll_animation = egui::style::ScrollAnimation::none();
+                });
+                let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                let channel = ChannelId::new("example");
+                let mut search = MessageSearchState::for_pane(71);
+                search.username = "viewer".into();
+                search.keyword = "sample".into();
+                search.regex = "message".into();
+                search.request_open();
+                let render = |search: &mut MessageSearchState, events| {
+                    let mut input = egui::RawInput {
+                        screen_rect: Some(screen), events,
+                        time: Some(ctx.cumulative_pass_nr() as f64 * 0.2),
+                        ..Default::default()
+                    };
+                    input.viewports.get_mut(&ViewportId::ROOT).unwrap().native_pixels_per_point = Some(pixels_per_point);
+                    ctx.run(input, |ctx| show_message_search_native_panel(ctx, &channel, &VecDeque::new(), search))
+                };
+                let mut output = egui::FullOutput::default();
+                for _ in 0..3 { output = render(&mut search, Vec::new()); }
+                assert_eq!(ctx.pixels_per_point(), pixels_per_point);
+                if size.y == SEARCH_WINDOW_DEFAULT_HEIGHT {
+                    let (help, clip) = text_rect(&output, "Username and keyword ignore case.");
+                    assert!(clip.expand(0.5).contains_rect(help),
+                        "default native popup clipped its help at {pixels_per_point}x: {help:?} in {clip:?}");
+                }
+
+                for delta in [-600.0, 600.0] {
+                    let _ = render(&mut search, vec![egui::Event::PointerMoved(screen.center()), egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, delta), modifiers: egui::Modifiers::NONE,
+                    }]);
+                    for _ in 0..60 {
+                        output = render(&mut search, Vec::new());
+                        if ctx.input(|input| input.time_since_last_scroll() > 0.0) { break; }
+                    }
+                    let expected = if delta < 0.0 { "Username and keyword ignore case." } else { "Load older logs" };
+                    let (rect, clip) = text_rect(&output, expected);
+                    assert!(screen.contains_rect(rect) && clip.expand(0.5).contains_rect(rect),
+                        "{expected} cannot be reached at {size:?}/{pixels_per_point}x: {rect:?} in {clip:?}");
+                }
+                let clear = text_rect(&output, "Clear").0.center();
+                for pressed in [true, false] {
+                    let _ = render(&mut search, vec![egui::Event::PointerMoved(clear), egui::Event::PointerButton {
+                        pos: clear, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+                    }]);
+                }
+                assert!(search.username.is_empty() && search.keyword.is_empty() && search.regex.is_empty());
+                for _ in 0..2 { let _ = render(&mut search, Vec::new()); }
+                assert!(ctx.memory(|memory| memory.has_focus(search.field_id(&channel, "keyword"))));
+            }
+        }
+    }
+
+    #[test]
     fn closing_search_disables_filters_and_reopening_restores_them() {
         let mut search = MessageSearchState::default();
         search.request_open();
@@ -787,7 +870,9 @@ mod tests {
                 if embedded { egui::vec2(640.0, 480.0) } else { egui::vec2(360.0, 210.0) });
             let mut search = MessageSearchState::default();
             search.keyword = "café 🙂".into();
-            search.regex = format!("({}", "x".repeat(400));
+            // Keep enough error text below the fields to scroll the keyword
+            // away even when the popup's initial height fits the normal form.
+            search.regex = format!("({}", "x".repeat(1600));
             search.request_open();
             let frame = |search: &mut MessageSearchState, events| {
                 let mut field = None;

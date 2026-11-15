@@ -266,7 +266,7 @@ impl CrustApp {
         appended
     }
 
-    pub(super) fn open_reply_thread(&mut self, message: ChatMessage) {
+    pub(super) fn open_reply_thread(&mut self, message: ChatMessage) -> bool {
         let empty = VecDeque::new();
         let source = self
             .state
@@ -283,7 +283,10 @@ impl CrustApp {
                 t::red(),
                 false,
             );
+            return false;
         }
+        self.focus_main_viewport();
+        true
     }
 
     pub(super) fn show_reply_thread(&mut self, ctx: &Context, animations_allowed: bool) {

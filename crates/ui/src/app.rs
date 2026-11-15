@@ -6994,6 +6994,13 @@ exit 1
         });
     }
 
+    fn focus_main_viewport(&self) {
+        // A user action in a native search window can open UI in the main window.
+        if let Some(ctx) = self.egui_ctx.as_ref() {
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+        }
+    }
+
     fn apply_global_search_output(&mut self, output: GlobalSearchOutput) {
         for channel in output.load_older_requests {
             let oldest_ts = self
@@ -7005,21 +7012,35 @@ exit 1
                 .unwrap_or(i64::MAX);
             self.request_older_local_history(&channel, oldest_ts);
         }
+        let mut accepted = false;
         if let Some((channel, msg_id)) = output.jump_to {
-            self.jump_to_message(channel, msg_id);
+            accepted |= self.jump_to_message(channel, msg_id);
         }
-        self.apply_message_preview_actions(output.message_actions);
+        accepted |= self.apply_message_preview_actions(output.message_actions);
+        if accepted {
+            self.global_search.close();
+            if let Some(ctx) = self.egui_ctx.as_ref() {
+                // An owned native window can cover its owner even after focus moves there.
+                let search = egui::ViewportId::from_hash_of("global_search");
+                if ctx.input(|input| input.raw.viewports.contains_key(&search)) {
+                    ctx.send_viewport_cmd_to(search, egui::ViewportCommand::Close);
+                }
+            }
+        }
     }
 
-    fn apply_message_preview_actions(&mut self, actions: MessagePreviewActions) {
-        if let Some(message) = actions.open_thread { self.open_reply_thread(message); }
+    fn apply_message_preview_actions(&mut self, actions: MessagePreviewActions) -> bool {
+        let mut accepted = false;
+        if let Some(message) = actions.open_thread { accepted |= self.open_reply_thread(message); }
         if let Some((channel, message)) = actions.jump_to {
-            self.jump_to_message(channel, message);
+            accepted |= self.jump_to_message(channel, message);
         }
         if let Some((channel, info)) = actions.reply {
             if self.state.channels.contains_key(&channel) {
                 self.activate_channel(channel.clone());
                 self.pending_reply = Some(PendingReply { channel, info });
+                self.focus_main_viewport();
+                accepted = true;
             } else {
                 self.push_event_toast("That channel is no longer open".to_owned(), t::red(), false);
             }
@@ -7029,10 +7050,13 @@ exit 1
                 || (channel.is_twitch() && self.state.auth.username.as_deref()
                     .is_some_and(|name| channel.display_name().eq_ignore_ascii_case(name)));
             self.user_profile_popup.set_loading(&login, badges, Some(channel), is_mod);
+            self.focus_main_viewport();
+            accepted = true;
         }
+        accepted
     }
 
-    fn jump_to_message(&mut self, channel: ChannelId, msg_id: MessageId) {
+    fn jump_to_message(&mut self, channel: ChannelId, msg_id: MessageId) -> bool {
         let still_present = self
             .state
             .channels
@@ -7045,10 +7069,12 @@ exit 1
                 "global search jump target evicted from buffer: {:?}",
                 channel
             );
-            return;
+            return false;
         }
         self.pending_scroll_to_message.insert(channel.clone(), msg_id);
         self.activate_channel(channel);
+        self.focus_main_viewport();
+        true
     }
 
     fn static_avatar_texture_for(
@@ -9079,7 +9105,7 @@ impl CrustApp {
             preview,
         ) {
             match action {
-                PopupAction::MessageActions(actions) => self.apply_message_preview_actions(actions),
+                PopupAction::MessageActions(actions) => { self.apply_message_preview_actions(actions); }
                 PopupAction::Timeout {
                     channel,
                     login,
@@ -18353,6 +18379,202 @@ mod tests {
                 assert!(ctx.input_mut(|input| super::consume_binding(input, &binding)));
             });
         }
+    }
+
+    fn native_search_action_frame(
+        ctx: &egui::Context,
+        app: &mut super::CrustApp,
+        action: super::GlobalSearchOutput,
+    ) -> egui::FullOutput {
+        app.egui_ctx = Some(ctx.clone());
+        let search = egui::ViewportId::from_hash_of("global_search");
+        let mut input = egui::RawInput { viewport_id: search, ..Default::default() };
+        input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap().focused = Some(false);
+        input.viewports.insert(search, egui::ViewportInfo {
+            parent: Some(egui::ViewportId::ROOT),
+            focused: Some(true),
+            ..Default::default()
+        });
+        let mut action = Some(action);
+        ctx.run(input, |_| {
+            if let Some(action) = action.take() {
+                app.apply_global_search_output(action);
+            }
+        })
+    }
+
+    fn requested_main_focus(output: &egui::FullOutput) -> bool {
+        output.viewport_output.get(&egui::ViewportId::ROOT).is_some_and(|viewport| {
+            viewport.commands.iter().any(|command| matches!(command, egui::ViewportCommand::Focus))
+        })
+    }
+
+    fn requested_viewport_closures(output: &egui::FullOutput) -> Vec<egui::ViewportId> {
+        output.viewport_output.iter().filter_map(|(id, viewport)| {
+            viewport.commands.iter().any(|command| matches!(command, egui::ViewportCommand::Close))
+                .then_some(*id)
+        }).collect()
+    }
+
+    #[test]
+    fn native_search_actions_close_only_the_source_and_preserve_the_query_and_draft() {
+        for action in ["thread", "profile", "reply", "result_jump", "context_jump", "jump_and_profile"] {
+            let (mut app, mut commands) = test_app();
+            let ctx = egui::Context::default();
+            let channel = ChannelId::new("room");
+            app.state.join_channel(channel.clone());
+            let message = search_message(channel.clone());
+            app.state.channels.get_mut(&channel).unwrap().push_message(message.clone());
+            app.chat_input_buf = "main draft".into();
+            app.global_search.open = true;
+            app.global_search.input = "search target".into();
+            app.message_search_mut(&channel).request_open();
+            let mut output = super::GlobalSearchOutput {
+                load_older_requests: vec![channel.clone()],
+                ..Default::default()
+            };
+            match action {
+                "thread" => output.message_actions.open_thread = Some(message.clone()),
+                "profile" => output.message_actions.profile_request = Some((channel.clone(), "alice".into(), Vec::new())),
+                "reply" => output.message_actions.reply = Some((channel.clone(), crust_core::ReplyInfo::for_message(&message).unwrap())),
+                "result_jump" => output.jump_to = Some((channel.clone(), message.id)),
+                "context_jump" => output.message_actions.jump_to = Some((channel.clone(), message.id)),
+                "jump_and_profile" => {
+                    output.jump_to = Some((channel.clone(), message.id));
+                    output.message_actions.profile_request = Some((channel.clone(), "alice".into(), Vec::new()));
+                }
+                _ => unreachable!(),
+            }
+            let rendered = native_search_action_frame(&ctx, &mut app, output);
+            assert!(requested_main_focus(&rendered), "{action} must activate its destination window");
+            assert!(rendered.viewport_output.iter().all(|(id, viewport)| {
+                *id == egui::ViewportId::ROOT
+                    || viewport.commands.iter().all(|command| !matches!(command, egui::ViewportCommand::Focus))
+            }), "{action} must not reactivate the source window");
+            assert!(!app.global_search.open, "{action} must uncover its destination");
+            assert_eq!(requested_viewport_closures(&rendered), [egui::ViewportId::from_hash_of("global_search")]);
+            assert!(app.message_search.get(&channel).unwrap().open, "the channel search must stay open");
+            assert_eq!(app.global_search.input, "search target");
+            assert_eq!(app.chat_input_buf, "main draft");
+            assert!(std::iter::from_fn(|| commands.try_recv().ok()).any(|command| {
+                matches!(command, AppCommand::LoadOlderLocalHistory { channel: requested, .. } if requested == channel)
+            }), "the window handoff must not drop other search actions");
+            match action {
+                "thread" => assert_eq!(app.reply_threads.active_key(None).unwrap().root_id, "search-server-id"),
+                "profile" | "jump_and_profile" => {
+                    assert!(app.user_profile_popup.open);
+                    assert_eq!(app.user_profile_popup.channel.as_ref(), Some(&channel));
+                    if action == "jump_and_profile" {
+                        assert_eq!(app.pending_scroll_to_message.get(&channel), Some(&message.id));
+                    }
+                }
+                "reply" => assert_eq!(app.pending_reply.as_ref().unwrap().info.parent_msg_id, "search-server-id"),
+                _ => assert_eq!(app.pending_scroll_to_message.get(&channel), Some(&message.id)),
+            }
+            app.global_search.request_open();
+            assert!(app.global_search.open);
+            assert_eq!(app.global_search.input, "search target", "reopening must restore the query");
+            let idle = native_search_action_frame(&ctx, &mut app, Default::default());
+            assert!(!requested_main_focus(&idle), "an idle search frame must not repeat the handoff");
+            assert!(requested_viewport_closures(&idle).is_empty());
+            assert!(app.global_search.open);
+        }
+    }
+
+    #[test]
+    fn native_search_refreshes_and_rejected_actions_do_not_activate_main() {
+        for action in ["refresh", "load_older", "result_jump", "context_jump", "reply", "thread"] {
+            let (mut app, _commands) = test_app();
+            let ctx = egui::Context::default();
+            let channel = ChannelId::new("room");
+            app.state.join_channel(channel.clone());
+            app.chat_input_buf = "main draft".into();
+            app.global_search.open = true;
+            app.global_search.input = "search target".into();
+            let mut output = super::GlobalSearchOutput::default();
+            match action {
+                "refresh" => {
+                    app.global_search.invalidate();
+                    super::refresh_if_stale(&mut app.global_search, &app.state.channels);
+                }
+                "load_older" => output.load_older_requests.push(channel.clone()),
+                "result_jump" => output.jump_to = Some((channel.clone(), crust_core::MessageId(999))),
+                "context_jump" => output.message_actions.jump_to = Some((channel.clone(), crust_core::MessageId(999))),
+                "reply" => output.message_actions.reply = Some((ChannelId::new("closed"), reply_context())),
+                "thread" => {
+                    let mut message = search_message(channel);
+                    message.server_id = None;
+                    output.message_actions.open_thread = Some(message);
+                }
+                _ => unreachable!(),
+            }
+            let rendered = native_search_action_frame(&ctx, &mut app, output);
+            assert!(!requested_main_focus(&rendered), "{action}");
+            assert!(requested_viewport_closures(&rendered).is_empty(), "{action} must keep the source visible");
+            assert!(app.global_search.open);
+            assert_eq!(app.global_search.input, "search target");
+            assert_eq!(app.chat_input_buf, "main draft");
+            assert!(app.reply_threads.active_key(None).is_none());
+            assert!(app.pending_reply.is_none());
+            assert!(app.pending_scroll_to_message.is_empty());
+        }
+    }
+
+    #[test]
+    fn native_search_thread_handoff_keeps_typing_in_the_thread() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("room");
+        app.state.join_channel(channel.clone());
+        app.state.auth.logged_in = true;
+        app.state.auth.user_id = Some("alice-id".into());
+        app.state.auth.username = Some("alice".into());
+        let message = search_message(channel.clone());
+        app.state.channels.get_mut(&channel).unwrap().push_message(message.clone());
+        app.chat_input_buf = "main draft".into();
+        app.global_search.open = true;
+        app.global_search.input = "search target".into();
+        let output = native_search_action_frame(&ctx, &mut app, super::GlobalSearchOutput {
+            message_actions: super::MessagePreviewActions { open_thread: Some(message), ..Default::default() },
+            ..Default::default()
+        });
+        assert!(requested_main_focus(&output));
+        let key = app.reply_threads.active_key(Some("alice-id")).unwrap().clone();
+        for _ in 0..4 { production_ui_frame(&ctx, &mut app, Vec::new()); }
+        assert!(ctx.memory(|memory| memory.has_focus(key.composer_id())));
+        production_ui_frame(&ctx, &mut app, vec![egui::Event::Text("thread draft".into())]);
+        assert_eq!(app.reply_threads.draft(&key), Some("thread draft"));
+        assert_eq!(app.chat_input_buf, "main draft");
+        assert!(!app.global_search.open);
+        assert_eq!(app.global_search.input, "search target");
+    }
+
+    #[test]
+    fn embedded_search_destination_keeps_root_and_other_searches_open() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        app.egui_ctx = Some(ctx.clone());
+        let channel = ChannelId::new("room");
+        app.state.join_channel(channel.clone());
+        app.message_search_mut(&channel).request_open();
+        app.global_search.open = true;
+        app.global_search.input = "saved query".into();
+        let mut action = Some(super::GlobalSearchOutput {
+            message_actions: super::MessagePreviewActions {
+                profile_request: Some((channel.clone(), "alice".into(), Vec::new())),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let output = ctx.run(egui::RawInput::default(), |_| {
+            if let Some(action) = action.take() { app.apply_global_search_output(action); }
+        });
+        assert!(requested_main_focus(&output));
+        assert!(requested_viewport_closures(&output).is_empty(), "embedded search must not close a native viewport");
+        assert!(!app.global_search.open);
+        assert_eq!(app.global_search.input, "saved query");
+        assert!(app.user_profile_popup.open);
+        assert!(app.message_search.get(&channel).unwrap().open);
     }
 
     #[test]

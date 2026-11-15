@@ -44,6 +44,17 @@ and context actions. Clicking a result body navigates to its source message;
 sender names and links keep their own actions. Message identities remain stable
 as earlier rows move out of view.
 
+Successful message jumps, replies, thread openings, and user-card openings close
+the source global-search window and activate the main window. The query remains
+available when search is reopened. This also prevents an owned Windows search
+window from covering its destination while the main window has keyboard focus.
+Rejected actions and history loading leave search open. Other pane searches keep
+their state.
+
+The message menu's Open user card action previously fetched profile data without
+opening the card. It now opens the card immediately and keeps the sender's badges
+while the profile loads, using the same path as a sender-name click.
+
 The search height cache includes layout-affecting message and image metadata.
 Highlight-rule changes invalidate measurements so an offscreen banner cannot
 leave later results at the wrong position. Keyboard navigation uses the result
@@ -111,15 +122,40 @@ confirms that only the new request is polled.
 
 ## Verification
 
-The Windows release workspace run passed 1,511 tests across 20 targets, with
-22 opt-in performance tests excluded from the normal run. The 5,000-result search
-benchmark was run separately. The workspace correctness lint gate also passed.
+The Windows release workspace run passed 1,517 tests across 20 unit and
+integration targets, plus one doctest. The normal run skipped 22 tests, including
+opt-in benchmarks and fixture tests.
+The 5,000-result search benchmark was run separately. The workspace correctness
+lint gate also passed.
 
 Interaction regressions cover nested geometry, divider dragging, duplicate
 channel views, closed-pane restoration, channel drafts, async recovery, input
 ordering, account changes, thread focus, compact windows, and drag-to-copy text
 selection. Saved-layout tests cover migration and shutdown before the debounce
 timer expires.
+
+Native checks confirmed that switching between two channels preserves each
+unsent draft. Ctrl+Alt+R followed by Ctrl+Alt+D produced the expected three-pane
+layout. Closing and reopening the lower pane preserved its draft and keyword
+search, while the duplicate sibling's search stayed empty.
+
+Both divider directions resized in the native app. A restart restored the tree,
+divider positions, and the query edited immediately before shutdown. Thread
+typing and emote insertion left the main drafts unchanged; Escape returned to
+the main composer. Rich search results and user-card history displayed badges,
+emotes, and reply context.
+
+On the rebuilt package, thread and user-card actions closed the source search
+and activated the main window. Native Windows hit testing confirmed that the
+thread controls were exposed in that window, and typing reached its composer.
+Reopening global search restored the query. The user card opened immediately and
+then displayed the fetched profile.
+
+Native review also found clipping in the detached search popup at its old
+default height of 220 logical points. Its default height is now 280 logical
+points, with bounded scrolling at smaller sizes. Regression and native checks
+confirmed the full help text at the default size and reachable help and Clear
+controls at the minimum size, including the Windows display's 1.25x scaling.
 
 ## Measurements
 
@@ -142,11 +178,27 @@ The first layout still measures every result to establish exact wrapped heights.
 Progressive measurement with stable scroll anchors and keyboard jumps is tracked
 in [#45](https://github.com/frankischilling/crust/issues/45).
 
-A saved-account v0.5.9 native baseline recorded 602 UI updates: median 1.05 ms,
-95th percentile 2.90 ms, maximum 8.98 ms, and no update at or above 100 ms. These
-figures measure application update work, excluding presentation and compositor
-time. They do not reproduce or explain the older intermittent stalls tracked in
-[#17](https://github.com/frankischilling/crust/issues/17).
+Native startup was also observed with a saved account. The v0.6.0 candidate ran
+for 180 seconds. The recorded update timings were:
+
+| Observation | v0.5.9 baseline | v0.6.0 candidate |
+| --- | ---: | ---: |
+| UI updates | 602 | 681 |
+| Median update | 1.05455 ms | 0.7129 ms |
+| 95th percentile update | 2.8989 ms | 1.9417 ms |
+| Maximum update | 8.9803 ms | 6.604 ms |
+| Updates at or above 100 ms | 0 | 0 |
+| Event budget overruns | 0 | 0 |
+
+The candidate loaded 310 native global emotes at 1.060689 seconds after launch.
+Startup requested four room autojoins; three rooms joined, and the fourth
+returned a server notice.
+
+Live traffic and cache state were not controlled between the baseline and
+candidate launches. These timings cover application update work and exclude
+presentation and compositor time. They do not establish a controlled speedup or
+explain the older intermittent stalls in
+[#17](https://github.com/frankischilling/crust/issues/17), which remains open.
 
 ## Remaining work
 

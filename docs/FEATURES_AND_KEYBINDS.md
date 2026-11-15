@@ -277,6 +277,9 @@ found until you update the selection.
 - Search navigation that follows input/result focus and leaves other controls' keys alone
 - Search results and recent messages in user cards use the chat renderer for
   emotes, badges, replies, subscription messages, links, and message actions
+- Opening a message, reply, thread, or user card from cross-channel search closes
+  its window and returns focus to chat. Reopening search in the same session
+  restores the query.
 - Case-insensitive search regexes by default; inline regex flags can request case-sensitive matching
 - Subscriber-tier searches distinguish tier from subscription length; comma-separated `is:` values match any listed flag
 - Data directories via `directories::ProjectDirs` for config/cache/logs

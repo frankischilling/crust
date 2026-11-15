@@ -1949,6 +1949,10 @@ impl<'a> MessageList<'a> {
                     login: msg.sender.login.clone(),
                     channel: self.channel.clone(),
                 });
+                let key = self.state_id("ml_profile_req");
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(key, (msg.sender.login.clone(), msg.sender.badges.clone()));
+                });
                 ui.close_menu();
             }
         }
@@ -5883,6 +5887,71 @@ mod tests {
             }
             _ => None,
         })
+    }
+
+    #[test]
+    fn message_context_menu_opens_the_user_card_with_sender_badges() {
+        let ctx = egui::Context::default();
+        let mut state = PreviewTestState::default();
+        let mut message = test_msg("alice", "42", None);
+        message.channel = ChannelId::new("sourcechannel");
+        message.sender.badges.push(Badge { name: "moderator".into(), version: "1".into(), url: None });
+        message.spans = smallvec::smallvec![Span::Text { text: message.raw_text.clone(), is_action: false }];
+        let frame = |events: Vec<egui::Event>| {
+            let mut actions = MessagePreviewActions::default();
+            let output = ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 600.0))),
+                events,
+                ..Default::default()
+            }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    actions.append(state.context().show(ui, &message, Id::new("profile_menu_row"), false, false).actions);
+                });
+            });
+            (output, actions)
+        };
+        let mut output = egui::FullOutput::default();
+        for _ in 0..3 { output = frame(Vec::new()).0; }
+        let body = output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == "hello" => Some(text.galley.rows.iter()
+                .flat_map(|row| &row.glyphs)
+                .fold(egui::Rect::NOTHING, |bounds, glyph| bounds.union(glyph.logical_rect()))
+                .translate(text.pos.to_vec2()).center()),
+            _ => None,
+        }).expect("the message body must be painted");
+        for pressed in [true, false] {
+            let (_, actions) = frame(vec![
+                egui::Event::PointerMoved(body),
+                egui::Event::PointerButton {
+                    pos: body, button: egui::PointerButton::Secondary, pressed, modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+            assert!(actions.is_empty());
+        }
+        assert!(ctx.is_context_menu_open());
+        output = frame(Vec::new()).0;
+        let open = body_text_rect(&output, "Open user card").expect("the actual message menu must be visible").center();
+        let mut actions = MessagePreviewActions::default();
+        for pressed in [true, false] {
+            actions.append(frame(vec![
+                egui::Event::PointerMoved(open),
+                egui::Event::PointerButton {
+                    pos: open, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+                },
+            ]).1);
+        }
+        assert!(frame(Vec::new()).1.is_empty(), "the profile request must be consumed once");
+        let (channel, login, badges) = actions.profile_request.expect("the card must open before its fetch completes");
+        assert_eq!(channel, message.channel);
+        assert_eq!(login, message.sender.login);
+        assert_eq!(badges.len(), 1);
+        assert_eq!(badges[0].name, "moderator");
+        assert_eq!(badges[0].version, "1");
+        assert_eq!(badges[0].url, None);
+        assert!(actions.jump_to.is_none() && actions.reply.is_none() && actions.open_thread.is_none());
+        assert!(matches!(state.receiver.try_recv().unwrap(), AppCommand::ShowUserCard { login, channel }
+            if login == message.sender.login && channel == message.channel));
+        assert!(state.receiver.try_recv().is_err());
     }
 
     fn inline_mention_paint() -> crust_core::model::SenderNamePaint {
