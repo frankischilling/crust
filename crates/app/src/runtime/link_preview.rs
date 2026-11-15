@@ -1,8 +1,44 @@
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+
 use crust_core::events::AppEvent;
 use crust_emotes::cache::EmoteCache;
 use tokio::sync::mpsc;
 
 use crate::runtime::assets::fetch_emote_image;
+
+const MAX_PENDING_LINK_PREVIEWS: usize = 64;
+const MAX_PREVIEW_HTML_BYTES: usize = 64 * 1024;
+
+/// Keep only active requests so a preview evicted by the UI can be fetched again.
+#[derive(Default)]
+pub(crate) struct LinkPreviewRequests {
+    pending: Arc<Mutex<HashSet<String>>>,
+}
+
+impl LinkPreviewRequests {
+    pub(crate) fn begin(&self, url: &str) -> Option<LinkPreviewRequest> {
+        let mut pending = self.pending.lock().unwrap();
+        if pending.len() >= MAX_PENDING_LINK_PREVIEWS || !pending.insert(url.to_owned()) {
+            return None;
+        }
+        Some(LinkPreviewRequest {
+            pending: self.pending.clone(),
+            url: url.to_owned(),
+        })
+    }
+}
+
+pub(crate) struct LinkPreviewRequest {
+    pending: Arc<Mutex<HashSet<String>>>,
+    url: String,
+}
+
+impl Drop for LinkPreviewRequest {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().remove(&self.url);
+    }
+}
 
 /// Link preview fetch.
 pub(crate) async fn fetch_link_preview(
@@ -105,15 +141,14 @@ pub(crate) async fn fetch_link_preview(
         return;
     }
 
-    let bytes = match resp.bytes().await {
+    let bytes = match read_preview_html_prefix(resp).await {
         Ok(b) => b,
         Err(_) => {
             let _ = evt_tx.send(send_empty(url)).await;
             return;
         }
     };
-    // Only read the first 64 KB to avoid processing megabyte HTML files.
-    let html = String::from_utf8_lossy(&bytes[..bytes.len().min(65_536)]);
+    let html = String::from_utf8_lossy(&bytes);
 
     let title = og_meta(&html, "og:title")
         .or_else(|| og_meta(&html, "twitter:title"))
@@ -139,6 +174,19 @@ pub(crate) async fn fetch_link_preview(
         .await;
 }
 
+/// Metadata normally appears near the start of a page. Stop at the prefix limit
+/// without waiting for the rest of a large or continuing response body.
+async fn read_preview_html_prefix(mut response: reqwest::Response) -> Result<Vec<u8>, reqwest::Error> {
+    let capacity = response.content_length().unwrap_or(0).min(MAX_PREVIEW_HTML_BYTES as u64);
+    let mut bytes = Vec::with_capacity(capacity as usize);
+    while bytes.len() < MAX_PREVIEW_HTML_BYTES {
+        let Some(chunk) = response.chunk().await? else { break };
+        let keep = chunk.len().min(MAX_PREVIEW_HTML_BYTES - bytes.len());
+        bytes.extend_from_slice(&chunk[..keep]);
+    }
+    Ok(bytes)
+}
+
 /// Check if a URL is a YouTube / youtu.be link.
 fn is_youtube_url(url: &str) -> bool {
     let lower = url.to_lowercase();
@@ -162,7 +210,135 @@ fn is_direct_image_url(url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_direct_image_url;
+    use super::{fetch_link_preview, is_direct_image_url, read_preview_html_prefix, LinkPreviewRequests,
+        MAX_PENDING_LINK_PREVIEWS, MAX_PREVIEW_HTML_BYTES};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn continuing_preview_response(headers: String, body: Vec<u8>) -> (
+        reqwest::Response,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/preview", listener.local_addr().unwrap());
+        let (close, closed) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let mut chunk = [0; 1024];
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert!(count > 0, "request closed before its headers");
+                request.extend_from_slice(&chunk[..count]);
+                assert!(request.len() <= 16 * 1024);
+            }
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            // A bounded reader may close the socket before this oversized body is written.
+            let _ = stream.write_all(&body).await;
+            let _ = closed.await;
+        });
+        let response = reqwest::Client::builder().no_proxy()
+            .timeout(Duration::from_secs(3)).build().unwrap()
+            .get(url).send().await.unwrap();
+        (response, close, server)
+    }
+
+    #[tokio::test]
+    async fn link_preview_html_finishes_at_prefix_cap_without_waiting_for_body_end() {
+        for chunked in [false, true] {
+            let mut body = vec![b' '; MAX_PREVIEW_HTML_BYTES];
+            let title = b"<title>Preview title</title>";
+            body[..title.len()].copy_from_slice(title);
+            body.extend_from_slice(b"<meta property=\"og:description\" content=\"outside prefix\">");
+            let declared = MAX_PREVIEW_HTML_BYTES * 8;
+            let framing = if chunked {
+                let mut wire = format!("{declared:x}\r\n").into_bytes();
+                wire.extend_from_slice(&body);
+                body = wire;
+                "Transfer-Encoding: chunked".to_owned()
+            } else {
+                format!("Content-Length: {declared}")
+            };
+            let (response, close, server) = continuing_preview_response(
+                format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n{framing}\r\n\r\n"),
+                body,
+            ).await;
+            // The server deliberately keeps an incomplete body open until after this result.
+            let bytes = tokio::time::timeout(Duration::from_secs(2), read_preview_html_prefix(response))
+                .await.expect("preview must not wait for the oversized body to end").unwrap();
+            assert_eq!(bytes.len(), MAX_PREVIEW_HTML_BYTES);
+            let html = String::from_utf8_lossy(&bytes);
+            assert_eq!(super::html_title(&html).as_deref(), Some("Preview title"));
+            assert_eq!(super::og_meta(&html, "og:description"), None);
+            drop(close);
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn link_preview_html_preserves_errors_before_prefix_cap() {
+        let (response, close, server) = continuing_preview_response(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 1024\r\n\r\n".into(),
+            b"<title>Incomplete page</title>".to_vec(),
+        ).await;
+        drop(close);
+        server.await.unwrap();
+        assert!(read_preview_html_prefix(response).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn link_preview_requests_release_after_failed_fetch_publishes_result() {
+        let requests = LinkPreviewRequests::default();
+        let url = "not a valid URL";
+        let request = requests.begin(url).unwrap();
+        let (events, mut received) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            let _request = request;
+            fetch_link_preview(url, &None, &events).await;
+        });
+        assert!(requests.begin(url).is_none());
+        let event = received.recv().await.expect("failed fetch publishes an empty result");
+        assert!(matches!(event, crust_core::AppEvent::LinkPreviewReady {
+            title: None, description: None, thumbnail_url: None, ..
+        }));
+        task.await.unwrap();
+        assert!(requests.begin(url).is_some(), "failed requests must permit a later retry");
+    }
+
+    #[test]
+    fn link_preview_requests_deduplicate_bound_and_release_for_refetch() {
+        let requests = LinkPreviewRequests::default();
+        let url = "https://example.test/preview";
+        let first = requests.begin(url).unwrap();
+        assert!(requests.begin(url).is_none());
+        let mut others = Vec::new();
+        for index in 1..MAX_PENDING_LINK_PREVIEWS {
+            others.push(requests.begin(&format!("https://example.test/{index}")).unwrap());
+        }
+        assert!(requests.begin("https://example.test/overflow").is_none());
+        drop(first);
+        let refetch = requests.begin(url).expect("completed requests can be fetched again");
+        assert!(requests.begin(url).is_none());
+        drop(refetch);
+        drop(others);
+        assert!(requests.pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn link_preview_requests_release_when_fetch_task_is_cancelled() {
+        let requests = LinkPreviewRequests::default();
+        let url = "https://example.test/cancelled";
+        let request = requests.begin(url).unwrap();
+        let task = tokio::spawn(async move {
+            let _request = request;
+            std::future::pending::<()>().await;
+        });
+        assert!(requests.begin(url).is_none());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(requests.begin(url).is_some());
+    }
 
     #[test]
     fn direct_image_detection() {

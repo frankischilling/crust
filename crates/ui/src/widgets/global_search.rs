@@ -565,6 +565,7 @@ fn render_hit_row(
                 .color
                 .as_deref()
                 .and_then(parse_hex_color)
+                .map(t::readable_username_color)
                 .unwrap_or_else(t::text_secondary);
             row.append(
                 &hit.message.sender.login,

@@ -14,6 +14,7 @@ const MAX_CACHED_USERS: usize = 2_048;
 const MAX_PERSONAL_EMOTES_PER_USER: usize = 256;
 const MAX_PERSONAL_EMOTES: usize = 16_384;
 const MAX_LIVE_PERSONAL_USERS: usize = 64;
+const MAX_INLINE_EMOTES_PER_CHANNEL: usize = 2_048;
 const USER_LOOKUP_TTL: Duration = Duration::from_secs(10 * 60);
 const CHANNEL_RETRY_DELAY: Duration = Duration::from_secs(30);
 
@@ -53,6 +54,7 @@ struct ChannelEmotes {
     emotes: ProviderEmotes,
     /// Definitions carried by incoming messages survive older fetched snapshots.
     inline_emotes: ProviderEmotes,
+    inline_emote_order: VecDeque<(String, String)>,
     live: HashMap<String, LiveState>,
     live_enabled: bool,
     live_generation: u64,
@@ -638,11 +640,10 @@ impl EmoteRegistry {
             emotes.clear();
             match &target.scope {
                 LiveScope::Channel(channel) => {
-                    self.channels
-                        .get_mut(channel)
-                        .unwrap()
-                        .inline_emotes
-                        .remove(target.source.provider.name());
+                    let scope = self.channels.get_mut(channel).unwrap();
+                    let provider = target.source.provider.name();
+                    scope.inline_emotes.remove(provider);
+                    scope.inline_emote_order.retain(|(name, _)| name != provider);
                 }
                 LiveScope::Personal(_) => {
                     self.personal_emote_count = self.personal_emote_count.saturating_sub(removed)
@@ -675,14 +676,44 @@ impl EmoteRegistry {
         let Some(scope) = self.channels.get_mut(channel) else {
             return false;
         };
-        let changed = lookup(&scope.inline_emotes, &emote.provider, &emote.code)
+        let mut changed = lookup(&scope.inline_emotes, &emote.provider, &emote.code)
             .or_else(|| lookup(&scope.emotes, &emote.provider, &emote.code))
             .is_none_or(|old| old != &emote);
+        if !scope
+            .inline_emote_order
+            .back()
+            .is_some_and(|(provider, code)| provider == &emote.provider && code == &emote.code)
+        {
+            scope
+                .inline_emote_order
+                .retain(|(provider, code)| provider != &emote.provider || code != &emote.code);
+            scope
+                .inline_emote_order
+                .push_back((emote.provider.clone(), emote.code.clone()));
+        }
         scope
             .inline_emotes
             .entry(emote.provider.clone())
             .or_default()
             .insert(emote.code.clone(), emote);
+        while scope.inline_emote_order.len() > MAX_INLINE_EMOTES_PER_CHANNEL {
+            let (provider, code) = scope.inline_emote_order.pop_front().unwrap();
+            let removed = scope
+                .inline_emotes
+                .get_mut(&provider)
+                .and_then(|emotes| emotes.remove(&code));
+            // Evict only observed definitions; the fetched catalog can supply
+            // the same code again, and that fallback may change its metadata.
+            if removed
+                .as_ref()
+                .is_some_and(|old| lookup(&scope.emotes, &provider, &code) != Some(old))
+            {
+                changed = true;
+            }
+            if scope.inline_emotes.get(&provider).is_some_and(HashMap::is_empty) {
+                scope.inline_emotes.remove(&provider);
+            }
+        }
         changed
     }
 
@@ -1150,6 +1181,7 @@ impl EmoteRegistry {
                         ChannelEmotes {
                             emotes: scope.emotes.clone(),
                             inline_emotes: scope.inline_emotes.clone(),
+                            inline_emote_order: scope.inline_emote_order.clone(),
                             ..ChannelEmotes::default()
                         },
                     )])
@@ -1989,6 +2021,90 @@ mod tests {
         registry.close_channel(&channel);
         registry.open_channel(&channel);
         assert!(registry.resolve(&channel, "", "Wave").is_none());
+    }
+
+    #[test]
+    fn inline_emotes_keep_recent_observations_without_trimming_fetched_catalogs() {
+        let mut registry = EmoteRegistry::default();
+        let channel = ChannelId::kick("room");
+        let mut fetched: Vec<_> = (0..=MAX_INLINE_EMOTES_PER_CHANNEL)
+            .map(|index| emote("kick", &format!("catalog-{index}"), &format!("Fetched{index}")))
+            .collect();
+        let original_wave = emote("kick", "original-wave", "Wave");
+        let known = emote("kick", "known", "Known");
+        fetched.extend([original_wave.clone(), known.clone()]);
+        let fetched_count = fetched.len();
+        load(&mut registry, &channel, fetched);
+
+        assert!(registry.insert_channel_emote(&channel, emote("kick", "new-wave", "Wave")));
+        let mut recent = emote("kick", "recent", "Recent");
+        assert!(registry.insert_channel_emote(&channel, recent.clone()));
+        for index in 0..MAX_INLINE_EMOTES_PER_CHANNEL - 2 {
+            assert!(registry.insert_channel_emote(
+                &channel,
+                emote("kick", &format!("observed-{index}"), &format!("Observed{index}")),
+            ));
+        }
+        assert!(!registry.insert_channel_emote(&channel, recent.clone()));
+
+        // The incoming definition is unchanged, but evicting an old override
+        // restores a different fetched definition and must publish a catalog.
+        assert!(registry.insert_channel_emote(&channel, known.clone()));
+        assert_eq!(registry.resolve(&channel, "", "Wave"), Some(&original_wave));
+        assert_eq!(registry.resolve(&channel, "", "Recent"), Some(&recent));
+        assert!(registry.insert_channel_emote(&channel, emote("kick", "newest", "Newest")));
+        assert!(registry.resolve(&channel, "", "Observed0").is_none());
+        assert_eq!(registry.resolve(&channel, "", "Recent"), Some(&recent));
+
+        recent.url_4x = Some("https://example.com/recent-hd".into());
+        assert!(registry.insert_channel_emote(&channel, recent.clone()));
+        assert!(!registry.insert_channel_emote(&channel, recent.clone()));
+        assert_eq!(registry.resolve(&channel, "", "Recent"), Some(&recent));
+        assert_eq!(registry.resolve(&channel, "", "Known"), Some(&known));
+        let scope = &registry.channels[&channel];
+        assert_eq!(scope.inline_emotes.values().map(HashMap::len).sum::<usize>(), MAX_INLINE_EMOTES_PER_CHANNEL);
+        assert_eq!(scope.inline_emote_order.len(), MAX_INLINE_EMOTES_PER_CHANNEL);
+        assert_eq!(scope.emotes.values().map(HashMap::len).sum::<usize>(), fetched_count);
+        let catalog = registry.catalog();
+        assert_eq!(catalog.len(), fetched_count + MAX_INLINE_EMOTES_PER_CHANNEL - 1);
+        assert_eq!(catalog.iter().filter(|entry| entry.id.starts_with("catalog-")).count(), MAX_INLINE_EMOTES_PER_CHANNEL + 1);
+        assert_eq!(catalog.iter().find(|entry| entry.code == "Wave").unwrap().id, "original-wave");
+        assert_eq!(registry.snapshot_for(&channel).resolve(&channel, "", "Recent"), Some(&recent));
+    }
+
+    #[test]
+    fn inline_emote_eviction_preserves_already_tokenized_messages() {
+        let mut registry = EmoteRegistry::default();
+        let channel = ChannelId::kick("room");
+        registry.open_channel(&channel);
+        let first = emote("kick", "first", "First");
+        assert!(registry.insert_channel_emote(&channel, first.clone()));
+        let spans = crust_core::format::tokenize_with_flags("First", false, &[], &|code| {
+            registry.resolve(&channel, "", code).map(|info| {
+                (
+                    info.id.clone(),
+                    info.code.clone(),
+                    info.url_1x.clone(),
+                    info.provider.clone(),
+                    info.url_4x.clone().or_else(|| info.url_2x.clone()),
+                    info.zero_width,
+                )
+            })
+        });
+        for index in 0..MAX_INLINE_EMOTES_PER_CHANNEL {
+            registry.insert_channel_emote(
+                &channel,
+                emote("kick", &format!("next-{index}"), &format!("Next{index}")),
+            );
+        }
+        assert!(registry.resolve(&channel, "", "First").is_none());
+        assert!(matches!(&spans[0], crust_core::Span::Emote { id, url, .. }
+            if id == "first" && url == &first.url_1x));
+        assert_eq!(registry.channel_emote_count(&channel), MAX_INLINE_EMOTES_PER_CHANNEL);
+        registry.close_channel(&channel);
+        registry.open_channel(&channel);
+        assert!(registry.channels[&channel].inline_emote_order.is_empty());
+        assert_eq!(registry.channel_emote_count(&channel), 0);
     }
 
     #[test]

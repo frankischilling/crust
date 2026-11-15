@@ -24,3 +24,6 @@ directories = { workspace = true }
 regex = { workspace = true }
 smallvec = { workspace = true }
 rodio = { workspace = true }
+
+[dev-dependencies]
+accesskit_consumer = "=0.26.0"

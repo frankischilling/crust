@@ -58,7 +58,7 @@ use runtime::history::{
     load_local_older_messages, load_local_recent_mentions, load_local_recent_messages,
     load_recent_messages, WhisperAccount, WhisperHistory,
 };
-use runtime::link_preview::fetch_link_preview;
+use runtime::link_preview::{fetch_link_preview, LinkPreviewRequests};
 use runtime::live_emotes::LiveEmoteUpdates;
 use runtime::log_writer::{flush_before_read, publish_moderation, LogWriter};
 use runtime::outgoing::{chat_echo_body, complete_whisper_send, twitch_message_error, whisper_send_failure, ChatSendPublisher, OutgoingChat, WhisperSendTasks};
@@ -770,8 +770,7 @@ async fn reducer_loop(
     irc_runtime_enabled: bool,
 ) {
     let image_requests = ImageRequests::default();
-    // Track URLs we've already kicked off a link-preview fetch for.
-    let mut pending_link_previews: HashSet<String> = HashSet::new();
+    let link_preview_requests = LinkPreviewRequests::default();
     // Track recent EventSub metadata.message_id values to avoid applying
     // duplicated moderation/state events after websocket reconnects.
     let mut seen_eventsub_notice_ids: HashMap<String, Instant> = HashMap::new();
@@ -2111,6 +2110,7 @@ async fn reducer_loop(
                     KickEvent::ChatMessage(mut msg) => {
                         let (normalized_text, inline_emotes) =
                             normalize_kick_inline_emotes(&msg.raw_text);
+                        let mut message_emotes = HashMap::new();
                         if !inline_emotes.is_empty() {
                             msg.raw_text = normalized_text;
                             let mut inserted = 0usize;
@@ -2126,6 +2126,7 @@ async fn reducer_loop(
                                         provider: "kick".to_owned(),
                                         zero_width: false,
                                     };
+                                    message_emotes.insert(code, info.clone());
                                     if idx.insert_channel_emote(&msg.channel, info) {
                                         inserted += 1;
                                     }
@@ -2144,7 +2145,9 @@ async fn reducer_loop(
                                 msg.flags.is_action,
                                 &msg.twitch_emotes,
                                 &|code| {
-                                    resolve_emote(&emote_guard, &msg.channel, &msg.sender.user_id.0, code).map(|info| {
+                                    message_emotes.get(code)
+                                        .or_else(|| resolve_emote(&emote_guard, &msg.channel, &msg.sender.user_id.0, code))
+                                        .map(|info| {
                                         (
                                             info.id.clone(),
                                             info.code.clone(),
@@ -3403,11 +3406,12 @@ async fn reducer_loop(
                         image_requests.request_visible(&url, &emote_cache, &evt_tx);
                     }
                     AppCommand::FetchLinkPreview { url } => {
-                        if !pending_link_previews.contains(&url) {
-                            pending_link_previews.insert(url.clone());
+                        if let Some(request) = link_preview_requests.begin(&url) {
                             let evt_tx = evt_tx.clone();
                             let cache = emote_cache.clone();
                             tokio::spawn(async move {
+                                // Hold through event publication; cancellation also releases it.
+                                let _request = request;
                                 fetch_link_preview(&url, &cache, &evt_tx).await;
                             });
                         }

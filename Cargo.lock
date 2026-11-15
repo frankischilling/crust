@@ -1160,6 +1160,7 @@ dependencies = [
 name = "crust-ui"
 version = "0.5.6"
 dependencies = [
+ "accesskit_consumer",
  "arboard",
  "chrono",
  "crust-core",

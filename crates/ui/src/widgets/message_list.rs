@@ -3900,6 +3900,7 @@ fn show_sender_name(
 ) -> egui::Response {
     let fallback_color =
         Color32::from_rgb(fallback_color.r(), fallback_color.g(), fallback_color.b());
+    let display_color = t::readable_username_color(fallback_color);
     if let Some(paint) = paint {
         let label = Label::new(RichText::new(name).strong())
             .selectable(false)
@@ -3934,7 +3935,7 @@ fn show_sender_name(
                                     let t = paint_sample_t(paint, paint_rect, v.pos, stops);
                                     v.color = gradient_color_at_t(stops, t, paint.repeat);
                                 } else {
-                                    v.color = fallback_color;
+                                    v.color = display_color;
                                 }
                                 painted_vertices += 1;
                                 row_painted = true;
@@ -3951,14 +3952,14 @@ fn show_sender_name(
                     ui.painter().add(egui::epaint::TextShape::new(
                         galley_pos,
                         galley,
-                        fallback_color,
+                        display_color,
                     ));
                 }
             } else {
                 ui.painter().add(egui::epaint::TextShape::new(
                     galley_pos,
                     galley,
-                    fallback_color,
+                    display_color,
                 ));
             }
         }
@@ -3968,7 +3969,7 @@ fn show_sender_name(
     }
 
     ui.add(
-        Label::new(RichText::new(name).color(fallback_color).strong())
+        Label::new(RichText::new(name).color(display_color).strong())
             .selectable(false)
             .sense(egui::Sense::click()),
     )

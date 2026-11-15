@@ -178,7 +178,11 @@ impl<'a> ChannelList<'a> {
                         egui::Align2::RIGHT_CENTER,
                         format!("{}", self.live_feed_count),
                         t::tabs_font(),
-                        t::text_muted(),
+                        if is_active || resp.hovered() {
+                            t::text_primary()
+                        } else {
+                            t::text_secondary()
+                        },
                     );
 
                     if resp.clicked() {
@@ -246,7 +250,7 @@ impl<'a> ChannelList<'a> {
 
                     // Right-side count. Unread gets the warning-pill treatment
                     // (matches how regular channel unread-mentions are drawn);
-                    // when fully read, fall back to a muted total count.
+                    // when fully read, show the plain total count.
                     if self.mentions_unread > 0 {
                         let label = if self.mentions_unread > 99 {
                             "99+".to_owned()
@@ -275,7 +279,11 @@ impl<'a> ChannelList<'a> {
                             egui::Align2::RIGHT_CENTER,
                             format!("{}", self.mentions_total),
                             t::tabs_font(),
-                            t::text_muted(),
+                            if is_active || resp.hovered() {
+                                t::text_primary()
+                            } else {
+                                t::text_secondary()
+                            },
                         );
                     }
 
@@ -646,7 +654,7 @@ impl<'a> ChannelList<'a> {
                                                     );
                                                 });
                                         } else if unread_count > 0 {
-                                            // Plain unreads badge - muted
+                                            // Plain unread count.
                                             let label = if unread_count > 99 {
                                                 "99+".to_owned()
                                             } else {
@@ -655,7 +663,11 @@ impl<'a> ChannelList<'a> {
                                             ui.label(
                                                 RichText::new(label)
                                                     .font(t::small())
-                                                    .color(t::text_secondary()),
+                                                    .color(if is_active || is_hovered {
+                                                        t::text_primary()
+                                                    } else {
+                                                        t::text_secondary()
+                                                    }),
                                             );
                                         }
                                     },

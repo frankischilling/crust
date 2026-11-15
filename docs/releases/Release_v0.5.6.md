@@ -49,6 +49,8 @@ to load Mentions history and normal-size emote images.
 - Pausing animations also covers picker and completion images, whispers, and
   hover previews, including image URLs without a file extension.
 - Plugin emote catalogs and message spans include a `zero_width` flag.
+- Observed Kick emote definitions have a per-channel retention limit. Fetched
+  catalogs stay intact, and native message spans retain their own identities.
 
 ## Controls
 
@@ -65,6 +67,11 @@ to load Mentions history and normal-size emote images.
   internal channel names or a stream-status request.
 - Live and Mentions have named accessibility controls with an active state.
   Each Live row also exposes an action to open its channel.
+- Closing Settings with Windows accessibility active no longer crashes the app.
+  Channel changes wait for the composer to appear before giving it focus.
+- Plain username colors adapt to dark and light themes without changing the
+  stored color. Sidebar counts and Live metadata stay readable on selected and
+  hovered rows. Light-theme headings remain visible across views and dialogs.
 - Plugin action calls report whether they were queued. Full queues return a
   reason without blocking or panicking inside an asynchronous callback, and
   plugins can retain their inputs for an explicit retry.
@@ -73,6 +80,8 @@ to load Mentions history and normal-size emote images.
   no longer add system sounds that bypass the configured volume and mute settings.
 - Slow-update diagnostics identify the event being handled without recording
   message contents.
+- Link-preview metadata and active requests have separate limits. Evicted
+  previews can load again, and HTML reads stop at 64 KiB.
 
 The [audit and measurements](../AUDIT_CHAT_RELIABILITY.md) describe the test
 workloads and verification. The earlier investigation into occasional long UI

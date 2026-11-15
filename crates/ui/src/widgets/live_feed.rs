@@ -371,6 +371,11 @@ impl<'a> LiveFeed<'a> {
             egui::Align::LEFT,
         );
         let login_top = text_top + m.body_height + m.line_gap;
+        let metadata_color = if resp.hovered() {
+            t::text_primary()
+        } else {
+            t::text_secondary()
+        };
         row_label(
             ui,
             egui::Rect::from_min_size(
@@ -379,7 +384,7 @@ impl<'a> LiveFeed<'a> {
             ),
             RichText::new(&snap.user_login)
                 .font(fonts.small.clone())
-                .color(t::text_muted()),
+                .color(metadata_color),
             egui::Align::LEFT,
         );
 
@@ -399,7 +404,7 @@ impl<'a> LiveFeed<'a> {
                 ),
                 RichText::new(metadata)
                     .font(fonts.small.clone())
-                    .color(t::text_secondary()),
+                    .color(metadata_color),
                 egui::Align::LEFT,
             );
         } else {
@@ -425,7 +430,7 @@ impl<'a> LiveFeed<'a> {
                     ),
                     RichText::new(uptime)
                         .font(fonts.small.clone())
-                        .color(t::text_muted()),
+                        .color(metadata_color),
                     egui::Align::RIGHT,
                 );
             }

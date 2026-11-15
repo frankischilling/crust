@@ -31,7 +31,7 @@ use crate::widgets::{
     analytics::AnalyticsPanel,
     bytes_uri,
     channel_list::ChannelList,
-    chat_input::{insert_picker_emote, invalidate_emote_completions, ChatInput},
+    chat_input::{insert_picker_emote, invalidate_emote_completions, request_composer_focus, ChatInput},
     chrome::{self, ChromeIcon, IconButtonState},
     crash_viewer::{CrashReportMeta, CrashViewer},
     emote_picker::EmotePicker,
@@ -102,72 +102,42 @@ const ANALYTICS_COMPACT_DEFAULT_W: f32 = 176.0;
 const ANALYTICS_COMPACT_MIN_W: f32 = 140.0;
 const ANALYTICS_COMPACT_MAX_W: f32 = 360.0;
 const LOCAL_HISTORY_SEARCH_PAGE: usize = 800;
-
-/// AccessKit requires the focused node to be present in every tree update.
-/// A channel switch can remove the focused navigation button in the same
-/// frame that a new editor is being mounted. Keep that frame's focus valid
-/// before egui builds the accessibility tree at the end of the pass.
-fn guard_accessibility_focus(ctx: &Context) {
-    if let Some(focused) = ctx.memory(|memory| memory.focused()) {
-        // A navigation action may request focus on a composer being mounted
-        // next frame. Preserve keyboard focus and ensure the matching
-        // accessibility node exists, even during that brief transition.
-        ctx.accesskit_node_builder(focused, |_| {});
-    }
-}
+const MAX_LINK_PREVIEWS: usize = 512;
 
 #[cfg(test)]
 mod accessibility_focus_tests {
-    use super::*;
+    struct Changes;
 
-    #[test]
-    fn removed_live_navigation_focus_cannot_reference_a_missing_accessibility_node() {
-        let ctx = Context::default();
-        ctx.enable_accesskit();
-        ctx.on_end_pass(
-            "test_accessibility_focus_guard",
-            Arc::new(guard_accessibility_focus),
-        );
+    impl accesskit_consumer::TreeChangeHandler for Changes {
+        fn node_added(&mut self, _: &accesskit_consumer::Node<'_>) {}
+        fn node_updated(
+            &mut self,
+            _: &accesskit_consumer::Node<'_>,
+            _: &accesskit_consumer::Node<'_>,
+        ) {}
+        fn focus_moved(
+            &mut self,
+            _: Option<&accesskit_consumer::Node<'_>>,
+            _: Option<&accesskit_consumer::Node<'_>>,
+        ) {}
+        fn node_removed(&mut self, _: &accesskit_consumer::Node<'_>) {}
+    }
 
-        let mut live_button = None;
-        let input = || egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(640.0, 480.0),
-            )),
-            ..Default::default()
-        };
-        let _ = ctx.run(input(), |ctx| {
-            CentralPanel::default().show(ctx, |ui| {
-                live_button = Some(ui.button("Open live channel").id);
-            });
-        });
+    #[derive(Default)]
+    pub(super) struct AccessibilityTree(Option<accesskit_consumer::Tree>);
 
-        // The clicked live row disappears when a channel opens. For one pass,
-        // egui can still expose its last response as a valid focus candidate.
-        let old_button = live_button.unwrap();
-        let switched = ctx.run(input(), |ctx| {
-            ctx.memory_mut(|memory| memory.request_focus(old_button));
-            CentralPanel::default().show(ctx, |ui| {
-                ui.label("Channel chat");
-            });
-        });
-        let update = switched.platform_output.accesskit_update.unwrap();
-        assert!(
-            update.nodes.iter().any(|(id, _)| *id == update.focus),
-            "focused navigation node must be included in the accessibility tree",
-        );
-
-        // A newly requested focus ID must not break accessibility updates,
-        // even when its editor is about to be mounted.
-        let missing = ctx.run(input(), |ctx| {
-            ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("missing_editor")));
-            CentralPanel::default().show(ctx, |ui| {
-                ui.label("Channel chat");
-            });
-        });
-        let update = missing.platform_output.accesskit_update.unwrap();
-        assert!(update.nodes.iter().any(|(id, _)| *id == update.focus));
+    impl AccessibilityTree {
+        pub(super) fn consume(&mut self, output: &egui::FullOutput) {
+            let update = output.platform_output.accesskit_update.clone()
+                .expect("accessibility is enabled for every test frame");
+            if let Some(tree) = self.0.as_mut() {
+                // The native adapter processes changes after updating the tree.
+                // Tree::update alone misses invalid updated/removed descendants.
+                tree.update_and_process_changes(update, &mut Changes);
+            } else {
+                self.0 = Some(accesskit_consumer::Tree::new(update, true));
+            }
+        }
     }
 }
 
@@ -1314,6 +1284,7 @@ pub struct CrustApp {
     user_profile_popup: UserProfilePopup,
     /// Cached link previews (Open-Graph metadata) keyed by URL.
     link_previews: HashMap<String, LinkPreview>,
+    link_preview_order: VecDeque<String>,
     /// Chat message history for Up/Down arrow recall.
     message_history: Vec<String>,
     /// Slash command usage frequency for autocomplete ranking.
@@ -1686,7 +1657,14 @@ pub(crate) fn apply_theme_visuals(ctx: &egui::Context) {
 
     vis.widgets.active.weak_bg_fill = t::accent_dim();
     vis.widgets.active.bg_fill = t::accent_dim();
-    vis.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, t::text_on_accent());
+    // egui also uses the active foreground for uncolored strong text.
+    // Dark text fits both light surfaces and the light theme's pressed fill.
+    let active_text = if t::is_light() {
+        t::text_primary()
+    } else {
+        t::text_on_accent()
+    };
+    vis.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, active_text);
     vis.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, t::accent());
     vis.widgets.active.corner_radius = t::RADIUS;
 
@@ -1916,6 +1894,7 @@ impl CrustApp {
             pending_reply: None,
             user_profile_popup: UserProfilePopup::default(),
             link_previews: HashMap::new(),
+            link_preview_order: VecDeque::new(),
             message_history: Vec::new(),
             slash_usage_counts: HashMap::new(),
             sidebar_visible: true,
@@ -5805,6 +5784,16 @@ exit 1
                 thumbnail_url,
                 site_name,
             } => {
+                // Completed metadata follows insertion order. A later hover can
+                // request an evicted URL again, including an empty failed result.
+                if !self.link_previews.contains_key(&url) {
+                    if self.link_preview_order.len() >= MAX_LINK_PREVIEWS {
+                        if let Some(oldest) = self.link_preview_order.pop_front() {
+                            self.link_previews.remove(&oldest);
+                        }
+                    }
+                    self.link_preview_order.push_back(url.clone());
+                }
                 self.link_previews.insert(
                     url,
                     LinkPreview {
@@ -7546,12 +7535,8 @@ exit 1
     }
 
     fn focus_chat_composer(&self, ctx: &Context) {
-        if self.state.active_channel.as_ref().is_some_and(ChannelId::is_virtual) {
-            ctx.memory_mut(|memory| {
-                if let Some(id) = memory.focused() {
-                    memory.surrender_focus(id);
-                }
-            });
+        if self.state.active_channel.as_ref().is_none_or(ChannelId::is_virtual) {
+            request_composer_focus(ctx, None);
             return;
         }
         let pane = if self.split_panes.panes.len() > 1 {
@@ -7559,7 +7544,7 @@ exit 1
         } else {
             None
         };
-        ctx.memory_mut(|memory| memory.request_focus(chat_composer_id(pane)));
+        request_composer_focus(ctx, Some(chat_composer_id(pane)));
     }
 
     fn sync_split_focus(&mut self, ctx: &Context) {
@@ -8155,7 +8140,6 @@ impl CrustApp {
         // request repaints directly.  egui::Context is internally Arc-based
         // so cloning is cheap.
         if self.egui_ctx.is_none() {
-            ctx.on_end_pass("accessibility_focus_guard", Arc::new(guard_accessibility_focus));
             self.egui_ctx = Some(ctx.clone());
         }
 
@@ -13388,9 +13372,26 @@ fn refresh_message_emotes(
         if !matches!(message.msg_kind, MsgKind::Chat | MsgKind::Bits { .. } | MsgKind::SuspiciousUserMessage) {
             continue;
         }
+        // Kick's native tags were normalized out of raw_text. Their message
+        // identities must survive eviction from the observed-emote catalog.
+        let native_emotes: HashMap<_, _> = if message.channel.is_kick() {
+            message.spans.iter().filter_map(|span| match span {
+                Span::Emote { code, provider, .. } if provider == "kick" => Some((code.as_str(), span)),
+                _ => None,
+            }).collect()
+        } else {
+            HashMap::new()
+        };
         let spans = crust_core::format::tokenize_with_flags(&message.raw_text, message.flags.is_action,
-            &message.twitch_emotes, &|code| resolve_catalog_emote(catalog, index,
-                &message.channel, &message.sender.user_id.0, code).map(catalog_emote_data));
+            &message.twitch_emotes, &|code| {
+                native_emotes.get(code).and_then(|span| match span {
+                    Span::Emote { id, code, url, provider, url_hd, zero_width } => Some((
+                        id.clone(), code.clone(), url.clone(), provider.clone(), url_hd.clone(), *zero_width,
+                    )),
+                    _ => None,
+                }).or_else(|| resolve_catalog_emote(catalog, index,
+                    &message.channel, &message.sender.user_id.0, code).map(catalog_emote_data))
+            });
         if message.spans != spans {
             message.spans = spans;
             changed.push(message.id);
@@ -13448,6 +13449,42 @@ mod tests {
         let (sender, received) = tokio::sync::mpsc::channel(capacity);
         app.set_history_updates(sender, Default::default());
         received
+    }
+
+    #[test]
+    fn link_preview_cache_evicts_old_results_and_accepts_refetched_metadata() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        let ready = |url: String, title: Option<String>| AppEvent::LinkPreviewReady {
+            url,
+            title,
+            description: None,
+            thumbnail_url: None,
+            site_name: None,
+        };
+        for index in 0..super::MAX_LINK_PREVIEWS {
+            app.apply_event(ready(format!("https://example.test/{index}"), None), &ctx);
+        }
+        let first = "https://example.test/0";
+        let second = "https://example.test/1";
+        assert!(app.link_previews[first].fetched, "empty results remain cached");
+
+        // A duplicate completion replaces its metadata without filling another slot.
+        app.apply_event(ready(first.to_owned(), Some("updated".into())), &ctx);
+        assert_eq!(app.link_previews[first].title.as_deref(), Some("updated"));
+        assert_eq!(app.link_previews.len(), super::MAX_LINK_PREVIEWS);
+        assert_eq!(app.link_preview_order.len(), super::MAX_LINK_PREVIEWS);
+
+        app.apply_event(ready("https://example.test/new".into(), None), &ctx);
+        assert!(!app.link_previews.contains_key(first), "a cache miss permits another hover fetch");
+        assert!(app.link_previews.contains_key(second));
+        assert_eq!(app.link_previews.len(), super::MAX_LINK_PREVIEWS);
+
+        app.apply_event(ready(first.to_owned(), Some("refetched".into())), &ctx);
+        assert_eq!(app.link_previews[first].title.as_deref(), Some("refetched"));
+        assert!(!app.link_previews.contains_key(second));
+        assert_eq!(app.link_previews.len(), super::MAX_LINK_PREVIEWS);
+        assert_eq!(app.link_preview_order.len(), super::MAX_LINK_PREVIEWS);
     }
 
     #[test]
@@ -13721,6 +13758,90 @@ mod tests {
         app.refresh_emote_messages(&ctx);
         assert_eq!(emote_url(&app.state.channels[&channel].messages[0]), None);
         assert_eq!(emote_url(&app.state.mentions[0]), None);
+        app.ensure_input_emote_catalog(&channel);
+        assert!(app.input_emote_catalogs[&channel].is_empty());
+    }
+
+    fn kick_message_for_emote_refresh(channel: &ChannelId, id: u64) -> crust_core::ChatMessage {
+        let mut message = search_message(channel.clone());
+        message.id = crust_core::MessageId(id);
+        message.server_id = Some(format!("kick-native-{id}"));
+        message.raw_text = "SharedCode Addon".into();
+        message.flags.is_highlighted = true;
+        let mut native = scoped_emote(&format!("https://example.test/native-{id}"), Some(channel.clone()), None);
+        native.provider = "kick".into();
+        let mut addon = scoped_emote("https://example.test/addon", Some(channel.clone()), None);
+        addon.code = "Addon".into();
+        message.spans = crust_core::format::tokenize_with_flags(&message.raw_text, false, &[], &|code| {
+            match code {
+                "SharedCode" => Some(super::catalog_emote_data(&native)),
+                "Addon" => Some(super::catalog_emote_data(&addon)),
+                _ => None,
+            }
+        });
+        message
+    }
+
+    fn assert_kick_native_refresh(message: &crust_core::ChatMessage, native: &crust_core::Span) {
+        assert_eq!(&message.spans[0], native, "native identity changed for {:?}", message.id);
+        assert_eq!(message.raw_text, "SharedCode Addon");
+        assert!(!message.spans.iter().any(|span| matches!(span,
+            crust_core::Span::Emote { provider, .. } if provider == "7tv")));
+        assert!(message.spans.iter().any(|span| matches!(span,
+            crust_core::Span::Text { text, .. } if text.contains("Addon"))));
+    }
+
+    #[test]
+    fn kick_native_emotes_survive_queued_catalog_eviction_and_code_replacement() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        let channel = ChannelId::kick("room");
+        app.state.join_channel(channel.clone());
+        let messages: Vec<_> = (1..=2).map(|id| kick_message_for_emote_refresh(&channel, id)).collect();
+        let natives: Vec<_> = messages.iter().map(|message| message.spans[0].clone()).collect();
+        for message in messages {
+            app.state.mentions.push_back(message.clone());
+            app.state.channels.get_mut(&channel).unwrap().messages.push_back(message);
+        }
+        let mut replacement = scoped_emote("https://example.test/new-native", Some(channel.clone()), None);
+        replacement.provider = "kick".into();
+        for emotes in [vec![replacement.clone()], Vec::new()] {
+            app.apply_event(AppEvent::EmoteCatalogUpdated { emotes: emotes.clone() }, &ctx);
+            assert!(!app.pending_emote_refresh.is_empty());
+            app.refresh_emote_messages(&ctx);
+            assert!(app.pending_emote_refresh.is_empty());
+            for rows in [&app.state.channels[&channel].messages, &app.state.mentions] {
+                assert_eq!(rows.len(), natives.len());
+                for (message, native) in rows.iter().zip(&natives) {
+                    assert_kick_native_refresh(message, native);
+                }
+            }
+            app.ensure_input_emote_catalog(&channel);
+            assert_eq!(app.input_emote_catalogs[&channel], emotes);
+        }
+    }
+
+    #[test]
+    fn kick_native_emotes_survive_restored_history_and_mentions_refresh() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        let channel = ChannelId::kick("room");
+        app.state.join_channel(channel.clone());
+        app.apply_event(AppEvent::EmoteCatalogUpdated { emotes: Vec::new() }, &ctx);
+        let mut message = kick_message_for_emote_refresh(&channel, 1);
+        message.flags.is_history = true;
+        let native = message.spans[0].clone();
+        app.apply_event(AppEvent::HistoryLoaded {
+            channel: channel.clone(), messages: vec![message.clone()], local: None,
+        }, &ctx);
+        app.apply_event(AppEvent::MentionsLoaded { messages: vec![message] }, &ctx);
+        assert_eq!(app.pending_emote_refresh.len(), 2);
+        app.refresh_emote_messages(&ctx);
+        assert!(app.pending_emote_refresh.is_empty());
+        assert_eq!(app.state.channels[&channel].messages.len(), 1);
+        assert_eq!(app.state.mentions.len(), 1);
+        assert_kick_native_refresh(&app.state.channels[&channel].messages[0], &native);
+        assert_kick_native_refresh(&app.state.mentions[0], &native);
         app.ensure_input_emote_catalog(&channel);
         assert!(app.input_emote_catalogs[&channel].is_empty());
     }
@@ -14372,6 +14493,153 @@ mod tests {
             response = response_id.and_then(|id| ctx.read_response(id));
         });
         (output, response)
+    }
+
+    #[test]
+    fn settings_close_actions_preserve_a_valid_accessibility_tree() {
+        for (settings, focus_before_close) in [(true, true), (true, false), (false, true), (false, false)] {
+            let (mut app, _commands) = test_app();
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            ctx.set_pixels_per_point(1.25);
+            let mut tree = super::accessibility_focus_tests::AccessibilityTree::default();
+            app.state.join_channel(ChannelId::new("channel"));
+            app.state.auth.logged_in = true;
+            app.chat_input_buf = "kept draft".to_owned();
+            app.settings_open = settings;
+            app.whispers_visible = !settings;
+            let mut output = egui::FullOutput::default();
+            for _ in 0..3 {
+                output = production_ui_frame(&ctx, &mut app, Vec::new());
+                tree.consume(&output);
+            }
+            let close = output.platform_output.accesskit_update.as_ref().unwrap().nodes.iter()
+                .find_map(|(id, node)| (node.label() == Some("Close window")).then_some(*id))
+                .expect("the dialog exposes its close button");
+            let focus = egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::Focus,
+                target: close,
+                data: None,
+            });
+            let mut close_events = Vec::new();
+            if focus_before_close {
+                output = production_ui_frame(&ctx, &mut app, vec![focus]);
+                tree.consume(&output);
+                assert_eq!(ctx.memory(|memory| memory.focused().map(|id| id.value())), Some(close.0));
+            } else {
+                // Native accessibility can focus and activate the close control
+                // in one pass, before the window vanishes on the next pass.
+                close_events.push(focus);
+            }
+            close_events.push(egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::Click,
+                target: close,
+                data: None,
+            }));
+            output = production_ui_frame(&ctx, &mut app, close_events);
+            tree.consume(&output);
+            assert!(!app.settings_open);
+            assert!(!app.whispers_visible);
+            // Include the disappearance and later settled passes. Checking only
+            // the activation pass leaves the old window subtree in the tree.
+            for _ in 0..4 {
+                output = production_ui_frame(&ctx, &mut app, Vec::new());
+                tree.consume(&output);
+            }
+            assert_ne!(ctx.memory(|memory| memory.focused().map(|id| id.value())), Some(close.0));
+            assert_eq!(app.chat_input_buf, "kept draft");
+        }
+    }
+
+    #[test]
+    fn composer_focus_waits_until_the_editor_is_rendered() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut tree = super::accessibility_focus_tests::AccessibilityTree::default();
+        let channel = ChannelId::new("channel");
+        app.state.join_channel(channel.clone());
+        app.state.auth.logged_in = true;
+        app.state.active_channel = Some(ChannelId::live_feed());
+        app.state.live_feed_loaded = true;
+        tree.consume(&production_ui_frame(&ctx, &mut app, Vec::new()));
+        let switched = ctx.run(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 800.0))),
+            time: Some(ctx.cumulative_pass_nr() as f64 * 0.1),
+            ..Default::default()
+        }, |ctx| {
+            app.update_ui(ctx);
+            // A Live row can change the active channel after that pass has
+            // already rendered the feed instead of the channel composer.
+            app.activate_channel(channel.clone());
+        });
+        tree.consume(&switched);
+        let composer = super::chat_composer_id(None);
+        assert!(!ctx.memory(|memory| memory.has_focus(composer)));
+        assert!(!switched.platform_output.accesskit_update.as_ref().unwrap().nodes.iter()
+            .any(|(id, _)| id.0 == composer.value()), "an unrendered editor must not synthesize a node");
+        let mounted = production_ui_frame(&ctx, &mut app,
+            vec![egui::Event::Text("kept focus".to_owned())]);
+        tree.consume(&mounted);
+        assert_eq!(app.chat_input_buf, "kept focus");
+        assert!(ctx.memory(|memory| memory.has_focus(composer)));
+    }
+
+    #[test]
+    fn canceled_or_expired_composer_requests_cannot_steal_focus() {
+        for cancel in [true, false] {
+            let (mut app, _commands) = test_app();
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut tree = super::accessibility_focus_tests::AccessibilityTree::default();
+            let channel = ChannelId::new("channel");
+            app.state.join_channel(channel.clone());
+            app.state.auth.logged_in = true;
+            app.focus_chat_composer(&ctx);
+            app.state.active_channel = Some(ChannelId::live_feed());
+            app.state.live_feed_loaded = true;
+            if cancel {
+                app.focus_chat_composer(&ctx);
+            }
+            for _ in 0..4 {
+                tree.consume(&production_ui_frame(&ctx, &mut app, Vec::new()));
+            }
+            app.state.active_channel = Some(channel);
+            tree.consume(&production_ui_frame(&ctx, &mut app,
+                vec![egui::Event::Text("unwanted input".to_owned())]));
+            assert!(app.chat_input_buf.is_empty());
+            assert!(!ctx.memory(|memory| memory.has_focus(super::chat_composer_id(None))));
+            app.focus_chat_composer(&ctx);
+            tree.consume(&production_ui_frame(&ctx, &mut app,
+                vec![egui::Event::Text("accepted input".to_owned())]));
+            assert_eq!(app.chat_input_buf, "accepted input");
+            assert!(ctx.memory(|memory| memory.has_focus(super::chat_composer_id(None))));
+        }
+    }
+
+    #[test]
+    fn picker_tab_then_escape_keeps_the_accessibility_tree_valid() {
+        for modifiers in [egui::Modifiers::CTRL, egui::Modifiers::CTRL | egui::Modifiers::SHIFT] {
+            let (mut app, _commands) = test_app();
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut tree = super::accessibility_focus_tests::AccessibilityTree::default();
+            app.state.join_channel(ChannelId::new("channel"));
+            app.state.auth.logged_in = true;
+            app.chat_input_buf = "kept draft".to_owned();
+            app.emote_picker.toggle();
+            for _ in 0..3 {
+                tree.consume(&production_ui_frame(&ctx, &mut app, Vec::new()));
+            }
+            tree.consume(&production_ui_frame(&ctx, &mut app,
+                shortcut_input(egui::Key::Tab, modifiers).events));
+            tree.consume(&production_ui_frame(&ctx, &mut app,
+                shortcut_input(egui::Key::Escape, egui::Modifiers::NONE).events));
+            assert!(!app.emote_picker.open);
+            tree.consume(&production_ui_frame(&ctx, &mut app,
+                vec![egui::Event::Text(" continued".to_owned())]));
+            assert_eq!(app.chat_input_buf, "kept draft continued");
+        }
     }
 
     #[test]
@@ -15543,22 +15811,22 @@ mod tests {
         let (mut app, _commands) = test_app();
         let first = ChannelId::new("first");
         let second = ChannelId::new("second");
+        app.state.join_channel(first.clone());
+        app.state.join_channel(second.clone());
+        app.state.auth.logged_in = true;
         app.split_panes.add_pane(first, None);
         app.split_panes.add_pane(second.clone(), None);
         let ctx = egui::Context::default();
-        let mut input = shortcut_input(egui::Key::PageDown, egui::Modifiers::CTRL | egui::Modifiers::ALT);
-        input.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 200.0)));
-        input.events.push(egui::Event::Text("selected pane".to_owned()));
-        let _ = ctx.run(input, |ctx| {
-            ctx.memory_mut(|memory| memory.request_focus(super::chat_composer_id(Some(app.split_panes.panes[0].id))));
-            app.handle_channel_shortcuts(ctx);
-            egui::CentralPanel::default().show(ctx, |ui| {
-                for pane in &mut app.split_panes.panes {
-                    ui.add(egui::TextEdit::singleline(&mut pane.input_buf)
-                        .id(super::chat_composer_id(Some(pane.id))));
-                }
-            });
-        });
+        ctx.enable_accesskit();
+        let mut tree = super::accessibility_focus_tests::AccessibilityTree::default();
+        app.sync_split_focus(&ctx);
+        for _ in 0..3 {
+            tree.consume(&production_ui_frame(&ctx, &mut app, Vec::new()));
+        }
+        let mut events = shortcut_input(egui::Key::PageDown,
+            egui::Modifiers::CTRL | egui::Modifiers::ALT).events;
+        events.push(egui::Event::Text("selected pane".to_owned()));
+        tree.consume(&production_ui_frame(&ctx, &mut app, events));
         assert_eq!(app.state.active_channel, Some(second));
         assert!(app.split_panes.panes[0].input_buf.is_empty());
         assert_eq!(app.split_panes.panes[1].input_buf, "selected pane");
@@ -15635,38 +15903,38 @@ mod tests {
         ] {
             let (mut app, _commands) = test_app();
             let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut tree = super::accessibility_focus_tests::AccessibilityTree::default();
+            app.state.auth.logged_in = true;
             for name in ["first", "second", "third"].into_iter().take(pane_count) {
+                app.state.join_channel(ChannelId::new(name));
                 app.split_panes.add_pane(ChannelId::new(name), None);
                 app.split_panes.panes.last_mut().unwrap().input_buf = format!("{name} draft");
             }
             app.split_panes.focused = focused;
-            let render = |app: &mut super::CrustApp, ctx: &egui::Context| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    if app.split_panes.panes.is_empty() {
-                        ui.add(egui::TextEdit::singleline(&mut app.chat_input_buf)
-                            .id(super::chat_composer_id(None)));
-                    } else {
-                        for pane in &mut app.split_panes.panes {
-                            ui.add(egui::TextEdit::singleline(&mut pane.input_buf)
-                                .id(super::chat_composer_id(Some(pane.id))));
-                        }
+            app.sync_split_focus(&ctx);
+            for _ in 0..3 {
+                tree.consume(&production_ui_frame(&ctx, &mut app, Vec::new()));
+            }
+            let mut applied = false;
+            let closed = ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 800.0))),
+                time: Some(ctx.cumulative_pass_nr() as f64 * 0.1),
+                ..Default::default()
+            }, |ctx| {
+                app.update_ui(ctx);
+                if !applied {
+                    applied = true;
+                    if let Some(index) = keep {
+                        app.keep_split_pane(index, ctx);
+                    } else if let Some(index) = close {
+                        app.close_split_pane(index, ctx);
                     }
-                });
-            };
-            let _ = ctx.run(Default::default(), |ctx| {
-                app.sync_split_focus(ctx);
-                render(&mut app, ctx);
-                if let Some(index) = keep {
-                    app.keep_split_pane(index, ctx);
-                } else if let Some(index) = close {
-                    app.close_split_pane(index, ctx);
                 }
             });
-            let input = egui::RawInput {
-                events: vec![egui::Event::Text(" continued".to_owned())],
-                ..Default::default()
-            };
-            let _ = ctx.run(input, |ctx| render(&mut app, ctx));
+            tree.consume(&closed);
+            tree.consume(&production_ui_frame(&ctx, &mut app,
+                vec![egui::Event::Text(" continued".to_owned())]));
             assert_eq!(app.state.active_channel, Some(ChannelId::new(expected)));
             assert_eq!(app.split_panes.panes.len(), remaining);
             if remaining == 0 {
@@ -15826,6 +16094,9 @@ mod tests {
         for focused in 0..3 {
             let (mut app, mut commands) = test_app();
             let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut tree = super::accessibility_focus_tests::AccessibilityTree::default();
+            app.state.auth.logged_in = true;
             let old = ChannelId::new("old");
             let redirected = ChannelId::new("redirected");
             let other = ChannelId::new("other");
@@ -15839,31 +16110,30 @@ mod tests {
             }, &ctx);
             assert_eq!(app.split_panes.panes.iter().filter(|pane| pane.channel == redirected).count(), 2);
             app.split_panes.focused = focused;
-            let _ = ctx.run(Default::default(), |ctx| {
-                app.sync_split_focus(ctx);
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    for pane in &mut app.split_panes.panes {
-                        ui.add(egui::TextEdit::singleline(&mut pane.input_buf)
-                            .id(super::chat_composer_id(Some(pane.id))));
-                    }
-                });
-                app.close_channel_tab(redirected.clone(), ctx);
+            app.sync_split_focus(&ctx);
+            for _ in 0..3 {
+                tree.consume(&production_ui_frame(&ctx, &mut app, Vec::new()));
+            }
+            let mut applied = false;
+            let closed = ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 800.0))),
+                time: Some(ctx.cumulative_pass_nr() as f64 * 0.1),
+                ..Default::default()
+            }, |ctx| {
+                app.update_ui(ctx);
+                if !applied {
+                    applied = true;
+                    app.close_channel_tab(redirected.clone(), ctx);
+                }
             });
+            tree.consume(&closed);
             assert!(app.split_panes.panes.is_empty());
             assert_eq!(app.state.active_channel, Some(other.clone()));
             assert!(!app.state.channels.contains_key(&redirected));
             assert!(app.state.channels.contains_key(&other));
             assert_eq!(app.chat_input_buf, "other draft");
-            let input = egui::RawInput {
-                events: vec![egui::Event::Text(" continued".to_owned())],
-                ..Default::default()
-            };
-            let _ = ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.add(egui::TextEdit::singleline(&mut app.chat_input_buf)
-                        .id(super::chat_composer_id(None)));
-                });
-            });
+            tree.consume(&production_ui_frame(&ctx, &mut app,
+                vec![egui::Event::Text(" continued".to_owned())]));
             assert_eq!(app.chat_input_buf, "other draft continued");
             assert!(ctx.memory(|memory| memory.has_focus(super::chat_composer_id(None))));
             let mut leave_count = 0;

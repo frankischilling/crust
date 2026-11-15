@@ -18,6 +18,77 @@ const USERNAME_AUTOCOMPLETE_MAX: usize = 10;
 const TAB_COMPLETE_MAX: usize = 50;
 const TWITCH_MAX_CHARS: usize = 500;
 
+#[derive(Clone, Default)]
+struct ComposerFocus {
+    requested: Option<(Id, u64)>,
+    rendered_pass: u64,
+    rendered: Vec<Id>,
+}
+
+impl ComposerFocus {
+    fn begin_pass(&mut self, pass: u64) {
+        if self.rendered_pass != pass {
+            self.rendered_pass = pass;
+            self.rendered.clear();
+        }
+        // Allow a sizing pass before the requested editor mounts, but do not
+        // let a canceled pane steal focus if it is recreated much later.
+        if self
+            .requested
+            .is_some_and(|(_, requested)| pass.saturating_sub(requested) > 2)
+        {
+            self.requested = None;
+        }
+    }
+}
+
+/// Focus a rendered composer now, or hand the request to its next render.
+pub(crate) fn request_composer_focus(ctx: &egui::Context, target: Option<Id>) {
+    let pass = ctx.cumulative_pass_nr();
+    let focus_now = ctx.data_mut(|data| {
+        let state = data.get_temp_mut_or_default::<ComposerFocus>(Id::new("composer_focus"));
+        state.begin_pass(pass);
+        state.requested = target.map(|id| (id, pass));
+        let ready = target.filter(|id| state.rendered.contains(id));
+        if ready.is_some() {
+            state.requested = None;
+        }
+        ready
+    });
+    if let Some(id) = focus_now {
+        ctx.memory_mut(|memory| memory.request_focus(id));
+    } else {
+        // An earlier composer must not consume input intended for an editor
+        // that will receive focus later in this pass.
+        ctx.memory_mut(|memory| {
+            if let Some(id) = memory.focused() {
+                memory.surrender_focus(id);
+            }
+        });
+    }
+    ctx.request_repaint();
+}
+
+fn prepare_composer_focus(ctx: &egui::Context, id: Id) {
+    let pass = ctx.cumulative_pass_nr();
+    let requested = ctx.data_mut(|data| {
+        let state = data.get_temp_mut_or_default::<ComposerFocus>(Id::new("composer_focus"));
+        state.begin_pass(pass);
+        if !state.rendered.contains(&id) {
+            state.rendered.push(id);
+        }
+        if state.requested.is_some_and(|(target, _)| target == id) {
+            state.requested = None;
+            true
+        } else {
+            false
+        }
+    });
+    if requested {
+        ctx.memory_mut(|memory| memory.request_focus(id));
+    }
+}
+
 struct ComposerLayout {
     picker_width: f32,
     send_width: f32,
@@ -329,6 +400,7 @@ impl<'a> ChatInput<'a> {
         };
 
         let text_edit_id = self.id.unwrap_or_else(|| ui.id().with("chat_input"));
+        prepare_composer_focus(ui.ctx(), text_edit_id);
         let scope_id = text_edit_id.with("completion_channel");
         let channel_scope = Id::new(self.channel);
         let channel_changed = ui.data_mut(|data| {
@@ -2084,7 +2156,7 @@ pub fn insert_picker_emote(ctx: &egui::Context, id: Id, buf: &mut String, code: 
         data.insert_temp(id.with("tab_complete_state"), TabState::default());
         data.insert_temp(id.with("msg_history_state"), HistState::default());
     });
-    ctx.memory_mut(|memory| memory.request_focus(id));
+    request_composer_focus(ctx, Some(id));
 }
 
 /// The word containing the caret; all offsets are valid UTF-8 byte boundaries.
@@ -3176,6 +3248,13 @@ mod tests {
             state.cursor.char_range().unwrap().primary.index,
             "hé Kappa ".chars().count()
         );
+        completion_frame(
+            &ctx,
+            &mut buf,
+            vec![egui::Event::Text("more ".to_owned())],
+            None,
+        );
+        assert_eq!(buf, "hé Kappa more tail🙂");
         assert!(ctx.memory(|memory| memory.has_focus(id)));
     }
 
