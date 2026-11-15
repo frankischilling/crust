@@ -225,30 +225,34 @@ fn paint_icon(ui: &Ui, rect: egui::Rect, icon: ChromeIcon, state: IconButtonStat
             }
         }
         ChromeIcon::Whisper => {
-            let bubble = egui::Rect::from_min_max(
-                egui::pos2(rect.left() + 1.5, rect.top() + 2.0),
-                egui::pos2(rect.right() - 1.5, rect.bottom() - 4.0),
-            );
+            // An envelope distinguishes private messages from public chat.
+            let envelope = rect.shrink2(egui::vec2(0.5, 2.5));
             painter.rect_stroke(
-                bubble,
-                CornerRadius::same(3),
+                envelope,
+                CornerRadius::same(2),
                 stroke,
-                egui::StrokeKind::Outside,
+                egui::StrokeKind::Inside,
             );
-            let tail_top = egui::pos2(bubble.left() + 5.0, bubble.bottom());
-            painter.line_segment([tail_top, tail_top + egui::vec2(-2.5, 3.0)], stroke);
+            let fold = egui::pos2(envelope.center().x, envelope.top() + envelope.height() * 0.56);
+            painter.line_segment(
+                [envelope.left_top() + egui::vec2(0.7, 0.8), fold],
+                stroke,
+            );
+            painter.line_segment(
+                [fold, envelope.right_top() + egui::vec2(-0.7, 0.8)],
+                stroke,
+            );
             painter.line_segment(
                 [
-                    tail_top + egui::vec2(-2.5, 3.0),
-                    tail_top + egui::vec2(1.5, 2.0),
+                    envelope.left_bottom() + egui::vec2(0.7, -0.8),
+                    egui::pos2(envelope.left() + envelope.width() * 0.34, envelope.center().y),
                 ],
                 stroke,
             );
-            let y = bubble.center().y;
             painter.line_segment(
                 [
-                    egui::pos2(bubble.left() + 3.0, y),
-                    egui::pos2(bubble.right() - 3.0, y),
+                    egui::pos2(envelope.right() - envelope.width() * 0.34, envelope.center().y),
+                    envelope.right_bottom() + egui::vec2(-0.7, -0.8),
                 ],
                 stroke,
             );

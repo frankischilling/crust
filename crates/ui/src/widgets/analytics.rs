@@ -9,8 +9,6 @@ use crust_core::model::{ChannelId, ChannelState, MsgKind, Span};
 
 use crate::theme as t;
 
-use super::chrome;
-
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const ACTIVITY_BUCKETS: usize = 30;
 
@@ -372,12 +370,14 @@ impl AnalyticsPanel {
     pub fn show(&mut self, ui: &mut Ui, channel: &ChannelState) {
         self.tick(channel);
 
-        // Header
+        // Keep actions beside the title; the description gets its own row
+        // so it cannot push the resize handle off screen.
         ui.horizontal(|ui| {
-            chrome::dialog_header(
-                ui,
-                "Analytics",
-                Some("Recent message, chatter, and activity stats."),
+            ui.label(
+                RichText::new("Analytics")
+                    .font(t::body())
+                    .strong()
+                    .color(t::text_primary()),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
@@ -405,6 +405,14 @@ impl AnalyticsPanel {
                 }
             });
         });
+        ui.add(
+            egui::Label::new(
+                RichText::new("Recent message, chatter, and activity stats.")
+                    .font(t::small())
+                    .color(t::text_helper()),
+            )
+            .wrap(),
+        );
 
         // Toast
         if let Some((msg, at)) = &self.toast {
@@ -427,34 +435,50 @@ impl AnalyticsPanel {
         ui.add_space(4.0);
 
         // Time window selector
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 3.0;
-            for w in [
-                TimeWindow::Last5Min,
-                TimeWindow::Last15Min,
-                TimeWindow::Last30Min,
-                TimeWindow::All,
-            ] {
-                let selected = self.time_window == w;
-                let btn = egui::Button::new(RichText::new(w.label()).font(t::small()))
-                    .fill(if selected {
-                        t::accent_dim()
-                    } else {
-                        t::bg_raised()
-                    })
-                    .stroke(egui::Stroke::new(
-                        1.0_f32,
-                        if selected {
-                            t::accent()
+        if ui.available_width() < 230.0 {
+            egui::ComboBox::from_id_salt("analytics_window")
+                .selected_text(self.time_window.label())
+                .width(ui.available_width().max(0.0))
+                .show_ui(ui, |ui| {
+                    for window in [
+                        TimeWindow::Last5Min,
+                        TimeWindow::Last15Min,
+                        TimeWindow::Last30Min,
+                        TimeWindow::All,
+                    ] {
+                        ui.selectable_value(&mut self.time_window, window, window.label());
+                    }
+                });
+        } else {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                for w in [
+                    TimeWindow::Last5Min,
+                    TimeWindow::Last15Min,
+                    TimeWindow::Last30Min,
+                    TimeWindow::All,
+                ] {
+                    let selected = self.time_window == w;
+                    let btn = egui::Button::new(RichText::new(w.label()).font(t::small()))
+                        .fill(if selected {
+                            t::accent_dim()
                         } else {
-                            t::border_subtle()
-                        },
-                    ));
-                if ui.add(btn).clicked() {
-                    self.time_window = w;
+                            t::bg_raised()
+                        })
+                        .stroke(egui::Stroke::new(
+                            1.0_f32,
+                            if selected {
+                                t::accent()
+                            } else {
+                                t::border_subtle()
+                            },
+                        ));
+                    if ui.add(btn).clicked() {
+                        self.time_window = w;
+                    }
                 }
-            }
-        });
+            });
+        }
 
         self.tick(channel);
 
@@ -470,29 +494,40 @@ impl AnalyticsPanel {
         ui.add_space(4.0);
 
         // Tab bar
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            for tab in [Tab::Overview, Tab::Chatters, Tab::Emotes, Tab::Activity] {
-                let selected = self.active_tab == tab;
-                let btn = egui::Button::new(RichText::new(tab.label()).font(t::small()))
-                    .fill(if selected {
-                        t::bg_raised()
-                    } else {
-                        egui::Color32::TRANSPARENT
-                    })
-                    .stroke(egui::Stroke::new(
-                        1.0_f32,
-                        if selected {
-                            t::border_accent()
+        if ui.available_width() < 300.0 {
+            egui::ComboBox::from_id_salt("analytics_tab")
+                .selected_text(self.active_tab.label())
+                .width(ui.available_width().max(0.0))
+                .show_ui(ui, |ui| {
+                    for tab in [Tab::Overview, Tab::Chatters, Tab::Emotes, Tab::Activity] {
+                        ui.selectable_value(&mut self.active_tab, tab, tab.label());
+                    }
+                });
+        } else {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                for tab in [Tab::Overview, Tab::Chatters, Tab::Emotes, Tab::Activity] {
+                    let selected = self.active_tab == tab;
+                    let btn = egui::Button::new(RichText::new(tab.label()).font(t::small()))
+                        .fill(if selected {
+                            t::bg_raised()
                         } else {
-                            t::border_subtle()
-                        },
-                    ));
-                if ui.add(btn).clicked() {
-                    self.active_tab = tab;
+                            egui::Color32::TRANSPARENT
+                        })
+                        .stroke(egui::Stroke::new(
+                            1.0_f32,
+                            if selected {
+                                t::border_accent()
+                            } else {
+                                t::border_subtle()
+                            },
+                        ));
+                    if ui.add(btn).clicked() {
+                        self.active_tab = tab;
+                    }
                 }
-            }
-        });
+            });
+        }
         ui.add_space(4.0);
         ui.add(egui::Separator::default().spacing(0.0));
         ui.add_space(4.0);
@@ -694,10 +729,10 @@ fn show_activity(ui: &mut Ui, stats: &ChannelStats) {
     }
     let max_bucket = *stats.activity_buckets.iter().max().unwrap_or(&1).max(&1);
     let graph_h = 90.0f32;
-    let avail_w = ui.available_width();
-    let gap = 2.0f32;
+    let avail_w = ui.available_width().max(0.0);
+    let gap = (avail_w / 120.0).min(2.0);
     let bar_w =
-        ((avail_w - gap * (ACTIVITY_BUCKETS as f32 - 1.0)) / ACTIVITY_BUCKETS as f32).max(2.0);
+        ((avail_w - gap * (ACTIVITY_BUCKETS as f32 - 1.0)) / ACTIVITY_BUCKETS as f32).max(0.0);
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(avail_w, graph_h + 14.0), egui::Sense::hover());
     let painter = ui.painter_at(rect);
@@ -763,18 +798,24 @@ fn section_header(ui: &mut Ui, label: &str) {
 
 fn stat_row(ui: &mut Ui, label: &str, value: &str) {
     ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(label)
-                .font(t::small())
-                .color(t::text_secondary()),
-        );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(
-                RichText::new(value)
-                    .font(t::small())
-                    .color(t::text_primary()),
-            );
-        });
+        let width = ui.available_width().max(0.0);
+        let gap = ui.spacing().item_spacing.x;
+        let label_width = (width - gap).max(0.0) * 0.52;
+        let value_width = (width - gap - label_width).max(0.0);
+        let height = ui.fonts(|fonts| fonts.row_height(&t::small()));
+        ui.add_sized(
+            [label_width, height],
+            egui::Label::new(RichText::new(label).font(t::small()).color(t::text_secondary()))
+                .truncate(),
+        )
+        .on_hover_text(label);
+        ui.add_sized(
+            [value_width, height],
+            egui::Label::new(RichText::new(value).font(t::small()).color(t::text_primary()))
+                .halign(egui::Align::RIGHT)
+                .truncate(),
+        )
+        .on_hover_text(value);
     });
 }
 
@@ -981,6 +1022,48 @@ mod tests {
         }
         assert!(panel.wipe_times.contains_key(&channel.id));
         assert_eq!(panel.cached.as_ref().unwrap().total_msgs, 0);
+    }
+
+    #[test]
+    fn analytics_content_fits_at_both_resize_limits_and_each_tab() {
+        let channel = channel_with_messages(
+            ChannelId::new("test"),
+            3,
+            "extremely_long_chatter_name_that_used_to_push_the_panel",
+        );
+        for width in [140.0, 176.0, 260.0, 340.0, 480.0] {
+            for tab in [Tab::Overview, Tab::Chatters, Tab::Emotes, Tab::Activity] {
+                let ctx = egui::Context::default();
+                let mut panel = AnalyticsPanel::default();
+                panel.active_tab = tab;
+                let mut bounds = None;
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(920.0, 640.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::SidePanel::right("analytics_layout_test")
+                            .resizable(false)
+                            .exact_width(width)
+                            .show(ctx, |ui| {
+                                panel.show(ui, &channel);
+                                bounds = Some((ui.min_rect(), ui.max_rect()));
+                            });
+                        egui::CentralPanel::default().show(ctx, |_| {});
+                    },
+                );
+                let (used, available) = bounds.unwrap();
+                assert!(
+                    used.right() <= available.right() + 1.0,
+                    "tab {tab:?} at width {width} extends to {}, panel ends at {}",
+                    used.right(), available.right(),
+                );
+            }
+        }
     }
 
     #[test]
