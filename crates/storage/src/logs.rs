@@ -36,6 +36,7 @@ const MODERATION_MATCH: &str = "
         OR (?2 != 'message' AND (?6 IS NULL OR ts_ms <= ?6)
             AND (COALESCE(json_extract(payload_json, '$.msg_kind'), 'Chat') IN ('Chat', 'SuspiciousUserMessage')
                  OR json_type(payload_json, '$.msg_kind.Bits') = 'object'
+                 OR json_type(payload_json, '$.msg_kind.Announcement') = 'object'
                  OR COALESCE(json_extract(payload_json, '$.msg_kind.Sub.sub_msg'), '') != '')
             AND (?2 = 'channel' OR
                 CASE WHEN ?5 IS NOT NULL AND COALESCE(json_extract(payload_json, '$.sender.user_id'), '') != ''
@@ -55,6 +56,7 @@ fn moderation_insert_predicate(row: &str) -> String {
                     AND rule.target_key = {row}.server_id)
             OR ((COALESCE(json_extract({row}.payload_json, '$.msg_kind'), 'Chat') IN ('Chat', 'SuspiciousUserMessage')
                  OR json_type({row}.payload_json, '$.msg_kind.Bits') = 'object'
+                 OR json_type({row}.payload_json, '$.msg_kind.Announcement') = 'object'
                  OR COALESCE(json_extract({row}.payload_json, '$.msg_kind.Sub.sub_msg'), '') != '') AND (
                 EXISTS(SELECT 1 FROM chat_moderation AS rule
                     WHERE rule.channel = {row}.channel AND rule.target = 'channel'
@@ -1109,6 +1111,34 @@ mod tests {
                 .flags
                 .is_deleted
         );
+    }
+
+    #[test]
+    fn announcement_moderation_matches_retained_and_late_history() {
+        let channel = ChannelId::new("room");
+        for action in [
+            ModerationAction::user(channel.clone(), "alice".into(), Some("1".into()),
+                Some(Utc.timestamp_millis_opt(1000).unwrap())),
+            ModerationAction::channel(channel.clone(), Some(Utc.timestamp_millis_opt(1000).unwrap())),
+        ] {
+            let store = LogStore::with_db_path(":memory:".into()).unwrap();
+            let announcement = |id, timestamp| {
+                let mut row = message(id, timestamp, "room");
+                row.msg_kind = MsgKind::Announcement { color: "blue".into() };
+                row
+            };
+            store.append_message(&announcement(1, 999)).unwrap();
+            store.append_message(&announcement(2, 1001)).unwrap();
+            store.apply_moderation(&action).unwrap();
+            store.append_message(&announcement(3, 999)).unwrap();
+            let rows = store.recent_messages(&channel, 10).unwrap();
+            assert_eq!(rows.len(), 3);
+            for row in rows {
+                assert_eq!(row.flags.is_deleted, row.id.0 != 2);
+                assert!(matches!(&row.msg_kind, MsgKind::Announcement { color } if color == "blue"));
+                assert_eq!(row.raw_text, format!("message {}", row.id.0));
+            }
+        }
     }
 
     #[test]

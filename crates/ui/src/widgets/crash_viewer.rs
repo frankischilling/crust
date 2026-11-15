@@ -12,8 +12,6 @@
 
 use std::path::PathBuf;
 
-use tracing::warn;
-
 use crate::theme as t;
 
 /// Metadata for a single recovered crash report.
@@ -68,11 +66,8 @@ pub struct CrashViewer {
     /// One-shot status line displayed under the list (e.g. "Report
     /// deleted.").  Cleared on the next interaction.
     status: Option<String>,
-    /// Optional cleanup callback that runs before the viewer calls
-    /// `std::process::exit(...)` from the "Restart" button. The app
-    /// crate uses this to defuse the active session sentinel so the
-    /// relaunched instance doesn't treat this run as abnormal.
-    pre_exit_hook: Option<Box<dyn Fn() + Send + Sync + 'static>>,
+    /// Requests a restart after the app has completed its normal shutdown.
+    restart_handler: Option<Box<dyn Fn() + Send + Sync + 'static>>,
 }
 
 impl CrashViewer {
@@ -94,318 +89,275 @@ impl CrashViewer {
         !self.reports.is_empty()
     }
 
-    /// Install a cleanup closure invoked before the "Restart Crust"
-    /// button exits the current process. The app crate uses this to
-    /// remove the active session sentinel so the relaunched instance
-    /// doesn't report this run as an abnormal shutdown.
-    pub fn set_pre_exit_hook<F>(&mut self, f: F)
+    /// Register the application's restart request handler.
+    pub fn set_restart_handler<F>(&mut self, f: F)
     where
         F: Fn() + Send + Sync + 'static,
     {
-        self.pre_exit_hook = Some(Box::new(f));
+        self.restart_handler = Some(Box::new(f));
     }
 
-    /// Render the dialog.  Silently no-ops when closed or empty.
+    /// Render recovered reports without covering the window's dismissal controls.
     pub fn show(&mut self, ctx: &egui::Context) {
         if !self.open || self.reports.is_empty() {
             return;
         }
 
+        let bounds = ctx.screen_rect().shrink(8.0);
+        let style = ctx.style();
+        let frame = egui::Frame::window(&style);
+        let heading = egui::TextStyle::Heading.resolve(&style);
+        let title_height = ctx
+            .fonts(|fonts| fonts.row_height(&heading))
+            .max(style.spacing.interact_size.y)
+            + frame.inner_margin.sum().y
+            + frame.stroke.width;
+        let max_size = (bounds.size() - frame.total_margin().sum() - egui::vec2(0.0, title_height))
+            .max(egui::Vec2::splat(1.0));
+        let mut open = self.open;
         let mut should_close = false;
+        let mut dismiss_all = false;
+        let mut restart = false;
+        let mut open_folder = false;
+        let mut remove = None;
+        let mut selected = None;
 
-        egui::Window::new("Recovered crash reports")
+        egui::Window::new("Crash reports")
+            .id(egui::Id::new("crash_report_viewer"))
+            .open(&mut open)
             .collapsible(false)
             .resizable(true)
-            .default_width(560.0)
-            .default_height(420.0)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(frame)
+            .constrain_to(bounds)
+            .min_size(egui::vec2(160.0, 100.0).min(max_size))
+            .max_size(max_size)
+            .default_size(egui::vec2(560.0, 420.0).min(max_size))
+            .default_pos(bounds.center() - egui::vec2(560.0, 420.0).min(max_size) * 0.5)
             .show(ctx, |ui| {
-                ui.label(
-                    egui::RichText::new(
-                        "Crust detected crash reports from a previous session.",
-                    )
-                    .strong(),
-                );
-                ui.label(
-                    egui::RichText::new(
-                        "Review the details below, then dismiss to delete the report or \
-                         keep the file for later triage.",
-                    )
-                    .small()
-                    .weak(),
-                );
-                ui.add_space(6.0);
-
-                ui.horizontal(|ui| {
-                    if ui
-                        .button("Open crash folder")
-                        .on_hover_text("Reveal the crashes directory in your file manager.")
-                        .clicked()
-                    {
-                        // Walk back to the "crashes" folder regardless of whether the
-                        // first path is a report (directly in it) or a session sentinel
-                        // (in the sessions/ subdir).
-                        if let Some(first) = self.reports.first() {
-                            let target = first
-                                .path
-                                .parent()
-                                .and_then(|p| {
-                                    if p.file_name()
-                                        .and_then(|s| s.to_str())
-                                        == Some("sessions")
-                                    {
-                                        p.parent()
-                                    } else {
-                                        Some(p)
-                                    }
-                                })
-                                .map(std::path::Path::to_path_buf);
-                            if let Some(dir) = target {
-                                open_in_file_manager(&dir);
-                            }
+                ui.set_min_height(ui.available_height().min(max_size.y));
+                egui::TopBottomPanel::bottom("crash_report_actions")
+                    .frame(egui::Frame::NONE)
+                    .min_height(0.0)
+                    .show_inside(ui, |ui| {
+                        if let Some(status) = &self.status {
+                            ui.add(egui::Label::new(
+                                egui::RichText::new(status).small().color(t::text_primary()),
+                            ).truncate()).on_hover_text(status);
                         }
-                    }
-
-                    if ui
-                        .button("Restart Crust")
-                        .on_hover_text("Close this window and relaunch the app.")
-                        .clicked()
-                    {
-                        if let Some(hook) = self.pre_exit_hook.as_ref() {
-                            hook();
-                        }
-                        restart_and_exit();
-                    }
-
-                    if ui
-                        .button("Dismiss all")
-                        .on_hover_text("Delete every recovered crash report on disk.")
-                        .clicked()
-                    {
-                        let mut removed = 0_usize;
-                        for r in &self.reports {
-                            if std::fs::remove_file(&r.path).is_ok() {
-                                removed += 1;
-                            }
-                        }
-                        self.reports.clear();
-                        self.selected = None;
-                        self.status = Some(format!("{removed} report(s) deleted."));
-                        should_close = true;
-                    }
-
-                    if ui.button("Close").clicked() {
-                        should_close = true;
-                    }
-                });
-
-                ui.add_space(6.0);
-                ui.separator();
-
-                // List of reports ---------------------------------------
+                        ui.separator();
+                        ui.horizontal_wrapped(|ui| {
+                            should_close = ui.button("Close").clicked();
+                            ui.menu_button("More", |ui| {
+                                if ui.button("Open crash folder").clicked() {
+                                    open_folder = true;
+                                    ui.close_menu();
+                                }
+                                if ui.add_enabled(
+                                    self.restart_handler.is_some(),
+                                    egui::Button::new("Restart Crust"),
+                                ).on_hover_text("Save the current layout and chat history, then restart.")
+                                    .clicked()
+                                {
+                                    restart = true;
+                                    ui.close_menu();
+                                }
+                                if ui.button("Dismiss all")
+                                    .on_hover_text("Delete recovered report files. Files that cannot be deleted stay in this list.")
+                                    .clicked()
+                                {
+                                    dismiss_all = true;
+                                    ui.close_menu();
+                                }
+                            }).response.on_hover_text("Report actions");
+                        });
+                    });
                 egui::ScrollArea::vertical()
-                    .id_salt("crash_report_list")
-                    .auto_shrink([false; 2])
-                    .max_height(160.0)
+                    .id_salt("crash_report_body")
+                    .max_height(ui.available_height())
+                    .min_scrolled_height(0.0)
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        let mut remove: Option<usize> = None;
-                        let mut open_idx: Option<usize> = None;
-                        for (i, r) in self.reports.iter().enumerate() {
-                            let selected = self.selected == Some(i);
-                            let abnormal = r.is_abnormal_shutdown();
-                            let (summary_color, kind_label) = if abnormal {
-                                (t::yellow(), "ABNORMAL EXIT")
+                        ui.add(egui::Label::new(
+                            egui::RichText::new("Crust found reports from a previous session.").strong(),
+                        ).wrap());
+                        ui.add(egui::Label::new(
+                            egui::RichText::new("View a report to copy its contents. Delete removes its file; Close keeps it for later.")
+                                .small().weak(),
+                        ).wrap());
+                        ui.add_space(6.0);
+
+                        for (index, report) in self.reports.iter().enumerate() {
+                            let is_selected = self.selected == Some(index);
+                            let (color, kind) = if report.is_abnormal_shutdown() {
+                                (t::yellow(), "Abnormal exit")
                             } else {
-                                (t::red(), "PANIC")
+                                (t::red(), "Panic")
                             };
-                            egui::Frame::group(ui.style())
-                                .fill(if selected {
-                                    t::accent_dim()
-                                } else {
-                                    t::bg_dialog()
-                                })
-                                .stroke(egui::Stroke::new(
-                                    if selected { 1.0_f32 } else { 0.5_f32 },
-                                    if selected {
+                            ui.push_id(&report.path, |ui| {
+                                egui::Frame::group(ui.style())
+                                    .fill(if is_selected { t::accent_dim() } else { t::bg_dialog() })
+                                    .stroke(egui::Stroke::new(1.0_f32, if is_selected {
                                         t::accent()
                                     } else {
                                         t::border_subtle()
-                                    },
-                                ))
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.vertical(|ui| {
-                                            ui.horizontal(|ui| {
-                                                ui.label(
-                                                    egui::RichText::new(kind_label)
-                                                        .small()
-                                                        .strong()
-                                                        .color(summary_color),
-                                                );
-                                                ui.label(
-                                                    egui::RichText::new(&r.timestamp)
-                                                        .monospace()
-                                                        .color(t::text_primary()),
-                                                );
-                                            });
-                                            ui.label(
-                                                egui::RichText::new(&r.summary)
-                                                    .small()
-                                                    .color(summary_color),
-                                            );
-                                            ui.label(
-                                                egui::RichText::new(&r.file_name)
-                                                    .small()
-                                                    .weak(),
-                                            );
+                                    }))
+                                    .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label(egui::RichText::new(kind).small().strong().color(color));
+                                            ui.add(egui::Label::new(
+                                                egui::RichText::new(&report.timestamp).monospace(),
+                                            ).wrap());
                                         });
-
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(
-                                                egui::Align::Center,
-                                            ),
-                                            |ui| {
-                                                if ui.button("Delete").clicked() {
-                                                    remove = Some(i);
-                                                }
-                                                let label = if selected {
-                                                    "Hide"
-                                                } else {
-                                                    "View"
-                                                };
-                                                if ui.button(label).clicked() {
-                                                    open_idx = Some(i);
-                                                }
-                                            },
-                                        );
+                                        ui.add(egui::Label::new(
+                                            egui::RichText::new(&report.summary).small().color(color),
+                                        ).wrap());
+                                        ui.add(egui::Label::new(
+                                            egui::RichText::new(&report.file_name).small().weak(),
+                                        ).truncate()).on_hover_text(&report.file_name);
+                                        ui.horizontal_wrapped(|ui| {
+                                            if ui.button(if is_selected { "Hide" } else { "View" }).clicked() {
+                                                selected = Some(index);
+                                            }
+                                            if ui.button("Delete").clicked() {
+                                                remove = Some(index);
+                                            }
+                                        });
                                     });
-                                });
+                            });
                             ui.add_space(4.0);
                         }
-                        if let Some(i) = open_idx {
-                            self.selected =
-                                if self.selected == Some(i) { None } else { Some(i) };
-                            self.status = None;
-                        }
-                        if let Some(i) = remove {
-                            if let Some(r) = self.reports.get(i) {
-                                match std::fs::remove_file(&r.path) {
-                                    Ok(()) => {
-                                        self.status =
-                                            Some(format!("Deleted {}.", r.file_name));
-                                    }
-                                    Err(e) => {
-                                        self.status = Some(format!(
-                                            "Failed to delete {}: {e}",
-                                            r.file_name
-                                        ));
-                                    }
+
+                        if let Some(report) = self.selected.and_then(|index| self.reports.get(index)) {
+                            ui.separator();
+                            ui.label(egui::RichText::new("Report contents").strong());
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button("Copy to clipboard").clicked() {
+                                    ctx.copy_text(report.preview.clone());
+                                    self.status = Some("Report copied to clipboard.".into());
                                 }
-                            }
-                            self.reports.remove(i);
-                            self.selected = match self.selected {
-                                Some(sel) if sel == i => None,
-                                Some(sel) if sel > i => Some(sel - 1),
-                                other => other,
-                            };
-                            if self.reports.is_empty() {
-                                should_close = true;
-                            }
-                        }
-                    });
-
-                // Detail pane -----------------------------------------
-                if let Some(idx) = self.selected {
-                    if let Some(r) = self.reports.get(idx) {
-                        ui.add_space(6.0);
-                        ui.separator();
-                        ui.label(
-                            egui::RichText::new("Report contents")
-                                .strong()
-                                .color(t::text_primary()),
-                        );
-                        ui.add_space(2.0);
-
-                        let mut body = r.preview.clone();
-                        egui::ScrollArea::vertical()
-                            .id_salt("crash_report_detail")
-                            .auto_shrink([false; 2])
-                            .max_height(220.0)
-                            .show(ui, |ui| {
-                                ui.add(
-                                    egui::TextEdit::multiline(&mut body)
+                                if ui.button("Show file on disk").clicked() {
+                                    open_in_file_manager(&report.path);
+                                }
+                            });
+                            // The immutable buffer avoids cloning a large report every frame.
+                            let mut body = report.preview.as_str();
+                            egui::ScrollArea::both()
+                                .id_salt(("crash_report_detail", &report.path))
+                                .auto_shrink([false, false])
+                                .min_scrolled_height(0.0)
+                                .max_height(220.0)
+                                .show(ui, |ui| {
+                                    ui.add(egui::TextEdit::multiline(&mut body)
                                         .font(egui::TextStyle::Monospace)
                                         .code_editor()
                                         .desired_width(f32::INFINITY)
                                         .desired_rows(12)
-                                        .interactive(false),
-                                );
-                            });
-
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            if ui
-                                .button("Copy to clipboard")
-                                .on_hover_text(
-                                    "Copy the full report text so it can be shared \
-                                     with maintainers.",
-                                )
-                                .clicked()
-                            {
-                                ui.ctx().copy_text(r.preview.clone());
-                                self.status = Some("Report copied to clipboard.".into());
-                            }
-                            if ui.button("Show file on disk").clicked() {
-                                open_in_file_manager(&r.path);
-                            }
-                        });
-                    }
-                }
-
-                if let Some(msg) = &self.status {
-                    ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(msg)
-                            .small()
-                            .color(t::text_primary()),
-                    );
-                }
+                                        .interactive(false));
+                                });
+                        }
+                    });
             });
 
-        if should_close {
+        if let Some(index) = selected {
+            self.selected = if self.selected == Some(index) {
+                None
+            } else {
+                Some(index)
+            };
+            self.status = None;
+        }
+        if let Some(index) = remove {
+            self.delete_report(index);
+        }
+        if dismiss_all {
+            self.dismiss_all();
+        }
+        if open_folder {
+            if let Some(report) = self.reports.first() {
+                if let Some(parent) = report.path.parent() {
+                    let folder =
+                        if parent.file_name().and_then(|name| name.to_str()) == Some("sessions") {
+                            parent.parent().unwrap_or(parent)
+                        } else {
+                            parent
+                        };
+                    open_in_file_manager(folder);
+                }
+            }
+        }
+        if restart {
+            self.request_restart(ctx);
+        }
+        if should_close || !open {
             self.open = false;
             self.selected = None;
         }
     }
+
+    fn request_restart(&self, ctx: &egui::Context) {
+        if let Some(handler) = &self.restart_handler {
+            handler();
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+        }
+    }
+
+    fn delete_report(&mut self, index: usize) {
+        let Some(report) = self.reports.get(index) else {
+            return;
+        };
+        match remove_report_file(&report.path) {
+            Ok(()) => {
+                self.status = Some(format!("Removed {}.", report.file_name));
+                self.reports.remove(index);
+                self.selected = match self.selected {
+                    Some(selected) if selected == index => None,
+                    Some(selected) if selected > index => Some(selected - 1),
+                    other => other,
+                };
+                self.open = !self.reports.is_empty();
+            }
+            Err(error) => {
+                self.status = Some(format!("Could not delete {}: {error}", report.file_name));
+            }
+        }
+    }
+
+    fn dismiss_all(&mut self) {
+        let selected = self
+            .selected
+            .and_then(|index| self.reports.get(index))
+            .map(|report| report.path.clone());
+        let mut removed = 0;
+        let mut first_error = None;
+        self.reports
+            .retain(|report| match remove_report_file(&report.path) {
+                Ok(()) => {
+                    removed += 1;
+                    false
+                }
+                Err(error) => {
+                    first_error.get_or_insert_with(|| format!("{}: {error}", report.file_name));
+                    true
+                }
+            });
+        self.selected =
+            selected.and_then(|path| self.reports.iter().position(|report| report.path == path));
+        self.open = !self.reports.is_empty();
+        self.status = Some(match first_error {
+            Some(error) => format!(
+                "Removed {removed} reports. {} could not be deleted. {error}",
+                self.reports.len()
+            ),
+            None => format!("Removed {removed} reports."),
+        });
+    }
 }
 
-/// Best-effort relaunch: spawn a fresh instance of the current
-/// executable and exit this one.  On any failure we just log via
-/// `tracing` and leave the app running so the user can retry manually.
-fn restart_and_exit() {
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(e) => {
-            warn!("crash viewer restart: cannot resolve current_exe: {e}");
-            return;
-        }
-    };
-    // Spawn detached so killing this process doesn't take the child
-    // with it.  On Unix that's the default once the child has been
-    // reparented to init; on Windows `Command::spawn` already creates
-    // an independent process group.
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match std::process::Command::new(&exe).args(&args).spawn() {
-        Ok(_child) => {
-            // Exit with a zero status so the clean-shutdown path has
-            // a chance to defuse the current session sentinel.  The
-            // new instance will see no orphaned sentinels from this
-            // run.
-            std::process::exit(0);
-        }
-        Err(e) => {
-            warn!("crash viewer restart: failed to spawn {:?}: {e}", exe);
-        }
+fn remove_report_file(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
     }
 }
 
@@ -445,5 +397,202 @@ fn open_in_file_manager(path: &std::path::Path) {
             path
         };
         let _ = std::process::Command::new("xdg-open").arg(target).spawn();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "crust-crash-viewer-{}-{}",
+                std::process::id(),
+                NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn report(path: PathBuf) -> CrashReportMeta {
+        CrashReportMeta {
+            file_name: path.file_name().unwrap().to_string_lossy().into_owned(),
+            path,
+            timestamp: "2026-11-15T12:00:00+00:00".into(),
+            summary: "A recovered error with a long explanation and Unicode 🙂. ".repeat(12),
+            preview: "Frame in the recovered backtrace with Unicode 🙂.\n".repeat(300),
+        }
+    }
+
+    fn frame(
+        ctx: &egui::Context,
+        viewer: &mut CrashViewer,
+        size: egui::Vec2,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events,
+                ..Default::default()
+            },
+            |ctx| viewer.show(ctx),
+        )
+    }
+
+    fn label_rect(output: &egui::FullOutput, label: &str) -> Option<egui::Rect> {
+        output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::epaint::Shape::Text(text) if text.galley.text() == label => {
+                let rect = text.galley.rect.translate(text.pos.to_vec2());
+                shape
+                    .clip_rect
+                    .expand(0.5)
+                    .contains_rect(rect)
+                    .then_some(rect)
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn failed_deletion_keeps_the_report_selected_and_available_for_retry() {
+        let dir = TestDirectory::new();
+        let blocked = dir.0.join("report.txt");
+        std::fs::create_dir(&blocked).unwrap();
+        let mut viewer = CrashViewer::default();
+        viewer.set_pending_reports(vec![report(blocked.clone())]);
+        viewer.selected = Some(0);
+        viewer.delete_report(0);
+        assert!(viewer.open);
+        assert_eq!(viewer.reports.len(), 1);
+        assert_eq!(viewer.selected, Some(0));
+        assert!(viewer
+            .status
+            .as_deref()
+            .unwrap()
+            .starts_with("Could not delete"));
+        std::fs::remove_dir(&blocked).unwrap();
+        std::fs::write(&blocked, "recovered report").unwrap();
+        viewer.delete_report(0);
+        assert!(viewer.reports.is_empty());
+        assert!(!viewer.open);
+        assert!(!blocked.exists());
+    }
+
+    #[test]
+    fn dismiss_all_retains_failed_files_and_their_selection() {
+        let dir = TestDirectory::new();
+        let good = dir.0.join("good.txt");
+        let blocked = dir.0.join("blocked.txt");
+        let missing = dir.0.join("already-removed.txt");
+        std::fs::write(&good, "recovered report").unwrap();
+        std::fs::create_dir(&blocked).unwrap();
+        let mut viewer = CrashViewer::default();
+        viewer.set_pending_reports(vec![
+            report(good.clone()),
+            report(blocked.clone()),
+            report(missing),
+        ]);
+        viewer.selected = Some(1);
+        viewer.dismiss_all();
+        assert!(!good.exists());
+        assert!(viewer.open);
+        assert_eq!(viewer.reports.len(), 1);
+        assert_eq!(viewer.reports[0].path, blocked);
+        assert_eq!(viewer.selected, Some(0));
+        assert!(viewer
+            .status
+            .as_deref()
+            .unwrap()
+            .contains("1 could not be deleted"));
+    }
+
+    #[test]
+    fn recovery_footer_stays_visible_and_close_works_in_small_windows() {
+        for (size, font_size) in [
+            (egui::vec2(220.0, 200.0), 14.0),
+            (egui::vec2(320.0, 240.0), 24.0),
+            (egui::vec2(640.0, 480.0), 14.0),
+        ] {
+            let ctx = egui::Context::default();
+            let mut style = (*ctx.style()).clone();
+            style.override_font_id = Some(egui::FontId::proportional(font_size));
+            ctx.set_style(style);
+            let mut viewer = CrashViewer::default();
+            viewer.set_pending_reports(vec![report(PathBuf::from("recovered-long-report.txt"))]);
+            viewer.selected = Some(0);
+            let mut output = egui::FullOutput::default();
+            for _ in 0..4 {
+                output = frame(&ctx, &mut viewer, size, vec![]);
+            }
+            let bounds = ctx
+                .memory(|memory| memory.area_rect(egui::Id::new("crash_report_viewer")))
+                .unwrap();
+            assert!(
+                egui::Rect::from_min_size(egui::Pos2::ZERO, size)
+                    .expand(1.0)
+                    .contains_rect(bounds),
+                "recovery dialog {bounds:?} escaped {size:?}"
+            );
+            assert!(
+                label_rect(&output, "More").is_some(),
+                "report actions clipped at {size:?}"
+            );
+            let close = label_rect(&output, "Close")
+                .expect("close button is visible")
+                .center();
+            for pressed in [true, false] {
+                frame(
+                    &ctx,
+                    &mut viewer,
+                    size,
+                    vec![
+                        egui::Event::PointerMoved(close),
+                        egui::Event::PointerButton {
+                            pos: close,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+            assert!(!viewer.open);
+            assert_eq!(
+                viewer.reports.len(),
+                1,
+                "Close must preserve the recovered report"
+            );
+        }
+    }
+
+    #[test]
+    fn restart_requests_normal_root_shutdown_without_exiting_in_the_widget() {
+        let ctx = egui::Context::default();
+        let requested = Arc::new(AtomicUsize::new(0));
+        let signal = Arc::clone(&requested);
+        let mut viewer = CrashViewer::default();
+        viewer.set_restart_handler(move || {
+            signal.fetch_add(1, Ordering::Relaxed);
+        });
+        let output = ctx.run(egui::RawInput::default(), |ctx| viewer.request_restart(ctx));
+        assert_eq!(requested.load(Ordering::Relaxed), 1);
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .iter()
+            .any(|command| matches!(command, egui::ViewportCommand::Close)));
     }
 }

@@ -9,7 +9,7 @@ use crust_core::{
     },
 };
 use crust_storage::LogStore;
-use crust_twitch::{parse_line, parse_privmsg_irc};
+use crust_twitch::{parse_line, parse_privmsg_irc, parse_usernotice_irc};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -1189,9 +1189,14 @@ fn parse_history_records(
             continue;
         }
         let action = match record.command.as_str() {
-            "PRIVMSG" => {
+            "PRIVMSG" | "USERNOTICE" => {
                 let id = crate::HISTORY_MSG_ID.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                if let Some(mut message) = parse_privmsg_irc(&record, local_nick, id) {
+                let message = if record.command == "PRIVMSG" {
+                    parse_privmsg_irc(&record, local_nick, id)
+                } else {
+                    parse_usernotice_irc(&record, local_nick, id)
+                };
+                if let Some(mut message) = message {
                     state.apply(&mut message);
                     state.observe_deleted(&message);
                     messages.push(message);
@@ -1290,6 +1295,38 @@ mod moderation_history_tests {
         phrase.action = action;
         phrase.replace_with = replacement.into();
         phrase
+    }
+
+    #[test]
+    fn remote_history_keeps_rich_announcements_and_subscriber_bodies_with_moderation() {
+        use crust_core::{ignores::IgnoredPhraseAction, model::MsgKind};
+
+        let rules = [
+            phrase_rule("badword", IgnoredPhraseAction::Replace, "ok"),
+            phrase_rule("spam", IgnoredPhraseAction::Block, ""),
+        ];
+        let (messages, actions) = parse_history_records(&lines(&[
+            "@id=announcement;msg-id=announcement;msg-param-color=GREEN;login=alice;user-id=10;emotes=25:8-12;tmi-sent-ts=1000 :tmi.twitch.tv USERNOTICE #room :badword Kappa",
+            "@id=subscription;msg-id=resub;login=alice;user-id=10;display-name=Alice;msg-param-cumulative-months=2;tmi-sent-ts=1001 :tmi.twitch.tv USERNOTICE #room :subscriber text",
+            "@id=mirror;msg-id=sharedchatnotice;source-msg-id=announcement;room-id=1;source-room-id=2;source-id=original;login=alice;user-id=10;tmi-sent-ts=1002 :tmi.twitch.tv USERNOTICE #room :shared body",
+            "@id=payment;msg-id=sharedchatnotice;source-msg-id=sub;room-id=1;source-room-id=2;login=alice;user-id=10;tmi-sent-ts=1002 :tmi.twitch.tv USERNOTICE #room :other room subscription",
+            "@target-msg-id=announcement :tmi.twitch.tv CLEARMSG #room :badword Kappa",
+            "@target-user-id=10;tmi-sent-ts=1003 :tmi.twitch.tv CLEARCHAT #room :alice",
+            "@id=new;msg-id=announcement;login=alice;user-id=10;tmi-sent-ts=1004 :tmi.twitch.tv USERNOTICE #room :new announcement",
+            "@id=blocked;msg-id=announcement;login=alice;user-id=10;tmi-sent-ts=1005 :tmi.twitch.tv USERNOTICE #room :spam",
+        ]), None, &[], &ChannelId::new("room"), &[], &rules);
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].raw_text, "ok Kappa");
+        assert_eq!((messages[0].twitch_emotes[0].start, messages[0].twitch_emotes[0].end), (3, 7));
+        assert!(matches!(&messages[0].msg_kind, MsgKind::Announcement { color } if color == "green"));
+        assert!(matches!(&messages[1].msg_kind, MsgKind::Sub { sub_msg, .. } if sub_msg == "subscriber text"));
+        assert_eq!(messages[2].shared.as_ref().unwrap().source_message_id.as_deref(), Some("original"));
+        assert_eq!(messages[3].server_id.as_deref(), Some("new"));
+        assert!(messages[..3].iter().all(|message| message.flags.is_deleted));
+        assert!(!messages[3].flags.is_deleted);
+        assert!(messages.iter().all(|message| message.flags.is_history));
+        assert_eq!(actions.len(), 2);
     }
 
     #[test]

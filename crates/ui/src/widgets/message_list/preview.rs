@@ -268,6 +268,7 @@ impl<'a> MessagePreviewContext<'a> {
             .hash(&mut hash);
         std::mem::discriminant(&message.msg_kind).hash(&mut hash);
         match &message.msg_kind {
+            MsgKind::Announcement { color } => color.hash(&mut hash),
             MsgKind::Sub {
                 display_name,
                 months,

@@ -886,7 +886,10 @@ impl TwitchSession {
                 let Some(channel) = ch_opt else {
                     return None;
                 };
-                let msg_id = msg.tags.get("msg-id").unwrap_or("");
+                let msg_id = usernotice_type(msg);
+                if is_mirrored_usernotice(msg) && msg_id != "announcement" {
+                    return None;
+                }
                 let display_name = msg
                     .tags
                     .get("display-name")
@@ -895,9 +898,9 @@ impl TwitchSession {
                     .unwrap_or("unknown")
                     .to_owned();
                 match msg_id {
-                    "sub" | "resub" | "subgift" | "anonsubgift" => {
+                    "sub" | "resub" | "subgift" | "anonsubgift" | "announcement" => {
                         if let Some(mut message) =
-                            parse_subscription_irc(msg, self.auth_nick.as_deref(), self.next_msg_id)
+                            parse_usernotice_irc(msg, self.auth_nick.as_deref(), self.next_msg_id)
                         {
                             message.id = self.alloc_id();
                             message.flags.is_history = false;
@@ -1109,6 +1112,50 @@ fn parse_subscription_irc(
     }
     message.flags.is_mention |= gifted_to_me;
     message.flags.is_highlighted |= gifted_to_me;
+    Some(message)
+}
+
+fn usernotice_type(msg: &IrcMessage) -> &str {
+    match msg.tags.get("msg-id").unwrap_or("") {
+        "sharedchatnotice" => msg.tags.get("source-msg-id").unwrap_or(""),
+        kind => kind,
+    }
+}
+
+fn is_mirrored_usernotice(msg: &IrcMessage) -> bool {
+    msg.tags.get("msg-id") == Some("sharedchatnotice")
+        || msg.tags.get("source-room-id").map(str::trim).is_some_and(|source| {
+            !source.is_empty() && msg.tags.get("room-id").map(str::trim) != Some(source)
+        })
+}
+
+/// Parse notices that carry a sender's chat text through the ordinary message path.
+pub fn parse_usernotice_irc(
+    msg: &IrcMessage,
+    local_nick: Option<&str>,
+    id: u64,
+) -> Option<ChatMessage> {
+    if msg.command != "USERNOTICE" {
+        return None;
+    }
+    let kind = usernotice_type(msg);
+    if is_mirrored_usernotice(msg) && kind != "announcement" {
+        return None;
+    }
+    if kind != "announcement" {
+        return parse_subscription_irc(msg, local_nick, id);
+    }
+    let mut message = parse_chat_message_irc(msg, local_nick, id)?;
+    if message.raw_text.trim().is_empty() {
+        return None;
+    }
+    let color = msg.tags.get("msg-param-color").unwrap_or("primary").to_ascii_lowercase();
+    message.msg_kind = MsgKind::Announcement {
+        color: match color.as_str() {
+            "blue" | "green" | "orange" | "purple" => color,
+            _ => "primary".into(),
+        },
+    };
     Some(message)
 }
 
@@ -1444,6 +1491,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn announcements_keep_sender_emotes_identity_and_color_in_live_and_history_messages() {
+        for (wire_color, expected) in [("BLUE", "blue"), ("GREEN", "green"),
+            ("ORANGE", "orange"), ("PURPLE", "purple"), ("PRIMARY", "primary"), ("unknown", "primary")] {
+            let (mut session, mut events) = session();
+            session.auth_nick = Some("alice".into());
+            let raw = format!("@id=announcement-1;msg-id=announcement;msg-param-color={wire_color};login=alice;display-name=Alice;user-id=10;badges=moderator/1;emotes=25:2-6;tmi-sent-ts=1700000000123;system-msg=Announcement :tmi.twitch.tv USERNOTICE #room :🦀 Kappa welcome");
+            let record = parse_line(&raw).unwrap();
+            let history = parse_usernotice_irc(&record, Some("alice"), 42).unwrap();
+            session.handle_irc(&record).await;
+            let TwitchEvent::ChatMessage(live) = events.try_recv().unwrap() else {
+                panic!("expected rich announcement");
+            };
+            assert!(!live.flags.is_history);
+            assert!(history.flags.is_history);
+            for message in [&history, &live] {
+                assert!(matches!(&message.msg_kind, MsgKind::Announcement { color } if color == expected));
+                assert_eq!(message.raw_text, "🦀 Kappa welcome");
+                assert_eq!(message.sender.login, "alice");
+                assert_eq!(message.sender.user_id.0, "10");
+                assert_eq!(message.sender.badges[0].name, "moderator");
+                assert_eq!(message.server_id.as_deref(), Some("announcement-1"));
+                assert_eq!(message.timestamp.timestamp_millis(), 1700000000123);
+                assert!(message.flags.is_self);
+                let spans = crust_core::format::tokenize_with_flags(
+                    &message.raw_text, false, &message.twitch_emotes, &|_| None,
+                );
+                assert!(spans.iter().any(|span| matches!(span,
+                    crust_core::model::Span::Emote { id, code, .. } if id == "25" && code == "Kappa")));
+            }
+            assert!(events.try_recv().is_err(), "announcement header must not duplicate the row");
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_chat_notices_only_mirror_announcements_and_keep_their_source() {
+        for kind in ["announcement", "sub", "resub", "raid"] {
+            for (msg_id, source_tag) in [(kind, String::new()),
+                ("sharedchatnotice", format!(";source-msg-id={kind}"))] {
+                let (mut session, mut events) = session();
+                let raw = format!("@id=mirror;msg-id={msg_id}{source_tag};room-id=1;source-room-id=2;source-id=original;source-badges=moderator/1;login=alice;user-id=10;msg-param-color=ORANGE;rm-deleted :tmi.twitch.tv USERNOTICE #room :shared body");
+                let record = parse_line(&raw).unwrap();
+                session.handle_irc(&record).await;
+                let history = parse_usernotice_irc(&record, None, 42);
+                if kind != "announcement" {
+                    assert!(events.try_recv().is_err());
+                    assert!(history.is_none());
+                    continue;
+                }
+                let TwitchEvent::ChatMessage(live) = events.try_recv().unwrap() else {
+                    panic!("expected mirrored announcement");
+                };
+                for message in [live, history.unwrap()] {
+                    assert!(message.flags.is_deleted);
+                    assert!(matches!(message.msg_kind, MsgKind::Announcement { .. }));
+                    assert_eq!(message.server_id.as_deref(), Some("mirror"));
+                    let source = message.shared.unwrap();
+                    assert_eq!(source.room_id, "2");
+                    assert_eq!(source.source_message_id.as_deref(), Some("original"));
+                    assert_eq!(source.badges[0].name, "moderator");
+                }
+                assert!(events.try_recv().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn announcements_without_a_body_do_not_create_empty_messages() {
+        for suffix in ["", " :", " :   "] {
+            let raw = format!("@msg-id=announcement;login=alice :tmi.twitch.tv USERNOTICE #room{suffix}");
+            assert!(parse_usernotice_irc(&parse_line(&raw).unwrap(), None, 1).is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn subscription_without_a_body_has_no_chat_text() {
         let (mut session, mut events) = session();
         let message =
@@ -1517,7 +1638,7 @@ mod tests {
     async fn system_notices_do_not_decode_tags_twice() {
         let (mut session, mut events) = session();
         let message = parse_line(
-            r"@msg-id=announcement;system-msg=literal\\s\sword :tmi.twitch.tv USERNOTICE #room",
+            r"@msg-id=standardpayforward;system-msg=literal\\s\sword :tmi.twitch.tv USERNOTICE #room",
         )
         .unwrap();
         session.handle_irc(&message).await;

@@ -4004,6 +4004,10 @@ fn push_msg_kind_table(L: *mut lua_State, kind: &MsgKind) {
             MsgKind::Chat => {
                 set_field_string(L, -1, "type", "Chat");
             }
+            MsgKind::Announcement { color } => {
+                set_field_string(L, -1, "type", "Announcement");
+                set_field_string(L, -1, "color", color);
+            }
             MsgKind::Sub {
                 display_name,
                 months,

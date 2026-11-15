@@ -535,9 +535,8 @@ fn parse_badge_snapshot(
     parse(body, scope, &mut incoming).then_some(incoming)
 }
 
-// Global fallback sources supplement one another. Parse outside the shared
-// lock, then merge only returned keys without cloning every loaded badge URL.
-fn merge_badge_response(
+// The bundled snapshot fills gaps without replacing newer cached definitions.
+fn seed_badge_response(
     body: &str,
     scope: &str,
     badge_map: &BadgeMap,
@@ -547,22 +546,29 @@ fn merge_badge_response(
     let mut map = badge_map.write().unwrap();
     let mut changed = 0;
     for (key, url) in incoming {
-        if map.get(&key) != Some(&url) {
-            map.insert(key, url);
+        if let std::collections::hash_map::Entry::Vacant(entry) = map.entry(key) {
+            entry.insert(url);
             changed += 1;
         }
     }
     Some(changed)
 }
 
-pub(crate) fn replace_channel_badges(
-    channel: &str,
+pub(crate) fn replace_badge_scope(
+    scope: &str,
     badge_map: &BadgeMap,
+    definitions: BadgeDefinitions,
+) -> bool {
+    replace_badge_definitions(scope, &mut badge_map.write().unwrap(), definitions)
+}
+
+fn replace_badge_definitions(
+    scope: &str,
+    map: &mut BadgeDefinitions,
     mut definitions: BadgeDefinitions,
 ) -> bool {
-    definitions.retain(|(scope, _, _), _| scope == channel);
-    let mut map = badge_map.write().unwrap();
-    let previous_count = map.keys().filter(|(scope, _, _)| scope == channel).count();
+    definitions.retain(|(candidate, _, _), _| candidate == scope);
+    let previous_count = map.keys().filter(|(candidate, _, _)| candidate == scope).count();
     if previous_count == definitions.len()
         && definitions
             .iter()
@@ -570,7 +576,7 @@ pub(crate) fn replace_channel_badges(
     {
         return false;
     }
-    map.retain(|(scope, _, _), _| scope != channel);
+    map.retain(|(candidate, _, _), _| candidate != scope);
     map.extend(definitions);
     true
 }
@@ -582,15 +588,15 @@ pub(crate) fn publish_channel_badges(
     badge_map: &BadgeMap,
     definitions: BadgeDefinitions,
 ) {
-    if replace_channel_badges(channel, badge_map, definitions) {
+    if replace_badge_scope(channel, badge_map, definitions) {
         persist_badge_map_cache(badge_map);
     }
 }
 
-async fn load_global_badges_v1_fallback(badge_map: &BadgeMap) {
+async fn load_global_badges_v1_fallback() -> Option<BadgeDefinitions> {
     if !host_resolves("badges.twitch.tv").await {
         warn_badges_twitch_unresolved_once();
-        return;
+        return None;
     }
 
     if let Some(text) = fetch_badge_payload_with_retries(
@@ -601,65 +607,53 @@ async fn load_global_badges_v1_fallback(badge_map: &BadgeMap) {
     )
     .await
     {
-        let badge_map_for_parse = badge_map.clone();
-        let changed = parse_badges_on_large_stack("badge-global-v1-parse", move || {
-            merge_badge_response(&text, "", &badge_map_for_parse, parse_badges_v1_response)
+        return parse_badges_on_large_stack("badge-global-v1-parse", move || {
+            parse_badge_snapshot(&text, "", parse_badges_v1_response)
         })
-        .flatten()
-        .unwrap_or_default();
-        if changed != 0 {
-            info!("Updated {changed} global badge definitions via badges.twitch.tv fallback");
-            persist_badge_map_cache(&badge_map);
-        }
+        .flatten();
     }
+    None
 }
 
-async fn load_global_badges_helix(badge_map: &BadgeMap, auth: Option<&BadgeAuth>) {
-    let Some(auth) = auth else {
-        return;
-    };
-
-    if let Some(text) = fetch_badge_payload_with_retries(
-        badge_client(),
-        &["https://api.twitch.tv/helix/chat/badges/global"],
-        "Helix global badges",
-        Some(auth.headers()),
-    )
-    .await
-    {
-        let badge_map_for_parse = badge_map.clone();
-        let changed = parse_badges_on_large_stack("badge-global-helix-parse", move || {
-            merge_badge_response(&text, "", &badge_map_for_parse, parse_helix_badge_response)
-        })
-        .flatten()
-        .unwrap_or_default();
-        if changed != 0 {
-            info!("Updated {changed} global badge definitions via Helix");
-            persist_badge_map_cache(badge_map);
+async fn load_global_badges_from(
+    client: &reqwest::Client,
+    auth: Option<&BadgeAuth>,
+    helix_url: &str,
+    ivr_url: &str,
+) -> Option<BadgeDefinitions> {
+    if let Some(auth) = auth {
+        if let Some(text) = fetch_badge_payload_with_retries(
+            client,
+            &[helix_url],
+            "Helix global badges",
+            Some(auth.headers()),
+        )
+        .await
+        {
+            let definitions = parse_badges_on_large_stack("badge-global-helix-parse", move || {
+                parse_badge_snapshot(&text, "", parse_helix_badge_response)
+            })
+            .flatten();
+            if let Some(definitions) = definitions {
+                return Some(definitions);
+            }
         }
     }
-}
 
-async fn load_global_badges_ivr_fallback(badge_map: &BadgeMap) {
     if let Some(text) = fetch_badge_payload_with_retries(
-        badge_client(),
-        &["https://api.ivr.fi/v2/twitch/badges/global"],
+        client,
+        &[ivr_url],
         "IVR global badges",
         None,
     )
     .await
     {
-        let badge_map_for_parse = badge_map.clone();
-        let changed = parse_badges_on_large_stack("badge-global-ivr-parse", move || {
-            merge_badge_response(&text, "", &badge_map_for_parse, parse_ivr_badge_response)
+        return parse_badges_on_large_stack("badge-global-ivr-parse", move || {
+            parse_badge_snapshot(&text, "", parse_ivr_badge_response)
         })
-        .flatten()
-        .unwrap_or_default();
-        if changed != 0 {
-            info!("Updated {changed} global badge definitions via IVR");
-            persist_badge_map_cache(badge_map);
-        }
+        .flatten();
     }
+    None
 }
 
 async fn load_channel_badges_v1_fallback(room_id: &str, channel: &str) -> Option<BadgeDefinitions> {
@@ -697,15 +691,31 @@ async fn load_channel_badges_v1_fallback(room_id: &str, channel: &str) -> Option
 #[derive(Default)]
 pub(crate) struct GlobalBadgeRefresh {
     task: Option<tokio::task::JoinHandle<()>>,
+    generation: Arc<AtomicU64>,
 }
 
 impl GlobalBadgeRefresh {
     pub(crate) fn request(&mut self, badge_map: &BadgeMap, auth: Option<BadgeAuth>) {
         let badge_map = badge_map.clone();
-        self.replace_with(async move {
-            load_global_badges_helix(&badge_map, auth.as_ref()).await;
-            load_global_badges_ivr_fallback(&badge_map).await;
-            load_global_badges_v1_fallback(&badge_map).await;
+        self.replace_with(move |generation, expected| async move {
+            let definitions = load_global_badges_from(
+                badge_client(),
+                auth.as_ref(),
+                "https://api.twitch.tv/helix/chat/badges/global",
+                "https://api.ivr.fi/v2/twitch/badges/global",
+            )
+            .await;
+            let definitions = match definitions {
+                Some(definitions) => Some(definitions),
+                None => load_global_badges_v1_fallback().await,
+            };
+            if let Some(definitions) = definitions {
+                let count = definitions.len();
+                if replace_current_global_badges(&badge_map, definitions, &generation, expected) {
+                    info!("Refreshed {count} global badge definitions");
+                    persist_badge_map_cache(&badge_map);
+                }
+            }
         });
     }
 
@@ -717,19 +727,34 @@ impl GlobalBadgeRefresh {
         }
     }
 
-    fn replace_with<F>(&mut self, refresh: F)
+    fn replace_with<F>(&mut self, refresh: impl FnOnce(Arc<AtomicU64>, u64) -> F)
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
         self.clear();
-        self.task = Some(tokio::spawn(refresh));
+        let expected = self.generation.load(Ordering::Relaxed);
+        self.task = Some(tokio::spawn(refresh(self.generation.clone(), expected)));
     }
 
     pub(crate) fn clear(&mut self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
         if let Some(task) = self.task.take() {
             task.abort();
         }
     }
+}
+
+fn replace_current_global_badges(
+    badge_map: &BadgeMap,
+    definitions: BadgeDefinitions,
+    generation: &AtomicU64,
+    expected: u64,
+) -> bool {
+    let mut map = badge_map.write().unwrap();
+    // Synchronous parsing can outlive an aborted task's current poll.
+    // Check while holding the publication lock so a stale parse cannot replace a newer snapshot.
+    generation.load(Ordering::Relaxed) == expected
+        && replace_badge_definitions("", &mut map, definitions)
 }
 
 impl Drop for GlobalBadgeRefresh {
@@ -741,7 +766,7 @@ impl Drop for GlobalBadgeRefresh {
 pub(crate) fn load_bundled_global_badges(badge_map: &BadgeMap) {
     let badge_map_for_parse = badge_map.clone();
     let changed = parse_badges_on_large_stack("badge-global-bundled-parse", move || {
-        merge_badge_response(
+        seed_badge_response(
             CRUST_TWITCH_BADGES_JSON,
             "",
             &badge_map_for_parse,
@@ -956,7 +981,7 @@ mod tests {
         let (started, observed_start) = tokio::sync::oneshot::channel();
         let (release, pending) = tokio::sync::oneshot::channel();
         let (completed, observed_completion) = tokio::sync::oneshot::channel();
-        refresh.replace_with(async move {
+        refresh.replace_with(move |_, _| async move {
             let _ = started.send(());
             let _ = pending.await;
             let _ = completed.send(());
@@ -1001,6 +1026,123 @@ mod tests {
         })
         .await
         .expect("clearing or dropping a global refresh must cancel its request");
+    }
+
+    #[test]
+    fn a_canceled_global_parse_cannot_replace_the_current_snapshot() {
+        let mut refresh = GlobalBadgeRefresh::default();
+        let map = BadgeMap::default();
+        let key = (String::new(), "subscriber".into(), "1".into());
+        let old_generation = refresh.generation.load(Ordering::Relaxed);
+        refresh.clear();
+        let current_generation = refresh.generation.load(Ordering::Relaxed);
+        assert!(replace_current_global_badges(&map,
+            BadgeDefinitions::from([(key.clone(), "new".into())]),
+            &refresh.generation, current_generation));
+        assert!(!replace_current_global_badges(&map,
+            BadgeDefinitions::from([(key.clone(), "old".into())]),
+            &refresh.generation, old_generation));
+        assert_eq!(map.read().unwrap()[&key], "new");
+        refresh.clear();
+        assert!(!replace_current_global_badges(&map, BadgeDefinitions::new(),
+            &refresh.generation, current_generation));
+        assert_eq!(map.read().unwrap()[&key], "new");
+    }
+
+    #[tokio::test]
+    async fn authoritative_global_badges_skip_fallbacks_and_replace_only_the_global_scope() {
+        for body in [HELIX_BADGES, r#"{"data":[]}"#] {
+            let (base, server) = serve_badges(vec![(200, body)]).await;
+            let auth = BadgeAuth::from_validated(Some("client"), "private-token").unwrap();
+            let map = BadgeMap::default();
+            let old = (String::new(), "old".to_owned(), "1".to_owned());
+            let channel = ("room".to_owned(), "subscriber".to_owned(), "1".to_owned());
+            map.write().unwrap().extend([
+                (old.clone(), "old-global".to_owned()),
+                (channel.clone(), "channel-badge".to_owned()),
+            ]);
+            let (definitions, requests) = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                async {
+                    let definitions = load_global_badges_from(
+                        badge_client(),
+                        Some(&auth),
+                        &format!("{base}/helix"),
+                        &format!("{base}/fallback"),
+                    )
+                    .await
+                    .unwrap();
+                    (definitions, server.await.unwrap())
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].starts_with("GET /helix "));
+            assert!(replace_badge_scope("", &map, definitions.clone()));
+            assert!(!replace_badge_scope("", &map, definitions));
+            let current = map.read().unwrap();
+            assert!(!current.contains_key(&old));
+            assert_eq!(current[&channel], "channel-badge");
+            assert_eq!(current.len(), if body == HELIX_BADGES { 2 } else { 1 });
+        }
+    }
+
+    #[tokio::test]
+    async fn global_badge_fallback_handles_rejected_or_malformed_primary_without_credentials() {
+        for (status, body) in [(401, ""), (200, "invalid"), (200, r#"{"data":[{}]}"#)] {
+            let (base, server) = serve_badges(vec![(status, body), (200, IVR_BADGES)]).await;
+            let auth = BadgeAuth::from_validated(Some("client"), "private-token").unwrap();
+            let (definitions, requests) = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                async {
+                    let definitions = load_global_badges_from(
+                        badge_client(),
+                        Some(&auth),
+                        &format!("{base}/helix"),
+                        &format!("{base}/fallback"),
+                    )
+                    .await
+                    .unwrap();
+                    (definitions, server.await.unwrap())
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(definitions.len(), 1);
+            assert_eq!(requests.len(), 2);
+            assert!(requests[0].starts_with("GET /helix "));
+            let fallback = requests[1].to_ascii_lowercase();
+            assert!(fallback.starts_with("get /fallback "));
+            assert!(!fallback.contains("authorization:"));
+            assert!(!fallback.contains("client-id:"));
+            assert!(!fallback.contains("private-token"));
+        }
+    }
+
+    #[tokio::test]
+    async fn anonymous_global_badges_skip_the_authenticated_endpoint() {
+        let (base, server) = serve_badges(vec![(200, IVR_BADGES)]).await;
+        let (definitions, requests) = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            async {
+                let definitions = load_global_badges_from(
+                    badge_client(),
+                    None,
+                    &format!("{base}/helix"),
+                    &format!("{base}/fallback"),
+                )
+                .await
+                .unwrap();
+                (definitions, server.await.unwrap())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /fallback "));
+        assert!(!requests[0].to_ascii_lowercase().contains("authorization:"));
     }
 
     #[tokio::test]
@@ -1164,30 +1306,30 @@ mod tests {
     }
 
     #[test]
-    fn badge_refresh_merges_changed_keys_and_preserves_other_channels() {
+    fn bundled_badges_fill_missing_keys_without_overwriting_newer_cached_urls() {
         let map = BadgeMap::default();
         let first = r#"[{"set_id":"subscriber","versions":[{"id":"1","image_url_1x":"https://example.test/first.png"}]}]"#;
         let second = r#"[{"set_id":"subscriber","versions":[{"id":"1","image_url_1x":"https://example.test/second.png"}]}]"#;
         assert_eq!(
-            merge_badge_response(first, "a", &map, parse_ivr_badge_response),
+            seed_badge_response(first, "a", &map, parse_ivr_badge_response),
             Some(1)
         );
         assert_eq!(
-            merge_badge_response(first, "b", &map, parse_ivr_badge_response),
+            seed_badge_response(first, "b", &map, parse_ivr_badge_response),
             Some(1)
         );
         assert_eq!(
-            merge_badge_response(first, "a", &map, parse_ivr_badge_response),
+            seed_badge_response(first, "a", &map, parse_ivr_badge_response),
             Some(0)
         );
         assert_eq!(
-            merge_badge_response(second, "a", &map, parse_ivr_badge_response),
-            Some(1)
+            seed_badge_response(second, "a", &map, parse_ivr_badge_response),
+            Some(0)
         );
         let map = map.read().unwrap();
         assert_eq!(
             resolve_badge_url(&map, "a", "subscriber", "1").as_deref(),
-            Some("https://example.test/second.png")
+            Some("https://example.test/first.png")
         );
         assert_eq!(
             resolve_badge_url(&map, "b", "subscriber", "1").as_deref(),
@@ -1200,15 +1342,15 @@ mod tests {
         let map = BadgeMap::default();
         let body = r#"[{"set_id":"subscriber","versions":[{"id":"1","image_url_1x":"https://example.test/shared.png"}]}]"#;
         assert_eq!(
-            merge_badge_response(body, "a", &map, parse_ivr_badge_response),
+            seed_badge_response(body, "a", &map, parse_ivr_badge_response),
             Some(1)
         );
         assert_eq!(
-            merge_badge_response(body, "b", &map, parse_ivr_badge_response),
+            seed_badge_response(body, "b", &map, parse_ivr_badge_response),
             Some(1)
         );
         assert_eq!(
-            merge_badge_response("invalid", "a", &map, parse_ivr_badge_response),
+            seed_badge_response("invalid", "a", &map, parse_ivr_badge_response),
             None
         );
         assert_eq!(map.read().unwrap().len(), 2);
@@ -1224,11 +1366,11 @@ mod tests {
             (parse_badges_v1_response, r#"{"badge_sets":{}}"#),
         ];
         for (parse, empty) in responses {
-            assert_eq!(merge_badge_response(empty, "room", &map, parse), Some(0));
-            assert_eq!(merge_badge_response("not json", "room", &map, parse), None);
-            assert_eq!(merge_badge_response("null", "room", &map, parse), None);
+            assert_eq!(seed_badge_response(empty, "room", &map, parse), Some(0));
+            assert_eq!(seed_badge_response("not json", "room", &map, parse), None);
+            assert_eq!(seed_badge_response("null", "room", &map, parse), None);
             assert_eq!(
-                merge_badge_response(r#"{"error":"unavailable"}"#, "room", &map, parse),
+                seed_badge_response(r#"{"error":"unavailable"}"#, "room", &map, parse),
                 None
             );
         }
@@ -1252,8 +1394,8 @@ mod tests {
             (key("b", "1"), "other-channel".to_owned()),
         ]);
         let definitions = BadgeDefinitions::from([(key("a", "1"), "current".to_owned())]);
-        assert!(replace_channel_badges("a", &map, definitions.clone()));
-        assert!(!replace_channel_badges("a", &map, definitions));
+        assert!(replace_badge_scope("a", &map, definitions.clone()));
+        assert!(!replace_badge_scope("a", &map, definitions));
         {
             let snapshot = map.read().unwrap();
             assert_eq!(
@@ -1272,7 +1414,7 @@ mod tests {
         }
         let empty =
             parse_badge_snapshot(r#"{"data":[]}"#, "a", parse_helix_badge_response).unwrap();
-        assert!(replace_channel_badges("a", &map, empty));
+        assert!(replace_badge_scope("a", &map, empty));
         let snapshot = map.read().unwrap();
         assert_eq!(snapshot.len(), 2);
         assert!(snapshot.keys().all(|(scope, _, _)| scope != "a"));

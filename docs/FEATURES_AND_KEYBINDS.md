@@ -36,6 +36,22 @@ commands. Kick and generic IRC support remain beta features.
   - reopen recently closed panes with their drafts, search, filters, and previous position
   - saved divider positions, focus, search fields, and filter selections restored at startup
 
+### Detached chats and overlays
+
+Open the chat header's options menu, then choose Chat windows > Open in new
+window or Open overlay. Up to 16 chat windows can be open. Each has its own
+composer, reply target, search, filters, emote picker, and scroll position.
+
+Window size, position, search, filters, and overlay settings survive a restart.
+Drafts and recently closed windows last for the session. Closing a channel's main
+tab keeps its detached chats connected; closing the last view leaves the channel.
+
+Use Chat windows > Manage chat windows to show or close a window, reopen a recently
+closed one, or restore its main tab. Reset position brings an offscreen window
+beside the main window. Overlays have a background-opacity control and an explicit
+Click-through mode. Use Interact in the manager to restore mouse and keyboard
+control of an overlay.
+
 ### Desktop UI shell
 
 - Join dialog and account/login switcher dialogs
@@ -50,11 +66,15 @@ commands. Kick and generic IRC support remain beta features.
 - Icon controls with visible keyboard focus and labels for accessibility tools
 - Layout controls that show the active layout and disable the sidebar when the
   window is too narrow
+- Crash reports and IRC status remain within small windows. Failed report deletions
+  stay available for retry; restarting from the report dialog saves through the
+  normal shutdown path.
 
 ### Messages and rendering
 
 - Message types rendered in chat include:
   - standard chat and actions
+  - announcements with sender details, badges, emotes, and the notice color
   - subscriptions, raids, bits, channel points redemptions
   - hype train begin/progress/end with progress bar + level + top contributor (`channel.hype_train.*` EventSub)
   - shared chat (cross-channel mirror) with source-channel chip, source mod/vip badges, and notification suppression for already-open source channels
@@ -273,7 +293,8 @@ found until you update the selection.
 - Ordered background log writes and an indexed Mentions query
 - Older local history paging, including messages with identical timestamps and rows without server IDs
 - Per-channel message search/filter UI
-- Cross-channel search with predicates such as `from:<user>`, `has:link`, `in:<channel>`, and `regex:"<pattern>"`
+- Cross-channel search with predicates such as `from:<user>`, `has:link`, `in:<channel>`, `is:announcement`, and `regex:"<pattern>"`
+- Saved expression filters can match announcements with `flags.announcement`.
 - Search navigation that follows input/result focus and leaves other controls' keys alone
 - Search results and recent messages in user cards use the chat renderer for
   emotes, badges, replies, subscription messages, links, and message actions
@@ -340,6 +361,8 @@ cancels an unfinished capture.
 | Ctrl+K | Open quick switch palette |
 | Ctrl+F | Open message search on active channel/pane |
 | Ctrl+Shift+F | Open cross-channel search popup (predicate DSL) |
+| Ctrl+, | Open settings |
+| Ctrl+W | Close the focused chat window, split, or channel tab |
 | Escape | Close quick switch or the focused search controls |
 | Ctrl+Tab, Ctrl+PageDown, Alt+Right | Next channel (prioritizes mentions/unread) |
 | Ctrl+Shift+Tab, Ctrl+PageUp, Alt+Left | Previous channel (prioritizes mentions/unread) |
@@ -351,6 +374,10 @@ cancels an unfinished capture.
 | Ctrl+= | Increase chat font size |
 | Ctrl+- | Decrease chat font size |
 | Ctrl+0 | Reset chat font size |
+
+In a detached chat, Ctrl+F searches that window. Ctrl+K, Ctrl+Shift+F, and Ctrl+,
+bring the main window forward for quick switch, cross-channel search, and settings.
+Ctrl+W closes only the detached window that has focus.
 
 ### Chat panes
 

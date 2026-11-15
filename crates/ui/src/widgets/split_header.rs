@@ -24,6 +24,9 @@ pub struct SplitHeaderResult {
     pub split: Option<SplitAxis>,
     pub reopen_clicked: bool,
     pub filters_clicked: bool,
+    pub open_window_clicked: bool,
+    pub open_overlay_clicked: bool,
+    pub manage_windows_clicked: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -268,6 +271,20 @@ fn show_split_menu(
             ui.close_menu();
         }
     }
+    ui.menu_button(RichText::new("Chat windows").font(t::small()), |ui| {
+        if can_search && ui.button(RichText::new("Open in new window").font(t::small())).clicked() {
+            result.open_window_clicked = true;
+            ui.close_menu();
+        }
+        if can_search && ui.button(RichText::new("Open overlay").font(t::small())).clicked() {
+            result.open_overlay_clicked = true;
+            ui.close_menu();
+        }
+        if ui.button(RichText::new("Manage chat windows").font(t::small())).clicked() {
+            result.manage_windows_clicked = true;
+            ui.close_menu();
+        }
+    });
     if ui
         .button(RichText::new("Close split").font(t::small()))
         .clicked()

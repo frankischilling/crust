@@ -482,6 +482,7 @@ fn identifier_palette() -> Vec<(&'static str, &'static [&'static str])> {
             "flags",
             &[
                 "flags.action",
+                "flags.announcement",
                 "flags.highlighted",
                 "flags.first_message",
                 "flags.sub_message",

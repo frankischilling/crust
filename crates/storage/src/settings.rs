@@ -429,6 +429,8 @@ pub struct AppSettings {
     pub split_layout: Option<crust_core::model::PaneLayout>,
     #[serde(default)]
     pub split_pane_views: Vec<crust_core::model::PaneViewSettings>,
+    #[serde(default)]
+    pub detached_chats: Vec<crust_core::model::DetachedChatSettings>,
 }
 
 /// Only known setting values may enter diagnostic output. Other strings can
@@ -562,10 +564,14 @@ impl AppSettings {
         let focused = snapshot.focused.min(panes.len().saturating_sub(1));
         let layout = snapshot.layout.and_then(|layout| layout.validated(panes.len()));
         let views: Vec<_> = snapshot.views.into_iter().take(panes.len().max(1)).collect();
+        let detached_chats: Vec<_> = snapshot.detached_chats.into_iter()
+            .take(crust_core::model::MAX_DETACHED_CHATS)
+            .map(crust_core::model::DetachedChatSettings::normalized).collect();
         let changed = self.last_active_channel != snapshot.active_channel
             || self.split_panes_focused != focused
             || self.split_layout != layout
             || self.split_pane_views != views
+            || self.detached_chats != detached_chats
             || self.split_panes.len() != panes.len()
             || self.split_panes.iter().zip(&panes)
                 .any(|(left, right)| left.channel != right.channel || (left.frac - right.frac).abs() > 0.001);
@@ -575,6 +581,7 @@ impl AppSettings {
             self.split_panes_focused = focused;
             self.split_layout = layout;
             self.split_pane_views = views;
+            self.detached_chats = detached_chats;
         }
         changed
     }
@@ -730,6 +737,7 @@ impl Default for AppSettings {
             split_panes_focused: 0,
             split_layout: None,
             split_pane_views: Vec::new(),
+            detached_chats: Vec::new(),
         }
     }
 }
@@ -1115,6 +1123,31 @@ mod tests {
         assert_eq!(settings.last_active_channel, "first");
         assert_eq!(settings.split_pane_views[0].search.keyword, "final query");
         assert_eq!(settings.split_pane_views[0].filters, Some(Vec::new()));
+    }
+
+    #[test]
+    fn detached_chat_settings_round_trip_geometry_views_and_tab_visibility() {
+        use crust_core::model::{DetachedChatSettings, PaneLayoutSnapshot, PaneSearchSettings, PaneViewSettings, MAX_DETACHED_CHATS};
+        let mut settings: AppSettings = toml::from_str("").unwrap();
+        assert!(settings.detached_chats.is_empty());
+        let window = DetachedChatSettings {
+            channel: "room".into(), channel_tab_visible: false, position: Some([-1280.0, 64.0]),
+            size: [640.0, 480.0], overlay: true, click_through: true, background_opacity: 0.35,
+            view: PaneViewSettings {
+                search: PaneSearchSettings { open: true, keyword: "café 🙂".into(), regex: "hello.*".into(), ..Default::default() },
+                filters: Some(Vec::new()),
+            },
+            ..Default::default()
+        };
+        let snapshot = PaneLayoutSnapshot { detached_chats: vec![window.clone(); MAX_DETACHED_CHATS + 2], ..Default::default() };
+        assert!(settings.apply_pane_layout(snapshot.clone()));
+        assert!(!settings.apply_pane_layout(snapshot));
+        assert_eq!(settings.detached_chats.len(), MAX_DETACHED_CHATS);
+        let encoded = toml::to_string(&settings).unwrap();
+        let restored: AppSettings = toml::from_str(&encoded).unwrap();
+        assert_eq!(restored.detached_chats, vec![window; MAX_DETACHED_CHATS]);
+        assert!(settings.apply_pane_layout(PaneLayoutSnapshot::default()));
+        assert!(settings.detached_chats.is_empty());
     }
 
     #[test]

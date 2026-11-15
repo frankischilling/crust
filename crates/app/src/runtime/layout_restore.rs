@@ -84,6 +84,13 @@ pub(crate) fn startup_restore_event(
         split_panes_focused: focused,
         split_layout,
         split_views,
+        detached_chats: settings.detached_chats.iter().filter_map(|window| {
+            let channel = restore_channel(&window.channel)?;
+            if channel.is_virtual() { return None; }
+            let mut window = window.clone().normalized();
+            window.channel = channel.0;
+            Some(window)
+        }).take(crust_core::model::MAX_DETACHED_CHATS).collect(),
         whispers_visible: settings.whispers_panel_visible,
         last_whisper_login: settings.last_whisper_login.clone(),
     }
@@ -269,5 +276,16 @@ mod tests {
         assert_eq!(split_panes_focused, 4);
         assert!(whispers_visible);
         assert_eq!(last_whisper_login, "friend");
+    }
+
+    #[test]
+    fn startup_detached_chats_keep_duplicate_views_and_prune_unavailable_channels() {
+        use crust_core::model::DetachedChatSettings;
+        let window = |channel: &str| DetachedChatSettings { channel: channel.into(), ..Default::default() };
+        let settings = AppSettings { detached_chats: vec![window("gone"), window("twitch:ROOM"),
+            window("room"), window("kick:room"), window(ChannelId::mentions().as_str())], ..Default::default() };
+        let AppEvent::RestoreLastActiveChannel { detached_chats, .. } = startup_restore_event(&settings,
+            &[ChannelId::new("room"), ChannelId::kick("room")], false, false) else { panic!() };
+        assert_eq!(detached_chats.iter().map(|window| window.channel.as_str()).collect::<Vec<_>>(), ["room", "room"]);
     }
 }

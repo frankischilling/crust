@@ -14,6 +14,7 @@
 - [7TV paints, image loading, and chat controls](./AUDIT_NAME_PAINTS.md)
 - [Search, subscriber messages, and live updates](./AUDIT_SEARCH_AND_LIVE_UPDATES.md)
 - [Pane layouts, rich message views, and emote loading](./AUDIT_PANE_VIEWS.md)
+- [Chat windows, search, and recovery](./AUDIT_CHAT_WINDOWS.md)
 
 ## Plugins
 
@@ -30,6 +31,7 @@
 
 ## Release notes
 
+- [v0.7.0](./releases/Release_v0.7.0.md)
 - [v0.6.0](./releases/Release_v0.6.0.md)
 - [v0.5.9](./releases/Release_v0.5.9.md)
 - [v0.5.8](./releases/Release_v0.5.8.md)

@@ -127,7 +127,7 @@ fn compute_stats(
         }
 
         let bits_amount = match &msg.msg_kind {
-            MsgKind::Chat => None,
+            MsgKind::Chat | MsgKind::Announcement { .. } => None,
             MsgKind::Bits { amount } => Some(*amount as u64),
             MsgKind::Sub { .. } => {
                 sub_count = sub_count.saturating_add(1);
@@ -1128,6 +1128,21 @@ mod tests {
         assert_eq!(stats.total_msgs, 2);
         assert!((stats.avg_msg_len - 4.0).abs() < 0.001);
         assert!((stats.emote_msg_pct - 50.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn announcements_count_as_chat_activity_with_sender_and_emote_metrics() {
+        let mut channel = ChannelState::new(ChannelId::new("test"));
+        channel.push_message(make_message(1, Utc::now(), "moderator", "Kappa",
+            MsgKind::Announcement { color: "green".into() }, vec![],
+            vec![TwitchEmotePos { id: "25".into(), start: 0, end: 4 }]));
+        let stats = compute_stats(&channel, TimeWindow::All, None);
+        assert_eq!(stats.total_msgs, 1);
+        assert_eq!(stats.unique_chatters, 1);
+        assert_eq!(stats.top_chatters, [("moderator".to_owned(), 1)]);
+        assert_eq!(stats.top_emotes, [("Kappa".to_owned(), 1)]);
+        assert_eq!(stats.avg_msg_len, 5.0);
+        assert_eq!(stats.emote_msg_pct, 100.0);
     }
 
     #[test]

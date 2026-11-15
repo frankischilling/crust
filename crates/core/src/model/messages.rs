@@ -50,6 +50,12 @@ pub enum MsgKind {
     /// Ordinary chat message.
     #[default]
     Chat,
+    /// Moderator announcement with an ordinary sender and chat body.
+    Announcement {
+        /// Twitch banner color: primary, blue, green, orange, or purple.
+        #[serde(default)]
+        color: String,
+    },
     /// Sub / resub / gift-sub notification (USERNOTICE).
     Sub {
         display_name: String,

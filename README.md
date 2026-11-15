@@ -3,14 +3,15 @@
 A native Twitch chat client written in Rust, with an `egui` desktop UI.
 
 Crust is an early-stage hobby project. It supports multiple channels and accounts,
-split chat panes, moderation tools, emotes, and Lua plugins. APIs and internals
-may change. Kick support is incomplete and unstable; generic IRC support is also
+split chat panes, detached windows, moderation tools, emotes, and Lua plugins.
+APIs and internals may change. Kick support is incomplete and unstable; generic IRC support is also
 in beta.
 
 ## Features
 
 - Twitch chat over IRC/WebSocket, with anonymous reading and authenticated chat
 - Tabs, a sidebar, nested horizontal and vertical chat panes, and a quick switch palette
+- Detached chat windows and transparent overlays with independent drafts, search, and filters
 - Twitch, BTTV, FFZ, and 7TV emotes, including animation and overlays, badges, and sender cosmetics
 - Reply threads, whispers, search, local history, highlights, and notification sounds
 - Moderation queues, user cards, polls, predictions, and channel-points tools
@@ -56,14 +57,10 @@ for current settings and account-dialog captures.
 
 - [Documentation index](docs/HOME.md)
 - [Features and keybinds](docs/FEATURES_AND_KEYBINDS.md)
-- [Chat controls and performance audit](docs/AUDIT_STABILITY.md)
-- [Chat loading, emotes, and navigation audit](docs/AUDIT_CHAT_RELIABILITY.md)
-- [Chat rendering, input, and saved-layout audit](docs/AUDIT_CHAT_POLISH.md)
-- [7TV paints, image loading, and chat controls](docs/AUDIT_NAME_PAINTS.md)
-- [Pane layouts, rich message views, and emote loading](docs/AUDIT_PANE_VIEWS.md)
+- [Chat windows, search, and recovery audit](docs/AUDIT_CHAT_WINDOWS.md)
 - [Plugin API reference](docs/API.md)
 - [Example plugins](plugins/)
-- [Release notes v0.6.0](docs/releases/Release_v0.6.0.md)
+- [Release notes v0.7.0](docs/releases/Release_v0.7.0.md)
 
 ## Data paths
 

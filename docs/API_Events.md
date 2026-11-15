@@ -337,6 +337,7 @@ whitespace. The original spans remain available for copying and logging.
 The nested `msg_kind` table includes a `type` field and then variant-specific fields:
 
 - `Chat`
+- `Announcement`: `color`
 - `Sub`: `display_name`, `months`, `plan`, `is_gift`, `sub_msg`
 - `Raid`: `display_name`, `viewer_count`
 - `Timeout`: `login`, `seconds`
@@ -349,6 +350,10 @@ The nested `msg_kind` table includes a `type` field and then variant-specific fi
 
 For `ChannelPointsReward`, `reward_id`, `redemption_id`, `user_input`, and
 `status` are omitted when unavailable.
+
+Announcements retain the sender, badges, message ID, timestamp, and emote spans.
+Their `color` is the lowercase notice color, such as `primary`, `blue`, `green`,
+`orange`, or `purple`. Shared-chat announcements also retain their source metadata.
 
 ### `c2.EventType.WhisperReceived`
 

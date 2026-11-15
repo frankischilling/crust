@@ -2568,9 +2568,9 @@ impl<'a> MessageList<'a> {
         if msg.channel.is_twitch() {
             sender_cosmetics::remember_sender(ui.ctx(), &msg.sender);
         }
-        // Dispatch non-chat (and non-bits) events to the compact system-event renderer.
+        // Announcements keep the ordinary sender, emote, and message interactions.
         match &msg.msg_kind {
-            MsgKind::Chat | MsgKind::Bits { .. } => {}
+            MsgKind::Chat | MsgKind::Announcement { .. } | MsgKind::Bits { .. } => {}
             MsgKind::SuspiciousUserMessage => {
                 self.render_suspicious_user_message(
                     ui,
@@ -5082,13 +5082,25 @@ fn redemption_accent(status: Option<&str>) -> Color32 {
     color
 }
 
+fn announcement_accent(color: &str) -> Color32 {
+    match color {
+        "blue" => t::link(),
+        "green" => t::green(),
+        "orange" => t::bits_orange(),
+        "purple" => t::twitch_purple(),
+        _ => t::accent(),
+    }
+}
+
 fn notification_label(
     flags: &MessageFlags,
     kind: &MsgKind,
     keyword_highlight: bool,
     keyword_highlight_color: Option<Color32>,
 ) -> Option<(&'static str, Color32)> {
-    if keyword_highlight {
+    if let MsgKind::Announcement { color } = kind {
+        Some(("Announcement", announcement_accent(color)))
+    } else if keyword_highlight {
         Some((
             "Keyword Highlight",
             keyword_highlight_color.unwrap_or_else(t::twitch_purple),
@@ -5146,6 +5158,8 @@ fn message_row_background(
         }
     } else if flags.is_mention {
         t::alpha(t::bits_orange(), 24)
+    } else if let MsgKind::Announcement { color } = kind {
+        t::alpha(announcement_accent(color), 18)
     } else if let MsgKind::ChannelPointsReward { status, .. } = kind {
         let accent = redemption_accent(status.as_deref());
         t::alpha(accent, 16)
@@ -5183,6 +5197,8 @@ fn message_left_accent_color(
         Some(t::accent())
     } else if keyword_highlight {
         Some(keyword_highlight_color.unwrap_or_else(t::twitch_purple))
+    } else if let MsgKind::Announcement { color } = kind {
+        Some(announcement_accent(color))
     } else if let MsgKind::ChannelPointsReward { status, .. } = kind {
         Some(redemption_accent(status.as_deref()))
     } else if flags.custom_reward_id.is_some() && flags.is_highlighted {
@@ -5578,6 +5594,51 @@ mod tests {
             },
         );
         (output, response, row_spacing)
+    }
+
+    #[test]
+    fn announcement_rows_keep_the_banner_sender_emotes_and_wrapped_body() {
+        for color in ["primary", "blue", "green", "orange", "purple"] {
+            let ctx = egui::Context::default();
+            let (sender, _receiver) = tokio::sync::mpsc::channel(8);
+            let sender = UiCommandSender::new(sender);
+            let mut message = test_msg("alice", "10", None);
+            message.raw_text = "Kappa announcement-start alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa quebec romeo sierra tango announcement-end".into();
+            message.twitch_emotes = crust_core::format::parse_twitch_emotes_tag("25:0-4");
+            message.spans = crust_core::format::tokenize_with_flags(
+                &message.raw_text, false, &message.twitch_emotes, &|_| None,
+            );
+            message.msg_kind = MsgKind::Announcement { color: color.into() };
+            let messages = VecDeque::from([message]);
+            for _ in 0..3 { wrapping_message_frame(&ctx, &messages, &sender, Vec::new()); }
+            let (output, response, _) = wrapping_message_frame(&ctx, &messages, &sender, Vec::new());
+            let row = response.expect("announcement row is interactive").rect;
+            let header = body_text_rect(&output, "Announcement").expect("announcement header");
+            let text: Vec<_> = output.shapes.iter().filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text),
+                _ => None,
+            }).collect();
+            assert_eq!(text.iter().filter(|text| text.galley.text() == "Announcement").count(), 1);
+            assert!(text.iter().any(|text| text.galley.text().contains("alice")));
+            assert!(text.iter().any(|text| text.galley.text() == "Kappa"));
+            assert!(text.iter().any(|text| text.galley.text().contains("announcement-end")));
+            let first = text.iter().find(|text| text.galley.text().contains("announcement-start")).unwrap();
+            let last = text.iter().find(|text| text.galley.text().contains("announcement-end")).unwrap();
+            assert!(last.pos.y > first.pos.y, "long announcement text must wrap below its first line");
+            for text in [first, last] {
+                let visible_lines: Vec<_> = text.galley.rows.iter()
+                    .filter(|line| line.glyphs.iter().any(|glyph| !glyph.chr.is_whitespace())).collect();
+                assert!(!visible_lines.is_empty(), "announcement body word must contain visible glyphs");
+                for line in visible_lines {
+                    let bounds = line.visuals.mesh_bounds.translate(text.pos.to_vec2());
+                    assert!(row.expand(1.0).contains_rect(bounds),
+                        "announcement text escaped its row: {color}, {:?}, {bounds:?} vs {row:?}", text.galley.text());
+                }
+            }
+            assert!(row.expand(1.0).contains_rect(header));
+            assert_eq!(notification_label(&messages[0].flags, &messages[0].msg_kind, false, None),
+                Some(("Announcement", announcement_accent(color))));
+        }
     }
 
     #[test]

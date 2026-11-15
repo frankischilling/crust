@@ -143,6 +143,7 @@ fn split_subtiers(v: &str) -> Vec<char> {
 fn flag_kind(v: &str) -> Option<FlagKind> {
     match v.to_lowercase().as_str() {
         "highlighted" | "highlight" => Some(FlagKind::Highlighted),
+        "announcement" => Some(FlagKind::Announcement),
         "sub" | "subscription" => Some(FlagKind::Sub),
         "reply" => Some(FlagKind::Reply),
         "action" | "me" => Some(FlagKind::Action),

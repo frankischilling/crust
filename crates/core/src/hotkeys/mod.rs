@@ -71,6 +71,8 @@ pub enum HotkeyAction {
     ToggleGlobalSearch,
     OpenMessageSearch,
     OpenQuickSwitcher,
+    OpenSettings,
+    CloseChannel,
     NextTab,
     PrevTab,
     MoveTabLeft,
@@ -124,7 +126,7 @@ pub enum HotkeyAction {
 
 impl HotkeyAction {
     /// Stable iteration order matching the settings UI layout.
-    pub fn all() -> [HotkeyAction; 47] {
+    pub fn all() -> [HotkeyAction; 49] {
         [
             Self::ZoomIn,
             Self::ZoomOut,
@@ -132,6 +134,8 @@ impl HotkeyAction {
             Self::ToggleGlobalSearch,
             Self::OpenMessageSearch,
             Self::OpenQuickSwitcher,
+            Self::OpenSettings,
+            Self::CloseChannel,
             Self::NextTab,
             Self::PrevTab,
             Self::MoveTabLeft,
@@ -186,6 +190,8 @@ impl HotkeyAction {
             Self::ToggleGlobalSearch => "toggle_global_search",
             Self::OpenMessageSearch => "open_message_search",
             Self::OpenQuickSwitcher => "open_quick_switcher",
+            Self::OpenSettings => "open_settings",
+            Self::CloseChannel => "close_channel",
             Self::NextTab => "next_tab",
             Self::PrevTab => "prev_tab",
             Self::MoveTabLeft => "move_tab_left",
@@ -241,7 +247,9 @@ impl HotkeyAction {
             | Self::ZoomReset
             | Self::ToggleGlobalSearch
             | Self::OpenMessageSearch
-            | Self::OpenQuickSwitcher => HotkeyCategory::Window,
+            | Self::OpenQuickSwitcher
+            | Self::OpenSettings
+            | Self::CloseChannel => HotkeyCategory::Window,
             Self::NextTab
             | Self::PrevTab
             | Self::MoveTabLeft
@@ -295,6 +303,8 @@ impl HotkeyAction {
             Self::ToggleGlobalSearch => "Toggle global message search",
             Self::OpenMessageSearch => "Search in current channel",
             Self::OpenQuickSwitcher => "Open quick switcher",
+            Self::OpenSettings => "Open settings",
+            Self::CloseChannel => "Close focused chat view",
             Self::NextTab => "Next channel tab",
             Self::PrevTab => "Previous channel tab",
             Self::MoveTabLeft => "Move tab left",
@@ -465,6 +475,8 @@ impl HotkeyBindings {
             HotkeyAction::OpenQuickSwitcher,
             KeyBinding::new("K").with_ctrl(),
         );
+        map.insert(HotkeyAction::OpenSettings, KeyBinding::new("Comma").with_ctrl());
+        map.insert(HotkeyAction::CloseChannel, KeyBinding::new("W").with_ctrl());
         // Tab navigation
         map.insert(HotkeyAction::NextTab, KeyBinding::new("Tab").with_ctrl());
         map.insert(
@@ -722,6 +734,21 @@ mod tests {
     #[test]
     fn defaults_have_no_conflicts() {
         assert!(HotkeyBindings::defaults().conflicts().is_empty());
+    }
+
+    #[test]
+    fn chat_window_bindings_migrate_and_detect_composer_conflicts() {
+        let mut bindings = HotkeyBindings::from_pairs([
+            ("open_settings".to_owned(), KeyBinding::new("F10")),
+            ("input_send".to_owned(), KeyBinding::new("F2")),
+        ]);
+        assert_eq!(bindings.get(HotkeyAction::CloseChannel), KeyBinding::new("W").with_ctrl());
+        assert_eq!(bindings.get(HotkeyAction::OpenSettings), KeyBinding::new("F10"));
+        assert_eq!(bindings, HotkeyBindings::from_pairs(bindings.to_pairs()));
+        assert_eq!(bindings.find_conflict(HotkeyAction::CloseChannel, &KeyBinding::new("F2")), Some(HotkeyAction::InputSend));
+        bindings.set(HotkeyAction::CloseChannel, KeyBinding::new("F2"));
+        assert!(bindings.conflicts().contains(&HotkeyAction::CloseChannel));
+        assert!(bindings.conflicts().contains(&HotkeyAction::InputSend));
     }
 
     #[test]

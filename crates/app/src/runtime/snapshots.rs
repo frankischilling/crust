@@ -297,7 +297,7 @@ mod tests {
     fn fixture() -> (BadgeRequests, BadgeMap) {
         let requests = BadgeRequests {
             publish: |channel, map, definitions| {
-                super::super::badges::replace_channel_badges(channel, map, definitions);
+                super::super::badges::replace_badge_scope(channel, map, definitions);
             },
             ..Default::default()
         };

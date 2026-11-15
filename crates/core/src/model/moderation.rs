@@ -100,7 +100,7 @@ impl ModerationAction {
 fn is_chat_message(message: &ChatMessage) -> bool {
     matches!(
         message.msg_kind,
-        MsgKind::Chat | MsgKind::Bits { .. } | MsgKind::SuspiciousUserMessage
+        MsgKind::Chat | MsgKind::Announcement { .. } | MsgKind::Bits { .. } | MsgKind::SuspiciousUserMessage
     ) || matches!(&message.msg_kind, MsgKind::Sub { sub_msg, .. } if !sub_msg.is_empty())
 }
 
@@ -352,6 +352,31 @@ mod tests {
         notice.msg_kind = MsgKind::SystemInfo;
         state.apply(&mut notice);
         assert!(!notice.flags.is_deleted);
+    }
+
+    #[test]
+    fn announcements_follow_retained_and_late_moderation_without_deleting_newer_rows() {
+        let channel = ChannelId::new("room");
+        for action in [
+            ModerationAction::user(channel.clone(), "alice".into(), Some("10".into()),
+                Some(Utc.timestamp_millis_opt(1000).unwrap())),
+            ModerationAction::channel(channel.clone(), Some(Utc.timestamp_millis_opt(1000).unwrap())),
+        ] {
+            let announcement = |id: &str, timestamp| {
+                let mut row = message(id, "room", "10", timestamp);
+                row.msg_kind = MsgKind::Announcement { color: "orange".into() };
+                row
+            };
+            let state = ModerationState::default();
+            let mut rows = [announcement("old", 999), announcement("new", 1001)];
+            state.apply_to_retained(&action, &mut rows);
+            assert!(rows[0].flags.is_deleted);
+            assert!(!rows[1].flags.is_deleted);
+            let mut history = announcement("history", 999);
+            state.apply(&mut history);
+            assert!(history.flags.is_deleted);
+            assert_eq!(history.raw_text, "original text");
+        }
     }
 
     #[test]

@@ -298,11 +298,28 @@ impl IrcStatusPanel {
             }
         }
 
-        egui::Window::new("IRC Status")
+        let bounds = ctx.screen_rect().shrink(8.0);
+        let style = ctx.style();
+        let frame = egui::Frame::window(&style);
+        let heading = egui::TextStyle::Heading.resolve(&style);
+        let title_height = ctx
+            .fonts(|fonts| fonts.row_height(&heading))
+            .max(style.spacing.interact_size.y)
+            + frame.inner_margin.sum().y
+            + frame.stroke.width;
+        let max_size = (bounds.size() - frame.total_margin().sum() - egui::vec2(0.0, title_height))
+            .max(egui::Vec2::splat(1.0));
+
+        egui::Window::new("IRC status")
+            .id(egui::Id::new("irc_status_window"))
             .open(&mut open)
-            .default_size(egui::vec2(760.0, 760.0))
-            .default_pos(egui::pos2(90.0, 60.0))
-            .min_width(520.0)
+            .frame(frame)
+            .constrain_to(bounds)
+            .min_size(egui::vec2(160.0, 100.0).min(max_size))
+            .max_size(max_size)
+            .default_size(egui::vec2(760.0, 760.0).min(max_size))
+            .default_pos(bounds.min)
+            .scroll([true, true])
             .show(ctx, |ui| {
                 if keys.is_empty() {
                     ui.label(
@@ -386,59 +403,50 @@ impl IrcStatusPanel {
                 });
                 ui.add_space(6.0);
 
-                egui::ScrollArea::vertical()
-                    .id_salt(egui::Id::new("irc_status_scroll").with(sel.label()))
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        Self::section_frame(
-                            ui,
-                            "1. Connection Overview",
-                            "Network, identity, and keepalive state",
-                            |ui| Self::show_connection_overview(ui, server),
-                        );
-                        ui.add_space(8.0);
-                        Self::section_frame(
-                            ui,
-                            "2. Channel State",
-                            "Selected channel metadata and membership snapshot",
-                            |ui| Self::show_channel_state(ui, server, active_channel, &sel),
-                        );
-                        ui.add_space(8.0);
-                        Self::section_frame(
-                            ui,
-                            "3. IRC Protocol Status",
-                            "Capabilities, numerics, and protocol-level state",
-                            |ui| Self::show_protocol_status(ui, server),
-                        );
-                        ui.add_space(8.0);
-                        Self::section_frame(
-                            ui,
-                            "4. Traffic / Performance",
-                            "Counters and rate metrics",
-                            |ui| Self::show_traffic_panel(ui, server),
-                        );
-                        ui.add_space(8.0);
-                        Self::section_frame(
-                            ui,
-                            "5. Security",
-                            "TLS/SASL/identity security posture",
-                            |ui| Self::show_security_panel(ui, server),
-                        );
-                        ui.add_space(8.0);
-                        Self::section_frame(
-                            ui,
-                            "6. Status / Event Log",
-                            "Live categorized IRC lifecycle and protocol events",
-                            |ui| Self::show_event_log(ui, server, &sel),
-                        );
-                        ui.add_space(8.0);
-                        Self::section_frame(
-                            ui,
-                            "7. Per-User Inspect",
-                            "WHOIS cache inspector",
-                            |ui| Self::show_user_inspect(ui, server, &sel),
-                        );
+                ui.push_id(("irc_status_contents", sel.label()), |ui| {
+                    Self::section_frame(
+                        ui,
+                        "Connection",
+                        "Network, identity, and keepalive state",
+                        |ui| Self::show_connection_overview(ui, server),
+                    );
+                    ui.add_space(8.0);
+                    Self::section_frame(
+                        ui,
+                        "Channel",
+                        "Selected channel metadata and membership snapshot",
+                        |ui| Self::show_channel_state(ui, server, active_channel, &sel),
+                    );
+                    ui.add_space(8.0);
+                    Self::section_frame(
+                        ui,
+                        "Protocol",
+                        "Capabilities, numerics, and protocol-level state",
+                        |ui| Self::show_protocol_status(ui, server),
+                    );
+                    ui.add_space(8.0);
+                    Self::section_frame(ui, "Traffic", "Counters and rate metrics", |ui| {
+                        Self::show_traffic_panel(ui, server)
                     });
+                    ui.add_space(8.0);
+                    Self::section_frame(
+                        ui,
+                        "Security",
+                        "TLS/SASL/identity security posture",
+                        |ui| Self::show_security_panel(ui, server),
+                    );
+                    ui.add_space(8.0);
+                    Self::section_frame(
+                        ui,
+                        "Event log",
+                        "Live categorized IRC lifecycle and protocol events",
+                        |ui| Self::show_event_log(ui, server, &sel),
+                    );
+                    ui.add_space(8.0);
+                    Self::section_frame(ui, "User details", "WHOIS cache inspector", |ui| {
+                        Self::show_user_inspect(ui, server, &sel)
+                    });
+                });
             });
 
         open
@@ -1606,4 +1614,50 @@ fn fmt_uptime(connected_since: Option<Instant>) -> String {
     connected_since
         .map(|t| fmt_duration_secs(t.elapsed().as_secs()))
         .unwrap_or_else(|| "n/a".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_window_fits_small_viewports_with_empty_and_populated_servers() {
+        for size in [egui::vec2(220.0, 200.0), egui::vec2(480.0, 320.0)] {
+            for populated in [false, true] {
+                let ctx = Context::default();
+                let mut panel = IrcStatusPanel::default();
+                if populated {
+                    let key = IrcServerKey {
+                        host: "a-long-hostname-for-a-server.example.org".into(),
+                        port: 6697,
+                        tls: true,
+                    };
+                    let server = panel.ensure_server(&key);
+                    server.current_nick = Some("a-long-current-nickname".into());
+                    server.ensure_channel("channel").topic =
+                        Some("A long channel topic. ".repeat(30));
+                }
+                for _ in 0..4 {
+                    let _ = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            assert!(panel.show(ctx, true, None));
+                        },
+                    );
+                }
+                let bounds = ctx
+                    .memory(|memory| memory.area_rect(egui::Id::new("irc_status_window")))
+                    .unwrap();
+                assert!(
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, size)
+                        .expand(1.0)
+                        .contains_rect(bounds),
+                    "status dialog {bounds:?} escaped {size:?}, populated={populated}"
+                );
+            }
+        }
+    }
 }

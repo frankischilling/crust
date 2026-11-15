@@ -6,7 +6,7 @@ pub mod providers;
 pub mod session;
 
 pub use irc::parse_line;
-pub use session::client::{parse_privmsg_irc, TwitchSession};
+pub use session::client::{parse_privmsg_irc, parse_usernotice_irc, TwitchSession};
 
 use thiserror::Error;
 

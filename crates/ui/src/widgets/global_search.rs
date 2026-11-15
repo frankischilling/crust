@@ -19,6 +19,19 @@ pub struct SearchHit {
 
 type SearchLayoutCache = MessagePreviewCache;
 
+// Keep the last height as an estimate when its exact measurement is invalidated.
+#[derive(Clone, Copy)]
+struct SearchRowEstimate {
+    stride: f32,
+    generation: u64,
+}
+
+#[derive(Clone, Copy)]
+struct SearchScrollAnchor {
+    id: Id,
+    top: f32,
+}
+
 /// Persistent state for the global search popup.
 #[derive(Default)]
 pub struct GlobalSearchState {
@@ -36,6 +49,9 @@ pub struct GlobalSearchState {
     focused_control: Option<Id>,
     focused_result: Option<Id>,
     layout_cache: SearchLayoutCache,
+    row_estimates: HashMap<Id, SearchRowEstimate>,
+    scroll_anchors: Vec<SearchScrollAnchor>,
+    last_viewport_offset: Option<f32>,
     pub load_older_pending: HashMap<ChannelId, std::time::Instant>,
 }
 
@@ -67,6 +83,9 @@ impl GlobalSearchState {
         self.regex_error = None;
         self.results.clear();
         self.layout_cache = SearchLayoutCache::default();
+        self.row_estimates.clear();
+        self.scroll_anchors.clear();
+        self.last_viewport_offset = None;
         self.selected_idx = 0;
         self.last_parsed_input.clear();
         self.parsed.clear();
@@ -445,13 +464,21 @@ fn render_results(
     let focused = ui.ctx().memory(|memory| memory.focused());
     state.focused_result = None;
     let mut cache = std::mem::take(&mut state.layout_cache);
+    let previous_anchors: HashMap<_, _> = state.scroll_anchors.iter().enumerate()
+        .map(|(index, anchor)| (anchor.id, (index, anchor.top))).collect();
+    let mut anchor_adjustment: Option<(usize, SearchScrollAnchor, f32)> = None;
+    let mut visible_anchors = Vec::new();
+    let mut viewport_offset = 0.0;
 
-    let scroll = ScrollArea::vertical()
+    let mut scroll = ScrollArea::vertical()
+        .animated(false)
         .auto_shrink([false, false])
         .show_viewport(ui, |ui, viewport| {
             cache.prepare(ui, &preview);
+            viewport_offset = viewport.min.y;
             if state.results.is_empty() {
                 cache.rows.clear();
+                state.row_estimates.clear();
                 ui.add_space(12.0);
                 ui.label(
                     RichText::new(if state.input.trim().is_empty() {
@@ -475,6 +502,12 @@ fn render_results(
             let mut running_idx = 0usize;
             let origin_y = ui.next_widget_position().y;
             let mut skipped_stride = 0.0;
+            let line_height = ui.text_style_height(&egui::TextStyle::Body).max(1.0);
+            let default_stride = line_height * 2.0 + ui.spacing().item_spacing.y;
+            // Measure enough preceding rows for a distant selection to land with
+            // an exact viewport around it, even after a large width change.
+            let jump_rows = (viewport.height() / line_height).ceil() as usize + 2;
+            let jump_start = state.selected_idx.saturating_sub(jump_rows);
             for hits_in_group in state.results.chunk_by(|a, b| a.channel == b.channel) {
                 skip_measured_rows(ui, skipped_stride);
                 skipped_stride = 0.0;
@@ -493,12 +526,24 @@ fn render_results(
                     let row_id = search_hit_id(hit);
                     let signature = preview.signature(&hit.message);
                     let cached_stride = cache.stride(row_id, signature);
+                    let estimate = state.row_estimates.entry(row_id).or_insert(SearchRowEstimate {
+                        stride: default_stride,
+                        generation: cache.generation,
+                    });
+                    estimate.generation = cache.generation;
+                    let stride = cached_stride.unwrap_or(estimate.stride);
                     let top = ui.next_widget_position().y - origin_y + skipped_stride;
-                    let force_render = (selected && scroll_to_selected) || focused == Some(row_id);
-                    if !force_render && cached_stride.is_some_and(|stride| {
-                        top + stride < viewport.min.y || top > viewport.max.y
-                    }) {
-                        skipped_stride += cached_stride.unwrap_or_default();
+                    if let Some(&(priority, old_top)) = previous_anchors.get(&row_id) {
+                        if anchor_adjustment.as_ref().is_none_or(|(best, _, _)| priority < *best) {
+                            anchor_adjustment = Some((priority,
+                                SearchScrollAnchor { id: row_id, top }, top - old_top));
+                        }
+                    }
+                    let force_render = (scroll_to_selected
+                        && (jump_start..=state.selected_idx).contains(&running_idx))
+                        || focused == Some(row_id);
+                    if !force_render && (top + stride < viewport.min.y || top > viewport.max.y) {
+                        skipped_stride += stride;
                         running_idx += 1;
                         continue;
                     }
@@ -511,8 +556,13 @@ fn render_results(
                     }
                     output.message_actions.append(rendered.actions);
                     let response = rendered.response;
-                    cache.record(row_id, signature, ui.next_widget_position().y - top,
-                        cached_stride.is_none());
+                    let stride = ui.next_widget_position().y - top;
+                    estimate.stride = stride;
+                    cache.record(row_id, signature, stride, cached_stride.is_none());
+                    let relative_top = top - origin_y;
+                    if relative_top + stride > viewport.min.y && relative_top < viewport.max.y {
+                        visible_anchors.push(SearchScrollAnchor { id: row_id, top: relative_top });
+                    }
                     if selected && scroll_to_selected {
                         response.scroll_to_me(Some(Align::Center));
                     }
@@ -528,7 +578,27 @@ fn render_results(
             }
         });
     cache.finish(scroll.content_size.y);
+    state.row_estimates.retain(|_, row| row.generation == cache.generation);
     state.layout_cache = cache;
+    // Wheel, drag, and keyboard movement take precedence over automatic anchoring.
+    let viewport_unchanged = state.last_viewport_offset
+        .is_some_and(|offset| (offset - viewport_offset).abs() < 0.5)
+        && (scroll.state.offset.y - viewport_offset).abs() < 0.5;
+    state.scroll_anchors = visible_anchors;
+    state.last_viewport_offset = Some(viewport_offset);
+    if !scroll_to_selected && viewport_unchanged {
+        if let Some((_, anchor, delta)) = anchor_adjustment.filter(|(_, _, delta)| delta.abs() >= 0.5) {
+            let max_offset = (scroll.content_size.y - scroll.inner_rect.height()).max(0.0);
+            scroll.state.offset.y = (scroll.state.offset.y + delta).clamp(0.0, max_offset);
+            state.scroll_anchors = vec![anchor];
+            state.last_viewport_offset = Some(scroll.state.offset.y);
+            scroll.state.store(ui.ctx(), scroll.id);
+            // A second pass draws at the corrected offset before this frame is
+            // presented. The repaint also covers integrations with one pass.
+            ui.ctx().request_discard("Keep the visible search result in place");
+            ui.ctx().request_repaint();
+        }
+    }
 
     if hit_count > 0 && state.selected_idx >= hit_count {
         state.selected_idx = hit_count - 1;
@@ -1531,9 +1601,34 @@ mod tests {
         cached: bool,
         events: Vec<egui::Event>,
     ) -> ResultFrame {
+        let preview = PreviewTestState::default();
+        result_frame_with_preview(ctx, state, channels, width, cached, events, preview.context())
+    }
+
+    fn result_frame_with_preview(
+        ctx: &Context,
+        state: &mut GlobalSearchState,
+        channels: &HashMap<ChannelId, ChannelState>,
+        width: f32,
+        cached: bool,
+        events: Vec<egui::Event>,
+        preview: MessagePreviewContext<'_>,
+    ) -> ResultFrame {
+        result_frame_observed(ctx, state, channels, width, cached, events, preview, |_, _| {})
+    }
+
+    fn result_frame_observed(
+        ctx: &Context,
+        state: &mut GlobalSearchState,
+        channels: &HashMap<ChannelId, ChannelState>,
+        width: f32,
+        cached: bool,
+        events: Vec<egui::Event>,
+        preview: MessagePreviewContext<'_>,
+        mut observe: impl FnMut(&Context, &GlobalSearchState),
+    ) -> ResultFrame {
         let mut action = GlobalSearchOutput::default();
         let mut content_height = 0.0;
-        let preview = PreviewTestState::default();
         let output = ctx.run(egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO, egui::vec2(width, 320.0),
@@ -1545,12 +1640,13 @@ mod tests {
             handle_keyboard(ctx, state, &mut action);
             CentralPanel::default().show(ctx, |ui| {
                 if cached {
-                    render_results(ui, channels, state, &mut action, preview.context());
+                    render_results(ui, channels, state, &mut action, preview);
                     content_height = state.layout_cache.content_height;
                 } else {
                     content_height = render_all_results(ui, channels, state, &mut action);
                 }
             });
+            observe(ctx, state);
         });
         ResultFrame { output, action, content_height }
     }
@@ -1561,6 +1657,27 @@ mod tests {
             let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
             shape.clip_rect.intersects(rect).then(|| (text.galley.text().to_owned(), text.pos))
         }).collect()
+    }
+
+    // Between frames, read_response can see an older widget buffer after end_pass
+    // swaps it. The final paint output describes the frame actually presented.
+    fn drawn_result_text_position(output: &egui::FullOutput, wanted: &str) -> egui::Pos2 {
+        output.shapes.iter().find_map(|shape| {
+            let egui::Shape::Text(text) = &shape.shape else { return None };
+            (text.galley.text() == wanted).then_some(text.pos)
+        }).expect("the result text was drawn in this frame")
+    }
+
+    fn drawn_result_click_position(output: &egui::FullOutput, wanted: &str) -> egui::Pos2 {
+        output.shapes.iter().find_map(|shape| {
+            let egui::Shape::Text(text) = &shape.shape else { return None };
+            if text.galley.text() != wanted { return None; }
+            text.galley.rows.iter().find_map(|row| {
+                if !row.glyphs.iter().any(|glyph| !glyph.chr.is_whitespace()) { return None; }
+                let rect = row.visuals.mesh_bounds.translate(text.pos.to_vec2());
+                shape.clip_rect.contains_rect(rect).then_some(rect.center())
+            })
+        }).expect("the result has a fully visible line to click")
     }
 
     #[test]
@@ -1580,7 +1697,7 @@ mod tests {
             }
             let actual = result_frame(&cached_ctx, &mut cached, &channels, 360.0, true, Vec::new());
             let expected = result_frame(&all_ctx, &mut all, &channels, 360.0, false, Vec::new());
-            assert!((actual.content_height - expected.content_height).abs() < 1.0);
+            assert!(actual.content_height > 0.0 && expected.content_height > 0.0);
             let actual_text = visible_result_text(&actual.output);
             let expected_text = visible_result_text(&expected.output);
             assert_eq!(actual_text.len(), expected_text.len(), "visible text count at {selected}");
@@ -1592,7 +1709,8 @@ mod tests {
             assert_eq!(cached.layout_cache.measured_rows, 0);
             assert!(cached.layout_cache.rendered_rows < 30,
                 "{} rows rendered at {selected}", cached.layout_cache.rendered_rows);
-            assert_eq!(cached.layout_cache.rows.len(), MAX_HITS);
+            assert!(cached.layout_cache.rows.len() < 200,
+                "unvisited rows keep estimated heights");
         }
     }
 
@@ -1605,33 +1723,210 @@ mod tests {
         let original_height = search.layout_cache.content_height;
         search.results[151].message.raw_text = "A changed offscreen result has a much longer preview with café and 🙂. ".repeat(4);
         result_frame(&ctx, &mut search, &channels, 480.0, true, Vec::new());
-        assert_eq!(search.layout_cache.measured_rows, 1);
-        assert!(search.layout_cache.content_height > original_height);
+        assert_eq!(search.layout_cache.measured_rows, 0);
+        assert_eq!(search.layout_cache.content_height, original_height);
         search.results[152].message.sender.display_name = "A substantially longer displayed name".repeat(4);
         result_frame(&ctx, &mut search, &channels, 480.0, true, Vec::new());
-        assert_eq!(search.layout_cache.measured_rows, 1);
+        assert_eq!(search.layout_cache.measured_rows, 0);
+        search.selected_idx = 151;
+        search.scroll_to_selected = true;
+        for _ in 0..3 { result_frame(&ctx, &mut search, &channels, 480.0, true, Vec::new()); }
+        let changed_id = search_hit_id(&search.results[151]);
+        let preview = PreviewTestState::default();
+        assert_eq!(search.layout_cache.rows[&changed_id].signature,
+            preview.context().signature(&search.results[151].message));
+        assert!(search.layout_cache.rows[&changed_id].stride > 40.0);
         result_frame(&ctx, &mut search, &channels, 240.0, true, Vec::new());
-        assert_eq!(search.layout_cache.measured_rows, search.results.len());
+        assert!(search.layout_cache.rows.len() < 30);
         ctx.style_mut(|style| style.spacing.item_spacing.y += 3.0);
         result_frame(&ctx, &mut search, &channels, 240.0, true, Vec::new());
-        assert_eq!(search.layout_cache.measured_rows, search.results.len());
+        assert!(search.layout_cache.rows.len() < 30);
         let mut fonts = egui::FontDefinitions::default();
         fonts.families.insert(egui::FontFamily::Proportional,
             fonts.families[&egui::FontFamily::Monospace].clone());
         ctx.set_fonts(fonts);
         result_frame(&ctx, &mut search, &channels, 240.0, true, Vec::new());
-        assert_eq!(search.layout_cache.measured_rows, search.results.len());
+        assert!(search.layout_cache.rows.len() < 30);
         let mut fonts = ctx.fonts(|fonts| fonts.lock().fonts.definitions().clone());
         let primary = fonts.families[&egui::FontFamily::Proportional][0].clone();
         Arc::make_mut(fonts.font_data.get_mut(&primary).unwrap()).tweak.scale *= 1.1;
         ctx.set_fonts(fonts);
         result_frame(&ctx, &mut search, &channels, 240.0, true, Vec::new());
-        assert_eq!(search.layout_cache.measured_rows, search.results.len());
+        assert!(search.layout_cache.rows.len() < 30);
         search.results.drain(..150);
         result_frame(&ctx, &mut search, &channels, 240.0, true, Vec::new());
-        assert_eq!(search.layout_cache.rows.len(), search.results.len());
+        assert_eq!(search.row_estimates.len(), search.results.len());
+        let remaining: std::collections::HashSet<_> = search.results.iter().map(search_hit_id).collect();
+        assert!(search.layout_cache.rows.keys().all(|id| remaining.contains(id)));
         search.clear();
         assert!(search.layout_cache.rows.is_empty());
+        assert!(search.row_estimates.is_empty());
+        assert!(search.scroll_anchors.is_empty());
+    }
+
+    #[test]
+    fn cold_results_measure_only_the_visible_rows() {
+        let (mut search, channels) = result_fixture(MAX_HITS);
+        search.scroll_to_selected = true;
+        let ctx = Context::default();
+        let shown = result_frame(&ctx, &mut search, &channels, 480.0, true, Vec::new());
+        assert!(search.layout_cache.measured_rows < 30);
+        assert!(search.layout_cache.rows.len() < 30);
+        assert_eq!(search.row_estimates.len(), MAX_HITS);
+        assert!(!search.layout_cache.rows.contains_key(&search_hit_id(search.results.last().unwrap())));
+        assert!(visible_result_text(&shown.output).iter().any(|(text, _)| text.contains("Result 0:")));
+    }
+
+    #[test]
+    fn result_insertions_and_removals_preserve_the_visible_message_anchor() {
+        let (mut search, channels) = result_fixture(MAX_HITS);
+        let ctx = Context::default();
+        search.selected_idx = 2000;
+        search.scroll_to_selected = true;
+        for _ in 0..3 { result_frame(&ctx, &mut search, &channels, 480.0, true, Vec::new()); }
+        let previous = result_frame(&ctx, &mut search, &channels, 480.0, true, Vec::new());
+        let anchor = search.scroll_anchors[0];
+        let anchor_text = search.results.iter().find(|hit| search_hit_id(hit) == anchor.id)
+            .unwrap().message.raw_text.clone();
+        let before = drawn_result_text_position(&previous.output, &anchor_text).y;
+        for index in 0..3 {
+            let mut hit = search.results[0].clone();
+            hit.message.id = MessageId(10000 + index);
+            hit.message.raw_text = "A new result before the current viewport. ".repeat(8);
+            search.results.insert(0, hit);
+        }
+        search.selected_idx += 3;
+        let changed = result_frame(&ctx, &mut search, &channels, 480.0, true, Vec::new());
+        let after = drawn_result_text_position(&changed.output, &anchor_text).y;
+        assert!((after - before).abs() < 1.0, "insertion moved the anchor: {before} -> {after}");
+
+        let fallback = search.scroll_anchors[1];
+        let hit = search.results.iter().find(|hit| search_hit_id(hit) == fallback.id).unwrap();
+        let fallback_text = hit.message.raw_text.clone();
+        let expected_jump = (hit.channel.clone(), hit.message.id);
+        let fallback_before = drawn_result_text_position(&changed.output, &fallback_text).y;
+        let click = drawn_result_click_position(&changed.output, &fallback_text);
+        let mut clicked = GlobalSearchOutput::default();
+        // Press in the first input frame after the corrected draw, without a
+        // settling frame that could hide drift in the pointer hit rectangles.
+        for pressed in [true, false] {
+            clicked = result_frame(&ctx, &mut search, &channels, 480.0, true, vec![
+                egui::Event::PointerMoved(click),
+                egui::Event::PointerButton { pos: click, button: egui::PointerButton::Primary,
+                    pressed, modifiers: egui::Modifiers::NONE },
+            ]).action;
+        }
+        assert_eq!(clicked.jump_to, Some(expected_jump));
+        search.results.retain(|hit| search_hit_id(hit) != anchor.id);
+        search.selected_idx -= 1;
+        let removed_anchor = result_frame(&ctx, &mut search, &channels, 480.0, true, Vec::new());
+        let fallback_after = drawn_result_text_position(&removed_anchor.output, &fallback_text).y;
+        assert!((fallback_after - fallback_before).abs() < 1.0,
+            "removing the anchor moved its successor: {fallback_before} -> {fallback_after}");
+
+        search.results.drain(..3);
+        search.selected_idx -= 3;
+        let removed_earlier = result_frame(&ctx, &mut search, &channels, 480.0, true, Vec::new());
+        let removed = drawn_result_text_position(&removed_earlier.output, &fallback_text).y;
+        assert!((removed - fallback_after).abs() < 1.0,
+            "removing earlier rows moved the anchor: {fallback_after} -> {removed}");
+    }
+
+    #[test]
+    fn scrolling_and_resizing_sparse_results_keep_rows_contiguous() {
+        let (mut search, channels) = result_fixture(MAX_HITS);
+        let ctx = Context::default();
+        for _ in 0..3 { result_frame(&ctx, &mut search, &channels, 480.0, true, Vec::new()); }
+        result_frame(&ctx, &mut search, &channels, 480.0, true, vec![
+            egui::Event::PointerMoved(egui::pos2(200.0, 150.0)),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -1600.0),
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        for _ in 0..4 { result_frame(&ctx, &mut search, &channels, 480.0, true, Vec::new()); }
+        result_frame(&ctx, &mut search, &channels, 480.0, true, Vec::new());
+        assert!(search.last_viewport_offset.unwrap() > 1000.0);
+        assert_eq!(search.layout_cache.measured_rows, 0);
+        assert!(search.layout_cache.rows.len() < 100);
+        for pair in search.scroll_anchors.windows(2) {
+            let stride = search.row_estimates[&pair[0].id].stride;
+            assert!((pair[1].top - pair[0].top - stride).abs() < 0.5,
+                "visible results must not have estimated gaps");
+        }
+        let anchor = search.scroll_anchors[0];
+        let preview = PreviewTestState::default();
+        let mut position = 0.0;
+        result_frame_observed(&ctx, &mut search, &channels, 480.0, true, Vec::new(),
+            preview.context(), |ctx, _| {
+                position = ctx.read_response(anchor.id).unwrap().rect.min.y;
+            });
+        for width in [240.0, 720.0] {
+            let mut after = 0.0;
+            result_frame_observed(&ctx, &mut search, &channels, width, true, Vec::new(),
+                preview.context(), |ctx, _| {
+                    after = ctx.read_response(anchor.id).unwrap().rect.min.y;
+                });
+            assert!((after - position).abs() < 1.0,
+                "resizing must keep the visible message in place");
+            assert!(search.layout_cache.rows.len() < 30);
+            for pair in search.scroll_anchors.windows(2) {
+                let stride = search.row_estimates[&pair[0].id].stride;
+                assert!((pair[1].top - pair[0].top - stride).abs() < 0.5,
+                    "resizing must not leave gaps between visible rows");
+            }
+        }
+    }
+
+    #[test]
+    fn lazy_results_remeasure_images_and_highlights_when_they_enter_view() {
+        let (mut search, channels) = result_fixture(300);
+        let ctx = Context::default();
+        let mut preview = PreviewTestState::default();
+        let url = "https://example.test/wide-emote.png";
+        search.results[251].message.raw_text = "special emote".to_owned();
+        search.results[251].message.spans = smallvec::smallvec![
+            crust_core::Span::Emote {
+                id: "wide".to_owned(), code: "special".to_owned(), url: url.to_owned(),
+                url_hd: None, provider: "twitch".to_owned(), zero_width: false,
+            },
+            crust_core::Span::Text { text: " trailing text wraps".repeat(4), is_action: false },
+        ];
+        let id = search_hit_id(&search.results[251]);
+        search.selected_idx = 251;
+        search.scroll_to_selected = true;
+        for _ in 0..3 {
+            result_frame_with_preview(&ctx, &mut search, &channels, 360.0, true, Vec::new(), preview.context());
+        }
+        let original_signature = search.layout_cache.rows[&id].signature;
+        search.selected_idx = 0;
+        search.scroll_to_selected = true;
+        for _ in 0..3 {
+            result_frame_with_preview(&ctx, &mut search, &channels, 360.0, true, Vec::new(), preview.context());
+        }
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(160, 20, image::Rgba([255, 0, 0, 255]))
+            .write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        assert!(preview.images.complete(&ctx, url.to_owned(), 160, 20, bytes.into_inner()));
+        result_frame_with_preview(&ctx, &mut search, &channels, 360.0, true, Vec::new(), preview.context());
+        assert_eq!(search.layout_cache.measured_rows, 0);
+        assert!(!search.layout_cache.rows.contains_key(&id));
+        search.selected_idx = 251;
+        search.scroll_to_selected = true;
+        for _ in 0..3 {
+            result_frame_with_preview(&ctx, &mut search, &channels, 360.0, true, Vec::new(), preview.context());
+        }
+        assert_ne!(search.layout_cache.rows[&id].signature, original_signature);
+        let without_banner = search.layout_cache.rows[&id].stride;
+        let anchor = search.scroll_anchors[0];
+        let anchor_before = ctx.read_response(anchor.id).unwrap().rect.min.y;
+        let rules = crust_core::highlight::compile_rules(&[crust_core::highlight::HighlightRule::new("special")]);
+        let with_rules = MessagePreviewContext { highlight_rules: &rules, ..preview.context() };
+        result_frame_with_preview(&ctx, &mut search, &channels, 360.0, true, Vec::new(), with_rules);
+        assert!(search.layout_cache.rows.len() < 30);
+        assert!(search.layout_cache.rows[&id].stride > without_banner);
+        assert!((ctx.read_response(anchor.id).unwrap().rect.min.y - anchor_before).abs() < 1.0);
     }
 
     #[test]
@@ -1734,6 +2029,8 @@ mod tests {
         let start = std::time::Instant::now();
         std::hint::black_box(result_frame(&cached_ctx, &mut cached, &channels, 480.0, true, Vec::new()));
         let cold_cached = start.elapsed();
+        let cold_rendered_rows = cached.layout_cache.rendered_rows;
+        let cold_measured_rows = cached.layout_cache.measured_rows;
         let start = std::time::Instant::now();
         std::hint::black_box(result_frame(&all_ctx, &mut all, &channels, 480.0, false, Vec::new()));
         let cold_all = start.elapsed();
@@ -1753,8 +2050,9 @@ mod tests {
         }
         cached_times.sort();
         all_times.sort();
-        println!("global search {MAX_HITS} results; cold cached={cold_cached:?}; cold all={cold_all:?}; warm cached median={:?}; warm all median={:?}; cached rows={}; measured rows={}",
+        println!("global search {MAX_HITS} results; cold cached={cold_cached:?}; cold all={cold_all:?}; cold rendered rows={cold_rendered_rows}; cold measured rows={cold_measured_rows}; warm cached median={:?}; warm all median={:?}; cached rows={}; measured rows={}",
             cached_times[12], all_times[12], cached.layout_cache.rendered_rows, cached.layout_cache.measured_rows);
+        assert!(cold_rendered_rows < 30 && cold_measured_rows < 30);
         assert_eq!(cached.layout_cache.measured_rows, 0);
         assert!(cached.layout_cache.rendered_rows < 30);
     }

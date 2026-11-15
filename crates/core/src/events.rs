@@ -356,6 +356,7 @@ pub enum AppCommand {
         focused: usize,
         layout: Option<crate::model::PaneLayout>,
         views: Vec<crate::model::PaneViewSettings>,
+        detached_chats: Vec<crate::model::DetachedChatSettings>,
     },
     /// Update the per-tab visibility rule for `channel`. Setting the rule
     /// to [`crate::state::TabVisibilityRule::Always`] removes any prior
@@ -929,6 +930,7 @@ pub enum AppEvent {
         split_layout: Option<crate::model::PaneLayout>,
         /// Search and filter choices, indexed alongside panes (one entry for single view).
         split_views: Vec<crate::model::PaneViewSettings>,
+        detached_chats: Vec<crate::model::DetachedChatSettings>,
         /// Whispers panel was visible at last shutdown.
         whispers_visible: bool,
         /// Last-focused whisper thread login.

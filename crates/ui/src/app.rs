@@ -20,6 +20,9 @@ mod composer_routing;
 #[path = "classic_drafts.rs"]
 mod classic_drafts;
 use classic_drafts::ClassicDraft;
+#[path = "detached_chats.rs"]
+mod detached_chats;
+use detached_chats::DetachedChats;
 
 use crust_core::{
     events::{
@@ -1394,6 +1397,8 @@ pub struct CrustApp {
     pending_auth: Option<String>,
     unsent_messages: UnsentMessages,
     reply_threads: crate::widgets::reply_thread::ReplyThreads,
+    detached_chats: DetachedChats,
+    last_saved_detached_chats: Vec<crust_core::model::DetachedChatSettings>,
     emote_bytes: UiImageCache,
     previous_image_work: ImageWorkStats,
     join_dialog: JoinDialog,
@@ -2026,6 +2031,8 @@ impl CrustApp {
             pending_auth: None,
             unsent_messages: UnsentMessages::default(),
             reply_threads: crate::widgets::reply_thread::ReplyThreads::default(),
+            detached_chats: DetachedChats::default(),
+            last_saved_detached_chats: Vec::new(),
             emote_bytes: UiImageCache::default(),
             previous_image_work: ImageWorkStats::default(),
             join_dialog: JoinDialog::default(),
@@ -2233,16 +2240,12 @@ impl CrustApp {
         self.crash_viewer.set_pending_reports(reports);
     }
 
-    /// Register a cleanup closure that runs before the crash viewer's
-    /// "Restart Crust" button calls `std::process::exit`. The app
-    /// crate uses this to defuse its active session sentinel so the
-    /// relaunched process does not treat the current run as an
-    /// abnormal shutdown.
-    pub fn set_crash_pre_exit_hook<F>(&mut self, f: F)
+    /// Request a restart after the normal shutdown has saved the session.
+    pub fn set_crash_restart_handler<F>(&mut self, f: F)
     where
         F: Fn() + Send + Sync + 'static,
     {
-        self.crash_viewer.set_pre_exit_hook(f);
+        self.crash_viewer.set_restart_handler(f);
     }
 
     /// Keep final pane edits available after the runtime command loop stops.
@@ -3692,9 +3695,13 @@ exit 1
         self.input_emote_catalogs.clear();
         self.emote_picker.invalidate_catalog();
         self.reply_threads.invalidate_catalogs();
+        self.detached_chats.invalidate_catalogs();
         invalidate_emote_completions(ctx, chat_composer_id(None));
         for pane in &self.split_panes.panes {
             invalidate_emote_completions(ctx, chat_composer_id(Some(pane.id)));
+        }
+        for window in self.detached_chats.open.iter().chain(&self.detached_chats.closed) {
+            invalidate_emote_completions(ctx, chat_composer_id(Some(window.pane.id)));
         }
     }
 
@@ -3733,7 +3740,7 @@ exit 1
         }
         self.emote_refresh_followup = false;
         let mut seen = HashSet::new();
-        for channel in self.state.active_channel.iter().chain(self.state.channel_order.iter()) {
+        for channel in self.state.active_channel.iter().chain(self.state.channel_order.iter()).chain(self.state.channels.keys()) {
             if seen.insert(channel) {
                 if let Some(message) = self.state.channels.get(channel).and_then(|state| state.messages.back()) {
                     self.pending_emote_refresh.push_back(EmoteRefreshJob::Channel(channel.clone(), message.id));
@@ -4850,6 +4857,7 @@ exit 1
                 if self.state.redirect_channel(&old_channel, &new_channel) {
                     self.redirect_classic_drafts(&old_channel, &new_channel);
                     self.split_panes.redirect_channel(&old_channel, &new_channel);
+                    self.detached_chats.redirect_channel(&old_channel, &new_channel);
                     self.sorted_chatters.remove(&old_channel);
                     self.sorted_chatters.remove(&new_channel);
                     self.chatters_dirty.remove(&old_channel);
@@ -5072,7 +5080,7 @@ exit 1
                     // Only real user messages (Chat, Bits, Sub with text) are
                     // worth tracking; system notices and mod actions are not.
                     match message.msg_kind {
-                        MsgKind::Chat | MsgKind::Bits { .. } => {
+                        MsgKind::Chat | MsgKind::Announcement { .. } | MsgKind::Bits { .. } => {
                             let display_name = message.sender.display_name.trim();
                             if !display_name.is_empty() {
                                 if ch.chatters.len() < MAX_TRACKED_CHATTERS
@@ -5742,6 +5750,7 @@ exit 1
                                         && matches!(
                                             m.msg_kind,
                                             crust_core::model::MsgKind::Chat
+                                                | crust_core::model::MsgKind::Announcement { .. }
                                                 | crust_core::model::MsgKind::Bits { .. }
                                         )
                                 })
@@ -6174,6 +6183,7 @@ exit 1
                 split_panes_focused,
                 split_layout,
                 split_views,
+                detached_chats,
                 whispers_visible,
                 last_whisper_login,
             } => {
@@ -6201,6 +6211,8 @@ exit 1
                         Vec::new()
                     } else { split_views.clone() };
                     self.last_saved_split_views = split_views;
+                    self.detached_chats.restore(&detached_chats, &self.filter_records, self.state.auth.user_id.clone());
+                    self.last_saved_detached_chats = self.detached_chats.settings();
                     self.last_saved_split_focused = split_panes_focused;
                     self.last_saved_split_channel = channel;
                     self.pending_pane_save = None;
@@ -6271,6 +6283,7 @@ exit 1
                 self.filter_records = crust_core::model::filters::compile_filters(&records);
                 for pane in &mut self.split_panes.panes { pane.filters.refresh(&self.filter_records); }
                 for closed in &mut self.split_panes.closed { closed.pane.filters.refresh(&self.filter_records); }
+                self.detached_chats.refresh_filters(&self.filter_records);
                 for filters in self.single_pane_filters.values_mut() { filters.refresh(&self.filter_records); }
                 self.settings_filter_records = records.clone();
                 self.settings_filter_record_bufs =
@@ -6899,7 +6912,8 @@ exit 1
                 self.whisper_composers.entry(recipient).or_default().pending.push(text);
             }
         }
-        if reply.is_some() && matches!(target, crust_core::ComposerTarget::Chat { .. }) {
+        if reply.is_some() && matches!(target, crust_core::ComposerTarget::Chat { .. })
+            && !self.detached_chats.owns_target(&target) {
             self.pending_reply = None;
         }
         if self.message_history.last().map(String::as_str) != Some(text) {
@@ -6995,8 +7009,9 @@ exit 1
     }
 
     fn focus_main_viewport(&self) {
-        // A user action in a native search window can open UI in the main window.
+        // Child windows can open shared dialogs in the main window.
         if let Some(ctx) = self.egui_ctx.as_ref() {
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
         }
     }
@@ -7461,6 +7476,13 @@ exit 1
         }
     }
 
+    fn handle_settings_shortcut(&mut self, ctx: &Context) -> bool {
+        let binding = self.hotkey_bindings.get(crust_core::HotkeyAction::OpenSettings);
+        if !ctx.input_mut(|input| consume_binding(input, &binding)) { return false; }
+        self.settings_open = true;
+        true
+    }
+
     fn handle_settings_hotkey_capture(&mut self, ctx: &Context) -> bool {
         if !self.settings_open || self.settings_section != SettingsSection::Hotkeys {
             self.hotkey_capture_target = None;
@@ -7900,6 +7922,7 @@ exit 1
 
     fn activate_channel(&mut self, channel: ChannelId) {
         self.cancel_pending_layout_restore();
+        self.reveal_detached_channel_tab(&channel);
         self.apply_channel_activation(channel, true);
     }
 
@@ -8153,10 +8176,13 @@ exit 1
         if self.pending_reply.as_ref().is_some_and(|reply| reply.channel == channel) {
             self.pending_reply = None;
         }
-        self.send_cmd(AppCommand::LeaveChannel { channel: channel.clone() });
-        self.state.leave_channel(&channel);
+        let retained_detached = self.retain_detached_channel(&channel);
+        if !retained_detached {
+            self.send_cmd(AppCommand::LeaveChannel { channel: channel.clone() });
+            self.state.leave_channel(&channel);
+        }
         self.sync_classic_draft_owner();
-        self.sorted_chatters.remove(&channel);
+        if !retained_detached { self.sorted_chatters.remove(&channel); }
         self.message_search.remove(&channel);
         self.single_pane_filters.remove(&channel);
 
@@ -8275,6 +8301,7 @@ exit 1
             panes,
             layout: self.split_panes.saved_layout(),
             views,
+            detached_chats: self.detached_chats.settings(),
         }
     }
 
@@ -8283,12 +8310,14 @@ exit 1
         self.last_saved_split_focused = snapshot.focused;
         self.last_saved_split_layout = snapshot.layout.clone();
         self.last_saved_split_views = snapshot.views.clone();
+        self.last_saved_detached_chats = snapshot.detached_chats.clone();
         self.last_saved_split_channel = snapshot.active_channel.clone();
         self.last_saved_active_channel = (!snapshot.active_channel.is_empty()).then(|| snapshot.active_channel.clone());
         self.pending_pane_save = None;
         self.send_cmd(AppCommand::SetSplitPanes {
             active_channel: snapshot.active_channel,
             panes: snapshot.panes, focused: snapshot.focused, layout: snapshot.layout, views: snapshot.views,
+            detached_chats: snapshot.detached_chats,
         });
     }
 
@@ -8307,11 +8336,11 @@ exit 1
             self.save_pane_snapshot(snapshot);
             return;
         }
-        if snapshot.views == self.last_saved_split_views {
+        if snapshot.views == self.last_saved_split_views && snapshot.detached_chats == self.last_saved_detached_chats {
             self.pending_pane_save = None;
             return;
         }
-        if self.pending_pane_save.as_ref().is_none_or(|(_, pending)| pending.views != snapshot.views) {
+        if self.pending_pane_save.as_ref().is_none_or(|(_, pending)| pending.views != snapshot.views || pending.detached_chats != snapshot.detached_chats) {
             self.pending_pane_save = Some((now, snapshot));
         }
         let debounce = std::time::Duration::from_millis(750);
@@ -8326,13 +8355,21 @@ exit 1
 
     fn retain_shutdown_layout(&self) {
         // Unfinished joins still belong to the previous session's saved layout.
-        if (!self.layout_restore_received && !self.layout_restore_cancelled)
-            || self.pending_restore_channel.is_some() || !self.pending_restore_split_panes.is_empty() {
+        if !self.layout_restore_received && !self.layout_restore_cancelled {
             return;
         }
+        let snapshot = if self.pending_restore_channel.is_some() || !self.pending_restore_split_panes.is_empty() {
+            let detached_chats = self.detached_chats.settings();
+            if !self.layout_restore_received || detached_chats == self.last_saved_detached_chats { return; }
+            PaneLayoutSnapshot {
+                active_channel: self.last_saved_split_channel.clone(), panes: self.last_saved_split_panes.clone(),
+                focused: self.last_saved_split_focused, layout: self.last_saved_split_layout.clone(),
+                views: self.last_saved_split_views.clone(), detached_chats,
+            }
+        } else { self.pane_layout_snapshot() };
         if let Some(state) = &self.layout_shutdown_state {
             if let Ok(mut final_snapshot) = state.lock() {
-                *final_snapshot = Some(self.pane_layout_snapshot());
+                *final_snapshot = Some(snapshot);
             }
         }
     }
@@ -8548,6 +8585,15 @@ exit 1
     fn handle_channel_shortcuts(&mut self, ctx: &Context) {
         self.sync_split_keyboard_focus(ctx);
         use crust_core::HotkeyAction;
+        let close = self.hotkey_bindings.get(HotkeyAction::CloseChannel);
+        if ctx.input_mut(|input| consume_binding(input, &close)) {
+            if self.split_panes.panes.len() > 1 {
+                self.close_split_pane(self.split_panes.focused, ctx);
+            } else if let Some(channel) = self.state.active_channel.clone() {
+                self.close_channel_tab(channel, ctx);
+            }
+            return;
+        }
         for (action, axis) in [(HotkeyAction::SplitRight, SplitAxis::Horizontal), (HotkeyAction::SplitDown, SplitAxis::Vertical)] {
             let binding = self.hotkey_bindings.get(action);
             if ctx.input_mut(|input| consume_binding(input, &binding)) {
@@ -8799,6 +8845,10 @@ impl Drop for CrustApp {
 }
 
 impl eframe::App for CrustApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0; 4]
+    }
+
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.update_ui(ctx);
     }
@@ -8929,6 +8979,7 @@ impl CrustApp {
             }
             let quick_switch_consumed = self.handle_quick_switch_shortcuts(ctx);
             if !quick_switch_consumed && !thread_owns_keyboard {
+                self.handle_settings_shortcut(ctx);
                 self.handle_channel_shortcuts(ctx);
                 self.handle_search_shortcuts(ctx);
                 self.handle_font_zoom_shortcuts(ctx);
@@ -9033,7 +9084,7 @@ impl CrustApp {
             self.last_stream_refresh_scan = std::time::Instant::now();
             let mut stale: Vec<String> = Vec::new();
             let mut seen: HashSet<String> = HashSet::new();
-            for ch in &self.state.channel_order {
+            for ch in self.state.channel_order.iter().chain(self.detached_chats.open.iter().map(|window| &window.pane.channel)) {
                 if !ch.is_twitch() {
                     continue;
                 }
@@ -9083,6 +9134,7 @@ impl CrustApp {
 
         let maintenance_ms = finish_phase();
         self.show_reply_thread(ctx, animations_allowed);
+        self.show_detached_chats(ctx, &mut frame_chat_stats);
 
         // Render profile popup and dispatch any actions.
         let preview = MessagePreviewContext {
@@ -9895,6 +9947,10 @@ impl CrustApp {
 
                             if visibility.show_overflow_menu {
                                 ui.menu_button(RichText::new("⋯").font(t::topbar_font()), |ui| {
+                                    if ui.button(RichText::new("Chat windows").font(t::topbar_font())).clicked() {
+                                        self.detached_chats.manager_open = true;
+                                        ui.close_menu();
+                                    }
                                     if visibility.show_join_in_overflow
                                         && ui
                                             .button(
@@ -11231,6 +11287,10 @@ impl CrustApp {
                         if let Some(axis) = header.split { split_pane = Some((pi, axis)); }
                         reopen_pane |= header.reopen_clicked;
                         if header.filters_clicked { self.split_panes.panes[pi].filters.editor_open = true; }
+                        if header.open_window_clicked || header.open_overlay_clicked {
+                            self.open_detached_chat(ch.clone(), self.split_panes.panes[pi].view_settings(), header.open_overlay_clicked);
+                        }
+                        if header.manage_windows_clicked { self.detached_chats.manager_open = true; }
 
                         if ch.is_live_feed() {
                             use crate::widgets::live_feed::LiveFeed;
@@ -11605,6 +11665,14 @@ impl CrustApp {
                             can_split: true, can_reopen: !self.split_panes.closed.is_empty(), can_close_others: false,
                         });
                     if header.focus_clicked { self.focus_chat_composer(ctx); }
+                    if header.open_window_clicked || header.open_overlay_clicked {
+                        let view = PaneViewSettings {
+                            search: self.message_search.get(&active_ch).map(MessageSearchState::settings).unwrap_or_default(),
+                            filters: self.single_pane_filters.get(&active_ch).and_then(|filters| filters.selected.clone()),
+                        };
+                        self.open_detached_chat(active_ch.clone(), view, header.open_overlay_clicked);
+                    }
+                    if header.manage_windows_clicked { self.detached_chats.manager_open = true; }
                     if header.close_clicked {
                         self.close_channel_tab(active_ch.clone(), ctx);
                         ctx.request_repaint();
@@ -14138,7 +14206,7 @@ fn refresh_message_emotes(
     let next = start.checked_sub(1).map(|position| messages[position].id);
     let mut changed = Vec::new();
     for message in messages.range_mut(start..end) {
-        if !matches!(message.msg_kind, MsgKind::Chat | MsgKind::Bits { .. } | MsgKind::SuspiciousUserMessage) {
+        if !matches!(message.msg_kind, MsgKind::Chat | MsgKind::Announcement { .. } | MsgKind::Bits { .. } | MsgKind::SuspiciousUserMessage) {
             continue;
         }
         // Kick's native tags were normalized out of raw_text. Their message
@@ -14426,6 +14494,40 @@ mod tests {
         app.ensure_input_emote_catalog(&second);
         assert_eq!(app.input_emote_catalogs[&first][0].url, "channel");
         assert_eq!(app.input_emote_catalogs[&second][0].url, "global");
+    }
+
+    #[test]
+    fn announcement_catalog_refresh_keeps_banner_metadata_and_moderation() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("announcements");
+        app.state.join_channel(channel.clone());
+        let mut message = search_message(channel.clone());
+        message.raw_text = "SharedCode".into();
+        message.spans = crust_core::format::tokenize_with_flags(&message.raw_text, false, &[], &|_| None);
+        message.msg_kind = crust_core::model::MsgKind::Announcement { color: "purple".into() };
+        message.flags.is_history = true;
+        message.flags.is_deleted = true;
+        let original = message.clone();
+        app.state.mentions.push_back(message.clone());
+        app.state.channels.get_mut(&channel).unwrap().messages.push_back(message);
+        for url in [Some("first-catalog"), Some("replacement-catalog"), None] {
+            app.apply_event(crust_core::AppEvent::EmoteCatalogUpdated {
+                emotes: url.into_iter().map(|url| scoped_emote(url, Some(channel.clone()), None)).collect(),
+            }, &ctx);
+            app.refresh_emote_messages(&ctx);
+            for message in app.state.channels[&channel].messages.iter().chain(app.state.mentions.iter()) {
+                assert_eq!(emote_url(message), url);
+                assert_eq!(message.raw_text, original.raw_text);
+                assert_eq!(message.msg_kind, original.msg_kind);
+                assert_eq!(message.sender.user_id, original.sender.user_id);
+                assert_eq!(message.sender.login, original.sender.login);
+                assert_eq!(message.sender.display_name, original.sender.display_name);
+                assert_eq!(message.sender.badges, original.sender.badges);
+                assert_eq!(message.server_id, original.server_id);
+                assert!(message.flags.is_history && message.flags.is_deleted);
+            }
+        }
     }
 
     #[test]
@@ -16894,6 +16996,7 @@ mod tests {
             split_panes_focused: 1,
             split_layout: None,
             split_views: Vec::new(),
+            detached_chats: Vec::new(),
             whispers_visible: false,
             last_whisper_login: String::new(),
         }
@@ -17095,6 +17198,7 @@ mod tests {
                 split_panes: panes, split_panes_focused: saved_focus,
                 split_layout: saved_layout,
                 split_views: saved_views,
+                detached_chats: Vec::new(),
                 whispers_visible: false, last_whisper_login: String::new(),
             }, &ctx);
             restored.try_restore_pending_channel();
@@ -17127,6 +17231,7 @@ mod tests {
                 split_panes_focused: 0, whispers_visible: false, last_whisper_login: String::new(),
                 split_layout: None,
                 split_views: Vec::new(),
+                detached_chats: Vec::new(),
             }, &ctx);
             restored.try_restore_pending_channel();
             assert_eq!(restored.state.active_channel, Some(virtual_channel));
@@ -17336,6 +17441,7 @@ mod tests {
             split_panes_focused: 1,
             split_layout: None,
             split_views: Vec::new(),
+            detached_chats: Vec::new(),
             whispers_visible: false, last_whisper_login: String::new(),
         }, &ctx);
         app.apply_event(AppEvent::ChannelRedirected { old_channel: old, new_channel: new.clone() }, &ctx);
@@ -17387,6 +17493,7 @@ mod tests {
             split_panes_focused: 1,
             split_layout: None,
             split_views: Vec::new(),
+            detached_chats: Vec::new(),
             whispers_visible: false,
             last_whisper_login: String::new(),
         }, &ctx);
@@ -17560,6 +17667,7 @@ mod tests {
             channel: channel.0, channel_order: Vec::new(), split_panes: panes,
             split_panes_focused: focused, split_layout: layout.clone(),
             split_views: views,
+            detached_chats: Vec::new(),
             whispers_visible: false, last_whisper_login: String::new(),
         }, &ctx);
         restored.try_restore_pending_layout();
@@ -17713,6 +17821,7 @@ mod tests {
         restored.apply_event(AppEvent::RestoreLastActiveChannel {
             channel: "room".into(), channel_order: Vec::new(), split_panes: Vec::new(),
             split_panes_focused: 0, split_layout: None, split_views: views,
+            detached_chats: Vec::new(),
             whispers_visible: false, last_whisper_login: String::new(),
         }, &ctx);
         restored.reconcile_persistent_ui_state();
@@ -17745,6 +17854,7 @@ mod tests {
             channel: "room".into(), channel_order: vec!["later".into(), "room".into()],
             split_panes: vec![("room".into(), 1.0)], split_panes_focused: 0,
             split_layout: Some(super::PaneLayout::Pane { index: 0 }), split_views: vec![view],
+            detached_chats: Vec::new(),
             whispers_visible: false, last_whisper_login: String::new(),
         }, &ctx);
         app.try_restore_pending_channel();

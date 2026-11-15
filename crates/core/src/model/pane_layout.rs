@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 pub const MAX_CHAT_PANES: usize = 32;
+pub const MAX_DETACHED_CHATS: usize = 16;
 
 /// The final UI layout is handed to shutdown separately from the command queue.
 /// This keeps a pending search edit safe when the window closes during debounce.
@@ -13,6 +14,54 @@ pub struct PaneLayoutSnapshot {
     pub focused: usize,
     pub layout: Option<PaneLayout>,
     pub views: Vec<PaneViewSettings>,
+    pub detached_chats: Vec<DetachedChatSettings>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DetachedChatSettings {
+    pub channel: String,
+    /// False keeps the joined channel in its detached views without a main tab.
+    pub channel_tab_visible: bool,
+    pub view: PaneViewSettings,
+    pub position: Option<[f32; 2]>,
+    pub size: [f32; 2],
+    pub maximized: bool,
+    pub overlay: bool,
+    pub click_through: bool,
+    pub background_opacity: f32,
+}
+
+impl Default for DetachedChatSettings {
+    fn default() -> Self {
+        Self {
+            channel: String::new(),
+            channel_tab_visible: true,
+            view: PaneViewSettings::default(),
+            position: None,
+            size: [480.0, 600.0],
+            maximized: false,
+            overlay: false,
+            click_through: false,
+            background_opacity: 0.55,
+        }
+    }
+}
+
+impl DetachedChatSettings {
+    pub fn normalized(mut self) -> Self {
+        self.position = self.position.filter(|position| {
+            position.iter().all(|value| value.is_finite() && value.abs() <= 1_000_000.0)
+        });
+        for (value, minimum) in self.size.iter_mut().zip([240.0, 180.0]) {
+            *value = if value.is_finite() { value.clamp(minimum, 16_384.0) } else { minimum };
+        }
+        self.background_opacity = if self.background_opacity.is_finite() {
+            self.background_opacity.clamp(0.0, 1.0)
+        } else { 0.55 };
+        self.click_through &= self.overlay;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,5 +207,19 @@ mod tests {
         assert!(PaneLayout::Pane { index: usize::MAX }
             .validated(2)
             .is_none());
+    }
+
+    #[test]
+    fn detached_window_geometry_rejects_nonfinite_values_and_click_through_requires_overlay() {
+        let saved = DetachedChatSettings { size: [f32::NAN, -10.0], position: Some([f32::INFINITY, 2.0]),
+            background_opacity: f32::NAN, click_through: true, ..Default::default() }.normalized();
+        assert_eq!(saved.size, [240.0, 180.0]);
+        assert_eq!(saved.position, None);
+        assert_eq!(saved.background_opacity, 0.55);
+        assert!(!saved.click_through);
+        let overlay = DetachedChatSettings { position: Some([-1920.0, 80.0]), overlay: true,
+            click_through: true, ..Default::default() }.normalized();
+        assert_eq!(overlay.position, Some([-1920.0, 80.0]));
+        assert!(overlay.click_through);
     }
 }

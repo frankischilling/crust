@@ -8,6 +8,8 @@ enum ChatDestination {
     Closed(usize),
     Inactive(ChannelId),
     InactivePane((u64, ChannelId)),
+    Detached(usize),
+    ClosedDetached(usize),
 }
 
 impl CrustApp {
@@ -45,6 +47,14 @@ impl CrustApp {
         };
         if channel.is_twitch() && account_id != &self.state.auth.user_id {
             return None;
+        }
+        if let Some(index) = self.detached_chats.open.iter().position(|window| window.pane.id == *pane_id && &window.pane.channel == channel
+            && (!channel.is_twitch() || &window.account_id == account_id)) {
+            return Some(ChatDestination::Detached(index));
+        }
+        if let Some(index) = self.detached_chats.closed.iter().position(|window| window.pane.id == *pane_id && &window.pane.channel == channel
+            && (!channel.is_twitch() || &window.account_id == account_id)) {
+            return Some(ChatDestination::ClosedDetached(index));
         }
         if self.split_panes.panes.len() > 1 {
             if let Some(index) = self
@@ -95,6 +105,8 @@ impl CrustApp {
             ChatDestination::Closed(index) => &self.split_panes.closed[*index].pane.input_buf,
             ChatDestination::Inactive(channel) => &self.inactive_classic_drafts[channel].input_buf,
             ChatDestination::InactivePane(key) => &self.inactive_pane_drafts[key].input_buf,
+            ChatDestination::Detached(index) => &self.detached_chats.open[*index].pane.input_buf,
+            ChatDestination::ClosedDetached(index) => &self.detached_chats.closed[*index].pane.input_buf,
         }
     }
 
@@ -113,6 +125,8 @@ impl CrustApp {
             ChatDestination::InactivePane(key) => {
                 &mut self.inactive_pane_drafts.get_mut(&key).unwrap().input_buf
             }
+            ChatDestination::Detached(index) => &mut self.detached_chats.open[index].pane.input_buf,
+            ChatDestination::ClosedDetached(index) => &mut self.detached_chats.closed[index].pane.input_buf,
         }
     }
 
@@ -137,6 +151,8 @@ impl CrustApp {
             return false;
         }
         match &destination {
+            ChatDestination::Detached(index) => return self.detached_chats.open[*index].reply.is_none(),
+            ChatDestination::ClosedDetached(index) => return self.detached_chats.closed[*index].reply.is_none(),
             ChatDestination::Inactive(channel) => {
                 return self.inactive_classic_drafts[channel].reply.is_none()
             }
@@ -183,6 +199,8 @@ impl CrustApp {
         self.destination_draft_mut(destination.clone())
             .clone_from(&message.text);
         match destination {
+            ChatDestination::Detached(index) => self.detached_chats.open[index].reply = message.reply_info(),
+            ChatDestination::ClosedDetached(index) => self.detached_chats.closed[index].reply = message.reply_info(),
             ChatDestination::Inactive(channel) => {
                 self.inactive_classic_drafts
                     .get_mut(&channel)

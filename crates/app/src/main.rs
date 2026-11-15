@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -291,6 +292,8 @@ fn main() -> Result<()> {
     let shutdown_settings_store = settings_store.clone();
     let shutdown_layout = Arc::new(std::sync::Mutex::new(None));
     let ui_shutdown_layout = Arc::clone(&shutdown_layout);
+    let restart_requested = Arc::new(AtomicBool::new(false));
+    let ui_restart_requested = Arc::clone(&restart_requested);
     let chat_logs = LogStore::new().ok();
     let initial_settings: AppSettings = settings_store
         .as_ref()
@@ -562,6 +565,9 @@ fn main() -> Result<()> {
     let saved_max = initial_settings.window_maximized;
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Crust - Twitch, Kick & IRC Chat")
+        // All viewports share a GL visual. Request alpha for overlays from startup;
+        // the main window's panels still paint an opaque background.
+        .with_transparent(true)
         .with_inner_size(saved_size.unwrap_or(APP_INITIAL_INNER_SIZE))
         .with_min_inner_size(APP_MIN_INNER_SIZE)
         .with_icon(crust_icon_data())
@@ -602,7 +608,9 @@ fn main() -> Result<()> {
                 app.set_history_updates(sender, ui_history_backlog);
             }
             app.set_pending_crash_reports(pending_crash_reports);
-            app.set_crash_pre_exit_hook(|| crash::clear_session_sentinel());
+            app.set_crash_restart_handler(move || {
+                ui_restart_requested.store(true, Ordering::Relaxed);
+            });
             Ok(Box::new(app))
         }),
     );
@@ -670,6 +678,13 @@ fn main() -> Result<()> {
     // Clean-shutdown path: defuse the session sentinel so the next
     // launch does not treat this run as an abnormal exit.
     crash::clear_session_sentinel();
+    if restart_requested.load(Ordering::Relaxed) {
+        let executable = std::env::current_exe()?;
+        std::process::Command::new(executable)
+            .args(std::env::args_os().skip(1))
+            .spawn()
+            .map_err(|error| anyhow::anyhow!("Failed to restart Crust after shutdown: {error}"))?;
+    }
     Ok(())
 }
 
@@ -3703,10 +3718,10 @@ async fn reducer_loop(
                             }
                         }
                     }
-                    AppCommand::SetSplitPanes { active_channel, panes, focused, layout, views } => {
+                    AppCommand::SetSplitPanes { active_channel, panes, focused, layout, views, detached_chats } => {
                         let snapshot = crust_core::model::PaneLayoutSnapshot {
                             active_channel,
-                            panes, focused, layout, views,
+                            panes, focused, layout, views, detached_chats,
                         };
                         if settings.apply_pane_layout(snapshot) {
                             if let Some(store) = &settings_store {

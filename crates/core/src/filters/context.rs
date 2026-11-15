@@ -33,6 +33,7 @@ pub static MESSAGE_TYPING_CONTEXT: Lazy<HashMap<String, Type>> = Lazy::new(|| {
     // flags.*
     for k in [
         "flags.action",
+        "flags.announcement",
         "flags.highlighted",
         "flags.points_redeemed",
         "flags.sub_message",
@@ -146,6 +147,7 @@ pub fn build_message_context(
     let is_reward =
         matches!(msg.msg_kind, MsgKind::ChannelPointsReward { .. }) || f.custom_reward_id.is_some();
     ctx.insert("flags.action".into(), Value::Bool(f.is_action));
+    ctx.insert("flags.announcement".into(), Value::Bool(matches!(msg.msg_kind, MsgKind::Announcement { .. })));
     ctx.insert("flags.highlighted".into(), Value::Bool(f.is_highlighted));
     ctx.insert(
         "flags.points_redeemed".into(),
@@ -287,6 +289,20 @@ mod tests {
         let msg = make_message("alice", "gg ez", Vec::new());
         let ctx = build_message_context(&msg, "somech", Some(true), false);
         assert_eq!(evaluate(&expr, &ctx), Value::Bool(false));
+    }
+
+    #[test]
+    fn announcement_filter_preserves_author_text_and_user_message_classification() {
+        let expression = parse("flags.announcement && !flags.system_message && author.login == \"alice\" && message.content contains \"hello\"").unwrap();
+        assert_eq!(MESSAGE_TYPING_CONTEXT.get("flags.announcement"), Some(&Type::Bool));
+        let mut message = make_message("alice", "hello everyone", Vec::new());
+        for announcement in [false, true] {
+            message.msg_kind = if announcement {
+                MsgKind::Announcement { color: "orange".into() }
+            } else { MsgKind::Chat };
+            let context = build_message_context(&message, "somech", None, false);
+            assert_eq!(evaluate(&expression, &context), Value::Bool(announcement));
+        }
     }
 
     #[test]

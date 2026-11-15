@@ -4,6 +4,7 @@ use crate::model::{ChannelId, ChatMessage};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlagKind {
     Highlighted,
+    Announcement,
     Sub,
     Reply,
     Action,
@@ -132,6 +133,7 @@ impl Predicate {
                 .unwrap_or(false),
             Self::Flag(kind) => match kind {
                 FlagKind::Highlighted => msg.flags.is_highlighted,
+                FlagKind::Announcement => matches!(msg.msg_kind, crate::model::MsgKind::Announcement { .. }),
                 FlagKind::Action => msg.flags.is_action,
                 FlagKind::FirstMsg => msg.flags.is_first_msg,
                 FlagKind::Pinned => msg.flags.is_pinned,
@@ -539,6 +541,22 @@ mod tests {
                 matches(&crate::search::parse(query).predicates, &msg, &channel),
                 "{query}"
             );
+        }
+    }
+
+    #[test]
+    fn announcement_search_supports_negation_author_and_flag_alternatives() {
+        let channel = make_channel("foo");
+        let mut msg = make_msg("alice", "Alice", "a colorful notice");
+        for announcement in [false, true] {
+            msg.msg_kind = if announcement {
+                MsgKind::Announcement { color: "blue".into() }
+            } else { MsgKind::Chat };
+            for query in ["is:announcement", "from:alice is:announcement colorful", "is:sub,announcement"] {
+                assert_eq!(matches(&crate::search::parse(query).predicates, &msg, &channel), announcement, "{query}");
+            }
+            assert_eq!(matches(&crate::search::parse("!is:announcement").predicates, &msg, &channel), !announcement);
+            assert!(!matches(&crate::search::parse("is:system").predicates, &msg, &channel));
         }
     }
 
