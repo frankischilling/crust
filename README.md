@@ -62,7 +62,7 @@ for current settings and account-dialog captures.
 - [7TV paints, image loading, and chat controls](docs/AUDIT_NAME_PAINTS.md)
 - [Plugin API reference](docs/API.md)
 - [Example plugins](plugins/)
-- [Release notes v0.5.8](docs/releases/Release_v0.5.8.md)
+- [Release notes v0.5.9](docs/releases/Release_v0.5.9.md)
 
 ## Data paths
 

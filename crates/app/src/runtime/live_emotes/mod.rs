@@ -1,6 +1,7 @@
 mod bttv;
 pub(crate) mod reconcile;
 mod seventv;
+mod seventv_pool;
 #[cfg(test)]
 mod tests;
 
@@ -21,7 +22,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::seventv::{SevenTvCosmeticUpdate, SevenTvLiveCosmeticUpdate};
 
-use reconcile::{ApplyResult, SnapshotTicket};
+use reconcile::SnapshotTicket;
 
 const MAX_TARGETS: usize = 128;
 const MAX_SNAPSHOTS: usize = 4;
@@ -158,7 +159,6 @@ impl LiveEmoteUpdates {
             let next: Vec<_> = targets
                 .iter()
                 .filter(|target| target.source.provider == provider)
-                .take(MAX_TARGETS)
                 .cloned()
                 .collect();
             sender.send_if_modified(|current| {
@@ -173,6 +173,7 @@ impl LiveEmoteUpdates {
     }
 }
 
+#[derive(Clone)]
 struct Endpoints {
     socket: String,
     bttv_api: String,
@@ -201,6 +202,10 @@ async fn run_worker(
     mut desired: watch::Receiver<Vec<LiveTarget>>,
     cosmetics: Option<mpsc::Sender<SevenTvCosmeticUpdate>>,
 ) {
+    if provider == Provider::SevenTv {
+        seventv_pool::run(endpoints, index, dirty, desired, cosmetics).await;
+        return;
+    }
     let client = match reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(12))
@@ -254,7 +259,6 @@ async fn run_worker(
                     client: &client,
                     index: &index,
                     dirty: &dirty,
-                    cosmetics: cosmetics.as_ref(),
                 },
             )
             .await;
@@ -292,14 +296,12 @@ struct ConnectionContext<'a> {
     client: &'a reqwest::Client,
     index: &'a crate::EmoteIndex,
     dirty: &'a mpsc::Sender<()>,
-    cosmetics: Option<&'a mpsc::Sender<SevenTvCosmeticUpdate>>,
 }
 
 struct Watched {
     target: LiveTarget,
     next_snapshot: Instant,
     in_flight: bool,
-    refresh_after_load: bool,
 }
 
 struct Loaded {
@@ -345,141 +347,81 @@ async fn run_connected(
         client,
         index,
         dirty,
-        cosmetics,
     } = context;
     let mut watched = HashMap::<LiveScope, Watched>::new();
-    let mut topics = HashSet::<seventv::Topic>::new();
-    let mut acknowledged = HashSet::<seventv::Topic>::new();
     let mut rooms = HashSet::<String>::new();
     let mut jobs = JoinSet::<Loaded>::new();
-    let mut subscription_limit = if provider == Provider::Bttv {
-        Some(usize::MAX)
-    } else {
-        None
-    };
-    let mut heartbeat = Duration::from_secs(30);
     let mut last_received = Instant::now();
     let mut last_ping = Instant::now();
-    let mut awaiting_ack_since = None;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut refresh_subscriptions = true;
-    let mut cosmetics_connected = false;
     loop {
         if refresh_subscriptions {
             refresh_subscriptions = false;
-            if let Some(limit) = subscription_limit {
-                let next = select_targets(provider, &desired.borrow_and_update(), limit);
-                if next.is_empty() {
-                    break;
-                }
-                if next.iter().any(|target| {
-                    watched.get(&target.scope).is_some_and(|old| {
-                        old.target.generation != target.generation
-                            || old.target.binding_generation != target.binding_generation
-                    })
-                }) {
-                    // Rejoin with a new connection so buffered frames from the
-                    // previous room lifetime cannot acquire its new generation.
-                    break;
-                }
-                let next_topics: HashSet<_> = next.iter().flat_map(seventv::topics).collect();
-                let next_rooms: HashSet<_> = next
-                    .iter()
-                    .map(|target| target.source.room_id.clone())
-                    .collect();
-                if provider == Provider::SevenTv {
-                    for topic in topics.difference(&next_topics) {
-                        if write(&mut socket, Message::Text(topic.command(false).into()))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    for topic in next_topics.difference(&topics) {
-                        if write(&mut socket, Message::Text(topic.command(true).into()))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                        awaiting_ack_since.get_or_insert(Instant::now());
-                    }
-                    acknowledged.retain(|topic| next_topics.contains(topic));
-                    topics = next_topics;
-                    if acknowledged == topics {
-                        awaiting_ack_since = None;
-                    }
-                    if !cosmetics_connected {
-                        if !send_cosmetic_update(
-                            cosmetics,
-                            epoch,
-                            SevenTvLiveCosmeticUpdate::Connected,
-                        )
-                        .await
-                        {
-                            return;
-                        }
-                        cosmetics_connected = true;
-                    }
-                } else {
-                    for room in rooms.difference(&next_rooms) {
-                        if write(&mut socket, Message::Text(bttv::unsubscribe(room).into()))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    for room in next_rooms.difference(&rooms) {
-                        if write(&mut socket, Message::Text(bttv::subscribe(room).into()))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    rooms = next_rooms;
-                }
-                watched.retain(|_, old| next.iter().any(|target| target == &old.target));
-                for target in next {
-                    watched.entry(target.scope.clone()).or_insert_with(|| {
-                        index.write().unwrap().begin_live_epoch(&target, epoch);
-                        Watched {
-                            target,
-                            next_snapshot: Instant::now(),
-                            in_flight: false,
-                            refresh_after_load: false,
-                        }
-                    });
-                }
-                tracing::debug!(
-                    provider = provider.name(),
-                    scopes = watched.len(),
-                    subscriptions = if provider == Provider::SevenTv {
-                        topics.len()
-                    } else {
-                        rooms.len()
-                    },
-                    "Live emote subscriptions sent"
-                );
+            let next: Vec<_> = desired
+                .borrow_and_update()
+                .iter()
+                .filter(|target| target.source.provider == Provider::Bttv)
+                .take(MAX_TARGETS)
+                .cloned()
+                .collect();
+            if next.is_empty() {
+                break;
             }
+            if next.iter().any(|target| {
+                watched.get(&target.scope).is_some_and(|old| {
+                    old.target.generation != target.generation
+                        || old.target.binding_generation != target.binding_generation
+                })
+            }) {
+                break;
+            }
+            let next_rooms: HashSet<_> = next
+                .iter()
+                .map(|target| target.source.room_id.clone())
+                .collect();
+            for room in rooms.difference(&next_rooms) {
+                if write(&mut socket, Message::Text(bttv::unsubscribe(room).into()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            for room in next_rooms.difference(&rooms) {
+                if write(&mut socket, Message::Text(bttv::subscribe(room).into()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            rooms = next_rooms;
+            watched.retain(|_, old| next.iter().any(|target| target == &old.target));
+            for target in next {
+                watched.entry(target.scope.clone()).or_insert_with(|| {
+                    index.write().unwrap().begin_live_epoch(&target, epoch);
+                    Watched {
+                        target,
+                        next_snapshot: Instant::now(),
+                        in_flight: false,
+                    }
+                });
+            }
+            tracing::debug!(
+                provider = provider.name(),
+                scopes = watched.len(),
+                subscriptions = rooms.len(),
+                "Live emote subscriptions sent"
+            );
         }
 
-        // At most four metadata requests exist per provider, including obsolete jobs.
         for entry in watched.values_mut() {
             if jobs.len() >= MAX_SNAPSHOTS {
                 break;
             }
             if entry.in_flight || Instant::now() < entry.next_snapshot {
-                continue;
-            }
-            if provider == Provider::SevenTv
-                && !seventv::topics(&entry.target)
-                    .iter()
-                    .all(|topic| acknowledged.contains(topic))
-            {
                 continue;
             }
             let Some(ticket) = index
@@ -492,11 +434,7 @@ async fn run_connected(
             entry.in_flight = true;
             let target = entry.target.clone();
             let client = client.clone();
-            let endpoint = if provider == Provider::Bttv {
-                endpoints.bttv_api.clone()
-            } else {
-                endpoints.seven_tv_gql.clone()
-            };
+            let endpoint = endpoints.bttv_api.clone();
             jobs.spawn(async move {
                 let result = fetch_snapshot(&client, &endpoint, &target).await;
                 Loaded {
@@ -516,20 +454,19 @@ async fn run_connected(
                 let Ok(loaded) = completed else { break; };
                 let Some(entry) = watched.get_mut(&loaded.target.scope).filter(|entry| entry.target == loaded.target) else { continue; };
                 entry.in_flight = false;
-                entry.next_snapshot = Instant::now() + if std::mem::take(&mut entry.refresh_after_load) {
-                    Duration::ZERO
-                } else if loaded.result.is_some() { REFRESH_INTERVAL } else { RETRY_INTERVAL };
+                entry.next_snapshot = Instant::now() + if loaded.result.is_some() {
+                    REFRESH_INTERVAL
+                } else {
+                    RETRY_INTERVAL
+                };
                 tracing::debug!(provider = provider.name(), room_id = %loaded.target.source.room_id,
                     succeeded = loaded.result.is_some(), "Live emote snapshot finished");
-                let result = match loaded.result {
-                    Some(Snapshot::Emotes(emotes)) => index.write().unwrap().apply_live_snapshot(
-                        &loaded.target, loaded.ticket, emotes, provider == Provider::SevenTv),
-                    Some(Snapshot::Source(source)) => ApplyResult {
-                        changed: index.write().unwrap().switch_live_source(&loaded.target, epoch, source), needs_snapshot: false },
-                    None => ApplyResult::default(),
-                };
-                if result.needs_snapshot { entry.next_snapshot = Instant::now() + RETRY_INTERVAL; }
-                if result.changed { let _ = dirty.try_send(()); }
+                if let Some(Snapshot::Emotes(emotes)) = loaded.result {
+                    let result = index.write().unwrap().apply_live_snapshot(
+                        &loaded.target, loaded.ticket, emotes, false);
+                    if result.needs_snapshot { entry.next_snapshot = Instant::now() + RETRY_INTERVAL; }
+                    if result.changed { let _ = dirty.try_send(()); }
+                }
             }
             incoming = socket.next() => {
                 let Some(Ok(message)) = incoming else { break; };
@@ -538,99 +475,21 @@ async fn run_connected(
                     Message::Ping(payload) => {
                         if write(&mut socket, Message::Pong(payload)).await.is_err() { break; }
                     }
-                    Message::Pong(_) => {}
                     Message::Close(_) => break,
-                    Message::Text(text) if provider == Provider::Bttv => {
+                    Message::Text(text) => {
                         if let Some((room, deltas)) = bttv::decode(&text) {
-                            let targets: Vec<_> = watched.values().filter(|entry| entry.target.source.room_id == room).map(|entry| entry.target.clone()).collect();
+                            let targets: Vec<_> = watched.values()
+                                .filter(|entry| entry.target.source.room_id == room)
+                                .map(|entry| entry.target.clone()).collect();
                             apply_deltas(index, dirty, &mut watched, &targets, epoch, &deltas);
                         }
                     }
-                    Message::Text(text) => match seventv::decode(&text) {
-                        Some(seventv::Frame::Hello { heartbeat: interval, subscription_limit: limit }) => {
-                            heartbeat = interval;
-                            subscription_limit = Some(limit);
-                            refresh_subscriptions = true;
-                        }
-                        Some(seventv::Frame::Subscribed(topic)) => {
-                            if topics.contains(&topic) { acknowledged.insert(topic); }
-                            if acknowledged == topics {
-                                awaiting_ack_since = None;
-                                tracing::debug!(provider = provider.name(), subscriptions = topics.len(), "Live emote subscriptions ready");
-                            }
-                        }
-                        Some(seventv::Frame::Reconnect) => break,
-                        Some(seventv::Frame::Updates(updates)) => {
-                            for update in updates {
-                                match update {
-                                    seventv::Update::Emotes { set_id, deltas } => {
-                                        let targets: Vec<_> = watched.values().filter(|entry| entry.target.source.set_id.as_deref() == Some(set_id.as_str()))
-                                            .map(|entry| entry.target.clone()).collect();
-                                        apply_deltas(index, dirty, &mut watched, &targets, epoch, &deltas);
-                                    }
-                                    seventv::Update::ActiveSet { user_id, connection_index, set_id } => {
-                                        for entry in watched.values() {
-                                            if entry.target.source.user_id.as_deref() == Some(user_id.as_str())
-                                                && entry.target.source.connection_index == Some(connection_index) {
-                                                let mut source = entry.target.source.clone();
-                                                source.set_id = set_id.clone();
-                                                if index.write().unwrap().switch_live_source(&entry.target, epoch, source) {
-                                                    let _ = dirty.try_send(());
-                                                }
-                                            }
-                                        }
-                                    }
-                                    seventv::Update::DeletedSet(set_id) => {
-                                        for entry in watched.values() {
-                                            if entry.target.source.set_id.as_deref() == Some(set_id.as_str()) {
-                                                let mut source = entry.target.source.clone();
-                                                source.set_id = None;
-                                                if index.write().unwrap().switch_live_source(&entry.target, epoch, source) {
-                                                    let _ = dirty.try_send(());
-                                                }
-                                            }
-                                        }
-                                    }
-                                    seventv::Update::PersonalSetsChanged(user_id) => {
-                                        for entry in watched.values_mut() {
-                                            if matches!(entry.target.scope, LiveScope::Personal(_))
-                                                && entry.target.source.user_id.as_deref() == Some(user_id.as_str()) {
-                                                entry.next_snapshot = Instant::now();
-                                                entry.refresh_after_load |= entry.in_flight;
-                                            }
-                                        }
-                                    }
-                                    seventv::Update::UserStyleChanged(user_id) => {
-                                        let mut twitch_user_ids: Vec<_> = watched.values()
-                                            .filter(|entry| entry.target.source.platform == "TWITCH"
-                                                && entry.target.source.user_id.as_deref() == Some(user_id.as_str()))
-                                            .map(|entry| entry.target.source.room_id.clone()).collect();
-                                        twitch_user_ids.sort();
-                                        twitch_user_ids.dedup();
-                                        if !twitch_user_ids.is_empty() && !send_cosmetic_update(cosmetics, epoch,
-                                            SevenTvLiveCosmeticUpdate::RefreshUsers { twitch_user_ids }).await {
-                                            return;
-                                        }
-                                    }
-                                    seventv::Update::Cosmetic(update) => {
-                                        if topics.iter().any(|topic| matches!(topic.condition, seventv::Condition::Channel(_)))
-                                            && !send_cosmetic_update(cosmetics, epoch, update).await {
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    },
                     _ => {}
                 }
             }
             _ = tick.tick() => {
-                if subscription_limit.is_none() && last_received.elapsed() >= CONNECT_TIMEOUT { break; }
-                if awaiting_ack_since.is_some_and(|started: Instant| started.elapsed() >= CONNECT_TIMEOUT) { break; }
-                if last_received.elapsed() >= heartbeat.saturating_mul(3) { break; }
-                if provider == Provider::Bttv && last_ping.elapsed() >= Duration::from_secs(30) {
+                if last_received.elapsed() >= Duration::from_secs(90) { break; }
+                if last_ping.elapsed() >= Duration::from_secs(30) {
                     if write(&mut socket, Message::Ping(Vec::new().into())).await.is_err() { break; }
                     last_ping = Instant::now();
                 }
@@ -638,34 +497,6 @@ async fn run_connected(
         }
     }
     // Dropping the join set cancels metadata jobs from this socket epoch.
-}
-
-fn select_targets(
-    provider: Provider,
-    wanted: &[LiveTarget],
-    subscription_limit: usize,
-) -> Vec<LiveTarget> {
-    let mut selected = Vec::new();
-    let mut topics = HashSet::new();
-    for target in wanted
-        .iter()
-        .filter(|target| target.source.provider == provider)
-        .take(MAX_TARGETS)
-    {
-        if provider == Provider::SevenTv {
-            let needed = seventv::topics(target);
-            let additional = needed
-                .iter()
-                .filter(|topic| !topics.contains(*topic))
-                .count();
-            if topics.len() + additional > subscription_limit {
-                continue;
-            }
-            topics.extend(needed);
-        }
-        selected.push(target.clone());
-    }
-    selected
 }
 
 fn apply_deltas(

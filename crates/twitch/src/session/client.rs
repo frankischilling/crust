@@ -119,19 +119,6 @@ pub enum TwitchEvent {
         color: Option<String>,
         generation: u64,
     },
-    /// Sub / resub / giftsub notification (USERNOTICE).
-    SubAlert {
-        channel: ChannelId,
-        /// Display name of the subscriber or gift recipient.
-        display_name: String,
-        /// Cumulative months (1 for new subs).
-        months: u32,
-        /// "Prime" | "Tier 1" | "Tier 2" | "Tier 3"
-        plan: String,
-        is_gift: bool,
-        /// Optional message text typed by the subscriber.
-        sub_msg: String,
-    },
     /// Incoming raid notification (USERNOTICE msg-id=raid).
     Raid {
         channel: ChannelId,
@@ -907,52 +894,15 @@ impl TwitchSession {
                     .or_else(|| msg.nick())
                     .unwrap_or("unknown")
                     .to_owned();
-                let sub_msg = msg.params.get(1).cloned().unwrap_or_default();
-
                 match msg_id {
-                    "sub" | "resub" => {
-                        let months = msg
-                            .tags
-                            .get("msg-param-cumulative-months")
-                            .or_else(|| msg.tags.get("msg-param-months"))
-                            .and_then(|s| s.parse().ok())
-                            .unwrap_or(1u32);
-                        let plan =
-                            decode_sub_plan(msg.tags.get("msg-param-sub-plan").unwrap_or("1000"));
-                        self.emit(TwitchEvent::SubAlert {
-                            channel,
-                            display_name,
-                            months,
-                            plan,
-                            is_gift: false,
-                            sub_msg,
-                        })
-                        .await;
-                    }
-                    "subgift" | "anonsubgift" => {
-                        let months = msg
-                            .tags
-                            .get("msg-param-months")
-                            .and_then(|s| s.parse().ok())
-                            .unwrap_or(1u32);
-                        let plan =
-                            decode_sub_plan(msg.tags.get("msg-param-sub-plan").unwrap_or("1000"));
-                        // For subgift, display-name is the gifter; recipient is msg-param-recipient-display-name
-                        let recipient = msg
-                            .tags
-                            .get("msg-param-recipient-display-name")
-                            .filter(|s| !s.is_empty())
-                            .unwrap_or(&display_name)
-                            .to_owned();
-                        self.emit(TwitchEvent::SubAlert {
-                            channel,
-                            display_name: recipient,
-                            months,
-                            plan,
-                            is_gift: true,
-                            sub_msg,
-                        })
-                        .await;
+                    "sub" | "resub" | "subgift" | "anonsubgift" => {
+                        if let Some(mut message) =
+                            parse_subscription_irc(msg, self.auth_nick.as_deref(), self.next_msg_id)
+                        {
+                            message.id = self.alloc_id();
+                            message.flags.is_history = false;
+                            self.emit(TwitchEvent::ChatMessage(message)).await;
+                        }
                     }
                     "raid" => {
                         let source_login = msg
@@ -1105,22 +1055,85 @@ pub fn parse_privmsg_irc(
     local_nick: Option<&str>,
     id: u64,
 ) -> Option<ChatMessage> {
-    if msg.command != "PRIVMSG" {
+    if msg.command != "PRIVMSG" || msg.params.len() < 2 {
         return None;
     }
+    parse_chat_message_irc(msg, local_nick, id)
+}
+
+fn parse_subscription_irc(
+    msg: &IrcMessage,
+    local_nick: Option<&str>,
+    id: u64,
+) -> Option<ChatMessage> {
+    let notice_type = msg.tags.get("msg-id")?;
+    if msg.command != "USERNOTICE"
+        || !matches!(notice_type, "sub" | "resub" | "subgift" | "anonsubgift")
+    {
+        return None;
+    }
+    let mut message = parse_chat_message_irc(msg, local_nick, id)?;
+    let is_gift = matches!(notice_type, "subgift" | "anonsubgift");
+    let display_name = if is_gift {
+        msg.tags.get("msg-param-recipient-display-name")
+            .filter(|name| !name.is_empty())
+            .or_else(|| msg.tags.get("msg-param-recipient-user-name"))
+            .unwrap_or(&message.sender.display_name)
+            .to_owned()
+    } else {
+        message.sender.display_name.clone()
+    };
+    let months = if is_gift {
+        msg.tags.get("msg-param-months")
+    } else {
+        msg.tags.get("msg-param-cumulative-months")
+            .or_else(|| msg.tags.get("msg-param-months"))
+    }
+    .and_then(|months| months.parse().ok())
+    .unwrap_or(1);
+    let gifted_to_me = is_gift && local_nick.is_some_and(|nick| {
+        msg.tags.get("msg-param-recipient-user-name")
+            .filter(|login| !login.is_empty())
+            .unwrap_or(&display_name)
+            .eq_ignore_ascii_case(nick)
+    });
+    message.msg_kind = MsgKind::Sub {
+        display_name,
+        months,
+        plan: decode_sub_plan(msg.tags.get("msg-param-sub-plan").unwrap_or("1000")),
+        is_gift,
+        sub_msg: if message.raw_text.trim().is_empty() { String::new() } else { message.raw_text.clone() },
+    };
+    if message.raw_text.trim().is_empty() {
+        message.raw_text = message.msg_kind.subscription_notice_text().unwrap_or_default();
+    }
+    message.flags.is_mention |= gifted_to_me;
+    message.flags.is_highlighted |= gifted_to_me;
+    Some(message)
+}
+
+fn parse_chat_message_irc(
+    msg: &IrcMessage,
+    local_nick: Option<&str>,
+    id: u64,
+) -> Option<ChatMessage> {
     let channel_raw = msg.params.first()?;
     let channel = ChannelId::new(channel_raw.as_str());
-    let raw_text = msg.params.get(1)?;
+    let raw_text = msg.params.get(1).map(String::as_str).unwrap_or("");
 
     // Handle /me ACTION
     let (text, is_action) = if raw_text.starts_with("\x01ACTION ") && raw_text.ends_with('\x01') {
         (&raw_text[8..raw_text.len() - 1], true)
     } else {
-        (raw_text.as_str(), false)
+        (raw_text, false)
     };
 
     let tags = &msg.tags;
-    let login = msg.nick().unwrap_or("").to_owned();
+    let login = if msg.command == "USERNOTICE" {
+        tags.get("login").unwrap_or("")
+    } else {
+        msg.nick().unwrap_or("")
+    }.to_owned();
     let display_name = tags
         .get("display-name")
         .filter(|name| !name.is_empty())
@@ -1432,9 +1445,53 @@ mod tests {
         let message =
             parse_line("@msg-id=sub;display-name=Alice :tmi.twitch.tv USERNOTICE #room").unwrap();
         session.handle_irc(&message).await;
-        assert!(
-            matches!(events.try_recv().unwrap(), TwitchEvent::SubAlert { sub_msg, .. } if sub_msg.is_empty())
+        let TwitchEvent::ChatMessage(message) = events.try_recv().unwrap() else {
+            panic!("expected subscription message");
+        };
+        assert!(matches!(&message.msg_kind, MsgKind::Sub { sub_msg, .. } if sub_msg.is_empty()));
+        assert_eq!(message.raw_text, "Alice subscribed with Tier 1!");
+        assert_eq!(message.plain_text(), message.raw_text);
+        assert!(!message.flags.is_history);
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn subscriptions_preserve_body_identity_timestamp_and_native_emotes() {
+        let (mut session, mut events) = session();
+        let raw = "@id=sub-1;msg-id=resub;login=alice;display-name=Alice;user-id=10;color=#123456;badges=subscriber/12;emotes=25:2-6;tmi-sent-ts=1700000000123;msg-param-cumulative-months=12;msg-param-sub-plan=1000 :tmi.twitch.tv USERNOTICE #room :🦀 Kappa thank you";
+        session.handle_irc(&parse_line(raw).unwrap()).await;
+        let TwitchEvent::ChatMessage(message) = events.try_recv().unwrap() else {
+            panic!("expected subscription message");
+        };
+        assert_eq!(message.raw_text, "🦀 Kappa thank you");
+        assert_eq!(message.server_id.as_deref(), Some("sub-1"));
+        assert_eq!(message.timestamp.timestamp_millis(), 1700000000123);
+        assert_eq!(message.sender.login, "alice");
+        assert_eq!(message.sender.user_id.0, "10");
+        assert_eq!(message.sender.badges[0].name, "subscriber");
+        assert_eq!(message.twitch_emotes[0].start, 2);
+        assert_eq!(message.twitch_emotes[0].end, 6);
+        let spans = crust_core::format::tokenize_with_flags(
+            &message.raw_text, false, &message.twitch_emotes, &|_| None,
         );
+        assert!(spans.iter().any(|span| matches!(span,
+            crust_core::model::Span::Emote { id, code, .. } if id == "25" && code == "Kappa")));
+        assert_eq!(message.plain_text(), "Alice resubscribed with Tier 1! (12 months)\n🦀 Kappa thank you");
+        assert!(events.try_recv().is_err(), "one IRC notice must produce one chat row");
+    }
+
+    #[tokio::test]
+    async fn gift_mentions_use_the_recipient_login_without_replacing_the_gifter() {
+        let (mut session, mut events) = session();
+        session.auth_nick = Some("alice".into());
+        let message = parse_line("@id=gift-1;msg-id=subgift;login=bob;display-name=Bob;user-id=20;msg-param-recipient-user-name=ALICE;msg-param-recipient-display-name=アリス :tmi.twitch.tv USERNOTICE #room").unwrap();
+        session.handle_irc(&message).await;
+        let TwitchEvent::ChatMessage(message) = events.try_recv().unwrap() else {
+            panic!("expected gift subscription");
+        };
+        assert_eq!(message.sender.login, "bob");
+        assert!(message.flags.is_mention && message.flags.is_highlighted);
+        assert!(matches!(&message.msg_kind, MsgKind::Sub { display_name, is_gift: true, .. } if display_name == "アリス"));
     }
 
     #[tokio::test]

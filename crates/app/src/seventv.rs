@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use crust_core::model::{
     Badge, Sender, SenderNamePaint, SenderNamePaintShadow, SenderNamePaintStop,
@@ -7,11 +9,13 @@ use crust_emotes::{
     providers::{personal_emote_set_id, read_bounded_json, SevenTvProvider},
     EmoteInfo,
 };
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::runtime::live_emotes::{LiveSource, Provider};
 
 const SEVENTV_GQL_URL: &str = "https://api.7tv.app/v3/gql";
+static NEXT_CATALOG_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct SevenTvUserStyleRaw {
@@ -60,6 +64,22 @@ pub(crate) enum SevenTvCosmeticKind {
 #[derive(Debug, Clone)]
 pub(crate) enum SevenTvLiveCosmeticUpdate {
     Connected,
+    ConnectedSlot {
+        slot: usize,
+    },
+    DisconnectedSlot {
+        slot: usize,
+    },
+    /// Refresh cached users through the bounded profile queue when live coverage is unavailable.
+    RefreshAll,
+    CatalogRefreshStarted {
+        generation: u64,
+    },
+    CatalogRefreshFinished {
+        generation: u64,
+        badges: HashMap<String, SevenTvBadgeMeta>,
+        paints: HashMap<String, SevenTvPaintMeta>,
+    },
     Paint {
         id: String,
         paint: SevenTvPaintMeta,
@@ -80,10 +100,6 @@ pub(crate) enum SevenTvLiveCosmeticUpdate {
 }
 
 pub(crate) enum SevenTvCosmeticUpdate {
-    Catalog {
-        badges: HashMap<String, SevenTvBadgeMeta>,
-        paints: HashMap<String, SevenTvPaintMeta>,
-    },
     UserStyle {
         twitch_user_id: String,
         generation: u64,
@@ -115,7 +131,11 @@ pub(crate) struct SevenTvCosmetics {
     refresh_order: VecDeque<String>,
     live_badges: HashSet<String>,
     live_paints: HashSet<String>,
-    live_epoch: u64,
+    live_connections: HashMap<usize, (u64, bool)>,
+    catalog_generation: u64,
+    pending_catalog: Option<u64>,
+    catalog_live_badges: HashSet<String>,
+    catalog_live_paints: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -248,28 +268,78 @@ impl SevenTvCosmetics {
         update: SevenTvLiveCosmeticUpdate,
     ) -> SevenTvCosmeticEffects {
         let mut effects = SevenTvCosmeticEffects::default();
-        if epoch < self.live_epoch {
-            return effects;
-        }
-        if epoch != self.live_epoch && !matches!(update, SevenTvLiveCosmeticUpdate::Connected) {
+        let connected = self
+            .live_connections
+            .values()
+            .any(|&(current, active)| active && current == epoch);
+        if !connected
+            && !matches!(
+                update,
+                SevenTvLiveCosmeticUpdate::Connected
+                    | SevenTvLiveCosmeticUpdate::ConnectedSlot { .. }
+                    | SevenTvLiveCosmeticUpdate::DisconnectedSlot { .. }
+                    | SevenTvLiveCosmeticUpdate::RefreshAll
+                    | SevenTvLiveCosmeticUpdate::CatalogRefreshStarted { .. }
+                    | SevenTvLiveCosmeticUpdate::CatalogRefreshFinished { .. }
+            )
+        {
             return effects;
         }
         match update {
             SevenTvLiveCosmeticUpdate::Connected => {
-                if epoch <= self.live_epoch {
+                return self.connect_slot(0, epoch);
+            }
+            SevenTvLiveCosmeticUpdate::ConnectedSlot { slot } => {
+                return self.connect_slot(slot, epoch);
+            }
+            SevenTvLiveCosmeticUpdate::DisconnectedSlot { slot } => {
+                if let Some((current, active)) = self.live_connections.get_mut(&slot) {
+                    if *current == epoch {
+                        *active = false;
+                    }
+                }
+            }
+            SevenTvLiveCosmeticUpdate::RefreshAll => {
+                if epoch != 0 {
                     return effects;
                 }
-                if self.live_epoch != 0 {
-                    effects.refresh = self.user_order.iter().rev().cloned().collect();
-                    effects.invalidate = effects.refresh.clone();
+                effects.refresh = self.user_order.iter().rev().cloned().collect();
+                effects.invalidate = effects.refresh.clone();
+            }
+            SevenTvLiveCosmeticUpdate::CatalogRefreshStarted { generation } => {
+                if epoch == 0 && generation > self.catalog_generation {
+                    self.catalog_generation = generation;
+                    self.pending_catalog = Some(generation);
+                    self.catalog_live_badges.clear();
+                    self.catalog_live_paints.clear();
                 }
-                self.live_epoch = epoch;
+            }
+            SevenTvLiveCosmeticUpdate::CatalogRefreshFinished {
+                generation,
+                badges,
+                paints,
+            } => {
+                if epoch != 0 || self.pending_catalog != Some(generation) {
+                    return effects;
+                }
+                self.pending_catalog = None;
+                self.live_badges = std::mem::take(&mut self.catalog_live_badges);
+                self.live_paints = std::mem::take(&mut self.catalog_live_paints);
+                info!(
+                    "7TV catalog received: {} badges, {} paints",
+                    badges.len(),
+                    paints.len()
+                );
+                effects.changed = self.catalog(badges, paints);
             }
             SevenTvLiveCosmeticUpdate::Paint { id, paint } => {
                 if self.paints.len() >= MAX_COSMETIC_DEFINITIONS && !self.paints.contains_key(&id) {
                     return effects;
                 }
                 self.live_paints.insert(id.clone());
+                if self.pending_catalog.is_some() {
+                    self.catalog_live_paints.insert(id.clone());
+                }
                 if self.paints.get(&id) == Some(&paint) {
                     return effects;
                 }
@@ -290,6 +360,9 @@ impl SevenTvCosmetics {
                     return effects;
                 }
                 self.live_badges.insert(id.clone());
+                if self.pending_catalog.is_some() {
+                    self.catalog_live_badges.insert(id.clone());
+                }
                 if self.badges.get(&id) == Some(&badge) {
                     return effects;
                 }
@@ -345,6 +418,25 @@ impl SevenTvCosmetics {
                 effects.invalidate = effects.refresh.clone();
             }
         }
+        for user_id in effects.refresh.iter().rev() {
+            self.queue_refresh(user_id);
+        }
+        effects
+    }
+
+    fn connect_slot(&mut self, slot: usize, epoch: u64) -> SevenTvCosmeticEffects {
+        let mut effects = SevenTvCosmeticEffects::default();
+        if epoch == 0 || slot >= 8 {
+            return effects;
+        }
+        if let Some((current, _)) = self.live_connections.get(&slot) {
+            if epoch <= *current {
+                return effects;
+            }
+            effects.refresh = self.user_order.iter().rev().cloned().collect();
+            effects.invalidate = effects.refresh.clone();
+        }
+        self.live_connections.insert(slot, (epoch, true));
         for user_id in effects.refresh.iter().rev() {
             self.queue_refresh(user_id);
         }
@@ -650,8 +742,62 @@ pub(crate) fn complete_7tv_user_profile(
     Some((update, style))
 }
 
-pub(crate) async fn load_7tv_cosmetics_catalog(
+pub(crate) fn next_cosmetic_catalog_generation() -> u64 {
+    NEXT_CATALOG_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
+pub(crate) async fn load_initial_7tv_cosmetics_catalog(
+    client: reqwest::Client,
+    updates: mpsc::Sender<SevenTvCosmeticUpdate>,
+) {
+    load_initial_7tv_cosmetics_catalog_at(&client, &updates, SEVENTV_GQL_URL).await;
+}
+
+async fn load_initial_7tv_cosmetics_catalog_at(
     client: &reqwest::Client,
+    updates: &mpsc::Sender<SevenTvCosmeticUpdate>,
+    endpoint: &str,
+) {
+    let mut retry_delay = Duration::from_secs(1);
+    loop {
+        let Ok(permit) = updates.reserve().await else {
+            return;
+        };
+        let generation = next_cosmetic_catalog_generation();
+        permit.send(SevenTvCosmeticUpdate::Live {
+            epoch: 0,
+            update: SevenTvLiveCosmeticUpdate::CatalogRefreshStarted { generation },
+        });
+        let result = tokio::select! {
+            _ = updates.closed() => return,
+            result = load_7tv_cosmetics_catalog_at(client, endpoint) => result,
+        };
+        if let Some((badges, paints)) = result {
+            let _ = updates
+                .send(SevenTvCosmeticUpdate::Live {
+                    epoch: 0,
+                    update: SevenTvLiveCosmeticUpdate::CatalogRefreshFinished {
+                        generation,
+                        badges,
+                        paints,
+                    },
+                })
+                .await;
+            return;
+        }
+        // Only startup failures retry. A successful catalog ends this task;
+        // lost live coverage has its own bounded refresh path.
+        tokio::select! {
+            _ = updates.closed() => return,
+            _ = tokio::time::sleep(retry_delay) => {}
+        }
+        retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(30));
+    }
+}
+
+pub(crate) async fn load_7tv_cosmetics_catalog_at(
+    client: &reqwest::Client,
+    endpoint: &str,
 ) -> Option<(
     HashMap<String, SevenTvBadgeMeta>,
     HashMap<String, SevenTvPaintMeta>,
@@ -703,7 +849,8 @@ pub(crate) async fn load_7tv_cosmetics_catalog(
     "#;
 
     let resp = match client
-        .post(SEVENTV_GQL_URL)
+        .post(endpoint)
+        .timeout(Duration::from_secs(10))
         .json(&serde_json::json!({ "query": query }))
         .send()
         .await
@@ -1720,5 +1867,440 @@ mod tests {
         cosmetics.forget("5");
         assert!(cosmetics.resolved("5").is_none());
         assert_eq!(cosmetics.user_order.len(), MAX_CACHED_COSMETIC_USERS - 1);
+    }
+
+    #[test]
+    fn cosmetic_connection_epochs_remain_independent_and_retire_on_disconnect() {
+        let mut cosmetics = SevenTvCosmetics::default();
+        cosmetics.live(5, SevenTvLiveCosmeticUpdate::ConnectedSlot { slot: 1 });
+        cosmetics.live(10, SevenTvLiveCosmeticUpdate::ConnectedSlot { slot: 0 });
+        cosmetics.live(5, entitlement("first", true));
+        assert_eq!(cosmetics.raw["42"].paint_id.as_deref(), Some("first"));
+        cosmetics.live(10, entitlement("second", true));
+        assert_eq!(cosmetics.raw["42"].paint_id.as_deref(), Some("second"));
+
+        cosmetics.live(5, SevenTvLiveCosmeticUpdate::DisconnectedSlot { slot: 1 });
+        assert!(cosmetics
+            .live(5, entitlement("stale", true))
+            .invalidate
+            .is_empty());
+        assert_eq!(cosmetics.raw["42"].paint_id.as_deref(), Some("second"));
+        let reconnect = cosmetics.live(12, SevenTvLiveCosmeticUpdate::ConnectedSlot { slot: 1 });
+        assert_eq!(reconnect.refresh, ["42"]);
+        cosmetics.live(5, SevenTvLiveCosmeticUpdate::DisconnectedSlot { slot: 1 });
+        cosmetics.live(12, entitlement("replacement", true));
+        assert_eq!(cosmetics.raw["42"].paint_id.as_deref(), Some("replacement"));
+        cosmetics.live(10, entitlement("still-connected", true));
+        assert_eq!(
+            cosmetics.raw["42"].paint_id.as_deref(),
+            Some("still-connected")
+        );
+        cosmetics.live(5, SevenTvLiveCosmeticUpdate::ConnectedSlot { slot: 1 });
+        assert!(cosmetics
+            .live(5, entitlement("old-reconnect", true))
+            .invalidate
+            .is_empty());
+    }
+
+    #[test]
+    fn unavailable_live_coverage_refreshes_recent_users_without_accepting_old_updates() {
+        let mut cosmetics = SevenTvCosmetics::default();
+        cosmetics.profile("42", SevenTvUserStyleRaw::default());
+        cosmetics.profile("99", SevenTvUserStyleRaw::default());
+        let refresh = cosmetics.live(0, SevenTvLiveCosmeticUpdate::RefreshAll);
+        assert_eq!(refresh.refresh, ["99", "42"]);
+        assert_eq!(refresh.invalidate, ["99", "42"]);
+        assert_eq!(cosmetics.refresh_candidates(8), ["99", "42"]);
+        assert!(cosmetics
+            .live(0, entitlement("unowned", true))
+            .invalidate
+            .is_empty());
+    }
+
+    #[test]
+    fn fresh_cosmetic_catalogs_preserve_only_edits_received_after_the_request_started() {
+        let mut cosmetics = SevenTvCosmetics::default();
+        cosmetics.live(10, SevenTvLiveCosmeticUpdate::ConnectedSlot { slot: 0 });
+        cosmetics.live(
+            10,
+            SevenTvLiveCosmeticUpdate::Paint {
+                id: "old".into(),
+                paint: solid_paint("#111111"),
+            },
+        );
+        cosmetics.profile(
+            "42",
+            SevenTvUserStyleRaw {
+                paint_id: Some("old".into()),
+                ..Default::default()
+            },
+        );
+        cosmetics.profile(
+            "99",
+            SevenTvUserStyleRaw {
+                paint_id: Some("during".into()),
+                ..Default::default()
+            },
+        );
+        cosmetics.live(
+            0,
+            SevenTvLiveCosmeticUpdate::CatalogRefreshStarted { generation: 100 },
+        );
+        cosmetics.live(
+            10,
+            SevenTvLiveCosmeticUpdate::Paint {
+                id: "during".into(),
+                paint: solid_paint("#222222"),
+            },
+        );
+        let finished =
+            |generation, old, during| SevenTvLiveCosmeticUpdate::CatalogRefreshFinished {
+                generation,
+                badges: HashMap::new(),
+                paints: HashMap::from([
+                    ("old".into(), solid_paint(old)),
+                    ("during".into(), solid_paint(during)),
+                ]),
+            };
+        cosmetics.live(0, finished(100, "#333333", "#444444"));
+        assert_eq!(
+            cosmetics
+                .resolved("42")
+                .unwrap()
+                .name_paint
+                .as_ref()
+                .unwrap()
+                .stops[0]
+                .color,
+            "#333333"
+        );
+        assert_eq!(
+            cosmetics
+                .resolved("99")
+                .unwrap()
+                .name_paint
+                .as_ref()
+                .unwrap()
+                .stops[0]
+                .color,
+            "#222222"
+        );
+        cosmetics.live(
+            10,
+            SevenTvLiveCosmeticUpdate::Paint {
+                id: "during".into(),
+                paint: solid_paint("#555555"),
+            },
+        );
+        cosmetics.live(0, finished(100, "#333333", "#666666"));
+        assert_eq!(
+            cosmetics
+                .resolved("99")
+                .unwrap()
+                .name_paint
+                .as_ref()
+                .unwrap()
+                .stops[0]
+                .color,
+            "#555555"
+        );
+        cosmetics.live(
+            0,
+            SevenTvLiveCosmeticUpdate::CatalogRefreshStarted { generation: 101 },
+        );
+        cosmetics.live(
+            0,
+            SevenTvLiveCosmeticUpdate::CatalogRefreshStarted { generation: 100 },
+        );
+        cosmetics.live(0, finished(100, "#333333", "#666666"));
+        cosmetics.live(0, finished(101, "#333333", "#777777"));
+        assert_eq!(
+            cosmetics
+                .resolved("99")
+                .unwrap()
+                .name_paint
+                .as_ref()
+                .unwrap()
+                .stops[0]
+                .color,
+            "#777777"
+        );
+    }
+
+    mod startup_catalog {
+        use super::*;
+        use std::future::Future;
+        use std::time::Instant;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        async fn within<F: Future>(future: F) -> F::Output {
+            tokio::time::timeout(Duration::from_secs(5), future)
+                .await
+                .expect("catalog fixture timed out")
+        }
+
+        struct Harness {
+            http: TcpListener,
+            updates: mpsc::Receiver<SevenTvCosmeticUpdate>,
+            task: tokio::task::JoinHandle<()>,
+        }
+
+        impl Harness {
+            async fn new() -> Self {
+                let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let endpoint = format!("http://{}/gql", http.local_addr().unwrap());
+                let client = reqwest::Client::builder().no_proxy().build().unwrap();
+                let (sender, updates) = mpsc::channel(8);
+                let task = tokio::spawn(async move {
+                    load_initial_7tv_cosmetics_catalog_at(&client, &sender, &endpoint).await;
+                });
+                Self {
+                    http,
+                    updates,
+                    task,
+                }
+            }
+
+            async fn update(&mut self) -> SevenTvLiveCosmeticUpdate {
+                match within(self.updates.recv()).await {
+                    Some(SevenTvCosmeticUpdate::Live { epoch: 0, update }) => update,
+                    _ => panic!("expected a fenced cosmetic catalog update"),
+                }
+            }
+
+            async fn started(&mut self, cosmetics: &mut SevenTvCosmetics) -> u64 {
+                let update = self.update().await;
+                let SevenTvLiveCosmeticUpdate::CatalogRefreshStarted { generation } = update else {
+                    panic!("expected the catalog request boundary");
+                };
+                cosmetics.live(0, update);
+                generation
+            }
+
+            async fn request(&self) -> TcpStream {
+                within(async {
+                    let (mut stream, _) = self.http.accept().await.unwrap();
+                    let mut bytes = Vec::new();
+                    let mut chunk = [0u8; 2048];
+                    loop {
+                        let count = stream.read(&mut chunk).await.unwrap();
+                        assert!(count > 0, "catalog request ended before its body arrived");
+                        bytes.extend_from_slice(&chunk[..count]);
+                        assert!(bytes.len() <= 64 * 1024);
+                        if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                            let headers = std::str::from_utf8(&bytes[..end]).unwrap();
+                            let length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().unwrap())
+                                })
+                                .unwrap_or(0);
+                            if bytes.len() >= end + 4 + length {
+                                return stream;
+                            }
+                        }
+                    }
+                })
+                .await
+            }
+        }
+
+        impl Drop for Harness {
+            fn drop(&mut self) {
+                self.task.abort();
+            }
+        }
+
+        async fn respond(mut stream: TcpStream, status: u16, body: serde_json::Value) {
+            let body = body.to_string();
+            let response = format!(
+                "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            within(stream.write_all(response.as_bytes())).await.unwrap();
+            within(stream.shutdown()).await.unwrap();
+        }
+
+        fn catalog() -> serde_json::Value {
+            serde_json::json!({"data": {"cosmetics": {
+                "badges": [{"id": "supporter", "tooltip": "Supporter", "host": {
+                    "url": "//cdn.7tv.app/badge/supporter",
+                    "files": [{"name": "2x.webp"}]
+                }}],
+                "paints": [
+                    {"id": "selected", "function": "LINEAR_GRADIENT", "color": 0x223344FFu32},
+                    {"id": "during", "function": "LINEAR_GRADIENT", "color": 0x334455FFu32}
+                ]
+            }}})
+        }
+
+        #[tokio::test]
+        async fn retries_a_failed_startup_catalog_and_preserves_live_edits() {
+            let mut harness = Harness::new().await;
+            let mut cosmetics = SevenTvCosmetics::default();
+            cosmetics.profile(
+                "42",
+                SevenTvUserStyleRaw {
+                    paint_id: Some("selected".into()),
+                    badge_id: Some("supporter".into()),
+                    ..Default::default()
+                },
+            );
+            cosmetics.profile(
+                "99",
+                SevenTvUserStyleRaw {
+                    paint_id: Some("during".into()),
+                    ..Default::default()
+                },
+            );
+            cosmetics.live(50, SevenTvLiveCosmeticUpdate::ConnectedSlot { slot: 0 });
+            let first = harness.started(&mut cosmetics).await;
+            let request = harness.request().await;
+            let failed_at = Instant::now();
+            respond(request, 503, serde_json::json!({})).await;
+            let second = harness.started(&mut cosmetics).await;
+            assert!(failed_at.elapsed() >= Duration::from_secs(1));
+            assert!(second > first);
+            let request = harness.request().await;
+            cosmetics.live(
+                50,
+                SevenTvLiveCosmeticUpdate::Paint {
+                    id: "during".into(),
+                    paint: solid_paint("#ABCDEF"),
+                },
+            );
+            respond(request, 200, catalog()).await;
+            let changed = cosmetics.live(0, harness.update().await).changed;
+            assert!(changed.iter().any(|(user, _)| user == "42"));
+            let recovered = cosmetics.resolved("42").unwrap();
+            assert_eq!(
+                recovered.name_paint.as_ref().unwrap().stops[0].color,
+                "#223344"
+            );
+            assert!(recovered.badge.is_some());
+            assert_eq!(
+                cosmetics
+                    .resolved("99")
+                    .unwrap()
+                    .name_paint
+                    .as_ref()
+                    .unwrap()
+                    .stops[0]
+                    .color,
+                "#ABCDEF"
+            );
+            within(&mut harness.task).await.unwrap();
+            assert!(
+                within(harness.updates.recv()).await.is_none(),
+                "successful startup kept retrying"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_late_startup_catalog_cannot_replace_a_newer_recovery_snapshot() {
+            let mut harness = Harness::new().await;
+            let mut cosmetics = SevenTvCosmetics::default();
+            cosmetics.profile(
+                "42",
+                SevenTvUserStyleRaw {
+                    paint_id: Some("selected".into()),
+                    ..Default::default()
+                },
+            );
+            let initial = harness.started(&mut cosmetics).await;
+            let request = harness.request().await;
+            let generation = next_cosmetic_catalog_generation();
+            assert!(generation > initial);
+            cosmetics.live(
+                0,
+                SevenTvLiveCosmeticUpdate::CatalogRefreshStarted { generation },
+            );
+            cosmetics.live(
+                0,
+                SevenTvLiveCosmeticUpdate::CatalogRefreshFinished {
+                    generation,
+                    badges: HashMap::new(),
+                    paints: HashMap::from([("selected".into(), solid_paint("#00FF00"))]),
+                },
+            );
+            respond(request, 200, catalog()).await;
+            assert!(cosmetics.live(0, harness.update().await).changed.is_empty());
+            assert_eq!(
+                cosmetics
+                    .resolved("42")
+                    .unwrap()
+                    .name_paint
+                    .as_ref()
+                    .unwrap()
+                    .stops[0]
+                    .color,
+                "#00FF00"
+            );
+            within(&mut harness.task).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn repeated_catalog_failures_wait_and_shutdown_cancels_the_retry() {
+            let mut harness = Harness::new().await;
+            let mut cosmetics = SevenTvCosmetics::default();
+            harness.started(&mut cosmetics).await;
+            let request = harness.request().await;
+            let failed_at = Instant::now();
+            respond(request, 503, serde_json::json!({})).await;
+            harness.started(&mut cosmetics).await;
+            assert!(failed_at.elapsed() >= Duration::from_secs(1));
+            let request = harness.request().await;
+            respond(
+                request,
+                200,
+                serde_json::json!({
+                    "errors": [{"message": "catalog temporarily unavailable"}]
+                }),
+            )
+            .await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(150), harness.http.accept())
+                    .await
+                    .is_err(),
+                "failed requests retried without backoff"
+            );
+            assert!(!harness.task.is_finished());
+            harness.updates.close();
+            within(&mut harness.task).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn closing_the_receiver_cancels_an_in_flight_startup_request() {
+            let mut harness = Harness::new().await;
+            let mut cosmetics = SevenTvCosmetics::default();
+            harness.started(&mut cosmetics).await;
+            let _unanswered = harness.request().await;
+            harness.updates.close();
+            // The request deadline is ten seconds; shutdown must not wait for it.
+            within(&mut harness.task).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn a_stalled_catalog_retries_even_without_a_client_timeout() {
+            let mut harness = Harness::new().await;
+            let mut cosmetics = SevenTvCosmetics::default();
+            let first = harness.started(&mut cosmetics).await;
+            let _unanswered = harness.request().await;
+            let Some(SevenTvCosmeticUpdate::Live {
+                epoch: 0,
+                update: SevenTvLiveCosmeticUpdate::CatalogRefreshStarted { generation },
+            }) = tokio::time::timeout(Duration::from_secs(15), harness.updates.recv())
+                .await
+                .expect("the catalog request had no deadline")
+            else {
+                panic!("expected retry after a stalled response");
+            };
+            assert!(generation > first);
+            harness.updates.close();
+            within(&mut harness.task).await.unwrap();
+        }
     }
 }

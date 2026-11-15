@@ -101,7 +101,7 @@ fn is_chat_message(message: &ChatMessage) -> bool {
     matches!(
         message.msg_kind,
         MsgKind::Chat | MsgKind::Bits { .. } | MsgKind::SuspiciousUserMessage
-    )
+    ) || matches!(&message.msg_kind, MsgKind::Sub { sub_msg, .. } if !sub_msg.is_empty())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -352,6 +352,35 @@ mod tests {
         notice.msg_kind = MsgKind::SystemInfo;
         state.apply(&mut notice);
         assert!(!notice.flags.is_deleted);
+    }
+
+    #[test]
+    fn subscription_bodies_follow_moderation_without_deleting_empty_notices() {
+        let channel = ChannelId::new("room");
+        for action in [
+            ModerationAction::user(channel.clone(), "alice".into(), Some("10".into()),
+                Some(Utc.timestamp_millis_opt(1000).unwrap())),
+            ModerationAction::channel(channel.clone(), Some(Utc.timestamp_millis_opt(1000).unwrap())),
+        ] {
+            let subscription = |id: &str, body: &str, timestamp| {
+                let mut row = message(id, "room", "10", timestamp);
+                row.raw_text = body.into();
+                row.msg_kind = MsgKind::Sub { display_name: "Alice".into(), months: 1,
+                    plan: "Tier 1".into(), is_gift: false, sub_msg: body.into() };
+                row
+            };
+            let state = ModerationState::default();
+            let mut rows = [subscription("body", "subscriber text", 999),
+                subscription("notice", "", 999), subscription("new", "new text", 1001)];
+            state.apply_to_retained(&action, &mut rows);
+            assert!(rows[0].flags.is_deleted);
+            assert!(!rows[1].flags.is_deleted);
+            assert!(!rows[2].flags.is_deleted);
+            assert_eq!(rows[0].plain_text(), "Alice subscribed with Tier 1!\nsubscriber text");
+            let mut history = subscription("late-history", "older subscriber text", 999);
+            state.apply(&mut history);
+            assert!(history.flags.is_deleted);
+        }
     }
 
     #[test]
