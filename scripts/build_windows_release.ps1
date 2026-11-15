@@ -102,7 +102,15 @@ try {
 
     Write-Host "[4/5] Writing SHA256 digest..."
     $digestPath = "$zipPath.sha256"
-    $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath $zipPath).Hash.ToLowerInvariant()
+    $archiveStream = [System.IO.File]::OpenRead($zipPath)
+    $archiveHasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = [System.BitConverter]::ToString($archiveHasher.ComputeHash($archiveStream)).Replace("-", "").ToLowerInvariant()
+    }
+    finally {
+        $archiveStream.Dispose()
+        $archiveHasher.Dispose()
+    }
     [System.IO.File]::WriteAllText($digestPath, "$digest  $zipName`n", [System.Text.Encoding]::ASCII)
 
     Write-Host "[5/5] Done"

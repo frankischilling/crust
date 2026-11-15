@@ -326,6 +326,10 @@ fn render_hotkeys_section(ui: &mut egui::Ui, state: &mut SettingsPageState, comp
                 .font(t::body())
                 .strong(),
         );
+        if category == HotkeyCategory::Input {
+            ui.label(RichText::new("These shortcuts apply to the focused chat input.")
+                .font(t::small()).color(t::text_secondary()));
+        }
         for action in HotkeyAction::all() {
             if action.category() != category {
                 continue;
@@ -344,6 +348,8 @@ fn render_hotkeys_section(ui: &mut egui::Ui, state: &mut SettingsPageState, comp
                 ui.horizontal_wrapped(|ui| {
                     let label = if capture_active {
                         "Press any key...".to_owned()
+                    } else if let Some(alternative) = state.hotkey_bindings.shifted_send_binding(action) {
+                        format!("{} / {}", current.display_label(), alternative.display_label())
                     } else {
                         current.display_label()
                     };

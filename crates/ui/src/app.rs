@@ -9,13 +9,25 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tracing::warn;
 
+#[path = "pane_layout.rs"]
+mod pane_layout;
+use pane_layout::{LayoutNode, ReopenPosition};
+#[path = "pane_filters.rs"]
+mod pane_filters;
+use pane_filters::PaneFilters;
+#[path = "composer_routing.rs"]
+mod composer_routing;
+#[path = "classic_drafts.rs"]
+mod classic_drafts;
+use classic_drafts::ClassicDraft;
+
 use crust_core::{
     events::{
         AppCommand, AppEvent, AutoModQueueItem, ConnectionState, HistoryUpdate, LinkPreview, UnbanRequestItem,
     },
     model::{
         ChannelId, ChannelState, ChatMessage, EmoteCatalogEntry, MessageId, MsgKind, ReplyInfo,
-        Span, TwitchEmotePos, IRC_SERVER_CONTROL_CHANNEL,
+        Span, TwitchEmotePos, PaneLayout, PaneLayoutSnapshot, PaneViewSettings, SplitAxis, MAX_CHAT_PANES, IRC_SERVER_CONTROL_CHANNEL,
     },
     plugin_command_infos, plugin_host,
     plugins::PluginUiHostSlot,
@@ -46,7 +58,7 @@ use crate::widgets::{
     join_dialog::JoinDialog,
     loading_screen::{LoadEvent, LoadingScreen},
     login_dialog::{LoginAction, LoginDialog},
-    message_list::MessageList,
+    message_list::{MessageList, MessagePreviewActions, MessagePreviewContext},
     message_search::{
         should_use_search_window, show_message_search_inline, show_message_search_window,
         MessageSearchState,
@@ -59,7 +71,7 @@ use crate::widgets::{
         handle_hotkey_capture, parse_settings_lines, show_settings_page, SettingsPageState,
         SettingsSection, SettingsStats,
     },
-    split_header::{show_split_header, split_header_height},
+    split_header::{show_split_header, split_header_height, SplitHeaderOptions},
     user_profile_popup::{PopupAction, UserProfilePopup},
     unsent_messages::{UnsentMessage, UnsentMessages},
 };
@@ -604,8 +616,24 @@ struct Pane {
     id: u64,
     channel: ChannelId,
     input_buf: String,
+    /// Message-view identity survives transitions through the single-pane view.
+    view_scope: Option<u64>,
+    search: MessageSearchState,
+    filters: PaneFilters,
     /// Width fraction (0.0-1.0) of available space; all panes sum to ~1.0.
     frac: f32,
+}
+
+impl Pane {
+    fn view_settings(&self) -> PaneViewSettings {
+        PaneViewSettings { search: self.search.settings(), filters: self.filters.selected.clone() }
+    }
+
+    fn restore_view_settings(&mut self, settings: &PaneViewSettings, global: &[crust_core::model::CompiledFilter]) {
+        self.search = MessageSearchState::from_settings(&settings.search, Some(self.id));
+        self.filters.selected = settings.filters.clone();
+        self.filters.refresh(global);
+    }
 }
 
 /// One queued moderation action against a low-trust entry, dispatched after
@@ -671,7 +699,7 @@ impl ModToolsTab {
     }
 }
 
-/// Manages up to 4 side-by-side panes within the central area.
+/// Manages nested chat panes within the central area.
 /// When `panes` is empty the app falls back to the classic single-channel view
 /// driven by `active_channel`.
 #[derive(Default, Clone)]
@@ -680,6 +708,16 @@ struct SplitPanes {
     panes: Vec<Pane>,
     /// Index of the focused pane (receives keyboard input, shown in info bar).
     focused: usize,
+    layout: Option<LayoutNode>,
+    closed: VecDeque<ClosedPane>,
+}
+
+#[derive(Clone)]
+struct ClosedPane {
+    pane: Pane,
+    index: usize,
+    position: Option<ReopenPosition>,
+    reply: Option<ReplyInfo>,
 }
 
 impl SplitPanes {
@@ -699,16 +737,20 @@ impl SplitPanes {
 
     /// Focus an existing channel pane or replace the focused pane's channel.
     fn activate_channel(&mut self, channel: &ChannelId) {
+        if self.focused_channel() == Some(channel) {
+            return;
+        }
         if let Some(index) = self.panes.iter().position(|pane| &pane.channel == channel) {
             self.focused = index;
         } else if let Some(pane) = self.panes.get_mut(self.focused) {
             pane.channel = channel.clone();
+            pane.search = MessageSearchState::for_pane(pane.id);
         }
     }
 
     /// Keep both drafts when a redirected channel already has another pane.
     fn redirect_channel(&mut self, old: &ChannelId, new: &ChannelId) {
-        for pane in &mut self.panes {
+        for pane in self.panes.iter_mut().chain(self.closed.iter_mut().map(|closed| &mut closed.pane)) {
             if &pane.channel == old {
                 pane.channel = new.clone();
             }
@@ -721,22 +763,20 @@ impl SplitPanes {
         if n == 0 {
             return;
         }
-        let min_frac = 0.10_f32;
-        // Clamp minimums.
         for p in self.panes.iter_mut() {
-            p.frac = p.frac.max(min_frac);
+            if !p.frac.is_finite() || p.frac <= 0.0 { p.frac = 1.0; }
         }
-        let sum: f32 = self.panes.iter().map(|p| p.frac).sum();
+        let sum: f64 = self.panes.iter().map(|p| f64::from(p.frac)).sum();
         if sum > 0.0 {
             for p in self.panes.iter_mut() {
-                p.frac /= sum;
+                p.frac = (f64::from(p.frac) / sum) as f32;
             }
         }
     }
 
-    /// Add a channel to a new pane (at the given position or end).  Caps at 4.
+    /// Add a pane to a legacy horizontal layout, including startup restoration.
     fn add_pane(&mut self, channel: ChannelId, insert_at: Option<usize>) {
-        if self.panes.len() >= 4 {
+        if self.panes.len() >= MAX_CHAT_PANES {
             return;
         }
         let new_frac = 1.0 / (self.panes.len() as f32 + 1.0);
@@ -745,13 +785,14 @@ impl SplitPanes {
         for p in self.panes.iter_mut() {
             p.frac *= scale;
         }
+        let id = Self::next_id();
         let pane = Pane {
-            id: {
-                static NEXT_PANE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-                NEXT_PANE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            },
+            id,
             channel,
             input_buf: String::new(),
+            view_scope: Some(id),
+            search: MessageSearchState::for_pane(id),
+            filters: PaneFilters::default(),
             frac: new_frac,
         };
         match insert_at {
@@ -765,12 +806,77 @@ impl SplitPanes {
         }
         self.normalize_fractions();
         self.clamp_focus();
+        self.rebuild_horizontal();
+    }
+
+    fn next_id() -> u64 {
+        static NEXT_PANE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        NEXT_PANE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn rebuild_horizontal(&mut self) {
+        self.layout = LayoutNode::horizontal(&self.panes.iter().map(|pane| (pane.id, pane.frac)).collect::<Vec<_>>());
+    }
+
+    fn saved_layout(&self) -> Option<PaneLayout> {
+        self.layout.as_ref()?.saved(&self.panes.iter().map(|pane| pane.id).collect::<Vec<_>>())
+    }
+
+    fn split(&mut self, index: usize, channel: ChannelId, axis: SplitAxis) -> bool {
+        if self.panes.len() >= MAX_CHAT_PANES || index >= self.panes.len() {
+            return false;
+        }
+        let sibling = self.panes[index].id;
+        let id = Self::next_id();
+        let position = ReopenPosition { sibling, siblings: vec![sibling], axis, fraction: 0.5, before: false };
+        if !self.layout.as_mut().is_some_and(|layout| layout.insert(id, position)) {
+            return false;
+        }
+        let frac = self.panes[index].frac * 0.5;
+        self.panes[index].frac = frac;
+        self.panes.insert(index + 1, Pane {
+            id, channel, input_buf: String::new(), view_scope: Some(id),
+            search: MessageSearchState::for_pane(id), filters: PaneFilters::default(), frac,
+        });
+        self.focused = index + 1;
+        true
+    }
+
+    fn reopen(&mut self) -> Option<ChannelId> {
+        if self.panes.len() >= MAX_CHAT_PANES {
+            return None;
+        }
+        let closed = self.closed.pop_back()?;
+        let id = closed.pane.id;
+        let channel = closed.pane.channel.clone();
+        if let Some(layout) = self.layout.as_mut() {
+            let position = closed.position.filter(|position| layout.contains(position.sibling))
+                .unwrap_or(ReopenPosition {
+                    sibling: self.panes.get(self.focused).map(|pane| pane.id).unwrap_or_else(|| layout.first_pane()),
+                    siblings: Vec::new(),
+                    axis: SplitAxis::Horizontal, fraction: 0.5, before: false,
+                });
+            layout.insert(id, position);
+        } else {
+            self.layout = Some(LayoutNode::Pane(id));
+        }
+        let index = closed.index.min(self.panes.len());
+        self.panes.insert(index, closed.pane);
+        self.focused = index;
+        self.normalize_fractions();
+        Some(channel)
     }
 
     /// Remove a pane by index.
     fn remove_pane(&mut self, idx: usize) {
         if idx < self.panes.len() {
-            self.panes.remove(idx);
+            let pane = self.panes.remove(idx);
+            let position = self.layout.as_ref().and_then(|layout| layout.position(pane.id));
+            self.layout = self.layout.take().and_then(|layout| layout.without(pane.id));
+            self.closed.push_back(ClosedPane { pane, index: idx, position, reply: None });
+            while self.closed.len() > 16 {
+                self.closed.pop_front();
+            }
             if idx < self.focused {
                 self.focused -= 1;
             }
@@ -789,6 +895,9 @@ impl SplitPanes {
         }
         let idx = self.focused;
         let other = new_idx as usize;
+        if let Some(layout) = self.layout.as_mut() {
+            layout.swap(self.panes[idx].id, self.panes[other].id);
+        }
         self.panes.swap(idx, other);
         self.focused = other;
     }
@@ -1284,6 +1393,7 @@ pub struct CrustApp {
     event_rx: mpsc::Receiver<AppEvent>,
     pending_auth: Option<String>,
     unsent_messages: UnsentMessages,
+    reply_threads: crate::widgets::reply_thread::ReplyThreads,
     emote_bytes: UiImageCache,
     previous_image_work: ImageWorkStats,
     join_dialog: JoinDialog,
@@ -1426,15 +1536,23 @@ pub struct CrustApp {
     pending_restore_channel_order: Vec<String>,
     /// Split-pane layout from the previous session, applied once channels have joined.
     pending_restore_split_panes: Vec<(String, f32)>,
+    pending_restore_split_layout: Option<PaneLayout>,
+    pending_restore_split_views: Vec<PaneViewSettings>,
     /// Focused-pane index from the previous session.
     pending_restore_split_focused: usize,
     /// Explicit navigation or layout edits take precedence over startup restoration.
     layout_restore_cancelled: bool,
+    layout_restore_received: bool,
     /// Last channel order we persisted to disk (avoids spamming writes).
     last_saved_channel_order: Vec<String>,
     /// Last split-pane snapshot we persisted to disk (avoids spamming writes).
     last_saved_split_panes: Vec<(String, f32)>,
+    last_saved_split_layout: Option<PaneLayout>,
+    last_saved_split_views: Vec<PaneViewSettings>,
     last_saved_split_focused: usize,
+    last_saved_split_channel: String,
+    pending_pane_save: Option<(std::time::Instant, PaneLayoutSnapshot)>,
+    layout_shutdown_state: Option<Arc<Mutex<Option<PaneLayoutSnapshot>>>>,
     /// Last window geometry snapshot we persisted (avoids spamming writes).
     last_saved_window_pos: Option<[f32; 2]>,
     last_saved_window_size: Option<[f32; 2]>,
@@ -1579,8 +1697,13 @@ pub struct CrustApp {
     stv_avatars: HashMap<String, String>,
     /// Split-pane state for multi-channel side-by-side view.
     split_panes: SplitPanes,
+    single_pane_identity: Option<(u64, Option<u64>)>,
+    classic_draft_channel: Option<ChannelId>,
+    inactive_classic_drafts: HashMap<ChannelId, ClassicDraft>,
+    inactive_pane_drafts: HashMap<(u64, ChannelId), ClassicDraft>,
     /// Per-channel message search and filter state.
     message_search: HashMap<ChannelId, MessageSearchState>,
+    single_pane_filters: HashMap<ChannelId, PaneFilters>,
     /// Global cross-channel search popup state.
     global_search: GlobalSearchState,
     /// Messages to scroll to after a global-search jump, keyed by channel.
@@ -1812,7 +1935,7 @@ pub fn egui_key_name(key: egui::Key) -> &'static str {
 }
 
 /// Compose an [`egui::Modifiers`] mask from a [`crust_core::KeyBinding`].
-fn binding_modifiers(binding: &crust_core::KeyBinding) -> egui::Modifiers {
+pub(crate) fn binding_modifiers(binding: &crust_core::KeyBinding) -> egui::Modifiers {
     let mut m = egui::Modifiers::NONE;
     if binding.ctrl {
         m |= egui::Modifiers::CTRL;
@@ -1832,7 +1955,7 @@ fn binding_modifiers(binding: &crust_core::KeyBinding) -> egui::Modifiers {
 /// Try to consume a hotkey press matching `binding` from the egui input
 /// queue. Returns false for unbound or unknown-key bindings so callers can
 /// short-circuit without extra checks.
-fn consume_binding(input: &mut egui::InputState, binding: &crust_core::KeyBinding) -> bool {
+pub(crate) fn consume_binding(input: &mut egui::InputState, binding: &crust_core::KeyBinding) -> bool {
     if binding.is_unbound() {
         return false;
     }
@@ -1902,6 +2025,7 @@ impl CrustApp {
             event_rx,
             pending_auth: None,
             unsent_messages: UnsentMessages::default(),
+            reply_threads: crate::widgets::reply_thread::ReplyThreads::default(),
             emote_bytes: UiImageCache::default(),
             previous_image_work: ImageWorkStats::default(),
             join_dialog: JoinDialog::default(),
@@ -1979,11 +2103,19 @@ impl CrustApp {
             last_saved_active_channel: None,
             pending_restore_channel_order: Vec::new(),
             pending_restore_split_panes: Vec::new(),
+            pending_restore_split_layout: None,
+            pending_restore_split_views: Vec::new(),
             pending_restore_split_focused: 0,
             layout_restore_cancelled: false,
+            layout_restore_received: false,
             last_saved_channel_order: Vec::new(),
             last_saved_split_panes: Vec::new(),
+            last_saved_split_layout: None,
+            last_saved_split_views: Vec::new(),
             last_saved_split_focused: 0,
+            last_saved_split_channel: String::new(),
+            pending_pane_save: None,
+            layout_shutdown_state: None,
             last_saved_window_pos: None,
             last_saved_window_size: None,
             last_saved_window_max: false,
@@ -2049,7 +2181,12 @@ impl CrustApp {
             auto_join_buf: String::new(),
             stv_avatars: HashMap::new(),
             split_panes: SplitPanes::default(),
+            single_pane_identity: None,
+            classic_draft_channel: None,
+            inactive_classic_drafts: HashMap::new(),
+            inactive_pane_drafts: HashMap::new(),
             message_search: HashMap::new(),
+            single_pane_filters: HashMap::new(),
             global_search: GlobalSearchState::default(),
             pending_scroll_to_message: HashMap::new(),
             sorted_chatters: HashMap::new(),
@@ -2106,6 +2243,11 @@ impl CrustApp {
         F: Fn() + Send + Sync + 'static,
     {
         self.crash_viewer.set_pre_exit_hook(f);
+    }
+
+    /// Keep final pane edits available after the runtime command loop stops.
+    pub fn set_layout_shutdown_state(&mut self, state: Arc<Mutex<Option<PaneLayoutSnapshot>>>) {
+        self.layout_shutdown_state = Some(state);
     }
 
     fn appearance_snapshot(&self) -> AppearanceSnapshot {
@@ -3549,6 +3691,7 @@ exit 1
     fn invalidate_input_emote_catalogs(&mut self, ctx: &Context) {
         self.input_emote_catalogs.clear();
         self.emote_picker.invalidate_catalog();
+        self.reply_threads.invalidate_catalogs();
         invalidate_emote_completions(ctx, chat_composer_id(None));
         for pane in &self.split_panes.panes {
             invalidate_emote_completions(ctx, chat_composer_id(Some(pane.id)));
@@ -4647,7 +4790,10 @@ exit 1
                 }
             }
             AppEvent::ChannelParted { channel } => {
+                self.sync_classic_draft_owner();
+                if self.classic_draft_channel.as_ref() == Some(&channel) { self.stash_classic_draft(); }
                 self.state.leave_channel(&channel);
+                self.sync_classic_draft_owner();
                 self.input_emote_catalogs.remove(&channel);
                 self.sorted_chatters.remove(&channel);
                 self.automod_queue.remove(&channel);
@@ -4702,6 +4848,7 @@ exit 1
                     }
                 }
                 if self.state.redirect_channel(&old_channel, &new_channel) {
+                    self.redirect_classic_drafts(&old_channel, &new_channel);
                     self.split_panes.redirect_channel(&old_channel, &new_channel);
                     self.sorted_chatters.remove(&old_channel);
                     self.sorted_chatters.remove(&new_channel);
@@ -4725,6 +4872,9 @@ exit 1
                     }
                     if let Some(search) = self.message_search.remove(&old_channel) {
                         self.message_search.entry(new_channel.clone()).or_insert(search);
+                    }
+                    if let Some(filters) = self.single_pane_filters.remove(&old_channel) {
+                        self.single_pane_filters.entry(new_channel.clone()).or_insert(filters);
                     }
                     if let Some(message_id) = self.pending_scroll_to_message.remove(&old_channel) {
                         self.pending_scroll_to_message.entry(new_channel.clone()).or_insert(message_id);
@@ -4759,6 +4909,7 @@ exit 1
                 mut message,
             } => {
                 self.state.apply_message_moderation(&mut message);
+                self.reply_threads.update_seed(&message);
                 if message.flags.is_deleted {
                     if let Some(server_id) = message.server_id.as_ref().filter(|id| !id.is_empty()) {
                         self.state.apply_moderation(&crust_core::model::ModerationAction::message(
@@ -4850,7 +5001,15 @@ exit 1
                     is_watching_channel,
                 )
                 .cloned();
-                if highlight_rule.is_some() && !message.flags.is_highlighted {
+                if let Some(state) = self.state.channels.get(&channel) {
+                    self.reply_threads.observe_participation(self.state.auth.user_id.as_deref(),
+                        self.state.auth.username.as_deref(), &message, &state.messages);
+                }
+                let thread_notification = self.state.channels.get(&channel).is_some_and(|state| {
+                    self.reply_threads.should_notify(self.state.auth.user_id.as_deref(),
+                        self.state.auth.username.as_deref(), &message, &state.messages)
+                });
+                if (highlight_rule.is_some() || thread_notification) && !message.flags.is_highlighted {
                     message.flags.is_highlighted = true;
                     if !message.flags.is_history && self.local_log_indexing_enabled {
                         self.cmd_tx.send_history_update(HistoryUpdate::Highlight {
@@ -4866,13 +5025,13 @@ exit 1
                         .as_ref()
                         .map(|rule| {
                             (
-                                rule.show_in_mentions,
+                                rule.show_in_mentions || thread_notification,
                                 rule.has_alert,
-                                rule.has_sound,
+                                rule.has_sound || thread_notification,
                                 rule.sound_url.clone().filter(|s| !s.trim().is_empty()),
                             )
                         })
-                        .unwrap_or((false, false, false, None));
+                        .unwrap_or((thread_notification, thread_notification, thread_notification, None));
 
                 // Generate a short-lived event toast for high-visibility events.
                 // Only pop banners for the channel the user is watching.
@@ -5212,7 +5371,9 @@ exit 1
                 }
             }
             AppEvent::MessageDeleted { channel, server_id } => {
-                self.state.apply_moderation(&crust_core::model::ModerationAction::message(channel, server_id));
+                let action = crust_core::model::ModerationAction::message(channel, server_id);
+                self.reply_threads.apply_moderation(&action);
+                self.state.apply_moderation(&action);
             }
             AppEvent::SystemNotice(_) => {
                 // Converted to MessageReceived with MsgKind::SystemInfo in the reducer;
@@ -5249,13 +5410,13 @@ exit 1
             AppEvent::AuthenticationPending { username } => {
                 self.pending_auth = Some(username.unwrap_or_default());
             }
-            AppEvent::MessageSendRejected { channel, text, reply_to_msg_id, reply, reason } => {
-                let message = UnsentMessage { channel, text, reply_to_msg_id, reply, reason };
+            AppEvent::MessageSendRejected { channel, text, reply_to_msg_id, reply, composer, reason } => {
+                let message = UnsentMessage { channel, text, reply_to_msg_id, reply, composer, reason };
                 let editing_this_frame = ctx.input(|input| input.events.iter().any(|event| {
                     matches!(event, egui::Event::Text(_) | egui::Event::Paste(_)
                         | egui::Event::Key { pressed: true, .. })
                 }));
-                if !editing_this_frame && self.restore_unsent_message(&message) {
+                if !editing_this_frame && self.restore_targeted_unsent(&message, false) {
                     self.push_event_toast(
                         format!("Message to #{} was not sent. Your draft was restored. {}", message.channel.display_name(), message.reason),
                         t::red(),
@@ -5753,7 +5914,9 @@ exit 1
                 );
             }
             AppEvent::UserMessagesCleared { channel, login, user_id, timestamp } => {
-                self.state.apply_moderation(&crust_core::model::ModerationAction::user(channel, login, user_id, timestamp));
+                let action = crust_core::model::ModerationAction::user(channel, login, user_id, timestamp);
+                self.reply_threads.apply_moderation(&action);
+                self.state.apply_moderation(&action);
             }
             AppEvent::LowTrustStatusUpdated {
                 channel,
@@ -5770,7 +5933,9 @@ exit 1
                 }
             }
             AppEvent::ClearUserMessagesLocally { channel, login } => {
-                self.state.apply_moderation(&crust_core::model::ModerationAction::user(channel, login, None, None));
+                let action = crust_core::model::ModerationAction::user(channel, login, None, None);
+                self.reply_threads.apply_moderation(&action);
+                self.state.apply_moderation(&action);
             }
             AppEvent::UserStateUpdated {
                 channel, is_mod, ..
@@ -5797,7 +5962,9 @@ exit 1
                 }
             }
             AppEvent::ChannelChatCleared { channel, timestamp } => {
-                self.state.apply_moderation(&crust_core::model::ModerationAction::channel(channel, timestamp));
+                let action = crust_core::model::ModerationAction::channel(channel, timestamp);
+                self.reply_threads.apply_moderation(&action);
+                self.state.apply_moderation(&action);
             }
             AppEvent::SelfAvatarLoaded { account, avatar_url } => {
                 let account = Self::normalize_whisper_login(&account);
@@ -6005,9 +6172,12 @@ exit 1
                 channel_order,
                 split_panes,
                 split_panes_focused,
+                split_layout,
+                split_views,
                 whispers_visible,
                 last_whisper_login,
             } => {
+                self.layout_restore_received = true;
                 if !self.layout_restore_cancelled {
                     self.pending_restore_channel = (!channel.is_empty()).then(|| channel.clone());
                     self.last_saved_active_channel = self.pending_restore_channel.clone();
@@ -6016,7 +6186,24 @@ exit 1
                     self.pending_restore_split_panes = split_panes.clone();
                     self.pending_restore_split_focused = split_panes_focused;
                     self.last_saved_split_panes = split_panes;
+                    self.pending_restore_split_layout = split_layout.clone();
+                    self.last_saved_split_layout = split_layout;
+                    if self.pending_restore_split_panes.is_empty() && !channel.is_empty() && !ChannelId(channel.clone()).is_virtual() {
+                        if let Some(view) = split_views.first() {
+                            let channel = ChannelId(channel.clone());
+                            self.message_search.insert(channel.clone(), MessageSearchState::from_settings(&view.search, None));
+                            let filters = self.single_pane_filters.entry(channel).or_default();
+                            filters.selected = view.filters.clone();
+                            filters.refresh(&self.filter_records);
+                        }
+                    }
+                    self.pending_restore_split_views = if self.pending_restore_split_panes.is_empty() {
+                        Vec::new()
+                    } else { split_views.clone() };
+                    self.last_saved_split_views = split_views;
                     self.last_saved_split_focused = split_panes_focused;
+                    self.last_saved_split_channel = channel;
+                    self.pending_pane_save = None;
                 }
                 self.whispers_visible = whispers_visible;
                 self.last_saved_whispers_visible = whispers_visible;
@@ -6082,6 +6269,9 @@ exit 1
             }
             AppEvent::FilterRecordsUpdated { records } => {
                 self.filter_records = crust_core::model::filters::compile_filters(&records);
+                for pane in &mut self.split_panes.panes { pane.filters.refresh(&self.filter_records); }
+                for closed in &mut self.split_panes.closed { closed.pane.filters.refresh(&self.filter_records); }
+                for filters in self.single_pane_filters.values_mut() { filters.refresh(&self.filter_records); }
                 self.settings_filter_records = records.clone();
                 self.settings_filter_record_bufs =
                     records.iter().map(|r| r.pattern.clone()).collect();
@@ -6175,14 +6365,9 @@ exit 1
             AppEvent::UploadStarted { channel: _ } => {
                 // Status already shown as a SystemNotice inline message.
             }
-            AppEvent::UploadFinished { channel, result } => match result {
+            AppEvent::UploadFinished { channel, result, composer } => match result {
                 Ok(url) => {
-                    let buf = self.input_buf_for_channel_mut(&channel);
-                    if !buf.is_empty() && !buf.ends_with(' ') {
-                        buf.push(' ');
-                    }
-                    buf.push_str(&url);
-                    buf.push(' ');
+                    if !self.append_upload_to_composer(&channel, composer, &url) { return; }
                     self.send_cmd(AppCommand::InjectLocalMessage {
                         channel,
                         text: format!("Upload complete: {url}"),
@@ -6629,6 +6814,12 @@ exit 1
         reply: Option<ReplyInfo>,
         input_pane: Option<usize>,
     ) -> bool {
+        let target = self.chat_composer_target(input_pane);
+        self.submit_composer_input(channel, draft, reply, target)
+    }
+
+    fn submit_composer_input(&mut self, channel: &ChannelId, draft: String,
+        reply: Option<ReplyInfo>, target: crust_core::ComposerTarget) -> bool {
         let text = draft.trim();
         let can_moderate = self.state.channels.get(channel).is_some_and(|ch| ch.is_mod)
             || self.state.auth.username.as_deref().is_some_and(|login| {
@@ -6637,7 +6828,7 @@ exit 1
         let chatters_count = self.state.channels.get(channel).map_or(0, |ch| {
             ch.chatters.len().max(estimate_chatter_count(ch))
         });
-        let command = match self.expand_outgoing_aliases(text, channel) {
+        let mut command = match self.expand_outgoing_aliases(text, channel) {
             Err(error) => error,
             Ok(expanded) => {
                 let outgoing = expanded.as_deref().unwrap_or(text);
@@ -6660,6 +6851,7 @@ exit 1
                         text: outgoing.to_owned(),
                         reply_to_msg_id: reply.as_ref().map(|reply| reply.parent_msg_id.clone()),
                         reply: reply.clone(),
+                        composer: None,
                     })
                 } else {
                     match parsed {
@@ -6681,6 +6873,10 @@ exit 1
             }
         };
 
+        if let AppCommand::SendMessage { composer, .. } = &mut command {
+            *composer = Some(target.clone());
+        }
+
         let irc_text = match &command {
             AppCommand::SendMessage { text, .. } if channel.is_irc() => Some(text.clone()),
             _ => None,
@@ -6694,11 +6890,7 @@ exit 1
             _ => None,
         };
         if !self.try_send_cmd(command) {
-            if let Some(pane) = input_pane {
-                self.split_panes.panes[pane].input_buf = draft;
-            } else {
-                self.chat_input_buf = draft;
-            }
+            self.restore_failed_submission(channel, draft, reply, target);
             return false;
         }
 
@@ -6707,7 +6899,7 @@ exit 1
                 self.whisper_composers.entry(recipient).or_default().pending.push(text);
             }
         }
-        if reply.is_some() {
+        if reply.is_some() && matches!(target, crust_core::ComposerTarget::Chat { .. }) {
             self.pending_reply = None;
         }
         if self.message_history.last().map(String::as_str) != Some(text) {
@@ -6776,6 +6968,11 @@ exit 1
     }
 
     fn message_search_mut(&mut self, channel: &ChannelId) -> &mut MessageSearchState {
+        if self.split_panes.panes.len() > 1
+            && self.split_panes.focused_channel() == Some(channel)
+        {
+            return &mut self.split_panes.panes[self.split_panes.focused].search;
+        }
         self.message_search.entry(channel.clone()).or_default()
     }
 
@@ -6797,6 +6994,13 @@ exit 1
         });
     }
 
+    fn focus_main_viewport(&self) {
+        // A user action in a native search window can open UI in the main window.
+        if let Some(ctx) = self.egui_ctx.as_ref() {
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+        }
+    }
+
     fn apply_global_search_output(&mut self, output: GlobalSearchOutput) {
         for channel in output.load_older_requests {
             let oldest_ts = self
@@ -6808,12 +7012,51 @@ exit 1
                 .unwrap_or(i64::MAX);
             self.request_older_local_history(&channel, oldest_ts);
         }
+        let mut accepted = false;
         if let Some((channel, msg_id)) = output.jump_to {
-            self.jump_to_message(channel, msg_id);
+            accepted |= self.jump_to_message(channel, msg_id);
+        }
+        accepted |= self.apply_message_preview_actions(output.message_actions);
+        if accepted {
+            self.global_search.close();
+            if let Some(ctx) = self.egui_ctx.as_ref() {
+                // An owned native window can cover its owner even after focus moves there.
+                let search = egui::ViewportId::from_hash_of("global_search");
+                if ctx.input(|input| input.raw.viewports.contains_key(&search)) {
+                    ctx.send_viewport_cmd_to(search, egui::ViewportCommand::Close);
+                }
+            }
         }
     }
 
-    fn jump_to_message(&mut self, channel: ChannelId, msg_id: MessageId) {
+    fn apply_message_preview_actions(&mut self, actions: MessagePreviewActions) -> bool {
+        let mut accepted = false;
+        if let Some(message) = actions.open_thread { accepted |= self.open_reply_thread(message); }
+        if let Some((channel, message)) = actions.jump_to {
+            accepted |= self.jump_to_message(channel, message);
+        }
+        if let Some((channel, info)) = actions.reply {
+            if self.state.channels.contains_key(&channel) {
+                self.activate_channel(channel.clone());
+                self.pending_reply = Some(PendingReply { channel, info });
+                self.focus_main_viewport();
+                accepted = true;
+            } else {
+                self.push_event_toast("That channel is no longer open".to_owned(), t::red(), false);
+            }
+        }
+        if let Some((channel, login, badges)) = actions.profile_request {
+            let is_mod = self.state.channels.get(&channel).is_some_and(|state| state.is_mod)
+                || (channel.is_twitch() && self.state.auth.username.as_deref()
+                    .is_some_and(|name| channel.display_name().eq_ignore_ascii_case(name)));
+            self.user_profile_popup.set_loading(&login, badges, Some(channel), is_mod);
+            self.focus_main_viewport();
+            accepted = true;
+        }
+        accepted
+    }
+
+    fn jump_to_message(&mut self, channel: ChannelId, msg_id: MessageId) -> bool {
         let still_present = self
             .state
             .channels
@@ -6826,10 +7069,12 @@ exit 1
                 "global search jump target evicted from buffer: {:?}",
                 channel
             );
-            return;
+            return false;
         }
         self.pending_scroll_to_message.insert(channel.clone(), msg_id);
         self.activate_channel(channel);
+        self.focus_main_viewport();
+        true
     }
 
     fn static_avatar_texture_for(
@@ -7197,11 +7442,15 @@ exit 1
         let Some(channel) = self.active_search_target() else {
             return;
         };
+        if channel.is_virtual() {
+            return;
+        }
 
         if open_search {
             self.message_search_mut(&channel).request_open();
         }
-        if let Some(search) = self.message_search.get_mut(&channel) {
+        {
+            let search = self.message_search_mut(&channel);
             if search.open
                 && search.owns_keyboard(ctx)
                 && !ctx.is_context_menu_open()
@@ -7615,6 +7864,8 @@ exit 1
         self.pending_restore_channel = None;
         self.pending_restore_channel_order.clear();
         self.pending_restore_split_panes.clear();
+        self.pending_restore_split_layout = None;
+        self.pending_restore_split_views.clear();
     }
 
     fn is_chat_composer_id(&self, id: egui::Id) -> bool {
@@ -7653,6 +7904,7 @@ exit 1
     }
 
     fn apply_channel_activation(&mut self, channel: ChannelId, focus_composer: bool) {
+        self.sync_classic_draft_owner();
         if let Some(state) = self.state.channels.get_mut(&channel) {
             state.mark_read();
         }
@@ -7690,8 +7942,9 @@ exit 1
                 ctx.request_repaint();
             }
         }
-        self.split_panes.activate_channel(&channel);
+        self.activate_split_channel_draft(&channel);
         self.state.active_channel = Some(channel.clone());
+        self.sync_classic_draft_owner();
         self.persist_active_channel(&channel);
         if focus_composer {
             if let Some(ctx) = self.egui_ctx.as_ref() {
@@ -7725,16 +7978,125 @@ exit 1
         if index >= self.split_panes.panes.len() {
             return;
         }
+        let keep_id = self.split_panes.panes[index].id;
+        for other in (0..self.split_panes.panes.len()).rev() {
+            if self.split_panes.panes[other].id != keep_id {
+                self.remove_split_pane_with_reply(other);
+            }
+        }
+        self.collapse_split_pane(0, ctx);
+    }
+
+    fn collapse_split_pane(&mut self, index: usize, ctx: &Context) {
         self.cancel_pending_layout_restore();
-        let pane = self.split_panes.panes.remove(index);
-        if let Some(state) = egui::TextEdit::load_state(ctx, chat_composer_id(Some(pane.id))) {
-            egui::TextEdit::store_state(ctx, chat_composer_id(None), state);
+        self.transfer_single_split_pane(index, Some(ctx));
+        self.focus_chat_composer(ctx);
+    }
+
+    fn transfer_single_split_pane(&mut self, index: usize, ctx: Option<&Context>) {
+        let mut pane = self.split_panes.panes.remove(index);
+        if let Some(previous) = self.inactive_classic_drafts.remove(&pane.channel) {
+            if previous.id != pane.id { self.retain_replaced_classic_draft(pane.channel.clone(), previous); }
+        }
+        if let Some(ctx) = ctx {
+            crate::widgets::chat_input::migrate_composer_events(ctx, chat_composer_id(Some(pane.id)),
+                chat_composer_id(None), &pane.channel);
+            if let Some(state) = egui::TextEdit::load_state(ctx, chat_composer_id(Some(pane.id))) {
+                egui::TextEdit::store_state(ctx, chat_composer_id(None), state);
+            }
+        }
+        self.single_pane_identity = Some((pane.id, pane.view_scope));
+        self.classic_draft_channel = (!pane.channel.is_virtual()).then(|| pane.channel.clone());
+        pane.search.set_pane(None);
+        if !pane.channel.is_virtual() {
+            self.message_search.insert(pane.channel.clone(), pane.search);
+            self.single_pane_filters.insert(pane.channel.clone(), pane.filters);
         }
         self.state.active_channel = Some(pane.channel);
         self.chat_input_buf = pane.input_buf;
         self.split_panes.panes.clear();
+        self.split_panes.layout = None;
         self.split_panes.focused = 0;
-        self.focus_chat_composer(ctx);
+    }
+
+    fn seed_active_split(&mut self, ctx: &Context) {
+        if !self.split_panes.panes.is_empty() {
+            return;
+        }
+        self.sync_classic_draft_owner();
+        let Some(channel) = self.state.active_channel.clone() else { return; };
+        self.split_panes.add_pane(channel.clone(), None);
+        let pane = &mut self.split_panes.panes[0];
+        if let Some((id, view_scope)) = self.single_pane_identity.take() {
+            pane.id = id;
+            pane.view_scope = view_scope;
+        } else {
+            pane.view_scope = None;
+        }
+        pane.input_buf = std::mem::take(&mut self.chat_input_buf);
+        self.classic_draft_channel = None;
+        pane.search = self.message_search.remove(&channel).unwrap_or_default();
+        pane.filters = self.single_pane_filters.remove(&channel).unwrap_or_default();
+        pane.search.set_pane(Some(pane.id));
+        crate::widgets::chat_input::migrate_composer_events(ctx, chat_composer_id(None),
+            chat_composer_id(Some(pane.id)), &channel);
+        if let Some(state) = egui::TextEdit::load_state(ctx, chat_composer_id(None)) {
+            egui::TextEdit::store_state(ctx, chat_composer_id(Some(pane.id)), state);
+        }
+        self.split_panes.rebuild_horizontal();
+    }
+
+    fn split_active_pane(&mut self, axis: SplitAxis, ctx: &Context) {
+        self.seed_active_split(ctx);
+        let Some(channel) = self.split_panes.focused_channel().cloned() else { return; };
+        if self.split_panes.split(self.split_panes.focused, channel, axis) {
+            self.sync_split_focus(ctx);
+        }
+    }
+
+    fn reopen_closed_split(&mut self, ctx: &Context) {
+        if self.split_panes.closed.is_empty() {
+            return;
+        }
+        self.seed_active_split(ctx);
+        let channel = if let Some(channel) = self.reopen_existing_pane_draft(ctx) {
+            channel
+        } else {
+            let reply = self.split_panes.closed.back().and_then(|closed| closed.reply.clone());
+            let Some(channel) = self.split_panes.reopen() else { return; };
+            if let Some(info) = reply { self.pending_reply = Some(PendingReply { channel: channel.clone(), info }); }
+            if let Some(pane) = self.split_panes.panes.get(self.split_panes.focused) {
+                Self::restore_closed_pane_cursor(ctx, pane.id, &channel);
+            }
+            channel
+        };
+        if !channel.is_virtual() && !self.state.channels.contains_key(&channel) {
+            self.state.join_channel(channel.clone());
+            self.send_cmd(AppCommand::JoinChannel { channel: channel.clone() });
+        }
+        if self.split_panes.panes.len() == 1 {
+            self.collapse_split_pane(0, ctx);
+        } else {
+            self.sync_split_focus(ctx);
+        }
+    }
+
+    fn show_pane_filter_editors(&mut self, ctx: &Context) {
+        let mut edit_rules = false;
+        for pane in &mut self.split_panes.panes {
+            edit_rules |= pane.filters.show(ctx, &pane.channel, Some(pane.id), &self.settings_filter_records, &self.filter_records);
+        }
+        if self.split_panes.panes.is_empty() {
+            if let Some(channel) = &self.state.active_channel {
+                if let Some(filters) = self.single_pane_filters.get_mut(channel) {
+                    edit_rules |= filters.show(ctx, channel, None, &self.settings_filter_records, &self.filter_records);
+                }
+            }
+        }
+        if edit_rules {
+            self.settings_open = true;
+            self.settings_section = SettingsSection::Filters;
+        }
     }
 
     fn close_split_pane(&mut self, index: usize, ctx: &Context) {
@@ -7742,9 +8104,9 @@ exit 1
             return;
         }
         self.cancel_pending_layout_restore();
-        self.split_panes.remove_pane(index);
+        self.remove_split_pane_with_reply(index);
         if self.split_panes.panes.len() == 1 {
-            self.keep_split_pane(0, ctx);
+            self.collapse_split_pane(0, ctx);
         } else {
             self.sync_split_focus(ctx);
         }
@@ -7752,20 +8114,51 @@ exit 1
 
     fn close_channel_tab(&mut self, channel: ChannelId, ctx: &Context) {
         self.cancel_pending_layout_restore();
-        if self.pending_reply.as_ref().is_some_and(|reply| reply.channel == channel) {
-            self.pending_reply = None;
+        self.sync_classic_draft_owner();
+        if let Some(draft) = self.inactive_classic_drafts.remove(&channel) {
+            self.retain_replaced_classic_draft(channel.clone(), draft);
+        }
+        let hidden: Vec<_> = self.inactive_pane_drafts.keys().filter(|(_, target)| target == &channel).cloned().collect();
+        for key in hidden {
+            if let Some(draft) = self.inactive_pane_drafts.remove(&key) {
+                self.retain_hidden_draft(channel.clone(), draft, false);
+            }
+        }
+        if self.split_panes.panes.is_empty() && self.state.active_channel.as_ref() == Some(&channel) {
+            let (id, view_scope) = self.single_pane_identity.take()
+                .unwrap_or_else(|| (SplitPanes::next_id(), None));
+            let mut search = self.message_search.remove(&channel).unwrap_or_default();
+            search.set_pane(Some(id));
+            self.split_panes.closed.push_back(ClosedPane {
+                pane: Pane { id, channel: channel.clone(), input_buf: std::mem::take(&mut self.chat_input_buf),
+                    view_scope, search, filters: self.single_pane_filters.remove(&channel).unwrap_or_default(), frac: 1.0 },
+                index: 0, position: None,
+                reply: self.pending_reply.as_ref().filter(|reply| reply.channel == channel).map(|reply| reply.info.clone()),
+            });
+            self.classic_draft_channel = None;
+            crate::widgets::chat_input::migrate_composer_events(ctx, chat_composer_id(None),
+                chat_composer_id(Some(id)), &channel);
+            if let Some(state) = egui::TextEdit::load_state(ctx, chat_composer_id(None)) {
+                egui::TextEdit::store_state(ctx, chat_composer_id(Some(id)), state);
+            }
+            while self.split_panes.closed.len() > 16 { self.split_panes.closed.pop_front(); }
         }
         let mut removed_pane = false;
         for index in (0..self.split_panes.panes.len()).rev() {
             if self.split_panes.panes[index].channel == channel {
-                self.split_panes.remove_pane(index);
+                self.remove_split_pane_with_reply(index);
                 removed_pane = true;
             }
         }
+        if self.pending_reply.as_ref().is_some_and(|reply| reply.channel == channel) {
+            self.pending_reply = None;
+        }
         self.send_cmd(AppCommand::LeaveChannel { channel: channel.clone() });
         self.state.leave_channel(&channel);
+        self.sync_classic_draft_owner();
         self.sorted_chatters.remove(&channel);
         self.message_search.remove(&channel);
+        self.single_pane_filters.remove(&channel);
 
         if removed_pane {
             // Redirects can leave multiple drafts for one channel. Remove all
@@ -7775,7 +8168,7 @@ exit 1
                     ctx.memory_mut(|memory| memory.stop_text_input());
                 }
                 0 => self.focus_chat_composer(ctx),
-                1 => self.keep_split_pane(0, ctx),
+                1 => self.collapse_split_pane(0, ctx),
                 _ => self.sync_split_focus(ctx),
             }
         }
@@ -7865,6 +8258,85 @@ exit 1
         }
     }
 
+    fn pane_layout_snapshot(&self) -> PaneLayoutSnapshot {
+        let panes: Vec<_> = self.split_panes.panes.iter()
+            .map(|pane| (pane.channel.0.clone(), pane.frac)).collect();
+        let views = if panes.is_empty() {
+            self.state.active_channel.as_ref().map(|channel| PaneViewSettings {
+                search: self.message_search.get(channel).map(MessageSearchState::settings).unwrap_or_default(),
+                filters: self.single_pane_filters.get(channel).and_then(|filters| filters.selected.clone()),
+            }).into_iter().collect()
+        } else {
+            self.split_panes.panes.iter().map(Pane::view_settings).collect()
+        };
+        PaneLayoutSnapshot {
+            active_channel: self.state.active_channel.as_ref().map(|channel| channel.0.clone()).unwrap_or_default(),
+            focused: self.split_panes.focused.min(panes.len().saturating_sub(1)),
+            panes,
+            layout: self.split_panes.saved_layout(),
+            views,
+        }
+    }
+
+    fn save_pane_snapshot(&mut self, snapshot: PaneLayoutSnapshot) {
+        self.last_saved_split_panes = snapshot.panes.clone();
+        self.last_saved_split_focused = snapshot.focused;
+        self.last_saved_split_layout = snapshot.layout.clone();
+        self.last_saved_split_views = snapshot.views.clone();
+        self.last_saved_split_channel = snapshot.active_channel.clone();
+        self.last_saved_active_channel = (!snapshot.active_channel.is_empty()).then(|| snapshot.active_channel.clone());
+        self.pending_pane_save = None;
+        self.send_cmd(AppCommand::SetSplitPanes {
+            active_channel: snapshot.active_channel,
+            panes: snapshot.panes, focused: snapshot.focused, layout: snapshot.layout, views: snapshot.views,
+        });
+    }
+
+    fn reconcile_pane_snapshot(&mut self, now: std::time::Instant) {
+        if !self.pending_restore_split_panes.is_empty() || self.pending_restore_channel.is_some() {
+            return;
+        }
+        let snapshot = self.pane_layout_snapshot();
+        let geometry_changed = snapshot.active_channel != self.last_saved_split_channel
+            || snapshot.focused != self.last_saved_split_focused
+            || snapshot.layout != self.last_saved_split_layout
+            || snapshot.panes.len() != self.last_saved_split_panes.len()
+            || snapshot.panes.iter().zip(&self.last_saved_split_panes)
+                .any(|(left, right)| left.0 != right.0 || (left.1 - right.1).abs() > 0.001);
+        if geometry_changed {
+            self.save_pane_snapshot(snapshot);
+            return;
+        }
+        if snapshot.views == self.last_saved_split_views {
+            self.pending_pane_save = None;
+            return;
+        }
+        if self.pending_pane_save.as_ref().is_none_or(|(_, pending)| pending.views != snapshot.views) {
+            self.pending_pane_save = Some((now, snapshot));
+        }
+        let debounce = std::time::Duration::from_millis(750);
+        let elapsed = now.saturating_duration_since(self.pending_pane_save.as_ref().unwrap().0);
+        if elapsed >= debounce {
+            let (_, snapshot) = self.pending_pane_save.take().unwrap();
+            self.save_pane_snapshot(snapshot);
+        } else if let Some(ctx) = &self.egui_ctx {
+            ctx.request_repaint_after(debounce - elapsed);
+        }
+    }
+
+    fn retain_shutdown_layout(&self) {
+        // Unfinished joins still belong to the previous session's saved layout.
+        if (!self.layout_restore_received && !self.layout_restore_cancelled)
+            || self.pending_restore_channel.is_some() || !self.pending_restore_split_panes.is_empty() {
+            return;
+        }
+        if let Some(state) = &self.layout_shutdown_state {
+            if let Ok(mut final_snapshot) = state.lock() {
+                *final_snapshot = Some(self.pane_layout_snapshot());
+            }
+        }
+    }
+
     /// Detect changes to channel order, split panes, and whispers panel state
     /// that bypassed direct setters; persist diffs without spamming the disk.
     fn reconcile_persistent_ui_state(&mut self) {
@@ -7883,26 +8355,7 @@ exit 1
             }
         }
 
-        // Split panes (skip while restoration is still pending).
-        if self.pending_restore_split_panes.is_empty() {
-            let panes: Vec<(String, f32)> = self
-                .split_panes
-                .panes
-                .iter()
-                .map(|p| (p.channel.0.clone(), p.frac))
-                .collect();
-            let focused = self.split_panes.focused.min(panes.len().saturating_sub(1));
-            let panes_changed = panes.len() != self.last_saved_split_panes.len()
-                || panes
-                    .iter()
-                    .zip(self.last_saved_split_panes.iter())
-                    .any(|(a, b)| a.0 != b.0 || (a.1 - b.1).abs() > 0.001);
-            if panes_changed || focused != self.last_saved_split_focused {
-                self.last_saved_split_panes = panes.clone();
-                self.last_saved_split_focused = focused;
-                self.send_cmd(AppCommand::SetSplitPanes { panes, focused });
-            }
-        }
+        self.reconcile_pane_snapshot(std::time::Instant::now());
 
         // Whispers panel.
         let active_login = self.active_whisper_login.clone().unwrap_or_default();
@@ -7964,6 +8417,7 @@ exit 1
             }
             if all_present {
                 let focus_composer = self.restore_can_focus_composer();
+                self.stash_classic_draft();
                 self.split_panes.panes.clear();
                 for (key, _) in &self.pending_restore_split_panes {
                     let ch = ChannelId(key.clone());
@@ -7984,10 +8438,28 @@ exit 1
                     pane.frac = (weight / total) as f32;
                 }
                 self.split_panes.normalize_fractions();
+                self.split_panes.rebuild_horizontal();
+                if let Some(layout) = self.pending_restore_split_layout.take()
+                    .and_then(|layout| layout.validated(self.split_panes.panes.len()))
+                {
+                    let ids: Vec<_> = self.split_panes.panes.iter().map(|pane| pane.id).collect();
+                    self.split_panes.layout = LayoutNode::from_saved(&layout, &ids);
+                }
+                for (pane, view) in self.split_panes.panes.iter_mut().zip(&self.pending_restore_split_views) {
+                    pane.restore_view_settings(view, &self.filter_records);
+                }
+                self.pending_restore_split_views.clear();
                 self.split_panes.focused = self
                     .pending_restore_split_focused
                     .min(self.split_panes.panes.len().saturating_sub(1));
                 self.pending_restore_split_panes.clear();
+                if self.split_panes.panes.len() == 1 {
+                    let context = self.egui_ctx.clone();
+                    self.transfer_single_split_pane(0, context.as_ref());
+                    if focus_composer {
+                        if let Some(ctx) = context.as_ref() { self.focus_chat_composer(ctx); }
+                    }
+                }
                 if let Some(channel) = self.split_panes.focused_channel().cloned() {
                     self.state.active_channel = Some(channel.clone());
                     if let Some(state) = self.state.channels.get_mut(&channel) {
@@ -8057,8 +8529,37 @@ exit 1
         })
     }
 
+    fn sync_split_keyboard_focus(&mut self, ctx: &Context) {
+        let Some(focused) = ctx.memory(|memory| memory.focused()) else { return; };
+        if self.split_panes.panes.len() <= 1 { return; }
+        if let Some(index) = self.split_panes.panes.iter().position(|pane| {
+            focused == chat_composer_id(Some(pane.id)) || (pane.search.open
+                && ["username", "keyword", "regex"].iter().any(|field| pane.search.field_id(&pane.channel, field) == focused))
+                || pane.search.owns_keyboard(ctx)
+        }) {
+            if index != self.split_panes.focused {
+                self.cancel_pending_layout_restore();
+                self.split_panes.focused = index;
+                self.state.active_channel = Some(self.split_panes.panes[index].channel.clone());
+            }
+        }
+    }
+
     fn handle_channel_shortcuts(&mut self, ctx: &Context) {
+        self.sync_split_keyboard_focus(ctx);
         use crust_core::HotkeyAction;
+        for (action, axis) in [(HotkeyAction::SplitRight, SplitAxis::Horizontal), (HotkeyAction::SplitDown, SplitAxis::Vertical)] {
+            let binding = self.hotkey_bindings.get(action);
+            if ctx.input_mut(|input| consume_binding(input, &binding)) {
+                self.split_active_pane(axis, ctx);
+                return;
+            }
+        }
+        let reopen = self.hotkey_bindings.get(HotkeyAction::ReopenClosedSplit);
+        if ctx.input_mut(|input| consume_binding(input, &reopen)) {
+            self.reopen_closed_split(ctx);
+            return;
+        }
         let next_b = self.hotkey_bindings.get(HotkeyAction::NextTab);
         let prev_b = self.hotkey_bindings.get(HotkeyAction::PrevTab);
         let move_left_b = self.hotkey_bindings.get(HotkeyAction::MoveTabLeft);
@@ -8291,6 +8792,12 @@ exit 1
 
 // eframe::App implementation
 
+impl Drop for CrustApp {
+    fn drop(&mut self) {
+        self.retain_shutdown_layout();
+    }
+}
+
 impl eframe::App for CrustApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.update_ui(ctx);
@@ -8300,6 +8807,26 @@ impl eframe::App for CrustApp {
 impl CrustApp {
     fn update_ui(&mut self, ctx: &Context) {
         let frame_start = std::time::Instant::now();
+        self.sync_classic_draft_owner();
+        self.cancel_pending_layout_restore_for_input(ctx);
+        if self.hotkey_capture_target.is_none() {
+            let focused_owner = ctx.memory(|memory| memory.focused()).and_then(|id| {
+                if let Some(thread) = self.reply_threads.active_key(self.state.auth.user_id.as_deref())
+                    .filter(|thread| thread.composer_id() == id)
+                {
+                    Some((id, &thread.channel))
+                } else if self.split_panes.panes.len() > 1 {
+                    self.split_panes.panes.iter().find(|pane| chat_composer_id(Some(pane.id)) == id)
+                        .map(|pane| (id, &pane.channel))
+                } else if id == chat_composer_id(None) {
+                    self.state.active_channel.as_ref().map(|channel| (id, channel))
+                } else {
+                    None
+                }
+            });
+            crate::widgets::chat_input::prepare_composer_events(ctx, &self.hotkey_bindings, focused_owner,
+                self.state.auth.user_id.as_deref());
+        }
         let mut phase_start = frame_start;
         let mut finish_phase = || {
             let now = std::time::Instant::now();
@@ -8349,7 +8876,6 @@ impl CrustApp {
         }
 
         self.apply_font_scale(ctx);
-        self.cancel_pending_layout_restore_for_input(ctx);
         self.try_restore_pending_channel();
         self.try_restore_pending_layout();
         self.reconcile_last_active_channel();
@@ -8395,13 +8921,14 @@ impl CrustApp {
             self.settings_filter_editor_modal.close();
         }
         if !self.handle_settings_hotkey_capture(ctx) && !self.settings_filter_editor_modal.open {
+            let thread_owns_keyboard = self.reply_threads.handle_shortcuts(ctx, self.state.auth.user_id.as_deref());
             let picker_was_open = self.emote_picker.open;
             self.emote_picker.handle_shortcuts(ctx);
             if picker_was_open && !self.emote_picker.open {
                 self.focus_chat_composer(ctx);
             }
             let quick_switch_consumed = self.handle_quick_switch_shortcuts(ctx);
-            if !quick_switch_consumed {
+            if !quick_switch_consumed && !thread_owns_keyboard {
                 self.handle_channel_shortcuts(ctx);
                 self.handle_search_shortcuts(ctx);
                 self.handle_font_zoom_shortcuts(ctx);
@@ -8411,6 +8938,8 @@ impl CrustApp {
         let moderation_hotkey = self.consume_mod_hotkey_input(ctx);
         let setup_ms = finish_phase();
         let events = self.service_runtime_channels(ctx);
+        crate::widgets::chat_input::sync_composer_account(ctx, &self.hotkey_bindings,
+            self.state.auth.user_id.as_deref());
         let events_ms = finish_phase();
         let emote_rows = self.refresh_emote_messages(ctx);
         let emote_backfill_ms = finish_phase();
@@ -8553,15 +9082,30 @@ impl CrustApp {
         }
 
         let maintenance_ms = finish_phase();
+        self.show_reply_thread(ctx, animations_allowed);
 
         // Render profile popup and dispatch any actions.
+        let preview = MessagePreviewContext {
+            source_channels: Some(&self.state.channels),
+            viewer_login: self.state.auth.username.as_deref(),
+            show_timestamps: self.show_timestamps,
+            show_timestamp_seconds: self.show_timestamp_seconds,
+            use_24h_timestamps: self.use_24h_timestamps,
+            animate_emotes: animations_allowed,
+            hide_link_previews: self.streamer_mode_active && self.streamer_hide_link_previews,
+            highlight_rules: &self.highlight_rules,
+            mod_action_presets: &self.mod_action_presets,
+            ..MessagePreviewContext::new(&self.emote_bytes, &self.cmd_tx, &self.link_previews)
+        };
         for action in self.user_profile_popup.show(
             ctx,
             &self.emote_bytes,
             &self.stv_avatars,
             &self.mod_action_presets,
+            preview,
         ) {
             match action {
+                PopupAction::MessageActions(actions) => { self.apply_message_preview_actions(actions); }
                 PopupAction::Timeout {
                     channel,
                     login,
@@ -8680,6 +9224,7 @@ impl CrustApp {
                         text: command,
                         reply_to_msg_id: None,
                         reply: None,
+                        composer: None,
                     });
                 }
             }
@@ -10500,26 +11045,12 @@ impl CrustApp {
         // Drag-to-split: create a new pane for the dragged channel.
         if let Some(ch) = ch_drag_split {
             self.cancel_pending_layout_restore();
-            if let Some(existing_idx) = self.split_panes.panes.iter().position(|p| p.channel == ch)
-            {
-                self.split_panes.focused = existing_idx;
-                self.state.active_channel = Some(ch);
-            } else {
-                // If not yet in split mode, seed pane 0 with the current active channel.
-                if self.split_panes.panes.is_empty() {
-                    if let Some(ref active) = self.state.active_channel {
-                        if active != &ch {
-                            self.split_panes.add_pane(active.clone(), None);
-                            self.split_panes.panes[0].input_buf =
-                                std::mem::take(&mut self.chat_input_buf);
-                        }
-                    }
-                }
-                self.split_panes.add_pane(ch.clone(), None);
-                self.split_panes.focused = self.split_panes.panes.len().saturating_sub(1);
-                self.state.active_channel = Some(ch);
+            self.seed_active_split(ctx);
+            if self.split_panes.panes.is_empty() {
+                self.activate_channel(ch);
+            } else if self.split_panes.split(self.split_panes.focused, ch, SplitAxis::Horizontal) {
+                self.sync_split_focus(ctx);
             }
-            self.focus_chat_composer(ctx);
         }
 
         // Analytics right panel
@@ -10548,8 +11079,10 @@ impl CrustApp {
             }
         }
 
+        self.show_pane_filter_editors(ctx);
         let navigation_ms = finish_phase();
 
+        self.sync_classic_draft_owner();
         // Central area: messages + input
         CentralPanel::default()
             .frame(Frame::new().fill(t::bg_base()).inner_margin(Margin::ZERO))
@@ -10558,115 +11091,67 @@ impl CrustApp {
                 if self.split_panes.panes.len() > 1 {
                     let n = self.split_panes.panes.len();
                     let total = ui.available_rect_before_wrap();
-                    let sep_w = 1.0_f32; // 1px visible divider line
-                    let drag_w = 8.0_f32; // wider invisible drag hit-zone
                     let pane_inner_pad = 2.0_f32;
-                    let usable_w =
-                        total.width() - sep_w * (n as f32 - 1.0);
                     let mut close_pane: Option<usize> = None;
                     let mut close_other_panes: Option<usize> = None;
-
-                    // Draggable separators
-                    // Compute cumulative x positions first so we can
-                    // place the separator hit-rects.
-                    {
-                        let mut cx = total.left();
-                        for si in 0..(n - 1) {
-                            cx += self.split_panes.panes[si].frac * usable_w + sep_w;
-                            // Centre the wider drag zone on the 1px line.
-                            let drag_rect = egui::Rect::from_min_size(
-                                egui::pos2(cx - sep_w * 0.5 - drag_w * 0.5, total.top()),
-                                egui::vec2(drag_w, total.height()),
-                            );
-                            let sep_resp = ui.interact(
-                                drag_rect,
-                                egui::Id::new("pane_sep").with(si),
-                                egui::Sense::drag(),
-                            );
-                            if sep_resp.hovered() || sep_resp.dragged() {
-                                ui.ctx().set_cursor_icon(
-                                    egui::CursorIcon::ResizeHorizontal,
-                                );
-                                // Highlight a thin strip when hovered or dragged.
-                                let highlight_w = if sep_resp.dragged() { 3.0 } else { 2.0 };
-                                let highlight_alpha = if sep_resp.dragged() { 180_u8 } else { 100 };
-                                let ac = t::accent();
-                                let highlight_rect = egui::Rect::from_min_size(
-                                    egui::pos2(cx - sep_w * 0.5 - highlight_w * 0.5, total.top()),
-                                    egui::vec2(highlight_w, total.height()),
-                                );
-                                ui.painter().rect_filled(
-                                    highlight_rect,
-                                    egui::CornerRadius::ZERO,
-                                    t::alpha(ac, highlight_alpha),
-                                );
-                            }
-                            if sep_resp.dragged() {
-                                let dx = sep_resp.drag_delta().x;
-                                if dx.abs() > 0.0 {
+                    let mut split_pane: Option<(usize, SplitAxis)> = None;
+                    let mut reopen_pane = false;
+                    if self.split_panes.layout.is_none() {
+                        self.split_panes.rebuild_horizontal();
+                    }
+                    let (_, dividers) = self.split_panes.layout.as_ref().unwrap().geometry(total);
+                    for divider in dividers {
+                        let horizontal = divider.axis == SplitAxis::Horizontal;
+                        let drag_rect = divider.line.expand2(if horizontal {
+                            egui::vec2(3.5, 0.0)
+                        } else {
+                            egui::vec2(0.0, 3.5)
+                        }).intersect(total);
+                        let response = ui.interact(drag_rect,
+                            egui::Id::new("pane_sep").with(&divider.path), egui::Sense::drag());
+                        ui.painter().rect_filled(divider.line, egui::CornerRadius::ZERO, t::border_subtle());
+                        if response.hovered() || response.dragged() {
+                            ui.ctx().set_cursor_icon(if horizontal {
+                                egui::CursorIcon::ResizeHorizontal
+                            } else {
+                                egui::CursorIcon::ResizeVertical
+                            });
+                            ui.painter().rect_filled(divider.line.expand(0.5),
+                                egui::CornerRadius::ZERO, t::alpha(t::accent(), 180));
+                        }
+                        if response.dragged() {
+                            if let Some(pointer) = response.interact_pointer_pos() {
+                                let (offset, available) = if horizontal {
+                                    (pointer.x - divider.container.left(), divider.container.width() - 1.0)
+                                } else {
+                                    (pointer.y - divider.container.top(), divider.container.height() - 1.0)
+                                };
+                                if available > 0.0 {
                                     self.cancel_pending_layout_restore();
-                                    let dfrac = dx / usable_w;
-                                    let a = &mut self.split_panes.panes[si];
-                                    let new_a = (a.frac + dfrac).max(0.10);
-                                    let delta = new_a - a.frac;
-                                    self.split_panes.panes[si].frac = new_a;
-                                    self.split_panes.panes[si + 1].frac =
-                                        (self.split_panes.panes[si + 1].frac - delta)
-                                            .max(0.10);
-                                    self.split_panes.normalize_fractions();
+                                    self.split_panes.layout.as_mut().unwrap().resize(&divider.path,
+                                        (offset / available).clamp(divider.min_fraction, divider.max_fraction));
                                 }
-                                ui.ctx().request_repaint();
                             }
+                            ui.ctx().request_repaint();
                         }
                     }
+                    let (pane_rects, _) = self.split_panes.layout.as_ref().unwrap().geometry(total);
 
                     for pi in 0..n {
                         let ch = self.split_panes.panes[pi].channel.clone();
-
-                        // Compute left edge from cumulative fractions so
-                        // panes tile perfectly with no float-rounding gaps.
-                        let pane_left: f32 = total.left()
-                            + (0..pi)
-                                .map(|i| {
-                                    self.split_panes.panes[i].frac * usable_w
-                                        + sep_w
-                                })
-                                .sum::<f32>();
-                        let pane_right: f32 = if pi + 1 < n {
-                            // Right edge = next pane's left minus the separator.
-                            total.left()
-                                + (0..=pi)
-                                    .map(|i| {
-                                        self.split_panes.panes[i].frac
-                                            * usable_w
-                                            + sep_w
-                                    })
-                                    .sum::<f32>()
-                                - sep_w
-                        } else {
-                            // Last pane stretches to the container's right edge.
-                            total.right()
-                        };
-                        let pane_w = pane_right - pane_left;
-                        let pane_rect = egui::Rect::from_min_max(
-                            egui::pos2(pane_left, total.top()),
-                            egui::pos2(pane_right, total.bottom()),
-                        );
-
-                        // Separator line (1px divider)
-                        if pi > 0 {
-                            ui.painter().vline(
-                                pane_left - sep_w * 0.5,
-                                total.y_range(),
-                                egui::Stroke::new(1.0_f32, t::border_subtle()),
-                            );
-                        }
+                        let Some((_, pane_rect)) = pane_rects.iter().find(|(id, _)| *id == self.split_panes.panes[pi].id) else { continue; };
+                        let pane_rect = *pane_rect;
+                        let pane_w = pane_rect.width();
 
                         // Child controls also select their pane before dispatching actions.
                         if pane_pointer_pressed(ctx, pane_rect, ui.layer_id()) {
                             self.cancel_pending_layout_restore();
                             self.split_panes.focused = pi;
                             self.state.active_channel = Some(ch.clone());
+                            // A child search field can take focus later in this pass.
+                            // Header and message clicks still need to leave keyboard
+                            // input with the pane the user selected.
+                            self.focus_chat_composer(ctx);
                         }
                         let is_focused = pi == self.split_panes.focused;
                         let bg_resp = ui.interact(
@@ -10694,11 +11179,7 @@ impl CrustApp {
                             .get(&ch)
                             .map(|s| (s.unread_count, s.unread_mentions))
                             .unwrap_or((0, 0));
-                        let search_open = self
-                            .message_search
-                            .get(&ch)
-                            .map(|s| s.open)
-                            .unwrap_or(false);
+                        let search_open = self.split_panes.panes[pi].search.open;
                         let split_meta = if ch.is_twitch() && !ch.is_virtual() {
                             let login = ch.display_name().to_ascii_lowercase();
                             let show_viewers = self.split_header_show_viewer_count
@@ -10723,7 +11204,16 @@ impl CrustApp {
                             unread_mentions,
                             search_open,
                             split_meta.as_deref(),
+                            SplitHeaderOptions {
+                                can_split: n < MAX_CHAT_PANES,
+                                can_reopen: !self.split_panes.closed.is_empty() && n < MAX_CHAT_PANES,
+                                can_close_others: true,
+                            },
                         );
+                        if header.focus_clicked {
+                            self.split_panes.focused = pi;
+                            self.sync_split_focus(ctx);
+                        }
                         if header.close_clicked {
                             close_pane = Some(pi);
                         }
@@ -10731,13 +11221,16 @@ impl CrustApp {
                             close_other_panes = Some(pi);
                         }
                         if header.toggle_search_clicked {
-                            let search = self.message_search_mut(&ch);
+                            let search = &mut self.split_panes.panes[pi].search;
                             if search.open {
                                 search.close();
                             } else {
                                 search.request_open();
                             }
                         }
+                        if let Some(axis) = header.split { split_pane = Some((pi, axis)); }
+                        reopen_pane |= header.reopen_clicked;
+                        if header.filters_clicked { self.split_panes.panes[pi].filters.editor_open = true; }
 
                         if ch.is_live_feed() {
                             use crate::widgets::live_feed::LiveFeed;
@@ -10797,23 +11290,27 @@ impl CrustApp {
                                 &ch, &self.split_panes.panes[pi].input_buf,
                             )
                             + if pane_reply.is_some() { 36.0 } else { 0.0 };
+                        let input_pad_x = pane_inner_pad.min(pane_rect.width() * 0.5);
+                        let input_bottom = (pane_rect.bottom() - pane_inner_pad).max(pane_rect.top());
+                        let input_top = (pane_rect.bottom() - input_h)
+                            .max((pane_rect.top() + split_header_height()).min(input_bottom));
                         let input_rect = egui::Rect::from_min_max(
                             egui::pos2(
-                                pane_rect.left() + pane_inner_pad,
-                                pane_rect.bottom() - input_h,
+                                pane_rect.left() + input_pad_x,
+                                input_top,
                             ),
                             egui::pos2(
-                                pane_rect.right() - pane_inner_pad,
-                                pane_rect.bottom() - pane_inner_pad,
+                                pane_rect.right() - input_pad_x,
+                                input_bottom,
                             ),
                         );
                         // Paint input background edge-to-edge.
-                        ui.painter().rect_filled(
+                        pane_ui.painter().rect_filled(
                             input_rect,
                             egui::CornerRadius::ZERO,
                             t::bg_surface(),
                         );
-                        ui.painter().hline(
+                        pane_ui.painter().hline(
                             input_rect.x_range(),
                             input_rect.top(),
                             egui::Stroke::new(1.0_f32, t::border_subtle()),
@@ -10825,7 +11322,7 @@ impl CrustApp {
                                 .max_rect(input_rect)
                                 .layout(egui::Layout::top_down(egui::Align::Min)),
                         );
-                        inp_ui.set_clip_rect(input_rect);
+                        inp_ui.set_clip_rect(input_rect.intersect(pane_rect));
                             self.ensure_input_emote_catalog(&ch);
                             let chatters_sorted: &[String] = self
                                 .sorted_chatters
@@ -10834,6 +11331,7 @@ impl CrustApp {
                                 .unwrap_or(&[]);
                             let chat = ChatInput {
                                 id: Some(chat_composer_id(Some(self.split_panes.panes[pi].id))),
+                                hotkey_bindings: &self.hotkey_bindings,
                                 channel: &ch,
                                 logged_in: self.state.auth.logged_in,
                                 username: self
@@ -10861,11 +11359,13 @@ impl CrustApp {
                                 &mut self.split_panes.panes[pi].input_buf,
                             );
                             for up in inp.uploads {
+                                let composer = Some(self.chat_composer_target(Some(pi)));
                                 self.send_cmd(AppCommand::UploadImage {
                                     channel: ch.clone(),
                                     bytes: up.bytes,
                                     format: up.format,
                                     source_path: up.source_path.map(|p| p.display().to_string()),
+                                    composer,
                                 });
                             }
                             if let Some(word) = inp.add_to_dictionary {
@@ -10885,16 +11385,13 @@ impl CrustApp {
                         // Message list (remaining space)
                         // Region between header bottom and input top.
                         let mut search_h = 0.0;
-                        let content_top = pane_rect.top() + split_header_height() + pane_inner_pad;
-                        let content_bottom = input_rect.top() - pane_inner_pad;
+                        let content_bottom = (input_rect.top() - pane_inner_pad).max(pane_rect.top());
+                        let content_top = (pane_rect.top() + split_header_height() + pane_inner_pad).min(content_bottom);
                         if let Some(ch_state) = self.state.channels.get(&ch) {
-                            let search_open = self
-                                .message_search
-                                .get(&ch)
-                                .map(|s| s.open)
-                                .unwrap_or(false);
+                            let search_open = self.split_panes.panes[pi].search.open;
                             if search_open {
-                                if let Some(search) = self.message_search.get_mut(&ch) {
+                                {
+                                    let search = &mut self.split_panes.panes[pi].search;
                                     search.local_history_exhausted = ch_state.local_history_exhausted;
                                     if should_use_search_window(pane_w) {
                                         show_message_search_window(
@@ -11001,7 +11498,7 @@ impl CrustApp {
                                 &self.cmd_tx,
                                 &ch,
                                 &self.link_previews,
-                                self.message_search.get(&ch),
+                                Some(&self.split_panes.panes[pi].search),
                                 self.collapse_long_messages,
                                 self.collapse_long_message_lines,
                                 animations_allowed,
@@ -11012,11 +11509,11 @@ impl CrustApp {
                                 &self.ignores_set,
                                 &self.compiled_ignored_users,
                                 &self.highlight_rules,
-                                &self.filter_records,
+                                self.split_panes.panes[pi].filters.records(&self.filter_records),
                                 &self.mod_action_presets,
                                 &ch_state.low_trust_users,
                             )
-                            .with_pane(self.split_panes.panes[pi].id, is_focused)
+                            .with_optional_pane(self.split_panes.panes[pi].view_scope, is_focused)
                             .with_scroll_to(scroll_to)
                             .with_hide_link_previews(
                                 self.streamer_mode_active && self.streamer_hide_link_previews,
@@ -11040,6 +11537,7 @@ impl CrustApp {
                                     ch_state.is_mod || is_bc,
                                 );
                             }
+                            if let Some(message) = ml.open_thread { self.open_reply_thread(message); }
                             }
                             if raid_banner_dismissed {
                                 self.state.dismiss_raid_banner(&ch);
@@ -11052,6 +11550,11 @@ impl CrustApp {
                         self.keep_split_pane(keep_idx, ctx);
                     } else if let Some(idx) = close_pane {
                         self.close_split_pane(idx, ctx);
+                    } else if let Some((index, axis)) = split_pane {
+                        self.split_panes.focused = index;
+                        self.split_active_pane(axis, ctx);
+                    } else if reopen_pane {
+                        self.reopen_closed_split(ctx);
                     }
 
                     // Emote picker -> focused pane
@@ -11087,6 +11590,43 @@ impl CrustApp {
                     }
                 // Classic single-channel mode
                 } else if let Some(active_ch) = self.state.active_channel.clone() {
+                    let search_open = self.message_search.get(&active_ch).is_some_and(|search| search.open);
+                    let pane_rect = ui.available_rect_before_wrap();
+                    let meta = if active_ch.is_twitch() && !active_ch.is_virtual() {
+                        split_header_meta_text(
+                            self.stream_statuses.get(&active_ch.display_name().to_ascii_lowercase()),
+                            self.split_header_show_viewer_count && !(self.streamer_mode_active && self.streamer_hide_viewer_counts),
+                            self.split_header_show_game, self.split_header_show_title,
+                            self.channel_points.get(&active_ch).copied(),
+                        )
+                    } else { None };
+                    let header = show_split_header(ui, pane_rect, &active_ch, true, 0, 0,
+                        search_open, meta.as_deref(), SplitHeaderOptions {
+                            can_split: true, can_reopen: !self.split_panes.closed.is_empty(), can_close_others: false,
+                        });
+                    if header.focus_clicked { self.focus_chat_composer(ctx); }
+                    if header.close_clicked {
+                        self.close_channel_tab(active_ch.clone(), ctx);
+                        ctx.request_repaint();
+                        return;
+                    }
+                    if let Some(axis) = header.split {
+                        self.split_active_pane(axis, ctx);
+                        ctx.request_repaint();
+                        return;
+                    }
+                    if header.reopen_clicked {
+                        self.reopen_closed_split(ctx);
+                        ctx.request_repaint();
+                        return;
+                    }
+                    if header.toggle_search_clicked {
+                        let search = self.message_search_mut(&active_ch);
+                        if search.open { search.close(); } else { search.request_open(); }
+                    }
+                    if header.filters_clicked {
+                        self.single_pane_filters.entry(active_ch.clone()).or_default().editor_open = true;
+                    }
                     if active_ch.is_live_feed() {
                         use crate::widgets::live_feed::LiveFeed;
                         use std::collections::HashSet;
@@ -11172,6 +11712,7 @@ impl CrustApp {
                                 .unwrap_or(&[]);
                             let chat = ChatInput {
                                 id: Some(chat_composer_id(None)),
+                                hotkey_bindings: &self.hotkey_bindings,
                                 channel: &active_ch,
                                 logged_in: self.state.auth.logged_in,
                                 username: self.state.auth.username.as_deref(),
@@ -11191,11 +11732,13 @@ impl CrustApp {
                             };
                             let result = chat.show(ui, &mut self.chat_input_buf);
                             for up in result.uploads {
+                                let composer = Some(self.chat_composer_target(None));
                                 self.send_cmd(AppCommand::UploadImage {
                                     channel: active_ch.clone(),
                                     bytes: up.bytes,
                                     format: up.format,
                                     source_path: up.source_path.map(|p| p.display().to_string()),
+                                    composer,
                                 });
                             }
                             if let Some(word) = result.add_to_dictionary {
@@ -11338,10 +11881,12 @@ impl CrustApp {
                             &self.ignores_set,
                             &self.compiled_ignored_users,
                             &self.highlight_rules,
-                            &self.filter_records,
+                            self.single_pane_filters.get(&active_ch).map_or(self.filter_records.as_slice(),
+                                |filters| filters.records(&self.filter_records)),
                             &self.mod_action_presets,
                             &state.low_trust_users,
                         )
+                        .with_optional_pane(self.single_pane_identity.and_then(|(_, scope)| scope), true)
                         .with_scroll_to(scroll_to)
                         .with_hide_link_previews(
                             self.streamer_mode_active && self.streamer_hide_link_previews,
@@ -11363,6 +11908,7 @@ impl CrustApp {
                                 is_mod,
                             );
                         }
+                        if let Some(message) = ml_result.open_thread { self.open_reply_thread(message); }
                     }
                     if raid_banner_dismissed_single {
                         self.state.dismiss_raid_banner(&active_ch);
@@ -11426,10 +11972,10 @@ impl CrustApp {
             ctx.request_repaint();
         }
 
-        let can_restore_unsent = self.unsent_messages.front()
-            .is_some_and(|message| self.unsent_input_pane(message).is_some());
-        if let Some(message) = self.unsent_messages.show(ctx, can_restore_unsent) {
-            if !self.restore_unsent_message(&message) {
+        let can_restore_unsent = self.unsent_messages.front_for_account(self.state.auth.user_id.as_deref())
+            .is_some_and(|message| self.can_restore_unsent(message, true));
+        if let Some(message) = self.unsent_messages.show_for_account(ctx, can_restore_unsent, self.state.auth.user_id.as_deref()) {
+            if !self.restore_targeted_unsent(&message, true) {
                 self.unsent_messages.push(message);
             }
         }
@@ -11526,12 +12072,23 @@ impl CrustApp {
         // Global search popup
         if self.global_search.open {
             refresh_if_stale(&mut self.global_search, &self.state.channels);
+            let preview = MessagePreviewContext {
+                source_channels: Some(&self.state.channels),
+                viewer_login: self.state.auth.username.as_deref(),
+                show_timestamps: self.show_timestamps,
+                show_timestamp_seconds: self.show_timestamp_seconds,
+                use_24h_timestamps: self.use_24h_timestamps,
+                hide_link_previews: self.streamer_mode_active && self.streamer_hide_link_previews,
+                highlight_rules: &self.highlight_rules,
+                mod_action_presets: &self.mod_action_presets,
+                ..MessagePreviewContext::new(&self.emote_bytes, &self.cmd_tx, &self.link_previews)
+            };
             let output: GlobalSearchOutput = show_global_search_window(
                 ctx,
                 &self.state.channels,
                 &mut self.global_search,
                 self.always_on_top,
-                &self.emote_bytes,
+                preview,
                 self.animations_when_focused,
             );
             self.apply_global_search_output(output);
@@ -12211,6 +12768,7 @@ fn parse_slash_command(
                 text: format!("/redeem {}", rest.trim()),
                 reply_to_msg_id: None,
                 reply: None,
+                composer: None,
             })
         }
 
@@ -12949,6 +13507,7 @@ fn parse_slash_command(
                     text: text.to_owned(),
                     reply_to_msg_id,
                     reply: reply.clone(),
+                    composer: None,
                 });
             }
             let login = rest
@@ -13113,6 +13672,7 @@ fn parse_slash_command(
                 text: fwd,
                 reply_to_msg_id,
                 reply: reply.clone(),
+                composer: None,
             })
         }
 
@@ -13130,6 +13690,7 @@ fn parse_slash_command(
                     text: fwd,
                     reply_to_msg_id,
                     reply: reply.clone(),
+                    composer: None,
                 })
             }
         }
@@ -13142,6 +13703,7 @@ fn parse_slash_command(
                     text: text.to_owned(),
                     reply_to_msg_id,
                     reply: reply.clone(),
+                    composer: None,
                 });
             }
 
@@ -14181,6 +14743,154 @@ mod tests {
             parent_user_login: "viewer".to_owned(),
             parent_display_name: "Viewer".to_owned(),
             parent_msg_body: "original message".to_owned(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn thread_composer_sends_with_its_root_and_preserves_the_main_draft() {
+        let (mut app, mut commands) = test_app();
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("room");
+        app.state.join_channel(channel.clone());
+        app.state.auth.logged_in = true;
+        app.state.auth.user_id = Some("alice-id".into());
+        app.state.auth.username = Some("alice".into());
+        let root = search_message(channel.clone());
+        let root_id = root.server_id.clone().unwrap();
+        app.state.channels.get_mut(&channel).unwrap().push_message(root.clone());
+        app.chat_input_buf = "keep main draft".into();
+        app.pending_reply = Some(super::PendingReply { channel: channel.clone(), info: reply_context() });
+        app.open_reply_thread(root);
+        let key = app.reply_threads.active_key(Some("alice-id")).unwrap().clone();
+        for _ in 0..4 { production_ui_frame(&ctx, &mut app, Vec::new()); }
+        assert!(ctx.memory(|memory| memory.has_focus(key.composer_id())),
+            "thread={:?}, focused={:?}", key.composer_id(), ctx.memory(|memory| memory.focused()));
+        production_ui_frame(&ctx, &mut app, vec![egui::Event::Text("thread reply".into())]);
+        production_ui_frame(&ctx, &mut app, shortcut_input(egui::Key::Enter, egui::Modifiers::NONE).events);
+        let sends: Vec<_> = std::iter::from_fn(|| commands.try_recv().ok()).filter_map(|command| {
+            if let AppCommand::SendMessage { text, reply_to_msg_id, composer, .. } = command { Some((text, reply_to_msg_id, composer)) } else { None }
+        }).collect();
+        assert_eq!(sends, [("thread reply".into(), Some(root_id), Some(key.target()))]);
+        assert_eq!(app.chat_input_buf, "keep main draft");
+        assert_eq!(app.pending_reply.as_ref().unwrap().info.parent_msg_id, "parent-message");
+        production_ui_frame(&ctx, &mut app, vec![egui::Event::Text("/he".into())]);
+        production_ui_frame(&ctx, &mut app, Vec::new());
+        production_ui_frame(&ctx, &mut app, shortcut_input(egui::Key::Escape, egui::Modifiers::NONE).events);
+        assert!(app.reply_threads.active_key(Some("alice-id")).is_some(), "Escape first dismisses the thread completion helper");
+        assert_eq!(app.reply_threads.draft(&key), Some("/he"));
+        production_ui_frame(&ctx, &mut app, Vec::new());
+        production_ui_frame(&ctx, &mut app, shortcut_input(egui::Key::Escape, egui::Modifiers::NONE).events);
+        assert!(app.reply_threads.active_key(Some("alice-id")).is_none());
+        assert!(ctx.memory(|memory| memory.has_focus(super::chat_composer_id(None))));
+        production_ui_frame(&ctx, &mut app, vec![egui::Event::Text(" after closing thread".into())]);
+        assert_eq!(app.chat_input_buf, "keep main draft after closing thread");
+    }
+
+    #[test]
+    fn rejected_thread_sends_and_account_changes_never_overwrite_chat_drafts() {
+        let (mut app, commands) = test_app();
+        drop(commands);
+        let channel = ChannelId::new("room");
+        app.state.join_channel(channel.clone());
+        app.state.auth.logged_in = true;
+        app.state.auth.user_id = Some("alice-id".into());
+        app.chat_input_buf = "main draft".into();
+        let root = search_message(channel.clone());
+        let reply = crust_core::ReplyInfo::for_message(&root).unwrap();
+        app.open_reply_thread(root);
+        let key = app.reply_threads.active_key(Some("alice-id")).unwrap().clone();
+        assert!(!app.submit_composer_input(&channel, "  keep thread draft  ".into(), Some(reply.clone()), key.target()));
+        assert_eq!(app.reply_threads.draft(&key), Some("  keep thread draft  "));
+        assert_eq!(app.chat_input_buf, "main draft");
+        app.state.auth.user_id = Some("bob-id".into());
+        app.apply_event(crust_core::AppEvent::MessageSendRejected { channel: channel.clone(), text: "older reply".into(),
+            reply_to_msg_id: Some(reply.parent_msg_id.clone()), reply: Some(reply), composer: Some(key.target()),
+            reason: "Disconnected".into() }, &egui::Context::default());
+        assert_eq!(app.chat_input_buf, "main draft");
+        assert!(app.unsent_messages.front_for_account(Some("bob-id")).is_none());
+        assert_eq!(app.unsent_messages.front_for_account(Some("alice-id")).unwrap().text, "older reply");
+        assert!(!app.append_upload_to_composer(&channel, Some(key.target()), "https://example.test/late.png"));
+        assert_eq!(app.reply_threads.draft(&key), Some("  keep thread draft  "));
+    }
+
+    #[test]
+    fn subscribed_thread_replies_reach_mentions_only_for_live_other_user_messages() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("room");
+        app.state.join_channel(channel.clone());
+        app.state.auth.user_id = Some("alice-id".into());
+        app.state.auth.username = Some("alice".into());
+        let root = search_message(channel.clone());
+        let reply_info = crust_core::ReplyInfo::for_message(&root).unwrap();
+        app.state.channels.get_mut(&channel).unwrap().push_message(root.clone());
+        app.open_reply_thread(root);
+        let key = app.reply_threads.active_key(Some("alice-id")).unwrap().clone();
+        app.reply_threads.set_subscribed(key, true);
+        for (id, history, own, account) in [(2, false, false, "alice-id"), (3, true, false, "alice-id"),
+            (4, false, true, "alice-id"), (5, false, false, "bob-id")] {
+            let mut message = search_message(channel.clone());
+            message.id = crust_core::MessageId(id);
+            message.server_id = Some(format!("reply-{id}"));
+            message.raw_text = format!("reply body {id}");
+            message.reply = Some(reply_info.clone());
+            message.sender.login = if own { "alice" } else { "other" }.into();
+            message.flags.is_self = own;
+            message.flags.is_history = history;
+            app.state.auth.user_id = Some(account.into());
+            app.state.auth.username = Some(if account == "alice-id" { "alice" } else { "bob" }.into());
+            app.apply_event(crust_core::AppEvent::MessageReceived { channel: channel.clone(), message }, &ctx);
+        }
+        assert_eq!(app.state.mentions.len(), 1);
+        assert_eq!(app.state.mentions[0].server_id.as_deref(), Some("reply-2"));
+    }
+
+    #[test]
+    fn duplicate_pane_uploads_and_rejections_use_the_original_stable_target() {
+        let (mut app, _commands) = test_app();
+        let channel = ChannelId::new("room");
+        app.state.join_channel(channel.clone());
+        app.state.auth.user_id = Some("alice-id".into());
+        app.split_panes.add_pane(channel.clone(), None);
+        app.split_panes.add_pane(channel.clone(), None);
+        app.split_panes.panes[0].input_buf = "other draft".into();
+        let target = app.chat_composer_target(Some(1));
+        app.apply_event(crust_core::AppEvent::MessageSendRejected { channel: channel.clone(), text: "original pane".into(),
+            reply_to_msg_id: None, reply: None, composer: Some(target.clone()), reason: "Disconnected".into() }, &egui::Context::default());
+        assert_eq!(app.split_panes.panes[0].input_buf, "other draft");
+        assert_eq!(app.split_panes.panes[1].input_buf, "original pane");
+        assert!(app.append_upload_to_composer(&channel, Some(target), "https://example.test/image.png"));
+        assert_eq!(app.split_panes.panes[0].input_buf, "other draft");
+        assert_eq!(app.split_panes.panes[1].input_buf, "original pane https://example.test/image.png ");
+    }
+
+    #[test]
+    fn orphaned_hidden_pane_targets_keep_late_results_in_unsent_recovery() {
+        for upload in [false, true] {
+            let (mut app, _commands) = test_app();
+            let channel = ChannelId::new("room");
+            app.state.join_channel(channel.clone());
+            app.state.auth.user_id = Some("alice-id".into());
+            app.chat_input_buf = "current draft".into();
+            app.split_panes.add_pane(ChannelId::new("other"), None);
+            let id = app.split_panes.panes[0].id;
+            app.inactive_pane_drafts.insert((id, channel.clone()), super::ClassicDraft {
+                id, view_scope: Some(id), input_buf: String::new(), reply: None,
+            });
+            app.split_panes.remove_pane(0);
+            app.split_panes.closed.clear();
+            let target = crust_core::ComposerTarget::Chat { account_id: Some("alice-id".into()), pane_id: id };
+            if upload {
+                assert!(!app.append_upload_to_composer(&channel, Some(target), "https://example.test/late.png"));
+                assert_eq!(app.unsent_messages.front().unwrap().text, "https://example.test/late.png ");
+            } else {
+                app.apply_event(crust_core::AppEvent::MessageSendRejected { channel: channel.clone(), text: "late rejection".into(),
+                    reply_to_msg_id: None, reply: None, composer: Some(target), reason: "Disconnected".into() }, &egui::Context::default());
+                assert_eq!(app.unsent_messages.front().unwrap().text, "late rejection");
+            }
+            assert_eq!(app.chat_input_buf, "current draft");
+            assert!(app.inactive_pane_drafts[&(id, channel)].input_buf.is_empty());
         }
     }
 
@@ -14252,6 +14962,7 @@ mod tests {
             text: "later action".to_owned(),
             reply_to_msg_id: None,
             reply: None,
+            composer: None,
         }).unwrap();
         assert!(receiver.try_recv().is_err());
         let ctx = egui::Context::default();
@@ -14317,6 +15028,7 @@ mod tests {
     fn command_overflow_preserves_the_draft_reply_and_history() {
         let (mut app, _receiver) = saturated_app();
         let channel = ChannelId::new("channel");
+        app.state.join_channel(channel.clone());
         let reply = reply_context();
         app.state.auth.logged_in = true;
         app.pending_reply = Some(super::PendingReply {
@@ -14382,6 +15094,7 @@ mod tests {
         let (mut app, receiver) = test_app();
         drop(receiver);
         app.state.auth.logged_in = true;
+        app.state.join_channel(ChannelId::new("channel"));
         assert!(!app.submit_chat_input(&ChannelId::new("channel"), "unsent".to_owned(), None, None));
         assert_eq!(app.chat_input_buf, "unsent");
         app.service_runtime_channels(&egui::Context::default());
@@ -14398,6 +15111,7 @@ mod tests {
             bytes: vec![0; size],
             format: "png".to_owned(),
             source_path: None,
+            composer: None,
         };
         assert!(queue.send(&commands, upload(super::MAX_DEFERRED_UPLOAD_BYTES)));
         assert!(!queue.send(&commands, upload(1)));
@@ -14440,6 +15154,7 @@ mod tests {
             text: "unsent reply".to_owned(),
             reply_to_msg_id: Some("parent-message".to_owned()),
             reply: Some(reply_context()),
+            composer: None,
             reason: "The account is still connecting.".to_owned(),
         }, &egui::Context::default());
         assert_eq!(app.chat_input_buf, "unsent reply");
@@ -14458,6 +15173,7 @@ mod tests {
             text: "visible draft".to_owned(),
             reply_to_msg_id: None,
             reply: None,
+            composer: None,
             reason: "The account changed.".to_owned(),
         }, &egui::Context::default());
         assert_eq!(app.chat_input_buf, "visible draft");
@@ -14483,6 +15199,7 @@ mod tests {
             text: "reply from split".to_owned(),
             reply_to_msg_id: Some("parent-message".to_owned()),
             reply: Some(reply_context()),
+            composer: None,
             reason: "The account was connecting.".to_owned(),
         }, &egui::Context::default());
         assert!(app.split_panes.panes[0].input_buf.is_empty());
@@ -14492,7 +15209,7 @@ mod tests {
         assert!(app.submit_chat_input(&second, draft, reply, Some(1)));
         assert!(app.pending_reply.is_none());
         match receiver.try_recv().unwrap() {
-            AppCommand::SendMessage { channel, text, reply_to_msg_id, reply } => {
+            AppCommand::SendMessage { channel, text, reply_to_msg_id, reply, .. } => {
                 assert_eq!(channel, second);
                 assert_eq!(text, "reply from split");
                 assert_eq!(reply_to_msg_id.as_deref(), Some("parent-message"));
@@ -14516,6 +15233,7 @@ mod tests {
             text: "older reply".to_owned(),
             reply_to_msg_id: Some("parent-message".to_owned()),
             reply: Some(reply_context()),
+            composer: None,
             reason: "The account changed.".to_owned(),
         }, &egui::Context::default());
         assert_eq!(app.split_panes.panes[0].input_buf, "newer draft");
@@ -14543,6 +15261,7 @@ mod tests {
                 text: "unsent".to_owned(),
                 reply_to_msg_id: None,
                 reply: None,
+                composer: None,
                 reason: "The account changed.".to_owned(),
             }, ctx);
         });
@@ -14564,6 +15283,7 @@ mod tests {
             text: "older rejected message".to_owned(),
             reply_to_msg_id: Some("parent-message".to_owned()),
             reply: Some(reply_context()),
+            composer: None,
             reason: "The account is still connecting.".to_owned(),
         }, &egui::Context::default());
         assert_eq!(app.chat_input_buf, "newer draft");
@@ -14589,6 +15309,7 @@ mod tests {
             text: "unsent".to_owned(),
             reply_to_msg_id: Some("parent-without-metadata".to_owned()),
             reply: None,
+            composer: None,
             reason: "The account changed.".to_owned(),
         }, &egui::Context::default());
         assert!(app.chat_input_buf.is_empty());
@@ -16171,6 +16892,8 @@ mod tests {
             channel_order: vec!["delayed".into(), "first".into(), "second".into()],
             split_panes: vec![("first".into(), 0.4), ("delayed".into(), 0.6)],
             split_panes_focused: 1,
+            split_layout: None,
+            split_views: Vec::new(),
             whispers_visible: false,
             last_whisper_login: String::new(),
         }
@@ -16343,6 +17066,7 @@ mod tests {
             for (pane, frac) in app.split_panes.panes.iter_mut().zip(widths) {
                 pane.frac = frac;
             }
+            app.split_panes.rebuild_horizontal();
             app.activate_channel(layout[focused].clone());
             app.reconcile_persistent_ui_state();
             let mut saved_active = None;
@@ -16352,12 +17076,12 @@ mod tests {
                 match command {
                     AppCommand::SetLastActiveChannel { channel } => saved_active = Some(channel),
                     AppCommand::SetChannelOrder { order } => saved_order = Some(order),
-                    AppCommand::SetSplitPanes { panes, focused } => saved_panes = Some((panes, focused)),
+                    AppCommand::SetSplitPanes { panes, focused, layout, views, .. } => saved_panes = Some((panes, focused, layout, views)),
                     _ => {},
                 }
             }
             assert_eq!(saved_active.as_deref(), Some(layout[focused].as_str()));
-            let (panes, saved_focus) = saved_panes.expect("the complete split layout is saved");
+            let (panes, saved_focus, saved_layout, saved_views) = saved_panes.expect("the complete split layout is saved");
             assert_eq!(saved_focus, focused);
             assert_eq!(panes.iter().map(|(channel, _)| channel.as_str()).collect::<Vec<_>>(),
                 layout.iter().map(ChannelId::as_str).collect::<Vec<_>>());
@@ -16369,6 +17093,8 @@ mod tests {
             restored.apply_event(AppEvent::RestoreLastActiveChannel {
                 channel: saved_active.unwrap(), channel_order: saved_order.unwrap(),
                 split_panes: panes, split_panes_focused: saved_focus,
+                split_layout: saved_layout,
+                split_views: saved_views,
                 whispers_visible: false, last_whisper_login: String::new(),
             }, &ctx);
             restored.try_restore_pending_channel();
@@ -16399,6 +17125,8 @@ mod tests {
             restored.apply_event(AppEvent::RestoreLastActiveChannel {
                 channel, channel_order: Vec::new(), split_panes: Vec::new(),
                 split_panes_focused: 0, whispers_visible: false, last_whisper_login: String::new(),
+                split_layout: None,
+                split_views: Vec::new(),
             }, &ctx);
             restored.try_restore_pending_channel();
             assert_eq!(restored.state.active_channel, Some(virtual_channel));
@@ -16606,6 +17334,8 @@ mod tests {
             channel_order: vec![old.0.clone(), new.0.clone(), delayed.0.clone()],
             split_panes: vec![(old.0.clone(), 0.2), (new.0.clone(), 0.3), (delayed.0.clone(), 0.5)],
             split_panes_focused: 1,
+            split_layout: None,
+            split_views: Vec::new(),
             whispers_visible: false, last_whisper_login: String::new(),
         }, &ctx);
         app.apply_event(AppEvent::ChannelRedirected { old_channel: old, new_channel: new.clone() }, &ctx);
@@ -16630,7 +17360,7 @@ mod tests {
             match command {
                 AppCommand::SetLastActiveChannel { channel } => saved_active = Some(channel),
                 AppCommand::SetChannelOrder { order } => saved_order = Some(order),
-                AppCommand::SetSplitPanes { panes, focused } => saved_panes = Some((panes, focused)),
+                AppCommand::SetSplitPanes { panes, focused, .. } => saved_panes = Some((panes, focused)),
                 _ => {},
             }
         }
@@ -16655,6 +17385,8 @@ mod tests {
             channel_order: vec!["first".into()],
             split_panes: vec![("first".into(), f32::MAX), ("first".into(), f32::MAX)],
             split_panes_focused: 1,
+            split_layout: None,
+            split_views: Vec::new(),
             whispers_visible: false,
             last_whisper_login: String::new(),
         }, &ctx);
@@ -16727,7 +17459,11 @@ mod tests {
         events.push(egui::Event::Text("selected pane".to_owned()));
         tree.consume(&production_ui_frame(&ctx, &mut app, events));
         assert_eq!(app.state.active_channel, Some(second));
+        // Text following the navigation belongs to the selected editor's next pass.
+        tree.consume(&production_ui_frame(&ctx, &mut app, Vec::new()));
         assert!(app.split_panes.panes[0].input_buf.is_empty());
+        assert_eq!(app.split_panes.panes[1].input_buf, "selected pane");
+        tree.consume(&production_ui_frame(&ctx, &mut app, Vec::new()));
         assert_eq!(app.split_panes.panes[1].input_buf, "selected pane");
     }
 
@@ -16749,7 +17485,7 @@ mod tests {
     }
 
     #[test]
-    fn replacing_a_split_channel_keeps_its_draft_selection_and_reply_scope() {
+    fn replacing_a_split_channel_restores_its_own_draft_selection_and_reply_scope() {
         let (mut app, _commands) = test_app();
         let ctx = egui::Context::default();
         for name in ["first", "second", "third"] {
@@ -16776,20 +17512,407 @@ mod tests {
                 parent_user_login: "sender".into(),
                 parent_display_name: "Sender".into(),
                 parent_msg_body: "original message".into(),
+                ..Default::default()
             },
         });
 
         app.activate_channel(ChannelId::new("third"));
-        assert_eq!(app.split_panes.panes[1].input_buf, "keep 🙂 text");
+        assert!(app.split_panes.panes[1].input_buf.is_empty());
         assert!(app.reply_for_composer(&ChannelId::new("third"), Some(1)).is_none());
         production_ui_frame(&ctx, &mut app, vec![egui::Event::Text("kept".to_owned())]);
-        assert_eq!(app.split_panes.panes[1].input_buf, "kept 🙂 text");
+        assert_eq!(app.split_panes.panes[1].input_buf, "kept");
         assert_eq!(app.split_panes.panes[0].input_buf, "other draft");
         assert!(ctx.memory(|memory| memory.has_focus(id)));
         app.activate_channel(ChannelId::new("second"));
-        assert_eq!(app.split_panes.panes[1].input_buf, "kept 🙂 text");
+        assert_eq!(app.split_panes.panes[1].input_buf, "keep 🙂 text");
+        production_ui_frame(&ctx, &mut app, vec![egui::Event::Text("returned".to_owned())]);
+        assert_eq!(app.split_panes.panes[1].input_buf, "returned 🙂 text");
         assert_eq!(app.reply_for_composer(&ChannelId::new("second"), Some(1))
             .unwrap().parent_msg_id, "second-parent");
+    }
+
+    #[test]
+    fn nested_splits_round_trip_geometry_and_independent_searches() {
+        let (mut app, mut commands) = test_app();
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("room");
+        app.state.join_channel(channel.clone());
+        app.chat_input_buf = "original draft".into();
+        app.split_active_pane(super::SplitAxis::Horizontal, &ctx);
+        app.split_active_pane(super::SplitAxis::Vertical, &ctx);
+        assert_eq!(app.split_panes.panes.len(), 3);
+        assert_eq!(app.split_panes.panes[0].input_buf, "original draft");
+        app.split_panes.panes[0].search.request_open();
+        app.split_panes.panes[0].search.keyword = "first filter".into();
+        app.split_panes.panes[2].search.request_open();
+        app.split_panes.panes[2].search.keyword = "second filter".into();
+        app.split_panes.panes[2].filters.selected = Some(vec!["Links".into()]);
+        assert_ne!(app.split_panes.panes[0].search.field_id(&channel, "keyword"),
+            app.split_panes.panes[2].search.field_id(&channel, "keyword"));
+        assert!(app.split_panes.panes[1].search.keyword.is_empty());
+        app.reconcile_persistent_ui_state();
+        let (panes, focused, layout, views) = std::iter::from_fn(|| commands.try_recv().ok()).find_map(|command| {
+            match command { AppCommand::SetSplitPanes { panes, focused, layout, views, .. } => Some((panes, focused, layout, views)), _ => None }
+        }).expect("nested geometry is persisted");
+        let (mut restored, _) = test_app();
+        restored.state.join_channel(channel.clone());
+        restored.apply_event(AppEvent::RestoreLastActiveChannel {
+            channel: channel.0, channel_order: Vec::new(), split_panes: panes,
+            split_panes_focused: focused, split_layout: layout.clone(),
+            split_views: views,
+            whispers_visible: false, last_whisper_login: String::new(),
+        }, &ctx);
+        restored.try_restore_pending_layout();
+        assert_eq!(restored.split_panes.saved_layout(), layout);
+        assert_eq!(restored.split_panes.focused, 2);
+        assert_eq!(restored.split_panes.panes[0].search.keyword, "first filter");
+        assert_eq!(restored.split_panes.panes[2].search.keyword, "second filter");
+        assert_eq!(restored.split_panes.panes[2].filters.selected, Some(vec!["Links".into()]));
+    }
+
+    #[test]
+    fn duplicate_channel_search_fields_accept_typing_only_in_their_own_pane() {
+        let (mut app, _) = test_app();
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("room");
+        app.state.auth.logged_in = true;
+        app.state.join_channel(channel.clone());
+        app.chat_input_buf = "keep draft".into();
+        app.split_active_pane(super::SplitAxis::Vertical, &ctx);
+        for pane in &mut app.split_panes.panes { pane.search.open = true; }
+        for (index, text) in [(0, "first search"), (1, "second search")] {
+            let id = app.split_panes.panes[index].search.field_id(&channel, "keyword");
+            let mut response = None;
+            for _ in 0..3 { response = production_ui_frame_with_response(&ctx, &mut app, Vec::new(), Some(id)).1; }
+            let position = response.expect("each pane has its own rendered search field").rect.center();
+            for pressed in [true, false] {
+                production_ui_frame(&ctx, &mut app, vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton { pos: position, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE },
+                ]);
+            }
+            production_ui_frame(&ctx, &mut app, vec![egui::Event::Text(text.into())]);
+            assert_eq!(app.split_panes.panes[index].search.keyword, text);
+            assert_eq!(app.split_panes.focused, index);
+        }
+        assert_eq!(app.split_panes.panes[0].search.keyword, "first search");
+        assert_eq!(app.split_panes.panes[1].search.keyword, "second search");
+        assert_eq!(app.split_panes.panes[0].input_buf, "keep draft");
+        assert!(app.split_panes.panes[1].input_buf.is_empty());
+        let first_search = app.split_panes.panes[0].search.field_id(&channel, "keyword");
+        ctx.memory_mut(|memory| memory.request_focus(first_search));
+        production_ui_frame(&ctx, &mut app, Vec::new());
+        production_ui_frame(&ctx, &mut app, shortcut_input(egui::Key::Escape, egui::Modifiers::NONE).events);
+        assert_eq!(app.split_panes.focused, 0, "keyboard focus selects the pane without a pointer click");
+        assert!(!app.split_panes.panes[0].search.open);
+        assert!(app.split_panes.panes[1].search.open);
+    }
+
+    #[test]
+    fn pane_header_selection_keeps_later_typing_with_that_pane() {
+        let (mut app, _) = test_app();
+        let ctx = egui::Context::default();
+        app.state.auth.logged_in = true;
+        app.state.join_channel(ChannelId::new("room"));
+        app.split_active_pane(super::SplitAxis::Horizontal, &ctx);
+        let id = egui::Id::new("split_pane_bg").with(app.split_panes.panes[0].id);
+        let mut response = None;
+        for _ in 0..3 { response = production_ui_frame_with_response(&ctx, &mut app, Vec::new(), Some(id)).1; }
+        let pane = response.unwrap().rect;
+        let position = egui::pos2(pane.left() + 20.0, pane.top() + super::split_header_height() * 0.5);
+        for pressed in [true, false] {
+            production_ui_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(position), egui::Event::PointerButton {
+                pos: position, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+            }]);
+        }
+        production_ui_frame(&ctx, &mut app, Vec::new());
+        production_ui_frame(&ctx, &mut app, vec![egui::Event::Text("selected pane".into())]);
+        assert_eq!(app.split_panes.focused, 0);
+        assert_eq!(app.split_panes.panes[0].input_buf, "selected pane");
+        assert!(app.split_panes.panes[1].input_buf.is_empty());
+    }
+
+    #[test]
+    fn nested_divider_drag_stays_at_the_pointer_while_the_button_is_held() {
+        for (path, movement) in [(Vec::new(), egui::vec2(70.0, 0.0)), (vec![true], egui::vec2(0.0, 55.0))] {
+            let (mut app, _) = test_app();
+            let ctx = egui::Context::default();
+            app.state.auth.logged_in = true;
+            app.state.join_channel(ChannelId::new("room"));
+            app.split_active_pane(super::SplitAxis::Horizontal, &ctx);
+            app.split_active_pane(super::SplitAxis::Vertical, &ctx);
+            let id = egui::Id::new("pane_sep").with(&path);
+            let mut response = None;
+            for _ in 0..3 { response = production_ui_frame_with_response(&ctx, &mut app, Vec::new(), Some(id)).1; }
+            let position = response.expect("the divider has a drag target").rect.center();
+            let before = app.split_panes.saved_layout();
+            production_ui_frame(&ctx, &mut app, vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton { pos: position, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
+            ]);
+            let destination = position + movement;
+            production_ui_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(destination)]);
+            let moved = app.split_panes.saved_layout();
+            assert_ne!(moved, before);
+            for _ in 0..5 { production_ui_frame(&ctx, &mut app, Vec::new()); }
+            assert_eq!(app.split_panes.saved_layout(), moved, "holding still must not reapply cumulative drag distance");
+            production_ui_frame(&ctx, &mut app, vec![egui::Event::PointerButton {
+                pos: destination, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE,
+            }]);
+        }
+    }
+
+    #[test]
+    fn reopening_split_restores_draft_search_identity_and_nested_position() {
+        let (mut app, _) = test_app();
+        let ctx = egui::Context::default();
+        app.state.join_channel(ChannelId::new("room"));
+        app.chat_input_buf = "first draft".into();
+        app.split_active_pane(super::SplitAxis::Vertical, &ctx);
+        let id = app.split_panes.panes[1].id;
+        let view_scope = app.split_panes.panes[1].view_scope;
+        app.split_panes.panes[1].input_buf = "closed draft 🙂".into();
+        app.split_panes.panes[1].search.request_open();
+        app.split_panes.panes[1].search.username = "alice".into();
+        app.split_panes.panes[1].filters.selected = Some(vec!["Spam".into()]);
+        let before = app.split_panes.saved_layout();
+        app.close_split_pane(1, &ctx);
+        assert!(app.split_panes.panes.is_empty());
+        assert_eq!(app.chat_input_buf, "first draft");
+        app.chat_input_buf.push_str(" continued");
+        app.reopen_closed_split(&ctx);
+        assert_eq!(app.split_panes.panes.len(), 2);
+        assert_eq!(app.split_panes.panes[0].input_buf, "first draft continued");
+        let reopened = &app.split_panes.panes[1];
+        assert_eq!(reopened.id, id);
+        assert_eq!(reopened.view_scope, view_scope);
+        assert_eq!(reopened.input_buf, "closed draft 🙂");
+        assert_eq!(reopened.search.username, "alice");
+        assert_eq!(reopened.filters.selected, Some(vec!["Spam".into()]));
+        assert!(reopened.search.open);
+        assert_eq!(app.split_panes.saved_layout(), before);
+        assert_eq!(app.split_panes.focused, 1);
+        assert!(app.split_panes.closed.is_empty());
+    }
+
+    #[test]
+    fn collapsed_pane_settings_survive_restart_while_the_channel_is_still_joining() {
+        let (mut app, mut commands) = test_app();
+        let ctx = egui::Context::default();
+        app.state.join_channel(ChannelId::new("room"));
+        app.split_active_pane(super::SplitAxis::Horizontal, &ctx);
+        app.split_panes.panes[1].search.request_open();
+        app.split_panes.panes[1].search.keyword = "saved search".into();
+        app.split_panes.panes[1].filters.selected = Some(Vec::new());
+        app.keep_split_pane(1, &ctx);
+        app.reconcile_persistent_ui_state();
+        let views = std::iter::from_fn(|| commands.try_recv().ok()).find_map(|command| {
+            match command { AppCommand::SetSplitPanes { panes, views, .. } if panes.is_empty() => Some(views), _ => None }
+        }).unwrap();
+        let (mut restored, mut commands) = test_app();
+        restored.apply_event(AppEvent::RestoreLastActiveChannel {
+            channel: "room".into(), channel_order: Vec::new(), split_panes: Vec::new(),
+            split_panes_focused: 0, split_layout: None, split_views: views,
+            whispers_visible: false, last_whisper_login: String::new(),
+        }, &ctx);
+        restored.reconcile_persistent_ui_state();
+        assert!(!std::iter::from_fn(|| commands.try_recv().ok()).any(|command| matches!(command, AppCommand::SetSplitPanes { .. })),
+            "a delayed join must not replace the saved single view with an empty snapshot");
+        let channel = ChannelId::new("room");
+        restored.state.join_channel(channel.clone());
+        restored.try_restore_pending_channel();
+        assert_eq!(restored.message_search[&channel].keyword, "saved search");
+        assert!(restored.message_search[&channel].open);
+        assert_eq!(restored.single_pane_filters[&channel].selected, Some(Vec::new()));
+        restored.split_active_pane(super::SplitAxis::Vertical, &ctx);
+        assert_eq!(restored.split_panes.panes[0].search.keyword, "saved search");
+        assert_eq!(restored.split_panes.panes[0].filters.selected, Some(Vec::new()));
+    }
+
+    #[test]
+    fn one_surviving_saved_pane_restores_classic_search_and_filters_without_canceling_order() {
+        let (mut app, mut commands) = test_app();
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("room");
+        app.state.join_channel(channel.clone());
+        let view = crust_core::model::PaneViewSettings {
+            search: crust_core::model::PaneSearchSettings {
+                open: true, keyword: "saved query".into(), ..Default::default()
+            },
+            filters: Some(vec!["Links".into()]),
+        };
+        app.apply_event(AppEvent::RestoreLastActiveChannel {
+            channel: "room".into(), channel_order: vec!["later".into(), "room".into()],
+            split_panes: vec![("room".into(), 1.0)], split_panes_focused: 0,
+            split_layout: Some(super::PaneLayout::Pane { index: 0 }), split_views: vec![view],
+            whispers_visible: false, last_whisper_login: String::new(),
+        }, &ctx);
+        app.try_restore_pending_channel();
+        app.try_restore_pending_layout();
+        assert!(app.split_panes.panes.is_empty());
+        assert!(!app.layout_restore_cancelled);
+        assert_eq!(app.pending_restore_channel_order, vec!["later", "room"]);
+        assert_eq!(app.message_search[&channel].keyword, "saved query");
+        assert!(app.message_search[&channel].open);
+        assert_eq!(app.single_pane_filters[&channel].selected, Some(vec!["Links".into()]));
+        app.message_search.get_mut(&channel).unwrap().keyword = "edited query".into();
+        app.reconcile_persistent_ui_state();
+        let snapshot = std::iter::from_fn(|| commands.try_recv().ok()).find_map(|command| {
+            match command { AppCommand::SetSplitPanes { panes, views, .. } => Some((panes, views)), _ => None }
+        }).unwrap();
+        assert!(snapshot.0.is_empty());
+        assert_eq!(snapshot.1[0].search.keyword, "edited query");
+        assert_eq!(snapshot.1[0].filters, Some(vec!["Links".into()]));
+    }
+
+    #[test]
+    fn pane_search_saves_are_coalesced_and_shutdown_retains_the_last_unrendered_edit() {
+        let (mut app, mut commands) = test_app();
+        let channel = ChannelId::new("room");
+        app.state.join_channel(channel.clone());
+        app.cancel_pending_layout_restore();
+        let start = std::time::Instant::now();
+        app.reconcile_pane_snapshot(start);
+        while commands.try_recv().is_ok() {}
+        app.message_search.entry(channel.clone()).or_default().keyword = "fir".into();
+        app.reconcile_pane_snapshot(start);
+        assert!(commands.try_recv().is_err());
+        app.message_search.get_mut(&channel).unwrap().keyword = "first query".into();
+        app.reconcile_pane_snapshot(start + std::time::Duration::from_millis(600));
+        app.reconcile_pane_snapshot(start + std::time::Duration::from_millis(1000));
+        assert!(commands.try_recv().is_err(), "each edit restarts the debounce");
+        app.reconcile_pane_snapshot(start + std::time::Duration::from_millis(1400));
+        let AppCommand::SetSplitPanes { views, .. } = commands.try_recv().unwrap() else { panic!() };
+        assert_eq!(views[0].search.keyword, "first query");
+        assert!(commands.try_recv().is_err());
+        let final_state = std::sync::Arc::new(std::sync::Mutex::new(None));
+        app.set_layout_shutdown_state(std::sync::Arc::clone(&final_state));
+        app.message_search.get_mut(&channel).unwrap().keyword = "last edit".into();
+        drop(app);
+        let snapshot = final_state.lock().unwrap().take().unwrap();
+        assert_eq!(snapshot.active_channel, "room");
+        assert_eq!(snapshot.views[0].search.keyword, "last edit");
+    }
+
+    #[test]
+    fn shutdown_before_restore_arrives_preserves_saved_state_unless_the_user_navigates() {
+        for user_navigated in [false, true] {
+            let (mut app, _) = test_app();
+            let final_state = std::sync::Arc::new(std::sync::Mutex::new(None));
+            app.set_layout_shutdown_state(std::sync::Arc::clone(&final_state));
+            if user_navigated {
+                app.state.join_channel(ChannelId::new("selected"));
+                app.activate_channel(ChannelId::new("selected"));
+            }
+            drop(app);
+            let snapshot = final_state.lock().unwrap().take();
+            assert_eq!(snapshot.is_some(), user_navigated);
+            if let Some(snapshot) = snapshot { assert_eq!(snapshot.active_channel, "selected"); }
+        }
+    }
+
+    #[test]
+    fn collapsing_to_another_channel_persists_its_view_and_channel_together() {
+        let (mut app, mut commands) = test_app();
+        let ctx = egui::Context::default();
+        for name in ["first", "second"] {
+            let channel = ChannelId::new(name);
+            app.state.join_channel(channel.clone());
+            app.split_panes.add_pane(channel, None);
+        }
+        app.split_panes.focused = 0;
+        app.state.active_channel = Some(ChannelId::new("first"));
+        app.reconcile_persistent_ui_state();
+        while commands.try_recv().is_ok() {}
+        app.split_panes.panes[1].search.keyword = "second query".into();
+        app.keep_split_pane(1, &ctx);
+        app.reconcile_persistent_ui_state();
+        let (active_channel, panes, views) = std::iter::from_fn(|| commands.try_recv().ok()).find_map(|command| {
+            match command { AppCommand::SetSplitPanes { active_channel, panes, views, .. } => Some((active_channel, panes, views)), _ => None }
+        }).unwrap();
+        assert_eq!(active_channel, "second");
+        assert!(panes.is_empty());
+        assert_eq!(views[0].search.keyword, "second query");
+    }
+
+    #[test]
+    fn shutdown_does_not_replace_a_saved_layout_while_channels_are_joining() {
+        let (mut app, _) = test_app();
+        let final_state = std::sync::Arc::new(std::sync::Mutex::new(None));
+        app.set_layout_shutdown_state(std::sync::Arc::clone(&final_state));
+        app.pending_restore_channel = Some("still-joining".into());
+        drop(app);
+        assert!(final_state.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn redirected_channels_keep_classic_filter_selection_and_closed_pane_targets() {
+        for existing_destination in [false, true] {
+            let (mut app, _) = test_app();
+            let ctx = egui::Context::default();
+            let old = ChannelId::new("old");
+            let new = ChannelId::new("new");
+            app.state.join_channel(old.clone());
+            app.state.join_channel(new.clone());
+            app.single_pane_filters.entry(old.clone()).or_default().selected = Some(vec!["Links".into()]);
+            if existing_destination {
+                app.single_pane_filters.entry(new.clone()).or_default().selected = Some(Vec::new());
+            }
+            app.split_panes.add_pane(old.clone(), None);
+            app.split_panes.add_pane(new.clone(), None);
+            app.split_panes.remove_pane(0);
+            app.apply_event(AppEvent::ChannelRedirected { old_channel: old.clone(), new_channel: new.clone() }, &ctx);
+            assert!(!app.single_pane_filters.contains_key(&old));
+            assert_eq!(app.single_pane_filters[&new].selected,
+                Some(if existing_destination { Vec::new() } else { vec!["Links".into()] }));
+            assert_eq!(app.split_panes.closed.back().unwrap().pane.channel, new);
+            app.split_panes.reopen().unwrap();
+            assert!(app.split_panes.panes.iter().all(|pane| pane.channel != old));
+        }
+    }
+
+    #[test]
+    fn nested_panes_exceed_four_and_closed_history_stays_bounded() {
+        let mut panes = SplitPanes::default();
+        let channel = ChannelId::new("room");
+        panes.add_pane(channel.clone(), None);
+        for index in 1..super::MAX_CHAT_PANES {
+            assert!(panes.split(0, channel.clone(), if index % 2 == 0 {
+                super::SplitAxis::Vertical
+            } else { super::SplitAxis::Horizontal }));
+        }
+        assert_eq!(panes.panes.len(), super::MAX_CHAT_PANES);
+        assert!(!panes.split(0, channel, super::SplitAxis::Vertical));
+        assert!(panes.saved_layout().unwrap().validated(super::MAX_CHAT_PANES).is_some());
+        while panes.panes.len() > 1 { panes.remove_pane(panes.panes.len() - 1); }
+        assert_eq!(panes.closed.len(), 16);
+        for _ in 0..16 { assert!(panes.reopen().is_some()); }
+        assert_eq!(panes.panes.len(), 17);
+        assert!(panes.reopen().is_none());
+    }
+
+    #[test]
+    fn split_shortcuts_create_nested_panes_and_keep_the_original_composer() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        app.state.auth.logged_in = true;
+        app.state.join_channel(ChannelId::new("room"));
+        app.chat_input_buf = "keep original".into();
+        production_ui_frame(&ctx, &mut app, Vec::new());
+        production_ui_frame(&ctx, &mut app, shortcut_input(egui::Key::R,
+            egui::Modifiers { ctrl: true, alt: true, ..Default::default() }).events);
+        production_ui_frame(&ctx, &mut app, shortcut_input(egui::Key::D,
+            egui::Modifiers { ctrl: true, alt: true, ..Default::default() }).events);
+        assert_eq!(app.split_panes.panes.len(), 3);
+        assert_eq!(app.split_panes.panes[0].input_buf, "keep original");
+        production_ui_frame(&ctx, &mut app, vec![egui::Event::Text("new draft".into())]);
+        assert_eq!(app.split_panes.panes[2].input_buf, "new draft");
+        let last = app.split_panes.panes[2].id;
+        app.close_split_pane(2, &ctx);
+        production_ui_frame(&ctx, &mut app, shortcut_input(egui::Key::T,
+            egui::Modifiers { ctrl: true, shift: true, ..Default::default() }).events);
+        assert_eq!(app.split_panes.panes[2].id, last);
+        assert_eq!(app.split_panes.panes[2].input_buf, "new draft");
     }
 
     #[test]
@@ -17256,6 +18379,202 @@ mod tests {
                 assert!(ctx.input_mut(|input| super::consume_binding(input, &binding)));
             });
         }
+    }
+
+    fn native_search_action_frame(
+        ctx: &egui::Context,
+        app: &mut super::CrustApp,
+        action: super::GlobalSearchOutput,
+    ) -> egui::FullOutput {
+        app.egui_ctx = Some(ctx.clone());
+        let search = egui::ViewportId::from_hash_of("global_search");
+        let mut input = egui::RawInput { viewport_id: search, ..Default::default() };
+        input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap().focused = Some(false);
+        input.viewports.insert(search, egui::ViewportInfo {
+            parent: Some(egui::ViewportId::ROOT),
+            focused: Some(true),
+            ..Default::default()
+        });
+        let mut action = Some(action);
+        ctx.run(input, |_| {
+            if let Some(action) = action.take() {
+                app.apply_global_search_output(action);
+            }
+        })
+    }
+
+    fn requested_main_focus(output: &egui::FullOutput) -> bool {
+        output.viewport_output.get(&egui::ViewportId::ROOT).is_some_and(|viewport| {
+            viewport.commands.iter().any(|command| matches!(command, egui::ViewportCommand::Focus))
+        })
+    }
+
+    fn requested_viewport_closures(output: &egui::FullOutput) -> Vec<egui::ViewportId> {
+        output.viewport_output.iter().filter_map(|(id, viewport)| {
+            viewport.commands.iter().any(|command| matches!(command, egui::ViewportCommand::Close))
+                .then_some(*id)
+        }).collect()
+    }
+
+    #[test]
+    fn native_search_actions_close_only_the_source_and_preserve_the_query_and_draft() {
+        for action in ["thread", "profile", "reply", "result_jump", "context_jump", "jump_and_profile"] {
+            let (mut app, mut commands) = test_app();
+            let ctx = egui::Context::default();
+            let channel = ChannelId::new("room");
+            app.state.join_channel(channel.clone());
+            let message = search_message(channel.clone());
+            app.state.channels.get_mut(&channel).unwrap().push_message(message.clone());
+            app.chat_input_buf = "main draft".into();
+            app.global_search.open = true;
+            app.global_search.input = "search target".into();
+            app.message_search_mut(&channel).request_open();
+            let mut output = super::GlobalSearchOutput {
+                load_older_requests: vec![channel.clone()],
+                ..Default::default()
+            };
+            match action {
+                "thread" => output.message_actions.open_thread = Some(message.clone()),
+                "profile" => output.message_actions.profile_request = Some((channel.clone(), "alice".into(), Vec::new())),
+                "reply" => output.message_actions.reply = Some((channel.clone(), crust_core::ReplyInfo::for_message(&message).unwrap())),
+                "result_jump" => output.jump_to = Some((channel.clone(), message.id)),
+                "context_jump" => output.message_actions.jump_to = Some((channel.clone(), message.id)),
+                "jump_and_profile" => {
+                    output.jump_to = Some((channel.clone(), message.id));
+                    output.message_actions.profile_request = Some((channel.clone(), "alice".into(), Vec::new()));
+                }
+                _ => unreachable!(),
+            }
+            let rendered = native_search_action_frame(&ctx, &mut app, output);
+            assert!(requested_main_focus(&rendered), "{action} must activate its destination window");
+            assert!(rendered.viewport_output.iter().all(|(id, viewport)| {
+                *id == egui::ViewportId::ROOT
+                    || viewport.commands.iter().all(|command| !matches!(command, egui::ViewportCommand::Focus))
+            }), "{action} must not reactivate the source window");
+            assert!(!app.global_search.open, "{action} must uncover its destination");
+            assert_eq!(requested_viewport_closures(&rendered), [egui::ViewportId::from_hash_of("global_search")]);
+            assert!(app.message_search.get(&channel).unwrap().open, "the channel search must stay open");
+            assert_eq!(app.global_search.input, "search target");
+            assert_eq!(app.chat_input_buf, "main draft");
+            assert!(std::iter::from_fn(|| commands.try_recv().ok()).any(|command| {
+                matches!(command, AppCommand::LoadOlderLocalHistory { channel: requested, .. } if requested == channel)
+            }), "the window handoff must not drop other search actions");
+            match action {
+                "thread" => assert_eq!(app.reply_threads.active_key(None).unwrap().root_id, "search-server-id"),
+                "profile" | "jump_and_profile" => {
+                    assert!(app.user_profile_popup.open);
+                    assert_eq!(app.user_profile_popup.channel.as_ref(), Some(&channel));
+                    if action == "jump_and_profile" {
+                        assert_eq!(app.pending_scroll_to_message.get(&channel), Some(&message.id));
+                    }
+                }
+                "reply" => assert_eq!(app.pending_reply.as_ref().unwrap().info.parent_msg_id, "search-server-id"),
+                _ => assert_eq!(app.pending_scroll_to_message.get(&channel), Some(&message.id)),
+            }
+            app.global_search.request_open();
+            assert!(app.global_search.open);
+            assert_eq!(app.global_search.input, "search target", "reopening must restore the query");
+            let idle = native_search_action_frame(&ctx, &mut app, Default::default());
+            assert!(!requested_main_focus(&idle), "an idle search frame must not repeat the handoff");
+            assert!(requested_viewport_closures(&idle).is_empty());
+            assert!(app.global_search.open);
+        }
+    }
+
+    #[test]
+    fn native_search_refreshes_and_rejected_actions_do_not_activate_main() {
+        for action in ["refresh", "load_older", "result_jump", "context_jump", "reply", "thread"] {
+            let (mut app, _commands) = test_app();
+            let ctx = egui::Context::default();
+            let channel = ChannelId::new("room");
+            app.state.join_channel(channel.clone());
+            app.chat_input_buf = "main draft".into();
+            app.global_search.open = true;
+            app.global_search.input = "search target".into();
+            let mut output = super::GlobalSearchOutput::default();
+            match action {
+                "refresh" => {
+                    app.global_search.invalidate();
+                    super::refresh_if_stale(&mut app.global_search, &app.state.channels);
+                }
+                "load_older" => output.load_older_requests.push(channel.clone()),
+                "result_jump" => output.jump_to = Some((channel.clone(), crust_core::MessageId(999))),
+                "context_jump" => output.message_actions.jump_to = Some((channel.clone(), crust_core::MessageId(999))),
+                "reply" => output.message_actions.reply = Some((ChannelId::new("closed"), reply_context())),
+                "thread" => {
+                    let mut message = search_message(channel);
+                    message.server_id = None;
+                    output.message_actions.open_thread = Some(message);
+                }
+                _ => unreachable!(),
+            }
+            let rendered = native_search_action_frame(&ctx, &mut app, output);
+            assert!(!requested_main_focus(&rendered), "{action}");
+            assert!(requested_viewport_closures(&rendered).is_empty(), "{action} must keep the source visible");
+            assert!(app.global_search.open);
+            assert_eq!(app.global_search.input, "search target");
+            assert_eq!(app.chat_input_buf, "main draft");
+            assert!(app.reply_threads.active_key(None).is_none());
+            assert!(app.pending_reply.is_none());
+            assert!(app.pending_scroll_to_message.is_empty());
+        }
+    }
+
+    #[test]
+    fn native_search_thread_handoff_keeps_typing_in_the_thread() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("room");
+        app.state.join_channel(channel.clone());
+        app.state.auth.logged_in = true;
+        app.state.auth.user_id = Some("alice-id".into());
+        app.state.auth.username = Some("alice".into());
+        let message = search_message(channel.clone());
+        app.state.channels.get_mut(&channel).unwrap().push_message(message.clone());
+        app.chat_input_buf = "main draft".into();
+        app.global_search.open = true;
+        app.global_search.input = "search target".into();
+        let output = native_search_action_frame(&ctx, &mut app, super::GlobalSearchOutput {
+            message_actions: super::MessagePreviewActions { open_thread: Some(message), ..Default::default() },
+            ..Default::default()
+        });
+        assert!(requested_main_focus(&output));
+        let key = app.reply_threads.active_key(Some("alice-id")).unwrap().clone();
+        for _ in 0..4 { production_ui_frame(&ctx, &mut app, Vec::new()); }
+        assert!(ctx.memory(|memory| memory.has_focus(key.composer_id())));
+        production_ui_frame(&ctx, &mut app, vec![egui::Event::Text("thread draft".into())]);
+        assert_eq!(app.reply_threads.draft(&key), Some("thread draft"));
+        assert_eq!(app.chat_input_buf, "main draft");
+        assert!(!app.global_search.open);
+        assert_eq!(app.global_search.input, "search target");
+    }
+
+    #[test]
+    fn embedded_search_destination_keeps_root_and_other_searches_open() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        app.egui_ctx = Some(ctx.clone());
+        let channel = ChannelId::new("room");
+        app.state.join_channel(channel.clone());
+        app.message_search_mut(&channel).request_open();
+        app.global_search.open = true;
+        app.global_search.input = "saved query".into();
+        let mut action = Some(super::GlobalSearchOutput {
+            message_actions: super::MessagePreviewActions {
+                profile_request: Some((channel.clone(), "alice".into(), Vec::new())),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let output = ctx.run(egui::RawInput::default(), |_| {
+            if let Some(action) = action.take() { app.apply_global_search_output(action); }
+        });
+        assert!(requested_main_focus(&output));
+        assert!(requested_viewport_closures(&output).is_empty(), "embedded search must not close a native viewport");
+        assert!(!app.global_search.open);
+        assert_eq!(app.global_search.input, "saved query");
+        assert!(app.user_profile_popup.open);
+        assert!(app.message_search.get(&channel).unwrap().open);
     }
 
     #[test]

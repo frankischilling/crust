@@ -107,6 +107,8 @@ The shared `reply` table includes:
 - `parent_user_login`
 - `parent_display_name`
 - `parent_msg_body`
+- `thread_parent_msg_id`: omitted when the server did not supply the thread root
+- `thread_parent_user_login`: omitted when the thread root's author is unknown
 
 The shared `twitch_emote` table includes:
 
@@ -936,6 +938,11 @@ Fields:
 Notes:
 
 - emitted once at startup (persisted bindings, or defaults) and after every successful `c2.set_hotkey_bindings` call
+- pane actions include `split_right`, `split_down`, and `reopen_closed_split`
+- input actions include `input_send`, `input_send_keep`, `input_history_prev`,
+  `input_history_next`, `input_history_search_prev`, `input_history_search_next`,
+  `input_complete_prev`, `input_complete_next`, `input_clear`, `input_cancel_reply`,
+  and `input_emote_picker`; they apply to the focused chat composer
 
 ### `c2.EventType.UploadStarted`
 

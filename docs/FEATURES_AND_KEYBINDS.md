@@ -24,14 +24,17 @@ commands. Kick and generic IRC support remain beta features.
   - unified channel + whisper-thread list
   - query aliases for platforms and whispers
   - keyboard navigation that scrolls selection into view and follows search focus
-- Split-pane chat view (up to 4 panes):
+- Nested chat layouts (up to 32 panes):
   - drag channel to split
+  - split the focused view to the right or below, then resize either divider
   - focused-pane tracking
-  - split header controls and per-pane search toggle
+  - a search query and saved-filter selection for each pane, including duplicate views of one channel
   - an options menu in narrow panes, also available by right-clicking the header title
   - split keyboard navigation and pane reordering shortcuts
   - independent drafts and stable composer focus when panes are added, moved, or closed
   - independent scrolling and pause state when the same channel appears in two panes
+  - reopen recently closed panes with their drafts, search, filters, and previous position
+  - saved divider positions, focus, search fields, and filter selections restored at startup
 
 ### Desktop UI shell
 
@@ -76,9 +79,14 @@ commands. Kick and generic IRC support remain beta features.
 ### Input and command UX
 
 - Message input history recall (arrow keys)
+- Rebindable input actions in Settings > Hotkeys > Chat input, including Send,
+  Send and keep text, completion, history, Clear input, Cancel reply, and the emote picker
 - Case-insensitive input-history search with a query, match preview, and older/newer navigation
 - Emote picker access in narrow panes, with the character count below the input when needed
 - Rejected sends keep their original draft and reply context for recovery
+- Channel changes retain each view's unsent draft during the session. Delayed
+  send failures and upload results return to the originating composer when it
+  is available; otherwise, they remain in unsent recovery.
 - `:` emote autocomplete and Tab completion
 - Scrollable completion menus that fit short windows and enlarged fonts, with
   pointer selection that returns focus to the composer
@@ -88,6 +96,20 @@ commands. Kick and generic IRC support remain beta features.
 - Spellcheck on the input box (Norvig + Soundex + QWERTY proximity), with up to five right-click suggestions and a persistent personal dictionary
 - Image paste / drag-drop uploader (Imgur, Nuuls, ShareX SXCU, or any custom multipart endpoint), with deletion URLs logged locally
 
+### Reply threads
+
+- Open thread from a Twitch message's context menu in chat, search, or user history
+- View retained replies with the normal emotes, badges, links, and message actions
+- Compose a reply inside the thread while keeping the main chat draft intact
+- Subscribe to a thread to include new replies in the existing highlight and
+  Mentions flow. Live participation subscribes automatically; an explicit
+  unsubscribe remains in effect for that retained subscription entry.
+- Thread drafts and subscriptions belong to the active account and last for the
+  session. Up to 64 thread views and 256 subscription choices are retained.
+- When the original message is unavailable, hover over Original message not
+  loaded to inspect the available quote context. Opening a thread uses retained
+  channel history; it does not fetch a complete archive of older replies.
+
 ### Emotes, badges, and cosmetics
 
 - Emote providers:
@@ -96,6 +118,8 @@ commands. Kick and generic IRC support remain beta features.
   - FFZ
   - 7TV
   - Kick
+- Full native global emote catalog for signed-in Twitch accounts, without the
+  optional `user:read:emotes` permission; bundled globals remain available while it loads
 - Channel emotes stay in their channel; personal emotes resolve for their owner
 - Paginated Twitch account inventory for the picker, autocomplete, and outgoing
   emote ranges, with the optional `user:read:emotes` scope
@@ -120,12 +144,14 @@ commands. Kick and generic IRC support remain beta features.
 - Active 7TV channel-set changes and reconnect reconciliation, with stale
   subscription and snapshot checks
 - Live global and one selected personal 7TV set per sender, with ownership and membership refreshes
-- Coalesced channel refreshes and five-minute global metadata refreshes that retain usable catalogs on failure
+- Coalesced channel refreshes and five-minute BTTV, FFZ, and 7TV global metadata
+  refreshes that retain usable catalogs on failure
 - Automatic retries for failed channel providers after a 30-second cooldown,
   with successful catalogs and valid empty results preserved
 - Smaller 7TV assets for ordinary rendering, with larger images kept for HD previews
 
-Chat works without `user:read:emotes`. FFZ uses metadata refreshes. The
+Chat and native global emotes work without `user:read:emotes`. Personal inventory
+and follower-emote permissions still use that scope. FFZ uses metadata refreshes. The
 [UI and performance audit](AUDIT_UI_PERFORMANCE.md) explains provider limits,
 cached-snapshot behavior, and the measured rendering workloads.
 
@@ -234,6 +260,12 @@ Expression filters can match shared chat and whispers with `flags.shared` and
 `flags.whisper`. Hide rules remove matching messages from chat; dim rules leave
 them visible with reduced emphasis.
 
+Open a chat header's options menu and choose Pane filters to select the saved
+rules for that view. Use all enabled filters follows the global settings;
+clearing it allows a subset or no rules. Disabled rules remain inactive. The
+selection uses saved rule names, so a renamed or deleted rule appears as not
+found until you update the selection.
+
 ### Search, history, and local data
 
 - Recent-message history load on join (recent-messages API with IVR fallback)
@@ -243,6 +275,11 @@ them visible with reduced emphasis.
 - Per-channel message search/filter UI
 - Cross-channel search with predicates such as `from:<user>`, `has:link`, `in:<channel>`, and `regex:"<pattern>"`
 - Search navigation that follows input/result focus and leaves other controls' keys alone
+- Search results and recent messages in user cards use the chat renderer for
+  emotes, badges, replies, subscription messages, links, and message actions
+- Opening a message, reply, thread, or user card from cross-channel search closes
+  its window and returns focus to chat. Reopening search in the same session
+  restores the query.
 - Case-insensitive search regexes by default; inline regex flags can request case-sensitive matching
 - Subscriber-tier searches distinguish tier from subscription length; comma-separated `is:` values match any listed flag
 - Data directories via `directories::ProjectDirs` for config/cache/logs
@@ -289,8 +326,8 @@ messages; ordinary live chat keeps its 1,500-message limit.
 ## Keybinds
 
 The tables below show default shortcuts. Settings > Hotkeys lets you rebind
-registered app actions and reports conflicts. Text editing, autocomplete, and
-palette navigation also use the widget shortcuts listed below.
+registered app actions, including chat input, and reports conflicts in overlapping
+contexts. Palette navigation and ordinary text editing keep their widget controls.
 
 While a shortcut is waiting to be rebound, keyboard input goes to that binding.
 Escape cancels without changing it. Leaving Hotkeys or closing Settings also
@@ -311,14 +348,17 @@ cancels an unfinished capture.
 | Ctrl+End | Focus last channel (or last split in split mode) |
 | Alt+Shift+Left | Move active channel tab left (or move focused split left in split mode) |
 | Alt+Shift+Right | Move active channel tab right (or move focused split right in split mode) |
-| Ctrl+= | Increase chat font size on focused split |
-| Ctrl+- | Decrease chat font size on focused split |
-| Ctrl+0 | Reset chat font size on focused split |
+| Ctrl+= | Increase chat font size |
+| Ctrl+- | Decrease chat font size |
+| Ctrl+0 | Reset chat font size |
 
-### Split-mode only
+### Chat panes
 
 | Keybind | Behavior |
 | --- | --- |
+| Ctrl+Alt+R | Split the focused chat to the right |
+| Ctrl+Alt+D | Split the focused chat below |
+| Ctrl+Shift+T | Reopen the most recently closed pane |
 | Ctrl+Alt+PageUp | Focus previous split |
 | Ctrl+Alt+PageDown | Focus next split |
 | Ctrl+Alt+Shift+Left | Move focused split left |
@@ -338,11 +378,16 @@ cancels an unfinished capture.
 | Keybind | Behavior |
 | --- | --- |
 | Enter | Send a valid message when no input helper is using Enter |
+| Shift+Enter | Send without accepting the open completion menu |
+| Ctrl+Enter / Ctrl+Shift+Enter | Send and keep the text in the composer |
 | Tab | Accept/cycle autocomplete suggestion |
 | Shift+Tab | Cycle autocomplete suggestions backward |
 | Up / Down | Navigate autocomplete suggestions; if no autocomplete is active, navigate message history |
 | Ctrl+R | Open input-history search; while searching, select an older match |
 | Ctrl+Shift+R | Open input-history search in the forward direction; while searching, select a newer match |
+| Ctrl+U | Clear the focused input |
+| Escape | Dismiss the active completion or history helper; otherwise cancel the pending reply |
+| Ctrl+E | Open the emote picker for the focused composer |
 
 Notes:
 
@@ -357,24 +402,35 @@ Notes:
   or Cancel closes the search and keeps the original draft. Searching and
   accepting a result never send a message.
 - Autocomplete and history keys affect the focused chat input.
+- Input events keep their order around Send, Clear input, and pane navigation.
+  Text typed after Send begins the next draft, including when both events arrive
+  in one UI update.
+- Rebinding or clearing Send removes its default Shift+Enter alternative too.
+  The same rule applies to Send and keep text and Ctrl+Shift+Enter. Settings
+  displays both alternatives while their default Enter binding is active.
 - An input-history query belongs to its composer and closes when that composer
   changes channels. Search uses the same retained messages as Up/Down recall.
 - A rejected send keeps the draft and reply. If a later runtime rejection arrives
   after a new draft was started, the unsent message remains available to copy or
   restore without replacing that draft.
 - The Twitch character count and message limit behavior depend on the configured overflow mode.
-- Pasting an image from the clipboard or dropping an image file onto the chat input triggers the configured uploader; the returned URL is appended to that channel's draft.
+- Pasting or dropping an image onto a composer starts the configured uploader.
+  Its URL returns to that exact pane or reply thread, including an inactive
+  channel draft. If the destination is unavailable or the account has changed,
+  the link is retained with unsent messages for the original account.
 
 ## Common mouse and context actions
 
-- Right-click message row: reply/copy/moderation/workflow actions
+- Right-click message row: reply/open thread/copy/moderation/workflow actions
 - Right-click message row (mod): quick delete/timeout/ban/warn + full moderation submenus
 - Right-click chat input: cut/copy/paste/select all/search input history/send now/clear input/insert /help/spell suggestions (top 5) + "Add to dictionary"
-- Click split options or right-click its title: show/hide message search, close
-  that split, or close the other splits. These actions remain available in narrow panes.
+- Click split options or right-click its title: split right or below, reopen a
+  closed pane, choose filters, show/hide message search, close that split, or close
+  the other splits. These actions remain available in narrow panes.
 - Right-click channel tab: hide-when-offline toggle, Open in Streamlink
 - Click a sender name in channel chat or a Twitch @mention: open that user's card
-- Click a Mentions or search result: navigate to its message
+- Click the body of a Mentions or search result: navigate to its message;
+  sender names open user cards and links retain their own actions
 - Click toolbar buttons: open settings, join dialog, analytics, whispers, IRC status, moderation tools
 - Paste image (Ctrl+V) or drop file on chat input: upload to configured host and insert returned URL
 
@@ -473,4 +529,4 @@ User-defined command aliases (Settings -> Commands) dispatch after the built-in 
 - [UI API](API_UI.md)
 - [Events API](API_Events.md)
 - [Plugin API reference](API.md)
-- [Release notes v0.5.6](releases/Release_v0.5.6.md)
+- [Release notes v0.6.0](releases/Release_v0.6.0.md)

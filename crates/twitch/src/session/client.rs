@@ -1195,6 +1195,10 @@ fn parse_chat_message_irc(
                     .unwrap_or("")
                     .to_owned(),
                 parent_msg_body: tags.get("reply-parent-msg-body").unwrap_or("").to_owned(),
+                thread_parent_msg_id: tags.get("reply-thread-parent-msg-id")
+                    .map(str::trim).filter(|id| !id.is_empty()).map(str::to_owned),
+                thread_parent_user_login: tags.get("reply-thread-parent-user-login")
+                    .map(str::trim).filter(|login| !login.is_empty()).map(str::to_owned),
             })
         } else {
             None
@@ -1530,7 +1534,7 @@ mod tests {
     fn live_and_history_messages_keep_the_same_server_metadata() {
         let (mut session, _events) = session();
         session.auth_nick = Some("alice".into());
-        let message = parse_line(r"@id=message-1;bits=100;tmi-sent-ts=1700000000123;display-name=;reply-parent-msg-id=parent;reply-parent-msg-body=hello\sworld :alice!user@host PRIVMSG #room :Cheer100 🦀").unwrap();
+        let message = parse_line(r"@id=message-1;bits=100;tmi-sent-ts=1700000000123;display-name=;reply-parent-msg-id=parent;reply-parent-msg-body=hello\sworld;reply-thread-parent-msg-id=root;reply-thread-parent-user-login=bob :alice!user@host PRIVMSG #room :Cheer100 🦀").unwrap();
         let live = session.parse_privmsg(&message).unwrap();
         let history = parse_privmsg_irc(&message, Some("alice"), 10).unwrap();
         for parsed in [&live, &history] {
@@ -1542,6 +1546,8 @@ mod tests {
                 "hello world"
             );
             assert!(matches!(parsed.msg_kind, MsgKind::Bits { amount: 100 }));
+            assert_eq!(parsed.reply.as_ref().unwrap().thread_parent_msg_id.as_deref(), Some("root"));
+            assert_eq!(parsed.reply.as_ref().unwrap().thread_parent_user_login.as_deref(), Some("bob"));
             assert!(parsed.flags.is_self);
         }
         assert!(!live.flags.is_history);

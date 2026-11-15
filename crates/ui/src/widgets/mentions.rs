@@ -88,7 +88,7 @@ struct MentionLayoutCache {
     measured_rows: usize,
 }
 
-const MAX_CACHED_MENTION_VIEWS: usize = 5;
+const MAX_CACHED_MENTION_VIEWS: usize = crust_core::model::MAX_CHAT_PANES + 1;
 
 #[derive(Clone, Default)]
 struct MentionViewCaches {
@@ -1243,7 +1243,7 @@ mod tests {
         let mut active_id = egui::Id::NULL;
         let mut rotating_id = egui::Id::NULL;
         let mut first_rotating = None;
-        for pane in 0..30 {
+        for pane in 0..MAX_CACHED_MENTION_VIEWS + 10 {
             for _ in 0..3 {
                 let _ = ctx.run(
                     egui::RawInput {
@@ -1287,6 +1287,53 @@ mod tests {
             .unwrap();
         assert!(!caches.views.contains_key(&first_rotating.unwrap()));
         assert_eq!(caches.views.len(), MAX_CACHED_MENTION_VIEWS);
+    }
+
+    #[test]
+    fn expanded_layouts_keep_every_visible_mentions_cache_warm() {
+        let ctx = egui::Context::default();
+        let messages = messages(6);
+        let resources = Resources::new();
+        let list = MentionsList {
+            mentions: &messages,
+            body: resources.body(),
+            show_timestamps: true,
+            show_timestamp_seconds: false,
+            use_24h_timestamps: true,
+        };
+        let mut views = Vec::new();
+        for _ in 0..3 {
+            views.clear();
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1400.0, 700.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.columns(6, |columns| {
+                            for (pane, column) in columns.iter_mut().enumerate() {
+                                column.push_id(("active_mentions_pane", pane), |ui| {
+                                    views.push(ui.id().with("mentions_row_heights"));
+                                    list.show(ui);
+                                });
+                            }
+                        });
+                    });
+                },
+            );
+        }
+        let caches = ctx
+            .data(|data| data.get_temp::<MentionViewCaches>(mention_view_caches_id()))
+            .unwrap();
+        for id in views {
+            let cache = &caches.views[&id].1;
+            assert_eq!(cache.rows.len(), messages.len());
+            assert_eq!(cache.measured_rows, 0, "a visible pane was remeasured");
+        }
     }
 
     fn emote(code: &str, overlay: bool) -> Span {

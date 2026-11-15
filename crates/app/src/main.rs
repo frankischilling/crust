@@ -288,6 +288,9 @@ fn main() -> Result<()> {
 
     // Settings / token storage
     let settings_store = SettingsStore::new().ok();
+    let shutdown_settings_store = settings_store.clone();
+    let shutdown_layout = Arc::new(std::sync::Mutex::new(None));
+    let ui_shutdown_layout = Arc::clone(&shutdown_layout);
     let chat_logs = LogStore::new().ok();
     let initial_settings: AppSettings = settings_store
         .as_ref()
@@ -594,6 +597,7 @@ fn main() -> Result<()> {
         Box::new(move |cc| {
             let _ = UI_REPAINT_CTX.set(cc.egui_ctx.clone());
             let mut app = CrustApp::new(cc, cmd_tx, evt_rx);
+            app.set_layout_shutdown_state(ui_shutdown_layout);
             if let Some(sender) = history_updates {
                 app.set_history_updates(sender, ui_history_backlog);
             }
@@ -607,7 +611,22 @@ fn main() -> Result<()> {
     // deadline. Runtime shutdown must not wait indefinitely for a stuck disk.
     reducer_task.abort();
     rt.block_on(async {
-        let _ = tokio::time::timeout(Duration::from_millis(250), reducer_task).await;
+        let reducer_stopped = tokio::time::timeout(Duration::from_millis(250), reducer_task).await.is_ok();
+        // Reload after the reducer has stopped so its other settings writes
+        // cannot be overwritten by a stale snapshot from the UI thread.
+        if reducer_stopped {
+            let final_layout = shutdown_layout.lock().unwrap().take();
+            if let (Some(store), Some(snapshot)) = (&shutdown_settings_store, final_layout) {
+                let mut settings = store.load();
+                if settings.apply_pane_layout(snapshot) {
+                    if let Err(error) = store.save(&settings) {
+                        warn!("Failed to save final pane layout: {error}");
+                    }
+                }
+            }
+        } else {
+            warn!("Pane layout shutdown save skipped because the settings writer did not stop");
+        }
         if let Some(writer) = &log_writer {
             // The UI may close while its bounded history backlog is waiting for
             // relay capacity. Hand those accepted updates over before shutdown.
@@ -3100,7 +3119,7 @@ async fn reducer_loop(
             Some(cmd) = cmd_rx.recv() => {
                 if let Some(rejection) = auth_requests.action_rejection(
                     &cmd,
-                    auth_user_id.is_some(),
+                    auth_user_id.as_deref(),
                     expected_irc_identity.is_some(),
                 ) {
                     let _ = evt_tx.send(rejection).await;
@@ -3684,26 +3703,12 @@ async fn reducer_loop(
                             }
                         }
                     }
-                    AppCommand::SetSplitPanes { panes, focused } => {
-                        let mapped: Vec<crust_storage::settings::PersistedPane> = panes
-                            .into_iter()
-                            .map(|(channel, frac)| crust_storage::settings::PersistedPane {
-                                channel,
-                                frac,
-                            })
-                            .collect();
-                        let changed = settings.split_panes_focused != focused
-                            || settings.split_panes.len() != mapped.len()
-                            || settings
-                                .split_panes
-                                .iter()
-                                .zip(mapped.iter())
-                                .any(|(a, b)| {
-                                    a.channel != b.channel || (a.frac - b.frac).abs() > 0.001
-                                });
-                        if changed {
-                            settings.split_panes = mapped;
-                            settings.split_panes_focused = focused;
+                    AppCommand::SetSplitPanes { active_channel, panes, focused, layout, views } => {
+                        let snapshot = crust_core::model::PaneLayoutSnapshot {
+                            active_channel,
+                            panes, focused, layout, views,
+                        };
+                        if settings.apply_pane_layout(snapshot) {
                             if let Some(store) = &settings_store {
                                 if let Err(e) = store.save(&settings) {
                                     warn!("Failed to save split panes: {e}");
@@ -4377,6 +4382,7 @@ async fn reducer_loop(
                         text,
                         mut reply_to_msg_id,
                         reply,
+                        composer,
                     } => {
                         if channel.is_twitch() {
                             if let Some((target_login, whisper_text)) =
@@ -4431,7 +4437,7 @@ async fn reducer_loop(
                         // they hit the IRC layer (and before local-echo).
                         if channel.is_twitch() {
                             if let Some(reason) = twitch_message_error(&text) {
-                                let draft = OutgoingChat { channel, text, reply_to_msg_id, reply };
+                                let draft = OutgoingChat { channel, text, reply_to_msg_id, reply, composer };
                                 let _ = evt_tx.send(draft.rejected(reason)).await;
                                 continue;
                             }
@@ -4566,6 +4572,7 @@ async fn reducer_loop(
                                 text: text.clone(),
                                 reply_to_msg_id: reply_to_msg_id.clone(),
                                 reply: reply.clone(),
+                                composer: composer.clone(),
                             };
                             let echo_log_writer = log_writer.clone().filter(|_| settings.local_log_indexing_enabled);
                             if chat_publisher.submit(receiver, draft, echo, echo_log_writer, evt_tx.clone()).await {
@@ -4663,6 +4670,7 @@ async fn reducer_loop(
                             let draft = OutgoingChat {
                                 channel: channel.clone(), text: text.clone(),
                                 reply_to_msg_id: reply_to_msg_id.clone(), reply: reply.clone(),
+                                composer: composer.clone(),
                             };
                             let echo_log_writer = log_writer.clone().filter(|_| settings.local_log_indexing_enabled);
                             if chat_publisher.submit_irc(receiver, draft, outgoing_echo, echo_log_writer, evt_tx.clone()).await {
@@ -5568,7 +5576,7 @@ async fn reducer_loop(
                             message: msg,
                         }).await;
                     }
-                    AppCommand::UploadImage { channel, bytes, format, source_path } => {
+                    AppCommand::UploadImage { channel, bytes, format, source_path, composer } => {
                         let cfg: UploaderConfig = settings.image_uploader.clone();
                         let etx = evt_tx.clone();
                         let ch = channel.clone();
@@ -5603,6 +5611,7 @@ async fn reducer_loop(
                                         .send(AppEvent::UploadFinished {
                                             channel: ch,
                                             result: Ok(resp.image_url),
+                                            composer,
                                         })
                                         .await;
                                 }
@@ -5611,6 +5620,7 @@ async fn reducer_loop(
                                         .send(AppEvent::UploadFinished {
                                             channel: ch,
                                             result: Err(e.to_string()),
+                                            composer,
                                         })
                                         .await;
                                 }

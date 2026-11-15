@@ -359,11 +359,7 @@ impl EmoteProvider for SevenTvProvider {
     }
 }
 
-/// Twitch native global emote provider.
-///
-/// Twitch global emotes are extremely stable and don't require authentication
-/// to look up by ID on the CDN. We hardcode the well-known set here so the
-/// "Twitch" tab in the emote picker is never empty.
+/// Bundled Twitch globals for startup before an authenticated catalog is available.
 pub struct TwitchGlobalProvider;
 
 impl TwitchGlobalProvider {
@@ -388,8 +384,8 @@ impl EmoteProvider for TwitchGlobalProvider {
 }
 
 fn twitch_cdn(id: &str, scale: &str) -> String {
-    // Use `static` format to guarantee PNG responses.  `default` may return
-    // WebP which the image crate can't decode without the webp feature.
+    // The bundled fallback uses static assets; fetched catalogs select the
+    // formats advertised by the service.
     format!("https://static-cdn.jtvnw.net/emoticons/v2/{id}/static/dark/{scale}")
 }
 
@@ -405,12 +401,7 @@ fn tw(id: &str, code: &str) -> EmoteInfo {
     }
 }
 
-/// Returns the well-known Twitch global emote set.
-///
-/// This intentionally keeps the startup list small. The full Twitch catalog
-/// is very large and was blowing the default worker stack during bootstrap on
-/// this build. Additional emotes can still be loaded later through channel
-/// emote refreshes.
+/// A small startup fallback, replaced by the full authenticated global catalog.
 fn twitch_global_emotes() -> Vec<EmoteInfo> {
     vec![
         tw("25", "Kappa"),

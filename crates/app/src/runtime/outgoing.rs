@@ -227,6 +227,7 @@ pub(crate) struct OutgoingChat {
     pub text: String,
     pub reply_to_msg_id: Option<String>,
     pub reply: Option<ReplyInfo>,
+    pub composer: Option<crust_core::ComposerTarget>,
 }
 
 impl OutgoingChat {
@@ -237,6 +238,7 @@ impl OutgoingChat {
             reply_to_msg_id: self.reply_to_msg_id,
             reply: self.reply,
             reason,
+            composer: self.composer,
         }
     }
 }
@@ -459,12 +461,15 @@ mod tests {
             parent_user_login: "bob".into(),
             parent_display_name: "Bob".into(),
             parent_msg_body: "hello".into(),
+            thread_parent_msg_id: Some("thread-root".into()),
+            thread_parent_user_login: Some("author".into()),
         };
         let draft = OutgoingChat {
             channel: channel.clone(),
             text: "/me waves 🦀".into(),
             reply_to_msg_id: Some("parent".into()),
             reply: Some(reply.clone()),
+            composer: Some(crust_core::ComposerTarget::Chat { account_id: Some("alice-id".into()), pane_id: 73 }),
         };
         let mut echo = super::super::system_messages::make_system_message(
             1,
@@ -750,6 +755,7 @@ mod tests {
             let AppEvent::MessageSendRejected {
                 text,
                 reply_to_msg_id,
+                composer,
                 ..
             } = received.recv().await.unwrap()
             else {
@@ -757,6 +763,7 @@ mod tests {
             };
             assert_eq!(text, "/me waves 🦀");
             assert_eq!(reply_to_msg_id.as_deref(), Some("parent"));
+            assert_eq!(composer, Some(crust_core::ComposerTarget::Chat { account_id: Some("alice-id".into()), pane_id: 73 }));
             assert!(received.try_recv().is_err());
         }
     }
@@ -787,33 +794,42 @@ mod tests {
 
     #[tokio::test]
     async fn chat_rejection_and_disconnect_restore_the_original_text_and_reply() {
-        for rejected in [false, true] {
-            let (receipt, receiver) = oneshot::channel();
-            let (events, mut received) = mpsc::channel(4);
-            let (draft, echo) = pending();
-            if rejected {
-                receipt.send(Err("queue full".into())).unwrap();
-            } else {
-                drop(receipt);
-            }
-            publish_chat_result(receiver, draft, echo, None, events).await;
-            match received.try_recv().unwrap() {
-                AppEvent::MessageSendRejected {
-                    channel,
-                    text,
-                    reply_to_msg_id,
-                    reply,
-                    reason,
-                } => {
-                    assert_eq!(channel, ChannelId::new("room"));
-                    assert_eq!(text, "/me waves 🦀");
-                    assert_eq!(reply_to_msg_id.as_deref(), Some("parent"));
-                    assert_eq!(reply.unwrap().parent_msg_id, "parent");
-                    assert!(!reason.is_empty());
+        for origin in [
+            None,
+            Some(crust_core::ComposerTarget::Chat { account_id: Some("alice-id".into()), pane_id: 73 }),
+            Some(crust_core::ComposerTarget::ReplyThread { account_id: Some("alice-id".into()), root_msg_id: "thread-root".into() }),
+        ] {
+            for rejected in [false, true] {
+                let (receipt, receiver) = oneshot::channel();
+                let (events, mut received) = mpsc::channel(4);
+                let (mut draft, echo) = pending();
+                draft.composer = origin.clone();
+                if rejected {
+                    receipt.send(Err("queue full".into())).unwrap();
+                } else {
+                    drop(receipt);
                 }
-                event => panic!("unexpected send outcome: {event:?}"),
+                publish_chat_result(receiver, draft, echo, None, events).await;
+                match received.try_recv().unwrap() {
+                    AppEvent::MessageSendRejected {
+                        channel,
+                        text,
+                        reply_to_msg_id,
+                        reply,
+                        reason,
+                        composer,
+                    } => {
+                        assert_eq!(channel, ChannelId::new("room"));
+                        assert_eq!(text, "/me waves 🦀");
+                        assert_eq!(reply_to_msg_id.as_deref(), Some("parent"));
+                        assert_eq!(reply.unwrap().parent_msg_id, "parent");
+                        assert_eq!(composer, origin);
+                        assert!(!reason.is_empty());
+                    }
+                    event => panic!("unexpected send outcome: {event:?}"),
+                }
+                assert!(received.try_recv().is_err());
             }
-            assert!(received.try_recv().is_err());
         }
     }
 

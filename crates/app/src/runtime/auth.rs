@@ -62,7 +62,7 @@ impl AuthValidationRequests {
     pub fn action_rejection(
         &self,
         command: &AppCommand,
-        authenticated: bool,
+        account_id: Option<&str>,
         connecting: bool,
     ) -> Option<AppEvent> {
         let action = twitch_account_action(command)?;
@@ -70,11 +70,14 @@ impl AuthValidationRequests {
             .pending
             .as_ref()
             .is_some_and(|request| request.kind != ValidationKind::Refresh);
-        if authenticated && !changing_account {
-            return None;
-        }
-
-        let reason = if self.is_pending() || connecting {
+        let reason = if account_id.is_some() && !changing_account {
+            if !matches!(command, AppCommand::SendMessage { composer: Some(composer), .. }
+                if composer.account_id() != account_id)
+            {
+                return None;
+            }
+            "Your active account changed. Return to the original account to send this draft."
+        } else if self.is_pending() || connecting {
             "Sign-in is still in progress. Wait until your account is connected, then try again."
         } else {
             "You are signed out. Select an account, then try again."
@@ -85,12 +88,14 @@ impl AuthValidationRequests {
                 text,
                 reply_to_msg_id,
                 reply,
+                composer,
             } => Some(AppEvent::MessageSendRejected {
                 channel: channel.clone(),
                 text: text.clone(),
                 reply_to_msg_id: reply_to_msg_id.clone(),
                 reply: reply.clone(),
                 reason: format!("Message was not sent. {reason}"),
+                composer: composer.clone(),
             }),
             AppCommand::SendWhisper { target_login, .. } => Some(AppEvent::Error {
                 context: "SendWhisper".into(),
@@ -309,6 +314,7 @@ mod tests {
             text: "message for the selected account".into(),
             reply_to_msg_id: None,
             reply: None,
+            composer: None,
         }
     }
 
@@ -359,7 +365,7 @@ mod tests {
             ];
             for command in &commands {
                 assert!(requests
-                    .action_rejection(command, user_id.is_some(), expected.is_some())
+                    .action_rejection(command, user_id.as_deref(), expected.is_some())
                     .is_some());
             }
 
@@ -370,7 +376,7 @@ mod tests {
             for command in &commands {
                 assert!(
                     requests
-                        .action_rejection(command, user_id.is_some(), expected.is_some())
+                        .action_rejection(command, user_id.as_deref(), expected.is_some())
                         .is_some(),
                     "token validation alone must not release chat actions"
                 );
@@ -380,7 +386,7 @@ mod tests {
             assert_eq!(username.as_deref(), Some("bob"));
             for command in &commands {
                 assert!(requests
-                    .action_rejection(command, user_id.is_some(), expected.is_some())
+                    .action_rejection(command, user_id.as_deref(), expected.is_some())
                     .is_none());
             }
         }
@@ -415,20 +421,20 @@ mod tests {
             .unwrap();
         assert!(!requests.is_pending());
         assert!(
-            matches!(requests.action_rejection(&chat_command(), user_id.is_some(), expected.is_some()), Some(AppEvent::MessageSendRejected { reason, .. }) if reason.contains("signed out"))
+            matches!(requests.action_rejection(&chat_command(), user_id.as_deref(), expected.is_some()), Some(AppEvent::MessageSendRejected { reason, .. }) if reason.contains("signed out"))
         );
 
         let newer = requests.begin(ValidationKind::SwitchAccount, Some("carol".into()));
         assert!(requests.finish(validated(failed, "bob")).is_none());
         assert!(requests.is_pending());
         assert!(requests
-            .action_rejection(&chat_command(), user_id.is_some(), expected.is_some())
+            .action_rejection(&chat_command(), user_id.as_deref(), expected.is_some())
             .is_some());
         requests.cancel();
         assert!(requests.finish(validated(newer, "carol")).is_none());
         assert!(!requests.is_pending());
         assert!(requests
-            .action_rejection(&chat_command(), user_id.is_some(), expected.is_some())
+            .action_rejection(&chat_command(), user_id.as_deref(), expected.is_some())
             .is_some());
         assert!(settings.oauth_token.is_empty());
     }
@@ -441,29 +447,97 @@ mod tests {
             parent_user_login: "viewer".into(),
             parent_display_name: "Viewer".into(),
             parent_msg_body: "quoted message".into(),
+            thread_parent_msg_id: Some("thread-root".into()),
+            thread_parent_user_login: Some("author".into()),
+        };
+        let origin = crust_core::ComposerTarget::ReplyThread {
+            account_id: Some("alice-id".into()),
+            root_msg_id: "thread-root".into(),
         };
         let command = AppCommand::SendMessage {
             channel: crust_core::ChannelId::new("room"),
             text: "  reply with spaces 🦀  ".into(),
             reply_to_msg_id: Some("parent-id".into()),
             reply: Some(reply),
+            composer: Some(origin.clone()),
         };
-        match requests.action_rejection(&command, false, true).unwrap() {
+        match requests.action_rejection(&command, None, true).unwrap() {
             AppEvent::MessageSendRejected {
                 channel,
                 text,
                 reply_to_msg_id,
                 reply,
                 reason,
+                composer,
             } => {
                 assert_eq!(channel, crust_core::ChannelId::new("room"));
                 assert_eq!(text, "  reply with spaces 🦀  ");
                 assert_eq!(reply_to_msg_id.as_deref(), Some("parent-id"));
-                assert_eq!(reply.unwrap().parent_msg_body, "quoted message");
+                let reply = reply.unwrap();
+                assert_eq!(reply.parent_msg_body, "quoted message");
+                assert_eq!(reply.thread_parent_msg_id.as_deref(), Some("thread-root"));
+                assert_eq!(reply.thread_parent_user_login.as_deref(), Some("author"));
+                assert_eq!(composer, Some(origin));
                 assert!(reason.contains("not sent"));
             }
             event => panic!("expected a recoverable rejected message, got {event:?}"),
         }
+    }
+
+    #[test]
+    fn delayed_targeted_chat_cannot_follow_a_completed_account_switch() {
+        let mut requests = AuthValidationRequests::default();
+        let switch = requests.begin(ValidationKind::SwitchAccount, Some("bob".into()));
+        let completion = requests.finish(validated(switch, "bob")).unwrap();
+        let connected = completion.result.unwrap();
+        assert!(!requests.is_pending());
+
+        for origin in [
+            crust_core::ComposerTarget::Chat {
+                account_id: Some("alice-id".into()),
+                pane_id: 7,
+            },
+            crust_core::ComposerTarget::ReplyThread {
+                account_id: Some("alice-id".into()),
+                root_msg_id: "thread-root".into(),
+            },
+        ] {
+            let mut command = chat_command();
+            let AppCommand::SendMessage {
+                composer,
+                reply_to_msg_id,
+                ..
+            } = &mut command
+            else {
+                unreachable!();
+            };
+            *composer = Some(origin.clone());
+            *reply_to_msg_id = Some("reply-parent".into());
+            match requests
+                .action_rejection(&command, Some(&connected.user_id), false)
+                .unwrap()
+            {
+                AppEvent::MessageSendRejected {
+                    text,
+                    reply_to_msg_id,
+                    composer,
+                    reason,
+                    ..
+                } => {
+                    assert_eq!(text, "message for the selected account");
+                    assert_eq!(reply_to_msg_id.as_deref(), Some("reply-parent"));
+                    assert_eq!(composer, Some(origin));
+                    assert!(reason.contains("active account changed"));
+                }
+                event => panic!("expected recoverable stale-account rejection, got {event:?}"),
+            }
+            assert!(requests
+                .action_rejection(&command, Some("alice-id"), false)
+                .is_none());
+        }
+        assert!(requests
+            .action_rejection(&chat_command(), Some(&connected.user_id), false)
+            .is_none());
     }
 
     #[test]
@@ -500,12 +574,14 @@ mod tests {
             let command: AppCommand = serde_json::from_value(value).unwrap();
             assert!(
                 matches!(
-                    requests.action_rejection(&command, false, false),
+                    requests.action_rejection(&command, None, false),
                     Some(AppEvent::Error { .. })
                 ),
                 "unguarded account action: {command:?}"
             );
-            assert!(requests.action_rejection(&command, true, false).is_none());
+            assert!(requests
+                .action_rejection(&command, Some("alice-id"), false)
+                .is_none());
         }
     }
 
@@ -514,7 +590,7 @@ mod tests {
         let mut requests = AuthValidationRequests::default();
         requests.begin(ValidationKind::Refresh, Some("alice".into()));
         assert!(requests
-            .action_rejection(&chat_command(), true, true)
+            .action_rejection(&chat_command(), Some("alice-id"), true)
             .is_none());
         requests.begin(ValidationKind::SwitchAccount, Some("bob".into()));
         let channel = crust_core::ChannelId::new("room");
@@ -534,10 +610,11 @@ mod tests {
                 text: "independent IRC account".into(),
                 reply_to_msg_id: None,
                 reply: None,
+                composer: None,
             },
             AppCommand::Logout,
         ] {
-            assert!(requests.action_rejection(&command, false, false).is_none());
+            assert!(requests.action_rejection(&command, None, false).is_none());
         }
     }
 

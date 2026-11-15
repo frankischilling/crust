@@ -1,4 +1,4 @@
-use crust_core::model::ChannelId;
+use crust_core::model::{ChannelId, SplitAxis};
 use egui::RichText;
 
 use crate::theme as t;
@@ -17,9 +17,20 @@ const HEADER_CTRL_GAP: f32 = 3.0;
 
 #[derive(Default, Debug, Clone, Copy)]
 pub struct SplitHeaderResult {
+    pub focus_clicked: bool,
     pub close_clicked: bool,
     pub close_others_clicked: bool,
     pub toggle_search_clicked: bool,
+    pub split: Option<SplitAxis>,
+    pub reopen_clicked: bool,
+    pub filters_clicked: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct SplitHeaderOptions {
+    pub can_split: bool,
+    pub can_reopen: bool,
+    pub can_close_others: bool,
 }
 
 pub fn show_split_header(
@@ -31,6 +42,7 @@ pub fn show_split_header(
     unread_mentions: u32,
     search_open: bool,
     meta_text: Option<&str>,
+    options: SplitHeaderOptions,
 ) -> SplitHeaderResult {
     let pane_w = pane_rect.width();
     let compact = pane_w < 240.0 * t::font_scale();
@@ -124,7 +136,7 @@ pub fn show_split_header(
             compact: true,
             ..Default::default()
         },
-        |ui| show_split_menu(ui, can_search, search_open, &mut result),
+        |ui| show_split_menu(ui, can_search, search_open, options, &mut result),
     );
 
     if show_search {
@@ -207,7 +219,8 @@ pub fn show_split_header(
         .truncate()
         .sense(egui::Sense::click()),
     );
-    title_resp.context_menu(|ui| show_split_menu(ui, can_search, search_open, &mut result));
+    result.focus_clicked = title_resp.clicked();
+    title_resp.context_menu(|ui| show_split_menu(ui, can_search, search_open, options, &mut result));
     let mut tooltip = format!("{prefix}{display_name}");
     if let Some(meta_text) = meta_text.filter(|text| !text.is_empty()) {
         tooltip.push('\n');
@@ -223,9 +236,25 @@ fn show_split_menu(
     ui: &mut egui::Ui,
     can_search: bool,
     search_open: bool,
+    options: SplitHeaderOptions,
     result: &mut SplitHeaderResult,
 ) {
+    for (label, axis) in [("Split right", SplitAxis::Horizontal), ("Split below", SplitAxis::Vertical)] {
+        if ui.add_enabled(options.can_split, egui::Button::new(RichText::new(label).font(t::small()))).clicked() {
+            result.split = Some(axis);
+            ui.close_menu();
+        }
+    }
+    if ui.add_enabled(options.can_reopen, egui::Button::new(RichText::new("Reopen closed split").font(t::small()))).clicked() {
+        result.reopen_clicked = true;
+        ui.close_menu();
+    }
+    ui.separator();
     if can_search {
+        if ui.button(RichText::new("Pane filters").font(t::small())).clicked() {
+            result.filters_clicked = true;
+            ui.close_menu();
+        }
         let search_label = if search_open {
             "Hide search"
         } else {
@@ -247,7 +276,7 @@ fn show_split_menu(
         ui.close_menu();
     }
     if ui
-        .button(RichText::new("Close other splits").font(t::small()))
+        .add_enabled(options.can_close_others, egui::Button::new(RichText::new("Close other splits").font(t::small())))
         .clicked()
     {
         result.close_others_clicked = true;
@@ -302,6 +331,7 @@ mod tests {
                         2,
                         false,
                         Some("A long stream title that must not cover the controls"),
+                        SplitHeaderOptions { can_split: true, can_reopen: true, can_close_others: true },
                     );
                 });
             },

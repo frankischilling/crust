@@ -563,6 +563,7 @@ mod tests {
             parent_user_login: "y".into(),
             parent_display_name: "Y".into(),
             parent_msg_body: "hello".into(),
+            ..Default::default()
         });
         assert!(Predicate::Flag(FlagKind::Reply).matches(&m, &ch));
     }

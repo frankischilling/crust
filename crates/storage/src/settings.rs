@@ -424,6 +424,11 @@ pub struct AppSettings {
     /// Index of the focused pane within `split_panes`.
     #[serde(default)]
     pub split_panes_focused: usize,
+    /// Nested split geometry. Missing values restore the legacy horizontal layout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_layout: Option<crust_core::model::PaneLayout>,
+    #[serde(default)]
+    pub split_pane_views: Vec<crust_core::model::PaneViewSettings>,
 }
 
 /// Only known setting values may enter diagnostic output. Other strings can
@@ -549,6 +554,31 @@ impl std::fmt::Debug for AppSettings {
 }
 
 impl AppSettings {
+    /// Merge only pane-owned fields, leaving account and application settings intact.
+    pub fn apply_pane_layout(&mut self, snapshot: crust_core::model::PaneLayoutSnapshot) -> bool {
+        let panes: Vec<PersistedPane> = snapshot.panes.into_iter()
+            .take(crust_core::model::MAX_CHAT_PANES)
+            .map(|(channel, frac)| PersistedPane { channel, frac }).collect();
+        let focused = snapshot.focused.min(panes.len().saturating_sub(1));
+        let layout = snapshot.layout.and_then(|layout| layout.validated(panes.len()));
+        let views: Vec<_> = snapshot.views.into_iter().take(panes.len().max(1)).collect();
+        let changed = self.last_active_channel != snapshot.active_channel
+            || self.split_panes_focused != focused
+            || self.split_layout != layout
+            || self.split_pane_views != views
+            || self.split_panes.len() != panes.len()
+            || self.split_panes.iter().zip(&panes)
+                .any(|(left, right)| left.channel != right.channel || (left.frac - right.frac).abs() > 0.001);
+        if changed {
+            self.last_active_channel = snapshot.active_channel;
+            self.split_panes = panes;
+            self.split_panes_focused = focused;
+            self.split_layout = layout;
+            self.split_pane_views = views;
+        }
+        changed
+    }
+
     /// Format only the diagnostic allowlist; persisted settings keep their values.
     pub fn diagnostic_snapshot(&self) -> String {
         format!("{self:#?}")
@@ -698,6 +728,8 @@ impl Default for AppSettings {
             channel_order: Vec::new(),
             split_panes: Vec::new(),
             split_panes_focused: 0,
+            split_layout: None,
+            split_pane_views: Vec::new(),
         }
     }
 }
@@ -711,6 +743,7 @@ fn account_keyring_key(username: &str) -> String {
     format!("oauth-token-{}", username.to_lowercase())
 }
 
+#[derive(Clone)]
 pub struct SettingsStore {
     config_path: PathBuf,
 }
@@ -1022,6 +1055,67 @@ mod tests {
     use super::sanitize_custom_spell_dict;
     use super::AccountEntry;
     use super::AppSettings;
+
+    #[test]
+    fn nested_split_layout_round_trips_and_legacy_settings_keep_their_widths() {
+        use crust_core::model::{PaneLayout, SplitAxis};
+        let legacy = r#"
+            split_panes_focused = 1
+            [[split_panes]]
+            channel = "one"
+            frac = 0.35
+            [[split_panes]]
+            channel = "two"
+            frac = 0.65
+        "#;
+        let mut settings: AppSettings = toml::from_str(legacy).unwrap();
+        assert!(settings.split_layout.is_none());
+        assert_eq!(settings.split_panes.len(), 2);
+        assert_eq!(settings.split_panes[0].frac, 0.35);
+        settings.split_layout = Some(PaneLayout::Split {
+            axis: SplitAxis::Vertical,
+            fraction: 0.35,
+            first: Box::new(PaneLayout::Pane { index: 0 }),
+            second: Box::new(PaneLayout::Pane { index: 1 }),
+        });
+        settings.split_pane_views = vec![crust_core::model::PaneViewSettings {
+            search: crust_core::model::PaneSearchSettings {
+                open: true, username: "alice".into(), keyword: "kept query".into(), regex: "^hello".into(),
+            },
+            filters: Some(vec!["Links".into()]),
+        }];
+        let encoded = toml::to_string(&settings).unwrap();
+        let restored: AppSettings = toml::from_str(&encoded).unwrap();
+        assert_eq!(restored.split_layout, settings.split_layout);
+        assert_eq!(restored.split_pane_views, settings.split_pane_views);
+        assert_eq!(restored.split_panes_focused, 1);
+        assert_eq!(restored.split_panes[1].channel, "two");
+        assert_eq!(restored.split_panes[1].frac, 0.65);
+    }
+
+    #[test]
+    fn final_pane_snapshot_preserves_unrelated_settings_and_avoids_unchanged_writes() {
+        let mut settings = AppSettings::default();
+        settings.username = "current-account".into();
+        settings.oauth_token = "unchanged-token".into();
+        settings.channel_order = vec!["second".into(), "first".into()];
+        let snapshot = crust_core::model::PaneLayoutSnapshot {
+            active_channel: "first".into(),
+            views: vec![crust_core::model::PaneViewSettings {
+                search: crust_core::model::PaneSearchSettings { keyword: "final query".into(), ..Default::default() },
+                filters: Some(Vec::new()),
+            }],
+            ..Default::default()
+        };
+        assert!(settings.apply_pane_layout(snapshot.clone()));
+        assert!(!settings.apply_pane_layout(snapshot));
+        assert_eq!(settings.username, "current-account");
+        assert_eq!(settings.oauth_token, "unchanged-token");
+        assert_eq!(settings.channel_order, vec!["second", "first"]);
+        assert_eq!(settings.last_active_channel, "first");
+        assert_eq!(settings.split_pane_views[0].search.keyword, "final query");
+        assert_eq!(settings.split_pane_views[0].filters, Some(Vec::new()));
+    }
 
     #[test]
     fn diagnostic_output_omits_credentials_and_freeform_settings() {
