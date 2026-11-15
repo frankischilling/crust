@@ -135,6 +135,14 @@ impl<'a> ChannelList<'a> {
                         egui::Id::new("live_feed_pin_row"),
                         egui::Sense::click(),
                     );
+                    resp.widget_info(|| {
+                        egui::WidgetInfo::selected(
+                            egui::WidgetType::Button,
+                            ui.is_enabled(),
+                            is_active,
+                            "Live",
+                        )
+                    });
 
                     // Background color: active / hover / default.
                     let bg = if is_active {
@@ -196,6 +204,14 @@ impl<'a> ChannelList<'a> {
                         egui::Id::new("mentions_pin_row"),
                         egui::Sense::click(),
                     );
+                    resp.widget_info(|| {
+                        egui::WidgetInfo::selected(
+                            egui::WidgetType::Button,
+                            ui.is_enabled(),
+                            is_active,
+                            "Mentions",
+                        )
+                    });
 
                     let bg = if is_active {
                         t::active_channel_bg()
@@ -724,6 +740,81 @@ impl<'a> ChannelList<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn virtual_sidebar_buttons_expose_their_names_selection_and_actions() {
+        let pins = [
+            (ChannelId::live_feed(), "Live"),
+            (ChannelId::mentions(), "Mentions"),
+        ];
+        for (active, _) in &pins {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let states = HashMap::new();
+            let rules = HashMap::new();
+            let mut list = ChannelList {
+                channels: &[],
+                active: Some(active),
+                channel_states: &states,
+                live_channels: None,
+                show_live_indicator: false,
+                show_close_button: false,
+                show_live_feed_pin: true,
+                live_feed_count: 3,
+                show_mentions_pin: true,
+                mentions_total: 5,
+                mentions_unread: 2,
+                tab_visibility_rules: &rules,
+            };
+            let mut frame = |events| {
+                let mut result = None;
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(240.0, 300.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            result = Some(list.show(ui));
+                        });
+                    },
+                );
+                (output, result.unwrap())
+            };
+            let (output, _) = frame(Vec::new());
+            let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+            for (channel, label) in &pins {
+                let (target, node) = nodes
+                    .iter()
+                    .find(|(_, node)| node.label() == Some(*label))
+                    .expect("each virtual sidebar row exposes a named button");
+                assert_eq!(node.role(), egui::accesskit::Role::Button);
+                assert!(node.supports_action(egui::accesskit::Action::Click));
+                assert_eq!(
+                    node.toggled(),
+                    Some(if channel == active {
+                        egui::accesskit::Toggled::True
+                    } else {
+                        egui::accesskit::Toggled::False
+                    })
+                );
+                let (_, result) = frame(vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click,
+                        target: *target,
+                        data: None,
+                    },
+                )]);
+                assert_eq!(result.selected.as_ref(), Some(channel));
+                assert!(result.closed.is_none());
+                assert!(result.reordered.is_none());
+            }
+        }
+    }
 
     #[test]
     fn drag_reorders_the_same_channel_after_visible_tabs_change() {

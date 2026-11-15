@@ -63,7 +63,8 @@ to load Mentions history and normal-size emote images.
   focused controls retain their keyboard behavior.
 - Mentions and Live hide the channel stream header, so virtual views do not show
   internal channel names or a stream-status request.
-- Live rows expose named channel actions to accessibility tools.
+- Live and Mentions have named accessibility controls with an active state.
+  Each Live row also exposes an action to open its channel.
 - Plugin action calls report whether they were queued. Full queues return a
   reason without blocking or panicking inside an asynchronous callback, and
   plugins can retain their inputs for an explicit retry.

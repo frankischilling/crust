@@ -130,6 +130,7 @@ that does not apply to that view.
 Each Live row exposes a named accessibility action to open its channel. The
 action covers the same full row as the pointer target, and navigation preserves
 the existing composer draft.
+The Live and Mentions sidebar controls expose their names and active state.
 
 Command descriptions and provider labels remain readable on both ordinary and
 selected rows. The composer uses a vector smile icon with the same focus,
@@ -209,7 +210,7 @@ completed successfully. Visual review of 26 captures checked narrow and short
 windows, enlarged text, message wrapping, popup boundaries, and layered hover
 previews. The fixtures use synthetic messages and an offline account.
 
-The final release-mode workspace run passed 1,236 tests across 20 targets, with
+The final release-mode workspace run passed 1,237 tests across 20 targets, with
 no failures and 16 optional tests ignored. Workspace correctness lints also
 passed. The UI regressions include opening an already joined channel from its
 Live row, keeping its draft, and opening the emote picker through both pointer
