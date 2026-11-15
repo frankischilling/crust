@@ -39,8 +39,9 @@ commands. Kick and generic IRC support remain beta features.
 ### Detached chats and overlays
 
 Open the chat header's options menu, then choose Open in new window or Open
-overlay. Up to 16 chat windows can be open. Each has its own
-composer, reply target, search, filters, emote picker, and scroll position.
+overlay. The flat menu fits its action labels within the available window space.
+Up to 16 chat windows can be open. Each has its own composer, reply target,
+search, filters, emote picker, and scroll position.
 
 Returning to the composer after using its emote picker or search keeps the same
 native window. Native chat and search windows initialize their own accessibility
@@ -53,8 +54,8 @@ tab keeps its detached chats connected; closing the last view leaves the channel
 Choose Manage chat windows from the same header menu to show or close a window,
 reopen a recently closed one, or restore its main tab. Reset position brings an
 offscreen window beside the main window. Overlays have a background-opacity
-control and an explicit Click-through mode. Use Interact in the manager to restore
-mouse and keyboard control of an overlay.
+slider labeled Background and an explicit Click-through mode. Use Interact in
+the manager to restore mouse and keyboard control of an overlay.
 
 ### Desktop UI shell
 
@@ -67,7 +68,8 @@ mouse and keyboard control of an overlay.
 - Searchable settings with per-page scroll positions and responsive rule editors
 - Account removal confirmation and a scrolling account list with a visible Close control
 - Compact startup status while chat, settings, and navigation remain available
-- Icon controls with visible keyboard focus and labels for accessibility tools
+- Icon controls with visible keyboard focus, accessible button actions and labels,
+  and the current state of toggles
 - Layout controls that show the active layout and disable the sidebar when the
   window is too narrow
 - Crash reports and IRC status remain within small windows. Failed report deletions

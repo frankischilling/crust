@@ -21,7 +21,10 @@ pub enum ChromeIcon {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IconButtonState {
+    /// Visual emphasis, including an open menu's highlight.
     pub selected: bool,
+    /// The current state of a toggle; ordinary action buttons leave this unset.
+    pub toggle_state: Option<bool>,
     pub compact: bool,
     pub danger: bool,
 }
@@ -30,6 +33,7 @@ impl Default for IconButtonState {
     fn default() -> Self {
         Self {
             selected: false,
+            toggle_state: None,
             compact: false,
             danger: false,
         }
@@ -48,13 +52,11 @@ pub fn icon_button(
         t::icon_btn()
     };
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), Sense::click());
-    resp.widget_info(|| {
-        egui::WidgetInfo::selected(
-            egui::WidgetType::Button,
-            ui.is_enabled(),
-            state.selected,
-            tooltip,
-        )
+    resp.widget_info(|| match state.toggle_state {
+        Some(selected) => {
+            egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), selected, tooltip)
+        }
+        None => egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tooltip),
     });
     let hovered = resp.hovered();
     let focused = resp.has_focus();
@@ -433,6 +435,81 @@ mod tests {
             pressed,
             repeat: false,
             modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn action_icons_and_toggles_publish_distinct_accessible_states() {
+        for (icon, selected, toggle_state, enabled) in [
+            (ChromeIcon::Close, false, None, true),
+            (ChromeIcon::Join, false, None, true),
+            (ChromeIcon::Menu, true, None, true),
+            (ChromeIcon::Search, false, Some(false), true),
+            (ChromeIcon::Search, true, Some(true), true),
+            (ChromeIcon::Search, true, Some(true), false),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let frame = |events| {
+                let mut response = None;
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(400.0, 200.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            response = Some(
+                                ui.add_enabled_ui(enabled, |ui| {
+                                    icon_button(
+                                        ui,
+                                        icon,
+                                        "Named action",
+                                        IconButtonState {
+                                            selected,
+                                            toggle_state,
+                                            ..Default::default()
+                                        },
+                                    )
+                                })
+                                .inner,
+                            );
+                        });
+                    },
+                );
+                (output, response.unwrap())
+            };
+            let (output, response) = frame(Vec::new());
+            let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+            let (target, node) = nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some("Named action"))
+                .expect("the icon exposes its action name");
+            assert_eq!(node.role(), egui::accesskit::Role::Button);
+            assert_eq!(
+                node.toggled(),
+                toggle_state.map(|selected| if selected {
+                    egui::accesskit::Toggled::True
+                } else {
+                    egui::accesskit::Toggled::False
+                })
+            );
+            assert_eq!(response.enabled(), enabled);
+            if enabled {
+                assert!(node.supports_action(egui::accesskit::Action::Click));
+            }
+            let (_, response) = frame(vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Click,
+                    target: *target,
+                    data: None,
+                },
+            )]);
+            assert_eq!(response.clicked(), enabled, "icon: {icon:?}");
         }
     }
 

@@ -150,6 +150,7 @@ pub fn show_split_header(
             IconButtonState {
                 compact: true,
                 selected: search_open,
+                toggle_state: Some(search_open),
                 ..Default::default()
             },
         )
@@ -246,9 +247,39 @@ fn show_split_menu(
     let frame_margin = egui::Frame::menu(ui.style()).total_margin().sum();
     let maximum = (ui.ctx().screen_rect().size() - frame_margin - egui::vec2(16.0, 16.0))
         .max(egui::Vec2::splat(1.0));
-    ui.set_max_width(maximum.x);
+    let font = t::small();
+    let label_width = ui.fonts(|fonts| {
+        [
+            "Split right",
+            "Split below",
+            "Reopen closed split",
+            "Pane filters",
+            "Show search",
+            "Hide search",
+            "Open in new window",
+            "Open overlay",
+            "Manage chat windows",
+            "Close split",
+            "Close other splits",
+        ]
+        .into_iter()
+        .map(|label| {
+            fonts
+                .layout_no_wrap(label.to_owned(), font.clone(), egui::Color32::WHITE)
+                .size()
+                .x
+        })
+        .fold(0.0, f32::max)
+    });
+    let scroll = &ui.spacing().scroll;
+    let scroll_width = scroll.bar_width + scroll.bar_inner_margin + scroll.bar_outer_margin;
+    let width = (label_width + ui.spacing().button_padding.x * 2.0 + scroll_width)
+        .ceil()
+        .min(maximum.x);
+    ui.set_width(width);
     egui::ScrollArea::vertical()
         .id_salt("split_options_scroll")
+        .max_width(width)
         .max_height(maximum.y)
         .min_scrolled_height(0.0)
         .show(ui, |ui| {
@@ -667,6 +698,53 @@ mod tests {
                     "selecting an action must close the menu"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn flat_menu_width_follows_its_labels_in_wide_viewports() {
+        let mut previous_width: Option<f32> = None;
+        for screen_width in [640.0, 1280.0, 2560.0] {
+            let ctx = egui::Context::default();
+            let viewport = HeaderViewport::at_right_edge(egui::vec2(screen_width, 720.0), 320.0);
+            let (_, _, close) = viewport_frame(&ctx, viewport, Vec::new());
+            viewport_frame(&ctx, viewport, Vec::new());
+            let menu = close - egui::vec2(t::icon_btn_sm() + HEADER_CTRL_GAP, 0.0);
+            click_in_viewport(&ctx, viewport, menu, egui::PointerButton::Primary);
+            let target = find_menu_action(&ctx, viewport, "Manage chat windows");
+            let layer = ctx.layer_id_at(target.center()).expect("menu layer");
+            let menu_rect = ctx.memory(|memory| memory.area_rect(layer.id).expect("menu area"));
+            let (output, _, _) = viewport_frame(&ctx, viewport, Vec::new());
+            let widest_label = [
+                "Reopen closed split",
+                "Open in new window",
+                "Manage chat windows",
+            ]
+            .into_iter()
+            .map(|label| {
+                text_rect(&output, label)
+                    .expect("visible menu label")
+                    .width()
+            })
+            .fold(0.0, f32::max);
+            assert!(menu_rect.width() >= widest_label);
+            assert!(
+                menu_rect.width() <= widest_label + 64.0,
+                "menu width {} exceeds its label width {widest_label} at screen width {screen_width}",
+                menu_rect.width()
+            );
+            assert!(
+                egui::Rect::from_min_size(egui::Pos2::ZERO, viewport.size).contains_rect(menu_rect),
+                "menu escaped the viewport: {menu_rect:?}"
+            );
+            if let Some(previous) = previous_width {
+                assert!(
+                    (menu_rect.width() - previous).abs() <= 1.0,
+                    "menu width changed with screen width: {previous} to {}",
+                    menu_rect.width()
+                );
+            }
+            previous_width = Some(menu_rect.width());
         }
     }
 

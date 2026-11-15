@@ -583,6 +583,7 @@ impl ReplyThreads {
         view.refresh(source);
         input.id = Some(key.composer_id());
         input.pending_reply = None;
+        input.emote_picker_open = view.picker.open;
         let mut open = true;
         let screen = ctx.screen_rect();
         let window_size = egui::vec2(
@@ -1009,6 +1010,7 @@ mod tests {
                         hotkey_bindings: &bindings,
                         emote_catalog: &[],
                         emote_bytes: &preview.images,
+                        emote_picker_open: false,
                         pending_reply: None,
                         message_history: &[],
                         slash_usage_counts: &HashMap::new(),
@@ -1065,6 +1067,7 @@ mod tests {
     #[test]
     fn unfocused_thread_picker_keeps_main_shortcuts_and_escape_with_main_chat() {
         let ctx = Context::default();
+        ctx.enable_accesskit();
         let preview = super::super::message_list::PreviewTestState::default();
         let source = VecDeque::from([message(1, None, None)]);
         let mut threads = ReplyThreads::default();
@@ -1083,8 +1086,9 @@ mod tests {
             );
         }
         threads.views.front_mut().unwrap().picker.toggle();
+        let mut output = egui::FullOutput::default();
         for _ in 0..3 {
-            render_frame(
+            output = render_frame(
                 &ctx,
                 &mut threads,
                 &source,
@@ -1094,6 +1098,10 @@ mod tests {
                 &mut main,
             );
         }
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        let picker = nodes.iter().find(|(_, node)| node.label() == Some("Emote picker"))
+            .expect("the thread composer exposes its picker button");
+        assert_eq!(picker.1.toggled(), Some(egui::accesskit::Toggled::True));
         assert!(threads.owns_keyboard(&ctx, Some("alice-id")));
         ctx.memory_mut(|memory| memory.request_focus(Id::new("other_composer")));
         render_frame(

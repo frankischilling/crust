@@ -346,6 +346,7 @@ impl CrustApp {
                 .map(Vec::as_slice)
                 .unwrap_or(&[]),
             emote_bytes: &self.emote_bytes,
+            emote_picker_open: false,
             pending_reply: None,
             message_history: &self.message_history,
             slash_usage_counts: &self.slash_usage_counts,

@@ -485,7 +485,7 @@ impl CrustApp {
                                     }
                                 });
                                 if window.settings.overlay {
-                                    ui.label("Background");
+                                    let label = ui.label("Background");
                                     ui.spacing_mut().slider_width = ui.available_width().max(1.0);
                                     ui.add(
                                         egui::Slider::new(
@@ -493,7 +493,8 @@ impl CrustApp {
                                             0.0..=1.0,
                                         )
                                         .show_value(false),
-                                    );
+                                    )
+                                    .labelled_by(label.id);
                                 }
                             });
                         }
@@ -871,6 +872,7 @@ impl CrustApp {
                     .map(Vec::as_slice)
                     .unwrap_or(&[]),
                 emote_bytes: &self.emote_bytes,
+                emote_picker_open: window.picker.open,
                 pending_reply: window.reply.as_ref(),
                 message_history: &self.message_history,
                 slash_usage_counts: &self.slash_usage_counts,
@@ -1130,6 +1132,7 @@ mod tests {
             let (mut app, _) = app();
             open(&mut app, overlay);
             let ctx = Context::default();
+            ctx.enable_accesskit();
             let run = |app: &mut CrustApp, events| {
                 ctx.run(
                     egui::RawInput {
@@ -1149,9 +1152,24 @@ mod tests {
             }
             let mut native_builder = app.detached_chats.open[0].viewport_builder(false);
             app.detached_chats.open[0].picker.toggle();
+            let mut output = egui::FullOutput::default();
             for _ in 0..4 {
-                run(&mut app, Vec::new());
+                output = run(&mut app, Vec::new());
             }
+            let picker_state = |output: &egui::FullOutput| {
+                output
+                    .platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .unwrap()
+                    .nodes
+                    .iter()
+                    .find(|(_, node)| node.label() == Some("Emote picker"))
+                    .expect("the detached composer exposes its picker button")
+                    .1
+                    .toggled()
+            };
+            assert_eq!(picker_state(&output), Some(egui::accesskit::Toggled::True));
             assert!(app.detached_chats.open[0].picker.owns_keyboard(&ctx));
             run(&mut app, shortcut(egui::Key::Escape, egui::Modifiers::NONE));
             let window = &app.detached_chats.open[0];
@@ -1161,7 +1179,8 @@ mod tests {
                 !native_builder.patch(window.viewport_builder(false)).1,
                 "closing the picker must not recreate its chat window"
             );
-            run(&mut app, Vec::new());
+            let output = run(&mut app, Vec::new());
+            assert_eq!(picker_state(&output), Some(egui::accesskit::Toggled::False));
             let window = &app.detached_chats.open[0];
             assert!(!window.focus_input);
             assert!(

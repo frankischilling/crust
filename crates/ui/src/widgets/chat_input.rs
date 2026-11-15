@@ -1017,6 +1017,8 @@ pub struct ChatInput<'a> {
     pub emote_catalog: &'a [EmoteCatalogEntry],
     /// Loaded emote image bytes for rendering previews.
     pub emote_bytes: &'a UiImageCache,
+    /// Whether this composer's emote picker is open.
+    pub emote_picker_open: bool,
     /// If set, show a dismissable "Replying to @name" banner above the input.
     pub pending_reply: Option<&'a ReplyInfo>,
     /// Previously-sent messages for Up/Down recall.
@@ -1895,7 +1897,11 @@ impl<'a> ChatInput<'a> {
                                 ui,
                                 super::chrome::ChromeIcon::Emotes,
                                 "Emote picker",
-                                super::chrome::IconButtonState::default(),
+                                super::chrome::IconButtonState {
+                                    selected: self.emote_picker_open,
+                                    toggle_state: Some(self.emote_picker_open),
+                                    ..Default::default()
+                                },
                             )
                         })
                         .inner;
@@ -3583,6 +3589,7 @@ mod tests {
             username: None,
             emote_catalog: catalog,
             emote_bytes: &UiImageCache::default(),
+            emote_picker_open: false,
             pending_reply: None,
             message_history: history,
             slash_usage_counts: &HashMap::new(),
@@ -3676,6 +3683,7 @@ mod tests {
                         username: Some("tester"),
                         emote_catalog: &[],
                         emote_bytes: &UiImageCache::default(),
+                        emote_picker_open: false,
                         pending_reply: None,
                         message_history: &[],
                         slash_usage_counts: &HashMap::new(),
@@ -3762,6 +3770,7 @@ mod tests {
                                         username: None,
                                         emote_catalog: &catalog,
                                         emote_bytes: &UiImageCache::default(),
+                                        emote_picker_open: false,
                                         pending_reply: None,
                                         message_history: &[],
                                         slash_usage_counts: &HashMap::new(),
@@ -4273,6 +4282,7 @@ mod tests {
                                 username: None,
                                 emote_catalog: &[],
                                 emote_bytes: &UiImageCache::default(),
+                                emote_picker_open: false,
                                 pending_reply: Some(&reply),
                                 message_history: &[],
                                 slash_usage_counts: &HashMap::new(),
@@ -4456,6 +4466,7 @@ mod tests {
                             username: None,
                             emote_catalog: catalog,
                             emote_bytes: &UiImageCache::default(),
+                            emote_picker_open: false,
                             pending_reply: None,
                             message_history: &[],
                             slash_usage_counts: &HashMap::new(),
@@ -4661,6 +4672,7 @@ mod tests {
                         username: None,
                         emote_catalog: &[],
                         emote_bytes: &UiImageCache::default(),
+                        emote_picker_open: false,
                         pending_reply: None,
                         message_history: history,
                         slash_usage_counts: &HashMap::new(),
@@ -4714,6 +4726,7 @@ mod tests {
             username: None,
             emote_catalog: &[],
             emote_bytes: &UiImageCache::default(),
+            emote_picker_open: false,
             pending_reply: None,
             message_history: &["older message".to_owned(), "newer message".to_owned()],
             slash_usage_counts: &HashMap::new(),
@@ -5824,6 +5837,7 @@ mod tests {
                             username: None,
                             emote_catalog: &[],
                             emote_bytes: &UiImageCache::default(),
+                            emote_picker_open: false,
                             pending_reply: None,
                             message_history: &history,
                             slash_usage_counts: &HashMap::new(),
@@ -6065,6 +6079,7 @@ mod tests {
                     username: None,
                     emote_catalog: &[],
                     emote_bytes: &UiImageCache::default(),
+                    emote_picker_open: false,
                     pending_reply: None,
                     message_history: &[],
                     slash_usage_counts: &HashMap::new(),

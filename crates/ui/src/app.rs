@@ -2332,7 +2332,8 @@ impl CrustApp {
         let controls = ChannelLayoutControls::new(self.channel_layout, self.sidebar_visible, force_top_tabs);
         let sidebar = ui.add_enabled_ui(controls.sidebar_enabled, |ui| {
             chrome::icon_button(ui, ChromeIcon::Sidebar, controls.sidebar_label,
-                IconButtonState { selected: controls.sidebar_selected, compact, ..Default::default() })
+                IconButtonState { selected: controls.sidebar_selected,
+                    toggle_state: Some(controls.sidebar_selected), compact, ..Default::default() })
         }).inner.on_disabled_hover_text(controls.sidebar_label);
         if sidebar.clicked() {
             self.activate_sidebar_control();
@@ -10139,6 +10140,7 @@ impl CrustApp {
                                                 "Toggle performance overlay",
                                                 IconButtonState {
                                                     selected: self.perf.visible,
+                                                    toggle_state: Some(self.perf.visible),
                                                     compact: visibility.compact_controls,
                                                     ..Default::default()
                                                 },
@@ -10154,6 +10156,7 @@ impl CrustApp {
                                                 "Toggle chatter analytics",
                                                 IconButtonState {
                                                     selected: self.analytics_visible,
+                                                    toggle_state: Some(self.analytics_visible),
                                                     compact: visibility.compact_controls,
                                                     ..Default::default()
                                                 },
@@ -10176,6 +10179,7 @@ impl CrustApp {
                                                 &tooltip,
                                                 IconButtonState {
                                                     selected: self.whispers_visible,
+                                                    toggle_state: Some(self.whispers_visible),
                                                     compact: visibility.compact_controls,
                                                     ..Default::default()
                                                 },
@@ -10203,6 +10207,7 @@ impl CrustApp {
                                                 "Toggle IRC status window",
                                                 IconButtonState {
                                                     selected: self.irc_status_visible,
+                                                    toggle_state: Some(self.irc_status_visible),
                                                     compact: visibility.compact_controls,
                                                     ..Default::default()
                                                 },
@@ -11389,6 +11394,7 @@ impl CrustApp {
                                 .get(&ch)
                                 .map(Vec::as_slice)
                                 .unwrap_or(&[]);
+                            let picker_open = self.emote_picker.open && is_focused;
                             let chat = ChatInput {
                                 id: Some(chat_composer_id(Some(self.split_panes.panes[pi].id))),
                                 hotkey_bindings: &self.hotkey_bindings,
@@ -11401,6 +11407,7 @@ impl CrustApp {
                                     .as_deref(),
                                 emote_catalog: self.input_emote_catalogs.get(&ch).map(Vec::as_slice).unwrap_or(&[]),
                                 emote_bytes: &self.emote_bytes,
+                                emote_picker_open: picker_open,
                                 pending_reply: pane_reply.as_ref(),
                                 message_history: &self.message_history,
                                 slash_usage_counts: &self.slash_usage_counts,
@@ -11438,6 +11445,11 @@ impl CrustApp {
                                 self.submit_chat_input(&ch, text, pane_reply, Some(pi));
                             }
                             if inp.toggle_emote_picker {
+                                self.split_panes.focused = pi;
+                                self.sync_split_focus(ctx);
+                                // Accessibility activation has no pointer press to select
+                                // this pane. Toggle from this composer's prior state.
+                                self.emote_picker.open = picker_open;
                                 self.emote_picker.toggle();
                             }
                         }
@@ -11786,6 +11798,7 @@ impl CrustApp {
                                 username: self.state.auth.username.as_deref(),
                                 emote_catalog: self.input_emote_catalogs.get(&active_ch).map(Vec::as_slice).unwrap_or(&[]),
                                 emote_bytes: &self.emote_bytes,
+                                emote_picker_open: self.emote_picker.open,
                                 pending_reply: active_reply.as_ref(),
                                 message_history: &self.message_history,
                                 slash_usage_counts: &self.slash_usage_counts,
@@ -15648,6 +15661,125 @@ mod tests {
     }
 
     #[test]
+    fn composer_picker_buttons_announce_their_own_open_state() {
+        for split in [false, true] {
+            let (mut app, _commands) = test_app();
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            app.state.join_channel(ChannelId::new("room"));
+            app.state.auth.logged_in = true;
+            if split {
+                app.split_active_pane(super::SplitAxis::Horizontal, &ctx);
+            }
+            for open in [false, true, false] {
+                app.emote_picker.open = open;
+                let mut output = egui::FullOutput::default();
+                for _ in 0..3 {
+                    output = production_ui_frame(&ctx, &mut app, Vec::new());
+                }
+                let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+                let pickers: Vec<_> = nodes.iter()
+                    .filter(|(_, node)| node.label() == Some("Emote picker"))
+                    .map(|(_, node)| node)
+                    .collect();
+                assert_eq!(pickers.len(), if split { 2 } else { 1 });
+                assert!(pickers.iter().all(|node| node.role() == egui::accesskit::Role::Button
+                    && node.supports_action(egui::accesskit::Action::Click)
+                    && node.toggled().is_some()));
+                assert_eq!(pickers.iter().filter(|node|
+                    node.toggled() == Some(egui::accesskit::Toggled::True)).count(),
+                    usize::from(open), "only the picker owner's button is On");
+            }
+        }
+    }
+
+    #[test]
+    fn accessible_picker_activation_selects_its_split_and_inserts_into_its_draft() {
+        for (other_picker_open, focus_before_click) in [(false, false), (false, true), (true, false), (true, true)] {
+            let (mut app, mut commands) = test_app();
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let first = ChannelId::new("first");
+            let second = ChannelId::new("second");
+            app.state.join_channel(first.clone());
+            app.state.join_channel(second.clone());
+            app.state.active_channel = Some(first.clone());
+            app.state.auth.logged_in = true;
+            app.split_active_pane(super::SplitAxis::Horizontal, &ctx);
+            app.split_panes.panes[1].channel = second.clone();
+            app.split_panes.panes[0].input_buf = "first draft".into();
+            app.split_panes.panes[1].input_buf = "second draft ".into();
+            app.split_panes.focused = 0;
+            app.sync_split_focus(&ctx);
+            let emotes = [(&first, "FirstOnly"), (&second, "SecondOnly")].into_iter()
+                .map(|(channel, code)| {
+                    let mut entry = scoped_emote(&format!("https://example.test/{code}.png"),
+                        Some(channel.clone()), None);
+                    entry.code = code.to_owned();
+                    entry
+                }).collect();
+            app.apply_event(crust_core::AppEvent::EmoteCatalogUpdated { emotes }, &ctx);
+            if other_picker_open {
+                app.emote_picker.toggle();
+            }
+            let mut output = egui::FullOutput::default();
+            for _ in 0..3 {
+                output = production_ui_frame(&ctx, &mut app, Vec::new());
+            }
+            assert_eq!(app.split_panes.focused, 0);
+            let nodes = &output.platform_output.accesskit_update.as_ref().unwrap().nodes;
+            let (target, button) = nodes.iter()
+                .filter(|(_, node)| node.label() == Some("Emote picker"))
+                .max_by(|(_, left), (_, right)| left.bounds().unwrap().x0.total_cmp(&right.bounds().unwrap().x0))
+                .expect("the right split exposes its picker button");
+            assert_eq!(button.toggled(), Some(egui::accesskit::Toggled::False));
+            let target = *target;
+            let composer = super::chat_composer_id(Some(app.split_panes.panes[1].id));
+            let mut edit = egui::TextEdit::load_state(&ctx, composer).expect("right composer state");
+            edit.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+                egui::text::CCursor::new(app.split_panes.panes[1].input_buf.chars().count()))));
+            egui::TextEdit::store_state(&ctx, composer, edit);
+            let mut events = Vec::new();
+            if focus_before_click {
+                events.push(egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Focus, target, data: None,
+                }));
+            }
+            events.push(egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::Click, target, data: None,
+            }));
+            production_ui_frame(&ctx, &mut app, events);
+            assert_eq!(app.split_panes.focused, 1);
+            assert_eq!(app.state.active_channel.as_ref(), Some(&second));
+            assert!(app.emote_picker.open, "activating an inactive split opens its picker");
+            assert_eq!(app.emote_picker_channel.as_ref(), Some(&second));
+            assert_eq!(app.split_panes.panes[0].input_buf, "first draft");
+            assert_eq!(app.split_panes.panes[1].input_buf, "second draft ");
+            for _ in 0..3 {
+                output = production_ui_frame(&ctx, &mut app, Vec::new());
+            }
+            assert!(app.emote_picker.owns_keyboard(&ctx));
+            let nodes = &output.platform_output.accesskit_update.as_ref().unwrap().nodes;
+            assert!(!nodes.iter().any(|(_, node)| node.label() == Some("FirstOnly")),
+                "the picker must replace the previously focused channel's catalog");
+            let emote = nodes.iter().find_map(|(id, node)|
+                (node.label() == Some("SecondOnly") && node.role() == egui::accesskit::Role::Button).then_some(*id))
+                .expect("the second channel's emote is available to select");
+            production_ui_frame(&ctx, &mut app, vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Click, target: emote, data: None,
+                })]);
+            production_ui_frame(&ctx, &mut app, Vec::new());
+            assert!(!app.emote_picker.open);
+            assert_eq!(app.split_panes.panes[0].input_buf, "first draft");
+            assert_eq!(app.split_panes.panes[1].input_buf, "second draft SecondOnly ");
+            assert!(ctx.memory(|memory| memory.has_focus(composer)));
+            assert!(!std::iter::from_fn(|| commands.try_recv().ok())
+                .any(|command| matches!(command, AppCommand::SendMessage { .. })));
+        }
+    }
+
+    #[test]
     fn picker_tab_then_escape_keeps_the_accessibility_tree_valid() {
         for modifiers in [egui::Modifiers::CTRL, egui::Modifiers::CTRL | egui::Modifiers::SHIFT] {
             let (mut app, _commands) = test_app();
@@ -19363,6 +19495,44 @@ mod tests {
         assert!(visibility.show_perf_toggle);
         assert!(visibility.show_stats_toggle);
         assert!(!visibility.compact_controls);
+    }
+
+    #[test]
+    fn top_tabs_accessible_action_keeps_selection_without_claiming_a_toggle() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        app.channel_layout = super::ChannelLayout::Sidebar;
+        app.sidebar_visible = true;
+        let frame = |app: &mut super::CrustApp, events| {
+            let mut tabs = None;
+            let output = ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 200.0))),
+                events, ..Default::default()
+            }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        tabs = Some(app.show_channel_layout_controls(ui, false, false).1);
+                    });
+                });
+            });
+            (output, tabs.unwrap())
+        };
+        for selected in [false, true] {
+            let (output, response) = frame(&mut app, Vec::new());
+            let nodes = &output.platform_output.accesskit_update.as_ref().unwrap().nodes;
+            let (target, node) = nodes.iter().find(|(_, node)| node.label() == Some("Use top tabs for channels"))
+                .expect("the layout action exposes its name");
+            assert_eq!(node.role(), egui::accesskit::Role::Button);
+            assert_eq!(node.toggled(), None);
+            assert!(node.supports_action(egui::accesskit::Action::Click));
+            assert_eq!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Rect(rect) if rect.rect == response.rect && rect.fill == super::t::tab_selected_bg())), selected);
+            frame(&mut app, vec![egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::Click, target: *target, data: None,
+            })]);
+            assert_eq!(app.channel_layout, super::ChannelLayout::TopTabs);
+        }
     }
 
     #[test]
