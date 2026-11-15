@@ -107,6 +107,7 @@ impl UserEmote {
             id: self.id,
             code: self.name,
             provider: "twitch".into(),
+            zero_width: false,
             url_1x,
             url_2x,
             url_4x,

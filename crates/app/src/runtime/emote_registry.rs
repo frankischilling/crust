@@ -15,6 +15,7 @@ const MAX_PERSONAL_EMOTES_PER_USER: usize = 256;
 const MAX_PERSONAL_EMOTES: usize = 16_384;
 const MAX_LIVE_PERSONAL_USERS: usize = 64;
 const USER_LOOKUP_TTL: Duration = Duration::from_secs(10 * 60);
+const CHANNEL_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct UserLookup {
@@ -35,12 +36,20 @@ pub(crate) struct TwitchFollowerTarget {
     pub(crate) generation: u64,
 }
 
+pub(crate) struct ChannelEmoteRetry {
+    pub(crate) channel: ChannelId,
+    pub(crate) room_id: String,
+    pub(crate) generation: u64,
+    pub(crate) providers: Vec<String>,
+}
+
 #[derive(Clone, Default)]
 struct ChannelEmotes {
     generation: u64,
     source_id: Option<String>,
     loading: bool,
-    load_failed: bool,
+    failed_providers: HashSet<String>,
+    retry_at: Option<Instant>,
     emotes: ProviderEmotes,
     /// Definitions carried by incoming messages survive older fetched snapshots.
     inline_emotes: ProviderEmotes,
@@ -214,7 +223,8 @@ impl EmoteRegistry {
         scope.source_id = None;
         scope.generation = self.next_generation;
         scope.loading = false;
-        scope.load_failed = false;
+        scope.failed_providers.clear();
+        scope.retry_at = None;
         scope.live_enabled = false;
         scope.live_generation = self.next_generation;
         scope.twitch_follower_generation = None;
@@ -235,7 +245,8 @@ impl EmoteRegistry {
         scope.generation = self.next_generation;
         scope.source_id = Some(source_id.to_owned());
         scope.loading = true;
-        scope.load_failed = false;
+        scope.failed_providers.clear();
+        scope.retry_at = None;
         scope.live_enabled = true;
         if scope.live_room_id.as_deref() != Some(source_id) || scope.live_generation == 0 {
             scope.live_generation = self.next_generation;
@@ -257,6 +268,15 @@ impl EmoteRegistry {
 
     /// Allow a failed provider to retry only after every provider has settled.
     pub(crate) fn complete_channel_load(&mut self, channel: &ChannelId, generation: u64) -> bool {
+        self.complete_channel_load_at(channel, generation, Instant::now())
+    }
+
+    fn complete_channel_load_at(
+        &mut self,
+        channel: &ChannelId,
+        generation: u64,
+        now: Instant,
+    ) -> bool {
         let Some(scope) = self.channels.get_mut(channel) else {
             return false;
         };
@@ -264,10 +284,57 @@ impl EmoteRegistry {
             return false;
         }
         scope.loading = false;
-        if scope.load_failed {
-            scope.source_id = None;
+        if !scope.failed_providers.is_empty() {
+            scope.retry_at = Some(now + CHANNEL_RETRY_DELAY);
         }
         true
+    }
+
+    /// Reserve only failed providers after cooldown, within the channel load budget.
+    pub(crate) fn take_channel_emote_retries(
+        &mut self,
+        now: Instant,
+        limit: usize,
+    ) -> Vec<ChannelEmoteRetry> {
+        let available =
+            limit.saturating_sub(self.channels.values().filter(|scope| scope.loading).count());
+        if available == 0 {
+            return Vec::new();
+        }
+        let mut due: Vec<_> = self
+            .channels
+            .iter()
+            .filter(|(channel, scope)| {
+                (channel.is_twitch() || channel.is_kick())
+                    && scope.live_enabled
+                    && !scope.loading
+                    && !scope.failed_providers.is_empty()
+            })
+            .filter_map(|(channel, scope)| {
+                let retry_at = scope.retry_at.filter(|at| *at <= now)?;
+                let room_id = scope.live_room_id.as_ref()?.clone();
+                let mut providers: Vec<_> = scope.failed_providers.iter().cloned().collect();
+                providers.sort();
+                Some((retry_at, channel.clone(), room_id, providers))
+            })
+            .collect();
+        due.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.as_str().cmp(right.1.as_str()))
+        });
+        due.into_iter()
+            .take(available)
+            .filter_map(|(_, channel, room_id, providers)| {
+                let generation = self.begin_channel_load(&channel, &room_id, true)?;
+                Some(ChannelEmoteRetry {
+                    channel,
+                    room_id,
+                    generation,
+                    providers,
+                })
+            })
+            .collect()
     }
 
     #[cfg(test)]
@@ -336,7 +403,7 @@ impl EmoteRegistry {
             scope.emotes.insert(provider.to_owned(), next);
         } else {
             // Keep the last usable set while other providers finish this generation.
-            scope.load_failed = true;
+            scope.failed_providers.insert(provider.to_owned());
         }
         true
     }
@@ -1111,6 +1178,7 @@ impl EmoteRegistry {
                     provider: emote.provider.clone(),
                     url: emote.url_1x.clone(),
                     url_hd: emote.url_4x.clone().or_else(|| emote.url_2x.clone()),
+                    zero_width: emote.zero_width,
                     scope: if user_id.is_some() {
                         "personal"
                     } else if channel.is_some() {
@@ -1154,6 +1222,7 @@ mod tests {
     fn emote(provider: &str, id: &str, code: &str) -> EmoteInfo {
         EmoteInfo {
             provider: provider.into(),
+            zero_width: false,
             id: id.into(),
             code: code.into(),
             url_1x: format!("https://example.com/{id}"),
@@ -1269,6 +1338,7 @@ mod tests {
                     EmoteDelta::Upsert {
                         emote: emote("7tv", "late", "Late"),
                         old_code: None,
+                        preserve_overlay: false,
                     }
                 )
                 .changed
@@ -1437,6 +1507,7 @@ mod tests {
             EmoteDelta::Upsert {
                 emote: emote("7tv", "extra", "Extra"),
                 old_code: None,
+                preserve_overlay: false,
             },
         );
         assert_eq!(registry.personal_emote_count, MAX_PERSONAL_EMOTES_PER_USER);
@@ -1714,7 +1785,8 @@ mod tests {
                     1,
                     EmoteDelta::Upsert {
                         emote: emote("7tv", "stale", "Stale"),
-                        old_code: None
+                        old_code: None,
+                        preserve_overlay: false,
                     }
                 )
                 .changed
@@ -1808,7 +1880,8 @@ mod tests {
                     1,
                     EmoteDelta::Upsert {
                         emote: emote("7tv", "old", "Old"),
-                        old_code: None
+                        old_code: None,
+                        preserve_overlay: false,
                     }
                 )
                 .changed
@@ -2122,11 +2195,171 @@ mod tests {
         assert!(registry.resolve(&channel, "", "Remove").is_none());
         assert_eq!(registry.channel_emote_count(&channel), 1);
         assert!(registry.complete_channel_load(&channel, generation));
+        assert!(registry.begin_channel_load(&channel, "room", false).is_none());
         let next = registry
-            .begin_channel_load(&channel, "room", false)
-            .unwrap();
+            .take_channel_emote_retries(Instant::now() + CHANNEL_RETRY_DELAY, 1)
+            .pop()
+            .unwrap()
+            .generation;
         assert_ne!(generation, next);
         assert!(!registry.replace_channel(&channel, generation, "ffz", Some(vec![])));
+    }
+
+    #[test]
+    fn failed_channel_providers_retry_after_cooldown_and_preserve_successful_sets() {
+        let mut registry = EmoteRegistry::default();
+        let channel = ChannelId::new("room");
+        let now = Instant::now();
+        registry.open_channel(&channel);
+        let initial = registry.begin_channel_load(&channel, "42", false).unwrap();
+        registry.replace_channel(
+            &channel,
+            initial,
+            "bttv",
+            Some(vec![emote("bttv", "kept", "Keep")]),
+        );
+        registry.replace_channel(&channel, initial, "7tv", Some(Vec::new()));
+        registry.replace_channel(&channel, initial, "ffz", None);
+        assert!(registry.complete_channel_load_at(&channel, initial, now));
+        // Repeated room-state updates must not reload successful providers or
+        // bypass the failed provider's cooldown.
+        for _ in 0..3 {
+            assert!(registry.begin_channel_load(&channel, "42", false).is_none());
+        }
+        assert!(registry
+            .take_channel_emote_retries(now + CHANNEL_RETRY_DELAY - Duration::from_millis(1), 4)
+            .is_empty());
+
+        let mut retries = registry.take_channel_emote_retries(now + CHANNEL_RETRY_DELAY, 4);
+        assert_eq!(retries.len(), 1);
+        let retry = retries.pop().unwrap();
+        assert_eq!(retry.channel, channel);
+        assert_eq!(retry.room_id, "42");
+        assert_eq!(retry.providers, ["ffz"]);
+        assert_ne!(retry.generation, initial);
+        assert!(registry
+            .take_channel_emote_retries(now + CHANNEL_RETRY_DELAY, 4)
+            .is_empty());
+        assert_eq!(registry.resolve(&channel, "", "Keep").unwrap().id, "kept");
+
+        registry.replace_channel(
+            &channel,
+            retry.generation,
+            "ffz",
+            Some(vec![emote("ffz", "new", "Recovered")]),
+        );
+        registry.complete_channel_load_at(&channel, retry.generation, now + CHANNEL_RETRY_DELAY);
+        assert_eq!(
+            registry.resolve(&channel, "", "Recovered").unwrap().id,
+            "new"
+        );
+        assert_eq!(registry.resolve(&channel, "", "Keep").unwrap().id, "kept");
+        assert!(registry
+            .take_channel_emote_retries(now + CHANNEL_RETRY_DELAY * 10, 4)
+            .is_empty());
+    }
+
+    #[test]
+    fn retries_drop_recovered_providers_and_accept_an_empty_inventory() {
+        let mut registry = EmoteRegistry::default();
+        let channel = ChannelId::new("room");
+        let now = Instant::now();
+        registry.open_channel(&channel);
+        let initial = registry.begin_channel_load(&channel, "42", false).unwrap();
+        for provider in ["7tv", "ffz"] {
+            registry.replace_channel(&channel, initial, provider, None);
+        }
+        registry.complete_channel_load_at(&channel, initial, now);
+        let retry = registry
+            .take_channel_emote_retries(now + CHANNEL_RETRY_DELAY, 4)
+            .pop()
+            .unwrap();
+        assert_eq!(retry.providers, ["7tv", "ffz"]);
+        registry.replace_channel(&channel, retry.generation, "ffz", Some(Vec::new()));
+        registry.replace_channel(&channel, retry.generation, "7tv", None);
+        registry.complete_channel_load_at(&channel, retry.generation, now + CHANNEL_RETRY_DELAY);
+        let retry = registry
+            .take_channel_emote_retries(now + CHANNEL_RETRY_DELAY * 2, 4)
+            .pop()
+            .unwrap();
+        assert_eq!(retry.providers, ["7tv"]);
+        registry.replace_channel(&channel, retry.generation, "7tv", Some(Vec::new()));
+        registry.complete_channel_load_at(
+            &channel,
+            retry.generation,
+            now + CHANNEL_RETRY_DELAY * 2,
+        );
+        assert!(registry
+            .take_channel_emote_retries(now + CHANNEL_RETRY_DELAY * 3, 4)
+            .is_empty());
+    }
+
+    #[test]
+    fn retries_share_the_channel_load_budget_and_public_scope_survives_account_changes() {
+        let mut registry = EmoteRegistry::default();
+        let now = Instant::now();
+        for index in 0..6 {
+            let channel = ChannelId::new(&format!("room{index}"));
+            registry.open_channel(&channel);
+            let initial = registry.begin_channel_load(&channel, "42", false).unwrap();
+            registry.replace_channel(&channel, initial, "ffz", None);
+            registry.complete_channel_load_at(&channel, initial, now);
+        }
+        let loading = ChannelId::new("new-room");
+        registry.open_channel(&loading);
+        registry.begin_channel_load(&loading, "43", false).unwrap();
+        registry.set_account(Some("account-a"));
+        registry.set_account(Some("account-b"));
+        let retries = registry.take_channel_emote_retries(now + CHANNEL_RETRY_DELAY, 4);
+        assert_eq!(retries.len(), 3);
+        assert!(registry
+            .take_channel_emote_retries(now + CHANNEL_RETRY_DELAY, 4)
+            .is_empty());
+        registry.close_channel(&retries[0].channel);
+        let next = registry.take_channel_emote_retries(now + CHANNEL_RETRY_DELAY, 4);
+        assert_eq!(next.len(), 1);
+        assert!(!retries.iter().any(|retry| retry.channel == next[0].channel));
+        assert!(!registry.complete_channel_load(&retries[0].channel, retries[0].generation));
+    }
+
+    #[test]
+    fn manual_reload_reconnect_and_departure_cancel_old_channel_retries() {
+        let mut registry = EmoteRegistry::default();
+        let now = Instant::now();
+        let channels: Vec<_> = ["manual", "reconnect", "depart", "replacement"]
+            .into_iter()
+            .map(ChannelId::new)
+            .collect();
+        let mut generations = Vec::new();
+        for channel in &channels {
+            registry.open_channel(channel);
+            let generation = registry.begin_channel_load(channel, "42", false).unwrap();
+            registry.replace_channel(channel, generation, "ffz", None);
+            registry.complete_channel_load_at(channel, generation, now);
+            generations.push(generation);
+        }
+        let manual = registry
+            .begin_channel_load(&channels[0], "42", true)
+            .unwrap();
+        registry.replace_channel(&channels[0], manual, "ffz", Some(Vec::new()));
+        registry.complete_channel_load_at(&channels[0], manual, now);
+        registry.reconnect_channel(&channels[1]);
+        registry.close_channel(&channels[2]);
+        registry.open_channel(&channels[2]);
+        registry
+            .begin_channel_load(&channels[3], "84", false)
+            .unwrap();
+        for (channel, generation) in channels.iter().zip(generations) {
+            assert!(!registry.replace_channel(
+                channel,
+                generation,
+                "ffz",
+                Some(vec![emote("ffz", "old", "Obsolete")])
+            ));
+        }
+        assert!(registry
+            .take_channel_emote_retries(now + CHANNEL_RETRY_DELAY * 2, 4)
+            .is_empty());
     }
 
     #[test]

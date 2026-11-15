@@ -86,6 +86,7 @@ pub struct ChannelState {
     /// and to populate the moderation tools "Low Trust" tab.
     pub low_trust_users: std::collections::HashMap<String, LowTrustEntry>,
     paired_moderation_notices: std::collections::VecDeque<super::MessageId>,
+    pub(crate) moderation: super::ModerationState,
 }
 
 impl ChannelState {
@@ -105,6 +106,7 @@ impl ChannelState {
             topic: None,
             low_trust_users: std::collections::HashMap::new(),
             paired_moderation_notices: std::collections::VecDeque::new(),
+            moderation: super::ModerationState::default(),
         }
     }
 
@@ -147,7 +149,9 @@ impl ChannelState {
             .map(|e| e.status)
     }
 
-    pub fn push_message(&mut self, msg: super::ChatMessage) {
+    pub fn push_message(&mut self, mut msg: super::ChatMessage) {
+        self.moderation.apply(&mut msg);
+        self.moderation.observe_deleted(&msg);
         if self.messages.len() >= self.message_limit {
             self.messages.pop_front();
             self.local_history_cursor = None;
@@ -209,25 +213,26 @@ impl ChannelState {
     /// echo arrives we should update the local copy in-place rather than
     /// pushing a second copy of the same message.
     ///
-    /// Returns `true` if a local echo was found and updated (caller should
-    /// NOT push a new message). Returns `false` if no match was found
-    /// (caller should push normally).
-    pub fn absorb_own_echo(&mut self, msg: &super::ChatMessage) -> bool {
+    /// Returns the local ID and timestamp before confirmation when a pending
+    /// echo was updated. Callers use that identity to reconcile saved history.
+    pub fn absorb_own_echo(
+        &mut self,
+        msg: &super::ChatMessage,
+    ) -> Option<(super::MessageId, chrono::DateTime<chrono::Utc>)> {
         // Only applies to own messages with a real server_id from Twitch.
-        let Some(ref echo_id) = msg.server_id else {
-            return false;
-        };
-        // Look for the most recent local echo: same sender login, same text,
-        // server_id = None (i.e. not yet confirmed by Twitch).
-        let sender_login = msg.sender.login.to_lowercase();
-        let raw_text = &msg.raw_text;
-        // Iterate from newest to oldest so we grab the closest pending echo.
-        if let Some(existing) = self.messages.iter_mut().rev().find(|m| {
-            m.server_id.is_none()
-                && m.flags.is_self
-                && m.sender.login.to_lowercase() == sender_login
-                && m.raw_text == *raw_text
-        }) {
+        if !msg.flags.is_self || msg.channel != self.id {
+            return None;
+        }
+        let echo_id = msg.server_id.as_ref().filter(|id| !id.is_empty())?;
+        // Match pending local echoes in the same order they were sent.
+        // The sender and text identify the first unconfirmed candidate.
+        // History rows cannot be waiting for a live socket confirmation.
+        if let Some(existing) = self
+            .messages
+            .iter_mut()
+            .find(|m| m.is_pending_own_echo_of(msg))
+        {
+            let original = (existing.id, existing.timestamp);
             // Stamp the local echo with the real server id and any Twitch-side
             // metadata we now know (badges, colour, timestamp, ...).
             existing.server_id = Some(echo_id.clone());
@@ -242,12 +247,13 @@ impl ChannelState {
             existing.flags.is_self = true;
             existing.flags.is_history = false;
             existing.flags.is_action = msg.flags.is_action;
-            existing.flags.is_highlighted = msg.flags.is_highlighted;
-            existing.flags.is_mention = msg.flags.is_mention;
+            existing.flags.is_highlighted |= msg.flags.is_highlighted;
+            existing.flags.is_mention |= msg.flags.is_mention;
+            existing.flags.is_deleted |= msg.flags.is_deleted;
             existing.flags.custom_reward_id = msg.flags.custom_reward_id.clone();
-            return true;
+            return Some(original);
         }
-        false
+        None
     }
 
     /// Clear unread counters (call when the user switches to this channel).
@@ -257,43 +263,30 @@ impl ChannelState {
     }
 
     pub fn delete_message(&mut self, server_id: &str) {
-        if let Some(m) = self
-            .messages
-            .iter_mut()
-            .find(|m| m.server_id.as_deref() == Some(server_id))
-        {
-            m.flags.is_deleted = true;
-        }
+        self.apply_moderation(&super::ModerationAction::message(
+            self.id.clone(),
+            server_id.to_owned(),
+        ));
     }
 
     /// Mark every non-deleted message from `login` as deleted (timeout/ban).
     pub fn delete_messages_from(&mut self, login: &str) {
-        for m in &mut self.messages {
-            if matches!(
-                m.msg_kind,
-                super::MsgKind::Chat
-                    | super::MsgKind::Bits { .. }
-                    | super::MsgKind::SuspiciousUserMessage
-            ) && m.sender.login.eq_ignore_ascii_case(login)
-                && !m.flags.is_deleted
-            {
-                m.flags.is_deleted = true;
-            }
-        }
+        self.apply_moderation(&super::ModerationAction::user(
+            self.id.clone(),
+            login.to_owned(),
+            None,
+            None,
+        ));
     }
 
     /// Mark chat messages deleted without removing notices or scroll context.
     pub fn delete_all_chat_messages(&mut self) {
-        for message in &mut self.messages {
-            if matches!(
-                message.msg_kind,
-                super::MsgKind::Chat
-                    | super::MsgKind::Bits { .. }
-                    | super::MsgKind::SuspiciousUserMessage
-            ) {
-                message.flags.is_deleted = true;
-            }
-        }
+        self.apply_moderation(&super::ModerationAction::channel(self.id.clone(), None));
+    }
+
+    pub fn apply_moderation(&mut self, action: &super::ModerationAction) {
+        self.moderation
+            .apply_to_retained(action, &mut self.messages);
     }
 
     /// Update the status for the most recent channel points redemption message
@@ -386,25 +379,37 @@ impl ChannelState {
         mut msgs: Vec<super::ChatMessage>,
         page: &LocalHistoryPageInfo,
     ) {
-        let live_ids: std::collections::HashSet<_> = self.messages.iter()
+        self.prepare_history_moderation(&mut msgs);
+        let live_ids: std::collections::HashSet<_> = self
+            .messages
+            .iter()
             .filter(|message| !message.flags.is_history && message.channel == self.id)
             .map(|message| (message.id, message.timestamp))
             .collect();
-        self.local_history_aliases.retain(|_, live| live_ids.contains(live));
+        self.local_history_aliases
+            .retain(|_, live| live_ids.contains(live));
         let matched_live_ids: std::collections::HashSet<_> =
             self.local_history_aliases.values().copied().collect();
-        let mut unmatched_live_rows: std::collections::HashMap<_, _> = self.messages.iter()
-            .filter(|message| !message.flags.is_history
-                && message.channel == self.id
-                && !matched_live_ids.contains(&(message.id, message.timestamp)))
+        let mut unmatched_live_rows: std::collections::HashMap<_, _> = self
+            .messages
+            .iter()
+            .filter(|message| {
+                !message.flags.is_history
+                    && message.channel == self.id
+                    && !matched_live_ids.contains(&(message.id, message.timestamp))
+            })
             .map(|message| ((message.id, message.timestamp), message))
             .collect();
-        let mut existing_rows: std::collections::HashSet<_> = self.messages.iter()
+        let mut existing_rows: std::collections::HashSet<_> = self
+            .messages
+            .iter()
             .filter(|message| message.id.is_local_history())
             .map(|message| message.id)
             .chain(self.local_history_aliases.keys().copied())
             .collect();
-        let original_ids: std::collections::HashMap<_, _> = page.identities.iter()
+        let original_ids: std::collections::HashMap<_, _> = page
+            .identities
+            .iter()
             .map(|identity| (identity.replay_id, identity.original_id))
             .collect();
         msgs.retain(|message| {
@@ -418,11 +423,13 @@ impl ChannelState {
                 return true;
             };
             let live_key = (original_id, message.timestamp);
-            let matches_live = unmatched_live_rows.get(&live_key).is_some_and(|live|
-                live.sender.login == message.sender.login && live.raw_text == message.raw_text);
+            let matches_live = unmatched_live_rows.get(&live_key).is_some_and(|live| {
+                live.sender.login == message.sender.login && live.raw_text == message.raw_text
+            });
             if matches_live {
                 unmatched_live_rows.remove(&live_key);
-                self.local_history_aliases.insert(message.id, (original_id, message.timestamp));
+                self.local_history_aliases
+                    .insert(message.id, (original_id, message.timestamp));
                 false
             } else {
                 true
@@ -432,6 +439,7 @@ impl ChannelState {
     }
 
     fn merge_history(&mut self, mut msgs: Vec<super::ChatMessage>, expand: bool) {
+        self.prepare_history_moderation(&mut msgs);
         // Drop duplicates by server_id against what's already in the buffer.
         let mut existing_ids: std::collections::HashSet<String> = self
             .messages
@@ -471,6 +479,20 @@ impl ChannelState {
         let mut new_deque = std::collections::VecDeque::with_capacity(total_cap);
         new_deque.extend(merged);
         self.messages = new_deque;
+    }
+
+    fn prepare_history_moderation(&mut self, msgs: &mut Vec<super::ChatMessage>) {
+        msgs.retain(|message| message.channel == self.id);
+        let carries_deletions = msgs.iter().any(|message| message.flags.is_deleted);
+        for message in msgs.iter_mut() {
+            self.moderation.observe_deleted(message);
+            self.moderation.apply(message);
+        }
+        if carries_deletions {
+            for message in &mut self.messages {
+                self.moderation.apply(message);
+            }
+        }
     }
 }
 
@@ -564,7 +586,9 @@ mod tests {
             message.timestamp = Utc.timestamp_opt(id as i64, 0).unwrap();
             message
         };
-        for id in 1000..2500 { room.push_message(make(id)); }
+        for id in 1000..2500 {
+            room.push_message(make(id));
+        }
         room.prepend_older_history((200..1000).map(make).collect());
         assert_eq!(room.messages.len(), 2300);
         room.push_message(make(2500));
@@ -584,16 +608,27 @@ mod tests {
         older.server_id = Some("older".to_owned());
         room.push_message(newer);
         room.prepend_older_history(vec![older]);
-        assert_eq!(room.messages.iter().map(|message| message.id.0).collect::<Vec<_>>(), [1, 2]);
+        assert_eq!(
+            room.messages
+                .iter()
+                .map(|message| message.id.0)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
     }
 
     #[test]
     fn ordinary_history_keeps_the_live_limit_and_eviction_reopens_local_paging() {
         let mut room = ChannelState::new(super::super::ChannelId::new("rustlang"));
         let message = test_hype_message("train", "begin", 1, 0, 1);
-        for _ in 0..MAX_MESSAGES { room.push_message(message.clone()); }
+        for _ in 0..MAX_MESSAGES {
+            room.push_message(message.clone());
+        }
         room.local_history_exhausted = true;
-        room.local_history_cursor = Some(HistoryCursor { timestamp_ms: 1000, row_id: 1 });
+        room.local_history_cursor = Some(HistoryCursor {
+            timestamp_ms: 1000,
+            row_id: 1,
+        });
         room.push_message(message);
         assert_eq!(room.messages.len(), MAX_MESSAGES);
         assert!(!room.local_history_exhausted);
@@ -615,20 +650,35 @@ mod tests {
         older: bool,
     ) -> (Vec<super::super::ChatMessage>, LocalHistoryPageInfo) {
         let mut identities = Vec::new();
-        let messages = rows.iter().map(|&(row_id, original_id)| {
-            let mut message = local_history_test_message(original_id);
-            let replay_id = super::super::MessageId::from_local_history_row(row_id).unwrap();
-            identities.push(LocalHistoryMessageIdentity { replay_id, original_id: message.id });
-            message.id = replay_id;
-            message.flags.is_history = true;
-            message
-        }).collect();
-        (messages, LocalHistoryPageInfo {
-            before: older.then_some(HistoryCursor { timestamp_ms: 1000, row_id: i64::MAX }),
-            next: rows.first().map(|&(row_id, _)| HistoryCursor { timestamp_ms: 1000, row_id }),
-            has_more: true,
-            identities,
-        })
+        let messages = rows
+            .iter()
+            .map(|&(row_id, original_id)| {
+                let mut message = local_history_test_message(original_id);
+                let replay_id = super::super::MessageId::from_local_history_row(row_id).unwrap();
+                identities.push(LocalHistoryMessageIdentity {
+                    replay_id,
+                    original_id: message.id,
+                });
+                message.id = replay_id;
+                message.flags.is_history = true;
+                message
+            })
+            .collect();
+        (
+            messages,
+            LocalHistoryPageInfo {
+                before: older.then_some(HistoryCursor {
+                    timestamp_ms: 1000,
+                    row_id: i64::MAX,
+                }),
+                next: rows.first().map(|&(row_id, _)| HistoryCursor {
+                    timestamp_ms: 1000,
+                    row_id,
+                }),
+                has_more: true,
+                identities,
+            },
+        )
     }
 
     #[test]
@@ -643,7 +693,13 @@ mod tests {
         for _ in 0..3 {
             room.prepend_local_history(messages.clone(), &page);
             assert_eq!(room.messages.len(), 4);
-            assert_eq!(room.messages.iter().filter(|message| message.id == super::super::MessageId(9)).count(), 1);
+            assert_eq!(
+                room.messages
+                    .iter()
+                    .filter(|message| message.id == super::super::MessageId(9))
+                    .count(),
+                1
+            );
         }
         // Even the same persisted original ID and timestamp can belong to a
         // different row. The first replay already matched the retained live row.
@@ -653,8 +709,17 @@ mod tests {
             room.prepend_local_history(messages.clone(), &page);
             assert_eq!(room.messages.len(), 5);
         }
-        assert!(room.messages.iter().all(|message| message.raw_text == "same text"));
-        assert_eq!(room.messages.iter().filter(|message| message.id.is_local_history()).count(), 3);
+        assert!(room
+            .messages
+            .iter()
+            .all(|message| message.raw_text == "same text"));
+        assert_eq!(
+            room.messages
+                .iter()
+                .filter(|message| message.id.is_local_history())
+                .count(),
+            3
+        );
     }
 
     #[test]
@@ -663,30 +728,53 @@ mod tests {
         for id in 1..=MAX_MESSAGES as u64 {
             room.push_message(local_history_test_message(id));
         }
-        room.local_history_cursor = Some(HistoryCursor { timestamp_ms: 1000, row_id: 1 });
+        room.local_history_cursor = Some(HistoryCursor {
+            timestamp_ms: 1000,
+            row_id: 1,
+        });
         room.push_message(local_history_test_message(MAX_MESSAGES as u64 + 1));
         assert_eq!(room.local_history_cursor, None);
-        assert_eq!(room.messages.front().unwrap().id, super::super::MessageId(2));
+        assert_eq!(
+            room.messages.front().unwrap().id,
+            super::super::MessageId(2)
+        );
 
         let (messages, page) = local_history_test_page(&[(1, 1), (2, 2), (3, 3)], true);
         for _ in 0..3 {
             room.prepend_local_history(messages.clone(), &page);
             assert_eq!(room.messages.len(), MAX_MESSAGES + 1);
-            assert_eq!(room.messages.iter().filter(|message| message.id == super::super::MessageId(2)).count(), 1);
-            assert_eq!(room.messages.iter().filter(|message| message.id == super::super::MessageId(3)).count(), 1);
+            assert_eq!(
+                room.messages
+                    .iter()
+                    .filter(|message| message.id == super::super::MessageId(2))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                room.messages
+                    .iter()
+                    .filter(|message| message.id == super::super::MessageId(3))
+                    .count(),
+                1
+            );
         }
-        assert_eq!(room.messages.front().unwrap().id,
-            super::super::MessageId::from_local_history_row(1).unwrap());
+        assert_eq!(
+            room.messages.front().unwrap().id,
+            super::super::MessageId::from_local_history_row(1).unwrap()
+        );
 
         // Forget aliases as soon as their live rows have left the buffer.
         room.messages.pop_front();
         room.messages.pop_front();
         room.prepend_local_history(messages, &page);
         assert_eq!(room.messages.len(), MAX_MESSAGES + 1);
-        assert!(room.messages.iter().any(|message|
-            Some(message.id) == super::super::MessageId::from_local_history_row(2)));
-        assert!(!room.local_history_aliases.contains_key(
-            &super::super::MessageId::from_local_history_row(2).unwrap()));
+        assert!(room
+            .messages
+            .iter()
+            .any(|message| Some(message.id) == super::super::MessageId::from_local_history_row(2)));
+        assert!(!room
+            .local_history_aliases
+            .contains_key(&super::super::MessageId::from_local_history_row(2).unwrap()));
     }
 
     #[test]

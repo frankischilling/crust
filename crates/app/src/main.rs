@@ -60,6 +60,7 @@ use runtime::history::{
 };
 use runtime::link_preview::fetch_link_preview;
 use runtime::live_emotes::LiveEmoteUpdates;
+use runtime::log_writer::{flush_before_read, publish_moderation, LogWriter};
 use runtime::outgoing::{chat_echo_body, complete_whisper_send, twitch_message_error, whisper_send_failure, ChatSendPublisher, OutgoingChat, WhisperSendTasks};
 use runtime::plugins::init_plugins;
 use runtime::profiles::{
@@ -348,6 +349,13 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
 
+    let log_writer = chat_logs.clone().map(|store| {
+        LogWriter::new(rt.handle(), store, evt_tx.clone())
+    });
+    let history_updates = log_writer.as_ref().map(LogWriter::update_sender);
+    let pending_history_updates = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let ui_history_backlog = pending_history_updates.clone();
+
     rt.spawn(async move {
         let mut whisper_account = WhisperAccount::default();
         while let Some(evt) = evt_bridge_rx.recv().await {
@@ -475,9 +483,11 @@ fn main() -> Result<()> {
     if initial_settings.local_log_indexing_enabled {
         if let Some(store) = chat_logs.clone() {
             let etx = evt_tx.clone();
+            let writer = log_writer.clone();
             rt.spawn(async move {
                 // 500 rows is enough for several sessions of backlog without
                 // blowing RAM even if every historical row qualifies.
+                flush_before_read(writer.as_ref()).await;
                 load_local_recent_mentions(store, 500, etx).await;
             });
         }
@@ -505,7 +515,7 @@ fn main() -> Result<()> {
     };
 
     // Spawn the reducer (bridges twitch/kick events -> tokenized AppEvents for UI)
-    rt.spawn({
+    let reducer_task = rt.spawn({
         let idx = emote_index.clone();
         let cache = emote_cache.clone();
         let bm = badge_map.clone();
@@ -534,6 +544,7 @@ fn main() -> Result<()> {
             global_badges,
             settings_store,
             chat_logs,
+            log_writer.clone(),
             saved_token,
             kick_runtime_enabled,
             irc_runtime_enabled,
@@ -584,11 +595,40 @@ fn main() -> Result<()> {
         Box::new(move |cc| {
             let _ = UI_REPAINT_CTX.set(cc.egui_ctx.clone());
             let mut app = CrustApp::new(cc, cmd_tx, evt_rx);
+            if let Some(sender) = history_updates {
+                app.set_history_updates(sender, ui_history_backlog);
+            }
             app.set_pending_crash_reports(pending_crash_reports);
             app.set_crash_pre_exit_hook(|| crash::clear_session_sentinel());
             Ok(Box::new(app))
         }),
     );
+
+    // Stop producing writes, then drain the accepted FIFO within a fixed
+    // deadline. Runtime shutdown must not wait indefinitely for a stuck disk.
+    reducer_task.abort();
+    rt.block_on(async {
+        let _ = tokio::time::timeout(Duration::from_millis(250), reducer_task).await;
+        if let Some(writer) = &log_writer {
+            // The UI may close while its bounded history backlog is waiting for
+            // relay capacity. Hand those accepted updates over before shutdown.
+            let pending = std::mem::take(&mut *pending_history_updates.lock().unwrap());
+            let shutdown = tokio::time::timeout(Duration::from_secs(3), async {
+                let sender = writer.update_sender();
+                for update in pending {
+                    sender.send(update).await
+                        .map_err(|_| "Chat history updates stopped before shutdown.".to_owned())?;
+                }
+                writer.shutdown().await
+            }).await;
+            match shutdown {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!("chat-history: shutdown did not finish saving all queued messages: {error}"),
+                Err(_) => warn!("chat-history: timed out saving queued messages during shutdown"),
+            }
+        }
+    });
+    rt.shutdown_background();
 
     // winit on Wayland may exit with code 1 if the sctk-adwaita CSD
     // portal query fails.  This is harmless - the user closed the window
@@ -609,7 +649,6 @@ fn main() -> Result<()> {
         }
     }
 
-    rt.shutdown_background();
     // Clean-shutdown path: defuse the session sentinel so the next
     // launch does not treat this run as an abnormal exit.
     crash::clear_session_sentinel();
@@ -725,6 +764,7 @@ async fn reducer_loop(
     mut global_badges: GlobalBadgeRefresh,
     settings_store: Option<SettingsStore>,
     chat_logs: Option<LogStore>,
+    log_writer: Option<LogWriter>,
     saved_token: Option<String>,
     kick_runtime_enabled: bool,
     irc_runtime_enabled: bool,
@@ -1449,7 +1489,9 @@ async fn reducer_loop(
                             if let Some(store) = chat_logs.clone() {
                                 let ch_local = channel.clone();
                                 let etx_local = snapshot.events();
+                                let writer = log_writer.clone();
                                 snapshot.spawn(async move {
+                                    flush_before_read(writer.as_ref()).await;
                                     load_local_recent_messages(ch_local, store, etx_local).await;
                                 });
                             }
@@ -1457,18 +1499,24 @@ async fn reducer_loop(
                         // Load recent chat history
                         let ch_hist = channel.clone();
                         let uname_hist = auth_username.clone();
+                        let nicknames_hist = settings.nicknames.clone();
                         let idx_hist = emote_index.clone();
                         let bm_hist = badge_map.clone();
                         let etx_hist = snapshot.events();
                         let stv_tx_hist = stv_update_tx.clone();
+                        let log_store_hist = chat_logs.clone().filter(|_| settings.local_log_indexing_enabled);
+                        let log_writer_hist = log_writer.clone().filter(|_| settings.local_log_indexing_enabled);
                         snapshot.spawn(async move {
                             load_recent_messages(
                                 ch_hist.as_str(),
                                 uname_hist.as_deref(),
+                                &nicknames_hist,
                                 &idx_hist,
                                 &bm_hist,
                                 &etx_hist,
                                 &stv_tx_hist,
+                                log_store_hist,
+                                log_writer_hist,
                             ).await;
                         });
                         // Fetch the currently pinned message snapshot for this channel.
@@ -1573,7 +1621,8 @@ async fn reducer_loop(
                         emote_index.write().unwrap().set_account(Some(&user_id));
                         if settings.local_log_indexing_enabled {
                             if let (Some(store), Some(login)) = (chat_logs.clone(), auth_username.as_deref()) {
-                                whisper_history.load(store, login, &user_id, &emote_index, evt_tx.clone());
+                                whisper_history.load(store, login, &user_id, &emote_index,
+                                    evt_tx.clone(), log_writer.clone());
                             }
                         }
 
@@ -1719,7 +1768,7 @@ async fn reducer_loop(
                         // Hold read lock only during tokenization (no clone needed)
                         {
                             let emote_guard = emote_index.read().unwrap();
-                            msg.spans = crust_core::format::tokenize(
+                            msg.spans = crust_core::format::tokenize_with_flags(
                                 &msg.raw_text,
                                 msg.flags.is_action,
                                 &msg.twitch_emotes,
@@ -1732,6 +1781,7 @@ async fn reducer_loop(
                                             info.provider.clone(),
                                             // Prefer 4x, fall back to 2x, for HD tooltip preview
                                             info.url_4x.clone().or_else(|| info.url_2x.clone()),
+                                            info.zero_width,
                                         )
                                     })
                                 },
@@ -1774,40 +1824,19 @@ async fn reducer_loop(
 
                         // Mention / reply-to-me detection
                         if let Some(ref uname) = auth_username {
-                            let uname_lower = uname.to_lowercase();
-                            let text_lower = msg.raw_text.to_lowercase();
-                            // Direct @mention in message body
-                            let has_at_mention = text_lower
-                                .contains(&format!("@{uname_lower}"));
-                            // Bare username as a whole word
-                            let has_bare_mention = text_lower
-                                .split(|c: char| !c.is_alphanumeric() && c != '_')
-                                .any(|w| w == uname_lower);
+                            let has_name_mention =
+                                crust_core::highlight::contains_mention(&msg.raw_text, uname);
                             // Reply directed at us
                             let is_reply_to_me = msg.reply.as_ref()
-                                .map(|r| r.parent_user_login.to_lowercase() == uname_lower)
+                                .map(|r| r.parent_user_login.eq_ignore_ascii_case(uname))
                                 .unwrap_or(false);
                             // Self-mention via nickname: if the logged-in user has a
                             // nickname alias (replace_mentions=true), also match messages
                             // that contain the alias as a bare or @-prefixed word.
-                            let has_nickname_mention = settings
-                                .nicknames
-                                .iter()
-                                .filter(|n| n.replace_mentions && n.matches_login(uname))
-                                .any(|n| {
-                                    let nick_lower = n.nickname.to_lowercase();
-                                    if nick_lower.is_empty() {
-                                        return false;
-                                    }
-                                    if text_lower.contains(&format!("@{nick_lower}")) {
-                                        return true;
-                                    }
-                                    text_lower
-                                        .split(|c: char| !c.is_alphanumeric() && c != '_')
-                                        .any(|w| w == nick_lower)
-                                });
-                            msg.flags.is_mention = has_at_mention
-                                || has_bare_mention
+                            let has_nickname_mention = crust_core::highlight::contains_nickname_mention(
+                                &msg.raw_text, uname, msg.channel.display_name(), &settings.nicknames,
+                            );
+                            msg.flags.is_mention = has_name_mention
                                 || is_reply_to_me
                                 || has_nickname_mention;
                         }
@@ -1826,18 +1855,11 @@ async fn reducer_loop(
                             }
                         }
 
-                        let channel = msg.channel.clone();
-                        if settings.local_log_indexing_enabled {
-                            if let Some(store) = chat_logs.as_ref() {
-                            if let Err(e) = store.append_message(&msg) {
-                                warn!("chat-log: failed to persist Twitch message: {e}");
-                            }
-                            }
-                        }
-                        let _ = evt_tx.send(AppEvent::MessageReceived {
-                            channel,
-                            message: msg,
-                        }).await;
+                        chat_publisher.publish_incoming(
+                            msg,
+                            log_writer.as_ref().filter(|_| settings.local_log_indexing_enabled),
+                            evt_tx.clone(),
+                        ).await;
                     }
                     TwitchEvent::Whisper {
                         generation,
@@ -1869,13 +1891,14 @@ async fn reducer_loop(
                         };
                         if let Some(event) = runtime::history::prepare_live_whisper(
                             event, auth_username.as_deref(), auth_user_id.as_deref(), &emote_index,
-                            chat_logs.as_ref().filter(|_| settings.local_log_indexing_enabled),
-                        ) {
+                            log_writer.as_ref().filter(|_| settings.local_log_indexing_enabled),
+                        ).await {
                             let _ = evt_tx.send(event).await;
                         }
                     }
                     TwitchEvent::MessageDeleted { channel, server_id } => {
-                        let _ = evt_tx.send(AppEvent::MessageDeleted { channel, server_id }).await;
+                        publish_moderation(AppEvent::MessageDeleted { channel, server_id },
+                            log_writer.as_ref().filter(|_| settings.local_log_indexing_enabled), &evt_tx).await;
                     }
                     TwitchEvent::SystemNotice(notice) => {
                         // "Joined channel" / "Left channel" are IRC-level confirmations
@@ -1904,16 +1927,18 @@ async fn reducer_loop(
                             }
                         }
                     }
-                    TwitchEvent::UserTimedOut { channel, login, seconds } => {
+                    TwitchEvent::UserTimedOut { channel, login, seconds, user_id, timestamp } => {
                         // Mark all visible messages from that user as deleted
-                        let _ = evt_tx.send(AppEvent::UserMessagesCleared {
+                        publish_moderation(AppEvent::UserMessagesCleared {
                             channel: channel.clone(),
                             login: login.clone(),
-                        }).await;
+                            user_id,
+                            timestamp,
+                        }, log_writer.as_ref().filter(|_| settings.local_log_indexing_enabled), &evt_tx).await;
                         // Show a moderation notice in chat
                         let text = format_timeout_text(&login, seconds);
                         let mut msg = make_system_message(
-                            local_msg_id, channel.clone(), text, Utc::now(),
+                            local_msg_id, channel.clone(), text, timestamp.unwrap_or_else(Utc::now),
                             MsgKind::Timeout { login: login.clone(), seconds },
                         );
                         msg.server_id = Some(format!("{}{}", crust_core::model::IRC_MODERATION_ID_PREFIX, local_msg_id));
@@ -1923,14 +1948,16 @@ async fn reducer_loop(
                             message: msg,
                         }).await;
                     }
-                    TwitchEvent::UserBanned { channel, login } => {
-                        let _ = evt_tx.send(AppEvent::UserMessagesCleared {
+                    TwitchEvent::UserBanned { channel, login, user_id, timestamp } => {
+                        publish_moderation(AppEvent::UserMessagesCleared {
                             channel: channel.clone(),
                             login: login.clone(),
-                        }).await;
+                            user_id,
+                            timestamp,
+                        }, log_writer.as_ref().filter(|_| settings.local_log_indexing_enabled), &evt_tx).await;
                         let text = format!("{login} was permanently banned.");
                         let mut msg = make_system_message(
-                            local_msg_id, channel.clone(), text, Utc::now(),
+                            local_msg_id, channel.clone(), text, timestamp.unwrap_or_else(Utc::now),
                             MsgKind::Ban { login: login.clone() },
                         );
                         msg.server_id = Some(format!("{}{}", crust_core::model::IRC_MODERATION_ID_PREFIX, local_msg_id));
@@ -1940,16 +1967,15 @@ async fn reducer_loop(
                             message: msg,
                         }).await;
                     }
-                    TwitchEvent::ChatCleared { channel } => {
-                        let _ = evt_tx
-                            .send(AppEvent::ChannelChatCleared {
+                    TwitchEvent::ChatCleared { channel, timestamp } => {
+                        publish_moderation(AppEvent::ChannelChatCleared {
                                 channel: channel.clone(),
-                            })
-                            .await;
+                                timestamp,
+                            }, log_writer.as_ref().filter(|_| settings.local_log_indexing_enabled), &evt_tx).await;
                         let mut msg = make_system_message(
                             local_msg_id, channel.clone(),
                             "Chat was cleared by a moderator.".to_owned(),
-                            Utc::now(), MsgKind::ChatCleared,
+                            timestamp.unwrap_or_else(Utc::now), MsgKind::ChatCleared,
                         );
                         msg.server_id = Some(format!("{}{}", crust_core::model::IRC_MODERATION_ID_PREFIX, local_msg_id));
                         local_msg_id += 1;
@@ -2098,6 +2124,7 @@ async fn reducer_loop(
                                         url_2x: None,
                                         url_4x: None,
                                         provider: "kick".to_owned(),
+                                        zero_width: false,
                                     };
                                     if idx.insert_channel_emote(&msg.channel, info) {
                                         inserted += 1;
@@ -2112,7 +2139,7 @@ async fn reducer_loop(
                         // Tokenize for emotes/emoji/URLs
                         {
                             let emote_guard = emote_index.read().unwrap();
-                            msg.spans = crust_core::format::tokenize(
+                            msg.spans = crust_core::format::tokenize_with_flags(
                                 &msg.raw_text,
                                 msg.flags.is_action,
                                 &msg.twitch_emotes,
@@ -2124,6 +2151,7 @@ async fn reducer_loop(
                                             info.url_1x.clone(),
                                             info.provider.clone(),
                                             info.url_4x.clone().or_else(|| info.url_2x.clone()),
+                                            info.zero_width,
                                         )
                                     })
                                 },
@@ -2132,10 +2160,10 @@ async fn reducer_loop(
 
                         let channel = msg.channel.clone();
                         if settings.local_log_indexing_enabled {
-                            if let Some(store) = chat_logs.as_ref() {
-                            if let Err(e) = store.append_message(&msg) {
-                                warn!("chat-log: failed to persist Kick message: {e}");
-                            }
+                            if let Some(writer) = &log_writer {
+                                if let Err(error) = writer.append(&msg).await {
+                                    warn!("chat-log: failed to queue Kick message: {error}");
+                                }
                             }
                         }
                         let _ = evt_tx.send(AppEvent::MessageReceived {
@@ -2144,13 +2172,16 @@ async fn reducer_loop(
                         }).await;
                     }
                     KickEvent::MessageDeleted { channel, server_id } => {
-                        let _ = evt_tx.send(AppEvent::MessageDeleted { channel, server_id }).await;
+                        publish_moderation(AppEvent::MessageDeleted { channel, server_id },
+                            log_writer.as_ref().filter(|_| settings.local_log_indexing_enabled), &evt_tx).await;
                     }
                     KickEvent::UserBanned { channel, login } => {
-                        let _ = evt_tx.send(AppEvent::UserMessagesCleared {
+                        publish_moderation(AppEvent::UserMessagesCleared {
                             channel: channel.clone(),
                             login: login.clone(),
-                        }).await;
+                            user_id: None,
+                            timestamp: None,
+                        }, log_writer.as_ref().filter(|_| settings.local_log_indexing_enabled), &evt_tx).await;
                         let text = format!("{login} was permanently banned.");
                         let msg = make_system_message(
                             local_msg_id, channel.clone(), text, Utc::now(),
@@ -2163,11 +2194,10 @@ async fn reducer_loop(
                         }).await;
                     }
                     KickEvent::ChatCleared { channel } => {
-                        let _ = evt_tx
-                            .send(AppEvent::ChannelChatCleared {
+                        publish_moderation(AppEvent::ChannelChatCleared {
                                 channel: channel.clone(),
-                            })
-                            .await;
+                                timestamp: None,
+                            }, log_writer.as_ref().filter(|_| settings.local_log_indexing_enabled), &evt_tx).await;
                         let msg = make_system_message(
                             local_msg_id, channel.clone(),
                             "Chat was cleared by a moderator.".to_owned(),
@@ -2275,7 +2305,11 @@ async fn reducer_loop(
                             if settings.local_log_indexing_enabled {
                                 if let Some(store) = chat_logs.clone() {
                                     let events = evt_tx.clone();
-                                    tokio::spawn(load_local_recent_messages(channel, store, events));
+                                    let writer = log_writer.clone();
+                                    tokio::spawn(async move {
+                                        flush_before_read(writer.as_ref()).await;
+                                        load_local_recent_messages(channel, store, events).await;
+                                    });
                                 }
                             }
                             save_channels(&settings_store, &mut settings, &joined_channels);
@@ -2358,7 +2392,7 @@ async fn reducer_loop(
                         // Tokenize for emotes/emoji/URLs
                         {
                             let emote_guard = emote_index.read().unwrap();
-                            msg.spans = crust_core::format::tokenize(
+                            msg.spans = crust_core::format::tokenize_with_flags(
                                 &msg.raw_text,
                                 msg.flags.is_action,
                                 &msg.twitch_emotes,
@@ -2370,6 +2404,7 @@ async fn reducer_loop(
                                             info.url_1x.clone(),
                                             info.provider.clone(),
                                             info.url_4x.clone().or_else(|| info.url_2x.clone()),
+                                            info.zero_width,
                                         )
                                     })
                                 },
@@ -2379,34 +2414,23 @@ async fn reducer_loop(
                         // Mention detection
                         let mut has_mention = false;
                         if let Some(ref uname) = auth_username {
-                            let uname_lower = uname.to_lowercase();
-                            let text_lower = msg.raw_text.to_lowercase();
-                            // @mention or bare username as a whole word
-                            has_mention = text_lower
-                                .contains(&format!("@{uname_lower}"))
-                                || text_lower
-                                    .split(|c: char| !c.is_alphanumeric() && c != '_')
-                                    .any(|w| w == uname_lower);
+                            has_mention = crust_core::highlight::contains_mention(&msg.raw_text, uname);
                         }
                         // Also match the configured IRC nick as a whole word.
                         if !has_mention {
                             let irc_nick = settings.irc_nick.trim();
                             if !irc_nick.is_empty() {
-                                let nick_lower = irc_nick.to_lowercase();
-                                let text_lower = msg.raw_text.to_lowercase();
-                                has_mention = text_lower
-                                    .split(|c: char| !c.is_alphanumeric() && c != '_')
-                                    .any(|w| w == nick_lower);
+                                has_mention = crust_core::highlight::contains_mention(&msg.raw_text, irc_nick);
                             }
                         }
                         msg.flags.is_mention = has_mention;
 
                         let channel = msg.channel.clone();
                         if settings.local_log_indexing_enabled {
-                            if let Some(store) = chat_logs.as_ref() {
-                            if let Err(e) = store.append_message(&msg) {
-                                warn!("chat-log: failed to persist IRC message: {e}");
-                            }
+                            if let Some(writer) = &log_writer {
+                                if let Err(error) = writer.append(&msg).await {
+                                    warn!("chat-log: failed to queue IRC message: {error}");
+                                }
                             }
                         }
                         let _ = evt_tx.send(AppEvent::MessageReceived {
@@ -2649,12 +2673,12 @@ async fn reducer_loop(
                                 }
                                 EventSubNoticeKind::ChannelBan { user_login, .. } => {
                                     if !user_login.trim().is_empty() {
-                                        let _ = evt_tx
-                                            .send(AppEvent::UserMessagesCleared {
+                                        publish_moderation(AppEvent::UserMessagesCleared {
                                                 channel: channel.clone(),
                                                 login: user_login.clone(),
-                                            })
-                                            .await;
+                                                user_id: notice.moderation_target_user_id.clone(),
+                                                timestamp: notice.timestamp,
+                                            }, log_writer.as_ref().filter(|_| settings.local_log_indexing_enabled), &evt_tx).await;
                                     }
                                 }
                                 EventSubNoticeKind::SuspiciousUserMessage {
@@ -2851,8 +2875,8 @@ async fn reducer_loop(
                                     };
                                     if let Some(event) = runtime::history::prepare_live_whisper(
                                         event, local_login.as_deref(), auth_user_id.as_deref(), &emote_index,
-                                        chat_logs.as_ref().filter(|_| settings.local_log_indexing_enabled),
-                                    ) {
+                                        log_writer.as_ref().filter(|_| settings.local_log_indexing_enabled),
+                                    ).await {
                                         let _ = evt_tx.send(event).await;
                                     }
                                 }
@@ -2884,27 +2908,24 @@ async fn reducer_loop(
                                     ) {
                                         match effect {
                                             ModerationActionEffect::ChannelMessagesCleared => {
-                                                let _ = evt_tx
-                                                    .send(AppEvent::ChannelChatCleared {
+                                                publish_moderation(AppEvent::ChannelChatCleared {
                                                         channel: channel.clone(),
-                                                    })
-                                                    .await;
+                                                        timestamp: notice.timestamp,
+                                                    }, log_writer.as_ref().filter(|_| settings.local_log_indexing_enabled), &evt_tx).await;
                                             }
                                             ModerationActionEffect::UserMessagesCleared(login) => {
-                                                let _ = evt_tx
-                                                    .send(AppEvent::UserMessagesCleared {
+                                                publish_moderation(AppEvent::UserMessagesCleared {
                                                         channel: channel.clone(),
                                                         login,
-                                                    })
-                                                    .await;
+                                                        user_id: notice.moderation_target_user_id.clone(),
+                                                        timestamp: notice.timestamp,
+                                                    }, log_writer.as_ref().filter(|_| settings.local_log_indexing_enabled), &evt_tx).await;
                                             }
                                             ModerationActionEffect::MessageDeleted(server_id) => {
-                                                let _ = evt_tx
-                                                    .send(AppEvent::MessageDeleted {
+                                                publish_moderation(AppEvent::MessageDeleted {
                                                         channel: channel.clone(),
                                                         server_id,
-                                                    })
-                                                    .await;
+                                                    }, log_writer.as_ref().filter(|_| settings.local_log_indexing_enabled), &evt_tx).await;
                                             }
                                         }
                                     }
@@ -3129,6 +3150,7 @@ async fn reducer_loop(
 
             // Coalesce live channel and personal-set changes before publishing the catalog.
             _ = personal_catalog_tick.tick() => {
+                runtime::emote_loading::retry_failed_channel_emotes(&emote_index, &evt_tx);
                 live_emotes.sync(&emote_index);
                 drain_7tv_user_lookups(&emote_index, &stv_http_client, &stv_lookup_sem, &stv_update_tx);
                 personal_catalog_dirty |= twitch_inventory.sync(auth_user_id.as_deref(),
@@ -3223,11 +3245,13 @@ async fn reducer_loop(
                         let _ = evt_tx.send(AppEvent::ChannelJoined {
                             channel: channel.clone(),
                         }).await;
-                        if !channel.is_twitch() {
+                        if !channel.is_twitch() && settings.local_log_indexing_enabled {
                             if let Some(store) = chat_logs.clone() {
                                 let etx_local = evt_tx.clone();
                                 let ch_local = channel.clone();
+                                let writer = log_writer.clone();
                                 tokio::spawn(async move {
+                                    flush_before_read(writer.as_ref()).await;
                                     load_local_recent_messages(ch_local, store, etx_local).await;
                                 });
                             }
@@ -3291,12 +3315,16 @@ async fn reducer_loop(
                                 channel: channel.clone(),
                             })
                             .await;
-                        if let Some(store) = chat_logs.clone() {
-                            let etx_local = evt_tx.clone();
-                            let ch_local = channel.clone();
-                            tokio::spawn(async move {
-                                load_local_recent_messages(ch_local, store, etx_local).await;
-                            });
+                        if settings.local_log_indexing_enabled {
+                            if let Some(store) = chat_logs.clone() {
+                                let etx_local = evt_tx.clone();
+                                let ch_local = channel.clone();
+                                let writer = log_writer.clone();
+                                tokio::spawn(async move {
+                                    flush_before_read(writer.as_ref()).await;
+                                    load_local_recent_messages(ch_local, store, etx_local).await;
+                                });
+                            }
                         }
                         let join_msg = make_system_message(
                             local_msg_id,
@@ -4422,11 +4450,8 @@ async fn reducer_loop(
                                         &whisper_text,
                                     )
                                 };
-                                let whisper_log_store = if settings.local_log_indexing_enabled {
-                                    chat_logs.clone()
-                                } else {
-                                    None
-                                };
+                                let whisper_log_writer = log_writer.clone()
+                                    .filter(|_| settings.local_log_indexing_enabled);
                                 let rejected = whisper_send_failure(
                                     from_user_id.as_deref().unwrap_or_default(), &target_login, &whisper_text,
                                     "Too many whispers are waiting to finish. Try again after they complete.",
@@ -4440,7 +4465,7 @@ async fn reducer_loop(
                                         &target_login,
                                         &whisper_text,
                                         whisper_twitch_emotes,
-                                        whisper_log_store.as_ref(),
+                                        whisper_log_writer.as_ref(),
                                     )
                                     .await
                                 }) {
@@ -4572,7 +4597,7 @@ async fn reducer_loop(
                                 let emote_guard = emote_index.read().unwrap();
                                 echo.twitch_emotes = infer_twitch_emote_positions_from_text(
                                     &emote_guard, Some(&echo.channel), &echo.sender.user_id.0, &echo.raw_text);
-                                echo.spans = crust_core::format::tokenize(
+                                echo.spans = crust_core::format::tokenize_with_flags(
                                     &echo.raw_text,
                                     echo.flags.is_action,
                                     &echo.twitch_emotes,
@@ -4584,6 +4609,7 @@ async fn reducer_loop(
                                                 info.url_1x.clone(),
                                                 info.provider.clone(),
                                                 info.url_4x.clone().or_else(|| info.url_2x.clone()),
+                                                info.zero_width,
                                             )
                                         })
                                     },
@@ -4596,8 +4622,8 @@ async fn reducer_loop(
                                 reply_to_msg_id: reply_to_msg_id.clone(),
                                 reply: reply.clone(),
                             };
-                            let echo_log_store = if settings.local_log_indexing_enabled { chat_logs.clone() } else { None };
-                            if chat_publisher.submit(receiver, draft, echo, echo_log_store, evt_tx.clone()).await {
+                            let echo_log_writer = log_writer.clone().filter(|_| settings.local_log_indexing_enabled);
+                            if chat_publisher.submit(receiver, draft, echo, echo_log_writer, evt_tx.clone()).await {
                                 let _ = sess_tx.send(SessionCommand::SendMessage(channel.clone(), text.clone(), reply_to_msg_id.clone(), receipt)).await;
                             }
                         }
@@ -4668,7 +4694,7 @@ async fn reducer_loop(
 
                                 {
                                     let emote_guard = emote_index.read().unwrap();
-                                    echo.spans = crust_core::format::tokenize(
+                                    echo.spans = crust_core::format::tokenize_with_flags(
                                         &echo.raw_text,
                                         echo.flags.is_action,
                                         &echo.twitch_emotes,
@@ -4680,6 +4706,7 @@ async fn reducer_loop(
                                                     info.url_1x.clone(),
                                                     info.provider.clone(),
                                                     info.url_4x.clone().or_else(|| info.url_2x.clone()),
+                                                    info.zero_width,
                                                 )
                                             })
                                         },
@@ -4692,8 +4719,8 @@ async fn reducer_loop(
                                 channel: channel.clone(), text: text.clone(),
                                 reply_to_msg_id: reply_to_msg_id.clone(), reply: reply.clone(),
                             };
-                            let echo_log_store = if settings.local_log_indexing_enabled { chat_logs.clone() } else { None };
-                            if chat_publisher.submit_irc(receiver, draft, outgoing_echo, echo_log_store, evt_tx.clone()).await {
+                            let echo_log_writer = log_writer.clone().filter(|_| settings.local_log_indexing_enabled);
+                            if chat_publisher.submit_irc(receiver, draft, outgoing_echo, echo_log_writer, evt_tx.clone()).await {
                                 let _ = irc_tx.send(GenericIrcSessionCommand::SendMessage(channel.clone(), text.clone(), receipt)).await;
                             }
                         }
@@ -4709,11 +4736,8 @@ async fn reducer_loop(
                             infer_twitch_emote_positions_from_text(&emote_guard, None,
                                 from_user_id.as_deref().unwrap_or_default(), &whisper_text)
                         };
-                        let whisper_log_store = if settings.local_log_indexing_enabled {
-                            chat_logs.clone()
-                        } else {
-                            None
-                        };
+                        let whisper_log_writer = log_writer.clone()
+                            .filter(|_| settings.local_log_indexing_enabled);
                         let rejected = whisper_send_failure(
                             from_user_id.as_deref().unwrap_or_default(), &target_login, &text,
                             "Too many whispers are waiting to finish. Try again after they complete.",
@@ -4727,7 +4751,7 @@ async fn reducer_loop(
                                 &target_login,
                                 &text,
                                 whisper_twitch_emotes,
-                                whisper_log_store.as_ref(),
+                                whisper_log_writer.as_ref(),
                             )
                             .await
                         }) {
@@ -5744,19 +5768,12 @@ async fn reducer_loop(
                             continue;
                         };
                         let etx = evt_tx.clone();
+                        let writer = log_writer.clone();
                         tokio::spawn(async move {
+                            flush_before_read(writer.as_ref()).await;
                             load_local_older_messages(channel, before_ts_ms, before_row_id, limit, store, etx)
                                 .await;
                         });
-                    }
-                    AppCommand::PersistMessageHighlight { channel, server_id, message_id, timestamp_ms } => {
-                        if settings.local_log_indexing_enabled {
-                            if let Some(store) = &chat_logs {
-                                if let Err(error) = store.mark_highlighted(&channel, server_id.as_deref(), message_id, timestamp_ms) {
-                                    warn!("chat-log: failed to save custom highlight: {error}");
-                                }
-                            }
-                        }
                     }
                     AppCommand::LiveFeedRefresh => {
                         let _ = live_feed_tx
@@ -7613,7 +7630,7 @@ async fn helix_send_whisper(
     target_login: &str,
     text: &str,
     twitch_emotes: Vec<TwitchEmotePos>,
-    log_store: Option<&LogStore>,
+    log_writer: Option<&LogWriter>,
 ) -> AppEvent {
     info!("Whisper send requested to {}", target_login.trim());
     let sender_id = match from_user_id.and_then(normalize_whisper_user_id) {
@@ -7711,8 +7728,8 @@ async fn helix_send_whisper(
         &login,
         text,
         twitch_emotes,
-        log_store,
-    )
+        log_writer,
+    ).await
 }
 
 async fn helix_send_announcement(
@@ -9748,6 +9765,7 @@ mod tests {
         let mut registry = crate::runtime::emote_registry::EmoteRegistry::default();
         let emote = |id: &str, code: &str| crust_emotes::EmoteInfo {
             id: id.into(), code: code.into(), provider: "twitch".into(),
+            zero_width: false,
             url_1x: format!("https://static-cdn.jtvnw.net/emoticons/v2/{id}/static/dark/1.0"),
             url_2x: None, url_4x: None,
         };
@@ -9778,6 +9796,7 @@ mod tests {
         assert!(registry.complete_twitch_follower_inventory("alice", &target, generation,
             Some(vec![crust_emotes::EmoteInfo {
                 id: "follower-id".into(), code: "FollowWave".into(), provider: "twitch".into(),
+                zero_width: false,
                 url_1x: "https://example.invalid/follower.webp".into(), url_2x: None, url_4x: None,
             }])));
         let text = "🙂 FollowWave";

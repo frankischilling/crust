@@ -120,6 +120,7 @@ impl OutboundQueue {
             let channel = self.joins.pop_front().expect("queued JOIN");
             self.pending_joins.remove(&channel);
             self.joined.insert(channel.clone());
+            tracing::debug!(channel = %channel, "Sending Twitch channel join");
             return Some(OutboundLine {
                 line: format!("JOIN {}", channel.irc_name()),
                 receipt: None,

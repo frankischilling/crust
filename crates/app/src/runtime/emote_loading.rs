@@ -232,6 +232,19 @@ pub(crate) async fn load_channel_emotes(
     index: &crate::EmoteIndex,
     evt_tx: &mpsc::Sender<AppEvent>,
 ) {
+    load_selected_channel_emotes(channel, room_id, generation, index, evt_tx, None).await;
+}
+
+async fn load_selected_channel_emotes(
+    channel: &ChannelId,
+    room_id: &str,
+    generation: u64,
+    index: &crate::EmoteIndex,
+    evt_tx: &mpsc::Sender<AppEvent>,
+    selected: Option<&[String]>,
+) {
+    let includes =
+        |provider: &str| selected.is_none_or(|names| names.iter().any(|name| name == provider));
     let bttv = BttvProvider::new();
     let ffz = FfzProvider::new();
     let seven_tv = SevenTvProvider::new();
@@ -243,28 +256,36 @@ pub(crate) async fn load_channel_emotes(
         .read()
         .unwrap()
         .live_binding(channel, generation, "7tv");
-    let providers: FuturesUnordered<ChannelProviderLoad<'_>> = [
-        async {
-            ChannelProviderResult {
-                provider: "bttv",
-                emotes: bttv.load_channel(room_id).await,
-                source: Some(LiveSource {
-                    provider: Provider::Bttv,
-                    platform: "TWITCH".into(),
-                    room_id: room_id.into(),
-                    user_id: None,
-                    set_id: None,
-                    connection_index: None,
-                }),
-                expected_source: bttv_source,
+    let providers: FuturesUnordered<ChannelProviderLoad<'_>> = FuturesUnordered::new();
+    if includes("bttv") {
+        providers.push(
+            async {
+                ChannelProviderResult {
+                    provider: "bttv",
+                    emotes: bttv.load_channel(room_id).await,
+                    source: Some(LiveSource {
+                        provider: Provider::Bttv,
+                        platform: "TWITCH".into(),
+                        room_id: room_id.into(),
+                        user_id: None,
+                        set_id: None,
+                        connection_index: None,
+                    }),
+                    expected_source: bttv_source,
+                }
             }
-        }
-        .boxed(),
-        async { ChannelProviderResult::from(("ffz", ffz.load_channel(room_id).await)) }.boxed(),
-        load_seven_tv_channel(&seven_tv, "TWITCH", room_id, seven_tv_source).boxed(),
-    ]
-    .into_iter()
-    .collect();
+            .boxed(),
+        );
+    }
+    if includes("ffz") {
+        providers.push(
+            async { ChannelProviderResult::from(("ffz", ffz.load_channel(room_id).await)) }.boxed(),
+        );
+    }
+    if includes("7tv") {
+        providers
+            .push(load_seven_tv_channel(&seven_tv, "TWITCH", room_id, seven_tv_source).boxed());
+    }
     publish_channel_loads(channel, generation, providers, index, evt_tx).await;
 }
 
@@ -275,6 +296,19 @@ pub(crate) async fn load_kick_channel_emotes(
     index: &crate::EmoteIndex,
     evt_tx: &mpsc::Sender<AppEvent>,
 ) {
+    load_selected_kick_channel_emotes(channel, kick_user_id, generation, index, evt_tx, None).await;
+}
+
+async fn load_selected_kick_channel_emotes(
+    channel: &ChannelId,
+    kick_user_id: u64,
+    generation: u64,
+    index: &crate::EmoteIndex,
+    evt_tx: &mpsc::Sender<AppEvent>,
+    selected: Option<&[String]>,
+) {
+    let includes =
+        |provider: &str| selected.is_none_or(|names| names.iter().any(|name| name == provider));
     let kick = KickProvider::new();
     let seven_tv = SevenTvProvider::new();
     let seven_tv_source = index
@@ -282,23 +316,72 @@ pub(crate) async fn load_kick_channel_emotes(
         .unwrap()
         .live_binding(channel, generation, "7tv");
     let room_id = kick_user_id.to_string();
-    let providers: FuturesUnordered<ChannelProviderLoad<'_>> = [
-        async {
-            ChannelProviderResult::from(("kick", kick.load_channel(channel.display_name()).await))
-        }
-        .boxed(),
-        async {
-            if kick_user_id == 0 {
-                ChannelProviderResult::from(("7tv", Some(Vec::new())))
-            } else {
-                load_seven_tv_channel(&seven_tv, "KICK", &room_id, seven_tv_source).await
+    let providers: FuturesUnordered<ChannelProviderLoad<'_>> = FuturesUnordered::new();
+    if includes("kick") {
+        providers.push(
+            async {
+                ChannelProviderResult::from((
+                    "kick",
+                    kick.load_channel(channel.display_name()).await,
+                ))
             }
-        }
-        .boxed(),
-    ]
-    .into_iter()
-    .collect();
+            .boxed(),
+        );
+    }
+    if includes("7tv") {
+        providers.push(
+            async {
+                if kick_user_id == 0 {
+                    ChannelProviderResult::from(("7tv", Some(Vec::new())))
+                } else {
+                    load_seven_tv_channel(&seven_tv, "KICK", &room_id, seven_tv_source).await
+                }
+            }
+            .boxed(),
+        );
+    }
     publish_channel_loads(channel, generation, providers, index, evt_tx).await;
+}
+
+/// Retry failed channel metadata without waiting for another room-state event.
+pub(crate) fn retry_failed_channel_emotes(
+    index: &crate::EmoteIndex,
+    evt_tx: &mpsc::Sender<AppEvent>,
+) {
+    if evt_tx.is_closed() {
+        return;
+    }
+    let retries = index
+        .write()
+        .unwrap()
+        .take_channel_emote_retries(std::time::Instant::now(), MAX_CHANNEL_LOADS);
+    for retry in retries {
+        let index = index.clone();
+        let evt_tx = evt_tx.clone();
+        tokio::spawn(async move {
+            if retry.channel.is_twitch() {
+                load_selected_channel_emotes(
+                    &retry.channel,
+                    &retry.room_id,
+                    retry.generation,
+                    &index,
+                    &evt_tx,
+                    Some(&retry.providers),
+                )
+                .await;
+            } else if let Ok(user_id) = retry.room_id.parse() {
+                load_selected_kick_channel_emotes(
+                    &retry.channel,
+                    user_id,
+                    retry.generation,
+                    &index,
+                    &evt_tx,
+                    Some(&retry.providers),
+                )
+                .await;
+            }
+        });
+    }
 }
 
 async fn publish_channel_loads<F, R>(
@@ -435,6 +518,7 @@ mod tests {
     fn emote(provider: &str, code: &str) -> EmoteInfo {
         EmoteInfo {
             provider: provider.to_owned(),
+            zero_width: false,
             id: code.to_owned(),
             code: code.to_owned(),
             url_1x: format!("https://example.test/{code}.png"),
@@ -536,14 +620,22 @@ mod tests {
             AppEvent::ChannelEmotesLoaded { channel: loaded, count: 3 } if loaded == channel));
         task.await.unwrap();
         assert!(received.try_recv().is_err());
+        let mut registry = index.write().unwrap();
         assert!(
-            index
-                .write()
-                .unwrap()
-                .begin_channel_load(&channel, "42", false)
-                .is_some(),
-            "a failed provider must remain retryable"
+            registry.begin_channel_load(&channel, "42", false).is_none(),
+            "ordinary room state must not bypass the failed provider cooldown"
         );
+        let now = std::time::Instant::now();
+        assert!(registry
+            .take_channel_emote_retries(now, MAX_CHANNEL_LOADS)
+            .is_empty());
+        let retries =
+            registry.take_channel_emote_retries(now + Duration::from_secs(60), MAX_CHANNEL_LOADS);
+        assert_eq!(retries.len(), 1);
+        assert_eq!(retries[0].channel, channel);
+        assert_eq!(retries[0].room_id, "42");
+        assert_eq!(retries[0].providers, ["7tv"]);
+        assert!(retries[0].generation > generation);
     }
 
     #[tokio::test]
@@ -581,11 +673,12 @@ mod tests {
         assert_eq!(codes(receive(&mut received).await), ["Available"]);
         assert!(matches!(receive(&mut received).await,
             AppEvent::ChannelEmotesLoaded { channel: loaded, count: 1 } if loaded == channel));
-        assert!(index
-            .write()
-            .unwrap()
-            .begin_channel_load(&channel, "42", false)
-            .is_some());
+        let mut registry = index.write().unwrap();
+        assert!(registry.begin_channel_load(&channel, "42", false).is_none());
+        let manual_refresh = registry.begin_channel_load(&channel, "42", true).unwrap();
+        assert!(manual_refresh > generation);
+        assert!(registry.is_current_channel_load(&channel, manual_refresh));
+        assert!(!registry.is_current_channel_load(&channel, generation));
     }
 
     #[tokio::test]
@@ -689,6 +782,8 @@ mod tests {
             starts.try_recv().is_err(),
             "an obsolete queued provider started a request"
         );
+        let expected_retry_channels: HashSet<_> =
+            running.iter().map(|n| channels[*n].clone()).collect();
         for n in running {
             if let Some(release) = releases[n].take() {
                 release.send(()).unwrap();
@@ -702,14 +797,34 @@ mod tests {
         }
         assert_eq!(peak.load(Ordering::SeqCst), MAX_CHANNEL_LOADS);
         assert_eq!(active.load(Ordering::SeqCst), 0);
+        let mut registry = index.write().unwrap();
         assert!(
-            index
-                .write()
-                .unwrap()
+            registry
                 .begin_channel_load(&channels[first], "42", false)
-                .is_some(),
-            "failed loads must remain retryable"
+                .is_none(),
+            "ordinary room state must not bypass the failed provider cooldown"
         );
+        let now = std::time::Instant::now();
+        assert!(registry
+            .take_channel_emote_retries(now, MAX_CHANNEL_LOADS)
+            .is_empty());
+        let retries =
+            registry.take_channel_emote_retries(now + Duration::from_secs(60), MAX_CHANNEL_LOADS);
+        assert_eq!(retries.len(), MAX_CHANNEL_LOADS);
+        assert_eq!(
+            retries
+                .iter()
+                .map(|retry| retry.channel.clone())
+                .collect::<HashSet<_>>(),
+            expected_retry_channels,
+            "closed and replaced queued loads must not be retried"
+        );
+        assert!(retries
+            .iter()
+            .all(|retry| retry.room_id == "42" && retry.providers == ["ffz"]));
+        assert!(registry
+            .take_channel_emote_retries(now + Duration::from_secs(120), MAX_CHANNEL_LOADS)
+            .is_empty());
     }
 
     #[tokio::test]
@@ -735,6 +850,81 @@ mod tests {
             AppEvent::ChannelEmotesLoaded { count: 0, .. }
         ));
         assert!(received.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_channel_retry_waits_for_completion_capacity_and_settles_after_recovery() {
+        let index = index();
+        let channel = ChannelId::new("room");
+        let generation = {
+            let mut registry = index.write().unwrap();
+            registry.open_channel(&channel);
+            registry.begin_channel_load(&channel, "42", false).unwrap()
+        };
+        let (events, mut received) = mpsc::channel(1);
+        events
+            .send(AppEvent::EmoteCatalogUpdated { emotes: Vec::new() })
+            .await
+            .unwrap();
+        let limit = tokio::sync::Semaphore::new(1);
+        let providers: FuturesUnordered<ProviderLoad<'static>> =
+            [async { ("ffz", None) }.boxed()].into_iter().collect();
+        let mut publish = Box::pin(publish_channel_loads_with_limit(
+            &channel, generation, providers, &index, &events, &limit,
+        ));
+        assert!(matches!(futures_util::poll!(&mut publish), Poll::Pending));
+        assert!(index
+            .write()
+            .unwrap()
+            .take_channel_emote_retries(
+                std::time::Instant::now() + Duration::from_secs(60),
+                MAX_CHANNEL_LOADS
+            )
+            .is_empty());
+        receive(&mut received).await;
+        publish.await;
+        assert!(matches!(
+            receive(&mut received).await,
+            AppEvent::ChannelEmotesLoaded { count: 0, .. }
+        ));
+
+        let retry = index
+            .write()
+            .unwrap()
+            .take_channel_emote_retries(
+                std::time::Instant::now() + Duration::from_secs(60),
+                MAX_CHANNEL_LOADS,
+            )
+            .pop()
+            .unwrap();
+        assert_eq!(retry.providers, ["ffz"]);
+        let recovered: FuturesUnordered<ProviderLoad<'static>> =
+            [async { ("ffz", Some(vec![emote("ffz", "Recovered")])) }.boxed()]
+                .into_iter()
+                .collect();
+        let publish = publish_channel_loads_with_limit(
+            &channel,
+            retry.generation,
+            recovered,
+            &index,
+            &events,
+            &limit,
+        );
+        tokio::join!(publish, async {
+            assert_eq!(codes(receive(&mut received).await), ["Recovered"]);
+            assert!(matches!(
+                receive(&mut received).await,
+                AppEvent::ChannelEmotesLoaded { count: 1, .. }
+            ));
+        });
+        assert!(index
+            .write()
+            .unwrap()
+            .take_channel_emote_retries(
+                std::time::Instant::now() + Duration::from_secs(600),
+                MAX_CHANNEL_LOADS
+            )
+            .is_empty());
     }
 
     #[tokio::test]

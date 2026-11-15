@@ -38,6 +38,7 @@ pub(super) fn decode(text: &str) -> Option<(String, Vec<EmoteDelta>)> {
         "emote_create" => EmoteDelta::Upsert {
             emote: parse_emote(envelope.data.get("emote")?)?,
             old_code: None,
+            preserve_overlay: false,
         },
         "emote_update" => {
             let emote = envelope.data.get("emote")?;
@@ -80,6 +81,7 @@ pub(super) fn parse_emote(emote: &Value) -> Option<EmoteInfo> {
         id: id.to_owned(),
         code: code.to_owned(),
         provider: "bttv".to_owned(),
+        zero_width: false,
         url_1x: format!("https://cdn.betterttv.net/emote/{id}/1x"),
         url_2x: Some(format!("https://cdn.betterttv.net/emote/{id}/2x")),
         url_4x: Some(format!("https://cdn.betterttv.net/emote/{id}/3x")),
@@ -145,7 +147,7 @@ mod tests {
         );
         let (room, deltas) = decode(&encoded).unwrap();
         assert_eq!(room, "1234");
-        let [EmoteDelta::Upsert { emote, old_code }] = deltas.as_slice() else {
+        let [EmoteDelta::Upsert { emote, old_code, .. }] = deltas.as_slice() else {
             panic!("expected create");
         };
         assert!(old_code.is_none());

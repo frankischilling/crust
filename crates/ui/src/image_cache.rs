@@ -7,6 +7,9 @@
 
 mod loaders;
 
+#[cfg(test)]
+pub(crate) use loaders::tests::{animated_webp as animated_webp_fixture, gif as animated_gif_fixture};
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

@@ -250,6 +250,13 @@ impl<'a> LiveFeed<'a> {
         let mut action: Option<LiveFeedAction> = None;
         let row_size = Vec2::new(ui.available_width(), m.row_height);
         let (rect, resp) = ui.allocate_exact_size(row_size, Sense::click());
+        resp.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Button,
+                ui.is_enabled(),
+                format!("Open #{}", snap.user_login),
+            )
+        });
         if !ui.is_rect_visible(rect) {
             return None;
         }
@@ -602,6 +609,74 @@ mod tests {
             },
         );
         (painted_text(&output), action)
+    }
+
+    #[test]
+    fn live_rows_expose_named_accessible_button_actions() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let snapshots = [LiveChannelSnapshot {
+            user_id: "1".to_owned(),
+            user_login: "channel".to_owned(),
+            user_name: "Channel".to_owned(),
+            viewer_count: 1,
+            thumbnail_url: String::new(),
+            started_at: String::new(),
+        }];
+        let joined = HashSet::from(["channel".to_owned()]);
+        let images = UiImageCache::default();
+        let feed = LiveFeed {
+            snapshots: &snapshots,
+            loaded: true,
+            error: None,
+            last_updated: None,
+            joined_logins: &joined,
+            thumbnail_bytes: &images,
+        };
+        let fonts = FeedFonts {
+            body: egui::FontId::proportional(14.0),
+            small: egui::FontId::proportional(13.0),
+            heading: egui::FontId::proportional(12.0),
+            tiny: egui::FontId::proportional(11.0),
+        };
+        let frame = |events| {
+            let mut action = None;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(640.0, 480.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        action = feed.show_with_fonts(ui, &fonts);
+                    });
+                },
+            );
+            (output, action)
+        };
+        let (output, _) = frame(Vec::new());
+        let (target, node) = output
+            .platform_output
+            .accesskit_update
+            .unwrap()
+            .nodes
+            .into_iter()
+            .find(|(_, node)| node.label() == Some("Open #channel"))
+            .expect("the entire Live row exposes a named action");
+        assert_eq!(node.role(), egui::accesskit::Role::Button);
+        assert!(node.supports_action(egui::accesskit::Action::Click));
+        let (_, action) = frame(vec![egui::Event::AccessKitActionRequest(
+            egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::Click,
+                target,
+                data: None,
+            },
+        )]);
+        assert!(matches!(action, Some(LiveFeedAction::OpenChannel(login)) if login == "channel"));
     }
 
     #[test]

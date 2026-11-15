@@ -32,9 +32,8 @@ pub fn show_channel_info_bars(
     // Shows live/offline status, viewer count and stream title for the
     // currently active channel. Hidden when no channel is active.
     if let Some(active_ch) = state.active_channel.as_ref() {
-        // The Live-feed pseudo-tab has its own header inside the widget;
-        // the normal channel info bar does not apply.
-        if active_ch.is_live_feed() {
+        // Virtual views have no stream status or channel-specific bars.
+        if active_ch.is_virtual() {
             return;
         }
         if !active_ch.is_twitch() {
@@ -513,4 +512,60 @@ fn format_followers_only_label(minutes: i32) -> String {
     }
 
     format!("Followers-only {}", parts.join(" "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn virtual_views_do_not_render_channel_status_bars() {
+        for channel in [
+            ChannelId::live_feed(),
+            ChannelId::mentions(),
+            ChannelId::new("room"),
+        ] {
+            let ctx = Context::default();
+            let mut state = AppState::default();
+            state.join_channel(channel.clone());
+            let mut remaining_height = 0.0;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 600.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    show_channel_info_bars(
+                        ctx,
+                        &state,
+                        &HashMap::new(),
+                        &HashMap::new(),
+                        &PluginUiSnapshot::default(),
+                        &mut PluginUiSessionState::default(),
+                    );
+                    remaining_height = ctx.available_rect().height();
+                },
+            );
+            let has_loading_status = output.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Text(text)
+                    if text.galley.text() == "Fetching stream status...")
+            });
+            if channel.is_virtual() {
+                assert_eq!(
+                    remaining_height, 600.0,
+                    "virtual views need no stream header"
+                );
+                assert!(!has_loading_status);
+            } else {
+                assert!(remaining_height < 600.0);
+                assert!(
+                    has_loading_status,
+                    "a joined channel retains its loading status"
+                );
+            }
+        }
+    }
 }

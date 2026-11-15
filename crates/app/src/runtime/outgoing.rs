@@ -1,9 +1,11 @@
 use chrono::Utc;
 use crust_core::model::{ChannelId, ChatMessage, ReplyInfo, TwitchEmotePos};
 use crust_core::AppEvent;
-use crust_storage::LogStore;
+use futures_util::{future::Shared, FutureExt};
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
+
+use super::log_writer::LogWriter;
 
 const MAX_PENDING_WHISPER_SENDS: usize = 32;
 
@@ -50,6 +52,13 @@ impl WhisperSendTasks {
 pub(crate) struct ChatSendPublisher {
     tails: std::collections::HashMap<ChannelId, oneshot::Receiver<()>>,
     slots: std::sync::Arc<tokio::sync::Semaphore>,
+    pending_publications:
+        std::collections::HashMap<ChannelId, std::collections::VecDeque<PendingChatPublication>>,
+}
+
+struct PendingChatPublication {
+    receipt: Shared<oneshot::Receiver<Result<(), String>>>,
+    published: oneshot::Receiver<()>,
 }
 
 impl Default for ChatSendPublisher {
@@ -57,6 +66,7 @@ impl Default for ChatSendPublisher {
         Self {
             tails: Default::default(),
             slots: std::sync::Arc::new(tokio::sync::Semaphore::new(512)),
+            pending_publications: Default::default(),
         }
     }
 }
@@ -67,19 +77,29 @@ impl ChatSendPublisher {
         receipt: oneshot::Receiver<Result<(), String>>,
         draft: OutgoingChat,
         echo: ChatMessage,
-        log_store: Option<LogStore>,
+        log_writer: Option<LogWriter>,
         events: mpsc::Sender<AppEvent>,
     ) -> bool {
+        self.prune_publications();
         // Bound completions that are still waiting for storage or UI capacity.
         let Ok(slot) = self.slots.clone().try_acquire_owned() else {
             let _ = events.send(draft.rejected("Message was not sent. Too many outgoing messages are waiting. Try again after they finish.".into())).await;
             return false;
         };
-        self.spawn_ordered(
-            draft.channel.clone(),
-            slot,
-            publish_chat_result(receipt, draft, echo, log_store, events),
-        );
+        let channel = draft.channel.clone();
+        let receipt = receipt.shared();
+        let (published, finished) = oneshot::channel();
+        self.pending_publications
+            .entry(channel.clone())
+            .or_default()
+            .push_back(PendingChatPublication {
+                receipt: receipt.clone(),
+                published: finished,
+            });
+        self.spawn_ordered(channel, slot, async move {
+            publish_chat_result(receipt, draft, echo, log_writer, events).await;
+            let _ = published.send(());
+        });
         true
     }
 
@@ -88,9 +108,10 @@ impl ChatSendPublisher {
         receipt: oneshot::Receiver<Result<String, String>>,
         draft: OutgoingChat,
         echo: Option<ChatMessage>,
-        log_store: Option<LogStore>,
+        log_writer: Option<LogWriter>,
         events: mpsc::Sender<AppEvent>,
     ) -> bool {
+        self.prune_publications();
         let Ok(slot) = self.slots.clone().try_acquire_owned() else {
             let _ = events.send(draft.rejected("Message was not sent. Too many outgoing messages are waiting. Try again after they finish.".into())).await;
             return false;
@@ -109,7 +130,7 @@ impl ChatSendPublisher {
                         if echo.channel.is_irc_query() {
                             let _ = events.send(AppEvent::ChannelJoined { channel: echo.channel.clone() }).await;
                         }
-                        Some(saved_chat_echo(echo, log_store).await)
+                        Some(saved_chat_echo(echo, log_writer).await)
                     } else {
                         None
                     }
@@ -122,6 +143,61 @@ impl ChatSendPublisher {
             }
         });
         true
+    }
+
+    /// Publish confirmed self messages after local echoes whose socket writes
+    /// have already completed. Later rate-limited sends never block incoming chat.
+    pub async fn publish_incoming(
+        &mut self,
+        message: ChatMessage,
+        log_writer: Option<&LogWriter>,
+        events: mpsc::Sender<AppEvent>,
+    ) {
+        if message.flags.is_self {
+            loop {
+                let ready = self
+                    .pending_publications
+                    .get_mut(&message.channel)
+                    .and_then(|pending| {
+                        let _ = pending.front()?.receipt.clone().now_or_never()?;
+                        pending.pop_front()
+                    });
+                let Some(ready) = ready else {
+                    break;
+                };
+                // This receipt and every predecessor have resolved. The fence
+                // depends only on the history writer and UI event consumer.
+                let _ = ready.published.await;
+            }
+            self.prune_publications();
+        }
+        // Local writes reached this same writer before their publication
+        // fences completed, so it can reconcile even if the UI closes now.
+        if let Some(writer) = log_writer {
+            if let Err(error) = writer.append(&message).await {
+                warn!("chat-history: failed to queue incoming message: {error}");
+            }
+        }
+        let _ = events
+            .send(AppEvent::MessageReceived {
+                channel: message.channel.clone(),
+                message,
+            })
+            .await;
+    }
+
+    fn prune_publications(&mut self) {
+        self.pending_publications.retain(|_, pending| {
+            while pending.front_mut().is_some_and(|entry| {
+                !matches!(
+                    entry.published.try_recv(),
+                    Err(oneshot::error::TryRecvError::Empty)
+                )
+            }) {
+                pending.pop_front();
+            }
+            !pending.is_empty()
+        });
     }
 
     fn spawn_ordered(
@@ -191,14 +267,14 @@ pub(crate) fn chat_echo_body(text: &str) -> (&str, bool) {
 }
 
 pub(crate) async fn publish_chat_result(
-    receipt: oneshot::Receiver<Result<(), String>>,
+    receipt: impl std::future::Future<Output = Result<Result<(), String>, oneshot::error::RecvError>>,
     draft: OutgoingChat,
     echo: ChatMessage,
-    log_store: Option<LogStore>,
+    log_writer: Option<LogWriter>,
     events: mpsc::Sender<AppEvent>,
 ) {
     let event = match receipt.await {
-        Ok(Ok(())) => saved_chat_echo(echo, log_store).await,
+        Ok(Ok(())) => saved_chat_echo(echo, log_writer).await,
         Ok(Err(reason)) => draft.rejected(format!("Message was not sent. {reason}")),
         Err(_) => draft.rejected(
             "The chat connection changed before the send completed. Check the channel before retrying.".into(),
@@ -207,15 +283,14 @@ pub(crate) async fn publish_chat_result(
     let _ = events.send(event).await;
 }
 
-async fn saved_chat_echo(echo: ChatMessage, log_store: Option<LogStore>) -> AppEvent {
+async fn saved_chat_echo(mut echo: ChatMessage, log_writer: Option<LogWriter>) -> AppEvent {
     // The socket write completed. Server NOTICE errors can still follow.
-    if let Some(store) = log_store {
-        let saved_echo = echo.clone();
-        let saved = tokio::task::spawn_blocking(move || store.append_message(&saved_echo)).await;
-        match saved {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => warn!("chat-history: failed to persist sent message: {error}"),
-            Err(error) => warn!("chat-history: sent-message writer failed: {error}"),
+    // A queued draft can predate a chat clear that happened before it was sent.
+    // Use the successful publication time until the server supplies its timestamp.
+    echo.timestamp = Utc::now();
+    if let Some(writer) = log_writer {
+        if let Err(error) = writer.append(&echo).await {
+            warn!("chat-history: failed to queue sent message: {error}");
         }
     }
     AppEvent::MessageReceived {
@@ -232,13 +307,16 @@ pub(crate) fn whisper_send_failure(
 ) -> AppEvent {
     AppEvent::WhisperSendFailed {
         owner_user_id: owner_user_id.to_owned(),
-        target_login: target_login.trim().trim_start_matches('@').to_ascii_lowercase(),
+        target_login: target_login
+            .trim()
+            .trim_start_matches('@')
+            .to_ascii_lowercase(),
         text: text.to_owned(),
         message: message.into(),
     }
 }
 
-pub(crate) fn complete_whisper_send(
+pub(crate) async fn complete_whisper_send(
     status: reqwest::StatusCode,
     body: &str,
     from_user_id: &str,
@@ -246,7 +324,7 @@ pub(crate) fn complete_whisper_send(
     target_login: &str,
     text: &str,
     twitch_emotes: Vec<TwitchEmotePos>,
-    log_store: Option<&LogStore>,
+    log_writer: Option<&LogWriter>,
 ) -> AppEvent {
     if !status.is_success() {
         let mut message = crate::helix_error_message(status, body);
@@ -258,7 +336,9 @@ pub(crate) fn complete_whisper_send(
             message.push_str(" Re-login with a token that includes user:manage:whispers.");
         }
         return whisper_send_failure(
-            from_user_id, target_login, text,
+            from_user_id,
+            target_login,
+            text,
             format!("Could not send whisper to {target_login}: {message}"),
         );
     }
@@ -276,11 +356,16 @@ pub(crate) fn complete_whisper_send(
         timestamp,
         is_history: false,
     };
-    if let Some(store) = log_store {
-        if let Err(error) = crate::persist_whisper_message(
-            store, Some(from_login), Some(from_user_id), &event,
-        ) {
-            warn!("whisper-history: failed to persist sent whisper: {error}");
+    if let Some(writer) = log_writer {
+        if let Err(error) = writer
+            .whisper(
+                from_login.to_owned(),
+                from_user_id.to_owned(),
+                event.clone(),
+            )
+            .await
+        {
+            warn!("whisper-history: failed to queue sent whisper: {error}");
         }
     }
     event
@@ -289,6 +374,7 @@ pub(crate) fn complete_whisper_send(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crust_storage::LogStore;
 
     #[tokio::test]
     async fn completed_whisper_outcomes_cannot_cross_account_lifetimes() {
@@ -297,10 +383,20 @@ mod tests {
             let (finished, ready) = oneshot::channel();
             assert!(sends.spawn(async move {
                 let event = complete_whisper_send(
-                    if old_succeeded { reqwest::StatusCode::NO_CONTENT }
-                    else { reqwest::StatusCode::FORBIDDEN },
-                    "old result", "10", "alice", "friend", "same body", Vec::new(), None,
-                );
+                    if old_succeeded {
+                        reqwest::StatusCode::NO_CONTENT
+                    } else {
+                        reqwest::StatusCode::FORBIDDEN
+                    },
+                    "old result",
+                    "10",
+                    "alice",
+                    "friend",
+                    "same body",
+                    Vec::new(),
+                    None,
+                )
+                .await;
                 let _ = finished.send(());
                 event
             }));
@@ -312,13 +408,21 @@ mod tests {
             sends.clear();
             let (finish_new, new_result) = oneshot::channel();
             assert!(sends.spawn(async move { new_result.await.unwrap() }));
-            assert!(tokio::time::timeout(
-                std::time::Duration::from_millis(10), sends.complete_next(),
-            ).await.is_err(), "an old outcome reached the replacement attempt");
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(10), sends.complete_next(),)
+                    .await
+                    .is_err(),
+                "an old outcome reached the replacement attempt"
+            );
 
-            finish_new.send(whisper_send_failure(
-                "10", "friend", "same body", "new result",
-            )).unwrap();
+            finish_new
+                .send(whisper_send_failure(
+                    "10",
+                    "friend",
+                    "same body",
+                    "new result",
+                ))
+                .unwrap();
             assert!(matches!(sends.complete_next().await,
                 Some(AppEvent::WhisperSendFailed { owner_user_id, target_login, text, message })
                     if owner_user_id == "10" && target_login == "friend"
@@ -335,9 +439,12 @@ mod tests {
         }
         assert!(!sends.spawn(async { panic!("a rejected send must never start") }));
         sends.clear();
-        assert!(tokio::time::timeout(
-            std::time::Duration::from_secs(1), sends.complete_next(),
-        ).await.unwrap().is_none());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), sends.complete_next(),)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(!sends.has_pending());
         assert!(sends.spawn(async { whisper_send_failure("20", "friend", "new", "rejected") }));
         assert!(matches!(sends.complete_next().await,
@@ -408,6 +515,183 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incoming_confirmation_waits_only_for_the_receipt_ready_prefix() {
+        let mut publisher = ChatSendPublisher::default();
+        let (events, mut received) = mpsc::channel(8);
+        let (first_receipt, first_result) = oneshot::channel();
+        let (draft, echo) = pending();
+        let mut confirmation = echo.clone();
+        confirmation.id.0 = 99;
+        confirmation.server_id = Some("confirmed".into());
+        assert!(
+            publisher
+                .submit(first_result, draft, echo, None, events.clone())
+                .await
+        );
+        let (later_receipt, later_result) = oneshot::channel();
+        let (draft, mut echo) = pending();
+        echo.id.0 = 2;
+        assert!(
+            publisher
+                .submit(later_result, draft, echo, None, events.clone())
+                .await
+        );
+        first_receipt.send(Ok(())).unwrap();
+        // The current-thread executor has not scheduled either publisher yet.
+        assert!(received.try_recv().is_err());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            publisher.publish_incoming(confirmation, None, events.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(received.try_recv().unwrap(), AppEvent::MessageReceived { message, .. }
+            if message.id.0 == 1 && message.server_id.is_none())
+        );
+        assert!(
+            matches!(received.try_recv().unwrap(), AppEvent::MessageReceived { message, .. }
+            if message.id.0 == 99 && message.server_id.as_deref() == Some("confirmed"))
+        );
+        assert!(
+            received.try_recv().is_err(),
+            "the later socket receipt is still pending"
+        );
+        later_receipt.send(Ok(())).unwrap();
+        assert!(
+            matches!(received.recv().await.unwrap(), AppEvent::MessageReceived { message, .. }
+            if message.id.0 == 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn incoming_rows_do_not_wait_for_unresolved_writes_or_send_capacity() {
+        let mut publisher = ChatSendPublisher::default();
+        publisher.slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let (events, mut received) = mpsc::channel(8);
+        let (receipt, result) = oneshot::channel();
+        let (draft, echo) = pending();
+        assert!(
+            publisher
+                .submit(result, draft, echo.clone(), None, events.clone())
+                .await
+        );
+        for (id, is_self) in [(98, false), (99, true)] {
+            let mut incoming = echo.clone();
+            incoming.id.0 = id;
+            incoming.server_id = Some(format!("incoming-{id}"));
+            incoming.flags.is_self = is_self;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                publisher.publish_incoming(incoming, None, events.clone()),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(received.try_recv().unwrap(), AppEvent::MessageReceived { message, .. }
+                if message.id.0 == id)
+            );
+        }
+        drop(receipt);
+        assert!(matches!(
+            received.recv().await.unwrap(),
+            AppEvent::MessageSendRejected { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn repeated_same_text_sends_keep_fifo_confirmation_identities() {
+        let mut publisher = ChatSendPublisher::default();
+        let (events, mut received) = mpsc::channel(8);
+        let mut receipts = Vec::new();
+        let mut confirmations = Vec::new();
+        for (id, server_id) in [(1, "first-confirmed"), (2, "second-confirmed")] {
+            let (receipt, result) = oneshot::channel();
+            let (draft, mut echo) = pending();
+            echo.id.0 = id;
+            let mut confirmed = echo.clone();
+            confirmed.id.0 += 10;
+            confirmed.server_id = Some(server_id.into());
+            assert!(
+                publisher
+                    .submit(result, draft, echo, None, events.clone())
+                    .await
+            );
+            receipts.push(receipt);
+            confirmations.push(confirmed);
+        }
+        for receipt in receipts {
+            receipt.send(Ok(())).unwrap();
+        }
+        for confirmed in confirmations {
+            publisher
+                .publish_incoming(confirmed, None, events.clone())
+                .await;
+        }
+        let mut room = crust_core::model::ChannelState::new(ChannelId::new("room"));
+        let (_, mut old_history) = pending();
+        old_history.id.0 = 999;
+        old_history.flags.is_history = true;
+        room.push_message(old_history);
+        for _ in 0..4 {
+            let AppEvent::MessageReceived { message, .. } = received.try_recv().unwrap() else {
+                panic!("expected a local or confirmed message");
+            };
+            if room.absorb_own_echo(&message).is_none() {
+                room.push_message(message);
+            }
+        }
+        assert_eq!(room.messages.len(), 3);
+        assert!(room.messages[0].flags.is_history && room.messages[0].server_id.is_none());
+        assert_eq!(room.messages[1].id.0, 1);
+        assert_eq!(
+            room.messages[1].server_id.as_deref(),
+            Some("first-confirmed")
+        );
+        assert_eq!(room.messages[2].id.0, 2);
+        assert_eq!(
+            room.messages[2].server_id.as_deref(),
+            Some("second-confirmed")
+        );
+        assert!(received.try_recv().is_err());
+    }
+
+    #[test]
+    fn confirmation_matching_keeps_actions_and_reply_contexts_separate() {
+        let (_, mut action) = pending();
+        action.id.0 = 1;
+        let mut ordinary = action.clone();
+        ordinary.id.0 = 2;
+        ordinary.flags.is_action = false;
+        ordinary.reply = None;
+        let mut reply = ordinary.clone();
+        reply.id.0 = 3;
+        reply.reply = action.reply.clone();
+        let mut room = crust_core::model::ChannelState::new(ChannelId::new("room"));
+        for row in [&action, &ordinary, &reply] {
+            room.push_message(row.clone());
+        }
+        for (server_id, row) in [("ordinary", ordinary), ("reply", reply), ("action", action)] {
+            let expected_id = row.id;
+            let expected_time = row.timestamp;
+            let mut confirmed = row;
+            confirmed.id.0 += 10;
+            confirmed.server_id = Some(server_id.into());
+            assert_eq!(
+                room.absorb_own_echo(&confirmed),
+                Some((expected_id, expected_time))
+            );
+        }
+        assert_eq!(
+            room.messages
+                .iter()
+                .map(|row| row.server_id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["action", "ordinary", "reply"]
+        );
+    }
+
+    #[tokio::test]
     async fn irc_echo_uses_the_confirmed_nick_target_and_action_after_writing() {
         let mut publisher = ChatSendPublisher::default();
         let (events, mut received) = mpsc::channel(4);
@@ -417,9 +701,14 @@ mod tests {
         echo.channel = ChannelId::irc("example.com", 6697, true, "target");
         let target = echo.channel.clone();
         let store = LogStore::with_db_path(std::path::PathBuf::from(":memory:")).unwrap();
+        let writer = LogWriter::new(
+            &tokio::runtime::Handle::current(),
+            store.clone(),
+            events.clone(),
+        );
         assert!(
             publisher
-                .submit_irc(receiver, draft, Some(echo), Some(store.clone()), events)
+                .submit_irc(receiver, draft, Some(echo), Some(writer.clone()), events)
                 .await
         );
         tokio::task::yield_now().await;
@@ -434,9 +723,11 @@ mod tests {
         assert_eq!(message.sender.display_name, "actual_1");
         assert!(message.flags.is_self && message.flags.is_action);
         assert_eq!(message.raw_text, "waves 🦀");
+        writer.flush().await.unwrap();
         let saved = store.recent_messages(&target, 10).unwrap();
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].sender.login, "actual_1");
+        writer.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -542,36 +833,44 @@ mod tests {
         let store = LogStore::with_db_path(file.0.clone()).unwrap();
         let (receipt, receiver) = oneshot::channel();
         let (events, mut received) = mpsc::channel(4);
+        let writer = LogWriter::new(
+            &tokio::runtime::Handle::current(),
+            store.clone(),
+            events.clone(),
+        );
         let (draft, echo) = pending();
         let expected_id = echo.id;
-        let expected_timestamp = echo.timestamp;
+        let submitted_at = echo.timestamp;
         let channel = echo.channel.clone();
         receipt.send(Ok(())).unwrap();
-        publish_chat_result(receiver, draft, echo, Some(store.clone()), events.clone()).await;
-        match received.try_recv().unwrap() {
+        publish_chat_result(receiver, draft, echo, Some(writer.clone()), events.clone()).await;
+        let expected_timestamp = match received.try_recv().unwrap() {
             AppEvent::MessageReceived { message, .. } => {
                 assert_eq!(message.id, expected_id);
-                assert_eq!(message.timestamp, expected_timestamp);
-                store
+                assert!(message.timestamp >= submitted_at);
+                writer
                     .mark_highlighted(
-                        &channel,
+                        channel.clone(),
                         None,
                         message.id,
                         message.timestamp.timestamp_millis(),
                     )
+                    .await
                     .unwrap();
+                message.timestamp
             }
             event => panic!("unexpected send outcome: {event:?}"),
-        }
+        };
         let (receipt, receiver) = oneshot::channel();
         let (draft, mut echo) = pending();
         echo.id.0 += 1;
         receipt.send(Err("rejected".into())).unwrap();
-        publish_chat_result(receiver, draft, echo, Some(store.clone()), events).await;
+        publish_chat_result(receiver, draft, echo, Some(writer.clone()), events).await;
         assert!(matches!(
             received.try_recv().unwrap(),
             AppEvent::MessageSendRejected { .. }
         ));
+        writer.shutdown().await.unwrap();
         drop(store);
 
         let reopened = LogStore::with_db_path(file.0.clone()).unwrap();
@@ -586,6 +885,206 @@ mod tests {
                 && messages[0].flags.is_highlighted
         );
         assert_eq!(messages[0].reply.as_ref().unwrap().parent_msg_id, "parent");
+    }
+
+    #[tokio::test]
+    async fn closing_before_ui_confirmation_keeps_one_deleted_row_after_restart() {
+        struct DatabaseFile(std::path::PathBuf);
+        impl Drop for DatabaseFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let file = DatabaseFile(std::env::temp_dir().join(format!(
+            "crust-close-confirmation-{}-{}.sqlite3",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        )));
+        let store = LogStore::with_db_path(file.0.clone()).unwrap();
+        let (events, received) = mpsc::channel(4);
+        let writer = LogWriter::new(
+            &tokio::runtime::Handle::current(),
+            store.clone(),
+            events.clone(),
+        );
+        let mut publisher = ChatSendPublisher::default();
+        let (receipt, result) = oneshot::channel();
+        let (draft, mut local) = pending();
+        local.flags.is_highlighted = true;
+        let local_id = local.id;
+        let channel = local.channel.clone();
+        let mut server = local.clone();
+        server.id.0 += 100;
+        server.server_id = Some("confirmed-before-close".into());
+        server.timestamp += chrono::Duration::seconds(1);
+        let server_time = server.timestamp;
+        assert!(
+            publisher
+                .submit(result, draft, local, Some(writer.clone()), events.clone())
+                .await
+        );
+        super::super::log_writer::publish_moderation(
+            AppEvent::MessageDeleted {
+                channel: channel.clone(),
+                server_id: "confirmed-before-close".into(),
+            },
+            Some(&writer),
+            &events,
+        )
+        .await;
+        receipt.send(Ok(())).unwrap();
+        publisher
+            .publish_incoming(server, Some(&writer), events)
+            .await;
+        assert_eq!(received.len(), 3);
+        // Closing the window discards all queued UI events without applying any.
+        drop(received);
+        writer.shutdown().await.unwrap();
+        drop(writer);
+        drop(store);
+        let reopened = LogStore::with_db_path(file.0.clone()).unwrap();
+        let rows = reopened.recent_messages(&channel, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, local_id);
+        assert_eq!(rows[0].server_id.as_deref(), Some("confirmed-before-close"));
+        assert_eq!(rows[0].timestamp, server_time);
+        assert!(rows[0].flags.is_deleted && rows[0].flags.is_highlighted);
+    }
+
+    async fn check_confirmed_echo_chronology(
+        state: &mut crust_core::AppState,
+        writer: &LogWriter,
+        store: &LogStore,
+        local: &ChatMessage,
+        server_timestamp: chrono::DateTime<Utc>,
+        deleted: bool,
+    ) {
+        let mut server = local.clone();
+        server.id.0 += 100;
+        server.server_id = Some("confirmed-chronology".into());
+        server.timestamp = server_timestamp;
+        server.flags.is_deleted = false;
+        writer.append(&server).await.unwrap();
+        state.apply_message_moderation(&mut server);
+        let room = state.channels.get_mut(&local.channel).unwrap();
+        assert_eq!(
+            room.absorb_own_echo(&server),
+            Some((local.id, local.timestamp)),
+        );
+        let confirmed = room.messages.back().unwrap().clone();
+        assert_eq!(room.messages.len(), 1);
+        assert_eq!(confirmed.flags.is_deleted, deleted);
+        assert!(confirmed.flags.is_highlighted);
+        assert_eq!(confirmed.timestamp, server_timestamp);
+        state.sync_mention_echo(&confirmed);
+        assert_eq!(state.mentions.len(), 1);
+        assert_eq!(state.mentions_unread, 1);
+        assert_eq!(state.mentions[0].flags.is_deleted, deleted);
+        writer
+            .update_sender()
+            .send(crust_core::events::HistoryUpdate::Confirmation {
+                message: Box::new(confirmed),
+                original_timestamp_ms: local.timestamp.timestamp_millis(),
+            })
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let saved = store.recent_messages(&local.channel, 10).unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].id, local.id);
+        assert_eq!(saved[0].server_id, server.server_id);
+        assert_eq!(saved[0].timestamp, server_timestamp);
+        assert_eq!(saved[0].flags.is_deleted, deleted);
+        assert!(saved[0].flags.is_highlighted);
+    }
+
+    #[tokio::test]
+    async fn a_clear_before_socket_success_does_not_delete_the_later_confirmed_send() {
+        let store = LogStore::with_db_path(":memory:".into()).unwrap();
+        let (events, mut received) = mpsc::channel(4);
+        let writer = LogWriter::new(
+            &tokio::runtime::Handle::current(),
+            store.clone(),
+            events.clone(),
+        );
+        let (draft, mut echo) = pending();
+        echo.timestamp = Utc::now() - chrono::Duration::minutes(2);
+        echo.flags.is_highlighted = true;
+        let cutoff = echo.timestamp + chrono::Duration::minutes(1);
+        let clear =
+            crust_core::model::ModerationAction::channel(echo.channel.clone(), Some(cutoff));
+        let mut state = crust_core::AppState::default();
+        state.join_channel(echo.channel.clone());
+        state.apply_moderation(&clear);
+        writer.moderate(clear).await.unwrap();
+        let (receipt, result) = oneshot::channel();
+        receipt.send(Ok(())).unwrap();
+        publish_chat_result(result, draft, echo, Some(writer.clone()), events).await;
+        let AppEvent::MessageReceived { message: local, .. } = received.recv().await.unwrap()
+        else {
+            panic!("expected successful local echo");
+        };
+        assert!(local.timestamp > cutoff);
+        state
+            .channels
+            .get_mut(&local.channel)
+            .unwrap()
+            .push_message(local.clone());
+        state.push_mention(local.clone(), true);
+        check_confirmed_echo_chronology(
+            &mut state,
+            &writer,
+            &store,
+            &local,
+            local.timestamp + chrono::Duration::milliseconds(1),
+            false,
+        )
+        .await;
+        writer.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_clear_after_socket_success_stays_deleted_through_confirmation() {
+        let store = LogStore::with_db_path(":memory:".into()).unwrap();
+        let (events, mut received) = mpsc::channel(4);
+        let writer = LogWriter::new(
+            &tokio::runtime::Handle::current(),
+            store.clone(),
+            events.clone(),
+        );
+        let (draft, mut echo) = pending();
+        echo.flags.is_highlighted = true;
+        let mut state = crust_core::AppState::default();
+        state.join_channel(echo.channel.clone());
+        let (receipt, result) = oneshot::channel();
+        receipt.send(Ok(())).unwrap();
+        publish_chat_result(result, draft, echo, Some(writer.clone()), events).await;
+        let AppEvent::MessageReceived { message: local, .. } = received.recv().await.unwrap()
+        else {
+            panic!("expected successful local echo");
+        };
+        state
+            .channels
+            .get_mut(&local.channel)
+            .unwrap()
+            .push_message(local.clone());
+        state.push_mention(local.clone(), true);
+        let clear = crust_core::model::ModerationAction::channel(
+            local.channel.clone(),
+            Some(local.timestamp + chrono::Duration::milliseconds(2)),
+        );
+        state.apply_moderation(&clear);
+        writer.moderate(clear).await.unwrap();
+        check_confirmed_echo_chronology(
+            &mut state,
+            &writer,
+            &store,
+            &local,
+            local.timestamp + chrono::Duration::milliseconds(1),
+            true,
+        )
+        .await;
+        writer.shutdown().await.unwrap();
     }
 
     #[test]
@@ -606,9 +1105,11 @@ mod tests {
             .contains("501"));
     }
 
-    #[test]
-    fn failed_whispers_never_enter_sent_history() {
+    #[tokio::test]
+    async fn failed_whispers_never_enter_sent_history() {
         let store = LogStore::with_db_path(":memory:".into()).unwrap();
+        let (events, _received) = mpsc::channel(4);
+        let writer = LogWriter::new(&tokio::runtime::Handle::current(), store.clone(), events);
         let channel = crate::whisper_thread_channel_id("123", "bob");
         let event = complete_whisper_send(
             reqwest::StatusCode::FORBIDDEN,
@@ -618,10 +1119,14 @@ mod tests {
             "bob",
             "  hello 🦀  ",
             Vec::new(),
-            Some(&store),
+            Some(&writer),
+        )
+        .await;
+        assert!(
+            matches!(event, AppEvent::WhisperSendFailed { owner_user_id, target_login, text, .. }
+            if owner_user_id == "123" && target_login == "bob" && text == "  hello 🦀  ")
         );
-        assert!(matches!(event, AppEvent::WhisperSendFailed { owner_user_id, target_login, text, .. }
-            if owner_user_id == "123" && target_login == "bob" && text == "  hello 🦀  "));
+        writer.flush().await.unwrap();
         assert!(store.recent_messages(&channel, 10).unwrap().is_empty());
         let event = complete_whisper_send(
             reqwest::StatusCode::NO_CONTENT,
@@ -630,9 +1135,14 @@ mod tests {
             "alice",
             "bob",
             "  🦀 Kappa  ",
-            vec![TwitchEmotePos { id: "25".into(), start: 2, end: 6 }],
-            Some(&store),
-        );
+            vec![TwitchEmotePos {
+                id: "25".into(),
+                start: 2,
+                end: 6,
+            }],
+            Some(&writer),
+        )
+        .await;
         assert!(matches!(
             event,
             AppEvent::WhisperReceived { is_self: true, owner_user_id, from_user_id, text, twitch_emotes, .. }
@@ -640,6 +1150,7 @@ mod tests {
                     && twitch_emotes.len() == 1 && twitch_emotes[0].id == "25"
                     && twitch_emotes[0].start == 2 && twitch_emotes[0].end == 6
         ));
+        writer.shutdown().await.unwrap();
         let messages = store.recent_messages(&channel, 10).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].raw_text, "🦀 Kappa");
@@ -656,13 +1167,31 @@ mod tests {
             let (draft, mut echo) = pending();
             let query = ChannelId::irc_query("irc.example", 6697, true, "bob");
             echo.channel = query.clone();
-            assert!(publisher.submit_irc(outcome, draft, Some(echo), None, events).await);
-            receipt.send(if succeeds { Ok("alice".into()) } else { Err("offline".into()) }).unwrap();
-            let first = tokio::time::timeout(std::time::Duration::from_secs(3), received.recv()).await.unwrap().unwrap();
+            assert!(
+                publisher
+                    .submit_irc(outcome, draft, Some(echo), None, events)
+                    .await
+            );
+            receipt
+                .send(if succeeds {
+                    Ok("alice".into())
+                } else {
+                    Err("offline".into())
+                })
+                .unwrap();
+            let first = tokio::time::timeout(std::time::Duration::from_secs(3), received.recv())
+                .await
+                .unwrap()
+                .unwrap();
             if succeeds {
                 assert!(matches!(first, AppEvent::ChannelJoined { channel } if channel == query));
-                let echo = tokio::time::timeout(std::time::Duration::from_secs(3), received.recv()).await.unwrap().unwrap();
-                assert!(matches!(echo, AppEvent::MessageReceived { channel, message } if channel == query && message.sender.login == "alice"));
+                let echo = tokio::time::timeout(std::time::Duration::from_secs(3), received.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    matches!(echo, AppEvent::MessageReceived { channel, message } if channel == query && message.sender.login == "alice")
+                );
             } else {
                 assert!(matches!(first, AppEvent::MessageSendRejected { .. }));
                 assert!(received.try_recv().is_err());

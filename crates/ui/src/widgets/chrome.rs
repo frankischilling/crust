@@ -16,6 +16,7 @@ pub enum ChromeIcon {
     Search,
     Close,
     Account,
+    Emotes,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -338,6 +339,25 @@ fn paint_icon(ui: &Ui, rect: egui::Rect, icon: ChromeIcon, state: IconButtonStat
                 stroke,
                 egui::StrokeKind::Outside,
             );
+        }
+        ChromeIcon::Emotes => {
+            let radius = rect.width().min(rect.height()) * 0.44;
+            let center = rect.center();
+            painter.circle_stroke(center, radius, stroke);
+            for direction in [-1.0, 1.0] {
+                painter.circle_filled(
+                    center + egui::vec2(direction * radius * 0.35, -radius * 0.25),
+                    1.0,
+                    stroke_color,
+                );
+            }
+            let smile: Vec<_> = (0..=8)
+                .map(|step| {
+                    let angle = std::f32::consts::PI * (0.2 + step as f32 * 0.6 / 8.0);
+                    center + egui::vec2(angle.cos(), angle.sin()) * radius * 0.55
+                })
+                .collect();
+            painter.add(egui::Shape::line(smile, stroke));
         }
     }
     let _ = Align2::CENTER_CENTER;

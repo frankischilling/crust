@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 use crate::filters::{self as dsl, build_message_context, parse as parse_expression, Expression};
 use crate::model::ChatMessage;
 
+mod mentions;
+pub use mentions::{contains_mention, contains_nickname_mention};
+
 /// RGB highlight tint color (red, green, blue).
 pub type HighlightColor = [u8; 3];
 

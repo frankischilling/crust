@@ -11,7 +11,7 @@ in beta.
 
 - Twitch chat over IRC/WebSocket, with anonymous reading and authenticated chat
 - Tabs, a sidebar, up to four split panes, and a quick switch palette
-- Twitch, BTTV, FFZ, and 7TV emotes, animated images, badges, and sender cosmetics
+- Twitch, BTTV, FFZ, and 7TV emotes, including animation and overlays, badges, and sender cosmetics
 - Replies, whispers, search, local history, highlights, and notification sounds
 - Moderation queues, user cards, polls, predictions, and channel-points tools
 - Configurable shortcuts, command aliases, spellcheck, image uploads, and Streamlink integration
@@ -57,9 +57,10 @@ for current settings and account-dialog captures.
 - [Documentation index](docs/HOME.md)
 - [Features and keybinds](docs/FEATURES_AND_KEYBINDS.md)
 - [Chat controls and performance audit](docs/AUDIT_STABILITY.md)
+- [Chat loading, emotes, and navigation audit](docs/AUDIT_CHAT_RELIABILITY.md)
 - [Plugin API reference](docs/API.md)
 - [Example plugins](plugins/)
-- [Release notes v0.5.5](docs/releases/Release_v0.5.5.md)
+- [Release notes v0.5.6](docs/releases/Release_v0.5.6.md)
 
 ## Data paths
 

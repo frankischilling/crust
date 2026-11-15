@@ -2,15 +2,99 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, NaiveDate, Utc};
-use crust_core::model::{ChannelId, ChatMessage, HistoryCursor, MessageFlags, MessageId, MsgKind, Sender, UserId};
+use crust_core::model::{
+    ChannelId, ChatMessage, HistoryCursor, MessageFlags, MessageId, ModerationAction,
+    ModerationState, ModerationTarget, MsgKind, Sender, UserId, MODERATION_RULE_LIMIT,
+};
 use directories::ProjectDirs;
-use rusqlite::{params, Connection, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use crate::StorageError;
 
 const SQLITE_LOG_FILENAME: &str = "chat_logs.sqlite3";
 const DEFAULT_RECENT_LIMIT: usize = 800;
 const MAX_ROWS_PER_CHANNEL: i64 = 50_000;
+
+const CONFIRMATION_FLAGS_QUERY: &str = "
+    SELECT
+        CASE WHEN json_valid(payload_json) THEN COALESCE(json_extract(payload_json, '$.flags.is_deleted'), 0) != 0 ELSE 0 END,
+        CASE WHEN json_valid(payload_json) THEN COALESCE(json_extract(payload_json, '$.flags.is_highlighted'), 0) != 0 ELSE 0 END,
+        CASE WHEN json_valid(payload_json) THEN COALESCE(json_extract(payload_json, '$.flags.is_mention'), 0) != 0 ELSE 0 END,
+        CASE WHEN json_valid(payload_json) THEN COALESCE(json_extract(payload_json, '$.flags.suppress_notification'), 0) != 0 ELSE 0 END
+    FROM (
+        SELECT payload_json FROM chat_messages WHERE id = ?2 AND channel = ?1
+        UNION ALL
+        SELECT payload_json FROM chat_messages
+        WHERE channel = ?1 AND server_id = ?3 AND id != ?2
+    )";
+
+// The CASE guard also protects old corrupt rows from JSON functions. Missing
+// msg_kind is the historical default (ordinary chat); notices stay intact.
+const MODERATION_MATCH: &str = "
+    channel = ?1 AND CASE WHEN json_valid(payload_json) THEN
+        (?2 = 'message' AND server_id = ?3)
+        OR (?2 != 'message' AND (?6 IS NULL OR ts_ms <= ?6)
+            AND (COALESCE(json_extract(payload_json, '$.msg_kind'), 'Chat') IN ('Chat', 'SuspiciousUserMessage')
+                 OR json_type(payload_json, '$.msg_kind.Bits') = 'object')
+            AND (?2 = 'channel' OR
+                CASE WHEN ?5 IS NOT NULL AND COALESCE(json_extract(payload_json, '$.sender.user_id'), '') != ''
+                    THEN json_extract(payload_json, '$.sender.user_id') = ?5
+                    ELSE ?4 != '' AND json_extract(payload_json, '$.sender.login') = ?4 COLLATE NOCASE END))
+    ELSE 0 END";
+
+// Each target has its own indexed probe. Combining these into one OR-filtered
+// subquery would scan every tombstone in a busy channel on each chat insert.
+fn moderation_insert_predicate(row: &str) -> String {
+    format!(
+        r#"
+        {row}.channel NOT LIKE 'whisper:%'
+        AND CASE WHEN json_valid({row}.payload_json) THEN
+            EXISTS(SELECT 1 FROM chat_moderation AS rule
+                WHERE rule.channel = {row}.channel AND rule.target = 'message'
+                    AND rule.target_key = {row}.server_id)
+            OR ((COALESCE(json_extract({row}.payload_json, '$.msg_kind'), 'Chat') IN ('Chat', 'SuspiciousUserMessage')
+                 OR json_type({row}.payload_json, '$.msg_kind.Bits') = 'object') AND (
+                EXISTS(SELECT 1 FROM chat_moderation AS rule
+                    WHERE rule.channel = {row}.channel AND rule.target = 'channel'
+                        AND rule.target_key = '' AND rule.cutoff_ms >= {row}.ts_ms)
+                OR CASE WHEN COALESCE(json_extract({row}.payload_json, '$.sender.user_id'), '') != '' THEN
+                    EXISTS(SELECT 1 FROM chat_moderation AS rule
+                        WHERE rule.channel = {row}.channel AND rule.target = 'user'
+                            AND rule.user_id = json_extract({row}.payload_json, '$.sender.user_id')
+                            AND rule.cutoff_ms >= {row}.ts_ms)
+                    OR EXISTS(SELECT 1 FROM chat_moderation AS rule
+                        WHERE rule.channel = {row}.channel AND rule.target = 'user' AND rule.user_id IS NULL
+                            AND rule.login != '' AND rule.login = json_extract({row}.payload_json, '$.sender.login') COLLATE NOCASE
+                            AND rule.cutoff_ms >= {row}.ts_ms)
+                ELSE EXISTS(SELECT 1 FROM chat_moderation AS rule
+                        WHERE rule.channel = {row}.channel AND rule.target = 'user'
+                            AND rule.login != '' AND rule.login = json_extract({row}.payload_json, '$.sender.login') COLLATE NOCASE
+                            AND rule.cutoff_ms >= {row}.ts_ms)
+                END))
+        ELSE 0 END"#
+    )
+}
+
+// Keep the query and partial index predicates identical so SQLite can read the
+// newest attention rows directly without scanning ordinary chat payloads.
+const RECENT_MENTIONS_FILTER: &str = "
+    channel NOT LIKE 'whisper:%'
+    AND CASE WHEN json_valid(payload_json) THEN
+        COALESCE(json_extract(payload_json, '$.flags.suppress_notification'), 0) = 0
+        AND (
+            json_extract(payload_json, '$.flags.is_highlighted') = 1
+            OR json_extract(payload_json, '$.flags.is_mention') = 1
+            OR json_extract(payload_json, '$.flags.is_first_msg') = 1
+            OR json_extract(payload_json, '$.flags.is_pinned') = 1
+        )
+    ELSE 0 END";
+
+fn recent_mentions_query() -> String {
+    format!(
+        "SELECT payload_json FROM chat_messages WHERE {RECENT_MENTIONS_FILTER}
+         ORDER BY ts_ms DESC, id DESC LIMIT ?1"
+    )
+}
 
 pub struct HistoryPage {
     pub messages: Vec<ChatMessage>,
@@ -61,8 +145,37 @@ impl LogStore {
                 ON chat_messages(channel, ts_ms DESC, id DESC);
             CREATE INDEX IF NOT EXISTS idx_chat_messages_channel_server_id
                 ON chat_messages(channel, server_id);
+            CREATE TABLE IF NOT EXISTS chat_moderation (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel TEXT NOT NULL,
+                target TEXT NOT NULL,
+                target_key TEXT NOT NULL,
+                login TEXT NOT NULL DEFAULT '',
+                user_id TEXT,
+                cutoff_ms INTEGER,
+                UNIQUE(channel, target, target_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_moderation_user_id
+                ON chat_moderation(channel, user_id, cutoff_ms)
+                WHERE target = 'user' AND user_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_chat_moderation_login
+                ON chat_moderation(channel, login COLLATE NOCASE, cutoff_ms)
+                WHERE target = 'user';
+            CREATE INDEX IF NOT EXISTS idx_chat_moderation_unknown_login
+                ON chat_moderation(channel, login COLLATE NOCASE, cutoff_ms)
+                WHERE target = 'user' AND user_id IS NULL;
             "#,
         )?;
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER IF NOT EXISTS chat_message_apply_moderation
+             AFTER INSERT ON chat_messages WHEN {}
+             BEGIN
+                 UPDATE chat_messages
+                 SET payload_json = json_set(payload_json, '$.flags.is_deleted', json('true'))
+                 WHERE id = NEW.id;
+             END;",
+            moderation_insert_predicate("NEW")
+        ))?;
         // Seed counts once for existing databases. Triggers keep them accurate
         // across transactions and other connections without rescanning history.
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -147,6 +260,281 @@ impl LogStore {
         Ok(())
     }
 
+    /// Check a channel/server identity before pairing another pending own send.
+    pub fn has_server_message(
+        &self,
+        channel: &ChannelId,
+        server_id: &str,
+    ) -> Result<bool, StorageError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| StorageError::Io(std::io::Error::other("chat log DB mutex poisoned")))?;
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM chat_messages WHERE channel = ?1 AND server_id = ?2)",
+            params![channel.as_str(), server_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Reconcile one identified local echo with its server-confirmed message.
+    /// The existing SQLite row and local message ID remain stable for history.
+    /// Returns false when neither the pending nor confirmed identity exists.
+    pub fn confirm_message(
+        &self,
+        confirmed: &ChatMessage,
+        original_timestamp_ms: i64,
+    ) -> Result<bool, StorageError> {
+        let Some(server_id) = confirmed.server_id.as_deref().filter(|id| !id.is_empty()) else {
+            return Ok(false);
+        };
+        let Ok(local_id) = i64::try_from(confirmed.id.0) else {
+            return Ok(false);
+        };
+        if !confirmed.flags.is_self || confirmed.flags.is_history {
+            return Ok(false);
+        }
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| StorageError::Io(std::io::Error::other("chat log DB mutex poisoned")))?;
+        let tx = conn.transaction()?;
+        let pending_row: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM chat_messages
+             WHERE channel = ?1 AND ts_ms = ?2 AND server_id IS NULL
+                 AND CASE WHEN json_valid(payload_json)
+                     THEN json_extract(payload_json, '$.id') = ?3 ELSE 0 END
+             ORDER BY id ASC LIMIT 1",
+                params![confirmed.channel.as_str(), original_timestamp_ms, local_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        // The ordered writer can confirm before the UI handles the event. A
+        // later UI update enriches only that exact confirmed local identity.
+        let pending_row = match pending_row {
+            Some(row) => Some(row),
+            None => tx.query_row(
+                "SELECT id FROM chat_messages
+                 WHERE channel = ?1 AND server_id = ?2
+                     AND CASE WHEN json_valid(payload_json)
+                         THEN json_extract(payload_json, '$.id') = ?3 ELSE 0 END
+                 ORDER BY id ASC LIMIT 1",
+                params![confirmed.channel.as_str(), server_id, local_id],
+                |row| row.get(0),
+            ).optional()?,
+        };
+        let Some(pending_row) = pending_row else {
+            return Ok(false);
+        };
+
+        let mut merged = confirmed.clone();
+        {
+            let mut statement = tx.prepare(CONFIRMATION_FLAGS_QUERY)?;
+            let flags = statement.query_map(
+                params![confirmed.channel.as_str(), pending_row, server_id],
+                |row| {
+                    Ok((
+                        row.get::<_, bool>(0)?,
+                        row.get::<_, bool>(1)?,
+                        row.get::<_, bool>(2)?,
+                        row.get::<_, bool>(3)?,
+                    ))
+                },
+            )?;
+            for flags in flags {
+                let (deleted, highlighted, mention, suppressed) = flags?;
+                merged.flags.is_deleted |= deleted;
+                merged.flags.is_highlighted |= highlighted;
+                merged.flags.is_mention |= mention;
+                merged.flags.suppress_notification |= suppressed;
+            }
+        }
+        let payload = serde_json::to_string(&merged)
+            .map_err(|error| StorageError::Serde(error.to_string()))?;
+        tx.execute(
+            "UPDATE chat_messages SET server_id = ?2, ts_ms = ?3, payload_json = ?4 WHERE id = ?1",
+            params![
+                pending_row,
+                server_id,
+                merged.timestamp.timestamp_millis(),
+                payload
+            ],
+        )?;
+        tx.execute(
+            &format!(
+                "UPDATE chat_messages
+                SET payload_json = json_set(payload_json, '$.flags.is_deleted', json('true'))
+                WHERE id = ?1 AND {}",
+                moderation_insert_predicate("chat_messages")
+            ),
+            params![pending_row],
+        )?;
+        tx.execute(
+            "DELETE FROM chat_messages WHERE channel = ?1 AND server_id = ?2 AND id != ?3",
+            params![confirmed.channel.as_str(), server_id, pending_row],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Mark saved rows and remember bounded source cutoffs or exact identities.
+    /// The insert trigger protects messages queued after the moderation action.
+    pub fn apply_moderation(&self, action: &ModerationAction) -> Result<(), StorageError> {
+        self.apply_moderation_batch(std::slice::from_ref(action))
+    }
+
+    pub fn apply_moderation_batch(&self, actions: &[ModerationAction]) -> Result<(), StorageError> {
+        if actions.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| StorageError::Io(std::io::Error::other("chat log DB mutex poisoned")))?;
+        let tx = conn.transaction()?;
+        for action in actions {
+            Self::apply_moderation_in_transaction(&tx, action)?;
+        }
+        tx.execute(
+            "DELETE FROM chat_moderation WHERE id NOT IN
+                (SELECT id FROM chat_moderation ORDER BY id DESC LIMIT ?1)",
+            params![MODERATION_RULE_LIMIT as i64],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn apply_moderation_in_transaction(
+        tx: &rusqlite::Transaction<'_>,
+        action: &ModerationAction,
+    ) -> Result<(), StorageError> {
+        if !action.is_channel_action() {
+            return Ok(());
+        }
+        let (target, key, login, user_id) = match &action.target {
+            ModerationTarget::Message(id) if !id.is_empty() => ("message", id.clone(), "", None),
+            ModerationTarget::Message(_) => return Ok(()),
+            ModerationTarget::User { login, user_id } => {
+                if login.is_empty() && user_id.is_none() {
+                    return Ok(());
+                }
+                let key = serde_json::to_string(&(login, user_id))
+                    .map_err(|error| StorageError::Serde(error.to_string()))?;
+                ("user", key, login.as_str(), user_id.as_deref())
+            }
+            ModerationTarget::Channel => ("channel", String::new(), "", None),
+        };
+        let cutoff = action.timestamp.map(|time| time.timestamp_millis());
+        if target == "message" || cutoff.is_some() {
+            tx.execute(
+                "INSERT INTO chat_moderation(channel, target, target_key, login, user_id, cutoff_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(channel, target, target_key) DO UPDATE
+                    SET id = excluded.id, cutoff_ms = excluded.cutoff_ms
+                    WHERE excluded.cutoff_ms > chat_moderation.cutoff_ms",
+                params![action.channel.as_str(), target, key, login, user_id, cutoff],
+            )?;
+        } else {
+            // No source time: retain only identities which actually existed
+            // when this action ran, never guess a cutoff from the local clock.
+            tx.execute(
+                &format!(
+                    "INSERT OR IGNORE INTO chat_moderation(channel, target, target_key)
+                    SELECT channel, 'message', server_id FROM chat_messages
+                    WHERE {MODERATION_MATCH} AND server_id IS NOT NULL AND server_id != ''
+                    ORDER BY ts_ms DESC, id DESC LIMIT ?7"
+                ),
+                params![
+                    action.channel.as_str(),
+                    target,
+                    key,
+                    login,
+                    user_id,
+                    cutoff,
+                    MODERATION_RULE_LIMIT as i64
+                ],
+            )?;
+        }
+        if target == "message" {
+            tx.execute(
+                "UPDATE chat_messages SET payload_json = json_set(payload_json, '$.flags.is_deleted', json('true'))
+                 WHERE channel = ?1 AND server_id = ?2 AND json_valid(payload_json)",
+                params![action.channel.as_str(), key],
+            )?;
+        } else {
+            tx.execute(
+                &format!("UPDATE chat_messages SET payload_json = json_set(payload_json, '$.flags.is_deleted', json('true'))
+                          WHERE {MODERATION_MATCH}"),
+                params![action.channel.as_str(), target, key, login, user_id, cutoff],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Apply durable moderation to a remote replay before it reaches the UI.
+    /// Loading only this channel's bounded rules avoids scanning saved payloads.
+    pub fn apply_saved_moderation(
+        &self,
+        channel: &ChannelId,
+        messages: &mut [ChatMessage],
+    ) -> Result<(), StorageError> {
+        let state = ModerationState::default();
+        for action in self.saved_moderation(channel)? {
+            state.apply_to_retained(&action, std::iter::empty());
+        }
+        for message in messages {
+            state.apply(message);
+        }
+        Ok(())
+    }
+
+    pub fn saved_moderation(
+        &self,
+        channel: &ChannelId,
+    ) -> Result<Vec<ModerationAction>, StorageError> {
+        if channel.as_str().starts_with("whisper:") {
+            return Ok(Vec::new());
+        }
+        let rules = {
+            let conn = self.conn.lock().map_err(|_| {
+                StorageError::Io(std::io::Error::other("chat log DB mutex poisoned"))
+            })?;
+            let mut statement = conn.prepare(
+                "SELECT target, target_key, login, user_id, cutoff_ms FROM chat_moderation
+                 WHERE channel = ?1 ORDER BY id ASC",
+            )?;
+            let rows = statement
+                .query_map(params![channel.as_str()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        let mut actions = Vec::with_capacity(rules.len());
+        for (target, key, login, user_id, cutoff) in rules {
+            let timestamp = cutoff.and_then(DateTime::from_timestamp_millis);
+            let action = match target.as_str() {
+                "message" => ModerationAction::message(channel.clone(), key),
+                "user" if timestamp.is_some() => {
+                    ModerationAction::user(channel.clone(), login, user_id, timestamp)
+                }
+                "channel" if timestamp.is_some() => {
+                    ModerationAction::channel(channel.clone(), timestamp)
+                }
+                _ => continue,
+            };
+            actions.push(action);
+        }
+        Ok(actions)
+    }
+
     /// Update the existing row after context-dependent highlight evaluation.
     pub fn mark_highlighted(
         &self,
@@ -155,7 +543,9 @@ impl LogStore {
         message_id: MessageId,
         timestamp_ms: i64,
     ) -> Result<(), StorageError> {
-        let conn = self.conn.lock()
+        let conn = self
+            .conn
+            .lock()
             .map_err(|_| StorageError::Io(std::io::Error::other("chat log DB mutex poisoned")))?;
         if let Some(server_id) = server_id.filter(|id| !id.is_empty()) {
             conn.execute(
@@ -192,42 +582,32 @@ impl LogStore {
     /// `is_first_msg`, `is_pinned`). Whispers are excluded (they have their
     /// own dedicated UI feed via `whisper:` channel prefix).
     ///
-    /// Uses SQLite LIKE patterns against the serialised JSON as a cheap
-    /// pre-filter, then validates by parsing the payload - this keeps the
-    /// scan bounded to a small slice of the full `chat_messages` table on
-    /// realistic datasets without needing a schema migration.
+    /// A partial timestamp index excludes ordinary chat and whisper threads.
+    /// The first read builds it for existing databases; callers should run
+    /// history reads on a blocking worker. SQLite maintains it when messages
+    /// are inserted, highlighted, suppressed, or removed.
     pub fn recent_mentions(&self, limit: usize) -> Result<Vec<ChatMessage>, StorageError> {
         let safe_limit = limit.clamp(1, 5_000) as i64;
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| StorageError::Io(std::io::Error::other("chat log DB mutex poisoned")))?;
-        // serde emits exactly these substrings for `true` bool fields.
-        let mut stmt = conn.prepare(
-            r#"SELECT payload_json
-             FROM chat_messages
-             WHERE channel NOT LIKE 'whisper:%'
-               AND CASE WHEN json_valid(payload_json)
-                   THEN COALESCE(json_extract(payload_json, '$.flags.suppress_notification'), 0) = 0
-                   ELSE 0 END
-               AND (
-                 payload_json LIKE '%"is_highlighted":true%'
-                 OR payload_json LIKE '%"is_mention":true%'
-                 OR payload_json LIKE '%"is_first_msg":true%'
-                 OR payload_json LIKE '%"is_pinned":true%'
-               )
-             ORDER BY ts_ms DESC, id DESC
-             LIMIT ?1"#,
-        )?;
-        let rows = stmt.query_map(params![safe_limit], |row| row.get::<_, String>(0))?;
+        let payloads = {
+            let conn = self.conn.lock().map_err(|_| {
+                StorageError::Io(std::io::Error::other("chat log DB mutex poisoned"))
+            })?;
+            // Defer the one-time scan from database opening to the history
+            // worker. Interrupted index creation rolls back atomically and
+            // the next read can retry it.
+            conn.execute_batch(&format!(
+                "CREATE INDEX IF NOT EXISTS idx_chat_messages_attention_ts
+                 ON chat_messages(ts_ms DESC, id DESC) WHERE {RECENT_MENTIONS_FILTER};"
+            ))?;
+            let mut stmt = conn.prepare(&recent_mentions_query())?;
+            let rows = stmt.query_map(params![safe_limit], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
 
         let mut out: Vec<ChatMessage> = Vec::new();
-        for row in rows {
-            let payload = row?;
+        // Decoding saved messages does not need the shared database lock.
+        for payload in payloads {
             if let Ok(msg) = serde_json::from_str::<ChatMessage>(&payload) {
-                // Double-check flags in-process in case the LIKE pre-filter
-                // false-positives (e.g. a user typed `"is_mention":true` in
-                // chat and it slipped through escaping).
                 let f = &msg.flags;
                 if !f.suppress_notification
                     && (f.is_highlighted || f.is_mention || f.is_first_msg || f.is_pinned)
@@ -247,10 +627,16 @@ impl LogStore {
         before_ts_ms: i64,
         limit: usize,
     ) -> Result<Vec<ChatMessage>, StorageError> {
-        Ok(self.history_page(channel, Some(HistoryCursor {
-            timestamp_ms: before_ts_ms,
-            row_id: i64::MIN,
-        }), limit)?.messages)
+        Ok(self
+            .history_page(
+                channel,
+                Some(HistoryCursor {
+                    timestamp_ms: before_ts_ms,
+                    row_id: i64::MIN,
+                }),
+                limit,
+            )?
+            .messages)
     }
 
     /// Read an indexed page and advance past corrupt payloads as well as valid rows.
@@ -277,8 +663,21 @@ impl LogStore {
              LIMIT ?4",
         )?;
         let rows = stmt.query_map(
-            params![channel.as_str(), boundary.timestamp_ms, boundary.row_id, (safe_limit + 1) as i64],
-            |row| Ok((HistoryCursor { timestamp_ms: row.get(0)?, row_id: row.get(1)? }, row.get::<_, String>(2)?)),
+            params![
+                channel.as_str(),
+                boundary.timestamp_ms,
+                boundary.row_id,
+                (safe_limit + 1) as i64
+            ],
+            |row| {
+                Ok((
+                    HistoryCursor {
+                        timestamp_ms: row.get(0)?,
+                        row_id: row.get(1)?,
+                    },
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )?;
 
         let mut out = Vec::new();
@@ -302,7 +701,12 @@ impl LogStore {
         }
         out.reverse();
         row_ids.reverse();
-        Ok(HistoryPage { messages: out, row_ids, next, has_more })
+        Ok(HistoryPage {
+            messages: out,
+            row_ids,
+            next,
+            has_more,
+        })
     }
 
     /// List distinct channel ids that begin with `prefix`, ordered by most
@@ -313,7 +717,13 @@ impl LogStore {
         limit: usize,
     ) -> Result<Vec<String>, StorageError> {
         let safe_limit = limit.clamp(1, 1_000) as i64;
-        let like_pattern = format!("{}%", prefix.replace('!', "!!").replace('%', "!%").replace('_', "!_"));
+        let like_pattern = format!(
+            "{}%",
+            prefix
+                .replace('!', "!!")
+                .replace('%', "!%")
+                .replace('_', "!_")
+        );
         let conn = self
             .conn
             .lock()
@@ -472,6 +882,394 @@ mod tests {
     }
 
     #[test]
+    fn moderation_insert_probes_use_exact_message_and_sender_indexes() {
+        let store = LogStore::with_db_path(":memory:".into()).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let predicate = moderation_insert_predicate("incoming");
+        let query = format!(
+            "WITH incoming(channel, server_id, ts_ms, payload_json) AS (VALUES (?1, ?2, ?3, ?4))
+            SELECT {predicate} FROM incoming"
+        );
+        let payload = serde_json::to_string(&message(1, 1000, "first")).unwrap();
+        let mut plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+            .unwrap();
+        let details: Vec<String> = plan
+            .query_map(params!["first", "message-1", 1000, payload], |row| {
+                row.get(3)
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let details = details.join("\n");
+        assert!(
+            details.contains("channel=? AND target=? AND target_key=?"),
+            "{details}"
+        );
+        assert!(
+            details
+                .contains("idx_chat_moderation_user_id (channel=? AND user_id=? AND cutoff_ms>?)"),
+            "{details}"
+        );
+        assert!(
+            details.contains("idx_chat_moderation_login (channel=? AND login=? AND cutoff_ms>?)"),
+            "{details}"
+        );
+        assert!(
+            details.contains(
+                "idx_chat_moderation_unknown_login (channel=? AND login=? AND cutoff_ms>?)"
+            ),
+            "{details}"
+        );
+        assert!(!details.contains("SCAN rule"), "{details}");
+    }
+
+    #[test]
+    fn moderation_survives_reopen_and_respects_channel_user_and_cutoff() {
+        let path = temp_db_path("moderation-reopen");
+        let channel = ChannelId::new("first");
+        {
+            let store = LogStore::with_db_path(path.clone()).unwrap();
+            let mut old = message(1, 1000, "first");
+            old.flags.is_mention = true;
+            store.append_message(&old).unwrap();
+            store.append_message(&message(1, 1000, "second")).unwrap();
+            store.append_message(&message(2, 1001, "first")).unwrap();
+            let mut other_user = message(3, 999, "first");
+            other_user.sender.user_id = UserId("2".into());
+            store.append_message(&other_user).unwrap();
+            let mut notice = message(4, 999, "first");
+            notice.msg_kind = MsgKind::SystemInfo;
+            store.append_message(&notice).unwrap();
+            let mut legacy = message(5, 999, "first");
+            legacy.sender.user_id.0.clear();
+            store.append_message(&legacy).unwrap();
+            store
+                .apply_moderation(&ModerationAction::user(
+                    channel.clone(),
+                    "ALICE".into(),
+                    Some("1".into()),
+                    Some(Utc.timestamp_millis_opt(1000).unwrap()),
+                ))
+                .unwrap();
+            assert!(store.recent_mentions(10).unwrap()[0].flags.is_deleted);
+        }
+        {
+            let store = LogStore::with_db_path(path.clone()).unwrap();
+            store.append_message(&message(6, 998, "first")).unwrap();
+            store.append_message(&message(7, 1002, "first")).unwrap();
+            let rows = store.recent_messages(&channel, 20).unwrap();
+            for row in rows {
+                assert_eq!(
+                    row.flags.is_deleted,
+                    [1, 5, 6].contains(&row.id.0),
+                    "row {}",
+                    row.id.0
+                );
+                assert_eq!(row.raw_text, format!("message {}", row.id.0));
+            }
+            assert!(
+                !store
+                    .recent_messages(&ChannelId::new("second"), 10)
+                    .unwrap()[0]
+                    .flags
+                    .is_deleted
+            );
+            let mut replay = vec![
+                message(8, 999, "first"),
+                message(9, 1001, "first"),
+                message(8, 999, "second"),
+            ];
+            store.apply_saved_moderation(&channel, &mut replay).unwrap();
+            assert_eq!(
+                replay
+                    .iter()
+                    .map(|row| row.flags.is_deleted)
+                    .collect::<Vec<_>>(),
+                [true, false, false]
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn untimed_moderation_keeps_saved_identities_without_guessing_a_cutoff() {
+        let store = LogStore::with_db_path(":memory:".into()).unwrap();
+        let channel = ChannelId::new("first");
+        let mut old = message(1, 1000, "first");
+        store.append_message(&old).unwrap();
+        store.append_message(&message(1, 1000, "second")).unwrap();
+        store.conn.lock().unwrap().execute(
+            "INSERT INTO chat_messages(channel, ts_ms, server_id, payload_json) VALUES ('first', 999, 'corrupt', '{bad json')", []).unwrap();
+        store
+            .apply_moderation(&ModerationAction::user(
+                channel.clone(),
+                "alice".into(),
+                None,
+                None,
+            ))
+            .unwrap();
+        store.append_message(&message(2, 999, "first")).unwrap();
+        let mut replay = vec![
+            old.clone(),
+            message(2, 999, "first"),
+            message(1, 1000, "second"),
+        ];
+        store.apply_saved_moderation(&channel, &mut replay).unwrap();
+        assert_eq!(
+            replay
+                .iter()
+                .map(|row| row.flags.is_deleted)
+                .collect::<Vec<_>>(),
+            [true, false, false]
+        );
+        assert_eq!(
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT payload_json FROM chat_messages WHERE server_id = 'corrupt'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "{bad json"
+        );
+        old.channel = ChannelId("whisper:uid:1:alice".into());
+        store.append_message(&old).unwrap();
+        store
+            .apply_moderation(&ModerationAction::channel(
+                old.channel.clone(),
+                Some(Utc::now()),
+            ))
+            .unwrap();
+        store
+            .apply_moderation(&ModerationAction::message(
+                old.channel.clone(),
+                old.server_id.unwrap(),
+            ))
+            .unwrap();
+        assert!(
+            !store.recent_messages(&old.channel, 10).unwrap()[0]
+                .flags
+                .is_deleted
+        );
+    }
+
+    #[test]
+    fn deletion_before_append_and_channel_clear_preserve_text_and_notices() {
+        let store = LogStore::with_db_path(":memory:".into()).unwrap();
+        let channel = ChannelId::new("first");
+        store
+            .apply_moderation(&ModerationAction::message(
+                channel.clone(),
+                "message-1".into(),
+            ))
+            .unwrap();
+        store.append_message(&message(1, 999, "first")).unwrap();
+        store.append_message(&message(1, 999, "second")).unwrap();
+        let mut notice = message(2, 999, "first");
+        notice.msg_kind = MsgKind::Timeout {
+            login: "alice".into(),
+            seconds: 60,
+        };
+        store.append_message(&notice).unwrap();
+        store
+            .apply_moderation(&ModerationAction::channel(
+                channel.clone(),
+                Some(Utc.timestamp_millis_opt(1000).unwrap()),
+            ))
+            .unwrap();
+        for (id, time, kind) in [
+            (3, 999, MsgKind::Bits { amount: 10 }),
+            (4, 999, MsgKind::SuspiciousUserMessage),
+            (5, 1001, MsgKind::Chat),
+        ] {
+            let mut row = message(id, time, "first");
+            row.msg_kind = kind;
+            store.append_message(&row).unwrap();
+        }
+        store
+            .apply_moderation(&ModerationAction::channel(
+                channel.clone(),
+                Some(Utc.timestamp_millis_opt(500).unwrap()),
+            ))
+            .unwrap();
+        for row in store.recent_messages(&channel, 10).unwrap() {
+            assert_eq!(row.flags.is_deleted, [1, 3, 4].contains(&row.id.0));
+            assert_eq!(row.raw_text, format!("message {}", row.id.0));
+        }
+        assert!(
+            !store
+                .recent_messages(&ChannelId::new("second"), 10)
+                .unwrap()[0]
+                .flags
+                .is_deleted
+        );
+    }
+
+    #[test]
+    fn confirmation_flag_reads_use_exact_row_and_server_id_indexes() {
+        let store = LogStore::with_db_path(":memory:".into()).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let mut plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {CONFIRMATION_FLAGS_QUERY}"))
+            .unwrap();
+        let details: Vec<String> = plan
+            .query_map(params!["first", 1, "confirmed-id"], |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let details = details.join("\n");
+        assert!(
+            details.contains("SEARCH chat_messages USING INTEGER PRIMARY KEY (rowid=?)"),
+            "{details}"
+        );
+        assert!(
+            details.contains("idx_chat_messages_channel_server_id (channel=? AND server_id=?)"),
+            "{details}"
+        );
+        assert!(
+            !details.contains("SCAN chat_messages") && !details.contains("(channel=?)"),
+            "{details}"
+        );
+    }
+
+    #[test]
+    fn confirmed_own_echoes_keep_one_durable_row_in_each_write_order() {
+        for order in [
+            "local-server-confirm",
+            "server-local-confirm",
+            "local-confirm-server",
+        ] {
+            let path = temp_db_path(order);
+            let channel = ChannelId::new("first");
+            let mut local = message(1, 1000, "first");
+            local.server_id = None;
+            local.flags.is_self = true;
+            local.flags.is_highlighted = true;
+            let mut server = local.clone();
+            server.id = MessageId(2);
+            server.server_id = Some("confirmed-id".into());
+            server.timestamp = Utc.timestamp_millis_opt(1100).unwrap();
+            server.sender.color = Some("#123456".into());
+            server.flags.is_highlighted = false;
+            let mut confirmed = server.clone();
+            confirmed.id = local.id;
+            {
+                let store = LogStore::with_db_path(path.clone()).unwrap();
+                if order == "server-local-confirm" {
+                    store.append_message(&server).unwrap();
+                }
+                store.append_message(&local).unwrap();
+                let original_row_id = store.history_page(&channel, None, 10).unwrap().row_ids[0];
+                if order == "local-server-confirm" {
+                    store.append_message(&server).unwrap();
+                }
+                store.confirm_message(&confirmed, 1000).unwrap();
+                if order == "local-confirm-server" {
+                    store.append_message(&server).unwrap();
+                }
+                store.confirm_message(&confirmed, 1000).unwrap();
+                let page = store.history_page(&channel, None, 10).unwrap();
+                assert_eq!(page.messages.len(), 1, "{order}");
+                assert_eq!(page.row_ids, [original_row_id], "{order}");
+                assert_eq!(page.messages[0].id, local.id, "{order}");
+                assert_eq!(page.messages[0].timestamp, server.timestamp, "{order}");
+                assert_eq!(
+                    page.messages[0].sender.color, server.sender.color,
+                    "{order}"
+                );
+                assert!(page.messages[0].flags.is_highlighted, "{order}");
+                store
+                    .apply_moderation(&ModerationAction::message(
+                        channel.clone(),
+                        "confirmed-id".into(),
+                    ))
+                    .unwrap();
+            }
+            {
+                let store = LogStore::with_db_path(path.clone()).unwrap();
+                let rows = store.recent_messages(&channel, 10).unwrap();
+                assert_eq!(rows.len(), 1, "{order}");
+                assert_eq!(rows[0].id, local.id, "{order}");
+                assert!(
+                    rows[0].flags.is_deleted && rows[0].flags.is_highlighted,
+                    "{order}"
+                );
+            }
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn confirmation_uses_exact_local_identity_and_preserves_saved_deletions() {
+        let store = LogStore::with_db_path(":memory:".into()).unwrap();
+        let channel = ChannelId::new("first");
+        let mut local = message(1, 1000, "first");
+        local.server_id = None;
+        local.flags.is_self = true;
+        store.append_message(&local).unwrap();
+        let mut repeated = local.clone();
+        repeated.id = MessageId(3);
+        store.append_message(&repeated).unwrap();
+        let mut older = local.clone();
+        older.timestamp = Utc.timestamp_millis_opt(900).unwrap();
+        store.append_message(&older).unwrap();
+        let mut server = local.clone();
+        server.id = MessageId(2);
+        server.server_id = Some("confirmed-id".into());
+        server.timestamp = Utc.timestamp_millis_opt(1100).unwrap();
+        server.flags.is_deleted = true;
+        store.append_message(&server).unwrap();
+        let mut other_channel = server.clone();
+        other_channel.channel = ChannelId::new("second");
+        other_channel.flags.is_deleted = false;
+        store.append_message(&other_channel).unwrap();
+        let mut confirmed = server;
+        confirmed.id = local.id;
+        confirmed.flags.is_deleted = false;
+        store.confirm_message(&confirmed, 999).unwrap();
+        assert_eq!(store.recent_messages(&channel, 10).unwrap().len(), 4);
+        store.confirm_message(&confirmed, 1000).unwrap();
+        let rows = store.recent_messages(&channel, 10).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows[0].server_id.is_none() && rows[1].server_id.is_none());
+        assert!(!rows[0].flags.is_deleted && !rows[1].flags.is_deleted);
+        assert_eq!(rows[1].id, repeated.id);
+        assert!(rows[2].flags.is_deleted);
+        assert_eq!(rows[2].id, local.id);
+        assert!(
+            !store.recent_messages(&other_channel.channel, 10).unwrap()[0]
+                .flags
+                .is_deleted
+        );
+    }
+
+    #[test]
+    fn confirmation_applies_deletion_that_arrived_before_the_server_row() {
+        let store = LogStore::with_db_path(":memory:".into()).unwrap();
+        let mut local = message(1, 1000, "first");
+        local.server_id = None;
+        local.flags.is_self = true;
+        store.append_message(&local).unwrap();
+        store
+            .apply_moderation(&ModerationAction::message(
+                local.channel.clone(),
+                "confirmed-id".into(),
+            ))
+            .unwrap();
+        let mut confirmed = local;
+        confirmed.server_id = Some("confirmed-id".into());
+        confirmed.timestamp = Utc.timestamp_millis_opt(1100).unwrap();
+        store.confirm_message(&confirmed, 1000).unwrap();
+        let rows = store.recent_messages(&confirmed.channel, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].flags.is_deleted);
+    }
+
+    #[test]
     fn custom_highlights_are_available_after_reopening_saved_history() {
         let path = temp_db_path("saved-highlight");
         let channel = ChannelId::new("first");
@@ -484,16 +1282,29 @@ mod tests {
             store.append_message(&second).unwrap();
             store.append_message(&message(3, 1000, "first")).unwrap();
             store.append_message(&message(1, 1000, "second")).unwrap();
-            store.mark_highlighted(&channel, first.server_id.as_deref(), first.id, 1000).unwrap();
-            store.mark_highlighted(&channel, None, second.id, 1000).unwrap();
+            store
+                .mark_highlighted(&channel, first.server_id.as_deref(), first.id, 1000)
+                .unwrap();
+            store
+                .mark_highlighted(&channel, None, second.id, 1000)
+                .unwrap();
         }
         {
             let store = LogStore::with_db_path(path.clone()).unwrap();
             let mentions = store.recent_mentions(10).unwrap();
-            assert_eq!(mentions.iter().map(|row| row.id.0).collect::<Vec<_>>(), [1, 2]);
-            assert!(mentions.iter().all(|row| row.flags.is_highlighted && row.channel == channel));
+            assert_eq!(
+                mentions.iter().map(|row| row.id.0).collect::<Vec<_>>(),
+                [1, 2]
+            );
+            assert!(mentions
+                .iter()
+                .all(|row| row.flags.is_highlighted && row.channel == channel));
             assert_eq!(mentions[0].raw_text, "message 1");
-            assert!(!store.recent_messages(&channel, 3).unwrap()[2].flags.is_highlighted);
+            assert!(
+                !store.recent_messages(&channel, 3).unwrap()[2]
+                    .flags
+                    .is_highlighted
+            );
         }
         std::fs::remove_file(path).unwrap();
     }
@@ -517,10 +1328,16 @@ mod tests {
             }
             ids.extend(page.messages.iter().rev().map(|message| message.id.0));
             cursor = page.next;
-            if !page.has_more { break; }
+            if !page.has_more {
+                break;
+            }
         }
         assert_eq!(ids, (1..=11).rev().collect::<Vec<_>>());
-        assert!(store.history_page(&channel, cursor, 3).unwrap().messages.is_empty());
+        assert!(store
+            .history_page(&channel, cursor, 3)
+            .unwrap()
+            .messages
+            .is_empty());
     }
 
     #[test]
@@ -535,7 +1352,14 @@ mod tests {
         }
         let first = store.history_page(&channel, None, 2).unwrap();
         assert_eq!(first.row_ids, [2, 3]);
-        assert_eq!(first.messages.iter().map(|row| row.id.0).collect::<Vec<_>>(), [17, 18]);
+        assert_eq!(
+            first
+                .messages
+                .iter()
+                .map(|row| row.id.0)
+                .collect::<Vec<_>>(),
+            [17, 18]
+        );
         let older = store.history_page(&channel, first.next, 2).unwrap();
         assert_eq!(older.row_ids, [1]);
         assert_eq!(older.messages[0].id, MessageId(17));
@@ -553,15 +1377,24 @@ mod tests {
         for id in 1..=5 {
             store.append_message(&message(id, 1000, "first")).unwrap();
         }
-        store.conn.lock().unwrap().execute(
-            "UPDATE chat_messages SET payload_json = 'invalid' WHERE id >= 4", [],
-        ).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE chat_messages SET payload_json = 'invalid' WHERE id >= 4",
+                [],
+            )
+            .unwrap();
         let first = store.history_page(&channel, None, 2).unwrap();
         assert!(first.messages.is_empty());
         assert!(first.row_ids.is_empty());
         assert!(first.has_more);
         let next = store.history_page(&channel, first.next, 3).unwrap();
-        assert_eq!(next.messages.iter().map(|row| row.id.0).collect::<Vec<_>>(), [1, 2, 3]);
+        assert_eq!(
+            next.messages.iter().map(|row| row.id.0).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
         assert_eq!(next.row_ids, [1, 2, 3]);
         assert!(!next.has_more);
     }
@@ -607,13 +1440,23 @@ mod tests {
     #[test]
     fn channel_prefixes_treat_sql_wildcards_as_literal_account_names() {
         let store = LogStore::with_db_path(PathBuf::from(":memory:")).unwrap();
-        let channels = ["whisper:some_one:bob", "whisper:somexone:bob", "whisper:some%one:bob", "whisper:some!one:bob"];
+        let channels = [
+            "whisper:some_one:bob",
+            "whisper:somexone:bob",
+            "whisper:some%one:bob",
+            "whisper:some!one:bob",
+        ];
         for (index, channel) in channels.iter().enumerate() {
-            store.append_message(&message(index as u64, 1000 + index as i64, channel)).unwrap();
+            store
+                .append_message(&message(index as u64, 1000 + index as i64, channel))
+                .unwrap();
         }
         for channel in channels {
             let prefix = channel.strip_suffix("bob").unwrap();
-            assert_eq!(store.recent_channels_with_prefix(prefix, 1).unwrap(), vec![channel]);
+            assert_eq!(
+                store.recent_channels_with_prefix(prefix, 1).unwrap(),
+                vec![channel]
+            );
         }
     }
 
@@ -977,5 +1820,288 @@ mod tests {
         assert_eq!(latest[0].raw_text, "mention");
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mentions_index_migrates_saved_rows_without_rewriting_payloads() {
+        let path = temp_db_path("mentions-index-migration");
+        let mut messages: Vec<_> = (1..=8).map(|id| message(id, 1000, "room")).collect();
+        messages[0].flags.is_highlighted = true;
+        messages[1].flags.is_mention = true;
+        messages[2].flags.is_first_msg = true;
+        messages[3].flags.is_pinned = true;
+        messages[4].flags.is_mention = true;
+        messages[4].flags.suppress_notification = true;
+        messages[5].flags.is_mention = true;
+        messages[5].channel = ChannelId("whisper:uid:1:bob".into());
+        messages[6].raw_text = r#"quoted flag: "is_mention":true"#.into();
+        messages[7].flags.is_mention = true;
+        messages[7].channel = ChannelId("whisper:alice".into());
+        let payloads: Vec<_> = messages
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let mut value = serde_json::to_value(row).unwrap();
+                if index == 1 {
+                    value["flags"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("suppress_notification");
+                }
+                if index == 3 {
+                    serde_json::to_string_pretty(&value).unwrap()
+                } else {
+                    serde_json::to_string(&value).unwrap()
+                }
+            })
+            .collect();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE chat_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, channel TEXT NOT NULL,
+                    ts_ms INTEGER NOT NULL, server_id TEXT, payload_json TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+            for (row, payload) in messages.iter().zip(&payloads) {
+                conn.execute(
+                    "INSERT INTO chat_messages(channel, ts_ms, server_id, payload_json)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        row.channel.as_str(),
+                        row.timestamp.timestamp_millis(),
+                        row.server_id,
+                        payload
+                    ],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO chat_messages(channel, ts_ms, payload_json)
+                 VALUES ('room', 2000, 'invalid archived JSON')",
+                [],
+            )
+            .unwrap();
+        }
+        {
+            let store = LogStore::with_db_path(path.clone()).unwrap();
+            let index_exists = || {
+                store.conn.lock().unwrap().query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'idx_chat_messages_attention_ts')",
+                [], |row| row.get::<_, bool>(0),
+            ).unwrap()
+            };
+            assert!(
+                !index_exists(),
+                "opening saved logs must defer the migration scan"
+            );
+            assert_eq!(
+                store
+                    .recent_mentions(20)
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.id.0)
+                    .collect::<Vec<_>>(),
+                [1, 2, 3, 4]
+            );
+            assert!(index_exists());
+            assert_eq!(
+                store
+                    .recent_mentions(2)
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.id.0)
+                    .collect::<Vec<_>>(),
+                [3, 4]
+            );
+            let conn = store.conn.lock().unwrap();
+            let mut query = conn
+                .prepare("SELECT payload_json FROM chat_messages WHERE id <= 8 ORDER BY id")
+                .unwrap();
+            let saved = query
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(saved, payloads);
+        }
+        {
+            let store = LogStore::with_db_path(path.clone()).unwrap();
+            assert_eq!(store.recent_mentions(20).unwrap().len(), 4);
+            let conn = store.conn.lock().unwrap();
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM chat_messages", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 9);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn mentions_index_tracks_writes_highlights_suppression_and_removal() {
+        let path = temp_db_path("mentions-index-updates");
+        let first = LogStore::with_db_path(path.clone()).unwrap();
+        assert!(first.recent_mentions(10).unwrap().is_empty());
+        let second = LogStore::with_db_path(path.clone()).unwrap();
+        let row = message(1, 1000, "room");
+        second.append_message(&row).unwrap();
+        assert!(first.recent_mentions(10).unwrap().is_empty());
+        second
+            .mark_highlighted(&row.channel, row.server_id.as_deref(), row.id, 1000)
+            .unwrap();
+        assert_eq!(first.recent_mentions(10).unwrap()[0].id.0, 1);
+
+        let mut next = message(2, 1000, "room");
+        next.flags.is_mention = true;
+        second.append_message(&next).unwrap();
+        assert_eq!(first.recent_mentions(1).unwrap()[0].id.0, 2);
+        {
+            let conn = second.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE chat_messages SET payload_json = json_set(payload_json, '$.flags.suppress_notification', json('true'))
+                 WHERE server_id = 'message-2'", [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO chat_messages(channel, ts_ms, payload_json) VALUES ('room', 3000, 'invalid')", [],
+            ).unwrap();
+        }
+        assert_eq!(
+            first
+                .recent_mentions(10)
+                .unwrap()
+                .iter()
+                .map(|row| row.id.0)
+                .collect::<Vec<_>>(),
+            [1]
+        );
+        second
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM chat_messages WHERE server_id = 'message-1'",
+                [],
+            )
+            .unwrap();
+        assert!(first.recent_mentions(10).unwrap().is_empty());
+        drop(first);
+        drop(second);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn mentions_query_uses_the_attention_index_without_sorting_the_log() {
+        let store = LogStore::with_db_path(PathBuf::from(":memory:")).unwrap();
+        let mut attention = message(1, 1000, "room");
+        attention.flags.is_mention = true;
+        store.append_message(&attention).unwrap();
+        for id in 2..=100 {
+            store
+                .append_message(&message(id, id as i64, "room"))
+                .unwrap();
+        }
+        assert_eq!(store.recent_mentions(1).unwrap()[0].id.0, 1);
+        let conn = store.conn.lock().unwrap();
+        let mut query = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", recent_mentions_query()))
+            .unwrap();
+        let plan = query
+            .query_map(params![500], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("USING INDEX idx_chat_messages_attention_ts")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter().all(|line| !line.contains("TEMP B-TREE")),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "manual performance comparison; timings depend on the machine"]
+    fn perf_mentions_history() {
+        use std::time::Instant;
+
+        const ROWS: i64 = 100_000;
+        let store = LogStore::with_db_path(PathBuf::from(":memory:")).unwrap();
+        let mut sample = message(1, 1000, "room");
+        sample.raw_text = "sample ".repeat(100);
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "WITH RECURSIVE rows(n) AS (
+                     VALUES(1) UNION ALL SELECT n + 1 FROM rows WHERE n < ?1
+                 )
+                 INSERT INTO chat_messages(channel, ts_ms, server_id, payload_json)
+                 SELECT 'room' || (n % 10), n, 'seed-' || n,
+                     json_set(?2, '$.id', n, '$.channel', 'room' || (n % 10),
+                         '$.flags.is_mention', json(CASE WHEN n % 1000 = 0 THEN 'true' ELSE 'false' END))
+                 FROM rows",
+                params![ROWS, serde_json::to_string(&sample).unwrap()],
+            ).unwrap();
+        }
+        let started = Instant::now();
+        let expected = store.recent_mentions(500).unwrap();
+        let migration = started.elapsed();
+        assert_eq!(expected.len(), 100);
+        let mut previous_samples = Vec::new();
+        let mut current_samples = Vec::new();
+        for round in 0..5 {
+            for current in [round % 2 == 0, round % 2 != 0] {
+                let started = Instant::now();
+                let messages = if current {
+                    store.recent_mentions(500).unwrap()
+                } else {
+                    let conn = store.conn.lock().unwrap();
+                    // The former query used payload substrings and had to
+                    // inspect every saved row, even when fewer than 500 matched.
+                    let mut query = conn.prepare(
+                        r#"SELECT payload_json FROM chat_messages
+                           WHERE channel NOT LIKE 'whisper:%'
+                             AND CASE WHEN json_valid(payload_json)
+                                 THEN COALESCE(json_extract(payload_json, '$.flags.suppress_notification'), 0) = 0
+                                 ELSE 0 END
+                             AND (payload_json LIKE '%"is_highlighted":true%'
+                                 OR payload_json LIKE '%"is_mention":true%'
+                                 OR payload_json LIKE '%"is_first_msg":true%'
+                                 OR payload_json LIKE '%"is_pinned":true%')
+                           ORDER BY ts_ms DESC, id DESC LIMIT 500"#,
+                    ).unwrap();
+                    let mut rows: Vec<ChatMessage> = query
+                        .query_map([], |row| row.get::<_, String>(0))
+                        .unwrap()
+                        .map(|row| serde_json::from_str(&row.unwrap()).unwrap())
+                        .collect();
+                    rows.reverse();
+                    rows
+                };
+                let elapsed = started.elapsed();
+                assert_eq!(
+                    messages.iter().map(|row| row.id).collect::<Vec<_>>(),
+                    expected.iter().map(|row| row.id).collect::<Vec<_>>()
+                );
+                if current {
+                    current_samples.push(elapsed);
+                } else {
+                    previous_samples.push(elapsed);
+                }
+            }
+        }
+        previous_samples.sort_unstable();
+        current_samples.sort_unstable();
+        let profile = if cfg!(debug_assertions) {
+            "dev"
+        } else {
+            "release"
+        };
+        eprintln!(
+            "SQLite {}: mentions from {ROWS} rows, 100 matches; median of 5, in-memory, {profile} profile. Previous {:?}; indexed {:?}; first read including index migration {:?}",
+            rusqlite::version(), previous_samples[2], current_samples[2], migration,
+        );
     }
 }

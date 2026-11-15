@@ -11,6 +11,7 @@ pub(crate) mod hype_train_poller;
 pub(crate) mod link_preview;
 pub(crate) mod live_emotes;
 pub(crate) mod live_feed;
+pub(crate) mod log_writer;
 pub(crate) mod outgoing;
 pub(crate) mod plugins;
 pub(crate) mod profiles;

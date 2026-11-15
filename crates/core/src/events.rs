@@ -57,6 +57,25 @@ pub struct LinkPreview {
     /// True once the fetch attempt has completed (even if it returned nothing).
     pub fetched: bool,
 }
+/// Internal history updates use a bounded queue independent of user commands.
+#[derive(Debug)]
+pub enum HistoryUpdate {
+    Highlight {
+        channel: ChannelId,
+        server_id: Option<String>,
+        message_id: crate::model::MessageId,
+        timestamp_ms: i64,
+    },
+    Confirmation {
+        message: Box<ChatMessage>,
+        original_timestamp_ms: i64,
+    },
+    /// Forward all earlier updates before a history read reaches the writer.
+    Flush(tokio::sync::oneshot::Sender<Result<(), String>>),
+    /// Close and drain this queue before the writer shuts down.
+    Shutdown(tokio::sync::oneshot::Sender<Result<(), String>>),
+}
+
 // Commands (UI to runtime): actions initiated by the UI
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -308,10 +327,7 @@ pub enum AppCommand {
         maximized: bool,
     },
     /// Persist whispers-panel state.
-    SetWhispersPanel {
-        visible: bool,
-        active_login: String,
-    },
+    SetWhispersPanel { visible: bool, active_login: String },
     /// Persist user-arranged channel tab order.
     SetChannelOrder { order: Vec<String> },
     /// Persist split-pane layout.
@@ -411,13 +427,6 @@ pub enum AppCommand {
         before_row_id: Option<i64>,
         /// Maximum number of rows to load.
         limit: usize,
-    },
-    /// Save a custom highlight after the UI evaluates its channel context.
-    PersistMessageHighlight {
-        channel: ChannelId,
-        server_id: Option<String>,
-        message_id: crate::model::MessageId,
-        timestamp_ms: i64,
     },
     /// Create a Twitch poll via Helix (`POST /helix/polls`).
     CreatePoll {
@@ -655,7 +664,9 @@ pub enum AppEvent {
         user_id: String,
     },
     /// The old account is detached while a new token or chat session is checked.
-    AuthenticationPending { username: Option<String> },
+    AuthenticationPending {
+        username: Option<String>,
+    },
     /// Full snapshot of the emote catalog (sent after each load).
     EmoteCatalogUpdated {
         emotes: Vec<EmoteCatalogEntry>,
@@ -673,6 +684,11 @@ pub enum AppEvent {
         messages: Vec<ChatMessage>,
         /// Local paging position; external history does not change this cursor.
         local: Option<crate::model::LocalHistoryPageInfo>,
+    },
+    /// Internal history restore; these are not new moderation events for plugins.
+    HistoryModerationLoaded {
+        channel: ChannelId,
+        actions: Vec<crate::model::ModerationAction>,
     },
     /// Mention-matching messages replayed from the local SQLite log on
     /// startup. Populates the cross-channel Mentions pseudo-tab buffer.
@@ -705,6 +721,10 @@ pub enum AppEvent {
     UserMessagesCleared {
         channel: ChannelId,
         login: String,
+        /// Stable sender identity when supplied by the chat service.
+        user_id: Option<String>,
+        /// Source event time; absent sources only clear retained messages.
+        timestamp: Option<DateTime<Utc>>,
     },
     /// Low-trust treatment for a user changed. `status = None` means cleared.
     LowTrustStatusUpdated {
@@ -732,6 +752,7 @@ pub enum AppEvent {
     /// A moderator cleared chat; hide user messages while retaining notices.
     ChannelChatCleared {
         channel: ChannelId,
+        timestamp: Option<DateTime<Utc>>,
     },
     /// The logged-in user's avatar URL has been resolved.
     SelfAvatarLoaded {
@@ -1053,7 +1074,9 @@ pub enum AppEvent {
         followed_at: Option<String>,
     },
     /// Auto-claim setting changed (persisted in [`crate::*`] settings).
-    AutoClaimBonusPointsUpdated { enabled: bool },
+    AutoClaimBonusPointsUpdated {
+        enabled: bool,
+    },
     /// Latest channel-points balance for the logged-in user in `channel`.
     /// Emitted by the periodic claimer poll; safe to ignore when the user
     /// is anonymous or not on a Twitch tab.
@@ -1070,9 +1093,13 @@ pub enum AppEvent {
     },
     /// Embedded webview login state changed.
     /// `logged_in = None` during initial probe.
-    TwitchWebviewLoginState { logged_in: Option<bool> },
+    TwitchWebviewLoginState {
+        logged_in: Option<bool>,
+    },
     /// Embedded webview DOM-clicked a Bonus Points button on `channel`.
-    TwitchWebviewBonusClaimed { channel: crate::model::ChannelId },
+    TwitchWebviewBonusClaimed {
+        channel: crate::model::ChannelId,
+    },
     /// Usercard preferences loaded/updated (currently: show-pronouns toggle).
     UsercardSettingsUpdated {
         show_pronouns: bool,
@@ -1270,6 +1297,136 @@ impl std::fmt::Display for ConnectionState {
                 write!(f, "Reconnecting (attempt {attempt})...")
             }
             ConnectionState::Error(e) => write!(f, "Error: {e}"),
+        }
+    }
+}
+
+impl AppEvent {
+    /// Fixed event name for timing diagnostics without logging payloads.
+    pub fn diagnostic_name(&self) -> &'static str {
+        match self {
+            Self::ConnectionStateChanged { .. } => "ConnectionStateChanged",
+            Self::ChannelJoined { .. } => "ChannelJoined",
+            Self::ChannelParted { .. } => "ChannelParted",
+            Self::ChannelRedirected { .. } => "ChannelRedirected",
+            Self::MessageReceived { .. } => "MessageReceived",
+            Self::MessageSendRejected { .. } => "MessageSendRejected",
+            Self::WhisperReceived { .. } => "WhisperReceived",
+            Self::WhisperSendFailed { .. } => "WhisperSendFailed",
+            Self::MessageDeleted { .. } => "MessageDeleted",
+            Self::SystemNotice(..) => "SystemNotice",
+            Self::EmoteImageReady { .. } => "EmoteImageReady",
+            Self::Authenticated { .. } => "Authenticated",
+            Self::AuthenticationPending { .. } => "AuthenticationPending",
+            Self::EmoteCatalogUpdated { .. } => "EmoteCatalogUpdated",
+            Self::LoggedOut => "LoggedOut",
+            Self::Error { .. } => "Error",
+            Self::HistoryLoaded { .. } => "HistoryLoaded",
+            Self::HistoryModerationLoaded { .. } => "HistoryModerationLoaded",
+            Self::MentionsLoaded { .. } => "MentionsLoaded",
+            Self::UserProfileLoaded { .. } => "UserProfileLoaded",
+            Self::StreamStatusUpdated { .. } => "StreamStatusUpdated",
+            Self::UserProfileUnavailable { .. } => "UserProfileUnavailable",
+            Self::UserMessagesCleared { .. } => "UserMessagesCleared",
+            Self::LowTrustStatusUpdated { .. } => "LowTrustStatusUpdated",
+            Self::UserStateUpdated { .. } => "UserStateUpdated",
+            Self::ChannelMessagesCleared { .. } => "ChannelMessagesCleared",
+            Self::ChannelChatCleared { .. } => "ChannelChatCleared",
+            Self::SelfAvatarLoaded { .. } => "SelfAvatarLoaded",
+            Self::SharedChannelResolved { .. } => "SharedChannelResolved",
+            Self::SharedChatSessionUpdated { .. } => "SharedChatSessionUpdated",
+            Self::LinkPreviewReady { .. } => "LinkPreviewReady",
+            Self::AccountListUpdated { .. } => "AccountListUpdated",
+            Self::IrcTopicChanged { .. } => "IrcTopicChanged",
+            Self::ChannelEmotesLoaded { .. } => "ChannelEmotesLoaded",
+            Self::BetaFeaturesUpdated { .. } => "BetaFeaturesUpdated",
+            Self::ChatUiBehaviorUpdated { .. } => "ChatUiBehaviorUpdated",
+            Self::GeneralSettingsUpdated { .. } => "GeneralSettingsUpdated",
+            Self::ExternalToolsSettingsUpdated { .. } => "ExternalToolsSettingsUpdated",
+            Self::SlashUsageCountsUpdated { .. } => "SlashUsageCountsUpdated",
+            Self::EmotePickerPreferencesUpdated { .. } => "EmotePickerPreferencesUpdated",
+            Self::SpellDictionaryUpdated { .. } => "SpellDictionaryUpdated",
+            Self::RestoreLastActiveChannel { .. } => "RestoreLastActiveChannel",
+            Self::FontSettingsUpdated { .. } => "FontSettingsUpdated",
+            Self::TabVisibilityRulesUpdated { .. } => "TabVisibilityRulesUpdated",
+            Self::AppearanceSettingsUpdated { .. } => "AppearanceSettingsUpdated",
+            Self::ImagePrefetchQueued { .. } => "ImagePrefetchQueued",
+            Self::RoomStateUpdated { .. } => "RoomStateUpdated",
+            Self::SenderCosmeticsUpdated { .. } => "SenderCosmeticsUpdated",
+            Self::IvrLogsLoaded { .. } => "IvrLogsLoaded",
+            Self::IvrLogsFailed { .. } => "IvrLogsFailed",
+            Self::AutoModQueueAppend { .. } => "AutoModQueueAppend",
+            Self::AutoModQueueRemove { .. } => "AutoModQueueRemove",
+            Self::ClearUserMessagesLocally { .. } => "ClearUserMessagesLocally",
+            Self::UnbanRequestsLoaded { .. } => "UnbanRequestsLoaded",
+            Self::UnbanRequestsFailed { .. } => "UnbanRequestsFailed",
+            Self::UnbanRequestUpsert { .. } => "UnbanRequestUpsert",
+            Self::UnbanRequestResolved { .. } => "UnbanRequestResolved",
+            Self::OpenModerationTools { .. } => "OpenModerationTools",
+            Self::HighlightRulesUpdated { .. } => "HighlightRulesUpdated",
+            Self::FilterRecordsUpdated { .. } => "FilterRecordsUpdated",
+            Self::ModActionPresetsUpdated { .. } => "ModActionPresetsUpdated",
+            Self::NicknamesUpdated { .. } => "NicknamesUpdated",
+            Self::IgnoredUsersUpdated { .. } => "IgnoredUsersUpdated",
+            Self::IgnoredPhrasesUpdated { .. } => "IgnoredPhrasesUpdated",
+            Self::CommandAliasesUpdated { .. } => "CommandAliasesUpdated",
+            Self::HotkeyBindingsUpdated { .. } => "HotkeyBindingsUpdated",
+            Self::UserPronounsLoaded { .. } => "UserPronounsLoaded",
+            Self::UserCardFollowAgeLoaded { .. } => "UserCardFollowAgeLoaded",
+            Self::AutoClaimBonusPointsUpdated { .. } => "AutoClaimBonusPointsUpdated",
+            Self::ChannelPointsBalanceUpdated { .. } => "ChannelPointsBalanceUpdated",
+            Self::ChannelPointsClaimed { .. } => "ChannelPointsClaimed",
+            Self::TwitchWebviewLoginState { .. } => "TwitchWebviewLoginState",
+            Self::TwitchWebviewBonusClaimed { .. } => "TwitchWebviewBonusClaimed",
+            Self::UsercardSettingsUpdated { .. } => "UsercardSettingsUpdated",
+            Self::AuthExpired => "AuthExpired",
+            Self::UpdaterSettingsUpdated { .. } => "UpdaterSettingsUpdated",
+            Self::UpdateAvailable { .. } => "UpdateAvailable",
+            Self::UpdateCheckUpToDate { .. } => "UpdateCheckUpToDate",
+            Self::UpdateCheckFailed { .. } => "UpdateCheckFailed",
+            Self::UpdateInstallStarted { .. } => "UpdateInstallStarted",
+            Self::UpdateInstallScheduled { .. } => "UpdateInstallScheduled",
+            Self::UpdateInstallFailed { .. } => "UpdateInstallFailed",
+            Self::PluginUiAction { .. } => "PluginUiAction",
+            Self::PluginUiChange { .. } => "PluginUiChange",
+            Self::PluginUiSubmit { .. } => "PluginUiSubmit",
+            Self::PluginUiWindowClosed { .. } => "PluginUiWindowClosed",
+            Self::SoundSettingsUpdated { .. } => "SoundSettingsUpdated",
+            Self::StreamerModeSettingsUpdated { .. } => "StreamerModeSettingsUpdated",
+            Self::StreamerModeActiveChanged { .. } => "StreamerModeActiveChanged",
+            Self::UploadStarted { .. } => "UploadStarted",
+            Self::UploadFinished { .. } => "UploadFinished",
+            Self::HypeTrainUpdated { .. } => "HypeTrainUpdated",
+            Self::HypeTrainCleared { .. } => "HypeTrainCleared",
+            Self::RaidBannerShown { .. } => "RaidBannerShown",
+            Self::LiveFeedUpdated { .. } => "LiveFeedUpdated",
+            Self::LiveFeedError { .. } => "LiveFeedError",
+            Self::LiveFeedPartialUpdate { .. } => "LiveFeedPartialUpdate",
+        }
+    }
+
+    pub fn moderation_action(&self) -> Option<crate::model::ModerationAction> {
+        use crate::model::ModerationAction;
+        match self {
+            Self::MessageDeleted { channel, server_id } => Some(ModerationAction::message(
+                channel.clone(),
+                server_id.clone(),
+            )),
+            Self::UserMessagesCleared {
+                channel,
+                login,
+                user_id,
+                timestamp,
+            } => Some(ModerationAction::user(
+                channel.clone(),
+                login.clone(),
+                user_id.clone(),
+                *timestamp,
+            )),
+            Self::ChannelChatCleared { channel, timestamp } => {
+                Some(ModerationAction::channel(channel.clone(), *timestamp))
+            }
+            _ => None,
         }
     }
 }

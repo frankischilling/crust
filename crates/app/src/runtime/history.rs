@@ -2,7 +2,10 @@ use std::collections::{HashMap, HashSet};
 
 use crust_core::{
     events::AppEvent,
-    model::{ChannelId, ChatMessage, HistoryCursor, LocalHistoryMessageIdentity, LocalHistoryPageInfo, MessageId},
+    model::{
+        ChannelId, ChatMessage, HistoryCursor, LocalHistoryMessageIdentity, LocalHistoryPageInfo,
+        MessageId, ModerationAction, ModerationState, ModerationTarget, Nickname,
+    },
 };
 use crust_storage::LogStore;
 use crust_twitch::{parse_line, parse_privmsg_irc};
@@ -12,6 +15,7 @@ use tracing::{info, warn};
 use crate::seventv::SevenTvCosmeticUpdate;
 
 use super::badges::{resolve_badge_url, BadgeMap};
+use super::log_writer::{flush_before_read, publish_history_moderation, LogWriter};
 
 const WHISPER_HISTORY_CHANNEL_PREFIX: &str = "whisper:uid:";
 
@@ -33,10 +37,19 @@ impl WhisperAccount {
                 self.owner = None;
                 self.user_id = None;
             }
-            AppEvent::WhisperReceived { owner_user_id, from_user_id, from_login, target_login, is_self, .. } => {
+            AppEvent::WhisperReceived {
+                owner_user_id,
+                from_user_id,
+                from_login,
+                target_login,
+                is_self,
+                ..
+            } => {
                 if self.user_id.as_deref() != crate::normalize_whisper_user_id(owner_user_id)
                     || self.user_id.is_none()
-                    || (*is_self && crate::normalize_whisper_user_id(from_user_id) != self.user_id.as_deref())
+                    || (*is_self
+                        && crate::normalize_whisper_user_id(from_user_id)
+                            != self.user_id.as_deref())
                 {
                     return false;
                 }
@@ -61,16 +74,24 @@ impl WhisperAccount {
 }
 
 /// Keep the sender's supplied identity when live whispers enter history and the UI.
-pub(crate) fn prepare_live_whisper(
+pub(crate) async fn prepare_live_whisper(
     event: AppEvent,
     local_login: Option<&str>,
     local_user_id: Option<&str>,
     emote_index: &crate::EmoteIndex,
-    log_store: Option<&LogStore>,
+    log_writer: Option<&LogWriter>,
 ) -> Option<AppEvent> {
     let AppEvent::WhisperReceived {
-        owner_user_id, from_user_id, from_login, target_login, is_self, ..
-    } = &event else { return None; };
+        owner_user_id,
+        from_user_id,
+        from_login,
+        target_login,
+        is_self,
+        ..
+    } = &event
+    else {
+        return None;
+    };
     let local_login = local_login.and_then(crate::normalize_whisper_login)?;
     let local_user_id = local_user_id.and_then(crate::normalize_whisper_user_id)?;
     if crate::normalize_whisper_user_id(owner_user_id) != Some(local_user_id)
@@ -82,13 +103,17 @@ pub(crate) fn prepare_live_whisper(
     if owner.as_deref() != Some(local_login.as_str()) {
         return None;
     }
-    emote_index.write().unwrap().queue_whisper_sender(local_user_id, from_user_id);
+    emote_index
+        .write()
+        .unwrap()
+        .queue_whisper_sender(local_user_id, from_user_id);
     if !*is_self {
-        if let Some(store) = log_store {
-            if let Err(error) = crate::persist_whisper_message(
-                store, Some(&local_login), Some(local_user_id), &event,
-            ) {
-                warn!("whisper-history: failed to persist whisper: {error}");
+        if let Some(writer) = log_writer {
+            if let Err(error) = writer
+                .whisper(local_login.clone(), local_user_id.to_owned(), event.clone())
+                .await
+            {
+                warn!("whisper-history: failed to queue whisper: {error}");
             }
         }
     }
@@ -109,18 +134,34 @@ impl WhisperHistory {
         owner_user_id: &str,
         emote_index: &crate::EmoteIndex,
         evt_tx: mpsc::Sender<AppEvent>,
+        log_writer: Option<LogWriter>,
     ) {
-        let Some(owner) = crate::normalize_whisper_login(owner) else { return; };
-        let Some(owner_user_id) = crate::normalize_whisper_user_id(owner_user_id).map(str::to_owned) else { return; };
+        let Some(owner) = crate::normalize_whisper_login(owner) else {
+            return;
+        };
+        let Some(owner_user_id) =
+            crate::normalize_whisper_user_id(owner_user_id).map(str::to_owned)
+        else {
+            return;
+        };
         let identity = (owner_user_id.clone(), owner.clone());
         if self.owner.as_ref() == Some(&identity) {
             return;
         }
         self.clear();
         self.owner = Some(identity);
-        self.task = Some(tokio::spawn(load_local_recent_whispers(
-            log_store, Some(owner), Some(owner_user_id), evt_tx, Some(emote_index.clone()),
-        )));
+        let emotes = emote_index.clone();
+        self.task = Some(tokio::spawn(async move {
+            flush_before_read(log_writer.as_ref()).await;
+            load_local_recent_whispers(
+                log_store,
+                Some(owner),
+                Some(owner_user_id),
+                evt_tx,
+                Some(emotes),
+            )
+            .await;
+        }));
     }
 
     pub(crate) fn clear(&mut self) {
@@ -144,7 +185,11 @@ mod whisper_tests {
     fn whisper(owner_user_id: &str, owner: &str, is_self: bool) -> AppEvent {
         AppEvent::WhisperReceived {
             owner_user_id: owner_user_id.to_owned(),
-            from_user_id: if is_self { owner_user_id.to_owned() } else { String::new() },
+            from_user_id: if is_self {
+                owner_user_id.to_owned()
+            } else {
+                String::new()
+            },
             from_login: if is_self { owner } else { "bob" }.into(),
             from_display_name: "Bob".into(),
             target_login: if is_self { "bob" } else { owner }.into(),
@@ -158,7 +203,9 @@ mod whisper_tests {
 
     fn save(store: &LogStore, owner_user_id: &str, owner: &str, text: &str) {
         let mut event = whisper(owner_user_id, owner, false);
-        if let AppEvent::WhisperReceived { text: body, .. } = &mut event { *body = text.to_owned(); }
+        if let AppEvent::WhisperReceived { text: body, .. } = &mut event {
+            *body = text.to_owned();
+        }
         crate::persist_whisper_message(store, Some(owner), Some(owner_user_id), &event).unwrap();
     }
 
@@ -166,52 +213,86 @@ mod whisper_tests {
     fn account_filter_rejects_old_callbacks_before_plugin_dispatch() {
         let mut account = WhisperAccount::default();
         assert!(!account.accepts(&whisper("1", "alice", false)));
-        account.accepts(&AppEvent::Authenticated { username: "Alice".into(), user_id: "1".into() });
+        account.accepts(&AppEvent::Authenticated {
+            username: "Alice".into(),
+            user_id: "1".into(),
+        });
         assert!(account.accepts(&whisper("1", "ALICE", false)));
         assert!(account.accepts(&whisper("1", "alice", true)));
         account.accepts(&AppEvent::LoggedOut);
         assert!(!account.accepts(&whisper("1", "alice", false)));
-        account.accepts(&AppEvent::Authenticated { username: "carol".into(), user_id: "2".into() });
+        account.accepts(&AppEvent::Authenticated {
+            username: "carol".into(),
+            user_id: "2".into(),
+        });
         assert!(!account.accepts(&whisper("1", "alice", false)));
         assert!(!account.accepts(&whisper("1", "alice", true)));
         assert!(account.accepts(&whisper("2", "carol", false)));
-        account.accepts(&AppEvent::Authenticated { username: "carol".into(), user_id: "3".into() });
+        account.accepts(&AppEvent::Authenticated {
+            username: "carol".into(),
+            user_id: "3".into(),
+        });
         assert!(!account.accepts(&whisper("2", "carol", false)));
         assert!(!account.accepts(&whisper("2", "carol", true)));
         assert!(account.accepts(&whisper("3", "carol", false)));
     }
 
-    #[test]
-    fn whisper_failures_follow_owner_ids_before_plugin_dispatch() {
+    #[tokio::test]
+    async fn whisper_failures_follow_owner_ids_before_plugin_dispatch() {
         let mut account = WhisperAccount::default();
-        let failed = |owner: &str| super::super::outgoing::complete_whisper_send(
-            reqwest::StatusCode::FORBIDDEN, "unavailable", owner, "alice", "bob",
-            "private message", Vec::new(), None,
-        );
-        assert!(!account.accepts(&failed("1")));
-        account.accepts(&AppEvent::Authenticated { username: "alice".into(), user_id: "1".into() });
-        assert!(account.accepts(&failed("1")));
+        async fn failed(owner: &str) -> AppEvent {
+            super::super::outgoing::complete_whisper_send(
+                reqwest::StatusCode::FORBIDDEN,
+                "unavailable",
+                owner,
+                "alice",
+                "bob",
+                "private message",
+                Vec::new(),
+                None,
+            )
+            .await
+        }
+        assert!(!account.accepts(&failed("1").await));
+        account.accepts(&AppEvent::Authenticated {
+            username: "alice".into(),
+            user_id: "1".into(),
+        });
+        assert!(account.accepts(&failed("1").await));
         account.accepts(&AppEvent::LoggedOut);
-        assert!(!account.accepts(&failed("1")));
-        account.accepts(&AppEvent::Authenticated { username: "alice".into(), user_id: "2".into() });
-        assert!(!account.accepts(&failed("1")));
-        assert!(!account.accepts(&failed("")));
-        assert!(account.accepts(&failed("2")));
-        account.accepts(&AppEvent::Authenticated { username: "renamed".into(), user_id: "2".into() });
-        assert!(account.accepts(&failed("2")));
+        assert!(!account.accepts(&failed("1").await));
+        account.accepts(&AppEvent::Authenticated {
+            username: "alice".into(),
+            user_id: "2".into(),
+        });
+        assert!(!account.accepts(&failed("1").await));
+        assert!(!account.accepts(&failed("").await));
+        assert!(account.accepts(&failed("2").await));
+        account.accepts(&AppEvent::Authenticated {
+            username: "renamed".into(),
+            user_id: "2".into(),
+        });
+        assert!(account.accepts(&failed("2").await));
     }
 
     #[test]
     fn account_filter_rejects_stale_avatars_before_plugin_dispatch() {
         let mut account = WhisperAccount::default();
         let avatar = |owner: &str| AppEvent::SelfAvatarLoaded {
-            account: owner.to_owned(), avatar_url: "https://example.test/avatar.png".to_owned(),
+            account: owner.to_owned(),
+            avatar_url: "https://example.test/avatar.png".to_owned(),
         };
         assert!(!account.accepts(&avatar("alice")));
-        account.accepts(&AppEvent::Authenticated { username: "Alice".into(), user_id: "1".into() });
+        account.accepts(&AppEvent::Authenticated {
+            username: "Alice".into(),
+            user_id: "1".into(),
+        });
         assert!(account.accepts(&avatar("ALICE")));
         assert!(!account.accepts(&avatar("")));
-        account.accepts(&AppEvent::Authenticated { username: "carol".into(), user_id: "2".into() });
+        account.accepts(&AppEvent::Authenticated {
+            username: "carol".into(),
+            user_id: "2".into(),
+        });
         assert!(!account.accepts(&avatar("alice")));
         assert!(account.accepts(&avatar("carol")));
         account.accepts(&AppEvent::LoggedOut);
@@ -224,8 +305,11 @@ mod whisper_tests {
         save(&store, "1", "reused", "first account");
         save(&store, "2", "reused", "second account");
         let mut legacy = super::super::system_messages::make_system_message(
-            42, ChannelId("whisper:bob".into()), "unowned legacy".into(),
-            chrono::Utc::now(), crust_core::model::MsgKind::Chat,
+            42,
+            ChannelId("whisper:bob".into()),
+            "unowned legacy".into(),
+            chrono::Utc::now(),
+            crust_core::model::MsgKind::Chat,
         );
         legacy.sender.login = "bob".into();
         store.append_message(&legacy).unwrap();
@@ -234,8 +318,22 @@ mod whisper_tests {
         store.append_message(&legacy).unwrap();
         let (events, mut received) = mpsc::channel(8);
         for (owner, text) in [("1", "first account"), ("2", "second account")] {
-            load_local_recent_whispers(store.clone(), Some("reused".into()), Some(owner.into()), events.clone(), None).await;
-            let AppEvent::WhisperReceived { owner_user_id, target_login, text: actual, from_login, .. } = received.try_recv().unwrap() else {
+            load_local_recent_whispers(
+                store.clone(),
+                Some("reused".into()),
+                Some(owner.into()),
+                events.clone(),
+                None,
+            )
+            .await;
+            let AppEvent::WhisperReceived {
+                owner_user_id,
+                target_login,
+                text: actual,
+                from_login,
+                ..
+            } = received.try_recv().unwrap()
+            else {
                 panic!("expected account whisper history");
             };
             assert_eq!(owner_user_id, owner);
@@ -244,11 +342,24 @@ mod whisper_tests {
             assert_eq!(from_login, "bob");
             assert!(received.try_recv().is_err());
         }
-        load_local_recent_whispers(store.clone(), None, Some("1".into()), events.clone(), None).await;
+        load_local_recent_whispers(store.clone(), None, Some("1".into()), events.clone(), None)
+            .await;
         load_local_recent_whispers(store.clone(), Some("reused".into()), None, events, None).await;
         assert!(received.try_recv().is_err());
-        assert_eq!(store.recent_messages(&ChannelId("whisper:bob".into()), 10).unwrap().len(), 1);
-        assert_eq!(store.recent_messages(&ChannelId("whisper:reused:bob".into()), 10).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .recent_messages(&ChannelId("whisper:bob".into()), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .recent_messages(&ChannelId("whisper:reused:bob".into()), 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -256,10 +367,17 @@ mod whisper_tests {
         let store = LogStore::with_db_path(":memory:".into()).unwrap();
         save(&store, "10", "before", "incoming before rename");
         let mut sent = whisper("10", "before", true);
-        if let AppEvent::WhisperReceived { text, .. } = &mut sent { *text = "sent before rename".into(); }
+        if let AppEvent::WhisperReceived { text, .. } = &mut sent {
+            *text = "sent before rename".into();
+        }
         crate::persist_whisper_message(&store, Some("before"), Some("10"), &sent).unwrap();
         let channel = crate::whisper_thread_channel_id("10", "bob");
-        let mut bad_self = store.recent_messages(&channel, 10).unwrap().into_iter().find(|message| message.flags.is_self).unwrap();
+        let mut bad_self = store
+            .recent_messages(&channel, 10)
+            .unwrap()
+            .into_iter()
+            .find(|message| message.flags.is_self)
+            .unwrap();
         bad_self.sender.user_id.0 = "99".into();
         bad_self.raw_text = "wrong sender ID".into();
         store.append_message(&bad_self).unwrap();
@@ -267,10 +385,20 @@ mod whisper_tests {
         bad_self.raw_text = "unknown sender ID".into();
         store.append_message(&bad_self).unwrap();
         let (events, mut received) = mpsc::channel(8);
-        load_local_recent_whispers(store, Some("after".into()), Some("10".into()), events, None).await;
+        load_local_recent_whispers(store, Some("after".into()), Some("10".into()), events, None)
+            .await;
         let mut count = 0;
         while let Ok(event) = received.try_recv() {
-            let AppEvent::WhisperReceived { owner_user_id, from_user_id, from_login, target_login, text, is_self, .. } = event else {
+            let AppEvent::WhisperReceived {
+                owner_user_id,
+                from_user_id,
+                from_login,
+                target_login,
+                text,
+                is_self,
+                ..
+            } = event
+            else {
                 panic!("expected renamed account history");
             };
             assert_eq!(owner_user_id, "10");
@@ -295,30 +423,58 @@ mod whisper_tests {
         for is_self in [false, true] {
             let event = whisper("1", "alice", is_self);
             for (local, local_id) in [
-                (Some("carol"), Some("1")), (Some("alice"), Some("2")),
-                (Some("alice"), None), (None, Some("1")),
+                (Some("carol"), Some("1")),
+                (Some("alice"), Some("2")),
+                (Some("alice"), None),
+                (None, Some("1")),
             ] {
                 crate::persist_whisper_message(&store, local, local_id, &event).unwrap();
             }
         }
-        assert!(store.recent_channels_with_prefix("whisper:", 20).unwrap().is_empty());
+        assert!(store
+            .recent_channels_with_prefix("whisper:", 20)
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
     async fn live_whisper_sender_ids_survive_storage_and_replay_for_personal_emotes() {
         let store = LogStore::with_db_path(":memory:".into()).unwrap();
+        let (writer_events, _writer_received) = mpsc::channel(4);
+        let writer = LogWriter::new(
+            &tokio::runtime::Handle::current(),
+            store.clone(),
+            writer_events,
+        );
         let live_index = crate::EmoteIndex::default();
         live_index.write().unwrap().set_account(Some("10"));
         let mut live = whisper("10", "alice", false);
-        if let AppEvent::WhisperReceived { from_user_id, text, is_history, .. } = &mut live {
+        if let AppEvent::WhisperReceived {
+            from_user_id,
+            text,
+            is_history,
+            ..
+        } = &mut live
+        {
             *from_user_id = "20".into();
             *text = "PersonalHello".into();
             *is_history = false;
         }
-        let forwarded = prepare_live_whisper(live, Some("alice"), Some("10"), &live_index, Some(&store)).unwrap();
-        assert!(matches!(forwarded, AppEvent::WhisperReceived { from_user_id, is_history: false, .. } if from_user_id == "20"));
-        assert_eq!(live_index.write().unwrap().next_deferred_personal_load(), Some(("20".into(), None)));
-        let rows = store.recent_messages(&crate::whisper_thread_channel_id("10", "bob"), 10).unwrap();
+        let forwarded =
+            prepare_live_whisper(live, Some("alice"), Some("10"), &live_index, Some(&writer))
+                .await
+                .unwrap();
+        writer.shutdown().await.unwrap();
+        assert!(
+            matches!(forwarded, AppEvent::WhisperReceived { from_user_id, is_history: false, .. } if from_user_id == "20")
+        );
+        assert_eq!(
+            live_index.write().unwrap().next_deferred_personal_load(),
+            Some(("20".into(), None))
+        );
+        let rows = store
+            .recent_messages(&crate::whisper_thread_channel_id("10", "bob"), 10)
+            .unwrap();
         assert_eq!(rows[0].sender.user_id.0, "20");
 
         // Rows without IDs and the old login placeholders still display, but
@@ -332,11 +488,24 @@ mod whisper_tests {
         let replay_index = crate::EmoteIndex::default();
         replay_index.write().unwrap().set_account(Some("10"));
         let (events, mut received) = mpsc::channel(8);
-        load_local_recent_whispers(store, Some("alice".into()), Some("10".into()), events,
-            Some(replay_index.clone())).await;
+        load_local_recent_whispers(
+            store,
+            Some("alice".into()),
+            Some("10".into()),
+            events,
+            Some(replay_index.clone()),
+        )
+        .await;
         let mut identities = HashMap::new();
         while let Ok(event) = received.try_recv() {
-            let AppEvent::WhisperReceived { from_user_id, text, target_login, is_history, .. } = event else {
+            let AppEvent::WhisperReceived {
+                from_user_id,
+                text,
+                target_login,
+                is_history,
+                ..
+            } = event
+            else {
                 panic!("expected whisper replay");
             };
             assert!(is_history);
@@ -348,28 +517,68 @@ mod whisper_tests {
         assert_eq!(identities["legacy placeholder"], "");
 
         let mut registry = replay_index.write().unwrap();
-        assert_eq!(registry.next_deferred_personal_load(), Some(("20".into(), None)));
+        assert_eq!(
+            registry.next_deferred_personal_load(),
+            Some(("20".into(), None))
+        );
         assert!(registry.next_deferred_personal_load().is_none());
         let generation = registry.begin_personal_load("20", None).unwrap();
-        registry.complete_personal_load("20", generation, Some(vec![crust_emotes::EmoteInfo {
-            provider: "7tv".into(), id: "personal".into(), code: "PersonalHello".into(),
-            url_1x: "https://example.test/personal.png".into(), url_2x: None, url_4x: None,
-        }])).unwrap();
-        assert!(registry.resolve(&ChannelId::mentions(), "20", "PersonalHello").is_some());
-        assert!(registry.resolve(&ChannelId::mentions(), "10", "PersonalHello").is_none());
-        assert!(registry.resolve(&ChannelId::mentions(), "", "PersonalHello").is_none());
+        registry
+            .complete_personal_load(
+                "20",
+                generation,
+                Some(vec![crust_emotes::EmoteInfo {
+                    provider: "7tv".into(),
+                    id: "personal".into(),
+                    code: "PersonalHello".into(),
+                    zero_width: false,
+                    url_1x: "https://example.test/personal.png".into(),
+                    url_2x: None,
+                    url_4x: None,
+                }]),
+            )
+            .unwrap();
+        assert!(registry
+            .resolve(&ChannelId::mentions(), "20", "PersonalHello")
+            .is_some());
+        assert!(registry
+            .resolve(&ChannelId::mentions(), "10", "PersonalHello")
+            .is_none());
+        assert!(registry
+            .resolve(&ChannelId::mentions(), "", "PersonalHello")
+            .is_none());
     }
 
-    #[test]
-    fn stale_live_whispers_do_not_schedule_sender_lookups_or_history() {
+    #[tokio::test]
+    async fn stale_live_whispers_do_not_schedule_sender_lookups_or_history() {
         let store = LogStore::with_db_path(":memory:".into()).unwrap();
+        let (writer_events, _writer_received) = mpsc::channel(4);
+        let writer = LogWriter::new(
+            &tokio::runtime::Handle::current(),
+            store.clone(),
+            writer_events,
+        );
         let index = crate::EmoteIndex::default();
         index.write().unwrap().set_account(Some("30"));
         let mut stale = whisper("10", "alice", false);
-        if let AppEvent::WhisperReceived { from_user_id, .. } = &mut stale { *from_user_id = "20".into(); }
-        assert!(prepare_live_whisper(stale, Some("alice"), Some("30"), &index, Some(&store)).is_none());
-        assert!(index.write().unwrap().next_deferred_personal_load().is_none());
-        assert!(store.recent_channels_with_prefix("whisper:", 20).unwrap().is_empty());
+        if let AppEvent::WhisperReceived { from_user_id, .. } = &mut stale {
+            *from_user_id = "20".into();
+        }
+        assert!(
+            prepare_live_whisper(stale, Some("alice"), Some("30"), &index, Some(&writer))
+                .await
+                .is_none()
+        );
+        writer.shutdown().await.unwrap();
+        assert!(index
+            .write()
+            .unwrap()
+            .next_deferred_personal_load()
+            .is_none());
+        assert!(store
+            .recent_channels_with_prefix("whisper:", 20)
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -381,18 +590,30 @@ mod whisper_tests {
         events.send(AppEvent::LoggedOut).await.unwrap();
         let mut replay = WhisperHistory::default();
         let emotes = crate::EmoteIndex::default();
-        replay.load(store.clone(), "alice", "1", &emotes, events.clone());
+        replay.load(store.clone(), "alice", "1", &emotes, events.clone(), None);
         let handle = replay.task.as_ref().unwrap().abort_handle();
         replay.clear();
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            while !handle.is_finished() { tokio::task::yield_now().await; }
-        }).await.unwrap();
+            while !handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         assert!(matches!(received.try_recv().unwrap(), AppEvent::LoggedOut));
         assert!(received.try_recv().is_err());
-        replay.load(store, "carol", "2", &emotes, events);
-        tokio::time::timeout(std::time::Duration::from_secs(3), replay.task.take().unwrap()).await.unwrap().unwrap();
-        assert!(matches!(received.try_recv().unwrap(), AppEvent::WhisperReceived { target_login, text, .. }
-            if target_login == "carol" && text == "new account"));
+        replay.load(store, "carol", "2", &emotes, events, None);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            replay.task.take().unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(received.try_recv().unwrap(), AppEvent::WhisperReceived { target_login, text, .. }
+            if target_login == "carol" && text == "new account")
+        );
         assert!(received.try_recv().is_err());
     }
 }
@@ -404,7 +625,14 @@ pub(crate) async fn load_local_recent_messages(
     log_store: LogStore,
     evt_tx: mpsc::Sender<AppEvent>,
 ) {
-    load_local_history_page(channel, None, LogStore::default_recent_limit(), log_store, evt_tx).await;
+    load_local_history_page(
+        channel,
+        None,
+        LogStore::default_recent_limit(),
+        log_store,
+        evt_tx,
+    )
+    .await;
 }
 
 /// Load older locally persisted chat history rows before `before_ts_ms` and
@@ -433,21 +661,32 @@ async fn load_local_history_page(
 ) {
     let channel_for_query = channel.clone();
     let loaded = tokio::task::spawn_blocking(move || {
-        log_store.history_page(&channel_for_query, before, limit)
+        let page = log_store.history_page(&channel_for_query, before, limit)?;
+        let moderation = if before.is_none() {
+            log_store.saved_moderation(&channel_for_query)?
+        } else {
+            Vec::new()
+        };
+        Ok::<_, crust_storage::StorageError>((page, moderation))
     })
     .await;
 
-    let page = match loaded {
-        Ok(Ok(page)) => page,
+    let (page, moderation) = match loaded {
+        Ok(Ok(loaded)) => loaded,
         Ok(Err(e)) => {
             warn!(
                 "chat-history: local older SQLite load failed for #{}: {e}",
                 channel.display_name()
             );
-            let _ = evt_tx.send(AppEvent::Error {
-                context: "History".into(),
-                message: format!("Could not load local history for #{}: {e}", channel.display_name()),
-            }).await;
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "History".into(),
+                    message: format!(
+                        "Could not load local history for #{}: {e}",
+                        channel.display_name()
+                    ),
+                })
+                .await;
             return;
         }
         Err(e) => {
@@ -455,21 +694,41 @@ async fn load_local_history_page(
                 "chat-history: local older SQLite task failed for #{}: {e}",
                 channel.display_name()
             );
-            let _ = evt_tx.send(AppEvent::Error {
-                context: "History".into(),
-                message: format!("Could not load local history for #{}: {e}", channel.display_name()),
-            }).await;
+            let _ = evt_tx
+                .send(AppEvent::Error {
+                    context: "History".into(),
+                    message: format!(
+                        "Could not load local history for #{}: {e}",
+                        channel.display_name()
+                    ),
+                })
+                .await;
             return;
         }
     };
 
+    if !moderation.is_empty() {
+        if evt_tx
+            .send(AppEvent::HistoryModerationLoaded {
+                channel: channel.clone(),
+                actions: moderation,
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
     let mut messages = Vec::with_capacity(page.messages.len());
     let mut identities = Vec::with_capacity(page.messages.len());
     for (mut msg, row_id) in page.messages.into_iter().zip(page.row_ids) {
         let Some(replay_id) = MessageId::from_local_history_row(row_id) else {
             continue;
         };
-        identities.push(LocalHistoryMessageIdentity { replay_id, original_id: msg.id });
+        identities.push(LocalHistoryMessageIdentity {
+            replay_id,
+            original_id: msg.id,
+        });
         msg.id = replay_id;
         msg.flags.is_history = true;
         msg.channel = channel.clone();
@@ -485,7 +744,12 @@ async fn load_local_history_page(
         .send(AppEvent::HistoryLoaded {
             channel,
             messages,
-            local: Some(LocalHistoryPageInfo { before, next: page.next, has_more: page.has_more, identities }),
+            local: Some(LocalHistoryPageInfo {
+                before,
+                next: page.next,
+                has_more: page.has_more,
+                identities,
+            }),
         })
         .await;
 }
@@ -496,14 +760,48 @@ mod local_history_identity_tests {
     use crust_core::model::{ChannelState, MsgKind};
 
     #[tokio::test]
+    async fn local_restore_sends_one_internal_moderation_batch_before_messages() {
+        let store = LogStore::with_db_path(":memory:".into()).unwrap();
+        let channel = ChannelId::new("room");
+        let mut message = super::super::system_messages::make_system_message(
+            1,
+            channel.clone(),
+            "original text".into(),
+            chrono::Utc::now(),
+            MsgKind::Chat,
+        );
+        message.server_id = Some("old-message".into());
+        store.append_message(&message).unwrap();
+        store
+            .apply_moderation(&ModerationAction::message(
+                channel.clone(),
+                "old-message".into(),
+            ))
+            .unwrap();
+        let (events, mut received) = mpsc::channel(4);
+        load_local_recent_messages(channel, store, events).await;
+        assert!(
+            matches!(received.try_recv().unwrap(), AppEvent::HistoryModerationLoaded { actions, .. } if actions.len() == 1)
+        );
+        assert!(
+            matches!(received.try_recv().unwrap(), AppEvent::HistoryLoaded { messages, .. }
+            if messages.len() == 1 && messages[0].flags.is_deleted && messages[0].raw_text == "original text")
+        );
+        assert!(received.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn local_replays_keep_storage_ids_and_match_live_rows_after_reload() {
         let store = LogStore::with_db_path(std::path::PathBuf::from(":memory:")).unwrap();
         let channel = ChannelId::new("room");
         let mut room = ChannelState::new(channel.clone());
         for id in [17, 18, 19] {
             let message = super::super::system_messages::make_system_message(
-                id, channel.clone(), "same text".into(),
-                chrono::DateTime::from_timestamp_millis(1000).unwrap(), MsgKind::Chat,
+                id,
+                channel.clone(),
+                "same text".into(),
+                chrono::DateTime::from_timestamp_millis(1000).unwrap(),
+                MsgKind::Chat,
             );
             store.append_message(&message).unwrap();
             if id == 19 {
@@ -514,19 +812,36 @@ mod local_history_identity_tests {
         let mut previous_ids = None;
         for _ in 0..3 {
             load_local_recent_messages(channel.clone(), store.clone(), events.clone()).await;
-            let AppEvent::HistoryLoaded { messages, local: Some(page), .. } = received.recv().await.unwrap() else {
+            let AppEvent::HistoryLoaded {
+                messages,
+                local: Some(page),
+                ..
+            } = received.recv().await.unwrap()
+            else {
                 panic!("expected a local history page");
             };
             let ids: Vec<_> = messages.iter().map(|message| message.id).collect();
             assert!(ids.iter().all(|id| id.is_local_history()));
-            assert_eq!(page.identities.iter().map(|identity| identity.original_id.0).collect::<Vec<_>>(), [17, 18, 19]);
+            assert_eq!(
+                page.identities
+                    .iter()
+                    .map(|identity| identity.original_id.0)
+                    .collect::<Vec<_>>(),
+                [17, 18, 19]
+            );
             if let Some(previous) = &previous_ids {
                 assert_eq!(&ids, previous);
             }
             previous_ids = Some(ids);
             room.prepend_local_history(messages, &page);
             assert_eq!(room.messages.len(), 3);
-            assert_eq!(room.messages.iter().filter(|message| message.id == MessageId(19)).count(), 1);
+            assert_eq!(
+                room.messages
+                    .iter()
+                    .filter(|message| message.id == MessageId(19))
+                    .count(),
+                1
+            );
         }
     }
 }
@@ -579,10 +894,16 @@ pub(crate) async fn load_local_recent_whispers(
     evt_tx: mpsc::Sender<AppEvent>,
     emotes: Option<crate::EmoteIndex>,
 ) {
-    let Some(self_login) = self_login.as_deref().and_then(crate::normalize_whisper_login) else {
+    let Some(self_login) = self_login
+        .as_deref()
+        .and_then(crate::normalize_whisper_login)
+    else {
         return;
     };
-    let Some(self_user_id) = self_user_id.as_deref().and_then(crate::normalize_whisper_user_id) else {
+    let Some(self_user_id) = self_user_id
+        .as_deref()
+        .and_then(crate::normalize_whisper_user_id)
+    else {
         return;
     };
     let account_prefix = format!("{WHISPER_HISTORY_CHANNEL_PREFIX}{self_user_id}:");
@@ -642,12 +963,17 @@ pub(crate) async fn load_local_recent_whispers(
         for msg in messages {
             let stored_login = msg.sender.login.trim().to_ascii_lowercase();
             let from_user_id = crate::normalize_whisper_user_id(&msg.sender.user_id.0)
-                .unwrap_or_default().to_owned();
+                .unwrap_or_default()
+                .to_owned();
             let (from_login, from_display_name) = if msg.flags.is_self {
-                if from_user_id != self_user_id { continue; }
+                if from_user_id != self_user_id {
+                    continue;
+                }
                 (self_login.clone(), self_login.clone())
             } else {
-                if stored_login.is_empty() || stored_login != partner_login { continue; }
+                if stored_login.is_empty() || stored_login != partner_login {
+                    continue;
+                }
                 (stored_login, msg.sender.display_name)
             };
             let target_login = if msg.flags.is_self {
@@ -656,7 +982,10 @@ pub(crate) async fn load_local_recent_whispers(
                 self_login.clone()
             };
             if let Some(index) = &emotes {
-                index.write().unwrap().queue_whisper_sender(self_user_id, &from_user_id);
+                index
+                    .write()
+                    .unwrap()
+                    .queue_whisper_sender(self_user_id, &from_user_id);
             }
             if evt_tx
                 .send(AppEvent::WhisperReceived {
@@ -671,11 +1000,251 @@ pub(crate) async fn load_local_recent_whispers(
                     timestamp: msg.timestamp,
                     is_history: true,
                 })
-                .await.is_err()
+                .await
+                .is_err()
             {
                 return;
             }
         }
+    }
+}
+
+fn parse_history_records(
+    raw_lines: &[String],
+    local_nick: Option<&str>,
+    nicknames: &[Nickname],
+    channel: &ChannelId,
+    saved_actions: &[ModerationAction],
+) -> (Vec<ChatMessage>, Vec<ModerationAction>) {
+    let state = ModerationState::default();
+    state.remember(saved_actions);
+    let mut messages = Vec::with_capacity(raw_lines.len());
+    let mut actions = Vec::new();
+    for line in raw_lines {
+        let Ok(record) = parse_line(line) else {
+            continue;
+        };
+        if record
+            .params
+            .first()
+            .map(|value| ChannelId::new(value))
+            .as_ref()
+            != Some(channel)
+        {
+            continue;
+        }
+        let action = match record.command.as_str() {
+            "PRIVMSG" => {
+                let id = crate::HISTORY_MSG_ID.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                if let Some(mut message) = parse_privmsg_irc(&record, local_nick, id) {
+                    if let Some(nick) = local_nick {
+                        message.flags.is_mention =
+                            crust_core::highlight::contains_mention(&message.raw_text, nick)
+                                || message.reply.as_ref().is_some_and(|reply| {
+                                    reply.parent_user_login.eq_ignore_ascii_case(nick)
+                                })
+                                || crust_core::highlight::contains_nickname_mention(
+                                    &message.raw_text,
+                                    nick,
+                                    channel.display_name(),
+                                    nicknames,
+                                );
+                    }
+                    state.apply(&mut message);
+                    state.observe_deleted(&message);
+                    messages.push(message);
+                }
+                continue;
+            }
+            "CLEARMSG" => {
+                let Some(id) = record.tags.get("target-msg-id").filter(|id| !id.is_empty()) else {
+                    continue;
+                };
+                ModerationAction::message(channel.clone(), id.to_owned())
+            }
+            "CLEARCHAT" => {
+                let timestamp = record
+                    .tags
+                    .get("tmi-sent-ts")
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .and_then(chrono::DateTime::from_timestamp_millis);
+                if let Some(login) = record
+                    .params
+                    .get(1)
+                    .filter(|login| !login.trim().is_empty())
+                {
+                    ModerationAction::user(
+                        channel.clone(),
+                        login.clone(),
+                        record.tags.get("target-user-id").map(str::to_owned),
+                        timestamp,
+                    )
+                } else {
+                    ModerationAction::channel(channel.clone(), timestamp)
+                }
+            }
+            _ => continue,
+        };
+        state.apply_to_retained(&action, &mut messages);
+        // Untimed clears describe only the rows already seen in this history
+        // response. Publishing the broad action could delete newer live chat.
+        if action.timestamp.is_some() || matches!(action.target, ModerationTarget::Message(_)) {
+            actions.push(action);
+        }
+    }
+    let published = ModerationState::default();
+    published.remember(saved_actions);
+    for action in &actions {
+        published.apply_to_retained(action, std::iter::empty());
+    }
+    for message in &mut messages {
+        state.apply(message);
+        if message.flags.is_deleted && !published.is_deleted(message) {
+            if let Some(id) = message.server_id.as_ref().filter(|id| !id.is_empty()) {
+                let action = ModerationAction::message(channel.clone(), id.clone());
+                published.apply_to_retained(&action, std::iter::empty());
+                actions.push(action);
+            }
+        }
+    }
+    (messages, actions)
+}
+
+#[cfg(test)]
+mod moderation_history_tests {
+    use super::*;
+
+    fn lines(raw: &[&str]) -> Vec<String> {
+        raw.iter().map(|line| (*line).to_owned()).collect()
+    }
+
+    #[test]
+    fn stored_cutoffs_cover_deleted_flags_without_creating_more_tombstones() {
+        let channel = ChannelId::new("room");
+        let saved = vec![ModerationAction::channel(
+            channel.clone(),
+            chrono::DateTime::from_timestamp_millis(1000),
+        )];
+        let (messages, actions) = parse_history_records(
+            &lines(&[
+                "@id=old;rm-deleted=1;tmi-sent-ts=900 :alice!user@host PRIVMSG #room :old text",
+            ]),
+            None,
+            &[],
+            &channel,
+            &saved,
+        );
+        assert!(messages[0].flags.is_deleted);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn history_clears_use_source_identity_channel_and_time() {
+        let (messages, actions) = parse_history_records(&lines(&[
+            "@id=old;user-id=1;tmi-sent-ts=900 :alice!user@host PRIVMSG #room :old text",
+            "@id=new;user-id=1;tmi-sent-ts=1100 :alice!user@host PRIVMSG #room :new text",
+            "@id=reused-login;user-id=2;tmi-sent-ts=900 :alice!user@host PRIVMSG #room :another user",
+            "@target-user-id=1;tmi-sent-ts=1000 :tmi.twitch.tv CLEARCHAT #room :alice",
+            "@id=late;user-id=1;tmi-sent-ts=950 :alice!user@host PRIVMSG #room :late old text",
+            "@id=old;user-id=1;tmi-sent-ts=900 :alice!user@host PRIVMSG #elsewhere :another channel",
+            "@target-msg-id=unrelated :tmi.twitch.tv CLEARMSG #elsewhere :ignored",
+        ]), None, &[], &ChannelId::new("room"), &[]);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.flags.is_deleted)
+                .collect::<Vec<_>>(),
+            [true, false, false, true]
+        );
+        assert_eq!(messages[0].raw_text, "old text");
+        assert_eq!(
+            actions.len(),
+            1,
+            "the cutoff must not turn into redundant per-row tombstones"
+        );
+        assert!(matches!(actions[0].target, ModerationTarget::User { .. }));
+    }
+
+    #[test]
+    fn untimed_history_clears_publish_only_preceding_message_identities() {
+        let (messages, actions) = parse_history_records(&lines(&[
+            "@id=old;user-id=1;tmi-sent-ts=900 :alice!user@host PRIVMSG #room :old text",
+            "@tmi-sent-ts=invalid :tmi.twitch.tv CLEARCHAT #room :alice",
+            "@id=new;user-id=1;tmi-sent-ts=800 :alice!user@host PRIVMSG #room :new text",
+            "@target-msg-id=explicit :tmi.twitch.tv CLEARMSG #room :removed text",
+            "@id=explicit;user-id=2;tmi-sent-ts=1100 :bob!user@host PRIVMSG #room :removed text",
+            "@id=flagged;rm-deleted=1;tmi-sent-ts=1200 :bob!user@host PRIVMSG #room :flagged text",
+            "@id=broken",
+        ]), None, &[], &ChannelId::new("room"), &[]);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.flags.is_deleted)
+                .collect::<Vec<_>>(),
+            [true, false, true, true]
+        );
+        assert_eq!(actions.len(), 3);
+        assert!(actions
+            .iter()
+            .all(|action| matches!(action.target, ModerationTarget::Message(_))));
+    }
+
+    #[test]
+    fn remote_history_mentions_honor_nickname_scope_and_boundaries() {
+        let channel = ChannelId::new("room");
+        let mut nickname = Nickname::new("alice", "Local name");
+        nickname.channel = Some("ROOM".into());
+        let raw = lines(&[
+            "@id=alias;tmi-sent-ts=1000 :bob!user@host PRIVMSG #room :hello @Local name!",
+            "@id=longer;tmi-sent-ts=1001 :bob!user@host PRIVMSG #room :hello @Local names!",
+        ]);
+        let parse = |nicknames: &[Nickname], account| {
+            parse_history_records(&raw, account, nicknames, &channel, &[]).0
+        };
+        assert_eq!(
+            parse(&[nickname.clone()], Some("ALICE"))
+                .iter()
+                .map(|message| message.flags.is_mention)
+                .collect::<Vec<_>>(),
+            [true, false]
+        );
+        assert!(
+            !parse(&[nickname.clone()], Some("carol"))[0]
+                .flags
+                .is_mention
+        );
+        assert!(!parse(&[nickname.clone()], None)[0].flags.is_mention);
+        nickname.channel = Some("elsewhere".into());
+        assert!(
+            !parse(&[nickname.clone()], Some("alice"))[0]
+                .flags
+                .is_mention
+        );
+        nickname.channel = None;
+        assert!(
+            parse(&[nickname.clone()], Some("alice"))[0]
+                .flags
+                .is_mention
+        );
+        nickname.replace_mentions = false;
+        assert!(!parse(&[nickname], Some("alice"))[0].flags.is_mention);
+    }
+
+    #[test]
+    fn remote_history_mentions_preserve_account_names_and_reply_targets() {
+        let (messages, _) = parse_history_records(&lines(&[
+            "@id=name;tmi-sent-ts=1000 :bob!user@host PRIVMSG #room :hello @ALICE!",
+            "@id=longer;tmi-sent-ts=1001 :bob!user@host PRIVMSG #room :hello @alice_other!",
+            "@id=reply;reply-parent-msg-id=parent;reply-parent-user-login=ALICE;reply-parent-display-name=Alice;reply-parent-msg-body=question;tmi-sent-ts=1002 :bob!user@host PRIVMSG #room :an answer",
+            "@id=other;reply-parent-msg-id=parent;reply-parent-user-login=alice_other;reply-parent-display-name=Other;reply-parent-msg-body=question;tmi-sent-ts=1003 :bob!user@host PRIVMSG #room :another answer",
+        ]), Some("alice"), &[], &ChannelId::new("room"), &[]);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.flags.is_mention)
+                .collect::<Vec<_>>(),
+            [true, false, true, false]
+        );
     }
 }
 
@@ -686,10 +1255,13 @@ pub(crate) async fn load_local_recent_whispers(
 pub(crate) async fn load_recent_messages(
     channel: &str,
     local_nick: Option<&str>,
+    nicknames: &[Nickname],
     emote_index: &crate::EmoteIndex,
     badge_map: &BadgeMap,
     evt_tx: &mpsc::Sender<AppEvent>,
     stv_update_tx: &mpsc::Sender<SevenTvCosmeticUpdate>,
+    log_store: Option<LogStore>,
+    log_writer: Option<LogWriter>,
 ) {
     let ch = channel.trim_start_matches('#');
     let channel_id = crust_core::model::ChannelId::new(ch);
@@ -837,42 +1409,49 @@ pub(crate) async fn load_recent_messages(
         bm.clone()
     };
     let local_nick_owned = local_nick.map(str::to_owned);
+    let nicknames = nicknames.to_vec();
     let channel_scope = ch.to_owned();
+    let query_channel = channel_id.clone();
+    flush_before_read(log_writer.as_ref()).await;
 
     // Move parse + tokenize CPU work off async executors.
-    let messages = tokio::task::spawn_blocking(move || {
-        let mut messages: Vec<ChatMessage> = Vec::with_capacity(raw_lines.len());
-
-        for line in &raw_lines {
-            let irc_msg = match parse_line(line) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if irc_msg.command != "PRIVMSG" {
-                continue;
-            }
-
-            let id = crate::HISTORY_MSG_ID.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            let mut msg = match parse_privmsg_irc(&irc_msg, local_nick_owned.as_deref(), id) {
-                Some(m) => m,
-                None => continue,
-            };
-
+    let (messages, actions) = tokio::task::spawn_blocking(move || {
+        let saved_actions = log_store
+            .map(|store| store.saved_moderation(&query_channel))
+            .transpose()
+            .unwrap_or_else(|error| {
+                warn!(
+                    "chat-history: could not load saved moderation for {}: {error}",
+                    query_channel.as_str()
+                );
+                None
+            })
+            .unwrap_or_default();
+        let (mut messages, actions) = parse_history_records(
+            &raw_lines,
+            local_nick_owned.as_deref(),
+            &nicknames,
+            &query_channel,
+            &saved_actions,
+        );
+        for msg in &mut messages {
             // Tokenize spans
-            msg.spans = crust_core::format::tokenize(
+            msg.spans = crust_core::format::tokenize_with_flags(
                 &msg.raw_text,
                 msg.flags.is_action,
                 &msg.twitch_emotes,
                 &|code| {
-                    crate::resolve_emote(&emote_snapshot, &msg.channel, &msg.sender.user_id.0, code).map(|info| {
-                        (
-                            info.id.clone(),
-                            info.code.clone(),
-                            info.url_1x.clone(),
-                            info.provider.clone(),
-                            info.url_4x.clone().or_else(|| info.url_2x.clone()),
-                        )
-                    })
+                    crate::resolve_emote(&emote_snapshot, &msg.channel, &msg.sender.user_id.0, code)
+                        .map(|info| {
+                            (
+                                info.id.clone(),
+                                info.code.clone(),
+                                info.url_1x.clone(),
+                                info.provider.clone(),
+                                info.url_4x.clone().or_else(|| info.url_2x.clone()),
+                                info.zero_width,
+                            )
+                        })
                 },
             );
 
@@ -881,30 +1460,13 @@ pub(crate) async fn load_recent_messages(
                 badge.url =
                     resolve_badge_url(&badge_snapshot, &channel_scope, &badge.name, &badge.version);
             }
-
-            // Mention detection
-            if let Some(ref nick) = local_nick_owned {
-                let nick_lower = nick.to_lowercase();
-                let text_lower = msg.raw_text.to_lowercase();
-                // @mention or bare username as a whole word
-                let has_mention = text_lower.contains(&format!("@{nick_lower}"))
-                    || text_lower
-                        .split(|c: char| !c.is_alphanumeric() && c != '_')
-                        .any(|w| w == nick_lower);
-                let is_reply_to_me = msg
-                    .reply
-                    .as_ref()
-                    .map(|r| r.parent_user_login.to_lowercase() == nick_lower)
-                    .unwrap_or(false);
-                msg.flags.is_mention = has_mention || is_reply_to_me;
-            }
-
-            messages.push(msg);
         }
-        messages
+        (messages, actions)
     })
     .await
     .unwrap_or_default();
+
+    publish_history_moderation(channel_id.clone(), actions, log_writer.as_ref(), evt_tx).await;
 
     if messages.is_empty() {
         info!("chat-history: parsed 0 PRIVMSG lines from {raw_line_count} raw lines for #{ch}");
