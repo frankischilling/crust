@@ -1476,6 +1476,9 @@ pub struct CrustApp {
     collapse_long_message_lines: usize,
     /// Only animate while the window is focused.
     animations_when_focused: bool,
+    show_name_paints: bool,
+    show_name_paint_shadows: bool,
+    large_name_paint_shadows: bool,
     /// Show chat timestamps before each message.
     show_timestamps: bool,
     /// Include seconds in chat timestamps.
@@ -1994,6 +1997,9 @@ impl CrustApp {
             collapse_long_messages: true,
             collapse_long_message_lines: 8,
             animations_when_focused: true,
+            show_name_paints: true,
+            show_name_paint_shadows: true,
+            large_name_paint_shadows: true,
             show_timestamps: true,
             show_timestamp_seconds: false,
             use_24h_timestamps: true,
@@ -3655,6 +3661,47 @@ exit 1
         EMOTE_REFRESH_ROWS_PER_FRAME - remaining
     }
 
+    fn render_whisper_sender_name(
+        &self,
+        ui: &mut egui::Ui,
+        line: &WhisperLine,
+        fallback_color: Color32,
+    ) -> Option<egui::Response> {
+        let name = if line.from_display_name.trim().is_empty() {
+            &line.from_login
+        } else {
+            &line.from_display_name
+        };
+        if name.trim().is_empty() {
+            return None;
+        }
+        let user_id = (!line.from_user_id.trim().is_empty()).then_some(line.from_user_id.as_str());
+        let appearance = crate::widgets::sender_cosmetics::get(ui.ctx(), user_id, &line.from_login);
+        let color = appearance
+            .as_ref()
+            .and_then(|appearance| appearance.color)
+            .unwrap_or(fallback_color);
+        let paint = appearance
+            .as_ref()
+            .and_then(|appearance| appearance.paint.as_deref());
+        let animate = !self.animations_when_focused || ui.ctx().input(|input| input.focused);
+        Some(
+            ui.scope(|ui| {
+                ui.style_mut().override_font_id = Some(t::tiny());
+                crate::widgets::name_paint::show_sender_name_with_sense(
+                    ui,
+                    name,
+                    color,
+                    paint,
+                    &self.emote_bytes,
+                    animate,
+                    egui::Sense::hover(),
+                )
+            })
+            .inner,
+        )
+    }
+
     fn render_whisper_line_body(
         &mut self,
         ui: &mut egui::Ui,
@@ -4278,22 +4325,10 @@ exit 1
                                                             .corner_radius(t::RADIUS)
                                                             .inner_margin(Margin::symmetric(10, 8))
                                                             .show(ui, |ui| {
-                                                                let sender_label = if line
-                                                                    .from_display_name
-                                                                    .trim()
-                                                                    .is_empty()
+                                                                if self
+                                                                    .render_whisper_sender_name(ui, &line, other_meta)
+                                                                    .is_some()
                                                                 {
-                                                                    line.from_login.clone()
-                                                                } else {
-                                                                    line.from_display_name.clone()
-                                                                };
-                                                                if !sender_label.trim().is_empty() {
-                                                                    ui.label(
-                                                                        RichText::new(sender_label)
-                                                                        .font(t::tiny())
-                                                                        .strong()
-                                                                        .color(other_meta),
-                                                                    );
                                                                     ui.add_space(2.0);
                                                                 }
                                                                 self.render_whisper_line_body(
@@ -4787,6 +4822,13 @@ exit 1
                         return;
                     }
                 }
+                if channel.is_twitch() {
+                    if !message.flags.is_history {
+                        crate::widgets::sender_cosmetics::remember_identity(
+                            ctx, &message.sender.user_id.0, &message.sender.login);
+                    }
+                    crate::widgets::sender_cosmetics::remember_sender(ctx, &message.sender);
+                }
                 let is_active = self.state.active_channel.as_ref() == Some(&channel);
                 crust_core::model::apply_sender_nickname(
                     &self.nicknames,
@@ -4902,12 +4944,21 @@ exit 1
                     };
                     let own_echo_absorbed = echo_identity.is_some();
                     if let Some((local_id, original_timestamp)) = echo_identity {
+                        crate::widgets::message_list::invalidate_message_layouts(ctx, &channel, &[local_id]);
                         confirmed_mention_echo = ch.messages.iter().rev()
                             .find(|row| row.id == local_id)
                             .map(|row| (row.clone(), original_timestamp.timestamp_millis()));
                     }
                     let absorbed = own_echo_absorbed || ch.absorb_moderation_notice(&message);
                     if absorbed {
+                        crate::widgets::message_list::invalidate_reply_sender_index(ctx, &channel);
+                        self.global_search.invalidate();
+                        if !own_echo_absorbed {
+                            // Paired moderation notices can replace text and sender
+                            // metadata in the recent chat window without adding a row.
+                            let recent: Vec<_> = ch.messages.iter().rev().take(400).map(|row| row.id).collect();
+                            crate::widgets::message_list::invalidate_message_layouts(ctx, &channel, &recent);
+                        }
                         // Echo landed on an existing local copy; the mention
                         // (if any) was already recorded when that local copy
                         // was first pushed. Skip the mirror to avoid
@@ -4996,6 +5047,9 @@ exit 1
                 }
                 if let Some((confirmed, original_timestamp_ms)) = confirmed_mention_echo {
                     self.state.sync_mention_echo(&confirmed);
+                    crate::widgets::message_list::invalidate_message_layouts(
+                        ctx, &ChannelId::mentions(), &[confirmed.id]);
+                    crate::widgets::message_list::invalidate_reply_sender_index(ctx, &ChannelId::mentions());
                     if self.local_log_indexing_enabled {
                         self.cmd_tx.send_history_update(HistoryUpdate::Confirmation {
                             message: Box::new(confirmed), original_timestamp_ms,
@@ -5060,6 +5114,9 @@ exit 1
                 let Some(partner_login) = partner_login else {
                     return;
                 };
+
+                crate::widgets::sender_cosmetics::remember_identity(
+                    ctx, &from_user_id, &from_login);
 
                 if is_self && !is_history {
                     if let Some(composer) = self.whisper_composers.get_mut(&partner_login) {
@@ -5877,11 +5934,22 @@ exit 1
                 collapse_long_messages,
                 collapse_long_message_lines,
                 animations_when_focused,
+                show_name_paints,
+                show_name_paint_shadows,
+                large_name_paint_shadows,
             } => {
                 self.prevent_overlong_twitch_messages = prevent_overlong_twitch_messages;
                 self.collapse_long_messages = collapse_long_messages;
                 self.collapse_long_message_lines = collapse_long_message_lines.max(1);
                 self.animations_when_focused = animations_when_focused;
+                self.show_name_paints = show_name_paints;
+                self.show_name_paint_shadows = show_name_paint_shadows;
+                self.large_name_paint_shadows = large_name_paint_shadows;
+                crate::widgets::name_paint::configure(ctx, crate::widgets::name_paint::PaintOptions {
+                    show: show_name_paints,
+                    shadows: show_name_paint_shadows,
+                    large_shadows: large_name_paint_shadows,
+                });
             }
             AppEvent::GeneralSettingsUpdated {
                 show_timestamps,
@@ -6300,6 +6368,9 @@ exit 1
                 if user_id.is_empty() {
                     return;
                 }
+
+                crate::widgets::sender_cosmetics::update(
+                    ctx, &user_id, color.as_deref(), name_paint.as_ref());
 
                 // Store 7TV animated avatar URL for this user.
                 if let Some(ref url) = avatar_url {
@@ -8678,6 +8749,9 @@ impl CrustApp {
                 collapse_long_messages: self.collapse_long_messages,
                 collapse_long_message_lines: self.collapse_long_message_lines,
                 animations_when_focused: self.animations_when_focused,
+                show_name_paints: self.show_name_paints,
+                show_name_paint_shadows: self.show_name_paint_shadows,
+                large_name_paint_shadows: self.large_name_paint_shadows,
                 show_timestamps: self.show_timestamps,
                 show_timestamp_seconds: self.show_timestamp_seconds,
                 use_24h_timestamps: self.use_24h_timestamps,
@@ -8860,16 +8934,30 @@ impl CrustApp {
                 || state.collapse_long_messages != self.collapse_long_messages
                 || state.collapse_long_message_lines != self.collapse_long_message_lines
                 || state.animations_when_focused != self.animations_when_focused
+                || state.show_name_paints != self.show_name_paints
+                || state.show_name_paint_shadows != self.show_name_paint_shadows
+                || state.large_name_paint_shadows != self.large_name_paint_shadows
             {
                 self.prevent_overlong_twitch_messages = state.prevent_overlong_twitch_messages;
                 self.collapse_long_messages = state.collapse_long_messages;
                 self.collapse_long_message_lines = state.collapse_long_message_lines.max(1);
                 self.animations_when_focused = state.animations_when_focused;
+                self.show_name_paints = state.show_name_paints;
+                self.show_name_paint_shadows = state.show_name_paint_shadows;
+                self.large_name_paint_shadows = state.large_name_paint_shadows;
+                crate::widgets::name_paint::configure(ctx, crate::widgets::name_paint::PaintOptions {
+                    show: self.show_name_paints,
+                    shadows: self.show_name_paint_shadows,
+                    large_shadows: self.large_name_paint_shadows,
+                });
                 self.send_cmd(AppCommand::SetChatUiBehavior {
                     prevent_overlong_twitch_messages: self.prevent_overlong_twitch_messages,
                     collapse_long_messages: self.collapse_long_messages,
                     collapse_long_message_lines: self.collapse_long_message_lines,
                     animations_when_focused: self.animations_when_focused,
+                    show_name_paints: Some(self.show_name_paints),
+                    show_name_paint_shadows: Some(self.show_name_paint_shadows),
+                    large_name_paint_shadows: Some(self.large_name_paint_shadows),
                 });
             }
             self.channel_layout = state.channel_layout;
@@ -11439,6 +11527,8 @@ impl CrustApp {
                 &self.state.channels,
                 &mut self.global_search,
                 self.always_on_top,
+                &self.emote_bytes,
+                self.animations_when_focused,
             );
             self.apply_global_search_output(output);
         }
@@ -15531,6 +15621,174 @@ mod tests {
     }
 
     #[test]
+    fn received_whisper_headers_use_current_paints_and_keep_the_timestamp() {
+        fn frame(ctx: &egui::Context, app: &mut super::CrustApp) -> egui::FullOutput {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(320.0, 260.0),
+                    )),
+                    time: Some(ctx.cumulative_pass_nr() as f64 * 0.1),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        app.render_whisper_conversation_panel(
+                            ui, "painted", &mut None, &mut None, true,
+                        );
+                    });
+                },
+            )
+        }
+        let (mut app, mut commands) = test_app();
+        let ctx = egui::Context::default();
+        app.apply_event(
+            crust_core::AppEvent::Authenticated {
+                username: "alice".to_owned(),
+                user_id: "10".to_owned(),
+            },
+            &ctx,
+        );
+        let mut incoming = whisper_event("10", "painted", "alice", false, true);
+        if let crust_core::AppEvent::WhisperReceived {
+            from_user_id,
+            from_display_name,
+            ..
+        } = &mut incoming
+        {
+            *from_user_id = "42".to_owned();
+            *from_display_name = "Painted Sender".to_owned();
+        }
+        app.apply_event(incoming, &ctx);
+        app.open_whisper_compose("painted");
+        app.whisper_composers.get_mut("painted").unwrap().text = "draft to keep".to_owned();
+        let timestamp = app.format_whisper_timestamp(app.whisper_threads["painted"][0].timestamp);
+        let mut output = frame(&ctx, &mut app);
+        for _ in 0..2 {
+            output = frame(&ctx, &mut app);
+        }
+        let original_name =
+            visible_text_rect(&output, "Painted Sender").expect("plain sender is visible");
+        let original_timestamp =
+            visible_text_rect(&output, &timestamp).expect("timestamp is visible");
+        let paint = crust_core::model::SenderNamePaint {
+            function: "linear-gradient".to_owned(),
+            stops: vec![crust_core::model::SenderNamePaintStop {
+                at: 0.0,
+                color: "#ff0080".to_owned(),
+            }],
+            ..Default::default()
+        };
+        crate::widgets::sender_cosmetics::update(&ctx, "42", Some("#00ff00"), Some(&paint));
+        for _ in 0..2 {
+            output = frame(&ctx, &mut app);
+        }
+        assert!(crate::widgets::name_paint::cached_name_count(&ctx) > 0);
+        assert!(visible_text_rect(&output, "Painted Sender").is_none());
+        assert_eq!(
+            visible_text_rect(&output, &timestamp),
+            Some(original_timestamp)
+        );
+        let body_text: String = output
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                let egui::epaint::Shape::Text(text) = &shape.shape else {
+                    return None;
+                };
+                let rect = text.galley.rect.translate(text.pos.to_vec2());
+                (rect.top() >= original_name.bottom()
+                    && rect.bottom() <= original_timestamp.top()
+                    && shape.clip_rect.contains_rect(rect))
+                .then_some(text.galley.text())
+            })
+            .collect();
+        assert_eq!(body_text, "private message");
+        assert_eq!(app.whisper_composers["painted"].text, "draft to keep");
+        crate::widgets::sender_cosmetics::update(&ctx, "42", None, None);
+        output = frame(&ctx, &mut app);
+        assert_eq!(
+            visible_text_rect(&output, "Painted Sender"),
+            Some(original_name)
+        );
+        assert_eq!(
+            visible_text_rect(&output, &timestamp),
+            Some(original_timestamp)
+        );
+        while let Ok(command) = commands.try_recv() {
+            assert!(!matches!(
+                command,
+                AppCommand::SendWhisper { .. } | AppCommand::ShowUserCard { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn whisper_sender_paints_follow_account_ids_and_do_not_add_a_keyboard_stop() {
+        fn frame(
+            ctx: &egui::Context,
+            app: &super::CrustApp,
+            line: &super::WhisperLine,
+        ) -> (egui::Response, egui::FullOutput) {
+            let mut response = None;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(320.0, 200.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        response = app.render_whisper_sender_name(ui, line, egui::Color32::WHITE);
+                    });
+                },
+            );
+            (response.unwrap(), output)
+        }
+        let (app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        let mut line = super::WhisperLine {
+            from_user_id: "42".to_owned(),
+            from_login: "painted".to_owned(),
+            from_display_name: "Painted Sender".to_owned(),
+            text: "private message".to_owned(),
+            twitch_emotes: Vec::new(),
+            spans: Vec::new(),
+            timestamp: chrono::Utc::now(),
+            is_self: false,
+        };
+        let paint = crust_core::model::SenderNamePaint {
+            function: "linear-gradient".to_owned(),
+            stops: vec![crust_core::model::SenderNamePaintStop {
+                at: 0.0,
+                color: "#ff0080".to_owned(),
+            }],
+            ..Default::default()
+        };
+        crate::widgets::sender_cosmetics::remember_identity(&ctx, "42", "painted");
+        crate::widgets::sender_cosmetics::update(&ctx, "42", None, Some(&paint));
+        let (response, _) = frame(&ctx, &app, &line);
+        assert!(!response.sense.senses_click());
+        assert!(!response.sense.is_focusable());
+        assert!(crate::widgets::name_paint::cached_name_count(&ctx) > 0);
+        line.from_user_id = "99".to_owned();
+        let (_, output) = frame(&ctx, &app, &line);
+        assert!(
+            visible_text_rect(&output, "Painted Sender").is_some(),
+            "a different account cannot inherit the login paint"
+        );
+        line.from_user_id.clear();
+        let (_, output) = frame(&ctx, &app, &line);
+        assert!(
+            visible_text_rect(&output, "Painted Sender").is_none(),
+            "ID-less history can resolve a known login"
+        );
+    }
+
+    #[test]
     fn whisper_reply_sends_from_the_account_without_a_joined_channel() {
         let (commands, mut receiver) = tokio::sync::mpsc::channel(64);
         let (events, event_receiver) = tokio::sync::mpsc::channel(64);
@@ -16645,19 +16903,19 @@ mod tests {
                     &ctx, &mut app, Vec::new(), Some(response_id));
             }
             let pane = pane.expect("virtual pane is visible in the current pass").rect;
-            let menu = output.shapes.iter().find_map(|shape| {
-                let egui::epaint::Shape::Text(text) = &shape.shape else { return None };
-                let rect = text.galley.rect.translate(text.pos.to_vec2());
-                (text.galley.text() == "..." && pane.contains_rect(rect)).then_some(rect.center())
-            }).unwrap_or_else(|| {
-                let menus: Vec<_> = output.shapes.iter().filter_map(|shape| {
-                    let egui::epaint::Shape::Text(text) = &shape.shape else { return None };
-                    (text.galley.text() == "...")
-                        .then_some(text.galley.rect.translate(text.pos.to_vec2()))
-                }).collect();
-                panic!("virtual split has no menu at zoom {zoom}; channel={virtual_channel:?}, pane={pane:?}, menus={menus:?}, screen={:?}, pixels_per_point={}",
-                    ctx.screen_rect(), ctx.pixels_per_point())
-            });
+            let header = egui::Rect::from_min_size(
+                pane.min,
+                egui::vec2(pane.width(), crate::widgets::split_header::split_header_height()),
+            );
+            let mut menu_dots: Vec<_> = output.shapes.iter().filter_map(|shape| {
+                let egui::epaint::Shape::Circle(circle) = &shape.shape else { return None };
+                (header.contains(circle.center) && shape.clip_rect.contains(circle.center))
+                    .then_some(circle.center)
+            }).collect();
+            assert_eq!(menu_dots.len(), 3,
+                "virtual split has no vector menu at zoom {zoom}; channel={virtual_channel:?}, header={header:?}, dots={menu_dots:?}");
+            menu_dots.sort_by(|left, right| left.x.total_cmp(&right.x));
+            let menu = menu_dots[1];
             for pressed in [true, false] {
                 production_ui_frame(&ctx, &mut app, vec![
                     egui::Event::PointerMoved(menu),
@@ -17261,6 +17519,14 @@ mod tests {
         assert_eq!(app.state.mentions[0].id, crust_core::MessageId(42));
         assert_eq!(app.state.mentions[0].server_id.as_deref(), Some("confirmed-own-message"));
         assert_eq!(app.state.mentions_unread, unread_before);
+        for channel in [&channel, &ChannelId::mentions()] {
+            assert!(ctx.data(|data| data.get_temp::<u64>(
+                egui::Id::new("message_layout_revision").with(channel.as_str()),
+            )).unwrap_or(0) > 0, "confirmed sender metadata must refresh rendered rows");
+            assert!(ctx.data(|data| data.get_temp::<u64>(
+                egui::Id::new("reply_sender_revision").with(channel.as_str()),
+            )).unwrap_or(0) > 0, "confirmed identities must refresh reply lookups");
+        }
         app.apply_event(crust_core::AppEvent::MessageDeleted {
             channel: channel.clone(), server_id: "confirmed-own-message".into(),
         }, &ctx);

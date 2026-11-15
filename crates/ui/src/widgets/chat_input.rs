@@ -1,6 +1,5 @@
 use crate::image_cache::UiImageCache;
 use std::collections::HashMap;
-#[cfg(test)]
 use std::sync::Arc;
 
 use egui::{Color32, Id, Key, Order, Pos2, RichText, Stroke, Ui, Vec2};
@@ -347,6 +346,120 @@ impl Default for HistState {
     }
 }
 
+#[derive(Clone)]
+struct InputHistorySearch {
+    channel: ChannelId,
+    original_draft: String,
+    entries: Arc<[(String, String)]>,
+    query: String,
+    matches: Vec<usize>,
+    selected: Option<usize>,
+    anchor: usize,
+    backwards: bool,
+    focus_query: bool,
+    opened_at: f64,
+}
+
+impl InputHistorySearch {
+    fn new(
+        channel: &ChannelId,
+        draft: &str,
+        history: &[String],
+        anchor: usize,
+        backwards: bool,
+        opened_at: f64,
+    ) -> Self {
+        Self {
+            channel: channel.clone(),
+            original_draft: draft.to_owned(),
+            entries: history
+                .iter()
+                .map(|text| (text.clone(), text.to_lowercase()))
+                .collect(),
+            query: String::new(),
+            matches: Vec::new(),
+            selected: None,
+            anchor,
+            backwards,
+            focus_query: true,
+            opened_at,
+        }
+    }
+
+    fn refresh(&mut self) {
+        self.matches.clear();
+        self.selected = None;
+        if self.query.is_empty() {
+            return;
+        }
+        let query = self.query.to_lowercase();
+        self.matches.extend(
+            self.entries
+                .iter()
+                .enumerate()
+                .filter_map(|(index, (_, text))| text.contains(&query).then_some(index)),
+        );
+        if !self.matches.is_empty() {
+            self.selected = Some(if self.backwards {
+                self.matches
+                    .iter()
+                    .rposition(|index| *index <= self.anchor)
+                    .unwrap_or(self.matches.len() - 1)
+            } else {
+                self.matches
+                    .iter()
+                    .position(|index| *index >= self.anchor)
+                    .unwrap_or(0)
+            });
+        }
+    }
+
+    fn cycle(&mut self, backwards: bool) {
+        self.backwards = backwards;
+        if let Some(selected) = self.selected {
+            let count = self.matches.len();
+            self.selected = Some(if backwards {
+                (selected + count - 1) % count
+            } else {
+                (selected + 1) % count
+            });
+        }
+    }
+
+    fn selected_text(&self) -> Option<&str> {
+        self.selected
+            .and_then(|selected| self.matches.get(selected))
+            .and_then(|index| self.entries.get(*index))
+            .map(|(text, _)| text.as_str())
+    }
+}
+
+fn begin_input_history_search(
+    ctx: &egui::Context,
+    id: Id,
+    channel: &ChannelId,
+    draft: &str,
+    history: &[String],
+    backwards: bool,
+) {
+    let recalled = ctx.data(|data| data.get_temp::<HistState>(id.with("msg_history_state")));
+    let anchor = recalled
+        .filter(|state| state.idx >= 0 && state.expected_buf == draft)
+        .map_or(history.len(), |state| {
+            history.len().saturating_sub(state.idx as usize + 1)
+        });
+    let opened_at = ctx.input(|input| input.time);
+    ctx.data_mut(|data| {
+        data.insert_temp(
+            id.with("input_history_search"),
+            InputHistorySearch::new(channel, draft, history, anchor, backwards, opened_at),
+        )
+    });
+    invalidate_emote_completions(ctx, id);
+    ctx.memory_mut(|memory| memory.request_focus(id.with("input_history_query")));
+    ctx.request_repaint();
+}
+
 /// Chat input bar shown at the bottom of the message area.
 pub struct ChatInput<'a> {
     /// Explicit identity keeps keyboard focus independent of the pane's layout.
@@ -434,11 +547,48 @@ impl<'a> ChatInput<'a> {
             ui.data_mut(|data| {
                 data.remove::<HistState>(text_edit_id.with("msg_history_state"));
                 data.remove::<SpellCtx>(text_edit_id.with("spell_check_ctx"));
+                data.remove::<InputHistorySearch>(text_edit_id.with("input_history_search"));
+            });
+            ui.memory_mut(|memory| {
+                if memory.has_focus(text_edit_id.with("input_history_query")) {
+                    memory.request_focus(text_edit_id);
+                }
             });
         }
         let popup_pointer_active = completion_pointer_active(ui.ctx(), text_edit_id);
-        let input_had_focus = ui.memory(|m| m.has_focus(text_edit_id)) || popup_pointer_active;
-        let mut retain_keyboard_focus = popup_pointer_active;
+        let mut history_search_active = ui.data(|data| {
+            data.get_temp::<InputHistorySearch>(text_edit_id.with("input_history_search"))
+                .is_some()
+        });
+        let composer_had_focus = ui.memory(|m| m.has_focus(text_edit_id)) || popup_pointer_active;
+        if composer_had_focus && !history_search_active {
+            let direction = ui.input_mut(|input| {
+                if crate::app::consume_exact_key(
+                    input,
+                    egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                    Key::R,
+                ) {
+                    Some(false)
+                } else if crate::app::consume_exact_key(input, egui::Modifiers::CTRL, Key::R) {
+                    Some(true)
+                } else {
+                    None
+                }
+            });
+            if let Some(backwards) = direction {
+                begin_input_history_search(
+                    ui.ctx(),
+                    text_edit_id,
+                    self.channel,
+                    buf,
+                    self.message_history,
+                    backwards,
+                );
+                history_search_active = true;
+            }
+        }
+        let input_had_focus = composer_had_focus && !history_search_active;
+        let mut retain_keyboard_focus = popup_pointer_active && !history_search_active;
 
         // Clipboard image paste (Ctrl/Cmd+V)
         // egui-winit 0.31's keyboard handler early-returns from a Ctrl+V
@@ -708,6 +858,7 @@ impl<'a> ChatInput<'a> {
                         .allocate_ui(egui::vec2(text_width, input_h), |ui| {
                             egui::TextEdit::singleline(buf)
                                 .id(text_edit_id)
+                                .interactive(!history_search_active)
                                 .hint_text(hint_text)
                                 .text_color(t::text_primary())
                                 .font(t::body())
@@ -1097,7 +1248,7 @@ impl<'a> ChatInput<'a> {
                     let twitch_over_limit =
                         is_twitch_channel && twitch_char_count > TWITCH_MAX_CHARS;
                     let is_slash_input = buf.trim_start().starts_with('/');
-                    let can_submit = !twitch_over_limit
+                    let can_submit = !history_search_active && !twitch_over_limit
                         && !buf.trim().is_empty()
                         && (self.logged_in || is_slash_input);
 
@@ -1307,6 +1458,7 @@ impl<'a> ChatInput<'a> {
                     let mut context_select_all = false;
                     let mut context_clear_input = false;
                     let mut context_insert_help = false;
+                    let mut context_search_history = false;
                     let has_selection = selected_input_range(ui.ctx(), text_edit_id, buf).is_some();
                     resp.context_menu(|ui| {
                         if ui
@@ -1360,6 +1512,11 @@ impl<'a> ChatInput<'a> {
                         }
 
                         ui.separator();
+
+                        if ui.button(RichText::new("Search input history (Ctrl+R)").font(t::small())).clicked() {
+                            context_search_history = true;
+                            ui.close_menu();
+                        }
 
                         let send_now_resp = ui.add_enabled(
                             can_submit,
@@ -1478,6 +1635,11 @@ impl<'a> ChatInput<'a> {
                         ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                     }
 
+                    if context_search_history {
+                        begin_input_history_search(ui.ctx(), text_edit_id, self.channel, buf, self.message_history, true);
+                        retain_keyboard_focus = false;
+                    }
+
                     if let Some((spelling, replacement)) = spell_replace {
                         if let Some(cursor) = spelling.replace(self.channel, buf, &replacement) {
                             move_cursor_to_end(ui.ctx(), text_edit_id, cursor);
@@ -1505,6 +1667,8 @@ impl<'a> ChatInput<'a> {
                 }
             });
 
+        retain_keyboard_focus |= self.show_input_history_search(ui, text_edit_id, buf);
+
         // request_focus resets egui's key filter. Reapply it after every child
         // control has registered so Tab completion cannot move focus to Send.
         ui.ctx().memory_mut(|memory| {
@@ -1525,6 +1689,213 @@ impl<'a> ChatInput<'a> {
         });
 
         result
+    }
+
+    fn show_input_history_search(&self, ui: &mut Ui, id: Id, buf: &mut String) -> bool {
+        let state_id = id.with("input_history_search");
+        let Some(mut search) = ui.data(|data| data.get_temp::<InputHistorySearch>(state_id)) else {
+            return false;
+        };
+        if search.channel != *self.channel || search.original_draft != *buf {
+            ui.data_mut(|data| data.remove::<InputHistorySearch>(state_id));
+            return false;
+        }
+        let query_id = id.with("input_history_query");
+        let just_opened = search.opened_at == ui.input(|input| input.time);
+        let owns_keys = ui.memory(|memory| {
+            memory.has_focus(query_id)
+                || (memory.focused().is_none() && memory.had_focus_last_frame(query_id))
+        });
+        let mut accept = false;
+        let mut cancel = false;
+        let mut direction = None;
+        if owns_keys {
+            ui.input_mut(|input| {
+                cancel = crate::app::consume_exact_key(input, egui::Modifiers::NONE, Key::Escape);
+                accept = crate::app::consume_exact_key(input, egui::Modifiers::NONE, Key::Enter)
+                    || crate::app::consume_exact_key(input, egui::Modifiers::NONE, Key::Tab)
+                    || crate::app::consume_exact_key(input, egui::Modifiers::SHIFT, Key::Tab);
+                if crate::app::consume_exact_key(
+                    input,
+                    egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                    Key::R,
+                ) || crate::app::consume_exact_key(input, egui::Modifiers::NONE, Key::ArrowDown)
+                {
+                    direction = Some(false);
+                } else if crate::app::consume_exact_key(input, egui::Modifiers::CTRL, Key::R)
+                    || crate::app::consume_exact_key(input, egui::Modifiers::NONE, Key::ArrowUp)
+                {
+                    direction = Some(true);
+                }
+            });
+        }
+
+        let viewport = ui.ctx().screen_rect().shrink(8.0);
+        let input_rect = ui
+            .ctx()
+            .read_response(id)
+            .map_or(ui.min_rect(), |response| response.rect);
+        let width = input_rect.width().clamp(260.0, 520.0).min(viewport.width());
+        let position = egui::pos2(
+            input_rect.left().clamp(
+                viewport.left(),
+                (viewport.right() - width).max(viewport.left()),
+            ),
+            (input_rect.top() - 210.0).max(viewport.top()),
+        );
+        let mut open = true;
+        let shown = egui::Window::new("Search input history")
+            .id(id.with("input_history_window"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_pos(position)
+            .default_width(width)
+            .min_width(0.0)
+            .max_width(viewport.width())
+            .max_height(viewport.height())
+            .show(ui.ctx(), |ui| {
+                let query = ui.add(
+                    egui::TextEdit::singleline(&mut search.query)
+                        .id(query_id)
+                        .hint_text("Search sent messages...")
+                        .desired_width(f32::INFINITY),
+                );
+                if search.focus_query {
+                    query.request_focus();
+                    search.focus_query = false;
+                }
+                if query.changed() {
+                    search.refresh();
+                }
+                if let Some(backwards) = direction {
+                    search.cycle(backwards);
+                }
+                let status = if search.query.is_empty() {
+                    "Type to search sent messages".to_owned()
+                } else if let Some(selected) = search.selected {
+                    format!(
+                        "Match {} of {}",
+                        search.matches.len() - selected,
+                        search.matches.len()
+                    )
+                } else {
+                    "No matches".to_owned()
+                };
+                let status_color = if !search.query.is_empty() && search.selected.is_none() {
+                    t::red()
+                } else {
+                    t::text_secondary()
+                };
+                ui.label(RichText::new(status).font(t::small()).color(status_color));
+                egui::ScrollArea::vertical()
+                    .id_salt(id.with("input_history_preview"))
+                    .max_height(80.0 * t::font_scale())
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.add(egui::Label::new(search.selected_text().unwrap_or("")).wrap());
+                    });
+                ui.horizontal_wrapped(|ui| {
+                    let has_match = search.selected.is_some();
+                    if ui
+                        .add_enabled(has_match, egui::Button::new("Older"))
+                        .on_hover_text("Ctrl+R or Up")
+                        .clicked()
+                    {
+                        search.cycle(true);
+                        query.request_focus();
+                    }
+                    if ui
+                        .add_enabled(has_match, egui::Button::new("Newer"))
+                        .on_hover_text("Ctrl+Shift+R or Down")
+                        .clicked()
+                    {
+                        search.cycle(false);
+                        query.request_focus();
+                    }
+                    accept |= ui
+                        .add_enabled(has_match, egui::Button::new("Use message"))
+                        .clicked();
+                    cancel |= ui.button("Cancel").clicked();
+                });
+                ui.label(
+                    RichText::new("Enter uses the message; Escape keeps your draft.")
+                        .font(t::tiny())
+                        .color(t::text_helper()),
+                );
+                if ui.memory(|memory| memory.has_focus(query_id)) {
+                    ui.memory_mut(|memory| {
+                        memory.set_focus_lock_filter(
+                            query_id,
+                            egui::EventFilter {
+                                tab: true,
+                                horizontal_arrows: true,
+                                vertical_arrows: true,
+                                ..Default::default()
+                            },
+                        )
+                    });
+                }
+            });
+
+        let clicked_elsewhere =
+            !just_opened && shown.is_some_and(|window| window.response.clicked_elsewhere());
+        let focus_moved = !just_opened
+            && ui.memory(|memory| memory.focused().is_some_and(|focused| focused != query_id));
+        let selected = accept
+            .then(|| search.selected_text().map(str::to_owned))
+            .flatten();
+        if cancel || !open || clicked_elsewhere || focus_moved || selected.is_some() {
+            if !cancel && open && !clicked_elsewhere {
+                if let Some(selected) = selected {
+                    *buf = selected;
+                    let cursor = buf.chars().count();
+                    move_cursor_to_end(ui.ctx(), id, cursor);
+                    invalidate_emote_completions(ui.ctx(), id);
+                    ui.data_mut(|data| {
+                        data.insert_temp(
+                            id.with("dismissed_completion"),
+                            DismissedCompletion {
+                                text: buf.clone(),
+                                caret: buf.len(),
+                            },
+                        );
+                        let idx = self
+                            .message_history
+                            .iter()
+                            .rposition(|text| text.as_str() == buf.as_str())
+                            .map_or(-1, |index| (self.message_history.len() - index - 1) as i32);
+                        data.insert_temp(
+                            id.with("msg_history_state"),
+                            HistState {
+                                idx,
+                                saved_input: search.original_draft.clone(),
+                                expected_buf: buf.clone(),
+                            },
+                        );
+                    });
+                }
+            }
+            ui.data_mut(|data| data.remove::<InputHistorySearch>(state_id));
+            ui.ctx().request_repaint();
+            return !clicked_elsewhere && (!focus_moved || cancel || accept || !open);
+        }
+        if accept {
+            ui.memory_mut(|memory| {
+                memory.request_focus(query_id);
+                memory.set_focus_lock_filter(
+                    query_id,
+                    egui::EventFilter {
+                        tab: true,
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        ..Default::default()
+                    },
+                );
+            });
+        }
+        ui.data_mut(|data| data.insert_temp(state_id, search));
+        false
     }
 
     fn show_autocomplete_popup(
@@ -3604,6 +3975,273 @@ mod tests {
                 assert_eq!(buf, expected);
             }
         }
+    }
+
+    fn input_history_search_frame(
+        ctx: &egui::Context,
+        channel: &ChannelId,
+        buf: &mut String,
+        history: &[String],
+        events: Vec<egui::Event>,
+        focus: bool,
+    ) -> ChatInputResult {
+        let mut result = None;
+        let _ = ctx.run(raw_input(events), |ctx| {
+            egui::TopBottomPanel::bottom("history_search_test_input").show(ctx, |ui| {
+                let id = Id::new("history_search_test");
+                if focus {
+                    ui.memory_mut(|memory| memory.request_focus(id));
+                }
+                result = Some(
+                    ChatInput {
+                        id: Some(id),
+                        channel,
+                        logged_in: true,
+                        username: None,
+                        emote_catalog: &[],
+                        emote_bytes: &UiImageCache::default(),
+                        pending_reply: None,
+                        message_history: history,
+                        slash_usage_counts: &HashMap::new(),
+                        known_channels: &[],
+                        chatters: &[],
+                        prevent_overlong_twitch_messages: false,
+                        animate_emotes: false,
+                        accept_dropped_files: false,
+                    }
+                    .show(ui, buf),
+                );
+            });
+        });
+        result.unwrap()
+    }
+
+    fn input_history_search_state(ctx: &egui::Context) -> Option<InputHistorySearch> {
+        ctx.data(|data| data.get_temp(Id::new("history_search_test").with("input_history_search")))
+    }
+
+    #[test]
+    fn input_history_search_filters_cycles_and_accepts_without_sending() {
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("example");
+        let history = vec![
+            "older Café visit".to_owned(),
+            "other message".to_owned(),
+            "newer CAFÉ visit".to_owned(),
+        ];
+        let mut buf = "original draft".to_owned();
+        input_history_search_frame(&ctx, &channel, &mut buf, &history, Vec::new(), true);
+        input_history_search_frame(
+            &ctx,
+            &channel,
+            &mut buf,
+            &history,
+            vec![key(Key::R, true, egui::Modifiers::CTRL)],
+            false,
+        );
+        assert!(input_history_search_state(&ctx).is_some());
+        let result = input_history_search_frame(
+            &ctx,
+            &channel,
+            &mut buf,
+            &history,
+            vec![egui::Event::Text("cAfÉ".to_owned())],
+            false,
+        );
+        assert!(result.send.is_none());
+        assert_eq!(
+            input_history_search_state(&ctx).unwrap().selected_text(),
+            Some("newer CAFÉ visit")
+        );
+        assert_eq!(buf, "original draft");
+        for (pressed, modifiers, expected) in [
+            (Key::R, egui::Modifiers::CTRL, "older Café visit"),
+            (Key::R, egui::Modifiers::CTRL, "newer CAFÉ visit"),
+            (
+                Key::R,
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                "older Café visit",
+            ),
+            (Key::ArrowDown, egui::Modifiers::NONE, "newer CAFÉ visit"),
+            (Key::ArrowUp, egui::Modifiers::NONE, "older Café visit"),
+        ] {
+            let result = input_history_search_frame(
+                &ctx,
+                &channel,
+                &mut buf,
+                &history,
+                vec![key(pressed, true, modifiers)],
+                false,
+            );
+            assert!(result.send.is_none());
+            assert_eq!(
+                input_history_search_state(&ctx).unwrap().selected_text(),
+                Some(expected)
+            );
+            assert_eq!(buf, "original draft");
+        }
+        let result = input_history_search_frame(
+            &ctx,
+            &channel,
+            &mut buf,
+            &history,
+            vec![key(Key::Enter, true, egui::Modifiers::NONE)],
+            false,
+        );
+        assert!(result.send.is_none(), "accepting a result must not send it");
+        assert_eq!(buf, "older Café visit");
+        assert!(input_history_search_state(&ctx).is_none());
+        assert!(ctx.memory(|memory| memory.has_focus(Id::new("history_search_test"))));
+        let result = input_history_search_frame(
+            &ctx,
+            &channel,
+            &mut buf,
+            &history,
+            vec![key(Key::Enter, true, egui::Modifiers::NONE)],
+            false,
+        );
+        assert_eq!(result.send.as_deref(), Some("older Café visit"));
+    }
+
+    #[test]
+    fn input_history_search_keeps_draft_on_escape_and_on_missing_match() {
+        for history in [vec!["matching message".to_owned()], Vec::new()] {
+            let ctx = egui::Context::default();
+            let channel = ChannelId::new("example");
+            let mut buf = "  original 🦀 draft  ".to_owned();
+            input_history_search_frame(&ctx, &channel, &mut buf, &history, Vec::new(), true);
+            input_history_search_frame(
+                &ctx,
+                &channel,
+                &mut buf,
+                &history,
+                vec![key(Key::R, true, egui::Modifiers::CTRL)],
+                false,
+            );
+            input_history_search_frame(
+                &ctx,
+                &channel,
+                &mut buf,
+                &history,
+                vec![egui::Event::Text("missing".to_owned())],
+                false,
+            );
+            let result = input_history_search_frame(
+                &ctx,
+                &channel,
+                &mut buf,
+                &history,
+                vec![key(Key::Enter, true, egui::Modifiers::NONE)],
+                false,
+            );
+            assert!(result.send.is_none());
+            assert!(input_history_search_state(&ctx).is_some());
+            assert_eq!(buf, "  original 🦀 draft  ");
+            let result = input_history_search_frame(
+                &ctx,
+                &channel,
+                &mut buf,
+                &history,
+                vec![key(Key::Escape, true, egui::Modifiers::NONE)],
+                false,
+            );
+            assert!(result.send.is_none());
+            assert!(input_history_search_state(&ctx).is_none());
+            assert_eq!(buf, "  original 🦀 draft  ");
+            assert!(ctx.memory(|memory| memory.has_focus(Id::new("history_search_test"))));
+        }
+    }
+
+    #[test]
+    fn input_history_search_does_not_apply_a_result_to_another_channel() {
+        let ctx = egui::Context::default();
+        let first = ChannelId::new("first");
+        let second = ChannelId::new("second");
+        let history = vec!["matching message".to_owned()];
+        let mut buf = "first draft".to_owned();
+        input_history_search_frame(&ctx, &first, &mut buf, &history, Vec::new(), true);
+        input_history_search_frame(
+            &ctx,
+            &first,
+            &mut buf,
+            &history,
+            vec![key(Key::R, true, egui::Modifiers::CTRL)],
+            false,
+        );
+        input_history_search_frame(
+            &ctx,
+            &first,
+            &mut buf,
+            &history,
+            vec![egui::Event::Text("match".to_owned())],
+            false,
+        );
+        assert!(input_history_search_state(&ctx).unwrap().selected.is_some());
+        buf = "second draft".to_owned();
+        let result =
+            input_history_search_frame(&ctx, &second, &mut buf, &history, Vec::new(), false);
+        assert!(result.send.is_none());
+        assert!(input_history_search_state(&ctx).is_none());
+        assert_eq!(buf, "second draft");
+    }
+
+    #[test]
+    fn input_history_search_shortcuts_belong_to_the_focused_split() {
+        let ctx = egui::Context::default();
+        let first_id = Id::new("history_search_first_split");
+        let second_id = Id::new("history_search_second_split");
+        let first_channel = ChannelId::new("first");
+        let second_channel = ChannelId::new("second");
+        let history = vec!["matching message".to_owned()];
+        let mut first = "first draft".to_owned();
+        let mut second = "second draft".to_owned();
+        for (index, events) in [
+            Vec::new(),
+            vec![key(Key::R, true, egui::Modifiers::CTRL)],
+            vec![egui::Event::Text("match".to_owned())],
+            vec![key(Key::Enter, true, egui::Modifiers::NONE)],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let _ = ctx.run(raw_input(events), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    for (id, channel, buf) in [
+                        (first_id, &first_channel, &mut first),
+                        (second_id, &second_channel, &mut second),
+                    ] {
+                        if index == 0 && id == second_id {
+                            ui.memory_mut(|memory| memory.request_focus(id));
+                        }
+                        let result = ChatInput {
+                            id: Some(id),
+                            channel,
+                            logged_in: true,
+                            username: None,
+                            emote_catalog: &[],
+                            emote_bytes: &UiImageCache::default(),
+                            pending_reply: None,
+                            message_history: &history,
+                            slash_usage_counts: &HashMap::new(),
+                            known_channels: &[],
+                            chatters: &[],
+                            prevent_overlong_twitch_messages: false,
+                            animate_emotes: false,
+                            accept_dropped_files: false,
+                        }
+                        .show(ui, buf);
+                        assert!(result.send.is_none());
+                    }
+                });
+            });
+            assert!(ctx
+                .data(|data| data
+                    .get_temp::<InputHistorySearch>(first_id.with("input_history_search")))
+                .is_none());
+            assert_eq!(first, "first draft");
+        }
+        assert_eq!(second, "matching message");
+        assert!(ctx.memory(|memory| memory.has_focus(second_id)));
     }
 
     #[test]

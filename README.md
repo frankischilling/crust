@@ -59,9 +59,10 @@ for current settings and account-dialog captures.
 - [Chat controls and performance audit](docs/AUDIT_STABILITY.md)
 - [Chat loading, emotes, and navigation audit](docs/AUDIT_CHAT_RELIABILITY.md)
 - [Chat rendering, input, and saved-layout audit](docs/AUDIT_CHAT_POLISH.md)
+- [7TV paints, image loading, and chat controls](docs/AUDIT_NAME_PAINTS.md)
 - [Plugin API reference](docs/API.md)
 - [Example plugins](plugins/)
-- [Release notes v0.5.7](docs/releases/Release_v0.5.7.md)
+- [Release notes v0.5.8](docs/releases/Release_v0.5.8.md)
 
 ## Data paths
 

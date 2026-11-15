@@ -1,6 +1,7 @@
 use crate::app::UiCommandSender;
 use crate::image_cache::UiImageCache;
 use std::borrow::Cow;
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -10,12 +11,14 @@ use crust_core::{
     events::{AppCommand, LinkPreview},
     model::{
         filters::FilterAction, Badge, ChannelId, ChatMessage, LowTrustStatus, MessageFlags,
-        MessageId, MsgKind, ReplyInfo, SenderNamePaint, Span,
+        MessageId, MsgKind, ReplyInfo, Span,
     },
 };
 
 use crate::theme as t;
 use crate::widgets::message_search::MessageSearchState;
+use crate::widgets::name_paint::show_sender_name;
+use crate::widgets::sender_cosmetics;
 
 /// Returned from [`MessageList::show`].
 pub struct MessageListResult {
@@ -49,6 +52,225 @@ struct MessageListView {
 fn view_state_id(channel: &ChannelId, pane: Option<u64>, name: &str) -> Id {
     let id = Id::new(name).with(channel.as_str());
     pane.map_or(id, |pane| id.with(pane))
+}
+
+/// Refresh reply identities after an existing row gains a server ID or sender.
+pub(crate) fn invalidate_reply_sender_index(ctx: &egui::Context, channel: &ChannelId) {
+    ctx.data_mut(|data| {
+        let key = Id::new("reply_sender_revision").with(channel.as_str());
+        let revision = data.get_temp::<u64>(key).unwrap_or(0).wrapping_add(1);
+        data.insert_temp(key, revision);
+    });
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ReplyBufferKey {
+    first: Option<MessageId>,
+    last: Option<MessageId>,
+    count: usize,
+    revision: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ReplySenderPosition {
+    ordinal: usize,
+    id: MessageId,
+}
+
+struct ReplySenderRow {
+    id: MessageId,
+    login: Option<Arc<str>>,
+    server_id: Option<Arc<str>>,
+}
+
+struct ReplySenderIndex {
+    key: ReplyBufferKey,
+    // Ordinals keep every map position stable when the deque drops old rows.
+    base: usize,
+    rows: VecDeque<ReplySenderRow>,
+    by_login: HashMap<Arc<str>, ReplySenderPosition>,
+    by_server_id: HashMap<Arc<str>, ReplySenderPosition>,
+}
+
+fn reply_lookup_key(value: &str) -> Cow<'_, str> {
+    let value = value.trim();
+    if value.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(value.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(value)
+    }
+}
+
+impl ReplySenderIndex {
+    fn new(key: ReplyBufferKey, messages: &VecDeque<ChatMessage>) -> Self {
+        let mut index = Self {
+            key,
+            base: 0,
+            rows: VecDeque::with_capacity(messages.len()),
+            by_login: HashMap::new(),
+            by_server_id: HashMap::new(),
+        };
+        for message in messages {
+            index.push(message);
+        }
+        index
+    }
+
+    fn push(&mut self, message: &ChatMessage) {
+        let position = ReplySenderPosition {
+            ordinal: self.base + self.rows.len(),
+            id: message.id,
+        };
+        let insert = |map: &mut HashMap<Arc<str>, ReplySenderPosition>, value: &str| {
+            let value = reply_lookup_key(value);
+            if value.is_empty() {
+                return None;
+            }
+            let key = map
+                .get_key_value(value.as_ref())
+                .map_or_else(|| Arc::<str>::from(value.as_ref()), |(key, _)| key.clone());
+            map.insert(key.clone(), position);
+            Some(key)
+        };
+        self.rows.push_back(ReplySenderRow {
+            id: message.id,
+            login: insert(&mut self.by_login, &message.sender.login),
+            server_id: message
+                .server_id
+                .as_deref()
+                .and_then(|id| insert(&mut self.by_server_id, id)),
+        });
+    }
+
+    /// Reuse retained keys for an append, including rotation of a full deque.
+    fn update(&mut self, key: ReplyBufferKey, messages: &VecDeque<ChatMessage>) -> bool {
+        if self.key.revision != key.revision || self.rows.is_empty() || messages.is_empty() {
+            return false;
+        }
+        let Some(dropped) = self.rows.iter().position(|row| Some(row.id) == key.first) else {
+            return false;
+        };
+        let retained = self.rows.len() - dropped;
+        if messages.len() < retained
+            || messages.get(retained - 1).map(|message| message.id) != self.key.last
+            || self
+                .base
+                .checked_add(dropped)
+                .and_then(|base| base.checked_add(messages.len()))
+                .is_none()
+        {
+            return false;
+        }
+        for _ in 0..dropped {
+            let row = self.rows.pop_front().unwrap();
+            if let Some(login) = row.login {
+                if self
+                    .by_login
+                    .get(&login)
+                    .is_some_and(|position| position.ordinal == self.base)
+                {
+                    self.by_login.remove(&login);
+                }
+            }
+            if let Some(id) = row.server_id {
+                if self
+                    .by_server_id
+                    .get(&id)
+                    .is_some_and(|position| position.ordinal == self.base)
+                {
+                    self.by_server_id.remove(&id);
+                }
+            }
+            self.base += 1;
+        }
+        for message in messages.iter().skip(retained) {
+            self.push(message);
+        }
+        self.key = key;
+        true
+    }
+
+    fn message<'a>(
+        &self,
+        messages: &'a VecDeque<ChatMessage>,
+        reply: &ReplyInfo,
+    ) -> Option<&'a ChatMessage> {
+        let login = reply_lookup_key(&reply.parent_user_login);
+        let position = if login.is_empty() {
+            self.by_server_id
+                .get(reply_lookup_key(&reply.parent_msg_id).as_ref())
+        } else {
+            self.by_login.get(login.as_ref())
+        }?;
+        let message = messages.get(position.ordinal.checked_sub(self.base)?)?;
+        (message.id == position.id).then_some(message)
+    }
+}
+
+#[derive(Clone)]
+struct ReplySenderCacheEntry {
+    channel: ChannelId,
+    index: Arc<ReplySenderIndex>,
+    used: u64,
+}
+
+#[derive(Clone, Default)]
+struct ReplySenderCache {
+    entries: Vec<ReplySenderCacheEntry>,
+}
+
+fn cached_reply_senders(
+    ctx: &egui::Context,
+    channel: &ChannelId,
+    messages: &VecDeque<ChatMessage>,
+) -> Arc<ReplySenderIndex> {
+    let pass = ctx.cumulative_pass_nr();
+    ctx.data_mut(|data| {
+        let revision = data
+            .get_temp::<u64>(Id::new("reply_sender_revision").with(channel.as_str()))
+            .unwrap_or(0);
+        let key = ReplyBufferKey {
+            first: messages.front().map(|message| message.id),
+            last: messages.back().map(|message| message.id),
+            count: messages.len(),
+            revision,
+        };
+        let cache = data.get_temp_mut_or_default::<ReplySenderCache>(Id::new("reply_sender_cache"));
+        if let Some(entry) = cache
+            .entries
+            .iter_mut()
+            .find(|entry| entry.channel == *channel)
+        {
+            entry.used = pass;
+            if entry.index.key != key {
+                let updated =
+                    Arc::get_mut(&mut entry.index).is_some_and(|index| index.update(key, messages));
+                if !updated {
+                    entry.index = Arc::new(ReplySenderIndex::new(key, messages));
+                }
+            }
+            return entry.index.clone();
+        }
+        // Four panes can be visible at once. Navigating channels must not retain
+        // an unbounded collection of history indices in egui's temporary data.
+        if cache.entries.len() >= 4 {
+            let oldest = cache
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.used)
+                .map(|(index, _)| index)
+                .unwrap();
+            cache.entries.remove(oldest);
+        }
+        let index = Arc::new(ReplySenderIndex::new(key, messages));
+        cache.entries.push(ReplySenderCacheEntry {
+            channel: channel.clone(),
+            index: index.clone(),
+            used: pass,
+        });
+        index
+    })
 }
 
 /// Discard measurements in each visible pane and mark hidden views for refresh.
@@ -143,6 +365,7 @@ struct RenderCtx {
     reply_key: Id,
     scroll_to_key: Id,
     scroll_hint_key: Id,
+    reply_senders: OnceCell<Arc<ReplySenderIndex>>,
     /// The server-id of the message currently being flash-highlighted (if any).
     highlight_server_id: Option<String>,
     /// Pre-computed base alpha for the highlight flash (0.0 when inactive).
@@ -948,6 +1171,7 @@ impl<'a> MessageList<'a> {
                 reply_key,
                 scroll_to_key,
                 scroll_hint_key,
+                reply_senders: OnceCell::new(),
                 highlight_server_id,
                 highlight_alpha,
                 highlight_animating,
@@ -1461,6 +1685,129 @@ impl<'a> MessageList<'a> {
             parent_display_name: msg.sender.display_name.clone(),
             parent_msg_body: msg.raw_text.clone(),
         })
+    }
+
+    fn reply_sender_message(
+        &self,
+        ctx: &egui::Context,
+        rctx: &RenderCtx,
+        reply: &ReplyInfo,
+    ) -> Option<&ChatMessage> {
+        // Prefer the latest retained appearance so live paint changes also reach
+        // replies to older messages. The shared index stores identities only.
+        rctx.reply_senders
+            .get_or_init(|| cached_reply_senders(ctx, self.channel, self.messages))
+            .message(self.messages, reply)
+    }
+
+    fn render_reply_preview(
+        &self,
+        ui: &mut Ui,
+        msg: &ChatMessage,
+        reply: &ReplyInfo,
+        rctx: &RenderCtx,
+        user_color_cache: &mut HashMap<String, Color32>,
+    ) -> egui::Response {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.style_mut().override_font_id = Some(t::small());
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+            let (stripe, _) = ui.allocate_exact_size(egui::vec2(2.0, 12.0), egui::Sense::hover());
+            ui.painter().rect_filled(stripe, 0.0, t::accent());
+            let body = if let Some((cut, _)) = reply.parent_msg_body.char_indices().nth(80) {
+                format!("{}...", &reply.parent_msg_body[..cut])
+            } else {
+                reply.parent_msg_body.clone()
+            };
+            let reply_color = t::text_secondary();
+            let arrow = ui.add(
+                Label::new(RichText::new("↩").color(reply_color))
+                    .selectable(false)
+                    .sense(egui::Sense::click()),
+            );
+            let parent = self.reply_sender_message(ui.ctx(), rctx, reply);
+            let appearance = if msg.channel.is_twitch() {
+                let twitch_parent = parent.filter(|parent| parent.channel.is_twitch());
+                if let Some(parent) = twitch_parent {
+                    sender_cosmetics::remember_sender(ui.ctx(), &parent.sender);
+                }
+                sender_cosmetics::get(
+                    ui.ctx(),
+                    twitch_parent.map(|parent| parent.sender.user_id.0.as_str()),
+                    &reply.parent_user_login,
+                )
+            } else {
+                None
+            };
+            let parent_color = appearance
+                .as_ref()
+                .and_then(|appearance| appearance.color)
+                .unwrap_or_else(|| {
+                    parent.map_or(reply_color, |parent| {
+                        resolve_sender_color(parent, user_color_cache)
+                    })
+                });
+            let parent_paint = match appearance.as_ref() {
+                Some(appearance) => appearance.paint.as_deref(),
+                None => parent.and_then(|parent| parent.sender.name_paint.as_ref()),
+            };
+            let display_name = if reply.parent_display_name.is_empty() {
+                &reply.parent_user_login
+            } else {
+                &reply.parent_display_name
+            };
+            // Leave space for the quoted message even when the name is long.
+            let sender_width =
+                ((ui.available_width() - ui.spacing().item_spacing.x) * 0.5).max(0.0);
+            let sender = ui
+                .allocate_ui_with_layout(
+                    egui::vec2(sender_width, t::small().size),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        show_sender_name(
+                            ui,
+                            display_name,
+                            parent_color,
+                            parent_paint,
+                            self.emote_bytes,
+                            self.animate_emotes,
+                        )
+                    },
+                )
+                .inner;
+            let body = ui.add(
+                Label::new(
+                    RichText::new(format!(": {body}"))
+                        .font(t::small())
+                        .color(reply_color)
+                        .italics(),
+                )
+                .selectable(false)
+                .sense(egui::Sense::click())
+                .truncate(),
+            );
+            let response = arrow.union(sender).union(body);
+            response.context_menu(|ui| self.show_message_context_menu(ui, msg, rctx.reply_key));
+            if response.clicked() {
+                let target = reply.parent_msg_id.trim().to_owned();
+                let hint = ReplyScrollHint {
+                    parent_user_login: reply.parent_user_login.clone(),
+                    parent_msg_body: reply.parent_msg_body.clone(),
+                    child_msg_local_id: msg.id.0,
+                };
+                ui.ctx().data_mut(|data| {
+                    if !target.is_empty() {
+                        data.insert_temp(rctx.scroll_to_key, target);
+                    }
+                    data.insert_temp(rctx.scroll_hint_key, hint);
+                });
+            }
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            response
+        })
+        .inner
     }
 
     fn resolve_server_id_for_actions(&self, msg: &ChatMessage) -> Option<String> {
@@ -2184,6 +2531,9 @@ impl<'a> MessageList<'a> {
         rctx: &RenderCtx,
         user_color_cache: &mut HashMap<String, Color32>,
     ) {
+        if msg.channel.is_twitch() {
+            sender_cosmetics::remember_sender(ui.ctx(), &msg.sender);
+        }
         // Dispatch non-chat (and non-bits) events to the compact system-event renderer.
         match &msg.msg_kind {
             MsgKind::Chat | MsgKind::Bits { .. } => {}
@@ -2204,7 +2554,6 @@ impl<'a> MessageList<'a> {
         }
 
         let reply_key = rctx.reply_key;
-        let scroll_to_key = rctx.scroll_to_key;
 
         // Message background
         // Use pre-computed highlight state from RenderCtx instead of per-
@@ -2288,54 +2637,7 @@ impl<'a> MessageList<'a> {
                     ui.set_opacity(if dimmed { 0.35 } else { 0.55 });
                 }
                 if let Some(ref rep) = msg.reply {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        // Accent left stripe
-                        let (stripe, _) =
-                            ui.allocate_exact_size(egui::vec2(2.0, 12.0), egui::Sense::hover());
-                        ui.painter().rect_filled(stripe, 0.0, t::accent());
-                        let body = if rep.parent_msg_body.chars().count() > 80 {
-                            // Find the byte offset of the 80th char boundary.
-                            let cut = rep
-                                .parent_msg_body
-                                .char_indices()
-                                .nth(80)
-                                .map(|(i, _)| i)
-                                .unwrap_or(rep.parent_msg_body.len());
-                            format!("{}...", &rep.parent_msg_body[..cut])
-                        } else {
-                            rep.parent_msg_body.clone()
-                        };
-                        let reply_color = t::text_secondary();
-                        let h = ui.add(
-                            Label::new(
-                                RichText::new(format!("↩ @{}: {}", rep.parent_display_name, body))
-                                    .font(t::small())
-                                    .color(reply_color)
-                                    .italics(),
-                            )
-                            .sense(egui::Sense::click())
-                            .truncate(),
-                        );
-                        h.context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
-                        if h.clicked() {
-                            let target = rep.parent_msg_id.trim().to_owned();
-                            let hint = ReplyScrollHint {
-                                parent_user_login: rep.parent_user_login.clone(),
-                                parent_msg_body: rep.parent_msg_body.clone(),
-                                child_msg_local_id: msg.id.0,
-                            };
-                            ui.ctx().data_mut(|d| {
-                                if !target.is_empty() {
-                                    d.insert_temp(scroll_to_key, target);
-                                }
-                                d.insert_temp(rctx.scroll_hint_key, hint);
-                            });
-                        }
-                        if h.hovered() {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                        }
-                    });
+                    self.render_reply_preview(ui, msg, rep, rctx, user_color_cache);
                 }
                 // Notification banner (pinned / first / highlighted / rewards)
                 // Rendered inside the Frame so the background fill covers
@@ -2458,7 +2760,15 @@ impl<'a> MessageList<'a> {
                         }
 
                         // Sender name - clickable to open user profile card.
-                        let name_color = resolve_sender_color(msg, user_color_cache);
+                        let appearance = cached_sender_appearance(ui.ctx(), msg);
+                        let name_color = appearance
+                            .as_ref()
+                            .and_then(|appearance| appearance.color)
+                            .unwrap_or_else(|| resolve_sender_color(msg, user_color_cache));
+                        let name_paint = match appearance.as_ref() {
+                            Some(appearance) => appearance.paint.as_deref(),
+                            None => msg.sender.name_paint.as_ref(),
+                        };
                         let name = if msg.flags.is_action {
                             format!("* {}", msg.sender.display_name)
                         } else {
@@ -2466,12 +2776,11 @@ impl<'a> MessageList<'a> {
                         };
                         let name_resp = show_sender_name(
                             ui,
-                            msg.id.0,
                             &name,
                             name_color,
-                            None,
+                            name_paint,
                             self.emote_bytes,
-                            self.cmd_tx,
+                            self.animate_emotes,
                         )
                         .on_hover_ui(|ui| {
                             ui.label(format!("@{}", msg.sender.login));
@@ -2532,7 +2841,10 @@ impl<'a> MessageList<'a> {
                         // Message spans carry their own whitespace from the
                         // tokenizer, so keep inter-widget spacing at zero to
                         // avoid rendering words with visually doubled spaces.
-                        ui.scope(|ui| {
+                        // Keep the parent's wrapping origin: a child scope here
+                        // would indent every body line past the sender prefix.
+                        {
+                            let previous_spacing = ui.spacing().item_spacing.x;
                             ui.spacing_mut().item_spacing.x = 0.0;
                             let collapsed_body = if self.collapse_long_messages {
                                 collapse_message_for_display(
@@ -2581,7 +2893,8 @@ impl<'a> MessageList<'a> {
                             } else {
                                 self.render_spans(ui, msg, reply_key);
                             }
-                        });
+                            ui.spacing_mut().item_spacing.x = previous_spacing;
+                        }
                     },
                 );
             }
@@ -3174,20 +3487,22 @@ impl<'a> MessageList<'a> {
                         } else {
                             format!("{}:", msg.sender.display_name)
                         };
-                        let name_color = msg
-                            .sender
-                            .color
-                            .as_deref()
-                            .and_then(parse_hex_color)
+                        let appearance = cached_sender_appearance(ui.ctx(), msg);
+                        let name_color = appearance
+                            .as_ref()
+                            .and_then(|appearance| appearance.color)
                             .unwrap_or_else(|| resolve_sender_color(msg, user_color_cache));
+                        let name_paint = match appearance.as_ref() {
+                            Some(appearance) => appearance.paint.as_deref(),
+                            None => msg.sender.name_paint.as_ref(),
+                        };
                         let name_resp = show_sender_name(
                             ui,
-                            msg.id.0,
                             &name,
                             name_color,
-                            msg.sender.name_paint.as_ref(),
+                            name_paint,
                             self.emote_bytes,
-                            self.cmd_tx,
+                            self.animate_emotes,
                         )
                         .on_hover_ui(|ui| {
                             ui.label(format!("@{}", msg.sender.login));
@@ -3211,7 +3526,9 @@ impl<'a> MessageList<'a> {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                         }
 
-                        ui.scope(|ui| {
+                        // Body continuation lines share the full message width.
+                        {
+                            let previous_spacing = ui.spacing().item_spacing.x;
                             ui.spacing_mut().item_spacing.x = 0.0;
                             if msg.flags.is_deleted {
                                 ui.add(
@@ -3226,7 +3543,8 @@ impl<'a> MessageList<'a> {
                             } else {
                                 self.render_spans(ui, msg, reply_key);
                             }
-                        });
+                            ui.spacing_mut().item_spacing.x = previous_spacing;
+                        }
                     },
                 );
             }
@@ -3317,7 +3635,13 @@ impl MessageBody<'_> {
         for item in crust_core::format::display_spans(&msg.spans) {
             match item {
                 crust_core::format::DisplaySpan::Single(span) => {
-                    clicked |= self.render_span(ui, span, msg.flags.is_action, context_menu);
+                    clicked |= self.render_span(
+                        ui,
+                        span,
+                        &msg.channel,
+                        msg.flags.is_action,
+                        context_menu,
+                    );
                 }
                 crust_core::format::DisplaySpan::EmoteLayers(layers) => {
                     let response = show_emote_layers(
@@ -3339,6 +3663,7 @@ impl MessageBody<'_> {
         &self,
         ui: &mut Ui,
         span: &Span,
+        channel: &ChannelId,
         is_action: bool,
         context_menu: &mut dyn FnMut(&mut Ui),
     ) -> bool {
@@ -3460,16 +3785,42 @@ impl MessageBody<'_> {
                 }
             }
             Span::Mention { login } => {
-                let resp = ui.add(
-                    Label::new(
-                        RichText::new(format!("@{login}"))
-                            .color(t::mention())
-                            .strong(),
-                    )
-                    .selectable(true),
-                );
-                clicked = resp.clicked();
-                resp.context_menu(&mut *context_menu);
+                let name = format!("@{login}");
+                if channel.is_twitch() {
+                    let appearance = super::sender_cosmetics::get(ui.ctx(), None, login);
+                    let color = appearance
+                        .as_ref()
+                        .and_then(|appearance| appearance.color)
+                        .unwrap_or_else(t::mention);
+                    let paint = appearance
+                        .as_ref()
+                        .and_then(|appearance| appearance.paint.as_deref());
+                    let response = show_sender_name(
+                        ui,
+                        &name,
+                        color,
+                        paint,
+                        self.emote_bytes,
+                        self.animate_emotes,
+                    );
+                    if response.clicked() {
+                        let _ = self.cmd_tx.try_send(AppCommand::ShowUserCard {
+                            login: login.clone(),
+                            channel: channel.clone(),
+                        });
+                    }
+                    response.context_menu(&mut *context_menu);
+                    if response.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                } else {
+                    let response = ui.add(
+                        Label::new(RichText::new(name).color(t::mention()).strong())
+                            .selectable(true),
+                    );
+                    clicked = response.clicked();
+                    response.context_menu(&mut *context_menu);
+                }
             }
             Span::Url { text, url } => {
                 let cmd_tx = self.cmd_tx;
@@ -4013,6 +4364,17 @@ fn crust_seeded_username_color(seed: &str) -> Option<Color32> {
     Some(TWITCH_USERNAME_COLORS[idx])
 }
 
+fn cached_sender_appearance(
+    ctx: &egui::Context,
+    msg: &ChatMessage,
+) -> Option<sender_cosmetics::Appearance> {
+    if msg.channel.is_twitch() {
+        sender_cosmetics::get(ctx, Some(&msg.sender.user_id.0), &msg.sender.login)
+    } else {
+        None
+    }
+}
+
 fn resolve_sender_color(
     msg: &ChatMessage,
     user_color_cache: &mut HashMap<String, Color32>,
@@ -4053,439 +4415,6 @@ fn resolve_sender_color(
     }
 
     t::accent()
-}
-
-fn show_sender_name(
-    ui: &mut Ui,
-    message_id: u64,
-    name: &str,
-    fallback_color: Color32,
-    paint: Option<&SenderNamePaint>,
-    emote_bytes: &UiImageCache,
-    cmd_tx: &UiCommandSender,
-) -> egui::Response {
-    let fallback_color =
-        Color32::from_rgb(fallback_color.r(), fallback_color.g(), fallback_color.b());
-    let display_color = t::readable_username_color(fallback_color);
-    if let Some(paint) = paint {
-        let label = Label::new(RichText::new(name).strong())
-            .selectable(false)
-            .sense(egui::Sense::click());
-        let (galley_pos, galley, response) = label.layout_in_ui(ui);
-
-        if ui.is_rect_visible(response.rect) {
-            let paint_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, galley.size());
-            let stops = normalized_paint_stops(paint, fallback_color);
-            let url_sampler = url_paint_sampler(ui, paint, emote_bytes, cmd_tx);
-            let font_uv_normalizer = font_uv_normalizer(ui);
-            if stops.is_some() || url_sampler.is_some() {
-                if !paint.shadows.is_empty() {
-                    paint_sender_name_shadows(ui, paint, galley_pos, &galley, font_uv_normalizer);
-                }
-                let mut painted_vertices = 0usize;
-                for row in &galley.rows {
-                    let mut row_painted = false;
-                    let mut mesh = row.visuals.mesh.clone();
-                    normalize_text_mesh_uvs(&mut mesh, font_uv_normalizer);
-                    if !row.visuals.glyph_vertex_range.is_empty() {
-                        for idx in row.visuals.glyph_vertex_range.clone() {
-                            if let Some(v) = mesh.vertices.get_mut(idx) {
-                                if let Some(sampler) = &url_sampler {
-                                    v.color = sample_url_paint_color(
-                                        fallback_color,
-                                        sampler,
-                                        paint_rect,
-                                        v.pos,
-                                    );
-                                } else if let Some(stops) = &stops {
-                                    let t = paint_sample_t(paint, paint_rect, v.pos, stops);
-                                    v.color = gradient_color_at_t(stops, t, paint.repeat);
-                                } else {
-                                    v.color = display_color;
-                                }
-                                painted_vertices += 1;
-                                row_painted = true;
-                            }
-                        }
-                    }
-                    if !row_painted {
-                        continue;
-                    }
-                    mesh.translate(galley_pos.to_vec2());
-                    ui.painter().add(egui::Shape::mesh(mesh));
-                }
-                if painted_vertices == 0 {
-                    ui.painter().add(egui::epaint::TextShape::new(
-                        galley_pos,
-                        galley,
-                        display_color,
-                    ));
-                }
-            } else {
-                ui.painter().add(egui::epaint::TextShape::new(
-                    galley_pos,
-                    galley,
-                    display_color,
-                ));
-            }
-        }
-
-        let id = ui.make_persistent_id(("ml_sender_name_paint", message_id));
-        return ui.interact(response.rect, id, egui::Sense::click());
-    }
-
-    ui.add(
-        Label::new(RichText::new(name).color(display_color).strong())
-            .selectable(false)
-            .sense(egui::Sense::click()),
-    )
-}
-
-type UrlPaintSampler = crate::image_cache::RgbaImage;
-
-fn url_paint_sampler(
-    _ui: &Ui,
-    paint: &SenderNamePaint,
-    emote_bytes: &UiImageCache,
-    _cmd_tx: &UiCommandSender,
-) -> Option<Arc<UrlPaintSampler>> {
-    let function = paint.function.trim();
-    if !function.eq_ignore_ascii_case("url") && !function.eq_ignore_ascii_case("image") {
-        return None;
-    }
-    let raw_url = paint.image_url.as_ref()?;
-    let url = normalize_external_image_url(raw_url)?;
-    emote_bytes.rgba_image(&url)
-}
-
-fn normalize_external_image_url(url: &str) -> Option<String> {
-    let trimmed = url.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if trimmed.starts_with("//") {
-        return Some(format!("https:{trimmed}"));
-    }
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        return Some(trimmed.to_owned());
-    }
-    None
-}
-
-fn sample_url_paint_color(
-    user_color: Color32,
-    sampler: &UrlPaintSampler,
-    drawing_rect: egui::Rect,
-    sample: egui::Pos2,
-) -> Color32 {
-    let w = drawing_rect.width().max(1.0);
-    let h = drawing_rect.height().max(1.0);
-    let u = ((sample.x - drawing_rect.left()) / w).clamp(0.0, 1.0);
-    let v = ((sample.y - drawing_rect.top()) / h).clamp(0.0, 1.0);
-
-    let sx = u * sampler.width.saturating_sub(1) as f32;
-    let sy = v * sampler.height.saturating_sub(1) as f32;
-    let x0 = sx.floor() as u32;
-    let y0 = sy.floor() as u32;
-    let x1 = (x0 + 1).min(sampler.width.saturating_sub(1));
-    let y1 = (y0 + 1).min(sampler.height.saturating_sub(1));
-    let tx = sx - x0 as f32;
-    let ty = sy - y0 as f32;
-
-    let c00 = sampler_pixel(sampler, x0, y0);
-    let c10 = sampler_pixel(sampler, x1, y0);
-    let c01 = sampler_pixel(sampler, x0, y1);
-    let c11 = sampler_pixel(sampler, x1, y1);
-
-    let lerp = |a: u8, b: u8, t: f32| -> f32 { a as f32 + (b as f32 - a as f32) * t };
-    let top = [
-        lerp(c00[0], c10[0], tx),
-        lerp(c00[1], c10[1], tx),
-        lerp(c00[2], c10[2], tx),
-        lerp(c00[3], c10[3], tx),
-    ];
-    let bot = [
-        lerp(c01[0], c11[0], tx),
-        lerp(c01[1], c11[1], tx),
-        lerp(c01[2], c11[2], tx),
-        lerp(c01[3], c11[3], tx),
-    ];
-    let lerp_f = |a: f32, b: f32, t: f32| -> f32 { a + (b - a) * t };
-    let rgba = [
-        lerp_f(top[0], bot[0], ty).round() as u8,
-        lerp_f(top[1], bot[1], ty).round() as u8,
-        lerp_f(top[2], bot[2], ty).round() as u8,
-        lerp_f(top[3], bot[3], ty).round() as u8,
-    ];
-
-    if rgba[3] == 0 {
-        return user_color;
-    }
-    let fg = Color32::from_rgba_unmultiplied(rgba[0], rgba[1], rgba[2], rgba[3]);
-    overlay_colors(user_color, fg)
-}
-
-fn sampler_pixel(sampler: &UrlPaintSampler, x: u32, y: u32) -> [u8; 4] {
-    let idx = ((y * sampler.width + x) * 4) as usize;
-    if idx + 3 >= sampler.rgba.len() {
-        return [0, 0, 0, 0];
-    }
-    [
-        sampler.rgba[idx],
-        sampler.rgba[idx + 1],
-        sampler.rgba[idx + 2],
-        sampler.rgba[idx + 3],
-    ]
-}
-
-fn paint_sender_name_shadows(
-    ui: &Ui,
-    paint: &SenderNamePaint,
-    galley_pos: egui::Pos2,
-    galley: &Arc<egui::Galley>,
-    uv_normalizer: egui::Vec2,
-) {
-    for shadow in &paint.shadows {
-        if shadow.radius <= 0.0 {
-            continue;
-        }
-        let Some(base_color) = parse_hex_color(&shadow.color) else {
-            continue;
-        };
-        let offsets = shadow_offsets(shadow.x_offset, shadow.y_offset, shadow.radius);
-        if offsets.is_empty() {
-            continue;
-        }
-        for row in &galley.rows {
-            for (dx, dy, alpha_scale) in &offsets {
-                let mut mesh = row.visuals.mesh.clone();
-                normalize_text_mesh_uvs(&mut mesh, uv_normalizer);
-                let c = scale_alpha(base_color, *alpha_scale);
-                for idx in row.visuals.glyph_vertex_range.clone() {
-                    if let Some(v) = mesh.vertices.get_mut(idx) {
-                        v.color = c;
-                    }
-                }
-                mesh.translate(galley_pos.to_vec2() + egui::vec2(*dx, *dy));
-                ui.painter().add(egui::Shape::mesh(mesh));
-            }
-        }
-    }
-}
-
-fn shadow_offsets(x: f32, y: f32, radius: f32) -> Vec<(f32, f32, f32)> {
-    // Match the large-shadow look by scaling the blur radius by 3.
-    let blur_radius = (radius.max(0.0)) * 3.0;
-    if blur_radius <= f32::EPSILON {
-        return Vec::new();
-    }
-
-    // Approximate QPixmapDropShadowFilter with a normalized Gaussian kernel.
-    // Keep tap count bounded for runtime stability in busy chats.
-    let tap_radius = ((blur_radius * 0.75).round() as i32).clamp(1, 6);
-    let step = (blur_radius / tap_radius as f32).max(0.5);
-    let sigma = (blur_radius * 0.5).max(0.5);
-    let two_sigma2 = 2.0 * sigma * sigma;
-
-    let mut taps: Vec<(f32, f32, f32)> = Vec::new();
-    let mut weight_sum = 0.0f32;
-    for gy in -tap_radius..=tap_radius {
-        for gx in -tap_radius..=tap_radius {
-            let ox = gx as f32 * step;
-            let oy = gy as f32 * step;
-            let dist2 = ox * ox + oy * oy;
-            let weight = (-dist2 / two_sigma2).exp();
-            if weight < 0.001 {
-                continue;
-            }
-            taps.push((x + ox, y + oy, weight));
-            weight_sum += weight;
-        }
-    }
-
-    if weight_sum <= f32::EPSILON {
-        return Vec::new();
-    }
-
-    for tap in &mut taps {
-        tap.2 /= weight_sum;
-    }
-    taps
-}
-
-fn scale_alpha(color: Color32, factor: f32) -> Color32 {
-    let a = (color.a() as f32 * factor.clamp(0.0, 1.0)).round() as u8;
-    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), a)
-}
-
-fn font_uv_normalizer(ui: &Ui) -> egui::Vec2 {
-    ui.fonts(|fonts| {
-        let [w, h] = fonts.font_image_size();
-        egui::vec2(1.0 / (w.max(1) as f32), 1.0 / (h.max(1) as f32))
-    })
-}
-
-fn normalize_text_mesh_uvs(mesh: &mut egui::epaint::Mesh, uv_normalizer: egui::Vec2) {
-    for v in &mut mesh.vertices {
-        v.uv = (v.uv.to_vec2() * uv_normalizer).to_pos2();
-    }
-}
-
-fn normalized_paint_stops(
-    paint: &SenderNamePaint,
-    user_color: Color32,
-) -> Option<Vec<(f32, Color32)>> {
-    let mut stops: Vec<(f32, Color32)> = paint
-        .stops
-        .iter()
-        .filter_map(|s| parse_hex_color(&s.color).map(|c| (s.at, overlay_colors(user_color, c))))
-        .collect();
-    if stops.is_empty() {
-        return None;
-    }
-    stops.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    Some(stops)
-}
-
-fn paint_sample_t(
-    paint: &SenderNamePaint,
-    rect: egui::Rect,
-    sample: egui::Pos2,
-    stops: &[(f32, Color32)],
-) -> f32 {
-    match paint.function.as_str() {
-        "radial-gradient" | "radial_gradient" | "radial" => {
-            radial_gradient_t(rect, sample, paint.repeat, stops)
-        }
-        _ => linear_gradient_t(rect, sample, paint.angle.unwrap_or(0.0)),
-    }
-}
-
-fn linear_gradient_t(rect: egui::Rect, sample: egui::Pos2, angle_deg: f32) -> f32 {
-    let mut start = rect.left_bottom();
-    let mut end = rect.right_top();
-    // Use `int(angle / 90) % 4` with truncation toward zero.
-    let angle_step = ((angle_deg / 90.0).trunc() as i32) % 4;
-    if angle_step == 1 {
-        start = rect.left_top();
-        end = rect.right_bottom();
-    } else if angle_step == 2 {
-        start = rect.right_top();
-        end = rect.left_bottom();
-    } else if angle_step == 3 {
-        start = rect.right_bottom();
-        end = rect.left_top();
-    }
-
-    let center = rect.center();
-    let gradient_angle = 90.0 - angle_deg;
-    let color_axis_angle = -angle_deg;
-
-    let (gradient_origin, gradient_dir) = line_from_angle(center, gradient_angle);
-    let (start_origin, start_dir) = line_from_angle(start, color_axis_angle);
-    let (end_origin, end_dir) = line_from_angle(end, color_axis_angle);
-
-    let gradient_start =
-        line_intersection(gradient_origin, gradient_dir, start_origin, start_dir).unwrap_or(start);
-    let gradient_end =
-        line_intersection(gradient_origin, gradient_dir, end_origin, end_dir).unwrap_or(end);
-
-    let axis = gradient_end - gradient_start;
-    let len2 = axis.length_sq().max(f32::EPSILON);
-    (sample - gradient_start).dot(axis) / len2
-}
-
-fn radial_gradient_t(
-    rect: egui::Rect,
-    sample: egui::Pos2,
-    repeat: bool,
-    stops: &[(f32, Color32)],
-) -> f32 {
-    let mut radius = rect.width().max(rect.height()) * 0.5;
-    if repeat {
-        let tail = stops.last().map(|(at, _)| *at).unwrap_or(1.0);
-        radius *= tail.max(f32::EPSILON);
-    }
-    if radius <= f32::EPSILON {
-        return 0.0;
-    }
-    sample.distance(rect.center()) / radius
-}
-
-fn line_from_angle(origin: egui::Pos2, angle_deg: f32) -> (egui::Pos2, egui::Vec2) {
-    let radians = angle_deg.to_radians();
-    let dir = egui::vec2(radians.cos(), -radians.sin());
-    (origin, dir)
-}
-
-fn line_intersection(
-    p1: egui::Pos2,
-    d1: egui::Vec2,
-    p2: egui::Pos2,
-    d2: egui::Vec2,
-) -> Option<egui::Pos2> {
-    let det = d1.x * d2.y - d1.y * d2.x;
-    if det.abs() <= f32::EPSILON {
-        return None;
-    }
-    let delta = p2 - p1;
-    let t = (delta.x * d2.y - delta.y * d2.x) / det;
-    Some(p1 + d1 * t)
-}
-
-fn gradient_color_at_t(stops: &[(f32, Color32)], t: f32, repeat: bool) -> Color32 {
-    if stops.is_empty() {
-        return Color32::WHITE;
-    }
-
-    if repeat && stops.len() >= 2 {
-        let start = stops[0].0;
-        let end = stops[stops.len() - 1].0;
-        let len = end - start;
-        if len.abs() > f32::EPSILON {
-            let wrapped = ((t - start) / len).rem_euclid(1.0);
-            let normalized: Vec<(f32, Color32)> = stops
-                .iter()
-                .map(|(at, c)| ((at - start) / len, *c))
-                .collect();
-            return gradient_color_at_t(&normalized, wrapped, false);
-        }
-    }
-
-    if t <= stops[0].0 {
-        return stops[0].1;
-    }
-    for window in stops.windows(2) {
-        let (at0, c0) = window[0];
-        let (at1, c1) = window[1];
-        if t <= at1 {
-            let span = (at1 - at0).max(f32::EPSILON);
-            let local_t = ((t - at0) / span).clamp(0.0, 1.0);
-            return Color32::from_rgba_unmultiplied(
-                lerp_u8(c0.r(), c1.r(), local_t),
-                lerp_u8(c0.g(), c1.g(), local_t),
-                lerp_u8(c0.b(), c1.b(), local_t),
-                255,
-            );
-        }
-    }
-    stops.last().map(|(_, c)| *c).unwrap_or(Color32::WHITE)
-}
-
-fn overlay_colors(background: Color32, foreground: Color32) -> Color32 {
-    let alpha = foreground.a() as f32 / 255.0;
-    let r = ((1.0 - alpha) * background.r() as f32) + (alpha * foreground.r() as f32);
-    let g = ((1.0 - alpha) * background.g() as f32) + (alpha * foreground.g() as f32);
-    let b = ((1.0 - alpha) * background.b() as f32) + (alpha * foreground.b() as f32);
-    Color32::from_rgb(r.round() as u8, g.round() as u8, b.round() as u8)
-}
-
-fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
-    (a as f32 + (b as f32 - a as f32) * t).round() as u8
-}
-
-fn parse_hex_color(s: &str) -> Option<Color32> {
-    t::parse_hex_rgba(s)
 }
 
 fn parse_hex_color_opaque_rgb(s: &str) -> Option<Color32> {
@@ -5481,6 +5410,276 @@ mod tests {
         stats
     }
 
+    fn wrapping_message_fixture(
+        suspicious: bool,
+        painted: bool,
+        count: usize,
+    ) -> VecDeque<ChatMessage> {
+        let prefix = "wrap-start alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa quebec romeo sierra tango uniform victor whiskey xray yankee zulu ";
+        (1..=count)
+            .map(|id| {
+                let mut message = test_msg("long_sender_display_name", "42", Some("#00ff00"));
+                message.id = MessageId(id as u64);
+                message.server_id = Some(format!("wrapped-message-{id}"));
+                if suspicious {
+                    message.msg_kind = MsgKind::SuspiciousUserMessage;
+                }
+                if painted {
+                    message.sender.name_paint = Some(inline_mention_paint());
+                }
+                message.sender.badges = ["moderator", "subscriber", "vip"]
+                    .into_iter()
+                    .map(|name| Badge {
+                        name: name.to_owned(),
+                        version: "1".to_owned(),
+                        url: None,
+                    })
+                    .collect();
+                message.raw_text = format!("{prefix}https://example.test/");
+                message.spans = prefix
+                    .split_inclusive(' ')
+                    .map(|text| Span::Text {
+                        text: text.to_owned(),
+                        is_action: false,
+                    })
+                    .chain(std::iter::once(Span::Url {
+                        text: "https://example.test/".to_owned(),
+                        url: "https://example.test/".to_owned(),
+                    }))
+                    .collect();
+                message
+            })
+            .collect()
+    }
+
+    fn wrapping_message_frame(
+        ctx: &egui::Context,
+        messages: &VecDeque<ChatMessage>,
+        sender: &UiCommandSender,
+        events: Vec<egui::Event>,
+    ) -> (egui::FullOutput, Option<egui::Response>, f32) {
+        let channel = ChannelId::new("rustlang");
+        let images = UiImageCache::default();
+        let previews = HashMap::new();
+        let ignored = HashSet::new();
+        let ignored_users = crust_core::ignores::CompiledIgnoredUsers::new(&[]);
+        let low_trust = HashMap::new();
+        let mut list = MessageList::new(
+            messages,
+            &images,
+            sender,
+            &channel,
+            &previews,
+            None,
+            false,
+            3,
+            false,
+            true,
+            false,
+            true,
+            false,
+            &ignored,
+            &ignored_users,
+            &[],
+            &[],
+            &[],
+            &low_trust,
+        );
+        let target = messages.back().unwrap().id;
+        list.scroll_to = Some(target);
+        list.hide_link_previews = true;
+        let row_id = list.state_id("msg_bg_click").with(target.0);
+        let mut response = None;
+        let mut row_spacing = 0.0;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(370.0, 600.0),
+                )),
+                time: Some(ctx.cumulative_pass_nr() as f64 * 0.1),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let spacing = ui.spacing().item_spacing;
+                    row_spacing = spacing.y;
+                    list.show(ui);
+                    assert_eq!(
+                        ui.spacing().item_spacing,
+                        spacing,
+                        "message spacing must not leak"
+                    );
+                    response = ctx.read_response(row_id);
+                });
+            },
+        );
+        (output, response, row_spacing)
+    }
+
+    fn wrapping_body_rects(
+        output: &egui::FullOutput,
+        wanted: &HashSet<&str>,
+        bounds: egui::Rect,
+    ) -> Vec<egui::Rect> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                let egui::epaint::Shape::Text(text) = &shape.shape else {
+                    return None;
+                };
+                wanted
+                    .contains(text.galley.text())
+                    .then_some((text, shape.clip_rect))
+            })
+            .flat_map(|(text, clip)| {
+                text.galley.rows.iter().filter_map(move |row| {
+                    if !row.glyphs.iter().any(|glyph| !glyph.chr.is_whitespace()) {
+                        return None;
+                    }
+                    let rect = row.visuals.mesh_bounds.translate(text.pos.to_vec2());
+                    (bounds.contains_rect(rect) && clip.contains_rect(rect)).then_some(rect)
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn long_sender_prefixes_leave_full_width_for_body_continuations_and_cached_heights() {
+        for suspicious in [false, true] {
+            for painted in [false, true] {
+                for count in [1, 48] {
+                    let ctx = egui::Context::default();
+                    let messages = wrapping_message_fixture(suspicious, painted, count);
+                    let (sender, _receiver) = tokio::sync::mpsc::channel(8);
+                    let sender = UiCommandSender::new(sender);
+                    let mut rendered = wrapping_message_frame(&ctx, &messages, &sender, Vec::new());
+                    for _ in 0..5 {
+                        rendered = wrapping_message_frame(&ctx, &messages, &sender, Vec::new());
+                    }
+                    let (output, response, row_spacing) = rendered;
+                    let row = response
+                        .expect("the requested last message is visible")
+                        .rect;
+                    let message = messages.back().unwrap();
+                    let body_text: HashSet<_> = message
+                        .spans
+                        .iter()
+                        .filter_map(|span| match span {
+                            Span::Text { text, .. } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    let body = wrapping_body_rects(&output, &body_text, row);
+                    assert!(!body.is_empty());
+                    let first_top = body
+                        .iter()
+                        .map(egui::Rect::top)
+                        .fold(f32::INFINITY, f32::min);
+                    let content_left = row.left() + ROW_PAD_X;
+                    assert!(body.iter().any(|rect| rect.top() > first_top + 5.0 && rect.left() <= content_left + 2.0),
+                        "continuation lines must return to {content_left}, suspicious={suspicious}, painted={painted}, count={count}, body={body:?}");
+                    assert!(body
+                        .iter()
+                        .all(|rect| rect.right() <= row.right() - ROW_PAD_X + 1.0));
+                    let cached = ctx.data(|data| {
+                        data.get_temp::<HashMap<u64, f32>>(view_state_id(
+                            &message.channel,
+                            None,
+                            "msg_row_h",
+                        ))
+                        .unwrap()[&message.id.0]
+                    });
+                    assert!((cached - row.height() - row_spacing).abs() <= 0.5,
+                        "cached stride {cached} must match the drawn row {row:?} plus spacing {row_spacing}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wrapped_message_bodies_keep_links_and_message_context_menus() {
+        for suspicious in [false, true] {
+            let ctx = egui::Context::default();
+            let messages = wrapping_message_fixture(suspicious, true, 1);
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+            let sender = UiCommandSender::new(sender);
+            let mut rendered = wrapping_message_frame(&ctx, &messages, &sender, Vec::new());
+            for _ in 0..5 {
+                rendered = wrapping_message_frame(&ctx, &messages, &sender, Vec::new());
+            }
+            let link = wrapping_body_rects(
+                &rendered.0,
+                &HashSet::from(["https://example.test/"]),
+                rendered.1.as_ref().unwrap().rect,
+            )[0]
+            .center();
+            for pressed in [true, false] {
+                rendered = wrapping_message_frame(
+                    &ctx,
+                    &messages,
+                    &sender,
+                    vec![
+                        egui::Event::PointerMoved(link),
+                        egui::Event::PointerButton {
+                            pos: link,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+            assert!(
+                matches!(receiver.try_recv().unwrap(), AppCommand::OpenUrl { url } if url == "https://example.test/")
+            );
+            assert!(receiver.try_recv().is_err());
+            for pressed in [true, false] {
+                rendered = wrapping_message_frame(
+                    &ctx,
+                    &messages,
+                    &sender,
+                    vec![
+                        egui::Event::PointerMoved(link),
+                        egui::Event::PointerButton {
+                            pos: link,
+                            button: egui::PointerButton::Secondary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+            assert!(ctx.is_context_menu_open());
+            rendered = wrapping_message_frame(&ctx, &messages, &sender, Vec::new());
+            let copy = body_text_rect(&rendered.0, "Copy message text")
+                .expect("the message menu is visible")
+                .center();
+            for pressed in [true, false] {
+                rendered = wrapping_message_frame(
+                    &ctx,
+                    &messages,
+                    &sender,
+                    vec![
+                        egui::Event::PointerMoved(copy),
+                        egui::Event::PointerButton {
+                            pos: copy,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+            assert!(rendered.0.platform_output.commands.iter().any(|command| {
+                matches!(command, egui::OutputCommand::CopyText(text) if text == &messages[0].raw_text)
+            }));
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+
     fn test_buffer(first_id: u64, count: usize) -> VecDeque<ChatMessage> {
         (first_id..first_id + count as u64)
             .map(|id| {
@@ -5489,6 +5688,795 @@ mod tests {
                 message
             })
             .collect()
+    }
+
+    fn message_body_frame(
+        ctx: &egui::Context,
+        body: &MessageBody<'_>,
+        message: &ChatMessage,
+        events: Vec<egui::Event>,
+    ) -> (bool, egui::FullOutput) {
+        let mut clicked = false;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(320.0, 200.0),
+                )),
+                time: Some(ctx.cumulative_pass_nr() as f64 * 0.1),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        clicked = body.show(ui, message, &mut |ui| {
+                            if ui.button("Copy message").clicked() {
+                                ui.ctx().copy_text(message.raw_text.clone());
+                                ui.close_menu();
+                            }
+                        });
+                    });
+                });
+            },
+        );
+        (clicked, output)
+    }
+
+    fn body_text_rect(output: &egui::FullOutput, wanted: &str) -> Option<egui::Rect> {
+        output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::epaint::Shape::Text(text) if text.galley.text() == wanted => {
+                Some(text.galley.rect.translate(text.pos.to_vec2()))
+            }
+            _ => None,
+        })
+    }
+
+    fn inline_mention_paint() -> crust_core::model::SenderNamePaint {
+        crust_core::model::SenderNamePaint {
+            function: "linear-gradient".to_owned(),
+            stops: vec![crust_core::model::SenderNamePaintStop {
+                at: 0.0,
+                color: "#ff0080".to_owned(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn inline_mentions_use_current_paints_and_open_the_source_channel_user_card() {
+        let ctx = egui::Context::default();
+        let images = UiImageCache::default();
+        let previews = HashMap::new();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        let sender = UiCommandSender::new(sender);
+        let body = MessageBody {
+            emote_bytes: &images,
+            cmd_tx: &sender,
+            link_previews: &previews,
+            animate_emotes: false,
+            hide_link_previews: true,
+        };
+        let mut message = test_msg("author", "1", None);
+        message.channel = ChannelId::new("sourcechannel");
+        message.raw_text = "Hello @painted welcome".to_owned();
+        message.spans = vec![
+            Span::Text {
+                text: "Hello ".to_owned(),
+                is_action: false,
+            },
+            Span::Mention {
+                login: "painted".to_owned(),
+            },
+            Span::Text {
+                text: " welcome".to_owned(),
+                is_action: false,
+            },
+        ]
+        .into();
+        let (_, output) = message_body_frame(&ctx, &body, &message, Vec::new());
+        let name = body_text_rect(&output, "@painted").expect("unknown names remain visible");
+        let mut mentioned = test_msg("painted", "42", Some("#00ff00")).sender;
+        mentioned.name_paint = Some(inline_mention_paint());
+        super::super::sender_cosmetics::remember_sender(&ctx, &mentioned);
+        let mut output = output;
+        for _ in 0..2 {
+            (_, output) = message_body_frame(&ctx, &body, &message, Vec::new());
+        }
+        assert!(crate::widgets::name_paint::cached_name_count(&ctx) > 0);
+        assert!(body_text_rect(&output, "@painted").is_none());
+        assert!(body_text_rect(&output, "Hello ").is_some());
+        assert!(body_text_rect(&output, " welcome").is_some());
+        for pressed in [true, false] {
+            let (row_clicked, _) = message_body_frame(
+                &ctx,
+                &body,
+                &message,
+                vec![
+                    egui::Event::PointerMoved(name.center()),
+                    egui::Event::PointerButton {
+                        pos: name.center(),
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            assert!(!row_clicked, "a profile click must not also jump the row");
+        }
+        assert!(
+            matches!(receiver.try_recv().unwrap(), AppCommand::ShowUserCard { login, channel }
+            if login == "painted" && channel == message.channel)
+        );
+        assert!(receiver.try_recv().is_err());
+        for pressed in [true, false] {
+            let (row_clicked, _) = message_body_frame(
+                &ctx,
+                &body,
+                &message,
+                vec![
+                    egui::Event::PointerMoved(name.center()),
+                    egui::Event::PointerButton {
+                        pos: name.center(),
+                        button: egui::PointerButton::Secondary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            assert!(!row_clicked);
+        }
+        assert!(ctx.is_context_menu_open());
+        let (_, output) = message_body_frame(&ctx, &body, &message, Vec::new());
+        assert!(body_text_rect(&output, "Copy message").is_some());
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn inline_mentions_keep_unknown_fallback_and_do_not_cross_platforms() {
+        for (channel, login) in [
+            (ChannelId::new("sourcechannel"), "unknown"),
+            (ChannelId::kick("sourcechannel"), "painted"),
+            (
+                ChannelId::irc("irc.example.test", 6697, true, "sourcechannel"),
+                "painted",
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            let images = UiImageCache::default();
+            let previews = HashMap::new();
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+            let sender = UiCommandSender::new(sender);
+            let body = MessageBody {
+                emote_bytes: &images,
+                cmd_tx: &sender,
+                link_previews: &previews,
+                animate_emotes: false,
+                hide_link_previews: true,
+            };
+            let mut known = test_msg("painted", "42", None).sender;
+            known.name_paint = Some(inline_mention_paint());
+            super::super::sender_cosmetics::remember_sender(&ctx, &known);
+            let mut message = test_msg("author", "1", None);
+            message.channel = channel;
+            message.spans = vec![Span::Mention {
+                login: login.to_owned(),
+            }]
+            .into();
+            let (_, output) = message_body_frame(&ctx, &body, &message, Vec::new());
+            let name =
+                body_text_rect(&output, &format!("@{login}")).expect("plain fallback is visible");
+            assert_eq!(crate::widgets::name_paint::cached_name_count(&ctx), 0);
+            for pressed in [true, false] {
+                message_body_frame(
+                    &ctx,
+                    &body,
+                    &message,
+                    vec![
+                        egui::Event::PointerMoved(name.center()),
+                        egui::Event::PointerButton {
+                            pos: name.center(),
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+            if message.channel.is_twitch() {
+                assert!(
+                    matches!(receiver.try_recv().unwrap(), AppCommand::ShowUserCard { login: target, channel }
+                    if target == login && channel == message.channel)
+                );
+            }
+            assert!(
+                receiver.try_recv().is_err(),
+                "other platforms must not open Twitch profiles"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_chat_messages_and_actions_use_the_selected_name_paint() {
+        use crust_core::model::{SenderNamePaint, SenderNamePaintStop};
+        for action in [false, true] {
+            let ctx = egui::Context::default();
+            let mut message = test_msg("painted", "1", Some("#ffffff"));
+            message.flags.is_action = action;
+            message.sender.name_paint = Some(SenderNamePaint {
+                function: "linear-gradient".to_owned(),
+                angle: Some(90.0),
+                stops: vec![
+                    SenderNamePaintStop { at: 0.0, color: "#ff0000".to_owned() },
+                    SenderNamePaintStop { at: 1.0, color: "#0000ff".to_owned() },
+                ],
+                ..Default::default()
+            });
+            let messages = VecDeque::from([message]);
+            for _ in 0..3 {
+                render_test_messages(&ctx, &messages, &[]);
+            }
+            assert!(crate::widgets::name_paint::cached_name_count(&ctx) > 0,
+                "the normal chat path must pass paint metadata to the renderer");
+        }
+    }
+
+    #[test]
+    fn reply_previews_use_the_parent_paint_and_keep_their_jump_target() {
+        use crust_core::model::{SenderNamePaint, SenderNamePaintStop};
+        let ctx = egui::Context::default();
+        let mut parent = test_msg("parent", "1", Some("#ffffff"));
+        parent.server_id = Some("parent-message".to_owned());
+        parent.sender.name_paint = Some(SenderNamePaint {
+            function: "linear-gradient".to_owned(),
+            stops: vec![SenderNamePaintStop { at: 0.0, color: "#ff0080".to_owned() }],
+            ..Default::default()
+        });
+        let mut child = test_msg("child", "2", None);
+        child.id = MessageId(2);
+        child.reply = MessageList::reply_info_for_message(&parent);
+        let messages = VecDeque::from([parent, child]);
+        for _ in 0..3 { render_test_messages(&ctx, &messages, &[]); }
+        assert_eq!(crate::widgets::name_paint::cached_name_count(&ctx), 2,
+            "the parent and its smaller reply preview need painted names");
+        assert_eq!(messages[1].reply.as_ref().unwrap().parent_msg_id, "parent-message");
+    }
+
+    #[test]
+    fn chat_and_suspicious_names_use_live_paints_and_keep_explicit_removals() {
+        let paint = crust_core::model::SenderNamePaint {
+            function: "linear-gradient".to_owned(),
+            stops: vec![crust_core::model::SenderNamePaintStop {
+                at: 0.0,
+                color: "#ff0080".to_owned(),
+            }],
+            ..Default::default()
+        };
+        for suspicious in [false, true] {
+            for removed in [false, true] {
+                let ctx = egui::Context::default();
+                let mut message = test_msg("sender", "1", Some("#ffffff"));
+                if suspicious {
+                    message.msg_kind = MsgKind::SuspiciousUserMessage;
+                }
+                // Old rows can retain a removed paint; new rows can be missing
+                // a paint whose live update reached the UI before its sender.
+                message.sender.name_paint = removed.then(|| paint.clone());
+                sender_cosmetics::update(
+                    &ctx,
+                    "1",
+                    Some("#00ff80"),
+                    (!removed).then_some(&paint),
+                );
+                let messages = VecDeque::from([message]);
+                for _ in 0..3 {
+                    render_test_messages(&ctx, &messages, &[]);
+                }
+                assert_eq!(
+                    crate::widgets::name_paint::cached_name_count(&ctx) > 0,
+                    !removed,
+                    "suspicious={suspicious}, removed={removed}"
+                );
+                let appearance = sender_cosmetics::get(&ctx, None, "sender").unwrap();
+                assert_eq!(appearance.paint.is_some(), !removed);
+                assert_eq!(appearance.color, Some(Color32::from_rgb(0, 255, 128)));
+            }
+        }
+    }
+
+    #[test]
+    fn non_twitch_senders_do_not_use_or_seed_twitch_appearances() {
+        let ctx = egui::Context::default();
+        let paint = crust_core::model::SenderNamePaint {
+            function: "linear-gradient".to_owned(),
+            stops: vec![crust_core::model::SenderNamePaintStop {
+                at: 0.0,
+                color: "#ff0080".to_owned(),
+            }],
+            ..Default::default()
+        };
+        sender_cosmetics::update(&ctx, "1", None, Some(&paint));
+        let mut messages = VecDeque::from([
+            reply_sender_fixture(1, "alice", Some("one")),
+            reply_sender_fixture(2, "bob", Some("two")),
+        ]);
+        for message in &mut messages {
+            message.channel = ChannelId::kick("room");
+        }
+        for _ in 0..3 {
+            render_test_messages(&ctx, &messages, &[]);
+        }
+        assert_eq!(crate::widgets::name_paint::cached_name_count(&ctx), 0);
+        assert!(sender_cosmetics::get(&ctx, Some("2"), "bob").is_none());
+    }
+
+    #[test]
+    fn reply_previews_use_cached_paints_without_a_retained_parent() {
+        let ctx = egui::Context::default();
+        let mut messages = narrow_reply_fixture(true);
+        let parent = messages[0].sender.clone();
+        sender_cosmetics::remember_identity(&ctx, &parent.user_id.0, &parent.login);
+        sender_cosmetics::update(&ctx, &parent.user_id.0, None, parent.name_paint.as_ref());
+        messages[0] = reply_sender_fixture(3, "unrelated", Some("other-message"));
+        let _ = reply_preview_frame(&ctx, &messages, 180.0, Vec::new());
+        assert_eq!(crate::widgets::name_paint::cached_name_count(&ctx), 1);
+    }
+
+    #[test]
+    fn reply_previews_keep_live_paint_clears_over_retained_metadata() {
+        let ctx = egui::Context::default();
+        let messages = narrow_reply_fixture(true);
+        sender_cosmetics::update(&ctx, &messages[0].sender.user_id.0, None, None);
+        let _ = reply_preview_frame(&ctx, &messages, 180.0, Vec::new());
+        assert_eq!(crate::widgets::name_paint::cached_name_count(&ctx), 0);
+        assert!(sender_cosmetics::get(&ctx, None, "parent")
+            .unwrap()
+            .paint
+            .is_none());
+    }
+
+    fn reply_sender_fixture(id: u64, login: &str, server_id: Option<&str>) -> ChatMessage {
+        let mut message = test_msg(login, &id.to_string(), None);
+        message.id = MessageId(id);
+        message.server_id = server_id.map(str::to_owned);
+        message
+    }
+
+    fn test_reply(login: &str, parent_id: &str) -> ReplyInfo {
+        ReplyInfo {
+            parent_msg_id: parent_id.to_owned(),
+            parent_user_login: login.to_owned(),
+            parent_display_name: login.to_owned(),
+            parent_msg_body: "A quoted message that is long enough to truncate in a narrow pane."
+                .to_owned(),
+        }
+    }
+
+    #[test]
+    fn reply_sender_cache_reuses_misses_and_reads_current_styles() {
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("rustlang");
+        let mut messages = VecDeque::from([
+            reply_sender_fixture(1, "Alice", Some("old-alice")),
+            reply_sender_fixture(2, "alice", Some("new-alice")),
+            reply_sender_fixture(3, "bob", Some("bob-message")),
+        ]);
+        let index = cached_reply_senders(&ctx, &channel, &messages);
+        assert_eq!(
+            index
+                .message(&messages, &test_reply(" ALICE ", "bob-message"))
+                .unwrap()
+                .id,
+            MessageId(2)
+        );
+        assert_eq!(
+            index
+                .message(&messages, &test_reply("", " OLD-ALICE "))
+                .unwrap()
+                .id,
+            MessageId(1)
+        );
+        for missing in 0..100 {
+            let current = cached_reply_senders(&ctx, &channel, &messages);
+            assert!(
+                Arc::ptr_eq(&index, &current),
+                "missing parents must reuse the complete index"
+            );
+            assert!(
+                current
+                    .message(
+                        &messages,
+                        &test_reply(&format!("missing-{missing}"), "old-alice")
+                    )
+                    .is_none(),
+                "a nonempty login must never borrow another parent's appearance"
+            );
+            assert!(current
+                .message(&messages, &test_reply("", &format!("missing-{missing}")))
+                .is_none());
+        }
+        assert_eq!(index.by_login.len(), 2);
+        assert_eq!(index.by_server_id.len(), 3);
+
+        messages[1].sender.name_paint = Some(crust_core::model::SenderNamePaint {
+            function: "radial-gradient".to_owned(),
+            ..Default::default()
+        });
+        invalidate_message_layouts(&ctx, &channel, &[MessageId(2)]);
+        let current = cached_reply_senders(&ctx, &channel, &messages);
+        assert!(
+            Arc::ptr_eq(&index, &current),
+            "cosmetic layout changes do not change sender identities"
+        );
+        assert_eq!(
+            current
+                .message(&messages, &test_reply("alice", "old-alice"))
+                .unwrap()
+                .sender
+                .name_paint
+                .as_ref()
+                .unwrap()
+                .function,
+            "radial-gradient"
+        );
+    }
+
+    #[test]
+    fn reply_sender_cache_updates_appends_and_rotations_without_rebuilding() {
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("rustlang");
+        let mut messages = VecDeque::from([
+            reply_sender_fixture(1, "alice", Some("first")),
+            reply_sender_fixture(2, "bob", Some("second")),
+            reply_sender_fixture(3, "alice", Some("third")),
+        ]);
+        let index = cached_reply_senders(&ctx, &channel, &messages);
+        let allocation = Arc::as_ptr(&index);
+        drop(index);
+        messages.pop_front();
+        messages.push_back(reply_sender_fixture(4, "carol", Some("fourth")));
+        let index = cached_reply_senders(&ctx, &channel, &messages);
+        assert_eq!(Arc::as_ptr(&index), allocation);
+        assert_eq!(index.base, 1);
+        assert!(index.message(&messages, &test_reply("", "first")).is_none());
+        assert_eq!(
+            index
+                .message(&messages, &test_reply("alice", "first"))
+                .unwrap()
+                .id,
+            MessageId(3)
+        );
+        drop(index);
+
+        messages.pop_front();
+        messages.push_back(reply_sender_fixture(5, "alice", Some("fifth")));
+        let index = cached_reply_senders(&ctx, &channel, &messages);
+        assert_eq!(Arc::as_ptr(&index), allocation);
+        assert_eq!(index.base, 2);
+        assert_eq!(index.by_login.len(), 2);
+        assert_eq!(index.by_server_id.len(), messages.len());
+        assert!(index
+            .message(&messages, &test_reply("bob", "second"))
+            .is_none());
+        assert_eq!(
+            index
+                .message(&messages, &test_reply("alice", "third"))
+                .unwrap()
+                .id,
+            MessageId(5)
+        );
+        drop(index);
+
+        messages.push_back(reply_sender_fixture(6, "dave", Some("sixth")));
+        let index = cached_reply_senders(&ctx, &channel, &messages);
+        assert_eq!(Arc::as_ptr(&index), allocation);
+        assert_eq!(index.base, 2);
+        assert_eq!(
+            index
+                .message(&messages, &test_reply("dave", ""))
+                .unwrap()
+                .id,
+            MessageId(6)
+        );
+        drop(index);
+
+        messages.push_front(reply_sender_fixture(0, "history", Some("older")));
+        let index = cached_reply_senders(&ctx, &channel, &messages);
+        assert_eq!(
+            index.base, 0,
+            "prepending history rebuilds the ordered identity index"
+        );
+        assert_eq!(
+            index
+                .message(&messages, &test_reply("", "older"))
+                .unwrap()
+                .id,
+            MessageId(0)
+        );
+        assert_eq!(
+            index
+                .message(&messages, &test_reply("alice", ""))
+                .unwrap()
+                .id,
+            MessageId(5)
+        );
+    }
+
+    #[test]
+    fn reply_sender_cache_refreshes_in_place_identity_changes() {
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("rustlang");
+        let mut messages = VecDeque::from([reply_sender_fixture(1, "pending", None)]);
+        let before = cached_reply_senders(&ctx, &channel, &messages);
+        assert!(before
+            .message(&messages, &test_reply("", "confirmed"))
+            .is_none());
+        messages[0].server_id = Some("confirmed".to_owned());
+        messages[0].sender.login = "confirmed-sender".to_owned();
+        invalidate_reply_sender_index(&ctx, &channel);
+        let after = cached_reply_senders(&ctx, &channel, &messages);
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert!(after
+            .message(&messages, &test_reply("pending", "confirmed"))
+            .is_none());
+        assert_eq!(
+            after
+                .message(&messages, &test_reply("confirmed-sender", ""))
+                .unwrap()
+                .id,
+            MessageId(1)
+        );
+        assert_eq!(
+            after
+                .message(&messages, &test_reply("", "CONFIRMED"))
+                .unwrap()
+                .id,
+            MessageId(1)
+        );
+    }
+
+    #[test]
+    fn reply_sender_cache_is_shared_and_bounded_across_channels() {
+        let ctx = egui::Context::default();
+        let messages = VecDeque::from([reply_sender_fixture(1, "alice", Some("message"))]);
+        for channel in 0..5 {
+            let channel = ChannelId::new(&format!("channel{channel}"));
+            let first_pane = cached_reply_senders(&ctx, &channel, &messages);
+            let second_pane = cached_reply_senders(&ctx, &channel, &messages);
+            assert!(Arc::ptr_eq(&first_pane, &second_pane));
+        }
+        let cache = ctx.data(|data| {
+            data.get_temp::<ReplySenderCache>(Id::new("reply_sender_cache"))
+                .unwrap()
+        });
+        assert_eq!(cache.entries.len(), 4);
+        assert!(!cache
+            .entries
+            .iter()
+            .any(|entry| entry.channel == ChannelId::new("channel0")));
+    }
+
+    fn reply_preview_frame(
+        ctx: &egui::Context,
+        messages: &VecDeque<ChatMessage>,
+        width: f32,
+        events: Vec<egui::Event>,
+    ) -> (egui::Response, egui::FullOutput) {
+        let channel = ChannelId::new("rustlang");
+        let images = UiImageCache::default();
+        let previews = HashMap::new();
+        let ignored = HashSet::new();
+        let ignored_users = crust_core::ignores::CompiledIgnoredUsers::new(&[]);
+        let low_trust = HashMap::new();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let sender = UiCommandSender::new(sender);
+        let list = MessageList::new(
+            messages,
+            &images,
+            &sender,
+            &channel,
+            &previews,
+            None,
+            false,
+            3,
+            false,
+            false,
+            false,
+            true,
+            false,
+            &ignored,
+            &ignored_users,
+            &[],
+            &[],
+            &[],
+            &low_trust,
+        );
+        let rctx = RenderCtx {
+            reply_key: list.state_id("ml_reply_req"),
+            scroll_to_key: list.state_id("ml_scroll_to"),
+            scroll_hint_key: list.state_id("ml_scroll_hint"),
+            reply_senders: OnceCell::new(),
+            highlight_server_id: None,
+            highlight_alpha: 0.0,
+            highlight_animating: false,
+        };
+        let mut response = None;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 200.0),
+                )),
+                events,
+                focused: true,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        let child = &messages[1];
+                        response = Some(list.render_reply_preview(
+                            ui,
+                            child,
+                            child.reply.as_ref().unwrap(),
+                            &rctx,
+                            &mut HashMap::new(),
+                        ));
+                    });
+            },
+        );
+        (response.unwrap(), output)
+    }
+
+    fn narrow_reply_fixture(painted: bool) -> VecDeque<ChatMessage> {
+        let mut parent = reply_sender_fixture(1, "parent", Some("parent-message"));
+        parent.sender.display_name = "長いユーザー名Rainbow".repeat(6);
+        parent.raw_text =
+            "A long quoted message that should keep some visible text beside a long name."
+                .to_owned();
+        if painted {
+            parent.sender.name_paint = Some(crust_core::model::SenderNamePaint {
+                function: "linear-gradient".to_owned(),
+                stops: vec![crust_core::model::SenderNamePaintStop {
+                    at: 0.0,
+                    color: "#ff0080".to_owned(),
+                }],
+                ..Default::default()
+            });
+        }
+        let mut child = reply_sender_fixture(2, "child", Some("child-message"));
+        child.reply = MessageList::reply_info_for_message(&parent);
+        VecDeque::from([parent, child])
+    }
+
+    #[test]
+    fn narrow_reply_previews_bound_long_names_and_leave_room_for_the_body() {
+        for painted in [false, true] {
+            let ctx = egui::Context::default();
+            let messages = narrow_reply_fixture(painted);
+            let (response, output) = reply_preview_frame(&ctx, &messages, 180.0, Vec::new());
+            let pixel = 1.0 / ctx.pixels_per_point();
+            assert!(
+                response.rect.right() <= 180.0 + pixel,
+                "reply header must fit the pane: {:?}",
+                response.rect
+            );
+            assert!(
+                response.rect.height() < t::small().size * 2.0,
+                "reply preview must stay on one line"
+            );
+            let body = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) if text.galley.text().starts_with(": ") => {
+                        Some(text)
+                    }
+                    _ => None,
+                })
+                .expect("the quoted message should still be drawn");
+            assert!(body.galley.elided);
+            assert!(
+                body.galley.size().x >= 40.0,
+                "a long sender must leave readable body space"
+            );
+            assert!(body.pos.x + body.galley.size().x <= 180.0 + pixel);
+        }
+    }
+
+    #[test]
+    fn reply_preview_clicks_jump_to_the_parent_without_opening_a_profile() {
+        let channel = ChannelId::new("rustlang");
+        for painted in [false, true] {
+            for fraction in [0.02, 0.25, 0.8] {
+                let ctx = egui::Context::default();
+                let messages = narrow_reply_fixture(painted);
+                let _ = reply_preview_frame(&ctx, &messages, 180.0, Vec::new());
+                let (response, _) = reply_preview_frame(&ctx, &messages, 180.0, Vec::new());
+                let point = response.rect.lerp_inside(egui::vec2(fraction, 0.5));
+                for pressed in [true, false] {
+                    let _ = reply_preview_frame(
+                        &ctx,
+                        &messages,
+                        180.0,
+                        vec![
+                            egui::Event::PointerMoved(point),
+                            egui::Event::PointerButton {
+                                pos: point,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                    );
+                }
+                assert_eq!(
+                    ctx.data(|data| data.get_temp::<String>(view_state_id(
+                        &channel,
+                        None,
+                        "ml_scroll_to"
+                    )))
+                    .as_deref(),
+                    Some("parent-message"),
+                    "painted={painted}, click fraction={fraction}"
+                );
+                let hint = ctx
+                    .data(|data| {
+                        data.get_temp::<ReplyScrollHint>(view_state_id(
+                            &channel,
+                            None,
+                            "ml_scroll_hint",
+                        ))
+                    })
+                    .unwrap();
+                assert_eq!(hint.child_msg_local_id, 2);
+                assert_eq!(hint.parent_user_login, "parent");
+                assert!(ctx
+                    .data(|data| data.get_temp::<(String, Vec<Badge>)>(view_state_id(
+                        &channel,
+                        None,
+                        "ml_profile_req"
+                    )))
+                    .is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn reply_preview_secondary_click_keeps_the_message_menu() {
+        let ctx = egui::Context::default();
+        let messages = narrow_reply_fixture(true);
+        let _ = reply_preview_frame(&ctx, &messages, 180.0, Vec::new());
+        let (response, _) = reply_preview_frame(&ctx, &messages, 180.0, Vec::new());
+        let point = response.rect.lerp_inside(egui::vec2(0.25, 0.5));
+        let mut opened = false;
+        for pressed in [true, false] {
+            let (response, _) = reply_preview_frame(
+                &ctx,
+                &messages,
+                180.0,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Secondary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            opened |= response.context_menu_opened();
+        }
+        assert!(
+            opened,
+            "the painted reply sender must still open the message context menu"
+        );
+        let channel = ChannelId::new("rustlang");
+        assert!(ctx
+            .data(|data| data.get_temp::<String>(view_state_id(&channel, None, "ml_scroll_to")))
+            .is_none());
     }
 
     fn render_duplicate_panes(
@@ -6269,57 +7257,4 @@ mod tests {
         assert_eq!(cache.get("alice").copied(), Some(color));
     }
 
-    #[test]
-    fn sender_name_gradient_maps_first_and_last_stop_to_edges() {
-        let stops = vec![
-            (0.0, Color32::from_rgb(0xFF, 0x00, 0x00)),
-            (1.0, Color32::from_rgb(0x00, 0x00, 0xFF)),
-        ];
-        assert_eq!(
-            gradient_color_at_t(&stops, 0.0, false),
-            Color32::from_rgb(0xFF, 0x00, 0x00)
-        );
-        assert_eq!(
-            gradient_color_at_t(&stops, 1.0, false),
-            Color32::from_rgb(0x00, 0x00, 0xFF)
-        );
-    }
-
-    #[test]
-    fn sender_name_gradient_interpolates_midpoint_color() {
-        let stops = vec![
-            (0.0, Color32::from_rgb(0x00, 0x00, 0x00)),
-            (1.0, Color32::from_rgb(0xFF, 0xFF, 0xFF)),
-        ];
-        assert_eq!(
-            gradient_color_at_t(&stops, 0.5, false),
-            Color32::from_rgb(128, 128, 128)
-        );
-    }
-
-    #[test]
-    fn sender_name_gradient_repeat_wraps_out_of_range_positions() {
-        let stops = vec![
-            (0.0, Color32::from_rgb(255, 0, 0)),
-            (1.0, Color32::from_rgb(0, 0, 255)),
-        ];
-        // 1.25 wraps to 0.25
-        assert_eq!(
-            gradient_color_at_t(&stops, 1.25, true),
-            gradient_color_at_t(&stops, 0.25, false)
-        );
-    }
-
-    #[test]
-    fn normalize_external_image_url_accepts_protocol_relative_urls() {
-        assert_eq!(
-            normalize_external_image_url("//cdn.7tv.app/paint/health/1x.webp"),
-            Some("https://cdn.7tv.app/paint/health/1x.webp".to_owned())
-        );
-        assert_eq!(
-            normalize_external_image_url("https://cdn.7tv.app/paint/health/1x.webp"),
-            Some("https://cdn.7tv.app/paint/health/1x.webp".to_owned())
-        );
-        assert_eq!(normalize_external_image_url(""), None);
-    }
 }

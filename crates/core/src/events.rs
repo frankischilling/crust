@@ -354,6 +354,10 @@ pub enum AppCommand {
         collapse_long_message_lines: usize,
         /// Only run animation-driven repainting while the window is focused.
         animations_when_focused: bool,
+        /// Omitted by older plugins; retain the saved preference.
+        show_name_paints: Option<bool>,
+        show_name_paint_shadows: Option<bool>,
+        large_name_paint_shadows: Option<bool>,
     },
     /// Persist general UI/filter/channel settings managed by the settings page.
     SetGeneralSettings {
@@ -829,6 +833,9 @@ pub enum AppEvent {
         collapse_long_message_lines: usize,
         /// Only run animation-driven repainting while the window is focused.
         animations_when_focused: bool,
+        show_name_paints: bool,
+        show_name_paint_shadows: bool,
+        large_name_paint_shadows: bool,
     },
     /// General settings snapshot loaded/updated from persistent storage.
     GeneralSettingsUpdated {

@@ -19,6 +19,8 @@ use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite::{protocol::WebSocketConfig, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+use crate::seventv::{SevenTvCosmeticUpdate, SevenTvLiveCosmeticUpdate};
+
 use reconcile::{ApplyResult, SnapshotTicket};
 
 const MAX_TARGETS: usize = 128;
@@ -120,7 +122,10 @@ pub(crate) struct LiveEmoteUpdates {
 }
 
 impl LiveEmoteUpdates {
-    pub(crate) fn spawn(index: crate::EmoteIndex) -> (Self, mpsc::Receiver<()>) {
+    pub(crate) fn spawn(
+        index: crate::EmoteIndex,
+        cosmetics: mpsc::Sender<SevenTvCosmeticUpdate>,
+    ) -> (Self, mpsc::Receiver<()>) {
         let (dirty, received) = mpsc::channel(1);
         let (bttv, bttv_rx) = watch::channel(Vec::new());
         let (seven_tv, seven_tv_rx) = watch::channel(Vec::new());
@@ -130,6 +135,7 @@ impl LiveEmoteUpdates {
             index.clone(),
             dirty.clone(),
             bttv_rx,
+            None,
         ));
         tokio::spawn(run_worker(
             Provider::SevenTv,
@@ -137,6 +143,7 @@ impl LiveEmoteUpdates {
             index,
             dirty,
             seven_tv_rx,
+            Some(cosmetics),
         ));
         (Self { bttv, seven_tv }, received)
     }
@@ -192,6 +199,7 @@ async fn run_worker(
     index: crate::EmoteIndex,
     dirty: mpsc::Sender<()>,
     mut desired: watch::Receiver<Vec<LiveTarget>>,
+    cosmetics: Option<mpsc::Sender<SevenTvCosmeticUpdate>>,
 ) {
     let client = match reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
@@ -246,6 +254,7 @@ async fn run_worker(
                     client: &client,
                     index: &index,
                     dirty: &dirty,
+                    cosmetics: cosmetics.as_ref(),
                 },
             )
             .await;
@@ -283,6 +292,7 @@ struct ConnectionContext<'a> {
     client: &'a reqwest::Client,
     index: &'a crate::EmoteIndex,
     dirty: &'a mpsc::Sender<()>,
+    cosmetics: Option<&'a mpsc::Sender<SevenTvCosmeticUpdate>>,
 }
 
 struct Watched {
@@ -305,6 +315,24 @@ async fn write(socket: &mut Socket, message: Message) -> Result<(), ()> {
         .map_err(|_| ())
 }
 
+async fn send_cosmetic_update(
+    sender: Option<&mpsc::Sender<SevenTvCosmeticUpdate>>,
+    epoch: u64,
+    update: SevenTvLiveCosmeticUpdate,
+) -> bool {
+    let Some(sender) = sender else {
+        return true;
+    };
+    matches!(
+        tokio::time::timeout(
+            WRITE_TIMEOUT,
+            sender.send(SevenTvCosmeticUpdate::Live { epoch, update })
+        )
+        .await,
+        Ok(Ok(()))
+    )
+}
+
 async fn run_connected(
     mut socket: Socket,
     desired: &mut watch::Receiver<Vec<LiveTarget>>,
@@ -317,6 +345,7 @@ async fn run_connected(
         client,
         index,
         dirty,
+        cosmetics,
     } = context;
     let mut watched = HashMap::<LiveScope, Watched>::new();
     let mut topics = HashSet::<seventv::Topic>::new();
@@ -335,6 +364,7 @@ async fn run_connected(
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut refresh_subscriptions = true;
+    let mut cosmetics_connected = false;
     loop {
         if refresh_subscriptions {
             refresh_subscriptions = false;
@@ -353,10 +383,7 @@ async fn run_connected(
                     // previous room lifetime cannot acquire its new generation.
                     break;
                 }
-                let next_topics: HashSet<_> = next
-                    .iter()
-                    .flat_map(|target| seventv::topics(&target.source))
-                    .collect();
+                let next_topics: HashSet<_> = next.iter().flat_map(seventv::topics).collect();
                 let next_rooms: HashSet<_> = next
                     .iter()
                     .map(|target| target.source.room_id.clone())
@@ -383,6 +410,18 @@ async fn run_connected(
                     topics = next_topics;
                     if acknowledged == topics {
                         awaiting_ack_since = None;
+                    }
+                    if !cosmetics_connected {
+                        if !send_cosmetic_update(
+                            cosmetics,
+                            epoch,
+                            SevenTvLiveCosmeticUpdate::Connected,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        cosmetics_connected = true;
                     }
                 } else {
                     for room in rooms.difference(&next_rooms) {
@@ -437,7 +476,7 @@ async fn run_connected(
                 continue;
             }
             if provider == Provider::SevenTv
-                && !seventv::topics(&entry.target.source)
+                && !seventv::topics(&entry.target)
                     .iter()
                     .all(|topic| acknowledged.contains(topic))
             {
@@ -561,6 +600,24 @@ async fn run_connected(
                                             }
                                         }
                                     }
+                                    seventv::Update::UserStyleChanged(user_id) => {
+                                        let mut twitch_user_ids: Vec<_> = watched.values()
+                                            .filter(|entry| entry.target.source.platform == "TWITCH"
+                                                && entry.target.source.user_id.as_deref() == Some(user_id.as_str()))
+                                            .map(|entry| entry.target.source.room_id.clone()).collect();
+                                        twitch_user_ids.sort();
+                                        twitch_user_ids.dedup();
+                                        if !twitch_user_ids.is_empty() && !send_cosmetic_update(cosmetics, epoch,
+                                            SevenTvLiveCosmeticUpdate::RefreshUsers { twitch_user_ids }).await {
+                                            return;
+                                        }
+                                    }
+                                    seventv::Update::Cosmetic(update) => {
+                                        if topics.iter().any(|topic| matches!(topic.condition, seventv::Condition::Channel(_)))
+                                            && !send_cosmetic_update(cosmetics, epoch, update).await {
+                                            return;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -596,7 +653,7 @@ fn select_targets(
         .take(MAX_TARGETS)
     {
         if provider == Provider::SevenTv {
-            let needed = seventv::topics(&target.source);
+            let needed = seventv::topics(target);
             let additional = needed
                 .iter()
                 .filter(|topic| !topics.contains(*topic))

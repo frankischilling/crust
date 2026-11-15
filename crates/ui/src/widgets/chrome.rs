@@ -99,6 +99,22 @@ pub fn toolbar_group_frame() -> Frame {
         .inner_margin(Margin::symmetric(6, 3))
 }
 
+pub fn icon_menu_button<R>(
+    ui: &mut Ui,
+    icon: ChromeIcon,
+    tooltip: &str,
+    mut state: IconButtonState,
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> egui::InnerResponse<Option<R>> {
+    let menu_id = ui.make_persistent_id(("icon_menu", tooltip));
+    let mut menu = egui::menu::BarState::load(ui.ctx(), menu_id);
+    state.selected |= menu.is_some();
+    let response = icon_button(ui, icon, tooltip, state);
+    let contents = menu.bar_menu(&response, add_contents);
+    menu.store(ui.ctx(), menu_id);
+    egui::InnerResponse::new(contents.map(|contents| contents.inner), response)
+}
+
 pub fn card_frame() -> Frame {
     Frame::new()
         .fill(t::bg_card())
@@ -234,25 +250,28 @@ fn paint_icon(ui: &Ui, rect: egui::Rect, icon: ChromeIcon, state: IconButtonStat
                 stroke,
                 egui::StrokeKind::Inside,
             );
-            let fold = egui::pos2(envelope.center().x, envelope.top() + envelope.height() * 0.56);
-            painter.line_segment(
-                [envelope.left_top() + egui::vec2(0.7, 0.8), fold],
-                stroke,
+            let fold = egui::pos2(
+                envelope.center().x,
+                envelope.top() + envelope.height() * 0.56,
             );
-            painter.line_segment(
-                [fold, envelope.right_top() + egui::vec2(-0.7, 0.8)],
-                stroke,
-            );
+            painter.line_segment([envelope.left_top() + egui::vec2(0.7, 0.8), fold], stroke);
+            painter.line_segment([fold, envelope.right_top() + egui::vec2(-0.7, 0.8)], stroke);
             painter.line_segment(
                 [
                     envelope.left_bottom() + egui::vec2(0.7, -0.8),
-                    egui::pos2(envelope.left() + envelope.width() * 0.34, envelope.center().y),
+                    egui::pos2(
+                        envelope.left() + envelope.width() * 0.34,
+                        envelope.center().y,
+                    ),
                 ],
                 stroke,
             );
             painter.line_segment(
                 [
-                    egui::pos2(envelope.right() - envelope.width() * 0.34, envelope.center().y),
+                    egui::pos2(
+                        envelope.right() - envelope.width() * 0.34,
+                        envelope.center().y,
+                    ),
                     envelope.right_bottom() + egui::vec2(-0.7, -0.8),
                 ],
                 stroke,
@@ -306,8 +325,13 @@ fn paint_icon(ui: &Ui, rect: egui::Rect, icon: ChromeIcon, state: IconButtonStat
             painter.line_segment([p4, p5], stroke);
         }
         ChromeIcon::Menu => {
-            for dx in [-4.0_f32, 0.0, 4.0] {
-                painter.circle_filled(rect.center() + egui::vec2(dx, 0.0), 1.4, stroke_color);
+            let radius = (rect.width() * 0.1).max(0.7);
+            for fraction in [-0.3_f32, 0.0, 0.3] {
+                painter.circle_filled(
+                    rect.center() + egui::vec2(rect.width() * fraction, 0.0),
+                    radius,
+                    stroke_color,
+                );
             }
         }
         ChromeIcon::Search => {

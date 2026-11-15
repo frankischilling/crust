@@ -13,6 +13,7 @@ use crust_core::model::{ChannelId, ChatMessage, MessageId, Span};
 
 use crate::theme as t;
 use crate::widgets::message_list::{format_message_timestamp, MessageBody};
+use crate::widgets::name_paint::show_sender_name_with_sense;
 
 /// One-shot action emitted by [`MentionsList::show`] when the user interacts
 /// with a row. The app is expected to switch `state.active_channel` to the
@@ -392,7 +393,6 @@ fn render_row(
         .color
         .as_deref()
         .and_then(parse_hex_color)
-        .map(t::readable_username_color)
         .unwrap_or(t::text_primary());
     let display_name = sender_name(msg);
 
@@ -439,6 +439,7 @@ fn render_row(
                     |ui| {
                         ui.set_max_width(content_w);
                         ui.spacing_mut().item_spacing = Vec2::new(6.0, 2.0);
+                        ui.style_mut().override_font_id = Some(t::body());
 
                         if show_ts {
                             ui.add(Label::new(
@@ -482,15 +483,23 @@ fn render_row(
                         }
 
                         // Sender
-                        ui.add(
-                            Label::new(
-                                RichText::new(format!("{display_name}:"))
-                                    .font(t::body())
-                                    .color(sender_color)
-                                    .strong(),
-                            )
-                            .selectable(false),
+                        let sender_response = show_sender_name_with_sense(
+                            ui,
+                            &format!("{display_name}:"),
+                            sender_color,
+                            msg.sender.name_paint.as_ref(),
+                            body.emote_bytes,
+                            body.animate_emotes,
+                            Sense::click().difference(Sense::focusable_noninteractive()),
                         );
+                        sender_response
+                            .context_menu(|ui| mention_context_menu(ui, msg, &mut jump));
+                        if sender_response.clicked() {
+                            jump = Some(MentionJumpTarget {
+                                channel: msg.channel.clone(),
+                                message: msg.id,
+                            });
+                        }
                     },
                 );
 
@@ -779,7 +788,7 @@ mod tests {
                     }
                 }
                 egui::epaint::Shape::Text(shape) => {
-                    let bounds = egui::Rect::from_min_size(shape.pos, shape.galley.size());
+                    let bounds = shape.galley.rect.translate(shape.pos.to_vec2());
                     if bounds.intersects(clip) {
                         rows.push((
                             shape.galley.text().to_owned(),
@@ -1045,6 +1054,177 @@ mod tests {
                 assert_eq!(action.channel, messages[0].channel);
                 assert_eq!(action.message, messages[0].id);
             }
+        }
+    }
+
+    #[test]
+    fn mentions_painted_names_keep_jump_context_menu_and_cached_layout() {
+        for width in [240.0, 480.0] {
+            let ctx = egui::Context::default();
+            let resources = Resources::new();
+            let mut rows = messages(1);
+            let mut cache = MentionLayoutCache::default();
+            let mut rendered = frame(
+                &ctx,
+                &resources.list(&rows),
+                &mut cache,
+                true,
+                width,
+                0.0,
+                Vec::new(),
+            );
+            let plain_name = rendered
+                .output
+                .shapes
+                .iter()
+                .find_map(|shape| {
+                    let egui::epaint::Shape::Text(text) = &shape.shape else {
+                        return None;
+                    };
+                    if text.galley.text() != "Viewer0:" {
+                        return None;
+                    }
+                    text.galley
+                        .rows
+                        .iter()
+                        .find(|row| !row.glyphs.is_empty())
+                        .map(|row| row.visuals.mesh_bounds.translate(text.pos.to_vec2()))
+                })
+                .expect("the sender glyphs are visible");
+            let original_height = rendered.content_height;
+            rows[0].sender.name_paint = Some(crust_core::model::SenderNamePaint {
+                function: "linear-gradient".to_owned(),
+                angle: Some(90.0),
+                stops: vec![
+                    crust_core::model::SenderNamePaintStop {
+                        at: 0.0,
+                        color: "#ff0000".to_owned(),
+                    },
+                    crust_core::model::SenderNamePaintStop {
+                        at: 1.0,
+                        color: "#0000ff".to_owned(),
+                    },
+                ],
+                ..Default::default()
+            });
+            for _ in 0..2 {
+                rendered = frame(
+                    &ctx,
+                    &resources.list(&rows),
+                    &mut cache,
+                    true,
+                    width,
+                    0.0,
+                    Vec::new(),
+                );
+            }
+            assert!(crate::widgets::name_paint::cached_name_count(&ctx) > 0);
+            assert!(!visible_text(&rendered.output)
+                .iter()
+                .any(|(text, _, _)| text == "Viewer0:"));
+            assert!((rendered.content_height - original_height).abs() < 0.5);
+            assert_eq!(
+                rendered.measured_rows, 0,
+                "paint changes do not alter row layout"
+            );
+            let texture = ctx
+                .tex_manager()
+                .read()
+                .allocated()
+                .find_map(|(id, meta)| (meta.name == "painted sender name").then_some(*id))
+                .expect("the sender has a painted texture");
+            let name = image_rects(&ctx, &rendered.output, texture)[0];
+            assert!(
+                (name.center() - plain_name.center()).length() <= 1.0,
+                "painted glyphs {name:?} must stay over plain glyphs {plain_name:?}"
+            );
+
+            for pressed in [true, false] {
+                rendered = frame(
+                    &ctx,
+                    &resources.list(&rows),
+                    &mut cache,
+                    true,
+                    width,
+                    0.0,
+                    vec![
+                        egui::Event::PointerMoved(name.center()),
+                        egui::Event::PointerButton {
+                            pos: name.center(),
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                );
+            }
+            let jump = rendered
+                .action
+                .expect("the painted sender opens its source message");
+            assert_eq!(jump.channel, rows[0].channel);
+            assert_eq!(jump.message, rows[0].id);
+
+            for pressed in [true, false] {
+                rendered = frame(
+                    &ctx,
+                    &resources.list(&rows),
+                    &mut cache,
+                    true,
+                    width,
+                    0.0,
+                    vec![
+                        egui::Event::PointerMoved(name.center()),
+                        egui::Event::PointerButton {
+                            pos: name.center(),
+                            button: egui::PointerButton::Secondary,
+                            pressed,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                );
+                assert!(rendered.action.is_none());
+            }
+            assert!(ctx.is_context_menu_open());
+            rendered = frame(
+                &ctx,
+                &resources.list(&rows),
+                &mut cache,
+                true,
+                width,
+                0.0,
+                vec![egui::Event::PointerMoved(name.center())],
+            );
+            let menu = visible_text(&rendered.output);
+            assert!(menu.iter().any(|(text, _, _)| text == "Open in channel"));
+            let copy = menu
+                .iter()
+                .find(|(text, _, _)| text == "Copy message")
+                .expect("the sender keeps the message context menu")
+                .1
+                .center();
+            for pressed in [true, false] {
+                rendered = frame(
+                    &ctx,
+                    &resources.list(&rows),
+                    &mut cache,
+                    true,
+                    width,
+                    0.0,
+                    vec![
+                        egui::Event::PointerMoved(copy),
+                        egui::Event::PointerButton {
+                            pos: copy,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                );
+                assert!(rendered.action.is_none());
+            }
+            assert!(rendered.output.platform_output.commands.iter().any(
+                |command| matches!(command, egui::OutputCommand::CopyText(text) if text == &rows[0].raw_text)
+            ));
         }
     }
 

@@ -15,7 +15,8 @@ pub struct Badge {
 pub struct SenderNamePaintStop {
     /// Relative position in `[0.0, 1.0]`.
     pub at: f32,
-    /// CSS-like hex color (`#RRGGBB`).
+    /// CSS-like hex color (`#RRGGBB` or `#RRGGBBAA`).
+    /// Transparent colors are preserved.
     pub color: String,
 }
 

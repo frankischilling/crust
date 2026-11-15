@@ -15,10 +15,12 @@ use egui::load::{
     ImageLoadResult, ImageLoader, ImagePoll, LoadError, SizeHint, SizedTexture, TextureLoadResult,
     TextureLoader, TexturePoll,
 };
+use image::ImageDecoder;
 
 const IMAGE_LOADER_ID: &str = "crust::bounded_image_loader";
 const TEXTURE_LOADER_ID: &str = "crust::bounded_texture_loader";
 const METRICS_ID: &str = "crust::image_work_metrics";
+const FIRST_FRAME_PREFIX: &str = "bytes://crust-first-frame/";
 
 #[derive(Default)]
 struct LoaderMetrics {
@@ -62,6 +64,20 @@ fn full_cache_error() -> LoadError {
     LoadError::Loading("Image cache is full; this image will retry on the next pass".to_owned())
 }
 
+pub(super) fn ensure_installed(ctx: &egui::Context) {
+    if ctx
+        .loaders()
+        .image
+        .lock()
+        .iter()
+        .any(|loader| loader.id() == IMAGE_LOADER_ID)
+    {
+        return;
+    }
+    egui_extras::install_image_loaders(ctx);
+    install(ctx, super::LOADER_BYTES, super::RAW_ENTRIES);
+}
+
 pub(super) fn install(ctx: &egui::Context, bytes: usize, entries: usize) {
     let loaders = ctx.loaders();
     let mut images = loaders.image.lock();
@@ -91,6 +107,57 @@ pub(super) fn install(ctx: &egui::Context, bytes: usize, entries: usize) {
         entries_limit: entries,
         metrics,
     }));
+}
+
+pub(super) fn color_frame(
+    ctx: &egui::Context,
+    source: &str,
+    raw: Arc<[u8]>,
+    animate: bool,
+) -> Option<(Arc<egui::ColorImage>, usize)> {
+    ensure_installed(ctx);
+    let animated = animate
+        && matches!(
+            image::guess_format(&raw),
+            Ok(image::ImageFormat::Gif | image::ImageFormat::WebP)
+        );
+    let source = if animated {
+        source.to_owned()
+    } else {
+        first_frame_uri(source)
+    };
+    ctx.include_bytes(source.clone(), raw);
+    let mut frame = if animated {
+        animation::frame_index(ctx, &source)
+    } else {
+        0
+    };
+    let ImagePoll::Ready { mut image } = ctx
+        .try_load_image(&format!("{source}#{frame}"), SizeHint::default())
+        .ok()?
+    else {
+        return None;
+    };
+    if animated {
+        let current = animation::frame_index(ctx, &source);
+        if current != frame {
+            let ImagePoll::Ready {
+                image: current_image,
+            } = ctx
+                .try_load_image(&format!("{source}#{current}"), SizeHint::default())
+                .ok()?
+            else {
+                return None;
+            };
+            image = current_image;
+            frame = current;
+        }
+    }
+    Some((image, frame))
+}
+
+pub(super) fn first_frame_uri(source: &str) -> String {
+    format!("{FIRST_FRAME_PREFIX}{source}")
 }
 
 struct DecodedEntry {
@@ -140,6 +207,7 @@ impl ImageLoader for BoundedImageLoader {
         let mut cache = self.cache.lock().unwrap();
         cache.order = cache.order.wrapping_add(1);
         let order = cache.order;
+        let mut selected = None;
         if let Some(entry) = cache.entries.get_mut(source) {
             entry.used_frame = pass;
             entry.used_order = order;
@@ -149,41 +217,52 @@ impl ImageLoader for BoundedImageLoader {
             if !entry.pending {
                 // Decoder byte_size walks its entire cache. Avoid that work for
                 // ordinary repaint hits, including later frames of an animation.
-                return self.inner[entry.decoder].load(ctx, uri, size_hint);
-            }
-        }
-        // GIF/WebP loaders collect an entire animation before returning. Check
-        // canvas size and frame count before they can allocate those buffers.
-        if let Ok(egui::load::BytesPoll::Ready { bytes, .. }) = ctx.try_load_bytes(source) {
-            if let Err(reason) = preflight_decoded_size(&bytes, self.bytes_limit) {
-                if cache.entries.len() < self.entries_limit {
-                    cache.entries.insert(
-                        source.to_owned(),
-                        DecodedEntry {
-                            decoder: 0,
-                            pending: false,
-                            rejected: Some(reason.clone()),
-                            used_frame: pass,
-                            used_order: order,
-                        },
-                    );
+                let result = self.inner[entry.decoder].load(ctx, uri, size_hint);
+                if matches!(result, Ok(ImagePoll::Ready { .. })) {
+                    return result;
                 }
-                return Err(LoadError::Loading(reason));
+                // A decoder may have evicted this source independently. A new
+                // pending decode must rejoin the combined cache budget below.
+                selected = Some((entry.decoder, result));
             }
         }
-        let mut selected = None;
         let mut detected_format = None;
-        for (index, decoder) in self.inner.iter().enumerate().rev() {
-            match decoder.load(ctx, uri, size_hint) {
-                Err(LoadError::NotSupported) => continue,
-                Err(LoadError::FormatNotSupported {
-                    detected_format: format,
-                }) => {
-                    detected_format = detected_format.or(format);
+        if selected.is_none() {
+            // GIF/WebP loaders collect an entire animation before returning. Check
+            // canvas size and frame count before they can allocate those buffers.
+            if let Ok(egui::load::BytesPoll::Ready { bytes, .. }) = ctx.try_load_bytes(source) {
+                if let Err(reason) = preflight_size(
+                    &bytes,
+                    self.bytes_limit,
+                    source.starts_with(FIRST_FRAME_PREFIX),
+                ) {
+                    if cache.entries.len() < self.entries_limit {
+                        cache.entries.insert(
+                            source.to_owned(),
+                            DecodedEntry {
+                                decoder: 0,
+                                pending: false,
+                                rejected: Some(reason.clone()),
+                                used_frame: pass,
+                                used_order: order,
+                            },
+                        );
+                    }
+                    return Err(LoadError::Loading(reason));
                 }
-                result => {
-                    selected = Some((index, result));
-                    break;
+            }
+            for (index, decoder) in self.inner.iter().enumerate().rev() {
+                match decoder.load(ctx, uri, size_hint) {
+                    Err(LoadError::NotSupported) => continue,
+                    Err(LoadError::FormatNotSupported {
+                        detected_format: format,
+                    }) => {
+                        detected_format = detected_format.or(format);
+                    }
+                    result => {
+                        selected = Some((index, result));
+                        break;
+                    }
                 }
             }
         }
@@ -238,18 +317,43 @@ impl ImageLoader for BoundedImageLoader {
 }
 
 fn preflight_decoded_size(raw: &[u8], limit: usize) -> Result<usize, String> {
+    preflight_size(raw, limit, false)
+}
+
+pub(super) fn preflight_size(raw: &[u8], limit: usize, first_frame: bool) -> Result<usize, String> {
     let Ok(format) = image::guess_format(raw) else {
         return Ok(0);
     };
-    let (width, height) = image::ImageReader::with_format(std::io::Cursor::new(raw), format)
-        .into_dimensions()
+    let decoder = image::ImageReader::with_format(std::io::Cursor::new(raw), format)
+        .into_decoder()
         .map_err(|error| error.to_string())?;
+    let (width, height) = decoder.dimensions();
     let frame_bytes = (width as usize)
         .checked_mul(height as usize)
         .and_then(|pixels| pixels.checked_mul(4))
         .ok_or_else(|| "Image dimensions exceed the decoded byte limit".to_owned())?;
     if frame_bytes > limit {
         return Err("Image dimensions exceed the decoded byte limit".to_owned());
+    }
+    if first_frame {
+        // PNG can decode to 16-bit RGB/RGBA before conversion to display pixels.
+        // Reserve that native output too, then release the extra bytes on completion.
+        let native_bytes = usize::try_from(decoder.total_bytes())
+            .map_err(|_| "Image dimensions exceed the decoded byte limit".to_owned())?;
+        let decode_bytes = frame_bytes.max(native_bytes);
+        if decode_bytes > limit {
+            return Err("Image dimensions exceed the decoded byte limit".to_owned());
+        }
+        match format {
+            image::ImageFormat::Gif => {
+                gif_frame_count(raw, 0)?;
+            }
+            image::ImageFormat::WebP => {
+                webp_frame_count(raw, 0, (width, height))?;
+            }
+            _ => {}
+        }
+        return Ok(decode_bytes);
     }
     let max_frames = limit.checked_div(frame_bytes.max(1)).unwrap_or(0);
     let frames = match format {
@@ -720,6 +824,30 @@ pub(super) mod tests {
         assert!(preflight_decoded_size(&raw, 1024)
             .unwrap_err()
             .contains("canvas"));
+        assert!(preflight_size(&raw, 1024, true)
+            .unwrap_err()
+            .contains("canvas"));
+    }
+
+    #[test]
+    fn paused_animation_needs_only_one_frame_of_decode_budget() {
+        let ctx = context(8, 1);
+        let raw = gif();
+        assert!(preflight_decoded_size(&raw, 8).is_err());
+        assert_eq!(preflight_size(&raw, 8, true).unwrap(), 8);
+        let source = first_frame_uri("bytes://paused.gif");
+        ctx.include_bytes(source.clone(), raw);
+        ready_image(&ctx, &format!("{source}#0"));
+        let ImagePoll::Ready { image } = ctx
+            .try_load_image(&format!("{source}#0"), SizeHint::default())
+            .unwrap()
+        else {
+            panic!("the paused first frame must be available");
+        };
+        assert!(image
+            .pixels
+            .iter()
+            .all(|pixel| *pixel == egui::Color32::RED));
     }
 
     #[test]

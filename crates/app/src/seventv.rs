@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crust_core::model::{
     Badge, Sender, SenderNamePaint, SenderNamePaintShadow, SenderNamePaintStop,
@@ -13,7 +13,7 @@ use crate::runtime::live_emotes::{LiveSource, Provider};
 
 const SEVENTV_GQL_URL: &str = "https://api.7tv.app/v3/gql";
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct SevenTvUserStyleRaw {
     pub(crate) color: Option<i32>,
     pub(crate) badge_id: Option<String>,
@@ -27,13 +27,13 @@ pub(crate) struct SevenTvUserProfile {
     pub(crate) personal_source: Option<LiveSource>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SevenTvBadgeMeta {
     pub(crate) tooltip: Option<String>,
     pub(crate) url: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct SevenTvPaintMeta {
     pub(crate) function: String,
     pub(crate) angle: Option<f32>,
@@ -43,12 +43,40 @@ pub(crate) struct SevenTvPaintMeta {
     pub(crate) stops: Vec<SenderNamePaintStop>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct SevenTvResolvedStyle {
     pub(crate) color_hex: Option<String>,
     pub(crate) badge: Option<Badge>,
     pub(crate) name_paint: Option<SenderNamePaint>,
     pub(crate) avatar_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SevenTvCosmeticKind {
+    Paint,
+    Badge,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum SevenTvLiveCosmeticUpdate {
+    Connected,
+    Paint {
+        id: String,
+        paint: SevenTvPaintMeta,
+    },
+    Badge {
+        id: String,
+        badge: SevenTvBadgeMeta,
+    },
+    Entitlement {
+        kind: SevenTvCosmeticKind,
+        cosmetic_id: String,
+        twitch_user_ids: Vec<String>,
+        granted: bool,
+    },
+    RefreshUsers {
+        twitch_user_ids: Vec<String>,
+    },
 }
 
 pub(crate) enum SevenTvCosmeticUpdate {
@@ -61,12 +89,267 @@ pub(crate) enum SevenTvCosmeticUpdate {
         generation: u64,
         profile: Option<SevenTvUserProfile>,
     },
+    Live {
+        epoch: u64,
+        update: SevenTvLiveCosmeticUpdate,
+    },
     /// Batch of Twitch user-ids discovered in history messages that need
     /// their 7TV styles resolved.
     BatchUserLookup {
         channel: crust_core::ChannelId,
         user_ids: Vec<String>,
     },
+}
+
+const MAX_CACHED_COSMETIC_USERS: usize = 2_048;
+const MAX_COSMETIC_DEFINITIONS: usize = 16_384;
+
+#[derive(Default)]
+pub(crate) struct SevenTvCosmetics {
+    badges: HashMap<String, SevenTvBadgeMeta>,
+    paints: HashMap<String, SevenTvPaintMeta>,
+    raw: HashMap<String, SevenTvUserStyleRaw>,
+    resolved: HashMap<String, SevenTvResolvedStyle>,
+    user_order: VecDeque<String>,
+    refresh_users: HashSet<String>,
+    refresh_order: VecDeque<String>,
+    live_badges: HashSet<String>,
+    live_paints: HashSet<String>,
+    live_epoch: u64,
+}
+
+#[derive(Default)]
+pub(crate) struct SevenTvCosmeticEffects {
+    pub(crate) changed: Vec<(String, SevenTvResolvedStyle)>,
+    pub(crate) invalidate: Vec<String>,
+    pub(crate) refresh: Vec<String>,
+}
+
+impl SevenTvCosmetics {
+    pub(crate) fn resolved(&self, user_id: &str) -> Option<&SevenTvResolvedStyle> {
+        self.resolved.get(user_id)
+    }
+
+    pub(crate) fn forget(&mut self, user_id: &str) {
+        self.raw.remove(user_id);
+        self.resolved.remove(user_id);
+        self.user_order.retain(|user| user != user_id);
+        self.complete_refresh(user_id);
+    }
+
+    fn complete_refresh(&mut self, user_id: &str) {
+        if self.refresh_users.remove(user_id) {
+            self.refresh_order.retain(|user| user != user_id);
+        }
+    }
+
+    /// Recover a canceled full profile without moving an already queued reconnect refresh.
+    pub(crate) fn retry_profile_lookup(&mut self, user_id: &str) {
+        if !self.refresh_users.contains(user_id) {
+            self.queue_refresh(user_id);
+        }
+    }
+
+    fn queue_refresh(&mut self, user_id: &str) {
+        if !valid_cosmetic_id(user_id) {
+            return;
+        }
+        if self.refresh_users.contains(user_id) {
+            self.refresh_order.retain(|user| user != user_id);
+        } else {
+            while self.refresh_order.len() >= MAX_CACHED_COSMETIC_USERS {
+                if let Some(oldest) = self.refresh_order.pop_back() {
+                    self.refresh_users.remove(&oldest);
+                }
+            }
+            self.refresh_users.insert(user_id.to_owned());
+        }
+        self.refresh_order.push_front(user_id.to_owned());
+    }
+
+    /// A refresh remains pending until a current profile succeeds. Its next
+    /// attempt can use another room when the previous request's room closes.
+    pub(crate) fn refresh_candidates(&mut self, limit: usize) -> Vec<String> {
+        let count = limit.min(self.refresh_order.len());
+        let mut candidates = Vec::with_capacity(count);
+        for _ in 0..count {
+            if let Some(user_id) = self.refresh_order.pop_front() {
+                candidates.push(user_id.clone());
+                self.refresh_order.push_back(user_id);
+            }
+        }
+        candidates
+    }
+
+    fn retain_user(&mut self, user_id: &str) {
+        self.user_order.retain(|user| user != user_id);
+        self.user_order.push_back(user_id.to_owned());
+        while self.user_order.len() > MAX_CACHED_COSMETIC_USERS {
+            if let Some(oldest) = self.user_order.pop_front() {
+                self.raw.remove(&oldest);
+                self.resolved.remove(&oldest);
+                self.complete_refresh(&oldest);
+            }
+        }
+    }
+
+    fn resolve_user(&mut self, user_id: &str) -> Option<(String, SevenTvResolvedStyle)> {
+        let raw = self.raw.get(user_id)?;
+        let resolved = resolve_7tv_user_style(raw, &self.badges, &self.paints);
+        if self.resolved.get(user_id) == Some(&resolved) {
+            return None;
+        }
+        self.resolved.insert(user_id.to_owned(), resolved.clone());
+        Some((user_id.to_owned(), resolved))
+    }
+
+    pub(crate) fn profile(
+        &mut self,
+        user_id: &str,
+        style: SevenTvUserStyleRaw,
+    ) -> Option<(String, SevenTvResolvedStyle)> {
+        if !valid_cosmetic_id(user_id) {
+            return None;
+        }
+        self.complete_refresh(user_id);
+        self.retain_user(user_id);
+        self.raw.insert(user_id.to_owned(), style);
+        self.resolve_user(user_id)
+    }
+
+    pub(crate) fn catalog(
+        &mut self,
+        mut badges: HashMap<String, SevenTvBadgeMeta>,
+        mut paints: HashMap<String, SevenTvPaintMeta>,
+    ) -> Vec<(String, SevenTvResolvedStyle)> {
+        // Socket objects may arrive while the startup catalog is in flight.
+        for id in &self.live_badges {
+            if let Some(badge) = self.badges.get(id) {
+                badges.insert(id.clone(), badge.clone());
+            }
+        }
+        for id in &self.live_paints {
+            if let Some(paint) = self.paints.get(id) {
+                paints.insert(id.clone(), paint.clone());
+            }
+        }
+        self.badges = badges;
+        self.paints = paints;
+        let users: Vec<_> = self.raw.keys().cloned().collect();
+        users
+            .into_iter()
+            .filter_map(|user| self.resolve_user(&user))
+            .collect()
+    }
+
+    pub(crate) fn live(
+        &mut self,
+        epoch: u64,
+        update: SevenTvLiveCosmeticUpdate,
+    ) -> SevenTvCosmeticEffects {
+        let mut effects = SevenTvCosmeticEffects::default();
+        if epoch < self.live_epoch {
+            return effects;
+        }
+        if epoch != self.live_epoch && !matches!(update, SevenTvLiveCosmeticUpdate::Connected) {
+            return effects;
+        }
+        match update {
+            SevenTvLiveCosmeticUpdate::Connected => {
+                if epoch <= self.live_epoch {
+                    return effects;
+                }
+                if self.live_epoch != 0 {
+                    effects.refresh = self.user_order.iter().rev().cloned().collect();
+                    effects.invalidate = effects.refresh.clone();
+                }
+                self.live_epoch = epoch;
+            }
+            SevenTvLiveCosmeticUpdate::Paint { id, paint } => {
+                if self.paints.len() >= MAX_COSMETIC_DEFINITIONS && !self.paints.contains_key(&id) {
+                    return effects;
+                }
+                self.live_paints.insert(id.clone());
+                if self.paints.get(&id) == Some(&paint) {
+                    return effects;
+                }
+                self.paints.insert(id.clone(), paint);
+                let users: Vec<_> = self
+                    .raw
+                    .iter()
+                    .filter(|(_, style)| style.paint_id.as_deref() == Some(id.as_str()))
+                    .map(|(user, _)| user.clone())
+                    .collect();
+                effects.changed = users
+                    .into_iter()
+                    .filter_map(|user| self.resolve_user(&user))
+                    .collect();
+            }
+            SevenTvLiveCosmeticUpdate::Badge { id, badge } => {
+                if self.badges.len() >= MAX_COSMETIC_DEFINITIONS && !self.badges.contains_key(&id) {
+                    return effects;
+                }
+                self.live_badges.insert(id.clone());
+                if self.badges.get(&id) == Some(&badge) {
+                    return effects;
+                }
+                self.badges.insert(id.clone(), badge);
+                let users: Vec<_> = self
+                    .raw
+                    .iter()
+                    .filter(|(_, style)| style.badge_id.as_deref() == Some(id.as_str()))
+                    .map(|(user, _)| user.clone())
+                    .collect();
+                effects.changed = users
+                    .into_iter()
+                    .filter_map(|user| self.resolve_user(&user))
+                    .collect();
+            }
+            SevenTvLiveCosmeticUpdate::Entitlement {
+                kind,
+                cosmetic_id,
+                twitch_user_ids,
+                granted,
+            } => {
+                for user_id in twitch_user_ids {
+                    if !valid_cosmetic_id(&user_id) {
+                        continue;
+                    }
+                    self.retain_user(&user_id);
+                    let raw = self.raw.entry(user_id.clone()).or_default();
+                    let selected = match kind {
+                        SevenTvCosmeticKind::Paint => &mut raw.paint_id,
+                        SevenTvCosmeticKind::Badge => &mut raw.badge_id,
+                    };
+                    if granted {
+                        if selected.as_deref() == Some(cosmetic_id.as_str()) {
+                            // The event is newer than an in-flight profile even
+                            // when its selected value matches the cached value.
+                            effects.invalidate.push(user_id.clone());
+                            continue;
+                        }
+                        *selected = Some(cosmetic_id.clone());
+                    } else if selected.as_deref() == Some(cosmetic_id.as_str()) {
+                        *selected = None;
+                    } else if selected.is_some() {
+                        continue;
+                    }
+                    effects.invalidate.push(user_id.clone());
+                    if let Some(changed) = self.resolve_user(&user_id) {
+                        effects.changed.push(changed);
+                    }
+                }
+            }
+            SevenTvLiveCosmeticUpdate::RefreshUsers { twitch_user_ids } => {
+                effects.refresh = twitch_user_ids;
+                effects.invalidate = effects.refresh.clone();
+            }
+        }
+        for user_id in effects.refresh.iter().rev() {
+            self.queue_refresh(user_id);
+        }
+        effects
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -100,6 +383,182 @@ impl<T> SevenTvGraphQlResponse<T> {
 #[derive(Debug, serde::Deserialize)]
 struct SevenTvBadgeFile {
     name: String,
+}
+
+#[derive(serde::Deserialize)]
+struct SevenTvBadgeNode {
+    id: String,
+    tooltip: Option<String>,
+    host: SevenTvBadgeHost,
+}
+
+#[derive(serde::Deserialize)]
+struct SevenTvBadgeHost {
+    url: String,
+    files: Vec<SevenTvBadgeFile>,
+}
+
+#[derive(Clone, Copy, serde::Deserialize)]
+#[serde(try_from = "i64")]
+struct SevenTvPackedColor(i32);
+
+impl TryFrom<i64> for SevenTvPackedColor {
+    type Error = &'static str;
+
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        if value < i64::from(i32::MIN) || value > i64::from(u32::MAX) {
+            return Err("RGBA color exceeds 32 bits");
+        }
+        Ok(Self(value as u32 as i32))
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct SevenTvPaintNode {
+    id: String,
+    #[serde(default)]
+    function: Option<String>,
+    #[serde(default)]
+    angle: Option<f32>,
+    #[serde(default)]
+    repeat: bool,
+    #[serde(default)]
+    image_url: Option<String>,
+    #[serde(default)]
+    color: Option<SevenTvPackedColor>,
+    #[serde(default)]
+    stops: Vec<SevenTvPaintStopNode>,
+    #[serde(default)]
+    shadows: Vec<SevenTvPaintShadowNode>,
+}
+
+#[derive(serde::Deserialize)]
+struct SevenTvPaintStopNode {
+    at: f32,
+    color: SevenTvPackedColor,
+}
+
+#[derive(serde::Deserialize)]
+struct SevenTvPaintShadowNode {
+    #[serde(default)]
+    x_offset: f32,
+    #[serde(default)]
+    y_offset: f32,
+    #[serde(default)]
+    radius: f32,
+    color: SevenTvPackedColor,
+}
+
+fn valid_cosmetic_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn parse_7tv_badge_node(badge: SevenTvBadgeNode) -> Option<(String, SevenTvBadgeMeta)> {
+    if !valid_cosmetic_id(&badge.id) {
+        return None;
+    }
+    let host = normalize_external_url(&badge.host.url)?;
+    let file = choose_7tv_badge_file(&badge.host.files)?;
+    Some((
+        badge.id,
+        SevenTvBadgeMeta {
+            tooltip: badge.tooltip,
+            url: seven_tv_badge_url(&host, &file.name),
+        },
+    ))
+}
+
+pub(crate) fn parse_7tv_live_cosmetic(
+    kind: &str,
+    value: serde_json::Value,
+) -> Option<SevenTvLiveCosmeticUpdate> {
+    match kind {
+        "PAINT" => {
+            let (id, paint) = parse_7tv_paint_node(serde_json::from_value(value).ok()?)?;
+            Some(SevenTvLiveCosmeticUpdate::Paint { id, paint })
+        }
+        "BADGE" => {
+            let (id, badge) = parse_7tv_badge_node(serde_json::from_value(value).ok()?)?;
+            Some(SevenTvLiveCosmeticUpdate::Badge { id, badge })
+        }
+        _ => None,
+    }
+}
+
+fn parse_7tv_paint_node(paint: SevenTvPaintNode) -> Option<(String, SevenTvPaintMeta)> {
+    if !valid_cosmetic_id(&paint.id) {
+        return None;
+    }
+    let function = paint
+        .function
+        .as_deref()
+        .unwrap_or("linear-gradient")
+        .trim()
+        .to_ascii_lowercase()
+        .replace('_', "-");
+    if !matches!(
+        function.as_str(),
+        "linear-gradient" | "radial-gradient" | "url"
+    ) {
+        return None;
+    }
+    let stops = paint
+        .stops
+        .into_iter()
+        .map(|stop| SenderNamePaintStop {
+            at: stop.at,
+            color: seven_tv_color_to_hex_with_alpha(stop.color.0),
+        })
+        .collect();
+    let stops = normalize_7tv_paint_stops(
+        stops,
+        paint
+            .color
+            .map(|color| seven_tv_color_to_hex_with_alpha(color.0)),
+    );
+    let image_url = paint.image_url.as_deref().and_then(normalize_external_url);
+    let shadows: Vec<_> = paint
+        .shadows
+        .into_iter()
+        .filter(|shadow| {
+            shadow.x_offset.is_finite()
+                && shadow.y_offset.is_finite()
+                && shadow.radius.is_finite()
+                && shadow.radius > 0.0
+        })
+        .map(|shadow| SenderNamePaintShadow {
+            x_offset: shadow.x_offset,
+            y_offset: shadow.y_offset,
+            radius: shadow.radius,
+            color: seven_tv_color_to_hex_with_alpha(shadow.color.0),
+        })
+        .collect();
+    let has_fill = if function == "url" {
+        image_url.is_some()
+    } else {
+        !stops.is_empty()
+    };
+    if !has_fill && shadows.is_empty() {
+        return None;
+    }
+    Some((
+        paint.id,
+        SevenTvPaintMeta {
+            function,
+            angle: paint
+                .angle
+                .filter(|angle| angle.is_finite())
+                .map(|angle| angle.rem_euclid(360.0)),
+            repeat: paint.repeat,
+            image_url,
+            shadows,
+            stops,
+        },
+    ))
 }
 
 pub(crate) fn resolve_7tv_user_style(
@@ -204,57 +663,8 @@ pub(crate) async fn load_7tv_cosmetics_catalog(
 
     #[derive(serde::Deserialize)]
     struct Cosmetics {
-        badges: Vec<BadgeNode>,
-        paints: Vec<PaintNode>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct BadgeNode {
-        id: String,
-        tooltip: Option<String>,
-        host: BadgeHost,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct BadgeHost {
-        url: String,
-        files: Vec<SevenTvBadgeFile>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct PaintNode {
-        id: String,
-        #[serde(default)]
-        function: Option<String>,
-        #[serde(default)]
-        angle: Option<f32>,
-        #[serde(default)]
-        repeat: bool,
-        #[serde(default)]
-        image_url: Option<String>,
-        #[serde(default)]
-        color: Option<i32>,
-        #[serde(default)]
-        stops: Vec<PaintStopNode>,
-        #[serde(default)]
-        shadows: Vec<PaintShadowNode>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct PaintStopNode {
-        at: f32,
-        color: i32,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct PaintShadowNode {
-        #[serde(default)]
-        x_offset: f32,
-        #[serde(default)]
-        y_offset: f32,
-        #[serde(default)]
-        radius: f32,
-        color: i32,
+        badges: Vec<SevenTvBadgeNode>,
+        paints: Vec<SevenTvPaintNode>,
     }
 
     let query = r#"
@@ -306,13 +716,14 @@ pub(crate) async fn load_7tv_cosmetics_catalog(
         }
     };
 
-    let payload = match resp.json::<SevenTvGraphQlResponse<RespData>>().await {
-        Ok(p) => p,
-        Err(e) => {
-            warn!("7TV cosmetics parse failed: {e}");
-            return None;
-        }
-    };
+    let payload =
+        match read_bounded_json::<SevenTvGraphQlResponse<RespData>>(resp, 8 * 1024 * 1024).await {
+            Some(payload) => payload,
+            None => {
+                warn!("7TV cosmetics response was invalid or exceeded the size limit");
+                return None;
+            }
+        };
 
     let Some(data) = payload.successful_data() else {
         return None;
@@ -322,64 +733,14 @@ pub(crate) async fn load_7tv_cosmetics_catalog(
         .cosmetics
         .badges
         .into_iter()
-        .filter_map(|b| {
-            let file = choose_7tv_badge_file(&b.host.files)?;
-            Some((
-                b.id,
-                SevenTvBadgeMeta {
-                    tooltip: b.tooltip,
-                    url: seven_tv_badge_url(&b.host.url, &file.name),
-                },
-            ))
-        })
+        .filter_map(parse_7tv_badge_node)
         .collect();
 
     let paints: HashMap<String, SevenTvPaintMeta> = data
         .cosmetics
         .paints
         .into_iter()
-        .filter_map(|p| {
-            let fallback = p.color.and_then(seven_tv_color_to_hex);
-            let stops = p
-                .stops
-                .into_iter()
-                .filter_map(|s| {
-                    seven_tv_color_to_hex_with_alpha(s.color)
-                        .map(|color| SenderNamePaintStop { at: s.at, color })
-                })
-                .collect::<Vec<_>>();
-            let normalized = normalize_7tv_paint_stops(stops, fallback);
-            let image_url = p.image_url.as_deref().and_then(normalize_external_url);
-            if normalized.is_empty() && image_url.is_none() {
-                return None;
-            }
-            let shadows = p
-                .shadows
-                .into_iter()
-                .filter_map(|s| {
-                    seven_tv_color_to_hex_with_alpha(s.color).map(|color| SenderNamePaintShadow {
-                        x_offset: s.x_offset,
-                        y_offset: s.y_offset,
-                        radius: s.radius,
-                        color,
-                    })
-                })
-                .collect::<Vec<_>>();
-            Some((
-                p.id,
-                SevenTvPaintMeta {
-                    function: p
-                        .function
-                        .unwrap_or_else(|| "linear-gradient".to_owned())
-                        .to_ascii_lowercase(),
-                    angle: p.angle,
-                    repeat: p.repeat,
-                    image_url,
-                    shadows,
-                    stops: normalized,
-                },
-            ))
-        })
+        .filter_map(parse_7tv_paint_node)
         .collect();
 
     info!(
@@ -489,7 +850,11 @@ fn parse_7tv_user_style(response: &serde_json::Value) -> Option<SevenTvUserStyle
     let color = style
         .and_then(|style| style.get("color"))
         .and_then(serde_json::Value::as_i64)
-        .map(|color| color as i32)
+        .and_then(|color| {
+            SevenTvPackedColor::try_from(color)
+                .ok()
+                .map(|color| color.0)
+        })
         .filter(|color| *color != 0);
     let badge_id = style
         .and_then(|style| {
@@ -532,9 +897,6 @@ fn seven_tv_color_to_rgba(color: i32) -> (u8, u8, u8, u8) {
     let g = ((raw >> 16) & 0xFF) as u8;
     let b = ((raw >> 8) & 0xFF) as u8;
     let a = (raw & 0xFF) as u8;
-    // 7TV user colors are expected to be opaque in chat rendering.
-    // Keep alpha=0 from turning names fully invisible.
-    let a = if a == 0 { 255 } else { a };
     (r, g, b, a)
 }
 
@@ -543,6 +905,8 @@ fn seven_tv_color_to_hex(color: i32) -> Option<String> {
         return None;
     }
     let (r, g, b, a) = seven_tv_color_to_rgba(color);
+    // Plain username colors remain visible even when their alpha byte is unset.
+    let a = if a == 0 { 255 } else { a };
     if a == 255 {
         Some(format!("#{r:02X}{g:02X}{b:02X}"))
     } else {
@@ -550,15 +914,12 @@ fn seven_tv_color_to_hex(color: i32) -> Option<String> {
     }
 }
 
-fn seven_tv_color_to_hex_with_alpha(color: i32) -> Option<String> {
-    if color == 0 {
-        return None;
-    }
+fn seven_tv_color_to_hex_with_alpha(color: i32) -> String {
     let (r, g, b, a) = seven_tv_color_to_rgba(color);
     if a == 255 {
-        Some(format!("#{r:02X}{g:02X}{b:02X}"))
+        format!("#{r:02X}{g:02X}{b:02X}")
     } else {
-        Some(format!("#{r:02X}{g:02X}{b:02X}{a:02X}"))
+        format!("#{r:02X}{g:02X}{b:02X}{a:02X}")
     }
 }
 
@@ -598,7 +959,6 @@ fn normalize_7tv_paint_stops(
     fallback_color: Option<String>,
 ) -> Vec<SenderNamePaintStop> {
     stops.retain(|s| !s.color.is_empty() && s.at.is_finite());
-    stops.sort_by(|a, b| a.at.partial_cmp(&b.at).unwrap_or(std::cmp::Ordering::Equal));
 
     if stops.is_empty() {
         if let Some(color) = fallback_color {
@@ -798,19 +1158,567 @@ mod tests {
     }
 
     #[test]
-    fn seven_tv_color_zero_is_treated_as_absent() {
+    fn zero_is_absent_for_plain_names_and_transparent_for_paints() {
         assert_eq!(seven_tv_color_to_hex(0), None);
-        assert_eq!(seven_tv_color_to_hex_with_alpha(0), None);
+        assert_eq!(seven_tv_color_to_hex_with_alpha(0), "#00000000");
     }
 
     #[test]
-    fn seven_tv_color_alpha_zero_is_normalized_to_opaque() {
-        // 0x11223300 should become opaque #112233.
+    fn paint_alpha_is_preserved_while_plain_names_remain_visible() {
         let c = 0x11223300u32 as i32;
         assert_eq!(seven_tv_color_to_hex(c), Some("#112233".to_owned()));
+        assert_eq!(seven_tv_color_to_hex_with_alpha(c), "#11223300");
+        assert_eq!(seven_tv_color_to_hex_with_alpha(0x11223380), "#11223380");
+        assert_eq!(seven_tv_color_to_hex_with_alpha(-1), "#FFFFFF");
+    }
+
+    #[test]
+    fn paint_payloads_preserve_transparency_and_normalize_known_functions() {
+        let payload = serde_json::json!({
+            "id": "gradient", "function": "RADIAL_GRADIENT", "repeat": true, "angle": -45,
+            "stops": [
+                {"at": 0.0, "color": 0},
+                {"at": 0.5, "color": 0xFF000080u32},
+                {"at": 0.5, "color": -1}
+            ],
+            "shadows": [{"x_offset": 1, "y_offset": -2, "radius": 3, "color": 0x11223300}]
+        });
+        let SevenTvLiveCosmeticUpdate::Paint { paint, .. } =
+            parse_7tv_live_cosmetic("PAINT", payload).unwrap()
+        else {
+            panic!("paint");
+        };
+        assert_eq!(paint.function, "radial-gradient");
+        assert_eq!(paint.angle, Some(315.0));
+        assert!(paint.repeat);
+        assert_eq!(paint.stops[0].color, "#00000000");
+        assert_eq!(paint.stops[1].color, "#FF000080");
+        assert_eq!(paint.stops[2].color, "#FFFFFF");
+        assert!(paint.stops[2].at > paint.stops[1].at);
+        assert_eq!(paint.shadows[0].color, "#11223300");
+    }
+
+    #[test]
+    fn paint_payloads_require_a_supported_function_and_usable_content() {
+        for value in [
+            serde_json::json!({"id": "bad", "function": "unknown", "color": -1}),
+            serde_json::json!({"id": "bad", "function": "URL", "image_url": "javascript:bad", "color": -1}),
+            serde_json::json!({"id": "bad", "function": "LINEAR_GRADIENT", "stops": []}),
+            serde_json::json!({"id": "bad", "color": 0x1FFFFFFFFu64}),
+        ] {
+            assert!(parse_7tv_live_cosmetic("PAINT", value).is_none());
+        }
+        let SevenTvLiveCosmeticUpdate::Paint { paint, .. } = parse_7tv_live_cosmetic("PAINT",
+            serde_json::json!({"id": "image", "function": "URL", "image_url": "//cdn.7tv.app/paint/example.webp"}))
+            .unwrap() else { panic!("image paint"); };
         assert_eq!(
-            seven_tv_color_to_hex_with_alpha(c),
-            Some("#112233".to_owned())
+            paint.image_url.as_deref(),
+            Some("https://cdn.7tv.app/paint/example.webp")
         );
+        assert!(paint.stops.is_empty());
+    }
+
+    #[test]
+    fn shadow_only_paints_keep_their_effect_when_fill_metadata_is_empty() {
+        for function in ["LINEAR_GRADIENT", "URL"] {
+            let SevenTvLiveCosmeticUpdate::Paint { paint, .. } = parse_7tv_live_cosmetic("PAINT",
+                serde_json::json!({"id": "shadow", "function": function, "stops": [], "image_url": null,
+                    "color": null, "shadows": [{"x_offset": 1, "y_offset": 0, "radius": 2, "color": -1}]}))
+                .unwrap() else { panic!("shadow paint"); };
+            assert!(paint.stops.is_empty());
+            assert!(paint.image_url.is_none());
+            assert_eq!(paint.shadows.len(), 1);
+        }
+        assert!(parse_7tv_live_cosmetic(
+            "PAINT",
+            serde_json::json!({"id": "invalid", "function": "LINEAR_GRADIENT",
+            "shadows": [{"radius": -1, "color": -1}]})
+        )
+        .is_none());
+    }
+
+    #[test]
+    #[ignore = "requires a public catalog capture in CRUST_7TV_CATALOG_PATH"]
+    fn captured_public_catalog_accepts_supported_paint_definitions() {
+        use serde_json::Value;
+        use std::collections::BTreeMap;
+
+        fn packed_color(value: &Value) -> bool {
+            value
+                .as_i64()
+                .is_some_and(|color| (i64::from(i32::MIN)..=i64::from(u32::MAX)).contains(&color))
+        }
+
+        fn finite_number(value: &Value) -> bool {
+            value
+                .as_f64()
+                .is_some_and(|number| (number as f32).is_finite())
+        }
+
+        fn optional(value: Option<&Value>, valid: fn(&Value) -> bool) -> bool {
+            value.is_none_or(|value| value.is_null() || valid(value))
+        }
+
+        fn array_field<'a>(value: &'a Value, field: &str) -> Option<&'a [Value]> {
+            match value.get(field) {
+                None => Some(&[]),
+                Some(Value::Array(values)) => Some(values),
+                _ => None,
+            }
+        }
+
+        let path = std::env::var_os("CRUST_7TV_CATALOG_PATH")
+            .expect("set CRUST_7TV_CATALOG_PATH to a captured cosmetics GraphQL response");
+        let bytes = std::fs::read(path).expect("read captured public cosmetics catalog");
+        let payload: Value = serde_json::from_slice(&bytes).expect("catalog must be valid JSON");
+        let paints = payload
+            .pointer("/data/cosmetics/paints")
+            .and_then(Value::as_array)
+            .expect("catalog must contain data.cosmetics.paints");
+        assert!(!paints.is_empty(), "catalog must contain paint definitions");
+
+        let mut functions = BTreeMap::<String, usize>::new();
+        let mut accepted_functions = BTreeMap::<String, usize>::new();
+        let (mut accepted, mut expected, mut shadow_only) = (0, 0, 0);
+        let (mut invalid, mut unsupported, mut empty, mut decode_errors) = (0, 0, 0, 0);
+        let mut rejected_valid = Vec::new();
+        for (index, raw) in paints.iter().enumerate() {
+            let function = raw
+                .get("function")
+                .and_then(Value::as_str)
+                .unwrap_or("linear-gradient")
+                .trim()
+                .to_ascii_lowercase()
+                .replace('_', "-");
+            *functions.entry(function.clone()).or_default() += 1;
+            let supported = matches!(
+                function.as_str(),
+                "linear-gradient" | "radial-gradient" | "url"
+            );
+            let stops = array_field(raw, "stops");
+            let shadows = array_field(raw, "shadows");
+            // Check the public payload independently of the Rust DTO and decoder.
+            let valid = raw["id"].as_str().is_some_and(valid_cosmetic_id)
+                && optional(raw.get("function"), Value::is_string)
+                && optional(raw.get("angle"), finite_number)
+                && optional(raw.get("image_url"), Value::is_string)
+                && optional(raw.get("color"), packed_color)
+                && raw.get("repeat").is_none_or(Value::is_boolean)
+                && stops.is_some_and(|stops| {
+                    stops
+                        .iter()
+                        .all(|stop| finite_number(&stop["at"]) && packed_color(&stop["color"]))
+                })
+                && shadows.is_some_and(|shadows| {
+                    shadows.iter().all(|shadow| {
+                        packed_color(&shadow["color"])
+                            && ["x_offset", "y_offset", "radius"]
+                                .iter()
+                                .all(|field| shadow.get(*field).is_none_or(finite_number))
+                    })
+                });
+            let has_fill = if function == "url" {
+                raw["image_url"].as_str().is_some_and(|url| {
+                    ["//", "https://", "http://"]
+                        .iter()
+                        .any(|prefix| url.trim().starts_with(*prefix))
+                })
+            } else {
+                stops.is_some_and(|stops| !stops.is_empty()) || packed_color(&raw["color"])
+            };
+            let has_shadow = shadows.is_some_and(|shadows| {
+                shadows.iter().any(|shadow| {
+                    shadow["radius"]
+                        .as_f64()
+                        .is_some_and(|radius| radius as f32 > 0.0)
+                })
+            });
+            let should_accept = valid && supported && (has_fill || has_shadow);
+            if !valid {
+                invalid += 1;
+            } else if !supported {
+                unsupported += 1;
+            } else if !should_accept {
+                empty += 1;
+            }
+            expected += usize::from(should_accept);
+
+            let decoded = serde_json::from_value::<SevenTvPaintNode>(raw.clone());
+            decode_errors += usize::from(decoded.is_err());
+            if let Some((_, paint)) = decoded.ok().and_then(parse_7tv_paint_node) {
+                accepted += 1;
+                *accepted_functions
+                    .entry(paint.function.clone())
+                    .or_default() += 1;
+                let has_fill = if paint.function == "url" {
+                    paint.image_url.is_some()
+                } else {
+                    !paint.stops.is_empty()
+                };
+                shadow_only += usize::from(!has_fill && !paint.shadows.is_empty());
+            } else if should_accept {
+                rejected_valid.push((index, raw["id"].as_str().unwrap_or_default()));
+            }
+        }
+
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "total": paints.len(), "accepted": accepted, "valid_supported": expected,
+                "functions": functions, "accepted_functions": accepted_functions,
+                "shadow_only": shadow_only, "invalid": invalid, "unsupported": unsupported,
+                "empty": empty, "decode_errors": decode_errors,
+            })
+        );
+        assert!(
+            expected > 0,
+            "catalog must contain usable supported definitions"
+        );
+        assert!(
+            rejected_valid.is_empty(),
+            "valid supported paints were rejected: {rejected_valid:?}"
+        );
+    }
+
+    fn solid_paint(color: &str) -> SevenTvPaintMeta {
+        SevenTvPaintMeta {
+            function: "linear-gradient".to_owned(),
+            stops: vec![SenderNamePaintStop {
+                at: 0.0,
+                color: color.to_owned(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn entitlement(id: &str, granted: bool) -> SevenTvLiveCosmeticUpdate {
+        SevenTvLiveCosmeticUpdate::Entitlement {
+            kind: SevenTvCosmeticKind::Paint,
+            cosmetic_id: id.to_owned(),
+            twitch_user_ids: vec!["42".to_owned()],
+            granted,
+        }
+    }
+
+    fn profile_with_paint(paint_id: Option<&str>) -> Option<SevenTvUserProfile> {
+        Some(SevenTvUserProfile {
+            style: SevenTvUserStyleRaw {
+                paint_id: paint_id.map(str::to_owned),
+                ..Default::default()
+            },
+            personal_emotes: Some(Vec::new()),
+            personal_source: None,
+        })
+    }
+
+    #[test]
+    fn entitlement_retries_canceled_initial_profiles_for_grants_and_deletes() {
+        for granted in [true, false] {
+            let index = crate::EmoteIndex::default();
+            let channel = crust_core::ChannelId::new("room");
+            index.write().unwrap().open_channel(&channel);
+            let initial = index
+                .write()
+                .unwrap()
+                .begin_personal_load("42", Some(&channel))
+                .unwrap();
+            let mut cosmetics = SevenTvCosmetics::default();
+            cosmetics.live(1, SevenTvLiveCosmeticUpdate::Connected);
+            let effects = cosmetics.live(1, entitlement("selected", granted));
+            for user_id in effects.invalidate {
+                if index.write().unwrap().invalidate_personal_lookup(&user_id) {
+                    cosmetics.retry_profile_lookup(&user_id);
+                }
+            }
+            assert!(complete_7tv_user_profile(
+                &index,
+                "42",
+                initial,
+                profile_with_paint(Some("old"))
+            )
+            .is_none());
+            assert_eq!(
+                cosmetics.refresh_candidates(8),
+                ["42"],
+                "the first profile must not be lost when its sender stays quiet"
+            );
+
+            let replacement = index
+                .write()
+                .unwrap()
+                .begin_personal_load("42", Some(&channel))
+                .unwrap();
+            let style = SevenTvUserStyleRaw {
+                color: Some(0x112233FF),
+                badge_id: Some("supporter".to_owned()),
+                paint_id: granted.then(|| "selected".to_owned()),
+                avatar_url: Some("https://example.test/avatar.webp".to_owned()),
+            };
+            let profile = SevenTvUserProfile {
+                style: style.clone(),
+                personal_emotes: Some(vec![EmoteInfo {
+                    id: "personal".to_owned(),
+                    code: "Personal".to_owned(),
+                    provider: "7tv".to_owned(),
+                    zero_width: false,
+                    url_1x: "https://example.test/personal.webp".to_owned(),
+                    url_2x: None,
+                    url_4x: None,
+                }]),
+                personal_source: None,
+            };
+            let (update, fetched_style) =
+                complete_7tv_user_profile(&index, "42", replacement, Some(profile)).unwrap();
+            assert!(update.catalog_changed);
+            cosmetics.profile("42", fetched_style.unwrap());
+            assert_eq!(cosmetics.raw["42"], style);
+            assert_eq!(
+                index
+                    .read()
+                    .unwrap()
+                    .resolve(&channel, "42", "Personal")
+                    .unwrap()
+                    .id,
+                "personal"
+            );
+            assert!(cosmetics.refresh_candidates(8).is_empty());
+        }
+    }
+
+    #[test]
+    fn entitlement_updates_without_pending_profiles_do_not_queue_lookups() {
+        let index = crate::EmoteIndex::default();
+        let mut cosmetics = SevenTvCosmetics::default();
+        cosmetics.live(1, SevenTvLiveCosmeticUpdate::Connected);
+        cosmetics.profile("42", SevenTvUserStyleRaw::default());
+        for granted in [true, true, false] {
+            let effects = cosmetics.live(1, entitlement("selected", granted));
+            for user_id in effects.invalidate {
+                if index.write().unwrap().invalidate_personal_lookup(&user_id) {
+                    cosmetics.retry_profile_lookup(&user_id);
+                }
+            }
+            assert!(cosmetics.refresh_candidates(8).is_empty());
+            assert_eq!(
+                cosmetics.raw["42"].paint_id.as_deref(),
+                granted.then_some("selected")
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_live_grants_invalidate_older_profile_generations_without_repainting() {
+        let index = crate::EmoteIndex::default();
+        let channel = crust_core::ChannelId::new("room");
+        index.write().unwrap().open_channel(&channel);
+        let mut cosmetics = SevenTvCosmetics::default();
+        cosmetics.live(1, SevenTvLiveCosmeticUpdate::Connected);
+        cosmetics.profile(
+            "42",
+            SevenTvUserStyleRaw {
+                paint_id: Some("selected".to_owned()),
+                ..Default::default()
+            },
+        );
+        let pending = index
+            .write()
+            .unwrap()
+            .begin_personal_load("42", Some(&channel))
+            .unwrap();
+        let duplicate = cosmetics.live(1, entitlement("selected", true));
+        assert!(duplicate.changed.is_empty());
+        assert_eq!(duplicate.invalidate, ["42"]);
+        for user_id in duplicate.invalidate {
+            if index.write().unwrap().invalidate_personal_lookup(&user_id) {
+                cosmetics.retry_profile_lookup(&user_id);
+            }
+        }
+        assert!(
+            complete_7tv_user_profile(&index, "42", pending, profile_with_paint(Some("old")))
+                .is_none()
+        );
+        assert_eq!(cosmetics.raw["42"].paint_id.as_deref(), Some("selected"));
+        assert_eq!(cosmetics.refresh_candidates(8), ["42"]);
+    }
+
+    #[test]
+    fn reconnect_refresh_survives_a_closed_request_owner_and_ignores_its_late_result() {
+        let index = crate::EmoteIndex::default();
+        let first_room = crust_core::ChannelId::new("first");
+        let second_room = crust_core::ChannelId::new("second");
+        {
+            let mut registry = index.write().unwrap();
+            registry.open_channel(&first_room);
+            registry.open_channel(&second_room);
+        }
+        let mut cosmetics = SevenTvCosmetics::default();
+        cosmetics.live(1, SevenTvLiveCosmeticUpdate::Connected);
+        cosmetics.profile(
+            "42",
+            SevenTvUserStyleRaw {
+                paint_id: Some("selected".to_owned()),
+                ..Default::default()
+            },
+        );
+        let reconnect = cosmetics.live(2, SevenTvLiveCosmeticUpdate::Connected);
+        for user_id in reconnect.invalidate {
+            index.write().unwrap().invalidate_personal_lookup(&user_id);
+        }
+        assert_eq!(cosmetics.refresh_candidates(8), ["42"]);
+        let old_request = index
+            .write()
+            .unwrap()
+            .begin_personal_load("42", Some(&first_room))
+            .unwrap();
+        index.write().unwrap().close_channel(&first_room);
+        assert!(complete_7tv_user_profile(
+            &index,
+            "42",
+            old_request,
+            profile_with_paint(Some("old"))
+        )
+        .is_none());
+        assert_eq!(
+            cosmetics.refresh_candidates(8),
+            ["42"],
+            "discarding a stale response cannot complete its refresh"
+        );
+        let current_request = index
+            .write()
+            .unwrap()
+            .begin_personal_load("42", Some(&second_room))
+            .unwrap();
+        let (_, style) =
+            complete_7tv_user_profile(&index, "42", current_request, profile_with_paint(None))
+                .unwrap();
+        cosmetics.profile("42", style.unwrap());
+        assert!(cosmetics.refresh_candidates(8).is_empty());
+        assert!(cosmetics.raw["42"].paint_id.is_none());
+    }
+
+    #[test]
+    fn reconnect_refreshes_recent_users_first_and_keeps_the_retry_queue_bounded() {
+        let mut cosmetics = SevenTvCosmetics::default();
+        cosmetics.live(1, SevenTvLiveCosmeticUpdate::Connected);
+        for user_id in ["oldest", "middle", "recent"] {
+            cosmetics.profile(user_id, SevenTvUserStyleRaw::default());
+        }
+        let reconnect = cosmetics.live(2, SevenTvLiveCosmeticUpdate::Connected);
+        assert_eq!(reconnect.refresh, ["recent", "middle", "oldest"]);
+        cosmetics.retry_profile_lookup("oldest");
+        cosmetics.retry_profile_lookup("recent");
+        assert_eq!(cosmetics.refresh_candidates(2), ["recent", "middle"]);
+        assert_eq!(cosmetics.refresh_candidates(2), ["oldest", "recent"]);
+        cosmetics.profile("recent", SevenTvUserStyleRaw::default());
+        assert_eq!(cosmetics.refresh_candidates(8), ["middle", "oldest"]);
+        cosmetics.live(
+            2,
+            SevenTvLiveCosmeticUpdate::RefreshUsers {
+                twitch_user_ids: (0..MAX_CACHED_COSMETIC_USERS + 5)
+                    .map(|index| index.to_string())
+                    .collect(),
+            },
+        );
+        assert_eq!(cosmetics.refresh_users.len(), MAX_CACHED_COSMETIC_USERS);
+        assert_eq!(cosmetics.refresh_order.len(), MAX_CACHED_COSMETIC_USERS);
+        assert_eq!(cosmetics.refresh_candidates(2), ["0", "1"]);
+        cosmetics.forget("0");
+        assert!(!cosmetics.refresh_users.contains("0"));
+        assert_eq!(cosmetics.refresh_order.len(), MAX_CACHED_COSMETIC_USERS - 1);
+    }
+
+    #[test]
+    fn late_paint_objects_resolve_assignments_and_survive_older_catalogs() {
+        let mut cosmetics = SevenTvCosmetics::default();
+        cosmetics.live(1, SevenTvLiveCosmeticUpdate::Connected);
+        let assigned = cosmetics.live(1, entitlement("selected", true));
+        assert_eq!(assigned.invalidate, ["42"]);
+        assert!(cosmetics.resolved("42").unwrap().name_paint.is_none());
+        let arrived = cosmetics.live(
+            1,
+            SevenTvLiveCosmeticUpdate::Paint {
+                id: "selected".to_owned(),
+                paint: solid_paint("#123456"),
+            },
+        );
+        assert_eq!(arrived.changed.len(), 1);
+        assert_eq!(
+            arrived.changed[0].1.name_paint.as_ref().unwrap().stops[0].color,
+            "#123456"
+        );
+        assert!(cosmetics
+            .catalog(
+                HashMap::new(),
+                HashMap::from([("selected".to_owned(), solid_paint("#FFFFFF")),])
+            )
+            .is_empty());
+        assert_eq!(
+            cosmetics
+                .resolved("42")
+                .unwrap()
+                .name_paint
+                .as_ref()
+                .unwrap()
+                .stops[0]
+                .color,
+            "#123456"
+        );
+    }
+
+    #[test]
+    fn entitlement_removal_only_clears_the_matching_selection() {
+        let mut cosmetics = SevenTvCosmetics::default();
+        cosmetics.live(1, SevenTvLiveCosmeticUpdate::Connected);
+        cosmetics.catalog(
+            HashMap::new(),
+            HashMap::from([
+                ("old".to_owned(), solid_paint("#FFFFFF")),
+                ("current".to_owned(), solid_paint("#123456")),
+            ]),
+        );
+        cosmetics.live(1, entitlement("old", true));
+        cosmetics.live(1, entitlement("current", true));
+        let stale = cosmetics.live(1, entitlement("old", false));
+        assert!(stale.changed.is_empty());
+        assert!(stale.invalidate.is_empty());
+        assert_eq!(cosmetics.raw["42"].paint_id.as_deref(), Some("current"));
+        let removed = cosmetics.live(1, entitlement("current", false));
+        assert_eq!(removed.invalidate, ["42"]);
+        assert!(removed.changed[0].1.name_paint.is_none());
+    }
+
+    #[test]
+    fn reconnect_refreshes_cached_users_and_rejects_older_socket_updates() {
+        let mut cosmetics = SevenTvCosmetics::default();
+        cosmetics.live(1, SevenTvLiveCosmeticUpdate::Connected);
+        cosmetics.live(1, entitlement("current", true));
+        let reconnect = cosmetics.live(2, SevenTvLiveCosmeticUpdate::Connected);
+        assert_eq!(reconnect.refresh, ["42"]);
+        assert_eq!(reconnect.invalidate, ["42"]);
+        assert!(cosmetics
+            .live(1, entitlement("stale", true))
+            .changed
+            .is_empty());
+        assert_eq!(cosmetics.raw["42"].paint_id.as_deref(), Some("current"));
+        assert!(cosmetics
+            .live(2, SevenTvLiveCosmeticUpdate::Connected)
+            .refresh
+            .is_empty());
+    }
+
+    #[test]
+    fn live_user_cache_keeps_a_bounded_recent_history() {
+        let mut cosmetics = SevenTvCosmetics::default();
+        cosmetics.live(1, SevenTvLiveCosmeticUpdate::Connected);
+        for index in 0..MAX_CACHED_COSMETIC_USERS + 5 {
+            cosmetics.profile(&index.to_string(), SevenTvUserStyleRaw::default());
+        }
+        assert_eq!(cosmetics.raw.len(), MAX_CACHED_COSMETIC_USERS);
+        assert_eq!(cosmetics.resolved.len(), MAX_CACHED_COSMETIC_USERS);
+        assert_eq!(cosmetics.user_order.len(), MAX_CACHED_COSMETIC_USERS);
+        assert!(cosmetics.resolved("0").is_none());
+        cosmetics.forget("5");
+        assert!(cosmetics.resolved("5").is_none());
+        assert_eq!(cosmetics.user_order.len(), MAX_CACHED_COSMETIC_USERS - 1);
     }
 }
