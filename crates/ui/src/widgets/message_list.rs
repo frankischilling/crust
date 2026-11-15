@@ -2554,7 +2554,7 @@ impl<'a> MessageList<'a> {
                                         RichText::new(format!("✂ {}", deleted_text))
                                             .strikethrough()
                                             .italics()
-                                            .color(t::text_muted()),
+                                            .color(t::text_secondary()),
                                     )
                                     .wrap(),
                                 );
@@ -2990,257 +2990,16 @@ impl<'a> MessageList<'a> {
     }
 
     fn render_spans(&self, ui: &mut Ui, msg: &ChatMessage, reply_key: Id) {
-        for item in crust_core::format::display_spans(&msg.spans) {
-            match item {
-                crust_core::format::DisplaySpan::Single(span) => {
-                    self.render_span(ui, span, msg.flags.is_action, msg, reply_key);
-                }
-                crust_core::format::DisplaySpan::EmoteLayers(layers) => {
-                    show_emote_layers(ui, layers, self.emote_bytes, EMOTE_SIZE, self.animate_emotes)
-                        .context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
-                }
-            }
+        MessageBody {
+            emote_bytes: self.emote_bytes,
+            cmd_tx: self.cmd_tx,
+            link_previews: self.link_previews,
+            animate_emotes: self.animate_emotes,
+            hide_link_previews: self.hide_link_previews,
         }
-    }
-
-    fn render_span(
-        &self,
-        ui: &mut Ui,
-        span: &Span,
-        is_action: bool,
-        msg: &ChatMessage,
-        reply_key: Id,
-    ) {
-        let action_color = t::text_secondary();
-        match span {
-            Span::Text { text, .. } => {
-                let cleaned = strip_invisible_chars(text);
-                if cleaned.is_empty() {
-                    return;
-                }
-                let rt = if is_action {
-                    RichText::new(&*cleaned).italics().color(action_color)
-                } else {
-                    RichText::new(&*cleaned)
-                };
-                let resp = ui.add(Label::new(rt).wrap().selectable(true));
-                resp.context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
-            }
-            Span::Emote {
-                url,
-                url_hd,
-                code,
-                provider,
-                ..
-            } => {
-                if let Some(&(w, h, ref raw)) = self.emote_bytes.get(url.as_str()) {
-                    let size = fit_size(w, h, EMOTE_SIZE);
-                    let url_key = super::bytes_uri(url, raw);
-
-                    // Capture shared references - string/Arc clones only
-                    // happen when the tooltip is actually shown (on hover).
-                    let emote_bytes = self.emote_bytes;
-
-                    self.show_image(ui, &url_key, raw, size, Some(url.as_str()))
-                        .on_hover_ui_at_pointer(|ui| {
-                            // Check HD availability at hover time, not every frame.
-                            let hd_entry = url_hd.as_deref().and_then(|u| emote_bytes.get(u));
-
-                            let (tt_url, tt_key, tt_raw, tt_w, tt_h) = match hd_entry {
-                                Some(&(hw, hh, ref href)) => (
-                                    url_hd.as_deref().unwrap(),
-                                    super::bytes_uri(url_hd.as_deref().unwrap(), href),
-                                    href.clone(),
-                                    hw,
-                                    hh,
-                                ),
-                                None => (url.as_str(), url_key.clone(), raw.clone(), w, h),
-                            };
-                            let tt_size = fit_size(tt_w, tt_h, TOOLTIP_EMOTE_SIZE);
-
-                            ui.set_max_width(280.0);
-                            ui.vertical_centered(|ui| {
-                                self.show_image(ui, &tt_key, &tt_raw, tt_size, Some(tt_url));
-                                ui.add_space(4.0);
-                                ui.label(RichText::new(code.as_str()).strong());
-                                ui.label(
-                                    RichText::new(provider_label(provider))
-                                        .small()
-                                        .color(t::text_secondary()),
-                                );
-                            });
-                        })
-                        .context_menu(|ui| {
-                            self.show_message_context_menu(ui, msg, reply_key);
-                        });
-                } else {
-                    // Image not yet loaded - show text code as placeholder
-                    ui.add(Label::new(
-                        RichText::new(code)
-                            .italics()
-                            .font(t::small())
-                            .color(t::green()),
-                    ));
-                }
-            }
-            Span::Emoji { text, url } => {
-                if let Some(&(w, h, ref raw)) = self.emote_bytes.get(url.as_str()) {
-                    let size = fit_size(w, h, EMOTE_SIZE);
-                    let tooltip_size = fit_size(w, h, TOOLTIP_EMOTE_SIZE);
-                    let url_key = super::bytes_uri(url, raw);
-                    self.show_image(ui, &url_key, raw, size, Some(url.as_str()))
-                        .on_hover_ui_at_pointer(|ui| {
-                            ui.set_max_width(200.0);
-                            ui.vertical_centered(|ui| {
-                                self.show_image(ui, &url_key, raw, tooltip_size, Some(url.as_str()));
-                                ui.add_space(4.0);
-                                ui.label(RichText::new(text.as_str()).strong());
-                                ui.label(
-                                    RichText::new("Twemoji").small().color(t::text_secondary()),
-                                );
-                            });
-                        })
-                        .context_menu(|ui| {
-                            self.show_message_context_menu(ui, msg, reply_key);
-                        });
-                } else {
-                    ui.add(Label::new(RichText::new(text)));
-                }
-            }
-            Span::Mention { login } => {
-                let resp = ui.add(
-                    Label::new(
-                        RichText::new(format!("@{login}"))
-                            .color(t::mention())
-                            .strong(),
-                    )
-                    .selectable(true),
-                );
-                resp.context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
-            }
-            Span::Url { text, url } => {
-                let cmd_tx = self.cmd_tx;
-                let link_previews = self.link_previews;
-                let emote_bytes = self.emote_bytes;
-
-                // Render as a clickable hyperlink-style label.
-                let resp = ui.add(
-                    Label::new(RichText::new(text).color(t::link()).underline())
-                        .selectable(false)
-                        .sense(egui::Sense::click()),
-                );
-                if resp.clicked() {
-                    let _ = cmd_tx.try_send(AppCommand::OpenUrl { url: url.clone() });
-                }
-                resp.context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
-                if self.hide_link_previews {
-                    return;
-                }
-                resp.on_hover_ui(|ui| {
-                    // Fire preview fetch on first hover (idempotent in reducer).
-                    let preview = link_previews.get(url.as_str());
-                    if preview.map(|p| p.fetched).unwrap_or(false) == false {
-                        let _ = cmd_tx.try_send(AppCommand::FetchLinkPreview { url: url.clone() });
-                    }
-
-                    ui.set_max_width(320.0);
-                    ui.vertical(|ui| {
-                        match preview {
-                            None => {
-                                // Not yet fetched - show hostname + spinner.
-                                let host = url_hostname(url);
-                                ui.label(RichText::new(host).small().color(t::link()));
-                                ui.label(
-                                    RichText::new("Loading preview...")
-                                        .small()
-                                        .italics()
-                                        .color(t::text_secondary()),
-                                );
-                            }
-                            Some(p) => {
-                                // Site name badge (YouTube, Twitter, etc.)
-                                if let Some(ref sn) = p.site_name {
-                                    let (badge_bg, badge_fg) = site_badge_colors(sn);
-                                    egui::Frame::new()
-                                        .fill(badge_bg)
-                                        .corner_radius(egui::CornerRadius::same(3))
-                                        .inner_margin(egui::Margin::symmetric(5, 1))
-                                        .show(ui, |ui| {
-                                            ui.label(
-                                                RichText::new(sn).small().strong().color(badge_fg),
-                                            );
-                                        });
-                                    ui.add_space(3.0);
-                                }
-                                // Thumbnail
-                                if let Some(ref thumb) = p.thumbnail_url {
-                                    if let Some(&(w, h, ref raw)) = emote_bytes.get(thumb.as_str())
-                                    {
-                                        let scale = (170.0_f32 / h as f32).min(300.0 / w as f32);
-                                        let size = Vec2::new(w as f32 * scale, h as f32 * scale);
-                                        let key = super::bytes_uri(thumb, raw);
-                                        egui::Frame::new()
-                                            .corner_radius(egui::CornerRadius::same(4))
-                                            .show(ui, |ui| {
-                                                self.show_image(
-                                                    ui,
-                                                    &key,
-                                                    raw,
-                                                    size,
-                                                    Some(thumb.as_str()),
-                                                );
-                                            });
-                                        ui.add_space(4.0);
-                                    }
-                                }
-                                // Title
-                                if let Some(ref title) = p.title {
-                                    ui.add(Label::new(RichText::new(title).strong()).wrap());
-                                }
-                                // Description
-                                if let Some(ref d) = p.description {
-                                    let snippet = if d.chars().count() > 260 {
-                                        let cut = d
-                                            .char_indices()
-                                            .nth(260)
-                                            .map(|(i, _)| i)
-                                            .unwrap_or(d.len());
-                                        format!("{}\u{2026}", &d[..cut])
-                                    } else {
-                                        d.clone()
-                                    };
-                                    ui.add(
-                                        Label::new(
-                                            RichText::new(snippet).small().color(t::text_muted()),
-                                        )
-                                        .wrap(),
-                                    );
-                                }
-                                if p.title.is_none()
-                                    && p.description.is_none()
-                                    && p.thumbnail_url.is_none()
-                                {
-                                    ui.label(
-                                        RichText::new("No preview available")
-                                            .small()
-                                            .italics()
-                                            .color(t::text_secondary()),
-                                    );
-                                }
-                                // Domain footer
-                                let host = url_hostname(url);
-                                ui.add_space(2.0);
-                                ui.label(RichText::new(host).small().color(t::text_muted()));
-                            }
-                        }
-                    });
-                });
-            }
-            Span::Badge { name, .. } => {
-                let tooltip = pretty_badge_name(name, "1");
-                render_badge_fallback(ui, name, "1", &tooltip);
-            }
-        }
+        .show(ui, msg, &mut |ui| {
+            self.show_message_context_menu(ui, msg, reply_key)
+        });
     }
 
     fn render_suspicious_user_message(
@@ -3460,7 +3219,7 @@ impl<'a> MessageList<'a> {
                                         RichText::new(format!("✂ {}", msg.raw_text))
                                             .strikethrough()
                                             .italics()
-                                            .color(t::text_muted()),
+                                            .color(t::text_secondary()),
                                     )
                                     .wrap(),
                                 );
@@ -3505,29 +3264,396 @@ impl<'a> MessageList<'a> {
         size: Vec2,
         url_hint: Option<&str>,
     ) -> egui::Response {
-        let cache_key = url_hint.unwrap_or(uri);
-        if !self.animate_emotes && is_animation_format(raw) {
-            if let Some(tex) = self.emote_bytes.static_texture(ui.ctx(), cache_key) {
-                let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
-                ui.painter().image(
-                    tex.id(),
-                    rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    t::text_on_accent(),
-                );
-                return resp;
-            }
-            return show_image_placeholder(ui, size);
-        }
-
-        // Image schedules the next real frame from the loader's FrameDurations.
-        // A still WebP has no frame deadline and can stay idle.
-        ui.add(
-            egui::Image::from_bytes(uri.to_owned(), egui::load::Bytes::Shared(raw.clone()))
-                .sense(egui::Sense::click())
-                .fit_to_exact_size(size),
+        show_message_image(
+            ui,
+            uri,
+            raw,
+            size,
+            url_hint,
+            self.emote_bytes,
+            self.animate_emotes,
         )
     }
+}
+
+/// Shared body rendering for channel chat and cross-channel history views.
+#[derive(Clone, Copy)]
+pub(crate) struct MessageBody<'a> {
+    pub emote_bytes: &'a UiImageCache,
+    pub cmd_tx: &'a UiCommandSender,
+    pub link_previews: &'a HashMap<String, LinkPreview>,
+    pub animate_emotes: bool,
+    pub hide_link_previews: bool,
+}
+
+impl MessageBody<'_> {
+    pub(crate) fn show(
+        &self,
+        ui: &mut Ui,
+        msg: &ChatMessage,
+        context_menu: &mut dyn FnMut(&mut Ui),
+    ) -> bool {
+        if msg.flags.is_deleted || msg.spans.is_empty() {
+            let text = if msg.raw_text.trim().is_empty() {
+                "(no text)"
+            } else {
+                &msg.raw_text
+            };
+            let rich = if msg.flags.is_deleted {
+                RichText::new(format!("✂ {text}"))
+                    .strikethrough()
+                    .italics()
+                    .color(t::text_secondary())
+            } else if msg.flags.is_action {
+                RichText::new(text).italics().color(t::text_secondary())
+            } else {
+                RichText::new(text)
+            };
+            let response = ui.add(Label::new(rich).wrap().selectable(true));
+            response.context_menu(context_menu);
+            return response.clicked();
+        }
+        let mut clicked = false;
+        for item in crust_core::format::display_spans(&msg.spans) {
+            match item {
+                crust_core::format::DisplaySpan::Single(span) => {
+                    clicked |= self.render_span(ui, span, msg.flags.is_action, context_menu);
+                }
+                crust_core::format::DisplaySpan::EmoteLayers(layers) => {
+                    let response = show_emote_layers(
+                        ui,
+                        layers,
+                        self.emote_bytes,
+                        EMOTE_SIZE,
+                        self.animate_emotes,
+                    );
+                    clicked |= response.clicked();
+                    response.context_menu(&mut *context_menu);
+                }
+            }
+        }
+        clicked
+    }
+
+    fn render_span(
+        &self,
+        ui: &mut Ui,
+        span: &Span,
+        is_action: bool,
+        context_menu: &mut dyn FnMut(&mut Ui),
+    ) -> bool {
+        let mut clicked = false;
+        let action_color = t::text_secondary();
+        match span {
+            Span::Text { text, .. } => {
+                let cleaned = strip_invisible_chars(text);
+                if cleaned.is_empty() {
+                    return false;
+                }
+                let rt = if is_action {
+                    RichText::new(&*cleaned).italics().color(action_color)
+                } else {
+                    RichText::new(&*cleaned)
+                };
+                let resp = ui.add(Label::new(rt).wrap().selectable(true));
+                clicked = resp.clicked();
+                resp.context_menu(&mut *context_menu);
+            }
+            Span::Emote {
+                url,
+                url_hd,
+                code,
+                provider,
+                ..
+            } => {
+                if let Some(&(w, h, ref raw)) = self.emote_bytes.peek(url.as_str()) {
+                    let size = fit_size(w, h, EMOTE_SIZE);
+                    let url_key = super::bytes_uri(url, raw);
+
+                    // Capture shared references - string/Arc clones only
+                    // happen when the tooltip is actually shown (on hover).
+                    let emote_bytes = self.emote_bytes;
+
+                    let response = self
+                        .show_image(ui, &url_key, raw, size, Some(url.as_str()))
+                        .on_hover_ui_at_pointer(|ui| {
+                            // Check HD availability at hover time, not every frame.
+                            let hd_entry = url_hd.as_deref().and_then(|u| emote_bytes.get(u));
+
+                            let (tt_url, tt_key, tt_raw, tt_w, tt_h) = match hd_entry {
+                                Some(&(hw, hh, ref href)) => (
+                                    url_hd.as_deref().unwrap(),
+                                    super::bytes_uri(url_hd.as_deref().unwrap(), href),
+                                    href.clone(),
+                                    hw,
+                                    hh,
+                                ),
+                                None => (url.as_str(), url_key.clone(), raw.clone(), w, h),
+                            };
+                            let tt_size = fit_size(tt_w, tt_h, TOOLTIP_EMOTE_SIZE);
+
+                            ui.set_max_width(280.0);
+                            ui.vertical_centered(|ui| {
+                                self.show_image(ui, &tt_key, &tt_raw, tt_size, Some(tt_url));
+                                ui.add_space(4.0);
+                                ui.label(RichText::new(code.as_str()).strong());
+                                ui.label(
+                                    RichText::new(provider_label(provider))
+                                        .small()
+                                        .color(t::text_secondary()),
+                                );
+                            });
+                        });
+                    clicked = response.clicked();
+                    response.context_menu(&mut *context_menu);
+                } else {
+                    // Image not yet loaded - show text code as placeholder
+                    let response = ui.add(
+                        Label::new(
+                            RichText::new(code)
+                                .italics()
+                                .font(t::small())
+                                .color(t::green()),
+                        )
+                        .selectable(true),
+                    );
+                    if ui.is_rect_visible(response.rect) {
+                        self.emote_bytes.get(url);
+                    }
+                    clicked = response.clicked();
+                    response.context_menu(&mut *context_menu);
+                }
+            }
+            Span::Emoji { text, url } => {
+                if let Some(&(w, h, ref raw)) = self.emote_bytes.peek(url.as_str()) {
+                    let size = fit_size(w, h, EMOTE_SIZE);
+                    let tooltip_size = fit_size(w, h, TOOLTIP_EMOTE_SIZE);
+                    let url_key = super::bytes_uri(url, raw);
+                    let response = self
+                        .show_image(ui, &url_key, raw, size, Some(url.as_str()))
+                        .on_hover_ui_at_pointer(|ui| {
+                            ui.set_max_width(200.0);
+                            ui.vertical_centered(|ui| {
+                                self.show_image(
+                                    ui,
+                                    &url_key,
+                                    raw,
+                                    tooltip_size,
+                                    Some(url.as_str()),
+                                );
+                                ui.add_space(4.0);
+                                ui.label(RichText::new(text.as_str()).strong());
+                                ui.label(
+                                    RichText::new("Twemoji").small().color(t::text_secondary()),
+                                );
+                            });
+                        });
+                    clicked = response.clicked();
+                    response.context_menu(&mut *context_menu);
+                } else {
+                    let response = ui.add(Label::new(RichText::new(text)).selectable(true));
+                    if ui.is_rect_visible(response.rect) {
+                        self.emote_bytes.get(url);
+                    }
+                    clicked = response.clicked();
+                    response.context_menu(&mut *context_menu);
+                }
+            }
+            Span::Mention { login } => {
+                let resp = ui.add(
+                    Label::new(
+                        RichText::new(format!("@{login}"))
+                            .color(t::mention())
+                            .strong(),
+                    )
+                    .selectable(true),
+                );
+                clicked = resp.clicked();
+                resp.context_menu(&mut *context_menu);
+            }
+            Span::Url { text, url } => {
+                let cmd_tx = self.cmd_tx;
+                let link_previews = self.link_previews;
+                let emote_bytes = self.emote_bytes;
+
+                // Render as a clickable hyperlink-style label.
+                let resp = ui.add(
+                    Label::new(RichText::new(text).color(t::link()).underline())
+                        .selectable(false)
+                        .sense(egui::Sense::click()),
+                );
+                if resp.clicked() {
+                    let _ = cmd_tx.try_send(AppCommand::OpenUrl { url: url.clone() });
+                }
+                resp.context_menu(&mut *context_menu);
+                if self.hide_link_previews {
+                    return false;
+                }
+                resp.on_hover_ui(|ui| {
+                    // Fire preview fetch on first hover (idempotent in reducer).
+                    let preview = link_previews.get(url.as_str());
+                    if preview.map(|p| p.fetched).unwrap_or(false) == false {
+                        let _ = cmd_tx.try_send(AppCommand::FetchLinkPreview { url: url.clone() });
+                    }
+
+                    ui.set_max_width(320.0);
+                    ui.vertical(|ui| {
+                        match preview {
+                            None => {
+                                // Not yet fetched - show hostname + spinner.
+                                let host = url_hostname(url);
+                                ui.label(RichText::new(host).small().color(t::link()));
+                                ui.label(
+                                    RichText::new("Loading preview...")
+                                        .small()
+                                        .italics()
+                                        .color(t::text_secondary()),
+                                );
+                            }
+                            Some(p) => {
+                                // Site name badge (YouTube, Twitter, etc.)
+                                if let Some(ref sn) = p.site_name {
+                                    let (badge_bg, badge_fg) = site_badge_colors(sn);
+                                    egui::Frame::new()
+                                        .fill(badge_bg)
+                                        .corner_radius(egui::CornerRadius::same(3))
+                                        .inner_margin(egui::Margin::symmetric(5, 1))
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                RichText::new(sn).small().strong().color(badge_fg),
+                                            );
+                                        });
+                                    ui.add_space(3.0);
+                                }
+                                // Thumbnail
+                                if let Some(ref thumb) = p.thumbnail_url {
+                                    if let Some(&(w, h, ref raw)) = emote_bytes.get(thumb.as_str())
+                                    {
+                                        let scale = (170.0_f32 / h as f32).min(300.0 / w as f32);
+                                        let size = Vec2::new(w as f32 * scale, h as f32 * scale);
+                                        let key = super::bytes_uri(thumb, raw);
+                                        egui::Frame::new()
+                                            .corner_radius(egui::CornerRadius::same(4))
+                                            .show(ui, |ui| {
+                                                self.show_image(
+                                                    ui,
+                                                    &key,
+                                                    raw,
+                                                    size,
+                                                    Some(thumb.as_str()),
+                                                );
+                                            });
+                                        ui.add_space(4.0);
+                                    }
+                                }
+                                // Title
+                                if let Some(ref title) = p.title {
+                                    ui.add(Label::new(RichText::new(title).strong()).wrap());
+                                }
+                                // Description
+                                if let Some(ref d) = p.description {
+                                    let snippet = if d.chars().count() > 260 {
+                                        let cut = d
+                                            .char_indices()
+                                            .nth(260)
+                                            .map(|(i, _)| i)
+                                            .unwrap_or(d.len());
+                                        format!("{}\u{2026}", &d[..cut])
+                                    } else {
+                                        d.clone()
+                                    };
+                                    ui.add(
+                                        Label::new(
+                                            RichText::new(snippet).small().color(t::text_muted()),
+                                        )
+                                        .wrap(),
+                                    );
+                                }
+                                if p.title.is_none()
+                                    && p.description.is_none()
+                                    && p.thumbnail_url.is_none()
+                                {
+                                    ui.label(
+                                        RichText::new("No preview available")
+                                            .small()
+                                            .italics()
+                                            .color(t::text_secondary()),
+                                    );
+                                }
+                                // Domain footer
+                                let host = url_hostname(url);
+                                ui.add_space(2.0);
+                                ui.label(RichText::new(host).small().color(t::text_muted()));
+                            }
+                        }
+                    });
+                });
+            }
+            Span::Badge { name, .. } => {
+                let tooltip = pretty_badge_name(name, "1");
+                render_badge_fallback(ui, name, "1", &tooltip);
+            }
+        }
+        clicked
+    }
+
+    fn show_image(
+        &self,
+        ui: &mut Ui,
+        uri: &str,
+        raw: &Arc<[u8]>,
+        size: Vec2,
+        url_hint: Option<&str>,
+    ) -> egui::Response {
+        show_message_image(
+            ui,
+            uri,
+            raw,
+            size,
+            url_hint,
+            self.emote_bytes,
+            self.animate_emotes,
+        )
+    }
+}
+
+fn show_message_image(
+    ui: &mut Ui,
+    uri: &str,
+    raw: &Arc<[u8]>,
+    size: Vec2,
+    url_hint: Option<&str>,
+    images: &UiImageCache,
+    animate: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    response.widget_info(|| egui::WidgetInfo::new(egui::WidgetType::Image));
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let cache_key = url_hint.unwrap_or(uri);
+    images.get(cache_key);
+    if !animate && is_animation_format(raw) {
+        if let Some(tex) = images.static_texture(ui.ctx(), cache_key) {
+            ui.painter().image(
+                tex.id(),
+                rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                t::text_on_accent(),
+            );
+            return response;
+        }
+        ui.painter()
+            .rect_filled(rect, 2.0, t::alpha(t::text_muted(), 28));
+        return response;
+    }
+
+    // Image schedules the next real frame from the loader's FrameDurations.
+    // A still WebP has no frame deadline and can stay idle.
+    egui::Image::from_bytes(uri.to_owned(), egui::load::Bytes::Shared(raw.clone()))
+        .fit_to_exact_size(size)
+        .paint_at(ui, rect);
+    response
 }
 
 pub(crate) fn format_message_timestamp(
@@ -3751,20 +3877,36 @@ fn layer_image<'a>(
     images: &'a UiImageCache,
     preview: bool,
 ) -> Option<(&'a str, &'a crate::image_cache::ImageBytes)> {
-    let Span::Emote { url, url_hd, .. } = span else { return None; };
+    let Span::Emote { url, url_hd, .. } = span else {
+        return None;
+    };
     if preview {
         if let Some(hd) = url_hd.as_deref() {
-            if let Some(image) = images.get(hd) {
+            if let Some(image) = images.peek(hd) {
                 return Some((hd, image));
             }
         }
     }
-    images.get(url).map(|image| (url.as_str(), image))
+    images.peek(url).map(|image| (url.as_str(), image))
+}
+
+fn request_emote_layers(layers: &[Span], images: &UiImageCache, preview: bool) {
+    for span in layers {
+        if let Span::Emote { url, url_hd, .. } = span {
+            images.get(url);
+            if preview {
+                if let Some(url) = url_hd {
+                    images.get(url);
+                }
+            }
+        }
+    }
 }
 
 fn layer_rect(bounds: egui::Rect, size: Vec2) -> egui::Rect {
     egui::Rect::from_min_size(
-        egui::pos2(bounds.center().x - size.x / 2.0, bounds.bottom() - size.y), size,
+        egui::pos2(bounds.center().x - size.x / 2.0, bounds.bottom() - size.y),
+        size,
     )
 }
 
@@ -3782,29 +3924,60 @@ fn paint_emote_layers(
             size = size.max(fit_size(*w, *h, target_height));
         }
     }
-    // Keep all codes readable until the base arrives. Looking up every layer above
-    // still queues their downloads through the bounded image cache.
-    if layers.first().and_then(|span| layer_image(span, images, preview)).is_none() {
-        let text: String = layers.iter().map(|span| match span {
-            Span::Emote { code, .. } => code.as_str(),
-            Span::Text { text, .. } => text.as_str(),
-            _ => "",
-        }).collect();
-        return ui.add(Label::new(RichText::new(text).italics().font(t::small()).color(t::green()))
-            .selectable(true));
+    // Measuring offscreen rows must not request or decode their images.
+    if layers
+        .first()
+        .and_then(|span| layer_image(span, images, preview))
+        .is_none()
+    {
+        let text: String = layers
+            .iter()
+            .map(|span| match span {
+                Span::Emote { code, .. } => code.as_str(),
+                Span::Text { text, .. } => text.as_str(),
+                _ => "",
+            })
+            .collect();
+        let response = ui.add(
+            Label::new(
+                RichText::new(text)
+                    .italics()
+                    .font(t::small())
+                    .color(t::green()),
+            )
+            .selectable(true),
+        );
+        if ui.is_rect_visible(response.rect) {
+            request_emote_layers(layers, images, preview);
+        }
+        return response;
     }
     let (bounds, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    if !ui.is_rect_visible(bounds) {
+        return response;
+    }
+    request_emote_layers(layers, images, preview);
     for span in layers {
-        let Some((url, (w, h, raw))) = layer_image(span, images, preview) else { continue; };
+        let Some((url, (w, h, raw))) = layer_image(span, images, preview) else {
+            continue;
+        };
         let rect = layer_rect(bounds, fit_size(*w, *h, target_height));
         if !animate && is_animation_format(raw) {
             if let Some(texture) = images.static_texture(ui.ctx(), url) {
-                ui.painter().image(texture.id(), rect,
-                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), Color32::WHITE);
+                ui.painter().image(
+                    texture.id(),
+                    rect,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
             }
         } else {
-            egui::Image::from_bytes(super::bytes_uri(url, raw), egui::load::Bytes::Shared(raw.clone()))
-                .fit_to_exact_size(rect.size()).paint_at(ui, rect);
+            egui::Image::from_bytes(
+                super::bytes_uri(url, raw),
+                egui::load::Bytes::Shared(raw.clone()),
+            )
+            .fit_to_exact_size(rect.size())
+            .paint_at(ui, rect);
         }
     }
     response
@@ -3822,13 +3995,6 @@ fn fit_size(w: u32, h: u32, target_h: f32) -> Vec2 {
 pub(crate) fn is_animation_format(raw: &[u8]) -> bool {
     raw.starts_with(b"GIF87a") || raw.starts_with(b"GIF89a")
         || (raw.len() >= 12 && raw.starts_with(b"RIFF") && &raw[8..12] == b"WEBP")
-}
-
-fn show_image_placeholder(ui: &mut Ui, size: Vec2) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
-    ui.painter()
-        .rect_filled(rect, egui::CornerRadius::same(3), Color32::from_gray(80));
-    resp
 }
 
 fn crust_seeded_username_color(seed: &str) -> Option<Color32> {

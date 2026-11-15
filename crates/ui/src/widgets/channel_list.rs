@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use egui::{Color32, Id, RichText, ScrollArea, Ui};
 
 use crate::theme as t;
+use crate::widgets::chrome::{self, ChromeIcon, IconButtonState};
 use crust_core::model::{ChannelId, ChannelState};
 use crust_core::state::TabVisibilityRule;
 
@@ -64,6 +65,212 @@ struct DragState {
     outside_sidebar: bool,
 }
 
+const ROW_PAD_X: f32 = 8.0;
+const ROW_PAD_Y: f32 = 5.0;
+const ROW_CONTENT_GAP: f32 = 4.0;
+
+struct SidebarRowStyle {
+    name: egui::FontId,
+    secondary: egui::FontId,
+    count: egui::FontId,
+    pin: egui::FontId,
+    close_size: f32,
+}
+
+impl SidebarRowStyle {
+    fn current() -> Self {
+        Self {
+            name: t::body(),
+            secondary: t::small(),
+            count: t::tiny(),
+            pin: t::tabs_font(),
+            close_size: t::icon_btn_sm(),
+        }
+    }
+
+    fn row_height(&self, ui: &Ui, show_close: bool) -> f32 {
+        let text_height = ui.fonts(|fonts| {
+            [&self.name, &self.secondary, &self.pin]
+                .into_iter()
+                .map(|font| fonts.row_height(font))
+                .fold(0.0_f32, f32::max)
+                .max(fonts.row_height(&self.count) + 4.0)
+        });
+        let content_height = text_height.max(if show_close { self.close_size } else { 0.0 });
+        (content_height + ROW_PAD_Y * 2.0).max(28.0)
+    }
+}
+
+fn paint_row_text(ui: &Ui, rect: egui::Rect, text: &str, font: egui::FontId, color: Color32) {
+    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return;
+    }
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
+    job.wrap.max_width = rect.width();
+    job.wrap.max_rows = 1;
+    let galley = ui.fonts(|fonts| fonts.layout_job(job));
+    let pos = egui::pos2(rect.left(), rect.center().y - galley.size().y * 0.5);
+    ui.painter()
+        .with_clip_rect(rect.intersect(ui.clip_rect()))
+        .galley(pos, galley, color);
+}
+
+/// Draw the count at the right edge and return the remaining text boundary.
+fn paint_row_count(
+    ui: &Ui,
+    rect: egui::Rect,
+    text: &str,
+    font: egui::FontId,
+    mention: bool,
+    color: Color32,
+) -> f32 {
+    let text_size = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font.clone(), color)
+        .size();
+    let padding = if mention {
+        egui::vec2(5.0, 2.0)
+    } else {
+        egui::Vec2::ZERO
+    };
+    let size = (text_size + padding * 2.0).min(rect.size().max(egui::Vec2::ZERO));
+    let badge = egui::Rect::from_center_size(
+        egui::pos2(rect.right() - size.x * 0.5, rect.center().y),
+        size,
+    );
+    if mention {
+        ui.painter()
+            .with_clip_rect(rect.intersect(ui.clip_rect()))
+            .rect_filled(badge, t::RADIUS_SM, t::mention_pill_bg());
+    }
+    paint_row_text(ui, badge.shrink2(padding), text, font, color);
+    (badge.left() - ROW_CONTENT_GAP).max(rect.left())
+}
+
+#[derive(Clone, Copy)]
+enum PinKind {
+    Live,
+    Mentions,
+}
+
+impl PinKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Live => "Live",
+            Self::Mentions => "Mentions",
+        }
+    }
+
+    fn id(self) -> Id {
+        Id::new(match self {
+            Self::Live => "live_feed_pin_row",
+            Self::Mentions => "mentions_pin_row",
+        })
+    }
+}
+
+fn pinned_row(
+    ui: &mut Ui,
+    kind: PinKind,
+    active: bool,
+    count: Option<(String, bool)>,
+    row_h: f32,
+    style: &SidebarRowStyle,
+) -> egui::Response {
+    let row_rect = egui::Rect::from_min_size(
+        ui.available_rect_before_wrap().min,
+        egui::vec2(ui.available_width(), row_h),
+    );
+    let response = ui.interact(row_rect, kind.id(), egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            active,
+            kind.label(),
+        )
+    });
+    if active || response.hovered() || response.has_focus() {
+        ui.painter().rect_filled(
+            row_rect,
+            t::RADIUS_SM,
+            if active {
+                t::active_channel_bg()
+            } else {
+                t::hover_row_bg()
+            },
+        );
+    }
+    let icon_width = ui
+        .painter()
+        .layout_no_wrap("@".to_owned(), style.pin.clone(), t::accent())
+        .size()
+        .x
+        .max(12.0);
+    let icon_rect = egui::Rect::from_min_max(
+        egui::pos2(row_rect.left() + ROW_PAD_X, row_rect.top() + ROW_PAD_Y),
+        egui::pos2(
+            row_rect.left() + ROW_PAD_X + icon_width,
+            row_rect.bottom() - ROW_PAD_Y,
+        ),
+    );
+    let painter = ui
+        .painter()
+        .with_clip_rect(row_rect.intersect(ui.clip_rect()));
+    match kind {
+        PinKind::Live => {
+            painter.circle_filled(icon_rect.center(), 4.0, t::red());
+        }
+        PinKind::Mentions => {
+            painter.text(
+                icon_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "@",
+                style.pin.clone(),
+                t::accent(),
+            );
+        }
+    }
+    let mut label_rect = row_rect.shrink2(egui::vec2(ROW_PAD_X, ROW_PAD_Y));
+    label_rect.min.x = (icon_rect.right() + ROW_CONTENT_GAP).min(label_rect.right());
+    if let Some((text, mention)) = &count {
+        label_rect.max.x = paint_row_count(
+            ui,
+            label_rect,
+            text,
+            if *mention {
+                style.count.clone()
+            } else {
+                style.pin.clone()
+            },
+            *mention,
+            if active || response.hovered() || *mention {
+                t::text_primary()
+            } else {
+                t::text_secondary()
+            },
+        );
+    }
+    paint_row_text(
+        ui,
+        label_rect,
+        kind.label(),
+        style.pin.clone(),
+        t::text_primary(),
+    );
+    ui.allocate_space(egui::vec2(row_rect.width(), row_h));
+    response.on_hover_text(count.map_or_else(
+        || kind.label().to_owned(),
+        |(count, unread)| {
+            format!(
+                "{}: {count}{}",
+                kind.label(),
+                if unread { " unread" } else { "" }
+            )
+        },
+    ))
+}
+
 impl DragState {
     fn reordered(&self, channels: &[ChannelId]) -> Option<Vec<ChannelId>> {
         let from = channels
@@ -83,6 +290,10 @@ impl DragState {
 
 impl<'a> ChannelList<'a> {
     pub fn show(&mut self, ui: &mut Ui) -> ChannelListResult {
+        self.show_with_style(ui, &SidebarRowStyle::current())
+    }
+
+    fn show_with_style(&mut self, ui: &mut Ui, style: &SidebarRowStyle) -> ChannelListResult {
         let mut result = ChannelListResult {
             selected: None,
             closed: None,
@@ -95,8 +306,8 @@ impl<'a> ChannelList<'a> {
         };
 
         let drag_id = Id::new("channel_list_drag");
-        // Row height scales with chat font so channel labels don't clip.
-        let row_h: f32 = (t::chat_font_size() + 14.0).max(28.0);
+        // Drawing, pointer targets, and drag insertion share the same geometry.
+        let row_h = style.row_height(ui, self.show_close_button);
         let stride: f32 = row_h + t::CHANNEL_ROW_GAP;
         let n = self.channels.len();
 
@@ -123,175 +334,48 @@ impl<'a> ChannelList<'a> {
 
                 if self.show_live_feed_pin {
                     let live_id = crust_core::ChannelId::live_feed();
-                    let is_active = self.active == Some(&live_id);
-
-                    // Allocate the row rect.
-                    let row_rect = {
-                        let avail = ui.available_rect_before_wrap();
-                        egui::Rect::from_min_size(avail.min, egui::vec2(avail.width(), row_h))
-                    };
-                    let resp = ui.interact(
-                        row_rect,
-                        egui::Id::new("live_feed_pin_row"),
-                        egui::Sense::click(),
-                    );
-                    resp.widget_info(|| {
-                        egui::WidgetInfo::selected(
-                            egui::WidgetType::Button,
-                            ui.is_enabled(),
-                            is_active,
-                            "Live",
-                        )
-                    });
-
-                    // Background color: active / hover / default.
-                    let bg = if is_active {
-                        t::active_channel_bg()
-                    } else if resp.hovered() {
-                        t::hover_row_bg()
-                    } else {
-                        Color32::TRANSPARENT
-                    };
-                    if bg != Color32::TRANSPARENT {
-                        ui.painter().rect_filled(row_rect, 4.0, bg);
-                    }
-
-                    // Red live dot at the left.
-                    let dot_center = row_rect.left_center() + egui::vec2(10.0, 0.0);
-                    ui.painter()
-                        .circle_filled(dot_center, 4.0, Color32::from_rgb(220, 60, 60));
-
-                    // "Live" label.
-                    let label_pos = row_rect.left_center() + egui::vec2(22.0, 0.0);
-                    ui.painter().text(
-                        label_pos,
-                        egui::Align2::LEFT_CENTER,
-                        "Live",
-                        t::tabs_font(),
-                        t::text_primary(),
-                    );
-
-                    // Count badge on the right.
-                    let badge_pos = row_rect.right_center() - egui::vec2(10.0, 0.0);
-                    ui.painter().text(
-                        badge_pos,
-                        egui::Align2::RIGHT_CENTER,
-                        format!("{}", self.live_feed_count),
-                        t::tabs_font(),
-                        if is_active || resp.hovered() {
-                            t::text_primary()
-                        } else {
-                            t::text_secondary()
-                        },
-                    );
-
-                    if resp.clicked() {
+                    if pinned_row(
+                        ui,
+                        PinKind::Live,
+                        self.active == Some(&live_id),
+                        Some((self.live_feed_count.to_string(), false)),
+                        row_h,
+                        style,
+                    )
+                    .clicked()
+                    {
                         result.selected = Some(live_id);
                     }
-
-                    // Reserve the row's vertical space; egui's item_spacing.y
-                    // (set to CHANNEL_ROW_GAP above) supplies the gap to the
-                    // first regular channel row automatically.
-                    ui.allocate_space(egui::vec2(0.0, row_h));
                 }
 
                 if self.show_mentions_pin {
                     let mentions_id = crust_core::ChannelId::mentions();
-                    let is_active = self.active == Some(&mentions_id);
-
-                    let row_rect = {
-                        let avail = ui.available_rect_before_wrap();
-                        egui::Rect::from_min_size(avail.min, egui::vec2(avail.width(), row_h))
-                    };
-                    let resp = ui.interact(
-                        row_rect,
-                        egui::Id::new("mentions_pin_row"),
-                        egui::Sense::click(),
-                    );
-                    resp.widget_info(|| {
-                        egui::WidgetInfo::selected(
-                            egui::WidgetType::Button,
-                            ui.is_enabled(),
-                            is_active,
-                            "Mentions",
-                        )
-                    });
-
-                    let bg = if is_active {
-                        t::active_channel_bg()
-                    } else if resp.hovered() {
-                        t::hover_row_bg()
-                    } else {
-                        Color32::TRANSPARENT
-                    };
-                    if bg != Color32::TRANSPARENT {
-                        ui.painter().rect_filled(row_rect, 4.0, bg);
-                    }
-
-                    // "@" glyph where the Live dot sits - same alignment as
-                    // the Live pin so the two sentinels line up visually.
-                    let glyph_center = row_rect.left_center() + egui::vec2(10.0, 0.0);
-                    ui.painter().text(
-                        glyph_center,
-                        egui::Align2::CENTER_CENTER,
-                        "@",
-                        t::tabs_font(),
-                        t::accent(),
-                    );
-
-                    let label_pos = row_rect.left_center() + egui::vec2(22.0, 0.0);
-                    ui.painter().text(
-                        label_pos,
-                        egui::Align2::LEFT_CENTER,
-                        "Mentions",
-                        t::tabs_font(),
-                        t::text_primary(),
-                    );
-
-                    // Right-side count. Unread gets the warning-pill treatment
-                    // (matches how regular channel unread-mentions are drawn);
-                    // when fully read, show the plain total count.
-                    if self.mentions_unread > 0 {
-                        let label = if self.mentions_unread > 99 {
-                            "99+".to_owned()
-                        } else {
-                            format!("{}", self.mentions_unread)
-                        };
-                        let badge_w = 28.0_f32;
-                        let badge_h = 14.0_f32;
-                        let badge_rect = egui::Rect::from_center_size(
-                            row_rect.right_center() - egui::vec2(6.0 + badge_w * 0.5, 0.0),
-                            egui::vec2(badge_w, badge_h),
-                        );
-                        ui.painter()
-                            .rect_filled(badge_rect, t::RADIUS_SM, t::mention_pill_bg());
-                        ui.painter().text(
-                            badge_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            label,
-                            t::tiny(),
-                            t::text_primary(),
-                        );
-                    } else if self.mentions_total > 0 {
-                        let badge_pos = row_rect.right_center() - egui::vec2(10.0, 0.0);
-                        ui.painter().text(
-                            badge_pos,
-                            egui::Align2::RIGHT_CENTER,
-                            format!("{}", self.mentions_total),
-                            t::tabs_font(),
-                            if is_active || resp.hovered() {
-                                t::text_primary()
+                    let count = if self.mentions_unread > 0 {
+                        Some((
+                            if self.mentions_unread > 99 {
+                                "99+".to_owned()
                             } else {
-                                t::text_secondary()
+                                self.mentions_unread.to_string()
                             },
-                        );
-                    }
-
-                    if resp.clicked() {
+                            true,
+                        ))
+                    } else if self.mentions_total > 0 {
+                        Some((self.mentions_total.to_string(), false))
+                    } else {
+                        None
+                    };
+                    if pinned_row(
+                        ui,
+                        PinKind::Mentions,
+                        self.active == Some(&mentions_id),
+                        count,
+                        row_h,
+                        style,
+                    )
+                    .clicked()
+                    {
                         result.selected = Some(mentions_id);
                     }
-
-                    ui.allocate_space(egui::vec2(0.0, row_h));
                 }
 
                 // Y reference for computing insert position from pointer.
@@ -324,6 +408,14 @@ impl<'a> ChannelList<'a> {
                     };
                     let row_resp =
                         ui.interact(row_rect, interact_id, egui::Sense::click_and_drag());
+                    row_resp.widget_info(|| {
+                        egui::WidgetInfo::selected(
+                            egui::WidgetType::Button,
+                            ui.is_enabled(),
+                            is_active,
+                            ch.display_name(),
+                        )
+                    });
 
                     // Drag start
                     if row_resp.drag_started() {
@@ -362,8 +454,12 @@ impl<'a> ChannelList<'a> {
 
                     // Drag release: split or reorder
                     if row_resp.drag_stopped() {
-                        if let Some(ds) = ui.data(|d| d.get_temp::<DragState>(drag_id)) {
+                        if let Some(mut ds) = ui.data(|d| d.get_temp::<DragState>(drag_id)) {
                             let sidebar_rect = ui.max_rect();
+                            if let Some(pos) = ui.ctx().pointer_latest_pos() {
+                                ds.insert_before =
+                                    (((pos.y - list_top) / stride + 0.5) as usize).min(n);
+                            }
                             let outside = ui
                                 .ctx()
                                 .pointer_latest_pos()
@@ -382,7 +478,14 @@ impl<'a> ChannelList<'a> {
                     // Right-click menu for quick channel actions.
                     row_resp.context_menu(|ui| {
                         if ui
-                            .button(RichText::new(if ch.is_irc_query() { "Switch to private chat" } else { "Switch to channel" }).font(t::small()))
+                            .button(
+                                RichText::new(if ch.is_irc_query() {
+                                    "Switch to private chat"
+                                } else {
+                                    "Switch to channel"
+                                })
+                                .font(t::small()),
+                            )
                             .clicked()
                         {
                             result.selected = Some(ch.clone());
@@ -390,7 +493,14 @@ impl<'a> ChannelList<'a> {
                         }
 
                         if ui
-                            .button(RichText::new(if ch.is_irc_query() { "Copy nickname" } else { "Copy channel" }).font(t::small()))
+                            .button(
+                                RichText::new(if ch.is_irc_query() {
+                                    "Copy nickname"
+                                } else {
+                                    "Copy channel"
+                                })
+                                .font(t::small()),
+                            )
                             .clicked()
                         {
                             let copy = if ch.is_irc_query() {
@@ -487,193 +597,196 @@ impl<'a> ChannelList<'a> {
                         Color32::TRANSPARENT
                     };
 
-                    egui::Frame::new()
-                        .fill(frame_bg)
-                        .corner_radius(t::RADIUS_SM)
-                        .inner_margin(egui::Margin::symmetric(8, 5))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.painter().rect_filled(row_rect, t::RADIUS_SM, frame_bg);
+                    let mut row_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .id_salt(("channel_row_content", ch))
+                            .max_rect(row_rect.shrink2(egui::vec2(ROW_PAD_X, ROW_PAD_Y)))
+                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    );
+                    row_ui.set_clip_rect(row_rect.intersect(ui.clip_rect()));
+                    // The row owns label and badge clicks; only its close button
+                    // has a separate action.
+                    row_ui.style_mut().interaction.selectable_labels = false;
+                    {
+                        let ui = &mut row_ui;
+                        ui.spacing_mut().item_spacing.x = 4.0;
 
-                                // Live-status indicator dot.
-                                if self.show_live_indicator {
-                                    if let Some(live_map) = self.live_channels {
-                                        if let Some(&is_live) = live_map.get(ch.display_name()) {
-                                            let dot_r = 3.5_f32;
-                                            let (dot_rect, _) = ui.allocate_exact_size(
-                                                egui::vec2(dot_r * 2.0 + 2.0, dot_r * 2.0),
-                                                egui::Sense::hover(),
-                                            );
-                                            let dot_col = if is_live {
-                                                t::red()
-                                            } else {
-                                                t::alpha(t::text_secondary(), 70)
-                                            };
-                                            ui.painter().circle_filled(
-                                                dot_rect.center(),
-                                                dot_r,
-                                                dot_col,
-                                            );
-                                        }
-                                    }
-                                }
-
-                                // Platform badge for non-Twitch channels
-                                if ch.is_kick() {
-                                    ui.label(
-                                        RichText::new("K")
-                                            .font(t::small())
-                                            .strong()
-                                            .color(t::kick_green()),
+                        // Live-status indicator dot.
+                        if self.show_live_indicator && ch.is_twitch() {
+                            if let Some(live_map) = self.live_channels {
+                                if let Some(&is_live) = live_map.get(ch.display_name()) {
+                                    let dot_r = 3.5_f32;
+                                    let (dot_rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(dot_r * 2.0 + 2.0, dot_r * 2.0),
+                                        egui::Sense::hover(),
                                     );
-                                } else if ch.is_irc() {
-                                    ui.label(
-                                        RichText::new("IRC")
-                                            .font(t::small())
-                                            .strong()
-                                            .color(t::text_muted()),
-                                    );
-                                }
-
-                                // Channel name label
-                                let display = ch.display_name();
-                                let prefix = if ch.is_irc_query() {
-                                    "@ "
-                                } else if ch.is_kick() || ch.is_irc_server_tab() {
-                                    ""
-                                } else {
-                                    "# "
-                                };
-                                let name_text = if unread_mentions > 0 {
-                                    RichText::new(format!("{prefix}{display}"))
-                                        .font(t::body())
-                                        .color(t::text_primary())
-                                        .strong()
-                                } else if unread_count > 0 {
-                                    RichText::new(format!("{prefix}{display}"))
-                                        .font(t::body())
-                                        .color(t::text_primary())
-                                        .strong()
-                                } else if is_active {
-                                    RichText::new(format!("{prefix}{display}"))
-                                        .font(t::body())
-                                        .color(t::text_primary())
-                                        .strong()
-                                } else {
-                                    RichText::new(format!("{prefix}{display}"))
-                                        .font(t::body())
-                                        .color(t::text_secondary())
-                                };
-
-                                let badge = if unread_mentions > 0 {
-                                    Some((unread_mentions, true))
-                                } else if unread_count > 0 {
-                                    Some((unread_count, false))
-                                } else {
-                                    None
-                                };
-                                let badge_label = badge.map(|(count, _)| {
-                                    if count > 99 {
-                                        "99+".to_owned()
+                                    let dot_col = if is_live {
+                                        t::red()
                                     } else {
-                                        count.to_string()
-                                    }
-                                });
-                                let close_size = t::icon_btn_sm();
-                                let mut trailing_width = if self.show_close_button {
-                                    close_size + ui.spacing().item_spacing.x
-                                } else {
-                                    0.0
-                                };
-                                if let Some(label) = &badge_label {
-                                    let mention = badge.is_some_and(|(_, mention)| mention);
-                                    trailing_width += ui
-                                        .painter()
-                                        .layout_no_wrap(
-                                            label.clone(),
-                                            if mention { t::tiny() } else { t::small() },
-                                            t::text_secondary(),
-                                        )
-                                        .size()
-                                        .x
-                                        + if mention { 10.0 } else { 0.0 }
-                                        + ui.spacing().item_spacing.x;
+                                        t::alpha(t::text_secondary(), 70)
+                                    };
+                                    ui.painter()
+                                        .circle_filled(dot_rect.center(), dot_r, dot_col);
                                 }
-                                let label_resp = ui.add_sized(
-                                    [
-                                        (ui.available_width()
-                                            - trailing_width.max(ui.spacing().item_spacing.x))
-                                        .max(0.0),
-                                        t::body().size,
-                                    ],
-                                    egui::Label::new(name_text)
-                                        .sense(egui::Sense::click())
-                                        .truncate(),
-                                );
-                                if label_resp.clicked() {
-                                    result.selected = Some(ch.clone());
-                                }
+                            }
+                        }
 
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if self.show_close_button {
-                                            let close = ui
-                                                .add_visible(
-                                                    is_hovered || is_active,
-                                                    egui::Button::new(
-                                                        RichText::new("✕")
-                                                            .font(t::small())
-                                                            .color(t::text_secondary()),
-                                                    )
-                                                    .frame(false)
-                                                    .min_size(egui::vec2(close_size, close_size)),
-                                                )
-                                                .on_hover_text("Close channel");
-                                            if close.clicked() {
-                                                result.closed = Some(ch.clone());
-                                            }
-                                        }
-                                        if unread_mentions > 0 {
-                                            // Mentions / highlights badge - semantic warning pill.
-                                            let label = if unread_mentions > 99 {
-                                                "99+".to_owned()
-                                            } else {
-                                                format!("{unread_mentions}")
-                                            };
-                                            egui::Frame::new()
-                                                .fill(t::mention_pill_bg())
-                                                .corner_radius(t::RADIUS_SM)
-                                                .inner_margin(egui::Margin::symmetric(5, 0))
-                                                .show(ui, |ui| {
-                                                    ui.label(
-                                                        egui::RichText::new(label)
-                                                            .font(t::tiny())
-                                                            .strong()
-                                                            .color(t::text_primary()),
-                                                    );
-                                                });
-                                        } else if unread_count > 0 {
-                                            // Plain unread count.
-                                            let label = if unread_count > 99 {
-                                                "99+".to_owned()
-                                            } else {
-                                                format!("{unread_count}")
-                                            };
-                                            ui.label(
-                                                RichText::new(label)
-                                                    .font(t::small())
-                                                    .color(if is_active || is_hovered {
-                                                        t::text_primary()
-                                                    } else {
-                                                        t::text_secondary()
-                                                    }),
-                                            );
-                                        }
-                                    },
-                                );
-                            });
+                        // Platform badge for non-Twitch channels
+                        if ch.is_kick() {
+                            ui.label(
+                                RichText::new("K")
+                                    .font(style.secondary.clone())
+                                    .strong()
+                                    .color(t::kick_green()),
+                            );
+                        } else if ch.is_irc() {
+                            ui.label(
+                                RichText::new("IRC")
+                                    .font(style.secondary.clone())
+                                    .strong()
+                                    .color(t::text_muted()),
+                            );
+                        }
+
+                        // Channel name label
+                        let display = ch.display_name();
+                        let prefix = if ch.is_irc_query() {
+                            "@ "
+                        } else if ch.is_kick() || ch.is_irc_server_tab() {
+                            ""
+                        } else {
+                            "# "
+                        };
+                        let name_text = if unread_mentions > 0 {
+                            RichText::new(format!("{prefix}{display}"))
+                                .font(style.name.clone())
+                                .color(t::text_primary())
+                                .strong()
+                        } else if unread_count > 0 {
+                            RichText::new(format!("{prefix}{display}"))
+                                .font(style.name.clone())
+                                .color(t::text_primary())
+                                .strong()
+                        } else if is_active {
+                            RichText::new(format!("{prefix}{display}"))
+                                .font(style.name.clone())
+                                .color(t::text_primary())
+                                .strong()
+                        } else {
+                            RichText::new(format!("{prefix}{display}"))
+                                .font(style.name.clone())
+                                .color(t::text_secondary())
+                        };
+
+                        let badge = if unread_mentions > 0 {
+                            Some((unread_mentions, true))
+                        } else if unread_count > 0 {
+                            Some((unread_count, false))
+                        } else {
+                            None
+                        };
+                        let badge_label = badge.map(|(count, _)| {
+                            if count > 99 {
+                                "99+".to_owned()
+                            } else {
+                                count.to_string()
+                            }
                         });
+                        let close_size = style.close_size;
+                        let mut trailing_width = if self.show_close_button {
+                            close_size + ui.spacing().item_spacing.x
+                        } else {
+                            0.0
+                        };
+                        if let Some(label) = &badge_label {
+                            let mention = badge.is_some_and(|(_, mention)| mention);
+                            trailing_width += ui
+                                .painter()
+                                .layout_no_wrap(
+                                    label.clone(),
+                                    if mention {
+                                        style.count.clone()
+                                    } else {
+                                        style.secondary.clone()
+                                    },
+                                    t::text_secondary(),
+                                )
+                                .size()
+                                .x
+                                + if mention { 10.0 } else { 0.0 }
+                                + ui.spacing().item_spacing.x;
+                        }
+                        ui.add_sized(
+                            [
+                                (ui.available_width()
+                                    - trailing_width.max(ui.spacing().item_spacing.x))
+                                .max(0.0),
+                                style.name.size,
+                            ],
+                            egui::Label::new(name_text).truncate(),
+                        );
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if self.show_close_button {
+                                let mut builder = egui::UiBuilder::new();
+                                if !(is_hovered || is_active) {
+                                    builder = builder.invisible();
+                                }
+                                let close = ui
+                                    .scope_builder(builder, |ui| {
+                                        chrome::icon_button(
+                                            ui,
+                                            ChromeIcon::Close,
+                                            "Close channel",
+                                            IconButtonState {
+                                                compact: true,
+                                                ..Default::default()
+                                            },
+                                        )
+                                    })
+                                    .inner;
+                                if close.clicked() {
+                                    result.closed = Some(ch.clone());
+                                }
+                            }
+                            if unread_mentions > 0 {
+                                // Mentions / highlights badge - semantic warning pill.
+                                let label = if unread_mentions > 99 {
+                                    "99+".to_owned()
+                                } else {
+                                    format!("{unread_mentions}")
+                                };
+                                egui::Frame::new()
+                                    .fill(t::mention_pill_bg())
+                                    .corner_radius(t::RADIUS_SM)
+                                    .inner_margin(egui::Margin::symmetric(5, 0))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            egui::RichText::new(label)
+                                                .font(style.count.clone())
+                                                .strong()
+                                                .color(t::text_primary()),
+                                        );
+                                    });
+                            } else if unread_count > 0 {
+                                // Plain unread count.
+                                let label = if unread_count > 99 {
+                                    "99+".to_owned()
+                                } else {
+                                    format!("{unread_count}")
+                                };
+                                ui.label(RichText::new(label).font(style.secondary.clone()).color(
+                                    if is_active || is_hovered {
+                                        t::text_primary()
+                                    } else {
+                                        t::text_secondary()
+                                    },
+                                ));
+                            }
+                        });
+                    }
+                    ui.allocate_space(row_rect.size());
 
                     // Reset opacity after the frame.
                     if is_dragging_this {
@@ -683,6 +796,7 @@ impl<'a> ChannelList<'a> {
                     if row_resp.clicked() && result.selected.is_none() && result.closed.is_none() {
                         result.selected = Some(ch.clone());
                     }
+                    row_resp.on_hover_text(ch.display_name());
                 }
 
                 // Floating drag ghost
@@ -752,6 +866,319 @@ impl<'a> ChannelList<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row_style(size: f32) -> SidebarRowStyle {
+        SidebarRowStyle {
+            name: egui::FontId::proportional(size),
+            secondary: egui::FontId::proportional((size - 1.0).max(8.0)),
+            count: egui::FontId::proportional((size - 3.0).max(8.0)),
+            pin: egui::FontId::proportional(size),
+            close_size: 18.0 * size / t::DEFAULT_CHAT_FONT_SIZE,
+        }
+    }
+
+    fn geometry_frame(
+        ctx: &egui::Context,
+        style: &SidebarRowStyle,
+        show_close: bool,
+        events: Vec<egui::Event>,
+    ) -> (ChannelListResult, Vec<egui::Rect>, egui::FullOutput) {
+        let channels: Vec<_> = (0..8)
+            .map(|index| ChannelId::new(&format!("room{index}")))
+            .collect();
+        let states = channels
+            .iter()
+            .map(|channel| {
+                let mut state = ChannelState::new(channel.clone());
+                state.unread_mentions = 2;
+                (channel.clone(), state)
+            })
+            .collect();
+        let rules = HashMap::new();
+        let mut list = ChannelList {
+            channels: &channels,
+            active: channels.first(),
+            channel_states: &states,
+            live_channels: None,
+            show_live_indicator: false,
+            show_close_button: show_close,
+            show_live_feed_pin: false,
+            live_feed_count: 0,
+            show_mentions_pin: false,
+            mentions_total: 0,
+            mentions_unread: 0,
+            tab_visibility_rules: &rules,
+        };
+        let mut result = None;
+        let mut rects = Vec::new();
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(240.0, 800.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    result = Some(list.show_with_style(ui, style));
+                    rects = channels
+                        .iter()
+                        .map(|channel| {
+                            ctx.read_response(Id::new("ch_row").with(channel))
+                                .unwrap()
+                                .rect
+                        })
+                        .collect();
+                });
+            },
+        );
+        (result.unwrap(), rects, output)
+    }
+
+    fn visible_text_rects(output: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
+        fn collect(
+            shape: &egui::epaint::Shape,
+            clip: egui::Rect,
+            text: &mut Vec<(String, egui::Rect)>,
+        ) {
+            match shape {
+                egui::epaint::Shape::Text(shape) => {
+                    let rect = shape
+                        .galley
+                        .rect
+                        .translate(shape.pos.to_vec2())
+                        .intersect(clip);
+                    if rect.is_positive() {
+                        text.push((shape.galley.text().to_owned(), rect));
+                    }
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, clip, text);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut text = Vec::new();
+        for shape in &output.shapes {
+            collect(&shape.shape, shape.clip_rect, &mut text);
+        }
+        text
+    }
+
+    #[test]
+    fn sidebar_row_targets_follow_rendered_rows_at_large_fonts_and_button_padding() {
+        for size in [13.5, 24.0, 32.0] {
+            for show_close in [false, true] {
+                let ctx = egui::Context::default();
+                ctx.style_mut(|style| style.spacing.button_padding = egui::vec2(10.0, 5.0));
+                let style = row_style(size);
+                geometry_frame(&ctx, &style, show_close, Vec::new());
+                let (_, rows, output) = geometry_frame(&ctx, &style, show_close, Vec::new());
+                for pair in rows.windows(2) {
+                    assert!(
+                        (pair[1].top() - pair[0].bottom() - t::CHANNEL_ROW_GAP).abs() < 0.1,
+                        "row targets diverged from rendered spacing at font size {size}"
+                    );
+                }
+                let texts = visible_text_rects(&output);
+                for (index, row) in rows.iter().enumerate() {
+                    let (_, text) = texts
+                        .iter()
+                        .find(|(text, _)| text == &format!("# room{index}"))
+                        .unwrap();
+                    assert!(
+                        row.expand(0.5).contains_rect(*text),
+                        "row {index} clips text at font size {size}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn pointer_button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn sidebar_drag_uses_visible_row_geometry_and_the_final_release_position() {
+        let ctx = egui::Context::default();
+        ctx.style_mut(|style| style.spacing.button_padding = egui::vec2(10.0, 5.0));
+        let style = row_style(32.0);
+        geometry_frame(&ctx, &style, true, Vec::new());
+        let (_, rows, _) = geometry_frame(&ctx, &style, true, Vec::new());
+        let start = egui::pos2(rows[0].left() + 2.0, rows[0].center().y);
+        let intermediate = egui::pos2(start.x, rows[2].center().y);
+        let release = egui::pos2(start.x, rows[5].top() + rows[5].height() * 0.25);
+        geometry_frame(
+            &ctx,
+            &style,
+            true,
+            vec![
+                egui::Event::PointerMoved(start),
+                pointer_button(start, true),
+            ],
+        );
+        geometry_frame(
+            &ctx,
+            &style,
+            true,
+            vec![egui::Event::PointerMoved(intermediate)],
+        );
+        let (result, _, _) =
+            geometry_frame(&ctx, &style, true, vec![pointer_button(release, false)]);
+        let reordered = result
+            .reordered
+            .expect("dragging a row should reorder channels");
+        let expected: Vec<_> = [1, 2, 3, 4, 0, 5, 6, 7]
+            .into_iter()
+            .map(|index| ChannelId::new(&format!("room{index}")))
+            .collect();
+        assert_eq!(reordered, expected);
+        assert!(result.drag_split.is_none());
+    }
+
+    #[test]
+    fn channel_names_and_unread_badges_select_their_row() {
+        for label in ["# room2", "2"] {
+            let ctx = egui::Context::default();
+            ctx.style_mut(|style| style.interaction.selectable_labels = true);
+            let style = row_style(24.0);
+            geometry_frame(&ctx, &style, true, Vec::new());
+            let (_, rows, output) = geometry_frame(&ctx, &style, true, Vec::new());
+            let point = visible_text_rects(&output)
+                .into_iter()
+                .find(|(text, rect)| text == label && rows[2].contains_rect(*rect))
+                .expect("the target row label is visible")
+                .1
+                .center();
+            geometry_frame(
+                &ctx,
+                &style,
+                true,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    pointer_button(point, true),
+                ],
+            );
+            let (result, _, _) =
+                geometry_frame(&ctx, &style, true, vec![pointer_button(point, false)]);
+            assert_eq!(
+                result.selected,
+                Some(ChannelId::new("room2")),
+                "click on {label}"
+            );
+            assert!(result.closed.is_none());
+        }
+    }
+
+    #[test]
+    fn pinned_labels_and_counts_do_not_overlap_in_narrow_sidebars() {
+        for size in [13.5, 28.0, 32.0] {
+            for width in [80.0, 124.0, 210.0] {
+                let ctx = egui::Context::default();
+                let style = row_style(size);
+                let mut row = egui::Rect::NOTHING;
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 160.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            let height = style.row_height(ui, false);
+                            row = pinned_row(
+                                ui,
+                                PinKind::Mentions,
+                                true,
+                                Some(("99+".to_owned(), true)),
+                                height,
+                                &style,
+                            )
+                            .rect;
+                        });
+                    },
+                );
+                let text = visible_text_rects(&output);
+                for (_, rect) in &text {
+                    assert!(row.expand(0.5).contains_rect(*rect));
+                }
+                let label = text
+                    .iter()
+                    .find(|(text, _)| text == "Mentions")
+                    .map(|(_, rect)| rect);
+                let count = text
+                    .iter()
+                    .find(|(text, _)| text == "99+")
+                    .map(|(_, rect)| rect);
+                if let (Some(label), Some(count)) = (label, count) {
+                    assert!(
+                        label.right() <= count.left(),
+                        "label overlaps count at {width}px, font {size}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn live_status_does_not_leak_to_other_platforms_with_the_same_channel_name() {
+        let channels = [
+            ChannelId::new("room"),
+            ChannelId::parse_user_input("kick:room").unwrap(),
+            ChannelId::parse_user_input("ircs://irc.example/#room").unwrap(),
+        ];
+        let states = HashMap::new();
+        let rules = HashMap::new();
+        let live = HashMap::from([("room".to_owned(), true)]);
+        let mut list = ChannelList {
+            channels: &channels,
+            active: None,
+            channel_states: &states,
+            live_channels: Some(&live),
+            show_live_indicator: true,
+            show_close_button: false,
+            show_live_feed_pin: false,
+            live_feed_count: 0,
+            show_mentions_pin: false,
+            mentions_total: 0,
+            mentions_unread: 0,
+            tab_visibility_rules: &rules,
+        };
+        let ctx = egui::Context::default();
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(240.0, 300.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    list.show(ui);
+                });
+            },
+        );
+        let indicators = output.shapes.iter().filter(|shape| {
+            matches!(&shape.shape, egui::epaint::Shape::Circle(circle) if circle.radius == 3.5 && circle.fill == t::red())
+        }).count();
+        assert_eq!(
+            indicators, 1,
+            "only the Twitch channel should carry the Twitch live status"
+        );
+    }
 
     #[test]
     fn virtual_sidebar_buttons_expose_their_names_selection_and_actions() {

@@ -968,16 +968,54 @@ struct ToolbarVisibility {
     show_mod_in_overflow: bool,
 }
 
-const TOOLBAR_ROW_PADDING_W: f32 = 28.0;
 const TOOLBAR_GROUP_FRAME_W: f32 = 14.0;
 const TOOLBAR_SEPARATOR_W: f32 = 8.0;
-const TOOLBAR_LOGO_W: f32 = 54.0;
-const TOOLBAR_DOT_W: f32 = 12.0;
-const TOOLBAR_CONN_LABEL_W: f32 = 92.0;
-const TOOLBAR_JOIN_LABEL_W: f32 = 32.0;
-const TOOLBAR_ACCOUNT_PILL_W: f32 = 118.0;
-const TOOLBAR_OVERFLOW_W: f32 = 30.0;
-const TOOLBAR_MOD_BUTTON_W: f32 = 42.0;
+const TOOLBAR_DOT_W: f32 = 10.0;
+
+fn topbar_button_padding() -> egui::Vec2 {
+    egui::vec2((t::topbar_font_size() * 0.55).max(8.0),
+        (t::topbar_font_size() * 0.3).max(4.0))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ToolbarMeasurements {
+    logo: f32,
+    connection: f32,
+    join_label: f32,
+    account: f32,
+    overflow: f32,
+    moderation: f32,
+}
+
+impl ToolbarMeasurements {
+    fn new(ui: &egui::Ui, connection: &str, account: f32) -> Self {
+        let width = |text: &str, font: egui::FontId| {
+            ui.painter().layout_no_wrap(text.to_owned(), font, t::text_primary()).size().x.ceil()
+        };
+        let button_width = |text, font| {
+            (width(text, font) + 2.0 * topbar_button_padding().x)
+                .max(ui.spacing().interact_size.x)
+        };
+        Self {
+            logo: width("crust", egui::FontId::proportional(15.0 * t::font_scale())),
+            connection: width(connection, t::topbar_font()),
+            join_label: width("Join", t::topbar_font()),
+            account,
+            overflow: button_width("⋯", t::topbar_font()),
+            moderation: button_width("Mod", t::tiny()),
+        }
+    }
+
+    fn action_content_width(&self, visibility: &ToolbarVisibility) -> f32 {
+        let icons = 1 + usize::from(visibility.show_perf_toggle)
+            + usize::from(visibility.show_stats_toggle)
+            + usize::from(visibility.show_whispers_toggle)
+            + usize::from(visibility.show_irc_toggle);
+        icons as f32 * estimate_icon_button_width(visibility.compact_controls)
+            + icons.saturating_sub(1) as f32 * 4.0
+            + if visibility.show_mod_button { self.moderation + 4.0 } else { 0.0 }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ToolbarDegradeStep {
@@ -1004,71 +1042,53 @@ fn estimate_icon_button_width(compact: bool) -> f32 {
     }
 }
 
-fn estimate_toolbar_group_width(icon_count: usize, icon_spacing: f32, compact: bool) -> f32 {
-    if icon_count == 0 {
-        return 0.0;
-    }
-    TOOLBAR_GROUP_FRAME_W
-        + icon_count as f32 * estimate_icon_button_width(compact)
-        + icon_count.saturating_sub(1) as f32 * icon_spacing
-}
-
-fn estimate_toolbar_required_width(visibility: &ToolbarVisibility) -> f32 {
-    let mut width = TOOLBAR_ROW_PADDING_W;
+fn estimate_toolbar_required_width(
+    visibility: &ToolbarVisibility,
+    measured: &ToolbarMeasurements,
+) -> f32 {
+    let row_gap = if visibility.compact_controls { 4.0 } else { 8.0 };
+    let right_gap = if visibility.compact_controls { 3.0 } else { t::TOOLBAR_SPACING.x };
+    // The panel has already removed its margins from available_width().
+    // Leave two points for pixel rounding between nested frames.
+    let mut width = 2.0;
 
     if visibility.show_logo {
-        width += TOOLBAR_LOGO_W + 8.0;
+        width += measured.logo + row_gap;
     }
 
     let mut left_group = TOOLBAR_DOT_W;
     if visibility.show_connection_label {
-        left_group += TOOLBAR_CONN_LABEL_W + 4.0;
+        left_group += measured.connection + 6.0;
     }
     if visibility.show_join_button {
-        left_group += estimate_icon_button_width(visibility.compact_controls) + 4.0;
+        left_group += estimate_icon_button_width(visibility.compact_controls) + 6.0;
         if visibility.show_join_text {
-            left_group += TOOLBAR_JOIN_LABEL_W + 4.0;
+            left_group += measured.join_label + 6.0;
         }
     }
     width += TOOLBAR_GROUP_FRAME_W + left_group;
 
     if visibility.show_sidebar_actions {
-        width += 6.0 + estimate_toolbar_group_width(2, 4.0, visibility.compact_controls);
+        width += row_gap + TOOLBAR_GROUP_FRAME_W
+            + 2.0 * estimate_icon_button_width(visibility.compact_controls) + 4.0;
     }
 
     let account_width = if visibility.compact_account {
         estimate_icon_button_width(visibility.ultra_compact_account)
     } else {
-        TOOLBAR_ACCOUNT_PILL_W
+        measured.account
     };
-    width += 8.0 + account_width;
+    width += row_gap + account_width + right_gap;
 
     if !visibility.compact_controls || visibility.show_overflow_menu
     {
-        width += TOOLBAR_SEPARATOR_W;
+        width += TOOLBAR_SEPARATOR_W + right_gap;
     }
 
     if visibility.show_overflow_menu {
-        width += TOOLBAR_OVERFLOW_W;
+        width += measured.overflow + right_gap;
     }
-
-    let mut icon_count = 1; // settings
-    if visibility.show_perf_toggle {
-        icon_count += 1;
-    }
-    if visibility.show_stats_toggle {
-        icon_count += 1;
-    }
-    if visibility.show_whispers_toggle {
-        icon_count += 1;
-    }
-    if visibility.show_irc_toggle {
-        icon_count += 1;
-    }
-    if visibility.show_mod_button {
-        width += TOOLBAR_MOD_BUTTON_W + 4.0;
-    }
-    width + estimate_toolbar_group_width(icon_count, 4.0, visibility.compact_controls)
+    width + TOOLBAR_GROUP_FRAME_W + measured.action_content_width(visibility)
 }
 
 fn apply_toolbar_degrade_step(visibility: &mut ToolbarVisibility, step: ToolbarDegradeStep) {
@@ -1132,6 +1152,7 @@ fn toolbar_visibility(
     bar_width: f32,
     irc_beta_enabled: bool,
     moderation_available: bool,
+    measured: &ToolbarMeasurements,
 ) -> ToolbarVisibility {
     let mut visibility = ToolbarVisibility {
         compact_controls: false,
@@ -1175,7 +1196,7 @@ fn toolbar_visibility(
 
     for step in STEPS {
         finalize_toolbar_visibility(&mut visibility, irc_beta_enabled, moderation_available);
-        if estimate_toolbar_required_width(&visibility) <= bar_width {
+        if estimate_toolbar_required_width(&visibility, measured) <= bar_width {
             break;
         }
         apply_toolbar_degrade_step(&mut visibility, step);
@@ -1184,7 +1205,7 @@ fn toolbar_visibility(
     finalize_toolbar_visibility(&mut visibility, irc_beta_enabled, moderation_available);
 
     // Extreme fallback to keep controls coherent on tiny windows.
-    if estimate_toolbar_required_width(&visibility) > bar_width {
+    if estimate_toolbar_required_width(&visibility, measured) > bar_width {
         visibility.compact_controls = true;
         visibility.compact_account = true;
         visibility.ultra_compact_account = true;
@@ -1407,6 +1428,8 @@ pub struct CrustApp {
     pending_restore_split_panes: Vec<(String, f32)>,
     /// Focused-pane index from the previous session.
     pending_restore_split_focused: usize,
+    /// Explicit navigation or layout edits take precedence over startup restoration.
+    layout_restore_cancelled: bool,
     /// Last channel order we persisted to disk (avoids spamming writes).
     last_saved_channel_order: Vec<String>,
     /// Last split-pane snapshot we persisted to disk (avoids spamming writes).
@@ -1954,6 +1977,7 @@ impl CrustApp {
             pending_restore_channel_order: Vec::new(),
             pending_restore_split_panes: Vec::new(),
             pending_restore_split_focused: 0,
+            layout_restore_cancelled: false,
             last_saved_channel_order: Vec::new(),
             last_saved_split_panes: Vec::new(),
             last_saved_split_focused: 0,
@@ -4627,6 +4651,21 @@ exit 1
                 old_channel,
                 new_channel,
             } => {
+                if self.pending_restore_channel.as_deref() == Some(old_channel.as_str()) {
+                    self.pending_restore_channel = Some(new_channel.0.clone());
+                }
+                for channel in &mut self.pending_restore_channel_order {
+                    if channel == old_channel.as_str() {
+                        *channel = new_channel.0.clone();
+                    }
+                }
+                let mut seen = HashSet::new();
+                self.pending_restore_channel_order.retain(|channel| seen.insert(channel.clone()));
+                for (channel, _) in &mut self.pending_restore_split_panes {
+                    if channel == old_channel.as_str() {
+                        *channel = new_channel.0.clone();
+                    }
+                }
                 if self.state.redirect_channel(&old_channel, &new_channel) {
                     self.split_panes.redirect_channel(&old_channel, &new_channel);
                     self.sorted_chatters.remove(&old_channel);
@@ -5901,15 +5940,11 @@ exit 1
                 whispers_visible,
                 last_whisper_login,
             } => {
-                if !channel.is_empty() {
-                    self.pending_restore_channel = Some(channel.clone());
-                    self.last_saved_active_channel = Some(channel);
-                }
-                if !channel_order.is_empty() {
+                if !self.layout_restore_cancelled {
+                    self.pending_restore_channel = (!channel.is_empty()).then(|| channel.clone());
+                    self.last_saved_active_channel = self.pending_restore_channel.clone();
                     self.pending_restore_channel_order = channel_order.clone();
                     self.last_saved_channel_order = channel_order;
-                }
-                if !split_panes.is_empty() {
                     self.pending_restore_split_panes = split_panes.clone();
                     self.pending_restore_split_focused = split_panes_focused;
                     self.last_saved_split_panes = split_panes;
@@ -6740,11 +6775,34 @@ exit 1
         self.emote_bytes.static_texture(ui.ctx(), url)
     }
 
+    fn topbar_account_width(&self, ui: &egui::Ui) -> f32 {
+        let (label, avatar) = if self.pending_auth.is_some() {
+            ("Signing in...", false)
+        } else if self.state.auth.logged_in {
+            (self.state.auth.username.as_deref().unwrap_or("User"), true)
+        } else if self.state.accounts.is_empty() {
+            ("Log in", false)
+        } else {
+            ("Accounts", false)
+        };
+        let text_width = ui.painter().layout_no_wrap(
+            label.to_owned(), t::topbar_font(), t::text_primary(),
+        ).size().x.ceil();
+        if avatar {
+            (t::bar_h() + 16.0 + text_width)
+                .clamp(t::bar_h() + 28.0, 230.0 * t::font_scale())
+        } else {
+            (text_width + 2.0 * topbar_button_padding().x)
+                .max(ui.spacing().interact_size.x).max(68.0)
+        }
+    }
+
     fn show_topbar_account_button(
         &mut self,
         ui: &mut egui::Ui,
         compact_account: bool,
         ultra_compact: bool,
+        account_width: f32,
     ) {
         if let Some(username) = self.pending_auth.as_ref() {
             let tooltip = if username.is_empty() {
@@ -6758,7 +6816,8 @@ exit 1
                     ..Default::default()
                 })
             } else {
-                ui.add(egui::Button::new(RichText::new("Signing in...").font(t::topbar_font())))
+                ui.add_sized([account_width, t::bar_h()],
+                    egui::Button::new(RichText::new("Signing in...").font(t::topbar_font())))
                     .on_hover_text(tooltip)
             };
             if response.clicked() {
@@ -6774,7 +6833,6 @@ exit 1
                 .as_deref()
                 .unwrap_or("User")
                 .to_owned();
-            let display_name = truncate_with_ellipsis(&name, if compact_account { 14 } else { 20 });
             let initial = name
                 .chars()
                 .next()
@@ -6787,7 +6845,7 @@ exit 1
                 if chrome::icon_button(
                     ui,
                     ChromeIcon::Account,
-                    "Account",
+                    &format!("Account: @{name}"),
                     IconButtonState {
                         compact: ultra_compact,
                         ..Default::default()
@@ -6799,17 +6857,11 @@ exit 1
                 }
             } else {
                 let btn_h = t::bar_h();
-                let name_galley = ui.painter().layout_no_wrap(
-                    display_name.clone(),
-                    t::topbar_font(),
-                    t::text_primary(),
-                );
-                let pill_w_max = (230.0 * t::font_scale()).max(btn_h + name_galley.size().x + 40.0);
-                let pill_w =
-                    (btn_h + 6.0 + name_galley.size().x + 10.0).clamp(btn_h + 28.0, pill_w_max);
                 let (rect, resp) =
-                    ui.allocate_exact_size(egui::vec2(pill_w, btn_h), egui::Sense::click());
-                resp.clone().on_hover_text("Account");
+                    ui.allocate_exact_size(egui::vec2(account_width, btn_h), egui::Sense::click());
+                resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button,
+                    ui.is_enabled(), format!("Account: @{name}")));
+                resp.clone().on_hover_text(format!("Account: @{name}"));
 
                 if ui.is_rect_visible(rect) {
                     let bg = if resp.hovered() {
@@ -6862,19 +6914,15 @@ exit 1
                         ui.painter()
                             .circle_filled(avatar_c, avatar_r, t::bg_raised());
                         if let Some(tex) = self.static_avatar_texture_for(ui, &logo, &raw) {
-                            ui.put(
-                                av_rect,
-                                egui::Image::new((tex.id(), egui::vec2(av_size, av_size)))
-                                    .corner_radius(egui::CornerRadius::same(avatar_r as u8)),
-                            );
+                            egui::Image::new((tex.id(), egui::vec2(av_size, av_size)))
+                                .corner_radius(egui::CornerRadius::same(avatar_r as u8))
+                                .paint_at(ui, av_rect);
                         } else {
                             let uri = bytes_uri(&logo, raw.as_ref());
-                            ui.put(
-                                av_rect,
-                                egui::Image::from_bytes(uri, egui::load::Bytes::Shared(raw))
-                                    .fit_to_exact_size(egui::vec2(av_size, av_size))
-                                    .corner_radius(egui::CornerRadius::same(avatar_r as u8)),
-                            );
+                            egui::Image::from_bytes(uri, egui::load::Bytes::Shared(raw))
+                                .fit_to_exact_size(egui::vec2(av_size, av_size))
+                                .corner_radius(egui::CornerRadius::same(avatar_r as u8))
+                                .paint_at(ui, av_rect);
                         }
                     } else {
                         ui.painter()
@@ -6888,14 +6936,19 @@ exit 1
                         );
                     }
 
-                    // Username
-                    ui.painter().text(
-                        egui::pos2(avatar_c.x + btn_h * 0.5 + 4.0, rect.center().y),
-                        egui::Align2::LEFT_CENTER,
-                        &display_name,
-                        t::topbar_font(),
-                        t::text_primary(),
+                    let text_rect = egui::Rect::from_min_max(
+                        egui::pos2(rect.left() + btn_h + 4.0, rect.top()),
+                        egui::pos2(rect.right() - 10.0, rect.bottom()),
                     );
+                    // A nested label must not move the parent RTL cursor back
+                    // inside the already allocated account button.
+                    let mut label_ui = ui.new_child(egui::UiBuilder::new()
+                        .id_salt("topbar_account_name").max_rect(text_rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)));
+                    label_ui.set_clip_rect(text_rect.intersect(ui.clip_rect()));
+                    label_ui.add(egui::Label::new(RichText::new(&name)
+                        .font(t::topbar_font()).color(t::text_primary()))
+                        .truncate().selectable(false));
                 }
 
                 if resp.clicked() {
@@ -6925,15 +6978,9 @@ exit 1
                     self.login_dialog.toggle();
                 }
             } else {
-                let label_galley = ui.painter().layout_no_wrap(
-                    login_label.to_owned(),
-                    t::topbar_font(),
-                    t::text_primary(),
-                );
-                let login_w = (label_galley.size().x + 24.0).max(68.0);
                 if ui
                     .add_sized(
-                        [login_w, t::bar_h()],
+                        [account_width, t::bar_h()],
                         egui::Button::new(RichText::new(login_label).font(t::topbar_font())),
                     )
                     .on_hover_text("Log in with a Twitch OAuth token")
@@ -7488,7 +7535,49 @@ exit 1
             .is_tab_hidden(channel, self.channel_live_status(channel))
     }
 
+    fn cancel_pending_layout_restore(&mut self) {
+        self.layout_restore_cancelled = true;
+        self.pending_restore_channel = None;
+        self.pending_restore_channel_order.clear();
+        self.pending_restore_split_panes.clear();
+    }
+
+    fn is_chat_composer_id(&self, id: egui::Id) -> bool {
+        id == chat_composer_id(None)
+            || self.split_panes.panes.iter().any(|pane| id == chat_composer_id(Some(pane.id)))
+    }
+
+    fn restore_can_focus_composer(&self) -> bool {
+        self.egui_ctx.as_ref()
+            .and_then(|ctx| ctx.memory(|memory| memory.focused()))
+            .is_none_or(|id| self.is_chat_composer_id(id))
+    }
+
+    fn cancel_pending_layout_restore_for_input(&mut self, ctx: &Context) {
+        if self.layout_restore_cancelled {
+            return;
+        }
+        let has_focus = ctx.memory(|memory| memory.focused().is_some());
+        if ctx.input(|input| input.events.iter().any(|event| match event {
+            egui::Event::PointerButton { pressed: true, .. }
+                | egui::Event::Key { pressed: true, .. } => true,
+            egui::Event::MouseWheel { delta, .. } => *delta != egui::Vec2::ZERO,
+            egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Cut
+                | egui::Event::Ime(egui::ImeEvent::Preedit(_) | egui::ImeEvent::Commit(_)) => has_focus,
+            _ => false,
+        })) {
+            // Widgets have not consumed this frame's input yet. Keep controls
+            // in place and preserve the field or chat the user is interacting with.
+            self.cancel_pending_layout_restore();
+        }
+    }
+
     fn activate_channel(&mut self, channel: ChannelId) {
+        self.cancel_pending_layout_restore();
+        self.apply_channel_activation(channel, true);
+    }
+
+    fn apply_channel_activation(&mut self, channel: ChannelId, focus_composer: bool) {
         if let Some(state) = self.state.channels.get_mut(&channel) {
             state.mark_read();
         }
@@ -7529,8 +7618,10 @@ exit 1
         self.split_panes.activate_channel(&channel);
         self.state.active_channel = Some(channel.clone());
         self.persist_active_channel(&channel);
-        if let Some(ctx) = self.egui_ctx.as_ref() {
-            self.focus_chat_composer(ctx);
+        if focus_composer {
+            if let Some(ctx) = self.egui_ctx.as_ref() {
+                self.focus_chat_composer(ctx);
+            }
         }
     }
 
@@ -7548,6 +7639,7 @@ exit 1
     }
 
     fn sync_split_focus(&mut self, ctx: &Context) {
+        self.cancel_pending_layout_restore();
         if let Some(channel) = self.split_panes.focused_channel().cloned() {
             self.state.active_channel = Some(channel);
             self.focus_chat_composer(ctx);
@@ -7558,6 +7650,7 @@ exit 1
         if index >= self.split_panes.panes.len() {
             return;
         }
+        self.cancel_pending_layout_restore();
         let pane = self.split_panes.panes.remove(index);
         if let Some(state) = egui::TextEdit::load_state(ctx, chat_composer_id(Some(pane.id))) {
             egui::TextEdit::store_state(ctx, chat_composer_id(None), state);
@@ -7573,6 +7666,7 @@ exit 1
         if index >= self.split_panes.panes.len() {
             return;
         }
+        self.cancel_pending_layout_restore();
         self.split_panes.remove_pane(index);
         if self.split_panes.panes.len() == 1 {
             self.keep_split_pane(0, ctx);
@@ -7582,6 +7676,7 @@ exit 1
     }
 
     fn close_channel_tab(&mut self, channel: ChannelId, ctx: &Context) {
+        self.cancel_pending_layout_restore();
         if self.pending_reply.as_ref().is_some_and(|reply| reply.channel == channel) {
             self.pending_reply = None;
         }
@@ -7613,9 +7708,6 @@ exit 1
 
     /// Persist the currently-focused channel so it can be restored next launch.
     fn persist_active_channel(&mut self, channel: &ChannelId) {
-        if channel.is_virtual() {
-            return; // Pseudo-tabs (Live / Mentions) can never be restored by id.
-        }
         let key = channel.0.clone();
         if self.last_saved_active_channel.as_deref() == Some(key.as_str()) {
             return;
@@ -7627,18 +7719,18 @@ exit 1
     /// If a previous-session channel is queued for restoration and it is now
     /// present in state, activate it.
     fn try_restore_pending_channel(&mut self) {
+        if !self.chat_input_buf.is_empty()
+            || self.split_panes.panes.iter().any(|pane| !pane.input_buf.is_empty())
+        {
+            self.cancel_pending_layout_restore();
+        }
         let Some(key) = self.pending_restore_channel.clone() else {
             return;
         };
         let target = ChannelId(key);
-        if target.is_virtual() {
-            // Pseudo-tab sentinels can never appear in state.channels; clear
-            // immediately so they don't permanently suppress persistence.
-            self.pending_restore_channel = None;
-            return;
-        }
-        if self.state.channels.contains_key(&target) {
-            self.activate_channel(target);
+        if target.is_virtual() || self.state.channels.contains_key(&target) {
+            let focus_composer = self.restore_can_focus_composer();
+            self.apply_channel_activation(target, focus_composer);
             self.pending_restore_channel = None;
         }
     }
@@ -7650,17 +7742,6 @@ exit 1
         // the previous-session channel to come online; otherwise a transient
         // "first channel in list" activation clobbers the user's choice.
         if self.pending_restore_channel.is_some() {
-            return;
-        }
-        // Never persist any pseudo-tab sentinel (Live / Mentions) as the
-        // last-active channel; restore would never find them anyway.
-        if self
-            .state
-            .active_channel
-            .as_ref()
-            .map(|c| c.is_virtual())
-            .unwrap_or(false)
-        {
             return;
         }
         let current = self.state.active_channel.as_ref().map(|c| c.0.clone());
@@ -7733,10 +7814,9 @@ exit 1
                 .split_panes
                 .panes
                 .iter()
-                .filter(|p| !p.channel.is_virtual())
                 .map(|p| (p.channel.0.clone(), p.frac))
                 .collect();
-            let focused = self.split_panes.focused;
+            let focused = self.split_panes.focused.min(panes.len().saturating_sub(1));
             let panes_changed = panes.len() != self.last_saved_split_panes.len()
                 || panes
                     .iter()
@@ -7766,6 +7846,11 @@ exit 1
     /// Apply the previous session's channel order and split-pane layout once
     /// the relevant channels have finished joining.
     fn try_restore_pending_layout(&mut self) {
+        if !self.chat_input_buf.is_empty()
+            || self.split_panes.panes.iter().any(|pane| !pane.input_buf.is_empty())
+        {
+            self.cancel_pending_layout_restore();
+        }
         // Channel order: reorder once every persisted channel has joined.
         if !self.pending_restore_channel_order.is_empty() {
             let mut still_missing = false;
@@ -7787,12 +7872,7 @@ exit 1
                         new_order.push(ch.clone());
                     }
                 }
-                self.state.channel_order = new_order.clone();
-                self.last_saved_channel_order = new_order
-                    .iter()
-                    .filter(|c| !c.is_virtual())
-                    .map(|c| c.0.clone())
-                    .collect();
+                self.state.channel_order = new_order;
                 self.pending_restore_channel_order.clear();
             }
         }
@@ -7801,32 +7881,49 @@ exit 1
         if !self.pending_restore_split_panes.is_empty() {
             let mut all_present = true;
             for (key, _) in &self.pending_restore_split_panes {
-                if !self.state.channels.contains_key(&ChannelId(key.clone())) {
+                let channel = ChannelId(key.clone());
+                if !channel.is_virtual() && !self.state.channels.contains_key(&channel) {
                     all_present = false;
                     break;
                 }
             }
             if all_present {
+                let focus_composer = self.restore_can_focus_composer();
                 self.split_panes.panes.clear();
-                for (key, frac) in &self.pending_restore_split_panes {
+                for (key, _) in &self.pending_restore_split_panes {
                     let ch = ChannelId(key.clone());
                     self.split_panes.add_pane(ch, None);
-                    if let Some(p) = self.split_panes.panes.last_mut() {
-                        p.frac = *frac;
-                    }
+                }
+                // add_pane redistributes existing widths. Apply saved weights
+                // only after all panes exist, using f64 to avoid sum overflow.
+                let saved_weights: Vec<f64> = self.pending_restore_split_panes.iter()
+                    .take(self.split_panes.panes.len())
+                    .map(|(_, frac)| if frac.is_finite() && *frac > 0.0 {
+                        f64::from(*frac)
+                    } else {
+                        1.0
+                    })
+                    .collect();
+                let total: f64 = saved_weights.iter().sum();
+                for (pane, weight) in self.split_panes.panes.iter_mut().zip(saved_weights) {
+                    pane.frac = (weight / total) as f32;
                 }
                 self.split_panes.normalize_fractions();
                 self.split_panes.focused = self
                     .pending_restore_split_focused
                     .min(self.split_panes.panes.len().saturating_sub(1));
-                self.last_saved_split_panes = self
-                    .split_panes
-                    .panes
-                    .iter()
-                    .map(|p| (p.channel.0.clone(), p.frac))
-                    .collect();
-                self.last_saved_split_focused = self.split_panes.focused;
                 self.pending_restore_split_panes.clear();
+                if let Some(channel) = self.split_panes.focused_channel().cloned() {
+                    self.state.active_channel = Some(channel.clone());
+                    if let Some(state) = self.state.channels.get_mut(&channel) {
+                        state.mark_read();
+                    }
+                    if focus_composer {
+                        if let Some(ctx) = self.egui_ctx.as_ref() {
+                            self.focus_chat_composer(ctx);
+                        }
+                    }
+                }
             }
         }
     }
@@ -7986,6 +8083,7 @@ exit 1
             } else if let Some(active) = self.state.active_channel.clone() {
                 if let Some(idx) = self.state.channel_order.iter().position(|ch| ch == &active) {
                     if idx > 0 {
+                        self.cancel_pending_layout_restore();
                         self.state.channel_order.swap(idx, idx - 1);
                     }
                 }
@@ -7998,6 +8096,7 @@ exit 1
             } else if let Some(active) = self.state.active_channel.clone() {
                 if let Some(idx) = self.state.channel_order.iter().position(|ch| ch == &active) {
                     if idx + 1 < self.state.channel_order.len() {
+                        self.cancel_pending_layout_restore();
                         self.state.channel_order.swap(idx, idx + 1);
                     }
                 }
@@ -8077,6 +8176,7 @@ exit 1
                 if self.state.channel_order.contains(&id) {
                     self.activate_channel(id);
                 } else if self.try_send_cmd(AppCommand::JoinChannel { channel: id.clone() }) {
+                    self.cancel_pending_layout_restore();
                     // Navigate to the new tab immediately; the JoinChannel
                     // command's ChannelJoined event arrives later but won't
                     // change `active_channel` since join_channel only sets it
@@ -8174,6 +8274,7 @@ impl CrustApp {
         }
 
         self.apply_font_scale(ctx);
+        self.cancel_pending_layout_restore_for_input(ctx);
         self.try_restore_pending_channel();
         self.try_restore_pending_layout();
         self.reconcile_last_active_channel();
@@ -8521,6 +8622,7 @@ impl CrustApp {
             .join_dialog
             .show(ctx, self.kick_beta_enabled, self.irc_beta_enabled)
         {
+            self.cancel_pending_layout_restore();
             self.send_cmd(AppCommand::JoinChannel { channel: ch });
         }
         // For the login dialog, prefer 7TV animated avatar if available.
@@ -9037,14 +9139,16 @@ impl CrustApp {
             )
             .show(ctx, |ui| {
                 let bar_width = ui.available_width();
-                let visibility =
-                    toolbar_visibility(bar_width, self.irc_beta_enabled, moderation_available);
-                let compact_account = visibility.compact_account;
                 let (dot_color, conn_label) = if self.pending_auth.is_some() {
                     (t::yellow(), "Signing in...")
                 } else {
                     connection_indicator(&self.state.connection, self.state.auth.logged_in)
                 };
+                let measured = ToolbarMeasurements::new(ui, conn_label, self.topbar_account_width(ui));
+                let visibility = toolbar_visibility(
+                    bar_width, self.irc_beta_enabled, moderation_available, &measured,
+                );
+                let compact_account = visibility.compact_account;
                 let row_size = ui.available_size_before_wrap();
                 ui.allocate_ui_with_layout(
                     row_size,
@@ -9057,9 +9161,7 @@ impl CrustApp {
                         };
                         // Scale button padding so ⋯ menu + wrapped menu items
                         // don't get overlapped by neighbours at large topbar fonts.
-                        let tb_pad_x = (t::topbar_font_size() * 0.55).max(8.0);
-                        let tb_pad_y = (t::topbar_font_size() * 0.3).max(4.0);
-                        ui.spacing_mut().button_padding = egui::vec2(tb_pad_x, tb_pad_y);
+                        ui.spacing_mut().button_padding = topbar_button_padding();
                         ui.spacing_mut().interact_size.y = t::bar_h();
 
                         if visibility.show_logo {
@@ -9141,14 +9243,17 @@ impl CrustApp {
                                 ui,
                                 compact_account,
                                 visibility.ultra_compact_account,
+                                measured.account,
                             );
                             if !visibility.compact_controls
                                 || visibility.show_overflow_menu
                             {
-                                let sep_gap = (t::topbar_font_size() * 0.4).max(6.0);
-                                ui.add_space(sep_gap);
-                                ui.separator();
-                                ui.add_space(sep_gap);
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(TOOLBAR_SEPARATOR_W, t::bar_h() * 0.7),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().vline(rect.center().x, rect.y_range(),
+                                    egui::Stroke::new(1.0_f32, t::border_subtle()));
                             }
 
                             if visibility.show_overflow_menu {
@@ -9291,20 +9396,10 @@ impl CrustApp {
                                         ui.close_menu();
                                     }
                                 });
-                                if bar_width > 520.0 {
-                                    ui.separator();
-                                }
                             }
 
                             chrome::toolbar_group_frame().show(ui, |ui| {
-                                let action_count = 1 + usize::from(visibility.show_perf_toggle)
-                                    + usize::from(visibility.show_stats_toggle)
-                                    + usize::from(visibility.show_whispers_toggle)
-                                    + usize::from(visibility.show_irc_toggle);
-                                let action_width = estimate_toolbar_group_width(action_count, 4.0,
-                                    visibility.compact_controls) - TOOLBAR_GROUP_FRAME_W
-                                    + if visibility.show_mod_button { TOOLBAR_MOD_BUTTON_W + 4.0 } else { 0.0 };
-                                ui.set_width(action_width.min(ui.available_width()));
+                                ui.set_width(measured.action_content_width(&visibility));
                                 ui.with_layout(
                                     egui::Layout::left_to_right(egui::Align::Center),
                                     |ui| {
@@ -10268,6 +10363,7 @@ impl CrustApp {
             self.close_channel_tab(ch, ctx);
         }
         if let Some(new_order) = ch_reordered {
+            self.cancel_pending_layout_restore();
             self.state.channel_order = new_order;
         }
 
@@ -10311,6 +10407,7 @@ impl CrustApp {
 
         // Drag-to-split: create a new pane for the dragged channel.
         if let Some(ch) = ch_drag_split {
+            self.cancel_pending_layout_restore();
             if let Some(existing_idx) = self.split_panes.panes.iter().position(|p| p.channel == ch)
             {
                 self.split_panes.focused = existing_idx;
@@ -10415,6 +10512,7 @@ impl CrustApp {
                             if sep_resp.dragged() {
                                 let dx = sep_resp.drag_delta().x;
                                 if dx.abs() > 0.0 {
+                                    self.cancel_pending_layout_restore();
                                     let dfrac = dx / usable_w;
                                     let a = &mut self.split_panes.panes[si];
                                     let new_a = (a.frac + dfrac).max(0.10);
@@ -10474,6 +10572,7 @@ impl CrustApp {
 
                         // Child controls also select their pane before dispatching actions.
                         if pane_pointer_pressed(ctx, pane_rect, ui.layer_id()) {
+                            self.cancel_pending_layout_restore();
                             self.split_panes.focused = pi;
                             self.state.active_channel = Some(ch.clone());
                         }
@@ -10577,6 +10676,13 @@ impl CrustApp {
                             use crate::widgets::mentions::MentionsList;
                             let action = MentionsList {
                                 mentions: &self.state.mentions,
+                                body: crate::widgets::message_list::MessageBody {
+                                    emote_bytes: &self.emote_bytes,
+                                    cmd_tx: &self.cmd_tx,
+                                    link_previews: &self.link_previews,
+                                    animate_emotes: animations_allowed,
+                                    hide_link_previews: self.streamer_mode_active && self.streamer_hide_link_previews,
+                                },
                                 show_timestamps: self.show_timestamps,
                                 show_timestamp_seconds: self.show_timestamp_seconds,
                                 use_24h_timestamps: self.use_24h_timestamps,
@@ -10921,6 +11027,13 @@ impl CrustApp {
                         use crate::widgets::mentions::MentionsList;
                         let action = MentionsList {
                             mentions: &self.state.mentions,
+                            body: crate::widgets::message_list::MessageBody {
+                                emote_bytes: &self.emote_bytes,
+                                cmd_tx: &self.cmd_tx,
+                                link_previews: &self.link_previews,
+                                animate_emotes: animations_allowed,
+                                hide_link_previews: self.streamer_mode_active && self.streamer_hide_link_previews,
+                            },
                             show_timestamps: self.show_timestamps,
                             show_timestamp_seconds: self.show_timestamp_seconds,
                             use_24h_timestamps: self.use_24h_timestamps,
@@ -13426,7 +13539,7 @@ fn whisper_fit_size(w: u32, h: u32, target_h: f32) -> egui::Vec2 {
 mod tests {
     use super::{
         filter_channels_for_query, parse_slash_command, parse_twitch_channel_login_arg,
-        quick_switch_priority_bucket, responsive_layout, toolbar_visibility, top_tab_metrics,
+        quick_switch_priority_bucket, responsive_layout, top_tab_metrics,
         whisper_thread_matches_query, EventToast, SplitPanes, TabVisualStyle,
     };
     use crate::theme as t;
@@ -15767,6 +15880,507 @@ mod tests {
         t::set_ui_font_size(original_ui_size);
     }
 
+    fn saved_layout_event() -> AppEvent {
+        AppEvent::RestoreLastActiveChannel {
+            channel: "delayed".into(),
+            channel_order: vec!["delayed".into(), "first".into(), "second".into()],
+            split_panes: vec![("first".into(), 0.4), ("delayed".into(), 0.6)],
+            split_panes_focused: 1,
+            whispers_visible: false,
+            last_whisper_login: String::new(),
+        }
+    }
+
+    #[test]
+    fn saved_layout_waits_for_delayed_joins_and_restores_widths_and_focus() {
+        let (mut app, mut commands) = test_app();
+        let ctx = egui::Context::default();
+        app.state.join_channel(ChannelId::new("second"));
+        app.state.join_channel(ChannelId::new("first"));
+        app.apply_event(saved_layout_event(), &ctx);
+        app.try_restore_pending_channel();
+        app.try_restore_pending_layout();
+        app.reconcile_last_active_channel();
+        app.reconcile_persistent_ui_state();
+        assert!(commands.try_recv().is_err(), "an incomplete join must not overwrite the saved layout");
+        assert_eq!(app.pending_restore_channel.as_deref(), Some("delayed"));
+        assert_eq!(app.pending_restore_split_panes.len(), 2);
+        assert!(app.split_panes.panes.is_empty());
+
+        app.state.join_channel(ChannelId::new("delayed"));
+        app.try_restore_pending_channel();
+        app.try_restore_pending_layout();
+        assert!(app.pending_restore_channel.is_none());
+        assert!(app.pending_restore_channel_order.is_empty());
+        assert!(app.pending_restore_split_panes.is_empty());
+        assert_eq!(app.state.channel_order, ["delayed", "first", "second"].map(ChannelId::new));
+        assert_eq!(app.state.active_channel, Some(ChannelId::new("delayed")));
+        assert_eq!(app.split_panes.focused, 1);
+        assert!((app.split_panes.panes[0].frac - 0.4).abs() < 0.0001);
+        assert!((app.split_panes.panes[1].frac - 0.6).abs() < 0.0001);
+        assert!(!app.layout_restore_cancelled, "restoration itself is not a user edit");
+    }
+
+    #[test]
+    fn saved_layout_explicit_navigation_wins_before_or_after_restore_event() {
+        for restore_arrives_first in [false, true] {
+            let (mut app, _commands) = test_app();
+            let ctx = egui::Context::default();
+            for channel in ["first", "second"] {
+                app.state.join_channel(ChannelId::new(channel));
+            }
+            if restore_arrives_first {
+                app.apply_event(saved_layout_event(), &ctx);
+            }
+            app.activate_channel(ChannelId::new("second"));
+            if !restore_arrives_first {
+                app.apply_event(saved_layout_event(), &ctx);
+            }
+            app.state.join_channel(ChannelId::new("delayed"));
+            app.try_restore_pending_channel();
+            app.try_restore_pending_layout();
+            assert_eq!(app.state.active_channel, Some(ChannelId::new("second")));
+            assert_eq!(app.state.channel_order, ["first", "second", "delayed"].map(ChannelId::new));
+            assert!(app.split_panes.panes.is_empty());
+            assert!(app.pending_restore_channel.is_none());
+            assert!(app.pending_restore_channel_order.is_empty());
+            assert!(app.pending_restore_split_panes.is_empty());
+        }
+    }
+
+    #[test]
+    fn saved_layout_tab_reorder_and_close_survive_a_late_join() {
+        for close_tab in [false, true] {
+            let (mut app, mut commands) = test_app();
+            let ctx = egui::Context::default();
+            for channel in ["first", "second"] {
+                app.state.join_channel(ChannelId::new(channel));
+            }
+            app.state.active_channel = Some(ChannelId::new("second"));
+            app.apply_event(saved_layout_event(), &ctx);
+            if close_tab {
+                app.close_channel_tab(ChannelId::new("first"), &ctx);
+            } else {
+                let _ = ctx.run(shortcut_input(egui::Key::ArrowLeft,
+                    egui::Modifiers::ALT | egui::Modifiers::SHIFT), |ctx| {
+                    app.handle_channel_shortcuts(ctx);
+                });
+            }
+            app.state.join_channel(ChannelId::new("delayed"));
+            app.try_restore_pending_channel();
+            app.try_restore_pending_layout();
+            app.reconcile_persistent_ui_state();
+            let expected: Vec<_> = if close_tab { vec!["second", "delayed"] }
+                else { vec!["second", "first", "delayed"] };
+            assert_eq!(app.state.channel_order, expected.iter().map(|name| ChannelId::new(*name)).collect::<Vec<_>>());
+            assert!(app.split_panes.panes.is_empty());
+            let mut saved_order = None;
+            while let Ok(command) = commands.try_recv() {
+                if let AppCommand::SetChannelOrder { order } = command {
+                    saved_order = Some(order);
+                }
+            }
+            assert_eq!(saved_order, Some(expected.into_iter().map(str::to_owned).collect()));
+        }
+    }
+
+    #[test]
+    fn saved_layout_manual_split_actions_cancel_delayed_replacement() {
+        for action in 0..3 {
+            let (mut app, _commands) = test_app();
+            let ctx = egui::Context::default();
+            for channel in ["first", "second"] {
+                app.state.join_channel(ChannelId::new(channel));
+                app.split_panes.add_pane(ChannelId::new(channel), None);
+            }
+            app.apply_event(saved_layout_event(), &ctx);
+            match action {
+                0 => {
+                    app.split_panes.focused = 1;
+                    app.sync_split_focus(&ctx);
+                }
+                1 => app.close_split_pane(0, &ctx),
+                _ => app.keep_split_pane(1, &ctx),
+            }
+            let pane_ids: Vec<_> = app.split_panes.panes.iter().map(|pane| pane.id).collect();
+            app.state.join_channel(ChannelId::new("delayed"));
+            app.try_restore_pending_channel();
+            app.try_restore_pending_layout();
+            assert_eq!(app.state.active_channel, Some(ChannelId::new("second")));
+            assert_eq!(app.split_panes.panes.iter().map(|pane| pane.id).collect::<Vec<_>>(), pane_ids);
+            assert!(app.pending_restore_split_panes.is_empty());
+        }
+    }
+
+    #[test]
+    fn saved_layout_does_not_move_or_discard_a_new_draft() {
+        for split_draft in [false, true] {
+            let (mut app, _commands) = test_app();
+            let ctx = egui::Context::default();
+            app.state.join_channel(ChannelId::new("first"));
+            app.apply_event(saved_layout_event(), &ctx);
+            let draft = "new unsent 🙂 draft";
+            if split_draft {
+                app.split_panes.add_pane(ChannelId::new("first"), None);
+                app.split_panes.panes[0].input_buf = draft.into();
+            } else {
+                app.chat_input_buf = draft.into();
+            }
+            app.state.join_channel(ChannelId::new("second"));
+            app.state.join_channel(ChannelId::new("delayed"));
+            app.try_restore_pending_channel();
+            app.try_restore_pending_layout();
+            assert_eq!(app.state.active_channel, Some(ChannelId::new("first")));
+            assert!(app.pending_restore_split_panes.is_empty());
+            if split_draft {
+                assert_eq!(app.split_panes.panes.len(), 1);
+                assert_eq!(app.split_panes.panes[0].input_buf, draft);
+            } else {
+                assert!(app.split_panes.panes.is_empty());
+                assert_eq!(app.chat_input_buf, draft);
+            }
+        }
+    }
+
+    #[test]
+    fn saved_layout_virtual_panes_round_trip_active_channel_widths_and_focus() {
+        let layout = [ChannelId::live_feed(), ChannelId::new("first"), ChannelId::mentions(), ChannelId::new("second")];
+        let widths = [0.1, 0.2, 0.3, 0.4];
+        for focused in 0..layout.len() {
+            let (mut app, mut commands) = test_app();
+            let ctx = egui::Context::default();
+            for channel in ["first", "second"] {
+                app.state.join_channel(ChannelId::new(channel));
+            }
+            for channel in &layout {
+                app.split_panes.add_pane(channel.clone(), None);
+            }
+            for (pane, frac) in app.split_panes.panes.iter_mut().zip(widths) {
+                pane.frac = frac;
+            }
+            app.activate_channel(layout[focused].clone());
+            app.reconcile_persistent_ui_state();
+            let mut saved_active = None;
+            let mut saved_order = None;
+            let mut saved_panes = None;
+            while let Ok(command) = commands.try_recv() {
+                match command {
+                    AppCommand::SetLastActiveChannel { channel } => saved_active = Some(channel),
+                    AppCommand::SetChannelOrder { order } => saved_order = Some(order),
+                    AppCommand::SetSplitPanes { panes, focused } => saved_panes = Some((panes, focused)),
+                    _ => {},
+                }
+            }
+            assert_eq!(saved_active.as_deref(), Some(layout[focused].as_str()));
+            let (panes, saved_focus) = saved_panes.expect("the complete split layout is saved");
+            assert_eq!(saved_focus, focused);
+            assert_eq!(panes.iter().map(|(channel, _)| channel.as_str()).collect::<Vec<_>>(),
+                layout.iter().map(ChannelId::as_str).collect::<Vec<_>>());
+
+            let (mut restored, mut restored_commands) = test_app();
+            for channel in ["second", "first"] {
+                restored.state.join_channel(ChannelId::new(channel));
+            }
+            restored.apply_event(AppEvent::RestoreLastActiveChannel {
+                channel: saved_active.unwrap(), channel_order: saved_order.unwrap(),
+                split_panes: panes, split_panes_focused: saved_focus,
+                whispers_visible: false, last_whisper_login: String::new(),
+            }, &ctx);
+            restored.try_restore_pending_channel();
+            restored.try_restore_pending_layout();
+            assert_eq!(restored.state.active_channel, Some(layout[focused].clone()));
+            assert_eq!(restored.split_panes.focused, focused);
+            assert!(restored.pending_restore_split_panes.is_empty());
+            for ((pane, channel), frac) in restored.split_panes.panes.iter().zip(&layout).zip(widths) {
+                assert_eq!(&pane.channel, channel);
+                assert!((pane.frac - frac).abs() < 0.0001);
+            }
+            restored.reconcile_last_active_channel();
+            restored.reconcile_persistent_ui_state();
+            assert!(restored_commands.try_recv().is_err(), "an unchanged restored layout needs no rewrite");
+        }
+    }
+
+    #[test]
+    fn saved_layout_virtual_single_channel_selection_round_trips() {
+        for virtual_channel in [ChannelId::live_feed(), ChannelId::mentions()] {
+            let (mut app, mut commands) = test_app();
+            let ctx = egui::Context::default();
+            app.state.active_channel = Some(virtual_channel.clone());
+            app.reconcile_last_active_channel();
+            let AppCommand::SetLastActiveChannel { channel } = commands.try_recv().unwrap() else { panic!() };
+            assert_eq!(channel, virtual_channel.0);
+            let (mut restored, _commands) = test_app();
+            restored.apply_event(AppEvent::RestoreLastActiveChannel {
+                channel, channel_order: Vec::new(), split_panes: Vec::new(),
+                split_panes_focused: 0, whispers_visible: false, last_whisper_login: String::new(),
+            }, &ctx);
+            restored.try_restore_pending_channel();
+            assert_eq!(restored.state.active_channel, Some(virtual_channel));
+            assert!(restored.pending_restore_channel.is_none());
+        }
+    }
+
+    #[test]
+    fn saved_layout_first_text_or_paste_stays_in_the_focused_composer() {
+        for split in [false, true] {
+            for paste in [false, true] {
+                let (mut app, _commands) = test_app();
+                let ctx = egui::Context::default();
+                app.state.auth.logged_in = true;
+                for channel in ["first", "second"] {
+                    app.state.join_channel(ChannelId::new(channel));
+                    if split { app.split_panes.add_pane(ChannelId::new(channel), None); }
+                }
+                let composer_id = super::chat_composer_id(split.then(|| app.split_panes.panes[0].id));
+                for _ in 0..3 { production_ui_frame(&ctx, &mut app, Vec::new()); }
+                ctx.memory_mut(|memory| memory.request_focus(composer_id));
+                production_ui_frame(&ctx, &mut app, Vec::new());
+                assert!(ctx.memory(|memory| memory.has_focus(composer_id)));
+                assert!(app.chat_input_buf.is_empty());
+                assert!(app.split_panes.panes.iter().all(|pane| pane.input_buf.is_empty()));
+                assert!(!app.layout_restore_cancelled);
+                app.apply_event(saved_layout_event(), &ctx);
+                app.state.join_channel(ChannelId::new("delayed"));
+                let text = "first typed 🙂 draft";
+                let event = if paste { egui::Event::Paste(text.into()) } else { egui::Event::Text(text.into()) };
+                crate::widgets::chat_input::with_test_clipboard_image(None, || {
+                    production_ui_frame(&ctx, &mut app, vec![event]);
+                });
+                assert_eq!(app.state.active_channel, Some(ChannelId::new("first")));
+                assert!(ctx.memory(|memory| memory.has_focus(composer_id)));
+                assert!(app.pending_restore_channel.is_none());
+                assert!(app.pending_restore_split_panes.is_empty());
+                if split {
+                    assert_eq!(app.split_panes.panes[0].input_buf, text, "split={split}, paste={paste}");
+                    assert!(app.split_panes.panes[1].input_buf.is_empty());
+                } else {
+                    assert_eq!(app.chat_input_buf, text, "split={split}, paste={paste}");
+                    assert!(app.split_panes.panes.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn saved_layout_ime_composition_respects_focused_fields() {
+        for focus in [None, Some(super::chat_composer_id(None)), Some(egui::Id::new("search_input"))] {
+            let (mut app, _commands) = test_app();
+            let ctx = egui::Context::default();
+            if let Some(focus) = focus { ctx.memory_mut(|memory| memory.request_focus(focus)); }
+            let _ = ctx.run(egui::RawInput {
+                events: vec![egui::Event::Ime(egui::ImeEvent::Preedit("に".into()))],
+                ..Default::default()
+            }, |ctx| app.cancel_pending_layout_restore_for_input(ctx));
+            assert_eq!(app.layout_restore_cancelled, focus.is_some());
+        }
+    }
+
+    #[test]
+    fn saved_layout_typing_in_channel_search_preserves_its_channel_and_input() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("first");
+        for name in ["first", "second"] { app.state.join_channel(ChannelId::new(name)); }
+        app.message_search_mut(&channel).request_open();
+        let input_id = egui::Id::new("message_search_field").with(channel.as_str()).with("keyword");
+        for _ in 0..3 { production_ui_frame(&ctx, &mut app, Vec::new()); }
+        assert!(ctx.memory(|memory| memory.has_focus(input_id)));
+        app.apply_event(saved_layout_event(), &ctx);
+        app.state.join_channel(ChannelId::new("delayed"));
+        production_ui_frame(&ctx, &mut app, vec![egui::Event::Text("find this".into())]);
+        assert_eq!(app.state.active_channel, Some(channel.clone()));
+        assert_eq!(app.message_search[&channel].keyword, "find this");
+        assert!(app.split_panes.panes.is_empty());
+        assert!(app.pending_restore_channel.is_none());
+        production_ui_frame(&ctx, &mut app, Vec::new());
+        assert!(ctx.memory(|memory| memory.has_focus(input_id)));
+        production_ui_frame(&ctx, &mut app, vec![egui::Event::Text(" please".into())]);
+        assert_eq!(app.message_search[&channel].keyword, "find this please");
+        assert!(app.chat_input_buf.is_empty());
+    }
+
+    #[test]
+    fn saved_layout_passive_external_focus_survives_without_a_queued_composer_request() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        for name in ["first", "second"] { app.state.join_channel(ChannelId::new(name)); }
+        app.settings_open = true;
+        app.settings_section = super::SettingsSection::Appearance;
+        let input_id = egui::Id::new("settings_search");
+        for _ in 0..3 { production_ui_frame(&ctx, &mut app, Vec::new()); }
+        ctx.memory_mut(|memory| memory.request_focus(input_id));
+        production_ui_frame(&ctx, &mut app, Vec::new());
+        assert!(ctx.memory(|memory| memory.has_focus(input_id)));
+        app.apply_event(saved_layout_event(), &ctx);
+        app.state.join_channel(ChannelId::new("delayed"));
+        production_ui_frame(&ctx, &mut app, Vec::new());
+        assert_eq!(app.state.active_channel, Some(ChannelId::new("delayed")));
+        assert_eq!(app.split_panes.panes.len(), 2);
+        assert!(ctx.memory(|memory| memory.has_focus(input_id)));
+        production_ui_frame(&ctx, &mut app, vec![egui::Event::Text("updates".into())]);
+        assert!(app.settings_section == super::SettingsSection::Updates);
+        assert!(ctx.memory(|memory| memory.has_focus(input_id)));
+        assert!(app.chat_input_buf.is_empty());
+        assert!(app.split_panes.panes.iter().all(|pane| pane.input_buf.is_empty()));
+    }
+
+    #[test]
+    fn saved_layout_sidebar_click_keeps_the_channel_under_the_pointer() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        app.channel_layout = super::ChannelLayout::Sidebar;
+        app.sidebar_visible = true;
+        for name in ["first", "second"] { app.state.join_channel(ChannelId::new(name)); }
+        let mut output = egui::FullOutput::default();
+        for _ in 0..3 { output = production_ui_frame(&ctx, &mut app, Vec::new()); }
+        let point = visible_text_rect(&output, "# second").expect("the target sidebar row is visible").center();
+        app.apply_event(saved_layout_event(), &ctx);
+        app.state.join_channel(ChannelId::new("delayed"));
+        for pressed in [true, false] {
+            production_ui_frame(&ctx, &mut app, vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point, button: egui::PointerButton::Primary,
+                    pressed, modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+        }
+        assert_eq!(app.state.active_channel, Some(ChannelId::new("second")));
+        assert_eq!(app.state.channel_order, ["first", "second", "delayed"].map(ChannelId::new));
+        assert!(app.split_panes.panes.is_empty());
+        assert!(app.pending_restore_channel.is_none());
+        assert!(app.pending_restore_split_panes.is_empty());
+    }
+
+    #[test]
+    fn saved_layout_navigation_and_scroll_take_precedence_over_a_late_restore() {
+        for navigate in [false, true] {
+            let (mut app, _commands) = test_app();
+            let ctx = egui::Context::default();
+            for name in ["first", "second"] { app.state.join_channel(ChannelId::new(name)); }
+            for _ in 0..3 { production_ui_frame(&ctx, &mut app, Vec::new()); }
+            app.apply_event(saved_layout_event(), &ctx);
+            app.state.join_channel(ChannelId::new("delayed"));
+            let events = if navigate {
+                shortcut_input(egui::Key::Tab, egui::Modifiers::CTRL).events
+            } else {
+                vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, 32.0), modifiers: egui::Modifiers::NONE,
+                }]
+            };
+            production_ui_frame(&ctx, &mut app, events);
+            assert_eq!(app.state.active_channel,
+                Some(ChannelId::new(if navigate { "second" } else { "first" })));
+            assert!(app.pending_restore_channel.is_none());
+            assert!(app.pending_restore_channel_order.is_empty());
+            assert!(app.pending_restore_split_panes.is_empty());
+            assert!(app.split_panes.panes.is_empty());
+        }
+    }
+
+    #[test]
+    fn saved_layout_passive_pointer_and_ime_notifications_do_not_cancel_restore() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        for name in ["first", "second"] { app.state.join_channel(ChannelId::new(name)); }
+        app.apply_event(saved_layout_event(), &ctx);
+        let _ = ctx.run(egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(egui::pos2(100.0, 100.0)),
+                egui::Event::Ime(egui::ImeEvent::Enabled),
+                egui::Event::Ime(egui::ImeEvent::Disabled),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::Vec2::ZERO, modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        }, |ctx| app.cancel_pending_layout_restore_for_input(ctx));
+        assert!(!app.layout_restore_cancelled);
+        assert_eq!(app.pending_restore_channel.as_deref(), Some("delayed"));
+        app.state.join_channel(ChannelId::new("delayed"));
+        app.try_restore_pending_channel();
+        app.try_restore_pending_layout();
+        assert_eq!(app.state.active_channel, Some(ChannelId::new("delayed")));
+        assert_eq!(app.split_panes.panes.len(), 2);
+    }
+
+    #[test]
+    fn saved_layout_redirects_pending_channels_and_persists_the_new_targets() {
+        let (mut app, mut commands) = test_app();
+        let ctx = egui::Context::default();
+        let old = ChannelId::parse_user_input("ircs://irc.example.test/#old").unwrap();
+        let new = ChannelId::parse_user_input("ircs://irc.example.test/#new").unwrap();
+        let delayed = ChannelId::new("delayed");
+        app.state.join_channel(old.clone());
+        app.state.join_channel(new.clone());
+        app.apply_event(AppEvent::RestoreLastActiveChannel {
+            channel: old.0.clone(),
+            channel_order: vec![old.0.clone(), new.0.clone(), delayed.0.clone()],
+            split_panes: vec![(old.0.clone(), 0.2), (new.0.clone(), 0.3), (delayed.0.clone(), 0.5)],
+            split_panes_focused: 1,
+            whispers_visible: false, last_whisper_login: String::new(),
+        }, &ctx);
+        app.apply_event(AppEvent::ChannelRedirected { old_channel: old, new_channel: new.clone() }, &ctx);
+        assert_eq!(app.pending_restore_channel.as_deref(), Some(new.as_str()));
+        assert_eq!(app.pending_restore_channel_order, [new.0.clone(), delayed.0.clone()]);
+        assert_eq!(app.pending_restore_split_panes[0].0, new.0);
+        assert_eq!(app.pending_restore_split_panes[1].0, new.0);
+        app.try_restore_pending_channel();
+        app.try_restore_pending_layout();
+        assert_eq!(app.pending_restore_split_panes.len(), 3, "the other valid join is still pending");
+        app.state.join_channel(delayed.clone());
+        app.try_restore_pending_layout();
+        app.reconcile_persistent_ui_state();
+        assert!(app.pending_restore_channel_order.is_empty());
+        assert!(app.pending_restore_split_panes.is_empty());
+        assert_eq!(app.split_panes.focused, 1);
+        assert_eq!(app.state.active_channel, Some(new.clone()));
+        let mut saved_active = None;
+        let mut saved_order = None;
+        let mut saved_panes = None;
+        while let Ok(command) = commands.try_recv() {
+            match command {
+                AppCommand::SetLastActiveChannel { channel } => saved_active = Some(channel),
+                AppCommand::SetChannelOrder { order } => saved_order = Some(order),
+                AppCommand::SetSplitPanes { panes, focused } => saved_panes = Some((panes, focused)),
+                _ => {},
+            }
+        }
+        assert_eq!(saved_active, Some(new.0.clone()));
+        assert_eq!(saved_order, Some(vec![new.0.clone(), delayed.0.clone()]));
+        let (panes, focused) = saved_panes.expect("the migrated snapshot must survive the next launch");
+        assert_eq!(focused, 1);
+        assert_eq!(panes.iter().map(|(channel, _)| channel.as_str()).collect::<Vec<_>>(),
+            [new.as_str(), new.as_str(), delayed.as_str()]);
+        for ((_, frac), expected) in panes.iter().zip([0.2, 0.3, 0.5]) {
+            assert!((*frac - expected).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn saved_layout_extreme_weights_remain_finite_and_duplicate_focus_is_preserved() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        app.state.join_channel(ChannelId::new("first"));
+        app.apply_event(AppEvent::RestoreLastActiveChannel {
+            channel: "first".into(),
+            channel_order: vec!["first".into()],
+            split_panes: vec![("first".into(), f32::MAX), ("first".into(), f32::MAX)],
+            split_panes_focused: 1,
+            whispers_visible: false,
+            last_whisper_login: String::new(),
+        }, &ctx);
+        app.try_restore_pending_channel();
+        app.try_restore_pending_layout();
+        assert_eq!(app.split_panes.focused, 1);
+        assert_eq!(app.split_panes.panes.len(), 2);
+        assert_ne!(app.split_panes.panes[0].id, app.split_panes.panes[1].id);
+        assert!(app.split_panes.panes.iter().all(|pane| (pane.frac - 0.5).abs() < 0.0001));
+    }
+
     #[test]
     fn previous_tab_shortcut_is_not_consumed_as_next_tab() {
         let (mut app, _commands) = test_app();
@@ -16941,6 +17555,83 @@ mod tests {
 
         let shown = toolbar_visibility(900.0, true, true);
         assert!(shown.show_irc_toggle);
+    }
+
+    fn toolbar_visibility(width: f32, irc: bool, moderation: bool) -> super::ToolbarVisibility {
+        let ctx = egui::Context::default();
+        let mut visibility = None;
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let measured = super::ToolbarMeasurements::new(ui, "Connected", 118.0);
+                visibility = Some(super::toolbar_visibility(width, irc, moderation, &measured));
+            });
+        });
+        visibility.unwrap()
+    }
+
+    #[test]
+    fn toolbar_long_account_labels_stay_inside_disjoint_controls() {
+        let (mut app, _commands) = test_app();
+        app.state.auth.logged_in = true;
+        let name = "W".repeat(25);
+        app.state.auth.username = Some(name.clone());
+        app.irc_beta_enabled = true;
+        let ctx = egui::Context::default();
+        let mut account_text_point = None;
+        for width in [350.0, 520.0, 600.0, 900.0, 1200.0] {
+            let input = || egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO,
+                    egui::vec2(width, 400.0))),
+                ..Default::default()
+            };
+            for _ in 0..2 {
+                let _ = ctx.run(input(), |ctx| app.update_ui(ctx));
+            }
+            let output = ctx.run(input(), |ctx| app.update_ui(ctx));
+            let toolbar = ctx.read_response(egui::Id::new("status_bar"))
+                .expect("toolbar has a response").rect;
+            let controls: Vec<_> = output.shapes.iter().filter_map(|shape| {
+                let egui::Shape::Rect(rect) = &shape.shape else { return None; };
+                let height = rect.rect.height();
+                (toolbar.y_range().contains(rect.rect.center().y)
+                    && [t::icon_btn(), t::icon_btn_sm(), t::bar_h()].iter()
+                        .any(|expected| (height - expected).abs() < 0.1))
+                    .then_some(rect.rect)
+            }).collect();
+            assert!(controls.len() >= 2, "account and settings remain visible at {width}");
+            for (index, control) in controls.iter().enumerate() {
+                assert!(toolbar.contains_rect(*control),
+                    "control outside toolbar at {width}: {control:?}");
+                for other in &controls[index + 1..] {
+                    assert!(!control.shrink(0.5).intersects(other.shrink(0.5)),
+                        "overlapping toolbar controls at {width}: {control:?}, {other:?}");
+                }
+            }
+            if let Some(text) = output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == name
+                    && toolbar.y_range().contains(text.pos.y) => Some(text),
+                _ => None,
+            }) {
+                let account = controls.iter().find(|rect| rect.contains(text.pos)).unwrap();
+                assert!(account.width() <= 230.0 * t::font_scale() + 0.1);
+                assert!(text.pos.x + text.galley.size().x <= account.right() + 0.5,
+                    "account label is clipped to its measured pill");
+                account_text_point = Some(text.pos + text.galley.size() * 0.5);
+            }
+        }
+        let point = account_text_point.expect("wide toolbar shows the account label");
+        for pressed in [true, false] {
+            let _ = ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 400.0))),
+                events: vec![egui::Event::PointerMoved(point), egui::Event::PointerButton {
+                    pos: point, button: egui::PointerButton::Primary, pressed,
+                    modifiers: Default::default(),
+                }],
+                ..Default::default()
+            }, |ctx| app.update_ui(ctx));
+        }
+        assert!(app.login_dialog.open, "the elided account label remains clickable");
     }
 
     #[test]

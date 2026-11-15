@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::model::{ChatMessage, TwitchEmotePos};
+
 fn bool_true() -> bool {
     true
 }
@@ -173,10 +175,8 @@ impl CompiledIgnoredUsers {
 // Phrase matching
 
 enum PhraseMatcher {
-    Substring {
-        needle: String,
-        case_sensitive: bool,
-    },
+    Substring(String),
+    CaseInsensitiveSubstring(regex::Regex),
     Regex(regex::Regex),
 }
 
@@ -218,10 +218,14 @@ impl CompiledIgnoredPhrases {
                     Ok(re) => PhraseMatcher::Regex(re),
                     Err(_) => continue, // silently skip invalid regex
                 }
+            } else if p.case_sensitive {
+                PhraseMatcher::Substring(p.pattern.clone())
             } else {
-                PhraseMatcher::Substring {
-                    needle: p.pattern.clone(),
-                    case_sensitive: p.case_sensitive,
+                let mut builder = regex::RegexBuilder::new(&regex::escape(&p.pattern));
+                builder.case_insensitive(true);
+                match builder.build() {
+                    Ok(re) => PhraseMatcher::CaseInsensitiveSubstring(re),
+                    Err(_) => continue,
                 }
             };
             out.push(CompiledPhrase {
@@ -242,22 +246,31 @@ impl CompiledIgnoredPhrases {
     /// Returns a [`PhraseApplyOutcome`] describing which rule kinds fired.
     /// `text` is mutated in place when a `Replace` action matches.
     pub fn apply(&self, text: &mut String) -> PhraseApplyOutcome {
+        self.apply_with_emotes(text, &mut Vec::new())
+    }
+
+    /// Apply rules to original message text while retaining native emote identities.
+    pub fn apply_to_message(&self, message: &mut ChatMessage) -> PhraseApplyOutcome {
+        let outcome = self.apply_with_emotes(&mut message.raw_text, &mut message.twitch_emotes);
+        message.flags.is_highlighted |= outcome.highlight_only;
+        message.flags.is_mention |= outcome.mention_only;
+        outcome
+    }
+
+    /// Shift native emote character ranges through replacements. An edit inside
+    /// an emote removes that occurrence; unrelated emotes retain their IDs.
+    pub fn apply_with_emotes(
+        &self,
+        text: &mut String,
+        emotes: &mut Vec<TwitchEmotePos>,
+    ) -> PhraseApplyOutcome {
         let mut out = PhraseApplyOutcome::default();
         for p in &self.phrases {
             let matched = match &p.matcher {
-                PhraseMatcher::Substring {
-                    needle,
-                    case_sensitive,
-                } => {
-                    if *case_sensitive {
-                        text.contains(needle.as_str())
-                    } else if needle.is_ascii() && text.is_ascii() {
-                        ascii_contains_insensitive(text, needle)
-                    } else {
-                        text.to_lowercase().contains(&needle.to_lowercase())
-                    }
+                PhraseMatcher::Substring(needle) => text.contains(needle.as_str()),
+                PhraseMatcher::CaseInsensitiveSubstring(re) | PhraseMatcher::Regex(re) => {
+                    re.is_match(text)
                 }
-                PhraseMatcher::Regex(re) => re.is_match(text),
             };
             if !matched {
                 continue;
@@ -274,21 +287,29 @@ impl CompiledIgnoredPhrases {
                     out.mention_only = true;
                 }
                 IgnoredPhraseAction::Replace => {
-                    let replaced = match &p.matcher {
-                        PhraseMatcher::Substring {
-                            needle,
-                            case_sensitive,
-                        } => {
-                            if *case_sensitive {
-                                text.replace(needle.as_str(), &p.replace_with)
-                            } else {
-                                replace_ascii_insensitive(text, needle, &p.replace_with)
+                    let mut writer = PhraseReplacement::new(text, emotes);
+                    match &p.matcher {
+                        PhraseMatcher::Substring(needle) => {
+                            for (start, _) in text.match_indices(needle.as_str()) {
+                                writer.replace(start..start + needle.len(), &p.replace_with);
+                            }
+                        }
+                        PhraseMatcher::CaseInsensitiveSubstring(re) => {
+                            for matched in re.find_iter(text) {
+                                writer.replace(matched.range(), &p.replace_with);
                             }
                         }
                         PhraseMatcher::Regex(re) => {
-                            re.replace_all(text, p.replace_with.as_str()).into_owned()
+                            let mut replacement = String::new();
+                            for captures in re.captures_iter(text) {
+                                let matched = captures.get(0).expect("whole regex match");
+                                replacement.clear();
+                                captures.expand(&p.replace_with, &mut replacement);
+                                writer.replace(matched.range(), &replacement);
+                            }
                         }
-                    };
+                    }
+                    let replaced = writer.finish();
                     if replaced != *text {
                         *text = replaced;
                         out.replaced = true;
@@ -300,54 +321,79 @@ impl CompiledIgnoredPhrases {
     }
 }
 
-fn ascii_contains_insensitive(haystack: &str, needle: &str) -> bool {
-    let h = haystack.as_bytes();
-    let n = needle.as_bytes();
-    if n.is_empty() {
-        return true;
-    }
-    if n.len() > h.len() {
-        return false;
-    }
-    let first = n[0].to_ascii_lowercase();
-    let last_start = h.len() - n.len();
-    'outer: for start in 0..=last_start {
-        if h[start].to_ascii_lowercase() != first {
-            continue;
-        }
-        for i in 1..n.len() {
-            if !h[start + i].eq_ignore_ascii_case(&n[i]) {
-                continue 'outer;
-            }
-        }
-        return true;
-    }
-    false
+struct PhraseReplacement<'a> {
+    original: &'a str,
+    output: String,
+    byte_cursor: usize,
+    character_cursor: usize,
+    emotes: &'a mut Vec<TwitchEmotePos>,
 }
 
-fn replace_ascii_insensitive(haystack: &str, needle: &str, replacement: &str) -> String {
-    if needle.is_empty() {
-        return haystack.to_owned();
-    }
-    let h = haystack.as_bytes();
-    let n = needle.as_bytes();
-    let mut out = String::with_capacity(haystack.len());
-    let mut i = 0;
-    while i < h.len() {
-        if i + n.len() <= h.len()
-            && h[i..i + n.len()]
-                .iter()
-                .zip(n.iter())
-                .all(|(a, b)| a.eq_ignore_ascii_case(b))
-        {
-            out.push_str(replacement);
-            i += n.len();
-        } else {
-            out.push(h[i] as char);
-            i += 1;
+impl<'a> PhraseReplacement<'a> {
+    fn new(original: &'a str, emotes: &'a mut Vec<TwitchEmotePos>) -> Self {
+        Self {
+            original,
+            output: String::with_capacity(original.len()),
+            byte_cursor: 0,
+            character_cursor: 0,
+            emotes,
         }
     }
-    out
+
+    fn replace(&mut self, range: std::ops::Range<usize>, replacement: &str) {
+        let unchanged = &self.original[self.byte_cursor..range.start];
+        self.output.push_str(unchanged);
+        self.character_cursor += unchanged.chars().count();
+
+        let matched = &self.original[range.clone()];
+        let removed = matched.chars().count();
+        let inserted = replacement.chars().count();
+        if matched != replacement {
+            let start = self.character_cursor;
+            let end = start + removed;
+            self.emotes.retain_mut(|emote| {
+                let Some(emote_end) = emote.end.checked_add(1) else {
+                    return false;
+                };
+                if emote.start >= emote_end {
+                    return false;
+                }
+                let overlaps = if removed == 0 {
+                    emote.start < start && start < emote_end
+                } else {
+                    emote.start < end && start < emote_end
+                };
+                if overlaps {
+                    return false;
+                }
+                if emote.start >= end {
+                    let shifted_start = emote
+                        .start
+                        .checked_sub(removed)
+                        .and_then(|value| value.checked_add(inserted));
+                    let shifted_end = emote
+                        .end
+                        .checked_sub(removed)
+                        .and_then(|value| value.checked_add(inserted));
+                    let (Some(shifted_start), Some(shifted_end)) = (shifted_start, shifted_end)
+                    else {
+                        return false;
+                    };
+                    emote.start = shifted_start;
+                    emote.end = shifted_end;
+                }
+                true
+            });
+        }
+        self.output.push_str(replacement);
+        self.character_cursor += inserted;
+        self.byte_cursor = range.end;
+    }
+
+    fn finish(mut self) -> String {
+        self.output.push_str(&self.original[self.byte_cursor..]);
+        self.output
+    }
 }
 
 #[cfg(test)]
@@ -411,6 +457,195 @@ mod tests {
         let mut text = "foo bar foo".to_owned();
         compiled.apply(&mut text);
         assert_eq!(text, "[redacted] bar [redacted]");
+    }
+
+    #[test]
+    fn literal_replacement_preserves_surrounding_unicode() {
+        let mut phrase = IgnoredPhrase::new("badword");
+        phrase.action = IgnoredPhraseAction::Replace;
+        let compiled = CompiledIgnoredPhrases::new(&[phrase]);
+        let mut text = "🦀 BADWORD café 世界 badword 🎉".to_owned();
+        assert!(compiled.apply(&mut text).replaced);
+        assert_eq!(text, "🦀 *** café 世界 *** 🎉");
+    }
+
+    #[test]
+    fn literal_replacement_matches_unicode_case_without_changing_other_text() {
+        for (pattern, text, expected) in [
+            ("CAFÉ", "café CAFÉ 🦀", "*** *** 🦀"),
+            ("ß", "ẞ ß café", "*** *** café"),
+            ("k", "K K k 世界", "*** *** *** 世界"),
+        ] {
+            let mut phrase = IgnoredPhrase::new(pattern);
+            phrase.action = IgnoredPhraseAction::Replace;
+            let compiled = CompiledIgnoredPhrases::new(&[phrase]);
+            let mut actual = text.to_owned();
+            assert!(compiled.apply(&mut actual).replaced, "{pattern}");
+            assert_eq!(actual, expected, "{pattern}");
+        }
+    }
+
+    #[test]
+    fn literal_replacement_keeps_metacharacters_and_capture_syntax_literal() {
+        let mut phrase = IgnoredPhrase::new("a.b");
+        phrase.action = IgnoredPhraseAction::Replace;
+        phrase.replace_with = "$1🦀".into();
+        let compiled = CompiledIgnoredPhrases::new(&[phrase]);
+        let mut text = "axb A.B a.b".to_owned();
+        assert!(compiled.apply(&mut text).replaced);
+        assert_eq!(text, "axb $1🦀 $1🦀");
+    }
+
+    #[test]
+    fn literal_replacement_uses_nonoverlapping_matches() {
+        let mut phrase = IgnoredPhrase::new("aba");
+        phrase.action = IgnoredPhraseAction::Replace;
+        phrase.replace_with = "x".into();
+        let compiled = CompiledIgnoredPhrases::new(&[phrase]);
+        let mut text = "ABABA AbA aba".to_owned();
+        assert!(compiled.apply(&mut text).replaced);
+        assert_eq!(text, "xBA x x");
+    }
+
+    #[test]
+    fn case_sensitive_literal_replacement_preserves_unicode_and_case() {
+        let mut phrase = IgnoredPhrase::new("café");
+        phrase.case_sensitive = true;
+        phrase.action = IgnoredPhraseAction::Replace;
+        let compiled = CompiledIgnoredPhrases::new(&[phrase]);
+        let mut text = "CAFÉ café 🦀".to_owned();
+        assert!(compiled.apply(&mut text).replaced);
+        assert_eq!(text, "CAFÉ *** 🦀");
+    }
+
+    #[test]
+    fn empty_disabled_and_unmatched_replacement_rules_leave_text_intact() {
+        let mut empty = IgnoredPhrase::new("");
+        empty.action = IgnoredPhraseAction::Replace;
+        let mut disabled = IgnoredPhrase::new("café");
+        disabled.action = IgnoredPhraseAction::Replace;
+        disabled.enabled = false;
+        let mut unmatched = IgnoredPhrase::new("missing");
+        unmatched.action = IgnoredPhraseAction::Replace;
+        let compiled = CompiledIgnoredPhrases::new(&[empty, disabled, unmatched]);
+        let mut text = "café 🦀".to_owned();
+        assert!(!compiled.apply(&mut text).replaced);
+        assert_eq!(text, "café 🦀");
+    }
+
+    fn replacement(pattern: &str, value: &str, regex: bool) -> IgnoredPhrase {
+        let mut phrase = IgnoredPhrase::new(pattern);
+        phrase.action = IgnoredPhraseAction::Replace;
+        phrase.replace_with = value.into();
+        phrase.is_regex = regex;
+        phrase
+    }
+
+    fn native_emote(id: &str, start: usize, end: usize) -> TwitchEmotePos {
+        TwitchEmotePos {
+            id: id.into(),
+            start,
+            end,
+        }
+    }
+
+    fn emote_ranges(emotes: &[TwitchEmotePos]) -> Vec<(&str, usize, usize)> {
+        emotes
+            .iter()
+            .map(|emote| (emote.id.as_str(), emote.start, emote.end))
+            .collect()
+    }
+
+    #[test]
+    fn replacements_shift_native_emotes_by_characters_and_preserve_unknown_ids() {
+        let compiled = CompiledIgnoredPhrases::new(&[
+            replacement("bad", "éé", false),
+            replacement("fin", "世界", false),
+        ]);
+        let mut text = "🦀 bad Native bad Other fin".to_owned();
+        let mut emotes = vec![
+            native_emote("unowned-1", 6, 11),
+            native_emote("unowned-2", 17, 21),
+        ];
+        assert!(compiled.apply_with_emotes(&mut text, &mut emotes).replaced);
+        assert_eq!(text, "🦀 éé Native éé Other 世界");
+        assert_eq!(
+            emote_ranges(&emotes),
+            [("unowned-1", 5, 10), ("unowned-2", 15, 19)]
+        );
+
+        let spans = crate::format::tokenize_with_flags(&text, false, &emotes, &|_| None);
+        let rendered: Vec<_> = spans
+            .iter()
+            .filter_map(|span| match span {
+                crate::model::Span::Emote { id, code, .. } => Some((id.as_str(), code.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rendered, [("unowned-1", "Native"), ("unowned-2", "Other")]);
+    }
+
+    #[test]
+    fn replacement_drops_only_overlapping_native_emotes() {
+        let compiled = CompiledIgnoredPhrases::new(&[replacement("app", "oo", false)]);
+        let mut text = "Before Kappa After".to_owned();
+        let mut emotes = vec![
+            native_emote("before", 0, 5),
+            native_emote("overlap", 7, 11),
+            native_emote("after", 13, 17),
+        ];
+        compiled.apply_with_emotes(&mut text, &mut emotes);
+        assert_eq!(text, "Before Kooa After");
+        assert_eq!(emote_ranges(&emotes), [("before", 0, 5), ("after", 12, 16)]);
+    }
+
+    #[test]
+    fn sequential_unicode_replacements_keep_emote_offsets_consistent() {
+        let compiled = CompiledIgnoredPhrases::new(&[
+            replacement("ß", "ss", false),
+            replacement("ss", "", false),
+        ]);
+        let mut text = "ẞ Native".to_owned();
+        let mut emotes = vec![native_emote("native", 2, 7)];
+        compiled.apply_with_emotes(&mut text, &mut emotes);
+        assert_eq!(text, " Native");
+        assert_eq!(emote_ranges(&emotes), [("native", 1, 6)]);
+    }
+
+    #[test]
+    fn regex_capture_replacements_shift_emotes_using_expanded_text() {
+        let compiled = CompiledIgnoredPhrases::new(&[replacement(r"[xy](\d+)", "[$1]🦀", true)]);
+        let mut text = "x12 Native y345".to_owned();
+        let mut emotes = vec![native_emote("native", 4, 9)];
+        compiled.apply_with_emotes(&mut text, &mut emotes);
+        assert_eq!(text, "[12]🦀 Native [345]🦀");
+        assert_eq!(emote_ranges(&emotes), [("native", 6, 11)]);
+    }
+
+    #[test]
+    fn empty_regex_matches_preserve_boundary_emotes_and_remove_split_codes() {
+        let mut text = "Native".to_owned();
+        let mut emotes = vec![native_emote("native", 0, 5)];
+        CompiledIgnoredPhrases::new(&[replacement("^|$", "🦀", true)])
+            .apply_with_emotes(&mut text, &mut emotes);
+        assert_eq!(text, "🦀Native🦀");
+        assert_eq!(emote_ranges(&emotes), [("native", 1, 6)]);
+
+        let mut text = "Native".to_owned();
+        let mut emotes = vec![native_emote("native", 0, 5)];
+        CompiledIgnoredPhrases::new(&[replacement("x*", ".", true)])
+            .apply_with_emotes(&mut text, &mut emotes);
+        assert_eq!(text, ".N.a.t.i.v.e.");
+        assert!(emotes.is_empty());
+    }
+
+    #[test]
+    fn unchanged_replacement_keeps_native_emote_metadata() {
+        let compiled = CompiledIgnoredPhrases::new(&[replacement("Native", "Native", false)]);
+        let mut text = "Native".to_owned();
+        let mut emotes = vec![native_emote("native", 0, 5)];
+        assert!(!compiled.apply_with_emotes(&mut text, &mut emotes).replaced);
+        assert_eq!(emote_ranges(&emotes), [("native", 0, 5)]);
     }
 
     #[test]

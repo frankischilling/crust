@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crust_core::{
     events::AppEvent,
+    ignores::{CompiledIgnoredPhrases, IgnoredPhrase},
     model::{
         ChannelId, ChatMessage, HistoryCursor, LocalHistoryMessageIdentity, LocalHistoryPageInfo,
         MessageId, ModerationAction, ModerationState, ModerationTarget, Nickname,
@@ -75,10 +76,11 @@ impl WhisperAccount {
 
 /// Keep the sender's supplied identity when live whispers enter history and the UI.
 pub(crate) async fn prepare_live_whisper(
-    event: AppEvent,
+    mut event: AppEvent,
     local_login: Option<&str>,
     local_user_id: Option<&str>,
     emote_index: &crate::EmoteIndex,
+    ignored_phrases: &CompiledIgnoredPhrases,
     log_writer: Option<&LogWriter>,
 ) -> Option<AppEvent> {
     let AppEvent::WhisperReceived {
@@ -86,9 +88,12 @@ pub(crate) async fn prepare_live_whisper(
         from_user_id,
         from_login,
         target_login,
+        text,
+        twitch_emotes,
         is_self,
+        is_history,
         ..
-    } = &event
+    } = &mut event
     else {
         return None;
     };
@@ -101,6 +106,14 @@ pub(crate) async fn prepare_live_whisper(
     }
     let owner = crate::normalize_whisper_login(if *is_self { from_login } else { target_login });
     if owner.as_deref() != Some(local_login.as_str()) {
+        return None;
+    }
+    if !*is_self
+        && !*is_history
+        && ignored_phrases
+            .apply_with_emotes(text, twitch_emotes)
+            .blocked
+    {
         return None;
     }
     emote_index
@@ -438,6 +451,136 @@ mod whisper_tests {
     }
 
     #[tokio::test]
+    async fn incoming_whisper_blocking_precedes_storage_and_sender_loading() {
+        let store = LogStore::with_db_path(":memory:".into()).unwrap();
+        let (writer_events, _writer_received) = mpsc::channel(4);
+        let writer = LogWriter::new(
+            &tokio::runtime::Handle::current(),
+            store.clone(),
+            writer_events,
+        );
+        let index = crate::EmoteIndex::default();
+        index.write().unwrap().set_account(Some("10"));
+        let mut incoming = whisper("10", "alice", false);
+        if let AppEvent::WhisperReceived {
+            from_user_id, text, ..
+        } = &mut incoming
+        {
+            *from_user_id = "20".into();
+            *text = "SPAM".into();
+        }
+        let rules = CompiledIgnoredPhrases::new(&[IgnoredPhrase::new("spam")]);
+        assert!(prepare_live_whisper(
+            incoming,
+            Some("alice"),
+            Some("10"),
+            &index,
+            &rules,
+            Some(&writer),
+        )
+        .await
+        .is_none());
+        writer.shutdown().await.unwrap();
+        assert!(store
+            .recent_channels_with_prefix("whisper:", 10)
+            .unwrap()
+            .is_empty());
+        assert!(index
+            .write()
+            .unwrap()
+            .next_deferred_personal_load()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn incoming_whisper_replacement_preserves_emotes_and_replays_once() {
+        let store = LogStore::with_db_path(":memory:".into()).unwrap();
+        let (writer_events, _writer_received) = mpsc::channel(4);
+        let writer = LogWriter::new(
+            &tokio::runtime::Handle::current(),
+            store.clone(),
+            writer_events,
+        );
+        let index = crate::EmoteIndex::default();
+        index.write().unwrap().set_account(Some("10"));
+        let mut phrase = IgnoredPhrase::new("badword");
+        phrase.action = crust_core::ignores::IgnoredPhraseAction::Replace;
+        phrase.replace_with = "badwordbadword".into();
+        let rules = CompiledIgnoredPhrases::new(&[phrase]);
+        let mut incoming = whisper("10", "alice", false);
+        if let AppEvent::WhisperReceived {
+            from_user_id,
+            text,
+            twitch_emotes,
+            ..
+        } = &mut incoming
+        {
+            *from_user_id = "20".into();
+            *text = "badword Native 🦀".into();
+            twitch_emotes.push(crust_core::model::TwitchEmotePos {
+                id: "unowned".into(),
+                start: 8,
+                end: 13,
+            });
+        }
+        let forwarded = prepare_live_whisper(
+            incoming,
+            Some("alice"),
+            Some("10"),
+            &index,
+            &rules,
+            Some(&writer),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(forwarded, AppEvent::WhisperReceived { text, twitch_emotes, is_history: false, .. }
+            if text == "badwordbadword Native 🦀" && twitch_emotes.len() == 1
+            && twitch_emotes[0].id == "unowned"
+            && twitch_emotes[0].start == 15 && twitch_emotes[0].end == 20)
+        );
+        writer.shutdown().await.unwrap();
+
+        let (events, mut received) = mpsc::channel(4);
+        load_local_recent_whispers(store, Some("alice".into()), Some("10".into()), events, None)
+            .await;
+        let replay = received.try_recv().unwrap();
+        assert!(
+            matches!(&replay, AppEvent::WhisperReceived { text, twitch_emotes, is_history: true, .. }
+            if text == "badwordbadword Native 🦀" && twitch_emotes.len() == 1
+            && twitch_emotes[0].start == 15 && twitch_emotes[0].end == 20)
+        );
+        assert!(received.try_recv().is_err());
+        let unchanged =
+            prepare_live_whisper(replay, Some("alice"), Some("10"), &index, &rules, None)
+                .await
+                .unwrap();
+        assert!(
+            matches!(unchanged, AppEvent::WhisperReceived { text, is_history: true, .. }
+            if text == "badwordbadword Native 🦀")
+        );
+    }
+
+    #[tokio::test]
+    async fn self_whisper_echoes_keep_the_sent_text_when_phrase_rules_match() {
+        let index = crate::EmoteIndex::default();
+        index.write().unwrap().set_account(Some("10"));
+        let mut outgoing = whisper("10", "alice", true);
+        if let AppEvent::WhisperReceived { text, .. } = &mut outgoing {
+            *text = "spam".into();
+        }
+        let rules = CompiledIgnoredPhrases::new(&[IgnoredPhrase::new("spam")]);
+        let forwarded =
+            prepare_live_whisper(outgoing, Some("alice"), Some("10"), &index, &rules, None)
+                .await
+                .unwrap();
+        assert!(
+            matches!(forwarded, AppEvent::WhisperReceived { text, is_self: true, .. }
+            if text == "spam")
+        );
+    }
+
+    #[tokio::test]
     async fn live_whisper_sender_ids_survive_storage_and_replay_for_personal_emotes() {
         let store = LogStore::with_db_path(":memory:".into()).unwrap();
         let (writer_events, _writer_received) = mpsc::channel(4);
@@ -460,10 +603,16 @@ mod whisper_tests {
             *text = "PersonalHello".into();
             *is_history = false;
         }
-        let forwarded =
-            prepare_live_whisper(live, Some("alice"), Some("10"), &live_index, Some(&writer))
-                .await
-                .unwrap();
+        let forwarded = prepare_live_whisper(
+            live,
+            Some("alice"),
+            Some("10"),
+            &live_index,
+            &CompiledIgnoredPhrases::new(&[]),
+            Some(&writer),
+        )
+        .await
+        .unwrap();
         writer.shutdown().await.unwrap();
         assert!(
             matches!(forwarded, AppEvent::WhisperReceived { from_user_id, is_history: false, .. } if from_user_id == "20")
@@ -564,11 +713,16 @@ mod whisper_tests {
         if let AppEvent::WhisperReceived { from_user_id, .. } = &mut stale {
             *from_user_id = "20".into();
         }
-        assert!(
-            prepare_live_whisper(stale, Some("alice"), Some("30"), &index, Some(&writer))
-                .await
-                .is_none()
-        );
+        assert!(prepare_live_whisper(
+            stale,
+            Some("alice"),
+            Some("30"),
+            &index,
+            &CompiledIgnoredPhrases::new(&[]),
+            Some(&writer)
+        )
+        .await
+        .is_none());
         writer.shutdown().await.unwrap();
         assert!(index
             .write()
@@ -1015,6 +1169,7 @@ fn parse_history_records(
     nicknames: &[Nickname],
     channel: &ChannelId,
     saved_actions: &[ModerationAction],
+    ignored_phrases: &[IgnoredPhrase],
 ) -> (Vec<ChatMessage>, Vec<ModerationAction>) {
     let state = ModerationState::default();
     state.remember(saved_actions);
@@ -1037,19 +1192,6 @@ fn parse_history_records(
             "PRIVMSG" => {
                 let id = crate::HISTORY_MSG_ID.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 if let Some(mut message) = parse_privmsg_irc(&record, local_nick, id) {
-                    if let Some(nick) = local_nick {
-                        message.flags.is_mention =
-                            crust_core::highlight::contains_mention(&message.raw_text, nick)
-                                || message.reply.as_ref().is_some_and(|reply| {
-                                    reply.parent_user_login.eq_ignore_ascii_case(nick)
-                                })
-                                || crust_core::highlight::contains_nickname_mention(
-                                    &message.raw_text,
-                                    nick,
-                                    channel.display_name(),
-                                    nicknames,
-                                );
-                    }
                     state.apply(&mut message);
                     state.observe_deleted(&message);
                     messages.push(message);
@@ -1107,6 +1249,27 @@ fn parse_history_records(
             }
         }
     }
+    let ignored_phrases = CompiledIgnoredPhrases::new(ignored_phrases);
+    messages.retain_mut(|message| {
+        if ignored_phrases.apply_to_message(message).blocked {
+            return false;
+        }
+        if let Some(nick) = local_nick {
+            message.flags.is_mention |=
+                crust_core::highlight::contains_mention(&message.raw_text, nick)
+                    || message
+                        .reply
+                        .as_ref()
+                        .is_some_and(|reply| reply.parent_user_login.eq_ignore_ascii_case(nick))
+                    || crust_core::highlight::contains_nickname_mention(
+                        &message.raw_text,
+                        nick,
+                        channel.display_name(),
+                        nicknames,
+                    );
+        }
+        true
+    });
     (messages, actions)
 }
 
@@ -1116,6 +1279,99 @@ mod moderation_history_tests {
 
     fn lines(raw: &[&str]) -> Vec<String> {
         raw.iter().map(|line| (*line).to_owned()).collect()
+    }
+
+    fn phrase_rule(
+        pattern: &str,
+        action: crust_core::ignores::IgnoredPhraseAction,
+        replacement: &str,
+    ) -> IgnoredPhrase {
+        let mut phrase = IgnoredPhrase::new(pattern);
+        phrase.action = action;
+        phrase.replace_with = replacement.into();
+        phrase
+    }
+
+    #[test]
+    fn remote_history_applies_all_phrase_actions_before_display() {
+        use crust_core::ignores::IgnoredPhraseAction;
+
+        let rules = [
+            phrase_rule("spam", IgnoredPhraseAction::Block, ""),
+            phrase_rule("urgent", IgnoredPhraseAction::MentionOnly, ""),
+            phrase_rule("bright", IgnoredPhraseAction::HighlightOnly, ""),
+            phrase_rule("badword", IgnoredPhraseAction::Replace, "é"),
+        ];
+        let (messages, _) = parse_history_records(&lines(&[
+            "@id=blocked;tmi-sent-ts=1000 :bob!user@host PRIVMSG #room :SPAM",
+            "@id=mention;tmi-sent-ts=1001 :bob!user@host PRIVMSG #room :urgent",
+            "@id=highlight;tmi-sent-ts=1002 :bob!user@host PRIVMSG #room :bright",
+            "@id=replaced;emotes=unowned:8-13;tmi-sent-ts=1003 :bob!user@host PRIVMSG #room :badword Native",
+        ]), Some("alice"), &[], &ChannelId::new("room"), &[], &rules);
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].server_id.as_deref(), Some("mention"));
+        assert!(messages[0].flags.is_mention);
+        assert!(messages[1].flags.is_highlighted);
+        assert_eq!(messages[2].raw_text, "é Native");
+        assert_eq!(messages[2].twitch_emotes.len(), 1);
+        assert_eq!(messages[2].twitch_emotes[0].id, "unowned");
+        assert_eq!(
+            (
+                messages[2].twitch_emotes[0].start,
+                messages[2].twitch_emotes[0].end
+            ),
+            (2, 7)
+        );
+        assert!(messages.iter().all(|message| message.flags.is_history));
+    }
+
+    #[test]
+    fn remote_history_detects_name_mentions_after_replacement() {
+        use crust_core::ignores::IgnoredPhraseAction;
+
+        let rules = [
+            phrase_rule("@alice", IgnoredPhraseAction::Replace, "@other"),
+            phrase_rule("welcome", IgnoredPhraseAction::Replace, "@alice"),
+        ];
+        let (messages, _) = parse_history_records(
+            &lines(&[
+                "@id=removed;tmi-sent-ts=1000 :bob!user@host PRIVMSG #room :hello @alice",
+                "@id=created;tmi-sent-ts=1001 :bob!user@host PRIVMSG #room :welcome",
+            ]),
+            Some("alice"),
+            &[],
+            &ChannelId::new("room"),
+            &[],
+            &rules,
+        );
+        assert_eq!(messages[0].raw_text, "hello @other");
+        assert!(!messages[0].flags.is_mention);
+        assert_eq!(messages[1].raw_text, "@alice");
+        assert!(messages[1].flags.is_mention);
+    }
+
+    #[test]
+    fn filtered_history_still_publishes_its_deletion_records() {
+        let channel = ChannelId::new("room");
+        let (messages, actions) = parse_history_records(
+            &lines(&[
+                "@id=blocked;rm-deleted=1;tmi-sent-ts=1000 :bob!user@host PRIVMSG #room :spam",
+            ]),
+            None,
+            &[],
+            &channel,
+            &[],
+            &[IgnoredPhrase::new("spam")],
+        );
+        assert!(messages.is_empty());
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].channel, channel);
+        assert_eq!(
+            actions[0].target,
+            crust_core::model::ModerationTarget::Message("blocked".into())
+        );
+        assert!(actions[0].timestamp.is_none());
     }
 
     #[test]
@@ -1133,6 +1389,7 @@ mod moderation_history_tests {
             &[],
             &channel,
             &saved,
+            &[],
         );
         assert!(messages[0].flags.is_deleted);
         assert!(actions.is_empty());
@@ -1148,7 +1405,7 @@ mod moderation_history_tests {
             "@id=late;user-id=1;tmi-sent-ts=950 :alice!user@host PRIVMSG #room :late old text",
             "@id=old;user-id=1;tmi-sent-ts=900 :alice!user@host PRIVMSG #elsewhere :another channel",
             "@target-msg-id=unrelated :tmi.twitch.tv CLEARMSG #elsewhere :ignored",
-        ]), None, &[], &ChannelId::new("room"), &[]);
+        ]), None, &[], &ChannelId::new("room"), &[], &[]);
         assert_eq!(
             messages
                 .iter()
@@ -1175,7 +1432,7 @@ mod moderation_history_tests {
             "@id=explicit;user-id=2;tmi-sent-ts=1100 :bob!user@host PRIVMSG #room :removed text",
             "@id=flagged;rm-deleted=1;tmi-sent-ts=1200 :bob!user@host PRIVMSG #room :flagged text",
             "@id=broken",
-        ]), None, &[], &ChannelId::new("room"), &[]);
+        ]), None, &[], &ChannelId::new("room"), &[], &[]);
         assert_eq!(
             messages
                 .iter()
@@ -1199,7 +1456,7 @@ mod moderation_history_tests {
             "@id=longer;tmi-sent-ts=1001 :bob!user@host PRIVMSG #room :hello @Local names!",
         ]);
         let parse = |nicknames: &[Nickname], account| {
-            parse_history_records(&raw, account, nicknames, &channel, &[]).0
+            parse_history_records(&raw, account, nicknames, &channel, &[], &[]).0
         };
         assert_eq!(
             parse(&[nickname.clone()], Some("ALICE"))
@@ -1237,7 +1494,7 @@ mod moderation_history_tests {
             "@id=longer;tmi-sent-ts=1001 :bob!user@host PRIVMSG #room :hello @alice_other!",
             "@id=reply;reply-parent-msg-id=parent;reply-parent-user-login=ALICE;reply-parent-display-name=Alice;reply-parent-msg-body=question;tmi-sent-ts=1002 :bob!user@host PRIVMSG #room :an answer",
             "@id=other;reply-parent-msg-id=parent;reply-parent-user-login=alice_other;reply-parent-display-name=Other;reply-parent-msg-body=question;tmi-sent-ts=1003 :bob!user@host PRIVMSG #room :another answer",
-        ]), Some("alice"), &[], &ChannelId::new("room"), &[]);
+        ]), Some("alice"), &[], &ChannelId::new("room"), &[], &[]);
         assert_eq!(
             messages
                 .iter()
@@ -1256,6 +1513,7 @@ pub(crate) async fn load_recent_messages(
     channel: &str,
     local_nick: Option<&str>,
     nicknames: &[Nickname],
+    ignored_phrases: &[IgnoredPhrase],
     emote_index: &crate::EmoteIndex,
     badge_map: &BadgeMap,
     evt_tx: &mpsc::Sender<AppEvent>,
@@ -1410,6 +1668,7 @@ pub(crate) async fn load_recent_messages(
     };
     let local_nick_owned = local_nick.map(str::to_owned);
     let nicknames = nicknames.to_vec();
+    let ignored_phrases = ignored_phrases.to_vec();
     let channel_scope = ch.to_owned();
     let query_channel = channel_id.clone();
     flush_before_read(log_writer.as_ref()).await;
@@ -1433,6 +1692,7 @@ pub(crate) async fn load_recent_messages(
             &nicknames,
             &query_channel,
             &saved_actions,
+            &ignored_phrases,
         );
         for msg in &mut messages {
             // Tokenize spans

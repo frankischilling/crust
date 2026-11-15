@@ -58,9 +58,10 @@ for current settings and account-dialog captures.
 - [Features and keybinds](docs/FEATURES_AND_KEYBINDS.md)
 - [Chat controls and performance audit](docs/AUDIT_STABILITY.md)
 - [Chat loading, emotes, and navigation audit](docs/AUDIT_CHAT_RELIABILITY.md)
+- [Chat rendering, input, and saved-layout audit](docs/AUDIT_CHAT_POLISH.md)
 - [Plugin API reference](docs/API.md)
 - [Example plugins](plugins/)
-- [Release notes v0.5.6](docs/releases/Release_v0.5.6.md)
+- [Release notes v0.5.7](docs/releases/Release_v0.5.7.md)
 
 ## Data paths
 

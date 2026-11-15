@@ -171,6 +171,11 @@ impl UiImageCache {
         }
     }
 
+    /// Read layout dimensions without fetching or retaining an offscreen image.
+    pub(crate) fn peek(&self, url: &str) -> Option<&ImageBytes> {
+        self.entries.get(url).map(|entry| &entry.image)
+    }
+
     /// Inspect presence without requesting an off-screen prefetch or pinning it.
     #[cfg(test)]
     pub(crate) fn contains_key(&self, url: &str) -> bool {

@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
+    hash::{DefaultHasher, Hash, Hasher},
     sync::Arc,
 };
 
@@ -8,10 +9,10 @@ use egui::{
     Stroke, Ui, Vec2,
 };
 
-use crust_core::model::{ChannelId, ChatMessage, MessageId};
+use crust_core::model::{ChannelId, ChatMessage, MessageId, Span};
 
 use crate::theme as t;
-use crate::widgets::message_list::format_message_timestamp;
+use crate::widgets::message_list::{format_message_timestamp, MessageBody};
 
 /// One-shot action emitted by [`MentionsList::show`] when the user interacts
 /// with a row. The app is expected to switch `state.active_channel` to the
@@ -25,15 +26,11 @@ pub struct MentionJumpTarget {
 /// Cross-channel "Mentions" pseudo-tab renderer.
 ///
 /// Renders the `state.mentions` ring buffer with a channel pill on each row
-/// that also doubles as a click target to jump back to the original message
-/// in its source channel (B4 acceptance criterion).
-///
-/// The rendering is intentionally simplified relative to
-/// [`super::message_list::MessageList`]: the Mentions tab is a *pointer*
-/// into the real chat, not a replacement for it. Users click through to see
-/// full emote/badge rendering in the source channel's own buffer.
-pub struct MentionsList<'a> {
+/// that also jumps back to the original message in its source channel.
+/// Message bodies share chat's emote, link, and animation rendering.
+pub(crate) struct MentionsList<'a> {
     pub mentions: &'a VecDeque<ChatMessage>,
+    pub body: MessageBody<'a>,
     pub show_timestamps: bool,
     pub show_timestamp_seconds: bool,
     pub use_24h_timestamps: bool,
@@ -53,19 +50,31 @@ struct MentionLayout {
 
 #[derive(Clone)]
 struct MentionRowHeight {
-    text: String,
-    display_name: String,
-    timestamp: chrono::DateTime<chrono::Utc>,
+    signature: u64,
     stride: f32,
     generation: u64,
 }
 
-impl MentionRowHeight {
-    fn matches(&self, message: &ChatMessage) -> bool {
-        self.text == message.raw_text
-            && self.display_name == sender_name(message)
-            && self.timestamp == message.timestamp
+fn message_layout_signature(
+    message: &ChatMessage,
+    images: &crate::image_cache::UiImageCache,
+) -> u64 {
+    let mut hash = DefaultHasher::new();
+    message.raw_text.hash(&mut hash);
+    sender_name(message).hash(&mut hash);
+    message.timestamp.hash(&mut hash);
+    message.flags.is_deleted.hash(&mut hash);
+    message.flags.is_action.hash(&mut hash);
+    message.spans.hash(&mut hash);
+    for span in &message.spans {
+        if let Span::Emote { url, .. } | Span::Emoji { url, .. } = span {
+            images
+                .peek(url)
+                .map(|(width, height, _)| (*width, *height))
+                .hash(&mut hash);
+        }
     }
+    hash.finish()
 }
 
 #[derive(Clone, Default)]
@@ -296,10 +305,11 @@ impl<'a> MentionsList<'a> {
 
         for message in self.mentions {
             let row_id = egui::Id::new((&message.channel, message.id.0));
+            let signature = message_layout_signature(message, self.body.emote_bytes);
             let cached_stride = cache
                 .rows
                 .get_mut(&row_id)
-                .filter(|row| row.matches(message))
+                .filter(|row| row.signature == signature)
                 .map(|row| {
                     row.generation = generation;
                     row.stride
@@ -323,6 +333,7 @@ impl<'a> MentionsList<'a> {
                     self.show_timestamps,
                     self.show_timestamp_seconds,
                     self.use_24h_timestamps,
+                    &self.body,
                 )
             });
             if response.inner.is_some() {
@@ -335,9 +346,7 @@ impl<'a> MentionsList<'a> {
                 cache.rows.insert(
                     row_id,
                     MentionRowHeight {
-                        text: message.raw_text.clone(),
-                        display_name: sender_name(message).to_owned(),
-                        timestamp: message.timestamp,
+                        signature,
                         stride,
                         generation,
                     },
@@ -359,6 +368,7 @@ fn render_row(
     show_ts: bool,
     show_ts_seconds: bool,
     use_24h: bool,
+    body: &MessageBody<'_>,
 ) -> Option<MentionJumpTarget> {
     let mut jump: Option<MentionJumpTarget> = None;
 
@@ -386,17 +396,6 @@ fn render_row(
         .unwrap_or(t::text_primary());
     let display_name = sender_name(msg);
 
-    let body_color = if msg.flags.is_deleted {
-        t::text_muted()
-    } else {
-        t::text_primary()
-    };
-    let body_text = if msg.raw_text.trim().is_empty() {
-        "(no text)".to_owned()
-    } else {
-        msg.raw_text.clone()
-    };
-
     // Reserve a painter slot BEFORE rendering the row content. We'll
     // fill it in with the row's real rect after `ui.interact` gives us
     // an accurate hover state below. Doing it this way ensures the
@@ -406,6 +405,12 @@ fn render_row(
     // hovering previously - the first row's hover rect covered every
     // row beneath it).
     let bg_shape_idx = ui.painter().add(egui::Shape::Noop);
+    // Register the row before its links and emotes so their actions win hit tests.
+    ui.interact(
+        egui::Rect::from_min_size(ui.next_widget_position(), Vec2::ZERO),
+        row_id,
+        Sense::click(),
+    );
 
     let outer = Frame::new()
         .fill(Color32::TRANSPARENT)
@@ -489,20 +494,28 @@ fn render_row(
                     },
                 );
 
-                // Putting the body on its own row guarantees it always
-                // has `content_w` available to wrap in, regardless of
-                // how wide the pill or sender turned out to be. Uses
-                // `Label::wrap()` for word-level breaks so long URLs
-                // or walls of text don't overflow the viewport.
-                ui.add(
-                    Label::new(RichText::new(body_text).font(t::body()).color(body_color)).wrap(),
-                );
+                let clicked = ui
+                    .horizontal_wrapped(|ui| {
+                        ui.set_max_width(content_w);
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        ui.style_mut().override_font_id = Some(t::body());
+                        ui.visuals_mut().override_text_color = Some(t::text_primary());
+                        body.show(ui, msg, &mut |ui| mention_context_menu(ui, msg, &mut jump))
+                    })
+                    .inner;
+                if clicked {
+                    jump = Some(MentionJumpTarget {
+                        channel: msg.channel.clone(),
+                        message: msg.id,
+                    });
+                }
             });
         });
 
     // Row-level click (anywhere outside the pill) also jumps. Also
     // drives the hover backdrop we reserved above.
     let row_click = ui.interact(outer.response.rect, row_id, Sense::click());
+    row_click.context_menu(|ui| mention_context_menu(ui, msg, &mut jump));
     if row_click.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         ui.painter().set(
@@ -522,6 +535,20 @@ fn render_row(
     }
 
     jump
+}
+
+fn mention_context_menu(ui: &mut Ui, msg: &ChatMessage, jump: &mut Option<MentionJumpTarget>) {
+    if ui.button("Copy message").clicked() {
+        ui.ctx().copy_text(msg.raw_text.clone());
+        ui.close_menu();
+    }
+    if ui.button("Open in channel").clicked() {
+        *jump = Some(MentionJumpTarget {
+            channel: msg.channel.clone(),
+            message: msg.id,
+        });
+        ui.close_menu();
+    }
 }
 
 /// Deterministic per-channel pill color. We hash the channel id to pick from
@@ -558,6 +585,71 @@ fn parse_hex_color(s: &str) -> Option<Color32> {
 mod tests {
     use super::*;
     use crust_core::model::{MessageFlags, MsgKind, Sender, UserId};
+
+    struct Resources {
+        images: crate::image_cache::UiImageCache,
+        sender: crate::app::UiCommandSender,
+        receiver: tokio::sync::mpsc::Receiver<crust_core::AppCommand>,
+        previews: HashMap<String, crust_core::events::LinkPreview>,
+    }
+
+    impl Resources {
+        fn new() -> Self {
+            let (sender, receiver) = tokio::sync::mpsc::channel(32);
+            Self {
+                images: Default::default(),
+                sender: crate::app::UiCommandSender::new(sender),
+                receiver,
+                previews: HashMap::new(),
+            }
+        }
+
+        fn body(&self) -> MessageBody<'_> {
+            MessageBody {
+                emote_bytes: &self.images,
+                cmd_tx: &self.sender,
+                link_previews: &self.previews,
+                animate_emotes: true,
+                hide_link_previews: true,
+            }
+        }
+
+        fn list<'a>(&'a self, messages: &'a VecDeque<ChatMessage>) -> MentionsList<'a> {
+            MentionsList {
+                mentions: messages,
+                body: self.body(),
+                show_timestamps: false,
+                show_timestamp_seconds: false,
+                use_24h_timestamps: true,
+            }
+        }
+
+        fn image(&mut self, ctx: &egui::Context, name: &str, width: u32) -> egui::TextureId {
+            let url = format!("https://example.test/{name}.png");
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::RgbaImage::from_pixel(width, 32, image::Rgba([240, 80, 40, 255]))
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .unwrap();
+            let bytes = bytes.into_inner();
+            let uri = crate::widgets::bytes_uri(&url, &bytes);
+            assert!(self.images.complete(ctx, url, width, 32, bytes.clone()));
+            ctx.include_bytes(uri.clone(), bytes);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match ctx.try_load_texture(&uri, egui::TextureOptions::LINEAR, Default::default()) {
+                    Ok(egui::load::TexturePoll::Ready { texture }) => return texture.id,
+                    Ok(egui::load::TexturePoll::Pending { .. }) => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "fixture decode timed out"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("fixture decode failed: {error}"),
+                }
+            }
+        }
+    }
 
     fn messages(count: usize) -> VecDeque<ChatMessage> {
         (0..count)
@@ -651,6 +743,7 @@ mod tests {
                                             list.show_timestamps,
                                             list.show_timestamp_seconds,
                                             list.use_24h_timestamps,
+                                            &list.body,
                                         )
                                     });
                                     if response.inner.is_some() {
@@ -738,8 +831,10 @@ mod tests {
     #[test]
     fn mentions_cache_keeps_wrapped_rows_and_scroll_extent_exact() {
         let messages = messages(2_000);
+        let resources = Resources::new();
         let list = MentionsList {
             mentions: &messages,
+            body: resources.body(),
             show_timestamps: true,
             show_timestamp_seconds: true,
             use_24h_timestamps: false,
@@ -789,6 +884,7 @@ mod tests {
     #[test]
     fn mentions_cache_tracks_text_names_options_and_retained_rows() {
         let ctx = egui::Context::default();
+        let resources = Resources::new();
         let mut messages = messages(200);
         let mut cache = MentionLayoutCache::default();
         let render =
@@ -797,6 +893,7 @@ mod tests {
                     &ctx,
                     &MentionsList {
                         mentions: messages,
+                        body: resources.body(),
                         show_timestamps: true,
                         show_timestamp_seconds: seconds,
                         use_24h_timestamps: true,
@@ -859,9 +956,13 @@ mod tests {
 
     #[test]
     fn mentions_cached_rows_keep_click_targets_and_current_colors() {
-        fn list(messages: &VecDeque<ChatMessage>) -> MentionsList<'_> {
+        fn list<'a>(
+            messages: &'a VecDeque<ChatMessage>,
+            resources: &'a Resources,
+        ) -> MentionsList<'a> {
             MentionsList {
                 mentions: messages,
+                body: resources.body(),
                 show_timestamps: false,
                 show_timestamp_seconds: false,
                 use_24h_timestamps: true,
@@ -869,12 +970,13 @@ mod tests {
         }
         let cached_ctx = egui::Context::default();
         let full_ctx = egui::Context::default();
+        let resources = Resources::new();
         let mut messages = messages(200);
         let mut cache = MentionLayoutCache::default();
         let mut unused = MentionLayoutCache::default();
         frame(
             &cached_ctx,
-            &list(&messages),
+            &list(&messages, &resources),
             &mut cache,
             true,
             480.0,
@@ -883,7 +985,7 @@ mod tests {
         );
         frame(
             &full_ctx,
-            &list(&messages),
+            &list(&messages, &resources),
             &mut unused,
             false,
             480.0,
@@ -894,7 +996,7 @@ mod tests {
         messages[0].sender.color = Some("€abc".into());
         let rendered = frame(
             &cached_ctx,
-            &list(&messages),
+            &list(&messages, &resources),
             &mut cache,
             true,
             480.0,
@@ -903,7 +1005,7 @@ mod tests {
         );
         let expected = frame(
             &full_ctx,
-            &list(&messages),
+            &list(&messages, &resources),
             &mut unused,
             false,
             480.0,
@@ -911,17 +1013,17 @@ mod tests {
             Vec::new(),
         );
         assert_same_layout(&rendered, &expected);
-        assert_eq!(rendered.measured_rows, 0);
+        assert_eq!(rendered.measured_rows, 1);
         let position = visible_text(&rendered.output)
             .into_iter()
-            .find(|(text, _, _)| text.starts_with("Message 0:"))
+            .find(|(text, _, _)| text.contains("Message 0:"))
             .expect("first message is visible")
             .1
             .center();
         for pressed in [true, false] {
             let result = frame(
                 &cached_ctx,
-                &list(&messages),
+                &list(&messages, &resources),
                 &mut cache,
                 true,
                 480.0,
@@ -950,8 +1052,10 @@ mod tests {
     fn mentions_view_caches_are_bounded_when_split_panes_are_replaced() {
         let ctx = egui::Context::default();
         let messages = messages(40);
+        let resources = Resources::new();
         let list = MentionsList {
             mentions: &messages,
+            body: resources.body(),
             show_timestamps: true,
             show_timestamp_seconds: false,
             use_24h_timestamps: true,
@@ -1005,12 +1109,421 @@ mod tests {
         assert_eq!(caches.views.len(), MAX_CACHED_MENTION_VIEWS);
     }
 
+    fn emote(code: &str, overlay: bool) -> Span {
+        Span::Emote {
+            id: code.into(),
+            code: code.into(),
+            url: format!("https://example.test/{code}.png"),
+            url_hd: Some(format!("https://example.test/{code}-hd.png")),
+            provider: "7tv".into(),
+            zero_width: overlay,
+        }
+    }
+
+    fn image_rects(
+        ctx: &egui::Context,
+        output: &egui::FullOutput,
+        texture: egui::TextureId,
+    ) -> Vec<egui::Rect> {
+        ctx.tessellate(output.shapes.clone(), output.pixels_per_point)
+            .into_iter()
+            .filter_map(|primitive| match primitive.primitive {
+                egui::epaint::Primitive::Mesh(mesh) if mesh.texture_id == texture => {
+                    Some(mesh.calc_bounds())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mentions_render_live_and_restored_emotes_with_layers_and_emoji() {
+        for restored in [false, true] {
+            for (width, zoom) in [(240.0, 1.0), (480.0, 1.75)] {
+                let ctx = egui::Context::default();
+                ctx.set_zoom_factor(zoom);
+                let mut resources = Resources::new();
+                resources.images.begin_frame(&ctx);
+                let solo = resources.image(&ctx, "Solo", 32);
+                let base = resources.image(&ctx, "Base", 32);
+                let hat = resources.image(&ctx, "Hat", 64);
+                let emoji = resources.image(&ctx, "Smile", 32);
+                let mut rows = messages(1);
+                rows[0].raw_text = "Solo Base Hat 🙂".into();
+                rows[0].spans = vec![
+                    emote("Solo", false),
+                    Span::Text {
+                        text: " ".into(),
+                        is_action: false,
+                    },
+                    emote("Base", false),
+                    Span::Text {
+                        text: " ".into(),
+                        is_action: false,
+                    },
+                    emote("Hat", true),
+                    Span::Text {
+                        text: " ".into(),
+                        is_action: false,
+                    },
+                    Span::Emoji {
+                        text: "🙂".into(),
+                        url: "https://example.test/Smile.png".into(),
+                    },
+                ]
+                .into();
+                if restored {
+                    rows = serde_json::from_str(&serde_json::to_string(&rows).unwrap()).unwrap();
+                    rows[0].flags.is_history = true;
+                }
+                let mut cache = MentionLayoutCache::default();
+                let rendered = frame(
+                    &ctx,
+                    &resources.list(&rows),
+                    &mut cache,
+                    true,
+                    width,
+                    0.0,
+                    Vec::new(),
+                );
+                let rects: Vec<_> = [solo, base, hat, emoji]
+                    .into_iter()
+                    .map(|id| image_rects(&ctx, &rendered.output, id))
+                    .collect();
+                assert!(
+                    rects.iter().all(|rects| rects.len() == 1),
+                    "each body image is painted once: {rects:?}"
+                );
+                let pixel = 1.0 / rendered.output.pixels_per_point;
+                assert!(
+                    (rects[1][0].center().x - rects[2][0].center().x).abs() <= pixel,
+                    "layers must align after physical-pixel rounding: {rects:?}"
+                );
+                assert!((rects[1][0].bottom() - rects[2][0].bottom()).abs() <= pixel);
+                assert!(rects[2][0].width() > rects[1][0].width());
+                assert!(rects
+                    .iter()
+                    .flatten()
+                    .all(|rect| rect.right() <= width + 0.5));
+                assert!(!visible_text(&rendered.output)
+                    .iter()
+                    .any(|(text, _, _)| text == "Solo Base Hat 🙂"));
+            }
+        }
+    }
+
+    #[test]
+    fn mentions_measure_offscreen_emotes_without_fetching_them() {
+        let ctx = egui::Context::default();
+        let resources = Resources::new();
+        let mut rows = messages(200);
+        for (index, message) in rows.iter_mut().enumerate() {
+            message.raw_text = format!("Base{index} Hat{index}");
+            message.spans = vec![
+                emote(&format!("Base{index}"), false),
+                Span::Text {
+                    text: " ".into(),
+                    is_action: false,
+                },
+                emote(&format!("Hat{index}"), true),
+            ]
+            .into();
+        }
+        let rendered = frame(
+            &ctx,
+            &resources.list(&rows),
+            &mut MentionLayoutCache::default(),
+            true,
+            480.0,
+            0.0,
+            Vec::new(),
+        );
+        let visible = visible_text(&rendered.output);
+        let mut requested = Vec::new();
+        resources.images.end_frame(&ctx, |command| {
+            if let crust_core::AppCommand::FetchImage { url } = command {
+                requested.push(url);
+            }
+            true
+        });
+        assert!(!requested.is_empty());
+        for url in requested {
+            let code = url.rsplit('/').next().unwrap().trim_end_matches(".png");
+            assert!(
+                visible
+                    .iter()
+                    .any(|(text, _, _)| text.split_whitespace().any(|word| word == code)),
+                "offscreen asset requested: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn mentions_remeasure_refreshed_spans_image_dimensions_and_deletions() {
+        let ctx = egui::Context::default();
+        let mut resources = Resources::new();
+        resources.images.begin_frame(&ctx);
+        let mut rows = messages(200);
+        let mut cache = MentionLayoutCache::default();
+        frame(
+            &ctx,
+            &resources.list(&rows),
+            &mut cache,
+            true,
+            240.0,
+            0.0,
+            Vec::new(),
+        );
+        rows[150].raw_text = "Base Hat".into();
+        rows[150].spans = vec![
+            emote("Base", false),
+            Span::Text {
+                text: " ".into(),
+                is_action: false,
+            },
+            emote("Hat", false),
+        ]
+        .into();
+        assert_eq!(
+            frame(
+                &ctx,
+                &resources.list(&rows),
+                &mut cache,
+                true,
+                240.0,
+                0.0,
+                Vec::new()
+            )
+            .measured_rows,
+            1
+        );
+        resources.image(&ctx, "Base", 160);
+        resources.image(&ctx, "Hat", 160);
+        let separate = frame(
+            &ctx,
+            &resources.list(&rows),
+            &mut cache,
+            true,
+            240.0,
+            0.0,
+            Vec::new(),
+        );
+        assert_eq!(separate.measured_rows, 1);
+        if let Span::Emote { zero_width, .. } = &mut rows[150].spans[2] {
+            *zero_width = true;
+        }
+        let layered = frame(
+            &ctx,
+            &resources.list(&rows),
+            &mut cache,
+            true,
+            240.0,
+            0.0,
+            Vec::new(),
+        );
+        assert_eq!(layered.measured_rows, 1);
+        assert!(layered.content_height < separate.content_height);
+        rows[150].flags.is_deleted = true;
+        assert_eq!(
+            frame(
+                &ctx,
+                &resources.list(&rows),
+                &mut cache,
+                true,
+                240.0,
+                0.0,
+                Vec::new()
+            )
+            .measured_rows,
+            1
+        );
+        assert_eq!(
+            frame(
+                &ctx,
+                &resources.list(&rows),
+                &mut cache,
+                true,
+                240.0,
+                0.0,
+                Vec::new()
+            )
+            .measured_rows,
+            0
+        );
+    }
+
+    #[test]
+    fn mentions_links_open_without_jumping_and_emotes_keep_the_channel_jump() {
+        let ctx = egui::Context::default();
+        let mut resources = Resources::new();
+        resources.images.begin_frame(&ctx);
+        let texture = resources.image(&ctx, "Solo", 32);
+        let mut rows = messages(1);
+        rows[0].raw_text = "Solo https://example.test/".into();
+        rows[0].spans = vec![
+            emote("Solo", false),
+            Span::Text {
+                text: " ".into(),
+                is_action: false,
+            },
+            Span::Url {
+                text: "example.test".into(),
+                url: "https://example.test/".into(),
+            },
+        ]
+        .into();
+        let mut cache = MentionLayoutCache::default();
+        let rendered = frame(
+            &ctx,
+            &resources.list(&rows),
+            &mut cache,
+            true,
+            480.0,
+            0.0,
+            Vec::new(),
+        );
+        let link = visible_text(&rendered.output)
+            .into_iter()
+            .find(|(text, _, _)| text == "example.test")
+            .unwrap()
+            .1
+            .center();
+        let emote = image_rects(&ctx, &rendered.output, texture)[0].center();
+        for (point, jumps) in [(link, false), (emote, true)] {
+            for pressed in [true, false] {
+                let rendered = frame(
+                    &ctx,
+                    &resources.list(&rows),
+                    &mut cache,
+                    true,
+                    480.0,
+                    0.0,
+                    vec![
+                        egui::Event::PointerMoved(point),
+                        egui::Event::PointerButton {
+                            pos: point,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                );
+                if !pressed {
+                    assert_eq!(rendered.action.is_some(), jumps);
+                    if let Some(target) = rendered.action {
+                        assert_eq!(target.channel, rows[0].channel);
+                        assert_eq!(target.message, rows[0].id);
+                    }
+                }
+            }
+        }
+        assert!(
+            matches!(resources.receiver.try_recv().unwrap(), crust_core::AppCommand::OpenUrl { url } if url == "https://example.test/")
+        );
+    }
+
+    #[test]
+    fn mentions_layer_context_menu_copies_original_codes_and_whitespace() {
+        let ctx = egui::Context::default();
+        let mut resources = Resources::new();
+        resources.images.begin_frame(&ctx);
+        resources.image(&ctx, "Base", 32);
+        let texture = resources.image(&ctx, "Hat", 64);
+        let mut rows = messages(1);
+        rows[0].raw_text = "Base   Hat".into();
+        rows[0].spans = vec![
+            emote("Base", false),
+            Span::Text {
+                text: "   ".into(),
+                is_action: false,
+            },
+            emote("Hat", true),
+        ]
+        .into();
+        let mut cache = MentionLayoutCache::default();
+        let mut rendered = frame(
+            &ctx,
+            &resources.list(&rows),
+            &mut cache,
+            true,
+            480.0,
+            0.0,
+            Vec::new(),
+        );
+        let point = image_rects(&ctx, &rendered.output, texture)[0].center();
+        for pressed in [true, false] {
+            rendered = frame(
+                &ctx,
+                &resources.list(&rows),
+                &mut cache,
+                true,
+                480.0,
+                0.0,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Secondary,
+                        pressed,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+            assert!(rendered.action.is_none());
+        }
+        assert!(
+            ctx.is_context_menu_open(),
+            "right-click opens the emote menu"
+        );
+        // Popup areas need a sizing pass before their content is visible.
+        rendered = frame(
+            &ctx,
+            &resources.list(&rows),
+            &mut cache,
+            true,
+            480.0,
+            0.0,
+            vec![egui::Event::PointerMoved(point)],
+        );
+        let point = visible_text(&rendered.output)
+            .into_iter()
+            .find(|(text, _, _)| text == "Copy message")
+            .expect("emote menu opens")
+            .1
+            .center();
+        for pressed in [true, false] {
+            rendered = frame(
+                &ctx,
+                &resources.list(&rows),
+                &mut cache,
+                true,
+                480.0,
+                0.0,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+            assert!(rendered.action.is_none());
+        }
+        assert!(rendered.output.platform_output.commands.iter().any(
+            |command| matches!(command, egui::OutputCommand::CopyText(text) if text == "Base   Hat")
+        ));
+    }
+
     #[test]
     #[ignore = "release benchmark"]
     fn mentions_cached_viewport_benchmark() {
         let messages = messages(2_000);
+        let resources = Resources::new();
         let list = MentionsList {
             mentions: &messages,
+            body: resources.body(),
             show_timestamps: true,
             show_timestamp_seconds: true,
             use_24h_timestamps: false,
