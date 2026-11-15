@@ -569,4 +569,4 @@ User-defined command aliases (Settings -> Commands) dispatch after the built-in 
 - [UI API](API_UI.md)
 - [Events API](API_Events.md)
 - [Plugin API reference](API.md)
-- [Release notes v0.7.0](releases/Release_v0.7.0.md)
+- [Release notes v0.7.1](releases/Release_v0.7.1.md)

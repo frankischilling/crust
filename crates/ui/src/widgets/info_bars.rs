@@ -78,7 +78,7 @@ pub fn show_channel_info_bars(
                             ui.label(
                                 RichText::new(platform)
                                     .font(t::small())
-                                    .color(t::text_muted()),
+                                    .color(t::text_secondary()),
                             );
                         }
                         if !topic.is_empty() && bar_w > 200.0 {
@@ -164,13 +164,13 @@ pub fn show_channel_info_bars(
                                     .color(t::text_primary()),
                                 );
                                 if let Some(pts) = points {
-                                    points_pill(ui, pts);
+                                    points_pill(ui, pts, bar_fill);
                                 }
                                 if !ultra_compact {
                                     ui.label(
                                         RichText::new("Fetching stream status...")
                                             .font(t::small())
-                                            .color(t::text_muted()),
+                                            .color(t::text_secondary()),
                                     );
                                 }
                             }
@@ -182,6 +182,10 @@ pub fn show_channel_info_bars(
                                 } else {
                                     t::alpha(t::text_muted(), 20)
                                 };
+                                let status_text_color = t::readable_text_color(
+                                    status_col,
+                                    bar_fill.blend(status_bg),
+                                );
 
                                 egui::Frame::new()
                                     .fill(status_bg)
@@ -194,13 +198,13 @@ pub fn show_channel_info_bars(
                                             ui.label(
                                                 RichText::new("●")
                                                     .font(t::small())
-                                                    .color(status_col),
+                                                    .color(status_text_color),
                                             );
                                             if !ultra_compact {
                                                 ui.label(
                                                     RichText::new(status_text)
                                                         .font(t::small())
-                                                        .color(status_col)
+                                                        .color(status_text_color)
                                                         .strong(),
                                                 );
                                             }
@@ -226,7 +230,7 @@ pub fn show_channel_info_bars(
                                 );
 
                                 if let Some(pts) = points {
-                                    points_pill(ui, pts);
+                                    points_pill(ui, pts, bar_fill);
                                 }
 
                                 // Viewer count (live only)
@@ -275,7 +279,7 @@ pub fn show_channel_info_bars(
                                                         egui::Label::new(
                                                             RichText::new(title.as_str())
                                                                 .font(t::small())
-                                                                .color(t::text_muted()),
+                                                                .color(t::text_secondary()),
                                                         )
                                                         .truncate(),
                                                     );
@@ -299,7 +303,7 @@ pub fn show_channel_info_bars(
                                                 egui::Label::new(
                                                     RichText::new(title.as_str())
                                                         .font(t::small())
-                                                        .color(t::text_muted()),
+                                                        .color(t::text_secondary()),
                                                 )
                                                 .truncate(),
                                             );
@@ -391,11 +395,13 @@ pub fn show_channel_info_bars(
                 .map(|m| (m.sender.display_name.clone(), m.raw_text.clone()))
         });
         if let Some((sender, text)) = latest_pinned {
+            let fill = t::warning_soft_bg();
+            let background = t::bg_base().blend(fill);
             TopBottomPanel::top("pinned_message_bar")
                 .exact_height((24.0 * t::font_scale()).max(t::chat_font_size() + 8.0))
                 .frame(
                     Frame::new()
-                        .fill(t::warning_soft_bg())
+                        .fill(fill)
                         .inner_margin(egui::Margin::symmetric(8, 3))
                         .stroke(egui::Stroke::new(1.0_f32, t::gold().gamma_multiply(0.45))),
                 )
@@ -406,7 +412,7 @@ pub fn show_channel_info_bars(
                             RichText::new("📌 Pinned")
                                 .font(t::small())
                                 .strong()
-                                .color(t::gold()),
+                                .color(t::readable_text_color(t::gold(), background)),
                         );
                         ui.label(RichText::new("|").font(t::small()).color(t::text_muted()));
                         ui.label(
@@ -419,7 +425,7 @@ pub fn show_channel_info_bars(
                             egui::Label::new(
                                 RichText::new(text)
                                     .font(t::small())
-                                    .color(t::text_secondary()),
+                                    .color(t::readable_text_color(t::text_secondary(), background)),
                             )
                             .truncate(),
                         );
@@ -432,10 +438,12 @@ pub fn show_channel_info_bars(
 /// Channel-points balance pill shown next to the channel name in the info
 /// bar. Uses the accent palette so it reads as a viewer-focused metric, not
 /// a room-state or moderation flag.
-fn points_pill(ui: &mut egui::Ui, balance: u64) {
+fn points_pill(ui: &mut egui::Ui, balance: u64, background: Color32) {
     let color = t::gold();
+    let fill = t::alpha(color, 22);
+    let text_color = t::readable_text_color(color, background.blend(fill));
     egui::Frame::new()
-        .fill(t::alpha(color, 22))
+        .fill(fill)
         .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.5)))
         .corner_radius(t::RADIUS_SM)
         .inner_margin(egui::Margin::symmetric(6, 1))
@@ -443,7 +451,7 @@ fn points_pill(ui: &mut egui::Ui, balance: u64) {
             ui.label(
                 RichText::new(format!("★ {} pts", fmt_points(balance)))
                     .font(t::small())
-                    .color(color)
+                    .color(text_color)
                     .strong(),
             )
             .on_hover_text(format!("Channel points balance: {balance}"));
@@ -462,8 +470,10 @@ fn fmt_points(n: u64) -> String {
 
 /// Render a tiny colored pill label (used for room-state modes in the stream bar).
 fn room_state_pill(ui: &mut egui::Ui, text: &str, color: Color32) {
+    let fill = t::alpha(color, 20);
+    let text_color = t::readable_text_color(color, t::bg_base().blend(fill));
     let frame = egui::Frame::new()
-        .fill(t::alpha(color, 20))
+        .fill(fill)
         .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.4)))
         .corner_radius(t::RADIUS_SM)
         .inner_margin(egui::Margin::symmetric(5, 0));
@@ -471,7 +481,7 @@ fn room_state_pill(ui: &mut egui::Ui, text: &str, color: Color32) {
     let width = (ui.max_rect().width() - margin.x).max(1.0);
     let galley = ui
         .painter()
-        .layout(text.to_owned(), t::pills_font(), color, width);
+        .layout(text.to_owned(), t::pills_font(), text_color, width);
     // Reserve the whole pill before drawing so the row can wrap it as one item.
     ui.allocate_ui_with_layout(
         galley.size() + margin,

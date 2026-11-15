@@ -17,10 +17,15 @@ emotes handle missing or very short frame delays.
 
 ## Interface
 
-- Room-mode labels wrap when space is limited. Hype Train metadata and Shared Chat
-  participant labels stay inside narrow panes, with full details available on hover.
+- Room-mode labels and Hype Train metadata wrap when space is limited. Shared Chat
+  participant labels stay inside narrow panes, with full names and counts on hover.
 - Raid text wraps around a shared Close icon with a named accessibility action.
 - Closing a channel that is still loading removes it from the startup status.
+- The main window paints an opaque background beneath its panels, fixing the
+  transparent seam below the toolbar while preserving detached overlay transparency.
+- Status, points, room-mode, pinned-message, and banner text stays readable in
+  both themes. Stream titles, helper text, and offline participant names are clearer.
+- Translucent selection, hover, and pill fills use the correct alpha conversion.
 
 ## Images
 
@@ -32,6 +37,6 @@ emotes handle missing or very short frame delays.
 - GIF and WebP frames with delays of at most 10 ms use 100 ms. Other delays below
   20 ms use 20 ms, preventing stalled or excessively fast playback.
 
-The [audit](../AUDIT_CHAT_STATE_AND_IMAGES.md) records the defects, regression
+The [audit](https://github.com/frankischilling/crust/blob/main/docs/AUDIT_CHAT_STATE_AND_IMAGES.md) records the defects, regression
 coverage, and measurements. The intermittent UI stalls remain tracked in
 [#17](https://github.com/frankischilling/crust/issues/17).

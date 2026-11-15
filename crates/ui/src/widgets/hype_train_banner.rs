@@ -32,6 +32,9 @@ pub fn show_hype_train_banner(ui: &mut Ui, state: &HypeTrainState) {
     let accent = hype_accent(state.level);
     let ended = state.phase.eq_ignore_ascii_case("end");
     let fill = t::alpha(accent, if ended { 18 } else { 32 });
+    let background = t::bg_base().blend(fill);
+    let title_color = t::readable_text_color(accent, background);
+    let detail_color = t::readable_text_color(t::text_secondary(), background);
 
     let avail_w = ui.available_width();
     let frame = egui::Frame::new()
@@ -51,14 +54,20 @@ pub fn show_hype_train_banner(ui: &mut Ui, state: &HypeTrainState) {
                     format!("🚂 Hype Train - Level {}", state.level.max(1))
                 };
                 ui.add(
-                    Label::new(RichText::new(title).font(t::small()).color(accent).strong()).wrap(),
+                    Label::new(
+                        RichText::new(title)
+                            .font(t::small())
+                            .color(title_color)
+                            .strong(),
+                    )
+                    .wrap(),
                 );
                 if state.total > 0 {
                     ui.add(
                         Label::new(
                             RichText::new(format!("{} total pts", fmt_u64(state.total)))
                                 .font(t::tiny())
-                                .color(t::text_secondary()),
+                                .color(detail_color),
                         )
                         .wrap(),
                     );
@@ -93,7 +102,7 @@ pub fn show_hype_train_banner(ui: &mut Ui, state: &HypeTrainState) {
                     Label::new(
                         RichText::new(progress_label)
                             .font(t::tiny())
-                            .color(t::text_secondary()),
+                            .color(detail_color),
                     )
                     .wrap(),
                 );
@@ -117,9 +126,7 @@ pub fn show_hype_train_banner(ui: &mut Ui, state: &HypeTrainState) {
                     };
                     ui.add(
                         Label::new(
-                            RichText::new(txt)
-                                .font(t::tiny())
-                                .color(t::text_secondary()),
+                            RichText::new(txt).font(t::tiny()).color(detail_color),
                         )
                         .wrap(),
                     );
@@ -134,10 +141,12 @@ pub fn show_hype_train_banner(ui: &mut Ui, state: &HypeTrainState) {
 #[must_use]
 pub fn show_raid_banner(ui: &mut Ui, state: &RaidBannerState) -> bool {
     let accent = t::raid_cyan();
+    let fill = t::alpha(accent, 28);
+    let text_color = t::readable_text_color(accent, t::bg_base().blend(fill));
     let mut dismissed = false;
     let avail_w = ui.available_width();
     let frame = egui::Frame::new()
-        .fill(t::alpha(accent, 28))
+        .fill(fill)
         .stroke(Stroke::new(1.0_f32, t::alpha(accent, 110)))
         .corner_radius(CornerRadius::same(6))
         .inner_margin(BANNER_INNER_PAD)
@@ -173,7 +182,13 @@ pub fn show_raid_banner(ui: &mut Ui, state: &RaidBannerState) -> bool {
             }
             ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
                 ui.add(
-                    Label::new(RichText::new(body).font(t::small()).color(accent).strong()).wrap(),
+                    Label::new(
+                        RichText::new(body)
+                            .font(t::small())
+                            .color(text_color)
+                            .strong(),
+                    )
+                    .wrap(),
                 );
             });
         });

@@ -39,6 +39,9 @@ pub fn show_shared_chat_banner(
 ) {
     let accent = Color32::from_rgb(155, 102, 214);
     let fill = t::alpha(accent, 24);
+    let background = t::bg_base().blend(fill);
+    let title_color = t::readable_text_color(accent, background);
+    let detail_color = t::readable_text_color(t::text_secondary(), background);
     let border = t::alpha(accent, 90);
     let avail_w = ui.available_width();
     let total = session.total_viewers();
@@ -58,7 +61,7 @@ pub fn show_shared_chat_banner(
                     Label::new(
                         RichText::new("🔗 Shared Chat")
                             .font(t::small())
-                            .color(accent)
+                            .color(title_color)
                             .strong(),
                     )
                     .wrap(),
@@ -78,7 +81,7 @@ pub fn show_shared_chat_banner(
                     Label::new(
                         RichText::new(format!("{live}/{n} live"))
                             .font(t::tiny())
-                            .color(t::text_secondary()),
+                            .color(detail_color),
                     )
                     .wrap(),
                 );
@@ -92,7 +95,7 @@ pub fn show_shared_chat_banner(
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 for p in &session.participants {
-                    render_participant_chip(ui, p, emote_bytes);
+                    render_participant_chip(ui, p, emote_bytes, background);
                 }
             });
         });
@@ -103,12 +106,14 @@ fn render_participant_chip(
     ui: &mut Ui,
     p: &crust_core::state::SharedChatParticipant,
     emote_bytes: &UiImageCache,
+    background: Color32,
 ) {
     let text_color = if p.live {
         t::text_primary()
     } else {
-        t::text_muted()
+        t::text_secondary()
     };
+    let text_color = t::readable_text_color(text_color, background);
 
     let label = if p.display_name.is_empty() {
         p.login.clone()
@@ -122,7 +127,14 @@ fn render_participant_chip(
         format!("{label} is offline")
     };
 
-    let count_color = if p.live { t::accent() } else { t::text_muted() };
+    let count_color = t::readable_text_color(
+        if p.live {
+            t::accent()
+        } else {
+            t::text_secondary()
+        },
+        background,
+    );
     let count_text = if p.live {
         fmt_u64(p.viewer_count)
     } else {
@@ -173,10 +185,10 @@ fn render_participant_chip(
                             .corner_radius(CornerRadius::same(3)),
                         );
                     } else {
-                        draw_avatar_fallback(ui, avatar_rect, &label, text_color);
+                        draw_avatar_fallback(ui, avatar_rect, &label, text_color, background);
                     }
                 } else {
-                    draw_avatar_fallback(ui, avatar_rect, &label, text_color);
+                    draw_avatar_fallback(ui, avatar_rect, &label, text_color, background);
                 }
 
                 ui.add_sized(
@@ -203,16 +215,23 @@ fn render_participant_chip(
     });
 }
 
-fn draw_avatar_fallback(ui: &mut Ui, rect: egui::Rect, label: &str, color: Color32) {
+fn draw_avatar_fallback(
+    ui: &mut Ui,
+    rect: egui::Rect,
+    label: &str,
+    color: Color32,
+    background: Color32,
+) {
     let initial = label.chars().next().unwrap_or('|').to_ascii_uppercase();
+    let fill = t::alpha(color, 40);
     ui.painter()
-        .rect_filled(rect, CornerRadius::same(3), t::alpha(color, 40));
+        .rect_filled(rect, CornerRadius::same(3), fill);
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
         initial,
         t::tiny(),
-        color,
+        t::readable_text_color(color, background.blend(fill)),
     );
 }
 
