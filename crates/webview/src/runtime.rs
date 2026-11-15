@@ -154,14 +154,20 @@ pub fn spawn(
 
     info!("crust-webview: spawning sidecar at {binary:?}");
 
-    let child_result = Command::new(&binary)
+    let mut command = Command::new(&binary);
+    command
         .arg(&data_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        // stderr inherits so the sidecar's tracing output shows in the
-        // Crust console alongside main-process logs.
-        .stderr(Stdio::inherit())
-        .spawn();
+        // Keep tracing output on the inherited diagnostic stream.
+        .stderr(Stdio::inherit());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let child_result = command.spawn();
     let mut child = match child_result {
         Ok(c) => c,
         Err(e) => {
