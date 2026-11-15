@@ -28,6 +28,7 @@ commands. Kick and generic IRC support remain beta features.
   - drag channel to split
   - focused-pane tracking
   - split header controls and per-pane search toggle
+  - an options menu in narrow panes, also available by right-clicking the header title
   - split keyboard navigation and pane reordering shortcuts
   - independent drafts and stable composer focus when panes are added, moved, or closed
   - independent scrolling and pause state when the same channel appears in two panes
@@ -56,7 +57,7 @@ commands. Kick and generic IRC support remain beta features.
   - shared chat (cross-channel mirror) with source-channel chip, source mod/vip badges, and notification suppression for already-open source channels
   - timeout/ban/clear notices and system notices
   - first-message and pinned-message indicators
-- Inline reply/thread support with reply metadata
+- Inline replies with parent previews and jump navigation
 - Rich span/token rendering:
   - text
   - emotes
@@ -75,6 +76,7 @@ commands. Kick and generic IRC support remain beta features.
 ### Input and command UX
 
 - Message input history recall (arrow keys)
+- Case-insensitive input-history search with a query, match preview, and older/newer navigation
 - Emote picker access in narrow panes, with the character count below the input when needed
 - Rejected sends keep their original draft and reply context for recovery
 - `:` emote autocomplete and Tab completion
@@ -104,6 +106,7 @@ commands. Kick and generic IRC support remain beta features.
 - Emoji tokenization/rendering via Twemoji URLs
 - Badge rendering from global/channel badge sources
 - 7TV sender colors, selected username paints, badges, and avatars
+- Chat settings for showing 7TV name paints, paint shadows, and larger shadows
 - Emote picker features:
   - favorites
   - recents
@@ -126,6 +129,13 @@ Chat works without `user:read:emotes`. FFZ uses metadata refreshes. The
 [UI and performance audit](AUDIT_UI_PERFORMANCE.md) explains provider limits,
 cached-snapshot behavior, and the measured rendering workloads.
 
+Settings > Chat > 7TV name paints has separate controls for paints, shadows, and
+larger shadow blur. Disabling paints or shadows preserves the choices beneath
+that control. Paint animation follows the existing window-focus animation setting.
+Known sender paints appear in channel chat, Mentions, search results, reply
+previews, inline Twitch @mentions, and received-whisper headers. Unknown names
+keep readable plain text while their cosmetics are unavailable.
+
 ### Whispers
 
 - Twitch whisper sending and receiving
@@ -133,6 +143,7 @@ cached-snapshot behavior, and the measured rendering workloads.
 - Per-thread unread counts and mention counts
 - Whisper compose/open workflow from thread context
 - Whisper desktop notifications (when enabled)
+- Received sender names use their current 7TV paint when known
 - Saved threads belong to the account's immutable Twitch user ID and remain
   available after that account changes its login
 - Legacy rows with no owner or only a login-based owner stay stored but are not
@@ -326,10 +337,12 @@ cancels an unfinished capture.
 
 | Keybind | Behavior |
 | --- | --- |
-| Enter | Send message (when input is valid and autocomplete did not consume Enter) |
+| Enter | Send a valid message when no input helper is using Enter |
 | Tab | Accept/cycle autocomplete suggestion |
 | Shift+Tab | Cycle autocomplete suggestions backward |
 | Up / Down | Navigate autocomplete suggestions; if no autocomplete is active, navigate message history |
+| Ctrl+R | Open input-history search; while searching, select an older match |
+| Ctrl+Shift+R | Open input-history search in the forward direction; while searching, select a newer match |
 
 Notes:
 
@@ -338,7 +351,14 @@ Notes:
 - Tab cycles emote and username matches; Shift+Tab reverses the cycle.
 - History starts with the newest sent message. Pressing Down past it restores
   the draft you were writing.
+- Input-history search matches text without case sensitivity and previews the
+  selected sent message. Up and Down move between matches and wrap at either end.
+  Enter or Tab puts the selected message into the composer for editing. Escape
+  or Cancel closes the search and keeps the original draft. Searching and
+  accepting a result never send a message.
 - Autocomplete and history keys affect the focused chat input.
+- An input-history query belongs to its composer and closes when that composer
+  changes channels. Search uses the same retained messages as Up/Down recall.
 - A rejected send keeps the draft and reply. If a later runtime rejection arrives
   after a new draft was started, the unsent message remains available to copy or
   restore without replacing that draft.
@@ -349,9 +369,12 @@ Notes:
 
 - Right-click message row: reply/copy/moderation/workflow actions
 - Right-click message row (mod): quick delete/timeout/ban/warn + full moderation submenus
-- Right-click chat input: cut/copy/paste/select all/send now/clear input/insert /help/spell suggestions (top 5) + "Add to dictionary"
+- Right-click chat input: cut/copy/paste/select all/search input history/send now/clear input/insert /help/spell suggestions (top 5) + "Add to dictionary"
+- Click split options or right-click its title: show/hide message search, close
+  that split, or close the other splits. These actions remain available in narrow panes.
 - Right-click channel tab: hide-when-offline toggle, Open in Streamlink
-- Click username: open user card
+- Click a sender name in channel chat or a Twitch @mention: open that user's card
+- Click a Mentions or search result: navigate to its message
 - Click toolbar buttons: open settings, join dialog, analytics, whispers, IRC status, moderation tools
 - Paste image (Ctrl+V) or drop file on chat input: upload to configured host and insert returned URL
 

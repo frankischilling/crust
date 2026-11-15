@@ -99,7 +99,7 @@ impl SettingsSection {
     fn search_terms(self) -> &'static str {
         match self {
             Self::Appearance => "theme dark light font text size scale zoom always top window layout sidebar tabs split header title game viewer count close buttons live indicators analytics",
-            Self::Chat => "timestamps seconds clock 24 hour history logs indexing collapse long messages lines overflow character limit animations focus moderation presets spell check spelling dictionary",
+            Self::Chat => "timestamps seconds clock 24 hour history logs indexing collapse long messages lines overflow character limit animations focus 7tv name paints gradient shadows moderation presets spell check spelling dictionary",
             Self::Highlights => "highlight rules keyword regex regular expression case sensitive visual alert flash sound ignored usernames",
             Self::Filters => "filter hide dim message sender username pattern regex regular expression moderation",
             Self::Nicknames => "nickname alias login display name channel case sensitive mention",
@@ -150,6 +150,9 @@ pub struct SettingsPageState {
     pub collapse_long_messages: bool,
     pub collapse_long_message_lines: usize,
     pub animations_when_focused: bool,
+    pub show_name_paints: bool,
+    pub show_name_paint_shadows: bool,
+    pub large_name_paint_shadows: bool,
     pub show_timestamps: bool,
     pub show_timestamp_seconds: bool,
     pub use_24h_timestamps: bool,
@@ -1384,6 +1387,9 @@ fn render_settings_content(
                     );
 
                     ui.add_space(8.0);
+                    render_name_paint_controls(ui, state);
+
+                    ui.add_space(8.0);
                     ui.label(
                         RichText::new("Moderation actions")
                             .font(t::small())
@@ -2536,6 +2542,26 @@ fn render_settings_content(
         });
 }
 
+fn render_name_paint_controls(ui: &mut egui::Ui, state: &mut SettingsPageState) {
+    ui.label(
+        RichText::new("7TV name paints")
+            .font(t::small())
+            .strong()
+            .color(t::text_primary()),
+    );
+    ui.checkbox(&mut state.show_name_paints, "Show 7TV name paints");
+    ui.add_enabled_ui(state.show_name_paints, |ui| {
+        ui.checkbox(&mut state.show_name_paint_shadows, "Show paint shadows");
+        ui.add_enabled_ui(state.show_name_paint_shadows, |ui| {
+            ui.checkbox(
+                &mut state.large_name_paint_shadows,
+                "Use larger paint shadows",
+            )
+            .on_hover_text("Use a wider blur for paint shadows.");
+        });
+    });
+}
+
 fn bounded_settings_scroll<R>(
     ui: &mut egui::Ui,
     id: &'static str,
@@ -3180,5 +3206,76 @@ mod responsive_tests {
         assert!(visible_text_rect(&output, "Settings").is_some());
         harness.click(size, game.center());
         assert!(harness.state.split_header_show_game);
+    }
+
+    #[test]
+    fn paint_controls_preserve_disabled_shadow_preferences() {
+        fn frame(
+            ctx: &egui::Context,
+            state: &mut SettingsPageState,
+            events: Vec<egui::Event>,
+        ) -> egui::FullOutput {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(600.0, 240.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .show(ctx, |ui| render_name_paint_controls(ui, state));
+                },
+            )
+        }
+        fn click_control(ctx: &egui::Context, state: &mut SettingsPageState, label: &str) {
+            let output = frame(ctx, state, Vec::new());
+            let pos = visible_text_rect(&output, label)
+                .expect("paint option is visible")
+                .center();
+            for pressed in [true, false] {
+                frame(
+                    ctx,
+                    state,
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+        }
+
+        let ctx = egui::Context::default();
+        let mut state = SettingsPageState {
+            show_name_paints: true,
+            show_name_paint_shadows: true,
+            large_name_paint_shadows: true,
+            ..Default::default()
+        };
+        frame(&ctx, &mut state, Vec::new());
+        click_control(&ctx, &mut state, "Show 7TV name paints");
+        assert!(!state.show_name_paints);
+        click_control(&ctx, &mut state, "Show paint shadows");
+        click_control(&ctx, &mut state, "Use larger paint shadows");
+        assert!(state.show_name_paint_shadows);
+        assert!(state.large_name_paint_shadows);
+
+        click_control(&ctx, &mut state, "Show 7TV name paints");
+        click_control(&ctx, &mut state, "Show paint shadows");
+        assert!(!state.show_name_paint_shadows);
+        click_control(&ctx, &mut state, "Use larger paint shadows");
+        assert!(state.large_name_paint_shadows);
+        click_control(&ctx, &mut state, "Show paint shadows");
+        click_control(&ctx, &mut state, "Use larger paint shadows");
+        assert!(!state.large_name_paint_shadows);
+        assert!(SettingsSection::Chat.matches("7tv paints"));
+        assert!(SettingsSection::Chat.matches("paint shadows"));
     }
 }

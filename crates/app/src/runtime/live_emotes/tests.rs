@@ -35,6 +35,7 @@ struct Harness {
     scope: LiveScope,
     desired: watch::Sender<Vec<LiveTarget>>,
     dirty: mpsc::Receiver<()>,
+    cosmetics: mpsc::Receiver<SevenTvCosmeticUpdate>,
     websocket: TcpListener,
     http: TcpListener,
     socket: ServerSocket,
@@ -107,12 +108,14 @@ impl Harness {
         };
         let (desired, updates) = watch::channel(index.read().unwrap().live_targets());
         let (changed, dirty) = mpsc::channel(1);
+        let (cosmetic_tx, cosmetics) = mpsc::channel(512);
         let task = tokio::spawn(run_worker(
             provider,
             endpoints,
             index.clone(),
             changed,
             updates,
+            Some(cosmetic_tx),
         ));
         let (stream, _) = within(websocket.accept()).await.unwrap();
         let socket = within(tokio_tungstenite::accept_async(stream))
@@ -124,6 +127,7 @@ impl Harness {
             scope,
             desired,
             dirty,
+            cosmetics,
             websocket,
             http,
             socket,
@@ -300,10 +304,10 @@ fn scoped_snapshot(scope: &LiveScope, set: &str, emotes: Vec<Value>) -> Value {
 }
 
 async fn ready_scoped(fixture: &mut Harness) {
-    let count = if matches!(fixture.scope, LiveScope::Global) {
-        2
-    } else {
-        3
+    let count = match fixture.scope {
+        LiveScope::Global => 2,
+        LiveScope::Personal(_) => 3,
+        LiveScope::Channel(_) => 6,
     };
     send(
         &mut fixture.socket,
@@ -330,35 +334,68 @@ async fn seven_tv_overlay_updates_survive_snapshots_and_stay_in_their_scope() {
         LiveScope::Channel(ChannelId::new("loopback")),
     ] {
         let mut fixture = Harness::new_scoped(
-            Provider::SevenTv, vec![emote(Provider::SevenTv, "hat", "Hat")], scope.clone(),
-        ).await;
+            Provider::SevenTv,
+            vec![emote(Provider::SevenTv, "hat", "Hat")],
+            scope.clone(),
+        )
+        .await;
         ready_scoped(&mut fixture).await;
         let (mut request, headers) = fixture.request().await;
         let body: Value = serde_json::from_str(headers.split_once("\r\n\r\n").unwrap().1).unwrap();
-        assert!(body["query"].as_str().unwrap().contains("emotes { id name flags data"));
-        let overlay = |set: &str, flags| json!({"op": 0, "d": {"type": "emote_set.update", "body": {
-            "id": set, "updated": [{"key": "emotes", "old_value": {"id": "hat", "name": "Hat"},
-                "value": {"id": "hat", "name": "Hat", "flags": flags}}]
-        }}});
+        assert!(body["query"]
+            .as_str()
+            .unwrap()
+            .contains("emotes { id name flags data"));
+        let overlay = |set: &str, flags| {
+            json!({"op": 0, "d": {"type": "emote_set.update", "body": {
+                "id": set, "updated": [{"key": "emotes", "old_value": {"id": "hat", "name": "Hat"},
+                    "value": {"id": "hat", "name": "Hat", "flags": flags}}]
+            }}})
+        };
         send(&mut fixture.socket, overlay("set-id", 1)).await;
         barrier(&mut fixture.socket, b"overlay-before-snapshot").await;
-        let is_overlay = |fixture: &Harness| fixture.index.read().unwrap()
-            .resolve(&fixture.channel, "42", "Hat").unwrap().zero_width;
+        let is_overlay = |fixture: &Harness| {
+            fixture
+                .index
+                .read()
+                .unwrap()
+                .resolve(&fixture.channel, "42", "Hat")
+                .unwrap()
+                .zero_width
+        };
         assert!(is_overlay(&fixture));
-        respond(&mut request, scoped_snapshot(&scope, "set-id", vec![
-            active_emote("hat", "Hat"), active_emote("rest", "RestMarker"),
-        ])).await;
+        respond(
+            &mut request,
+            scoped_snapshot(
+                &scope,
+                "set-id",
+                vec![
+                    active_emote("hat", "Hat"),
+                    active_emote("rest", "RestMarker"),
+                ],
+            ),
+        )
+        .await;
         fixture.wait_for("RestMarker").await;
-        assert!(is_overlay(&fixture), "snapshot erased a newer overlay change");
+        assert!(
+            is_overlay(&fixture),
+            "snapshot erased a newer overlay change"
+        );
         {
             let registry = fixture.index.read().unwrap();
             let catalog = registry.catalog();
             let entry = catalog.iter().find(|entry| entry.code == "Hat").unwrap();
             assert!(entry.zero_width);
             match &scope {
-                LiveScope::Personal(_) => assert!(!entry.is_available_for(&fixture.channel, "other")),
-                LiveScope::Channel(_) => assert!(!entry.is_available_for(&ChannelId::new("other"), "42")),
-                LiveScope::Global => assert!(entry.is_available_for(&ChannelId::new("other"), "other")),
+                LiveScope::Personal(_) => {
+                    assert!(!entry.is_available_for(&fixture.channel, "other"))
+                }
+                LiveScope::Channel(_) => {
+                    assert!(!entry.is_available_for(&ChannelId::new("other"), "42"))
+                }
+                LiveScope::Global => {
+                    assert!(entry.is_available_for(&ChannelId::new("other"), "other"))
+                }
             }
         }
         send(&mut fixture.socket, overlay("foreign-set", 0)).await;
@@ -595,6 +632,98 @@ async fn bttv_subscribes_and_reconciles_live_deletes_with_a_delayed_cached_snaps
 }
 
 #[tokio::test]
+async fn seven_tv_room_cosmetics_forward_in_order_and_start_a_new_epoch_after_reconnect() {
+    let mut fixture = Harness::new(Provider::SevenTv, Vec::new()).await;
+    ready_scoped(&mut fixture).await;
+    let connected = within(fixture.cosmetics.recv()).await.unwrap();
+    let SevenTvCosmeticUpdate::Live {
+        epoch,
+        update: SevenTvLiveCosmeticUpdate::Connected,
+    } = connected
+    else {
+        panic!("cosmetic epoch");
+    };
+    let (mut request, _) = fixture.request().await;
+    respond(
+        &mut request,
+        graphql_snapshot("set-id", vec![active_emote("ready", "Ready")]),
+    )
+    .await;
+    fixture.wait_for("Ready").await;
+    let entitlement = |event: &str| {
+        json!({"op": 0, "d": {"type": event, "body": {"object": {
+            "kind": "PAINT", "ref_id": "paint", "user": {"connections": [{"platform": "TWITCH", "id": "42"}]}
+        }}}})
+    };
+    send(&mut fixture.socket, entitlement("entitlement.create")).await;
+    send(&mut fixture.socket, json!({"op": 0, "d": {"type": "cosmetic.create", "body": {"object": {
+        "kind": "PAINT", "data": {"id": "paint", "function": "URL", "image_url": "https://example.test/paint.webp"}
+    }}}})).await;
+    send(&mut fixture.socket, entitlement("entitlement.delete")).await;
+    send(
+        &mut fixture.socket,
+        json!({"op": 0, "d": {"type": "user.update", "body": {
+            "id": "user-id", "updated": [{"key": "style", "value": {"paint_id": null}}]
+        }}}),
+    )
+    .await;
+    barrier(&mut fixture.socket, b"cosmetics-reduced").await;
+    let mut updates = Vec::new();
+    for _ in 0..4 {
+        let Some(SevenTvCosmeticUpdate::Live {
+            epoch: update_epoch,
+            update,
+        }) = within(fixture.cosmetics.recv()).await
+        else {
+            panic!("live cosmetic update");
+        };
+        assert_eq!(update_epoch, epoch);
+        updates.push(update);
+    }
+    assert!(
+        matches!(&updates[0], SevenTvLiveCosmeticUpdate::Entitlement { granted: true, cosmetic_id, .. } if cosmetic_id == "paint")
+    );
+    assert!(
+        matches!(&updates[1], SevenTvLiveCosmeticUpdate::Paint { id, paint } if id == "paint" && paint.function == "url")
+    );
+    assert!(matches!(
+        &updates[2],
+        SevenTvLiveCosmeticUpdate::Entitlement { granted: false, .. }
+    ));
+    assert!(
+        matches!(&updates[3], SevenTvLiveCosmeticUpdate::RefreshUsers { twitch_user_ids } if twitch_user_ids == &["42"])
+    );
+    send(&mut fixture.socket, json!({"op": 4, "d": {}})).await;
+    fixture.reconnect().await;
+    ready_scoped(&mut fixture).await;
+    assert!(matches!(within(fixture.cosmetics.recv()).await,
+        Some(SevenTvCosmeticUpdate::Live { epoch: next_epoch, update: SevenTvLiveCosmeticUpdate::Connected }) if next_epoch > epoch));
+    fixture.stop().await;
+}
+
+#[test]
+fn seven_tv_room_cosmetics_count_toward_the_subscription_limit() {
+    let target = LiveTarget {
+        scope: LiveScope::Channel(ChannelId::new("room")),
+        generation: 1,
+        binding_generation: 1,
+        source: LiveSource {
+            provider: Provider::SevenTv,
+            room_id: "42".to_owned(),
+            platform: "TWITCH".to_owned(),
+            user_id: Some("user".to_owned()),
+            set_id: Some("set".to_owned()),
+            connection_index: Some(0),
+        },
+    };
+    assert!(select_targets(Provider::SevenTv, std::slice::from_ref(&target), 5).is_empty());
+    assert_eq!(
+        select_targets(Provider::SevenTv, std::slice::from_ref(&target), 6),
+        [target]
+    );
+}
+
+#[tokio::test]
 async fn seven_tv_waits_for_acks_and_preserves_updates_across_snapshot_and_set_switch() {
     let mut fixture = Harness::new(
         Provider::SevenTv,
@@ -611,7 +740,7 @@ async fn seven_tv_waits_for_acks_and_preserves_updates_across_snapshot_and_set_s
     )
     .await;
     let mut subscriptions = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..6 {
         subscriptions.push(next_text(&mut fixture.socket).await);
     }
     let topics: HashSet<_> = subscriptions
@@ -620,7 +749,12 @@ async fn seven_tv_waits_for_acks_and_preserves_updates_across_snapshot_and_set_s
             assert_eq!(command["op"], 35);
             (
                 command["d"]["type"].as_str().unwrap(),
-                command["d"]["condition"]["object_id"].as_str().unwrap(),
+                command["d"]["condition"]
+                    .get("object_id")
+                    .or_else(|| command["d"]["condition"].get("id"))
+                    .unwrap()
+                    .as_str()
+                    .unwrap(),
             )
         })
         .collect();
@@ -630,14 +764,17 @@ async fn seven_tv_waits_for_acks_and_preserves_updates_across_snapshot_and_set_s
             ("user.update", "user-id"),
             ("emote_set.update", "set-id"),
             ("emote_set.delete", "set-id"),
+            ("cosmetic.create", "42"),
+            ("entitlement.create", "42"),
+            ("entitlement.delete", "42"),
         ])
     );
-    for subscription in &subscriptions[..2] {
+    for subscription in &subscriptions[..5] {
         acknowledge(&mut fixture.socket, subscription).await;
     }
     barrier(&mut fixture.socket, b"partial-acks").await;
     fixture.assert_no_request().await;
-    acknowledge(&mut fixture.socket, &subscriptions[2]).await;
+    acknowledge(&mut fixture.socket, &subscriptions[5]).await;
     let (mut request, headers) = fixture.request().await;
     assert!(headers.starts_with("POST /gql "));
     let request_body: Value =
@@ -705,7 +842,7 @@ async fn seven_tv_waits_for_acks_and_preserves_updates_across_snapshot_and_set_s
     )
     .await;
     let mut new_subscriptions = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..6 {
         new_subscriptions.push(next_text(&mut fixture.socket).await);
     }
     let topics: HashSet<_> = new_subscriptions
@@ -714,7 +851,12 @@ async fn seven_tv_waits_for_acks_and_preserves_updates_across_snapshot_and_set_s
             assert_eq!(command["op"], 35);
             (
                 command["d"]["type"].as_str().unwrap(),
-                command["d"]["condition"]["object_id"].as_str().unwrap(),
+                command["d"]["condition"]
+                    .get("object_id")
+                    .or_else(|| command["d"]["condition"].get("id"))
+                    .unwrap()
+                    .as_str()
+                    .unwrap(),
             )
         })
         .collect();
@@ -724,14 +866,17 @@ async fn seven_tv_waits_for_acks_and_preserves_updates_across_snapshot_and_set_s
             ("user.update", "user-id"),
             ("emote_set.update", "new-set"),
             ("emote_set.delete", "new-set"),
+            ("cosmetic.create", "42"),
+            ("entitlement.create", "42"),
+            ("entitlement.delete", "42"),
         ])
     );
-    for subscription in &new_subscriptions[..2] {
+    for subscription in &new_subscriptions[..5] {
         acknowledge(&mut fixture.socket, subscription).await;
     }
     barrier(&mut fixture.socket, b"new-binding-partial-acks").await;
     fixture.assert_no_request().await;
-    acknowledge(&mut fixture.socket, &new_subscriptions[2]).await;
+    acknowledge(&mut fixture.socket, &new_subscriptions[5]).await;
     let (mut request, headers) = fixture.request().await;
     let request_body: Value =
         serde_json::from_str(headers.split_once("\r\n\r\n").unwrap().1).unwrap();

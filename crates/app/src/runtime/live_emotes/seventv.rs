@@ -5,7 +5,9 @@ use crust_emotes::providers::{
 };
 use serde_json::{json, Value};
 
-use super::{EmoteDelta, LiveScope, LiveSource, Snapshot};
+use crate::seventv::{parse_7tv_live_cosmetic, SevenTvCosmeticKind, SevenTvLiveCosmeticUpdate};
+
+use super::{EmoteDelta, LiveScope, LiveSource, LiveTarget, Snapshot};
 
 pub(super) const URL: &str = "wss://events.7tv.io/v3";
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -13,35 +15,58 @@ const MAX_FRAME_BYTES: usize = 1024 * 1024;
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(super) struct Topic {
     pub(super) event: String,
-    pub(super) object_id: String,
+    pub(super) condition: Condition,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(super) enum Condition {
+    Object(String),
+    Channel(String),
 }
 
 impl Topic {
     pub(super) fn command(&self, subscribe: bool) -> String {
+        let condition = match &self.condition {
+            Condition::Object(id) => json!({"object_id": id}),
+            Condition::Channel(id) => json!({"ctx": "channel", "platform": "TWITCH", "id": id}),
+        };
         json!({"op": if subscribe { 35 } else { 36 }, "d": {
-            "type": self.event, "condition": {"object_id": self.object_id}
+            "type": self.event, "condition": condition
         }})
         .to_string()
     }
 }
 
-pub(super) fn topics(source: &LiveSource) -> Vec<Topic> {
-    let mut topics = Vec::with_capacity(3);
+pub(super) fn topics(target: &LiveTarget) -> Vec<Topic> {
+    let source = &target.source;
+    let mut topics = Vec::with_capacity(6);
     if let Some(user) = &source.user_id {
         topics.push(Topic {
             event: "user.update".into(),
-            object_id: user.clone(),
+            condition: Condition::Object(user.clone()),
         });
     }
     if let Some(set) = &source.set_id {
         topics.push(Topic {
             event: "emote_set.update".into(),
-            object_id: set.clone(),
+            condition: Condition::Object(set.clone()),
         });
         topics.push(Topic {
             event: "emote_set.delete".into(),
-            object_id: set.clone(),
+            condition: Condition::Object(set.clone()),
         });
+    }
+    if matches!(target.scope, LiveScope::Channel(_)) && source.platform == "TWITCH" {
+        for event in [
+            "cosmetic.create",
+            "entitlement.create",
+            "entitlement.delete",
+        ] {
+            topics.push(Topic {
+                event: event.into(),
+                condition: Condition::Channel(source.room_id.clone()),
+            });
+        }
     }
     topics
 }
@@ -71,6 +96,8 @@ pub(super) enum Update {
     },
     DeletedSet(String),
     PersonalSetsChanged(String),
+    UserStyleChanged(String),
+    Cosmetic(SevenTvLiveCosmeticUpdate),
 }
 
 fn id(value: &Value) -> Option<String> {
@@ -125,15 +152,24 @@ pub(super) fn decode(text: &str) -> Option<Frame> {
         {
             let data = body.get("data")?;
             let event = data.get("type")?.as_str()?;
-            if !matches!(
-                event,
-                "user.update" | "emote_set.update" | "emote_set.delete"
-            ) {
-                return None;
-            }
+            let condition = match event {
+                "user.update" | "emote_set.update" | "emote_set.delete" => {
+                    Condition::Object(id(data.get("condition")?.get("object_id")?)?)
+                }
+                "cosmetic.create" | "entitlement.create" | "entitlement.delete" => {
+                    let condition = data.get("condition")?;
+                    if condition.get("ctx")?.as_str()? != "channel"
+                        || condition.get("platform")?.as_str()? != "TWITCH"
+                    {
+                        return None;
+                    }
+                    Condition::Channel(id(condition.get("id")?)?)
+                }
+                _ => return None,
+            };
             Some(Frame::Subscribed(Topic {
                 event: event.into(),
-                object_id: id(data.get("condition")?.get("object_id")?)?,
+                condition,
             }))
         }
         0 => decode_dispatch(body),
@@ -144,6 +180,45 @@ pub(super) fn decode(text: &str) -> Option<Frame> {
 fn decode_dispatch(dispatch: &Value) -> Option<Frame> {
     let event = dispatch.get("type")?.as_str()?;
     let body = dispatch.get("body")?;
+    if event == "cosmetic.create" {
+        let object = body.get("object")?;
+        let update =
+            parse_7tv_live_cosmetic(object.get("kind")?.as_str()?, object.get("data")?.clone())?;
+        return Some(Frame::Updates(vec![Update::Cosmetic(update)]));
+    }
+    if matches!(event, "entitlement.create" | "entitlement.delete") {
+        let object = body.get("object")?;
+        let kind = match object.get("kind")?.as_str()? {
+            "PAINT" => SevenTvCosmeticKind::Paint,
+            "BADGE" => SevenTvCosmeticKind::Badge,
+            _ => return None,
+        };
+        let cosmetic_id = id(object.get("ref_id")?)?;
+        let connections = object.get("user")?.get("connections")?.as_array()?;
+        if connections.len() > 128 {
+            return None;
+        }
+        let mut twitch_user_ids: Vec<_> = connections
+            .iter()
+            .filter(|connection| {
+                connection.get("platform").and_then(Value::as_str) == Some("TWITCH")
+            })
+            .filter_map(|connection| connection.get("id").and_then(id))
+            .collect();
+        twitch_user_ids.sort();
+        twitch_user_ids.dedup();
+        if twitch_user_ids.is_empty() {
+            return None;
+        }
+        return Some(Frame::Updates(vec![Update::Cosmetic(
+            SevenTvLiveCosmeticUpdate::Entitlement {
+                kind,
+                cosmetic_id,
+                twitch_user_ids,
+                granted: event == "entitlement.create",
+            },
+        )]));
+    }
     let object_id = id(body.get("id")?)?;
     match event {
         "emote_set.update" => {
@@ -177,11 +252,14 @@ fn decode_dispatch(dispatch: &Value) -> Option<Frame> {
                     };
                     if let Some(emote) = parse_7tv_emote(value.clone()) {
                         deltas.push(EmoteDelta::Upsert {
-                            emote, old_code,
+                            emote,
+                            old_code,
                             preserve_overlay: field == "updated" && value.get("flags").is_none(),
                         });
                     } else if field == "updated" {
-                        let Some(emote_id) = value.get("id").or_else(|| previous.get("id")).and_then(id) else {
+                        let Some(emote_id) =
+                            value.get("id").or_else(|| previous.get("id")).and_then(id)
+                        else {
                             continue;
                         };
                         let name = value.get("name").and_then(code);
@@ -274,7 +352,22 @@ fn decode_dispatch(dispatch: &Value) -> Option<Frame> {
                     .take(128)
                     .any(|change| change.get("key").and_then(Value::as_str) == Some("emote_sets"))
             }) {
-                changes.push(Update::PersonalSetsChanged(object_id));
+                changes.push(Update::PersonalSetsChanged(object_id.clone()));
+            }
+            if ["updated", "pushed", "pulled"].into_iter().any(|field| {
+                body.get(field)
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .take(128)
+                    .any(|change| {
+                        matches!(
+                            change.get("key").and_then(Value::as_str),
+                            Some("style" | "avatar_url")
+                        )
+                    })
+            }) {
+                changes.push(Update::UserStyleChanged(object_id));
             }
             (!changes.is_empty()).then_some(Frame::Updates(changes))
         }
@@ -403,7 +496,7 @@ mod tests {
         assert_eq!(subscription_limit, 100);
         let topic = Topic {
             event: "emote_set.update".into(),
-            object_id: "set".into(),
+            condition: Condition::Object("set".into()),
         };
         let command: Value = serde_json::from_str(&topic.command(true)).unwrap();
         assert_eq!(command["op"], 35);
@@ -412,6 +505,75 @@ mod tests {
             matches!(decode(r#"{"op":5,"d":{"command":"SUBSCRIBE","data":{"type":"emote_set.update","condition":{"object_id":"set"}}}}"#), Some(Frame::Subscribed(received)) if received == topic)
         );
         assert!(decode(r#"{"op":1,"d":{"heartbeat_interval":0}}"#).is_none());
+    }
+
+    #[test]
+    fn room_cosmetics_use_channel_conditions_and_current_ack_envelopes() {
+        let topic = Topic {
+            event: "cosmetic.create".into(),
+            condition: Condition::Channel("42".into()),
+        };
+        let command: Value = serde_json::from_str(&topic.command(true)).unwrap();
+        assert_eq!(
+            command["d"]["condition"],
+            json!({"ctx": "channel", "platform": "TWITCH", "id": "42"})
+        );
+        let ack = json!({"op": 5, "d": {"command": "SUBSCRIBE", "data": command["d"]}});
+        assert!(
+            matches!(decode(&ack.to_string()), Some(Frame::Subscribed(received)) if received == topic)
+        );
+        let mut wrong_platform = ack.clone();
+        wrong_platform["d"]["data"]["condition"]["platform"] = json!("KICK");
+        assert!(decode(&wrong_platform.to_string()).is_none());
+        let unsubscribe: Value = serde_json::from_str(&topic.command(false)).unwrap();
+        assert_eq!(unsubscribe["op"], 36);
+    }
+
+    #[test]
+    fn cosmetic_and_entitlement_frames_keep_ids_and_rgba_without_outer_object_id() {
+        let cosmetic = json!({"op": 0, "d": {"type": "cosmetic.create", "body": {"object": {
+            "kind": "PAINT", "data": {"id": "paint", "function": "LINEAR_GRADIENT", "stops": [
+                {"at": 0, "color": 0}, {"at": 1, "color": 0xFFFFFFFFu32}
+            ]}
+        }}}});
+        let Some(Frame::Updates(updates)) = decode(&cosmetic.to_string()) else {
+            panic!("paint dispatch");
+        };
+        assert!(
+            matches!(&updates[0], Update::Cosmetic(SevenTvLiveCosmeticUpdate::Paint { id, paint })
+            if id == "paint" && paint.stops[0].color == "#00000000" && paint.stops[1].color == "#FFFFFF")
+        );
+        for event in ["entitlement.create", "entitlement.delete"] {
+            let entitlement = json!({"op": 0, "d": {"type": event, "body": {"object": {
+                "kind": "PAINT", "ref_id": "paint", "user": {"connections": [
+                    {"platform": "TWITCH", "id": "42"}, {"platform": "KICK", "id": "99"},
+                    {"platform": "TWITCH", "id": "42"}
+                ]}
+            }}}});
+            let Some(Frame::Updates(updates)) = decode(&entitlement.to_string()) else {
+                panic!("entitlement dispatch");
+            };
+            assert!(
+                matches!(&updates[0], Update::Cosmetic(SevenTvLiveCosmeticUpdate::Entitlement {
+                kind: SevenTvCosmeticKind::Paint, cosmetic_id, twitch_user_ids, granted,
+            }) if cosmetic_id == "paint" && twitch_user_ids == &["42"] && *granted == (event == "entitlement.create"))
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_entitlements_do_not_request_a_refresh_or_clear_a_selection() {
+        for object in [
+            json!({"kind": "PAINT", "ref_id": "paint", "user": {"connections": [{"platform": "KICK", "id": "42"}]}}),
+            json!({"kind": "PAINT", "ref_id": "", "user": {"connections": [{"platform": "TWITCH", "id": "42"}]}}),
+            json!({"kind": "BADGE", "ref_id": "badge", "user": {"connections": [{"platform": "TWITCH", "id": "invalid user"}]}}),
+        ] {
+            assert!(decode(
+                &json!({"op": 0, "d": {"type": "entitlement.delete", "body": {"object": object}}})
+                    .to_string()
+            )
+            .is_none());
+        }
     }
 
     #[test]
@@ -466,8 +628,12 @@ mod tests {
                 "id": "set", "updated": [{"key": "emotes",
                     "old_value": {"id": "id", "name": "Old"}, "value": value}]
             }}});
-            let Some(Frame::Updates(updates)) = decode(&frame.to_string()) else { panic!("dispatch"); };
-            let Update::Emotes { deltas, .. } = &updates[0] else { panic!("emotes"); };
+            let Some(Frame::Updates(updates)) = decode(&frame.to_string()) else {
+                panic!("dispatch");
+            };
+            let Update::Emotes { deltas, .. } = &updates[0] else {
+                panic!("emotes");
+            };
             assert!(deltas.iter().any(|delta| matches!(delta,
                 EmoteDelta::Overlay { id, code: Some(code), zero_width }
                 if id == "id" && code == expected_code && *zero_width == enabled)));
@@ -482,14 +648,22 @@ mod tests {
             let mut value = json!({"id": "id", "name": "Name", "data": {"host": {
                 "url": "//cdn.7tv.app/emote/id", "files": [{"name": "2x.webp", "width": 64}]
             }}});
-            if let Some(flags) = flags { value["flags"] = flags.into(); }
+            if let Some(flags) = flags {
+                value["flags"] = flags.into();
+            }
             let frame = json!({"op": 0, "d": {"type": "emote_set.update", "body": {
                 "id": "set", "updated": [{"key": "emotes", "value": value}]
             }}});
-            let Some(Frame::Updates(updates)) = decode(&frame.to_string()) else { panic!("dispatch"); };
-            let Update::Emotes { deltas, .. } = &updates[0] else { panic!("emotes"); };
-            assert!(matches!(&deltas[0], EmoteDelta::Upsert { emote, preserve_overlay, .. }
-                if *preserve_overlay == flags.is_none() && emote.zero_width == (flags == Some(1))));
+            let Some(Frame::Updates(updates)) = decode(&frame.to_string()) else {
+                panic!("dispatch");
+            };
+            let Update::Emotes { deltas, .. } = &updates[0] else {
+                panic!("emotes");
+            };
+            assert!(
+                matches!(&deltas[0], EmoteDelta::Upsert { emote, preserve_overlay, .. }
+                if *preserve_overlay == flags.is_none() && emote.zero_width == (flags == Some(1)))
+            );
         }
     }
 }

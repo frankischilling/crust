@@ -229,9 +229,11 @@ use egui::{
     ViewportBuilder, ViewportClass, ViewportCommand, ViewportId,
 };
 
+use crate::image_cache::UiImageCache;
 use crate::theme as t;
 
 use super::chrome;
+use super::name_paint::show_sender_name_with_sense;
 
 const WINDOW_DEFAULT_WIDTH: f32 = 520.0;
 const WINDOW_DEFAULT_HEIGHT: f32 = 380.0;
@@ -253,6 +255,8 @@ pub fn show_global_search_window(
     channels: &HashMap<ChannelId, ChannelState>,
     state: &mut GlobalSearchState,
     always_on_top: bool,
+    images: &UiImageCache,
+    animations_when_focused: bool,
 ) -> GlobalSearchOutput {
     let mut output = GlobalSearchOutput::default();
     let viewport_id = ViewportId::from_hash_of("global_search");
@@ -290,6 +294,7 @@ pub fn show_global_search_window(
         if !state.open {
             return;
         }
+        let animate = !animations_when_focused || child_ctx.input(|input| input.focused);
         match class {
             ViewportClass::Embedded => {
                 let mut open = state.open;
@@ -309,7 +314,7 @@ pub fn show_global_search_window(
                     )
                     .open(&mut open)
                     .show(child_ctx, |ui| {
-                        render_body(ui, channels, state, &mut output);
+                        render_body(ui, channels, state, &mut output, images, animate);
                     });
                 state.open &= open;
             }
@@ -322,7 +327,7 @@ pub fn show_global_search_window(
                             .inner_margin(egui::Margin::same(12)),
                     )
                     .show(child_ctx, |ui| {
-                        render_body(ui, channels, state, &mut output);
+                        render_body(ui, channels, state, &mut output, images, animate);
                     });
             }
         }
@@ -335,6 +340,8 @@ fn render_body(
     channels: &HashMap<ChannelId, ChannelState>,
     state: &mut GlobalSearchState,
     output: &mut GlobalSearchOutput,
+    images: &UiImageCache,
+    animate: bool,
 ) {
     handle_keyboard(ui.ctx(), state, output);
     render_header(ui, state, output);
@@ -350,7 +357,7 @@ fn render_body(
         );
     }
     ui.add_space(6.0);
-    render_results(ui, channels, state, output);
+    render_results(ui, channels, state, output, images, animate);
     state.focused_control = ui.ctx().memory(|memory| memory.focused()).filter(|id| {
         ui.ctx().read_response(*id).is_some_and(|response| {
             response.layer_id == ui.layer_id() && ui.min_rect().contains_rect(response.rect)
@@ -419,6 +426,8 @@ fn render_results(
     channels: &HashMap<ChannelId, ChannelState>,
     state: &mut GlobalSearchState,
     output: &mut GlobalSearchOutput,
+    images: &UiImageCache,
+    animate: bool,
 ) {
     let hit_count = state.results.len();
     let scroll_to_selected = std::mem::take(&mut state.scroll_to_selected);
@@ -462,7 +471,7 @@ fn render_results(
                 );
                 for hit in hits_in_group {
                     let selected = running_idx == state.selected_idx;
-                    let response = render_hit_row(ui, hit, selected, |hit_ref| {
+                    let response = render_hit_row(ui, hit, selected, images, animate, |hit_ref| {
                         output.jump_to = Some((hit_ref.channel.clone(), hit_ref.message.id));
                     });
                     if selected && scroll_to_selected {
@@ -535,6 +544,8 @@ fn render_hit_row(
     ui: &mut Ui,
     hit: &SearchHit,
     selected: bool,
+    images: &UiImageCache,
+    animate: bool,
     mut on_jump: impl FnMut(&SearchHit),
 ) -> egui::Response {
     let bg = if selected {
@@ -549,53 +560,70 @@ fn render_hit_row(
     let resp = frame
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            let mut row = egui::text::LayoutJob::default();
-            row.append(
-                &hit.message.timestamp.format("%H:%M ").to_string(),
-                0.0,
-                egui::TextFormat {
-                    font_id: t::tiny(),
-                    color: t::text_muted(),
-                    ..Default::default()
-                },
-            );
+            let content_width = ui.available_width();
             let color = hit
                 .message
                 .sender
                 .color
                 .as_deref()
                 .and_then(parse_hex_color)
-                .map(t::readable_username_color)
                 .unwrap_or_else(t::text_secondary);
-            row.append(
-                &hit.message.sender.login,
-                0.0,
-                egui::TextFormat {
-                    font_id: t::small(),
-                    color,
-                    ..Default::default()
+            let display_name = if hit.message.sender.display_name.trim().is_empty() {
+                &hit.message.sender.login
+            } else {
+                &hit.message.sender.display_name
+            };
+            ui.allocate_ui_with_layout(
+                egui::vec2(content_width, 0.0),
+                egui::Layout::left_to_right(Align::Center).with_main_wrap(true),
+                |ui| {
+                    ui.set_max_width(content_width);
+                    ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                    ui.style_mut().override_font_id = Some(t::small());
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(hit.message.timestamp.format("%H:%M ").to_string())
+                                .font(t::tiny())
+                                .color(t::text_muted()),
+                        )
+                        .selectable(false),
+                    );
+                    show_sender_name_with_sense(
+                        ui,
+                        display_name,
+                        color,
+                        hit.message.sender.name_paint.as_ref(),
+                        images,
+                        animate,
+                        egui::Sense::hover(),
+                    );
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!(
+                                " {}",
+                                truncate(hit.message.raw_text.trim(), 160)
+                            ))
+                            .font(t::small())
+                            .color(t::text_primary()),
+                        )
+                        .selectable(false)
+                        .wrap(),
+                    );
                 },
             );
-            row.append(
-                &format!(" {}", truncate(hit.message.raw_text.trim(), 160)),
-                0.0,
-                egui::TextFormat {
-                    font_id: t::small(),
-                    color: t::text_primary(),
-                    ..Default::default()
-                },
-            );
-            ui.add(egui::Label::new(row).wrap());
         })
         .response;
     let resp = ui.interact(resp.rect, search_hit_id(hit), egui::Sense::click());
-    resp.widget_info(|| egui::WidgetInfo::selected(
-        egui::WidgetType::SelectableLabel,
-        ui.is_enabled(),
-        selected,
-        format!("{}: {}", hit.message.sender.login, hit.message.raw_text),
-    ));
+    resp.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            ui.is_enabled(),
+            selected,
+            format!("{}: {}", hit.message.sender.login, hit.message.raw_text),
+        )
+    });
     if resp.clicked() {
+        resp.request_focus();
         on_jump(hit);
     }
     resp
@@ -719,14 +747,34 @@ mod tests {
         }
     }
 
+    fn test_name_paint() -> crust_core::model::SenderNamePaint {
+        crust_core::model::SenderNamePaint {
+            function: "linear-gradient".to_owned(),
+            angle: Some(90.0),
+            stops: vec![
+                crust_core::model::SenderNamePaintStop {
+                    at: 0.0,
+                    color: "#ff0000".to_owned(),
+                },
+                crust_core::model::SenderNamePaintStop {
+                    at: 1.0,
+                    color: "#0000ff".to_owned(),
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn narrow_results_wrap_and_the_last_line_remains_clickable() {
         for width in [240.0, 360.0, 480.0] {
             let ctx = Context::default();
-            let hit = SearchHit {
+            let images = UiImageCache::default();
+            let mut hit = SearchHit {
                 channel: ChannelId::new("channel"),
                 message: mk_msg(9, "a_long_viewer_name", "A narrow result must preserve readable text, including café and a long URL: https://example.com/a/very/long/path/that/still/belongs/to/the/same/message", 0),
             };
+            hit.message.sender.name_paint = Some(test_name_paint());
             let mut clicked = false;
             let mut row_rect = egui::Rect::NOTHING;
             let mut shapes = Vec::new();
@@ -743,7 +791,10 @@ mod tests {
                         |ctx| {
                             egui::CentralPanel::default().show(ctx, |ui| {
                                 let available = ui.available_rect_before_wrap();
-                                row_rect = render_hit_row(ui, &hit, true, |_| clicked = true).rect;
+                                row_rect = render_hit_row(ui, &hit, true, &images, true, |_| {
+                                    clicked = true
+                                })
+                                .rect;
                                 assert!(
                                     row_rect.right() <= available.right() + 0.5,
                                     "{row_rect:?} exceeds {available:?}"
@@ -764,8 +815,18 @@ mod tests {
                     _ => None,
                 })
                 .unwrap();
+            assert!(super::super::name_paint::cached_name_count(&ctx) > 0);
             assert!(text.galley.rows.len() > 1);
-            assert!(text.pos.x + text.galley.size().x <= row_rect.right() + 0.5);
+            let text_bounds = text.galley.rect.translate(text.pos.to_vec2());
+            assert!(
+                text_bounds.right() <= row_rect.right() + 0.5,
+                "snippet {text_bounds:?} exceeds result {row_rect:?} at width {width}; rows={:?}",
+                text.galley
+                    .rows
+                    .iter()
+                    .map(|row| row.rect)
+                    .collect::<Vec<_>>()
+            );
             let position = egui::pos2(row_rect.center().x, row_rect.bottom() - 5.0);
             for pressed in [true, false] {
                 let _ = ctx.run(
@@ -787,7 +848,7 @@ mod tests {
                     },
                     |ctx| {
                         egui::CentralPanel::default().show(ctx, |ui| {
-                            render_hit_row(ui, &hit, true, |_| clicked = true);
+                            render_hit_row(ui, &hit, true, &images, true, |_| clicked = true);
                         });
                     },
                 );
@@ -927,6 +988,7 @@ mod tests {
     fn embedded_close_button_keeps_the_search_window_closed() {
         let ctx = Context::default();
         let channels = HashMap::new();
+        let images = UiImageCache::default();
         let mut search = GlobalSearchState::default();
         search.request_open();
         let input = || egui::RawInput {
@@ -939,7 +1001,7 @@ mod tests {
         let mut shapes = Vec::new();
         for _ in 0..2 {
             shapes = ctx.run(input(), |ctx| {
-                show_global_search_window(ctx, &channels, &mut search, false);
+                show_global_search_window(ctx, &channels, &mut search, false, &images, true);
             }).shapes;
         }
         let close_position = shapes.iter().find_map(|shape| match &shape.shape {
@@ -962,7 +1024,7 @@ mod tests {
             ];
             let _ = ctx.run(frame_input, |ctx| {
                 close_requested |= show_global_search_window(
-                    ctx, &channels, &mut search, false,
+                    ctx, &channels, &mut search, false, &images, true,
                 ).close_requested;
             });
         }
@@ -1158,10 +1220,88 @@ mod tests {
             events, ..Default::default()
         }, |ctx| {
             CentralPanel::default().show(ctx, |ui| {
-                render_body(ui, channels, state, &mut output);
+                render_body(ui, channels, state, &mut output, &UiImageCache::default(), true);
             });
         });
         (rendered, output)
+    }
+
+    #[test]
+    fn painted_search_names_keep_row_click_and_keyboard_focus() {
+        let (channel, mut messages) = mk_channel("example");
+        let mut first = mk_msg(1, "first_login", "needle first", 0);
+        first.sender.display_name = "Custom Display Name".to_owned();
+        messages.push_message(first);
+        messages.push_message(mk_msg(2, "second_login", "needle second", 1));
+        let mut channels = HashMap::from([(channel.clone(), messages)]);
+        let mut search = GlobalSearchState {
+            open: true,
+            input: "needle".to_owned(),
+            focus_input: true,
+            ..Default::default()
+        };
+        refresh_if_stale(&mut search, &channels);
+        let ctx = Context::default();
+        let mut rendered = egui::FullOutput::default();
+        for _ in 0..3 {
+            rendered = search_widget_frame(&ctx, &mut search, &channels, Vec::new()).0;
+        }
+        let name = rendered
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "Custom Display Name" => {
+                    Some(text.galley.rect.translate(text.pos.to_vec2()))
+                }
+                _ => None,
+            })
+            .expect("search uses the displayed sender name");
+        for message in &mut channels.get_mut(&channel).unwrap().messages {
+            message.sender.name_paint = Some(test_name_paint());
+        }
+        search.invalidate();
+        refresh_if_stale(&mut search, &channels);
+        for _ in 0..2 {
+            rendered = search_widget_frame(&ctx, &mut search, &channels, Vec::new()).0;
+        }
+        assert!(super::super::name_paint::cached_name_count(&ctx) >= 2);
+        assert!(!rendered.shapes.iter().any(|shape| matches!(
+            &shape.shape,
+            egui::Shape::Text(text) if text.galley.text() == "Custom Display Name"
+        )));
+        let mut action = GlobalSearchOutput::default();
+        for pressed in [true, false] {
+            action = search_widget_frame(
+                &ctx,
+                &mut search,
+                &channels,
+                vec![
+                    egui::Event::PointerMoved(name.center()),
+                    egui::Event::PointerButton {
+                        pos: name.center(),
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    },
+                ],
+            )
+            .1;
+        }
+        assert_eq!(action.jump_to, Some((channel.clone(), MessageId(1))));
+        assert_eq!(
+            search.focused_result,
+            Some(search_hit_id(&search.results[0]))
+        );
+        search_widget_frame(
+            &ctx,
+            &mut search,
+            &channels,
+            vec![search_key(Key::ArrowDown)],
+        );
+        assert_eq!(search.selected_idx, 1);
+        let (_, action) =
+            search_widget_frame(&ctx, &mut search, &channels, vec![search_key(Key::Enter)]);
+        assert_eq!(action.jump_to, Some((channel, MessageId(2))));
     }
 
     #[test]

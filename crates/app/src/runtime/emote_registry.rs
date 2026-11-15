@@ -456,6 +456,8 @@ impl EmoteRegistry {
                         state.source.provider.name() != "7tv"
                             || state.source.user_id.is_some()
                             || state.source.set_id.is_some()
+                            || (state.source.platform == "TWITCH"
+                                && !state.source.room_id.is_empty())
                     })
                     .map(move |state| LiveTarget {
                         scope: LiveScope::Channel(channel.clone()),
@@ -643,7 +645,9 @@ impl EmoteRegistry {
                     let scope = self.channels.get_mut(channel).unwrap();
                     let provider = target.source.provider.name();
                     scope.inline_emotes.remove(provider);
-                    scope.inline_emote_order.retain(|(name, _)| name != provider);
+                    scope
+                        .inline_emote_order
+                        .retain(|(name, _)| name != provider);
                 }
                 LiveScope::Personal(_) => {
                     self.personal_emote_count = self.personal_emote_count.saturating_sub(removed)
@@ -710,7 +714,11 @@ impl EmoteRegistry {
             {
                 changed = true;
             }
-            if scope.inline_emotes.get(&provider).is_some_and(HashMap::is_empty) {
+            if scope
+                .inline_emotes
+                .get(&provider)
+                .is_some_and(HashMap::is_empty)
+            {
                 scope.inline_emotes.remove(&provider);
             }
         }
@@ -941,6 +949,17 @@ impl EmoteRegistry {
             }
         }
         None
+    }
+
+    /// Keep usable emotes and report whether an unfinished profile needs a replacement.
+    pub(crate) fn invalidate_personal_lookup(&mut self, user_id: &str) -> bool {
+        let canceled = self.pending_users.remove(user_id).is_some();
+        if let Some(retry_at) = self.cached_users.get_mut(user_id) {
+            // Keep the eviction entry until the replacement finishes. A deferred
+            // refresh must not leave retained personal emotes outside the budget.
+            *retry_at = Instant::now();
+        }
+        canceled
     }
 
     /// Reserve one bounded lookup for an open channel or the current account's senders.
@@ -1760,6 +1779,39 @@ mod tests {
     }
 
     #[test]
+    fn twitch_rooms_without_an_emote_set_keep_their_cosmetic_subscription_target() {
+        let mut registry = EmoteRegistry::default();
+        let channel = ChannelId::new("room");
+        registry.open_channel(&channel);
+        let generation = registry.begin_channel_load(&channel, "123", false).unwrap();
+        let source = LiveSource {
+            provider: Provider::SevenTv,
+            platform: "TWITCH".into(),
+            room_id: "123".into(),
+            user_id: None,
+            set_id: None,
+            connection_index: None,
+        };
+        assert!(registry.replace_channel_with_source(
+            &channel,
+            generation,
+            "7tv",
+            Some(Vec::new()),
+            Some(source),
+            None
+        ));
+        assert!(registry.complete_channel_load(&channel, generation));
+        let targets = registry.live_targets();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].scope, LiveScope::Channel(channel.clone()));
+        assert_eq!(targets[0].source.room_id, "123");
+        assert!(targets[0].source.user_id.is_none());
+        assert!(targets[0].source.set_id.is_none());
+        registry.close_channel(&channel);
+        assert!(registry.live_targets().is_empty());
+    }
+
+    #[test]
     fn live_set_switch_rejects_old_socket_and_inflight_manual_snapshot() {
         let mut registry = EmoteRegistry::default();
         let channel = ChannelId::new("room");
@@ -2028,7 +2080,13 @@ mod tests {
         let mut registry = EmoteRegistry::default();
         let channel = ChannelId::kick("room");
         let mut fetched: Vec<_> = (0..=MAX_INLINE_EMOTES_PER_CHANNEL)
-            .map(|index| emote("kick", &format!("catalog-{index}"), &format!("Fetched{index}")))
+            .map(|index| {
+                emote(
+                    "kick",
+                    &format!("catalog-{index}"),
+                    &format!("Fetched{index}"),
+                )
+            })
             .collect();
         let original_wave = emote("kick", "original-wave", "Wave");
         let known = emote("kick", "known", "Known");
@@ -2042,7 +2100,11 @@ mod tests {
         for index in 0..MAX_INLINE_EMOTES_PER_CHANNEL - 2 {
             assert!(registry.insert_channel_emote(
                 &channel,
-                emote("kick", &format!("observed-{index}"), &format!("Observed{index}")),
+                emote(
+                    "kick",
+                    &format!("observed-{index}"),
+                    &format!("Observed{index}")
+                ),
             ));
         }
         assert!(!registry.insert_channel_emote(&channel, recent.clone()));
@@ -2062,14 +2124,48 @@ mod tests {
         assert_eq!(registry.resolve(&channel, "", "Recent"), Some(&recent));
         assert_eq!(registry.resolve(&channel, "", "Known"), Some(&known));
         let scope = &registry.channels[&channel];
-        assert_eq!(scope.inline_emotes.values().map(HashMap::len).sum::<usize>(), MAX_INLINE_EMOTES_PER_CHANNEL);
-        assert_eq!(scope.inline_emote_order.len(), MAX_INLINE_EMOTES_PER_CHANNEL);
-        assert_eq!(scope.emotes.values().map(HashMap::len).sum::<usize>(), fetched_count);
+        assert_eq!(
+            scope
+                .inline_emotes
+                .values()
+                .map(HashMap::len)
+                .sum::<usize>(),
+            MAX_INLINE_EMOTES_PER_CHANNEL
+        );
+        assert_eq!(
+            scope.inline_emote_order.len(),
+            MAX_INLINE_EMOTES_PER_CHANNEL
+        );
+        assert_eq!(
+            scope.emotes.values().map(HashMap::len).sum::<usize>(),
+            fetched_count
+        );
         let catalog = registry.catalog();
-        assert_eq!(catalog.len(), fetched_count + MAX_INLINE_EMOTES_PER_CHANNEL - 1);
-        assert_eq!(catalog.iter().filter(|entry| entry.id.starts_with("catalog-")).count(), MAX_INLINE_EMOTES_PER_CHANNEL + 1);
-        assert_eq!(catalog.iter().find(|entry| entry.code == "Wave").unwrap().id, "original-wave");
-        assert_eq!(registry.snapshot_for(&channel).resolve(&channel, "", "Recent"), Some(&recent));
+        assert_eq!(
+            catalog.len(),
+            fetched_count + MAX_INLINE_EMOTES_PER_CHANNEL - 1
+        );
+        assert_eq!(
+            catalog
+                .iter()
+                .filter(|entry| entry.id.starts_with("catalog-"))
+                .count(),
+            MAX_INLINE_EMOTES_PER_CHANNEL + 1
+        );
+        assert_eq!(
+            catalog
+                .iter()
+                .find(|entry| entry.code == "Wave")
+                .unwrap()
+                .id,
+            "original-wave"
+        );
+        assert_eq!(
+            registry
+                .snapshot_for(&channel)
+                .resolve(&channel, "", "Recent"),
+            Some(&recent)
+        );
     }
 
     #[test]
@@ -2100,7 +2196,10 @@ mod tests {
         assert!(registry.resolve(&channel, "", "First").is_none());
         assert!(matches!(&spans[0], crust_core::Span::Emote { id, url, .. }
             if id == "first" && url == &first.url_1x));
-        assert_eq!(registry.channel_emote_count(&channel), MAX_INLINE_EMOTES_PER_CHANNEL);
+        assert_eq!(
+            registry.channel_emote_count(&channel),
+            MAX_INLINE_EMOTES_PER_CHANNEL
+        );
         registry.close_channel(&channel);
         registry.open_channel(&channel);
         assert!(registry.channels[&channel].inline_emote_order.is_empty());
@@ -2311,7 +2410,9 @@ mod tests {
         assert!(registry.resolve(&channel, "", "Remove").is_none());
         assert_eq!(registry.channel_emote_count(&channel), 1);
         assert!(registry.complete_channel_load(&channel, generation));
-        assert!(registry.begin_channel_load(&channel, "room", false).is_none());
+        assert!(registry
+            .begin_channel_load(&channel, "room", false)
+            .is_none());
         let next = registry
             .take_channel_emote_retries(Instant::now() + CHANNEL_RETRY_DELAY, 1)
             .pop()
@@ -2706,6 +2807,63 @@ mod tests {
                 .id,
             "old"
         );
+    }
+
+    #[test]
+    fn invalidating_a_profile_preserves_live_emotes_and_rejects_older_lookups() {
+        let mut registry = EmoteRegistry::default();
+        bind_personal(
+            &mut registry,
+            "42",
+            "set",
+            vec![emote("7tv", "old", "Same")],
+        );
+        let binding = registry.personal_live["42"].state.binding();
+        assert!(registry.begin_personal_load("42", None).is_none());
+        assert!(!registry.invalidate_personal_lookup("42"));
+        let stale = registry.begin_personal_load("42", None).unwrap();
+        assert!(registry.invalidate_personal_lookup("42"));
+        let current = registry.begin_personal_load("42", None).unwrap();
+        assert_ne!(current, stale);
+        assert!(registry
+            .complete_personal_load("42", stale, Some(Vec::new()))
+            .is_none());
+        assert_eq!(registry.personal_live["42"].state.binding(), binding);
+        assert_eq!(registry.personal_emote_count, 1);
+        assert_eq!(
+            registry
+                .cached_user_order
+                .iter()
+                .filter(|user| *user == "42")
+                .count(),
+            1
+        );
+        assert_eq!(
+            registry
+                .resolve(&ChannelId::new("room"), "42", "Same")
+                .unwrap()
+                .id,
+            "old"
+        );
+        registry
+            .complete_personal_load("42", current, Some(vec![emote("7tv", "new", "Same")]))
+            .unwrap();
+        assert_eq!(
+            registry
+                .resolve(&ChannelId::new("room"), "42", "Same")
+                .unwrap()
+                .id,
+            "new"
+        );
+        assert_eq!(
+            registry
+                .cached_user_order
+                .iter()
+                .filter(|user| *user == "42")
+                .count(),
+            1
+        );
+        assert!(registry.begin_personal_load("42", None).is_none());
     }
 
     #[test]

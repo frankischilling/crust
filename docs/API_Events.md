@@ -604,6 +604,9 @@ Fields:
 - `collapse_long_messages`
 - `collapse_long_message_lines`
 - `animations_when_focused`
+- `show_name_paints`
+- `show_name_paint_shadows`
+- `large_name_paint_shadows`
 
 ### `c2.EventType.GeneralSettingsUpdated`
 

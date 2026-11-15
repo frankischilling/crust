@@ -254,6 +254,15 @@ pub struct AppSettings {
     /// If true, animation repainting runs only while the app window is focused.
     #[serde(default = "bool_true")]
     pub animations_when_focused: bool,
+    /// Display provider username paints.
+    #[serde(default = "bool_true")]
+    pub show_name_paints: bool,
+    /// Display drop shadows attached to username paints.
+    #[serde(default = "bool_true")]
+    pub show_name_paint_shadows: bool,
+    /// Use the wider blur for paint shadows.
+    #[serde(default = "bool_true")]
+    pub large_name_paint_shadows: bool,
     /// Preferred channel chrome layout: `sidebar` or `top_tabs`.
     #[serde(default = "default_channel_layout")]
     pub channel_layout: String,
@@ -643,6 +652,9 @@ impl Default for AppSettings {
             collapse_long_messages: true,
             collapse_long_message_lines: default_collapse_long_message_lines(),
             animations_when_focused: true,
+            show_name_paints: true,
+            show_name_paint_shadows: true,
+            large_name_paint_shadows: true,
             channel_layout: default_channel_layout(),
             sidebar_visible: true,
             analytics_visible: false,
@@ -1197,6 +1209,9 @@ show_timestamps = true
         assert!(!cfg.split_header_show_game);
         assert!(!cfg.analytics_visible);
         assert!(!cfg.irc_status_visible);
+        assert!(cfg.show_name_paints);
+        assert!(cfg.show_name_paint_shadows);
+        assert!(cfg.large_name_paint_shadows);
     }
 
     #[test]
@@ -1213,6 +1228,9 @@ show_tab_live_indicators = false
 split_header_show_title = false
 split_header_show_game = true
 split_header_show_viewer_count = false
+show_name_paints = false
+show_name_paint_shadows = false
+large_name_paint_shadows = true
 "#,
         )
         .expect("appearance config should parse");
@@ -1227,6 +1245,13 @@ split_header_show_viewer_count = false
         assert!(!cfg.split_header_show_title);
         assert!(cfg.split_header_show_game);
         assert!(!cfg.split_header_show_viewer_count);
+        assert!(!cfg.show_name_paints);
+        assert!(!cfg.show_name_paint_shadows);
+        assert!(cfg.large_name_paint_shadows);
+        let restored: AppSettings = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert!(!restored.show_name_paints);
+        assert!(!restored.show_name_paint_shadows);
+        assert!(restored.large_name_paint_shadows);
     }
 
     #[test]
