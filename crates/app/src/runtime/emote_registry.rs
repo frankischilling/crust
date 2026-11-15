@@ -86,6 +86,7 @@ pub(crate) struct EmoteRegistry {
     cached_user_order: VecDeque<String>,
     personal_emote_count: usize,
     active_account: Option<String>,
+    twitch_global_generation: Option<u64>,
     twitch_inventory: ProviderEmotes,
     twitch_inventory_generation: Option<u64>,
     next_generation: u64,
@@ -127,6 +128,21 @@ impl EmoteRegistry {
 
     pub(crate) fn is_current_global_load(&self, generation: u64) -> bool {
         self.global_load_generation == generation
+    }
+
+    /// Keep the bundled globals available until a network catalog replaces them.
+    pub(crate) fn seed_twitch_globals(&mut self, emotes: Vec<EmoteInfo>) -> bool {
+        if self.global.contains_key("twitch") {
+            return false;
+        }
+        self.global.insert(
+            "twitch".into(),
+            emotes
+                .into_iter()
+                .map(|emote| (emote.code.clone(), emote))
+                .collect(),
+        );
+        true
     }
 
     pub(crate) fn replace_global_result(
@@ -731,6 +747,7 @@ impl EmoteRegistry {
             return;
         }
         self.active_account = user_id.map(str::to_owned);
+        self.twitch_global_generation = None;
         self.twitch_inventory.clear();
         self.twitch_inventory_generation = None;
         for scope in self.channels.values_mut() {
@@ -743,6 +760,39 @@ impl EmoteRegistry {
         let deferred = &self.deferred_users;
         self.deferred_user_order
             .retain(|user| deferred.contains_key(user));
+    }
+
+    pub(crate) fn begin_twitch_globals(&mut self, user_id: &str) -> Option<u64> {
+        if user_id.is_empty() || self.active_account.as_deref() != Some(user_id) {
+            return None;
+        }
+        self.next_generation = self.next_generation.wrapping_add(1);
+        self.twitch_global_generation = Some(self.next_generation);
+        Some(self.next_generation)
+    }
+
+    pub(crate) fn complete_twitch_globals(
+        &mut self,
+        user_id: &str,
+        generation: u64,
+        emotes: Option<Vec<EmoteInfo>>,
+    ) -> bool {
+        if self.active_account.as_deref() != Some(user_id)
+            || self.twitch_global_generation != Some(generation)
+        {
+            return false;
+        }
+        self.twitch_global_generation = None;
+        let Some(emotes) = emotes else {
+            return false;
+        };
+        let next = emotes
+            .into_iter()
+            .map(|emote| (emote.code.clone(), emote))
+            .collect();
+        let changed = self.global.get("twitch") != Some(&next);
+        self.global.insert("twitch".into(), next);
+        changed
     }
 
     pub(crate) fn begin_twitch_inventory(&mut self, user_id: &str) -> Option<u64> {
@@ -1000,6 +1050,12 @@ impl EmoteRegistry {
         Some(self.next_generation)
     }
 
+    pub(crate) fn is_current_personal_load(&self, user_id: &str, generation: u64) -> bool {
+        self.pending_users
+            .get(user_id)
+            .is_some_and(|lookup| lookup.generation == generation)
+    }
+
     #[cfg(test)]
     pub(crate) fn complete_personal_load(
         &mut self,
@@ -1017,12 +1073,7 @@ impl EmoteRegistry {
         mut emotes: Option<Vec<EmoteInfo>>,
         source: Option<LiveSource>,
     ) -> Option<UserEmoteUpdate> {
-        if self
-            .pending_users
-            .get(user_id)
-            .map(|lookup| lookup.generation)
-            != Some(generation)
-        {
+        if !self.is_current_personal_load(user_id, generation) {
             return None;
         }
         let pending = self.pending_users.remove(user_id).unwrap();
@@ -1305,6 +1356,28 @@ mod tests {
             set_id: Some(set_id.into()),
             connection_index: Some(0),
         }
+    }
+
+    #[test]
+    fn bundled_twitch_globals_never_replace_a_refreshed_or_empty_catalog() {
+        let mut registry = EmoteRegistry::default();
+        assert!(registry.seed_twitch_globals(vec![emote("twitch", "seed", "Kappa")]));
+        registry.set_account(Some("alice"));
+        let generation = registry.begin_twitch_globals("alice").unwrap();
+        assert!(registry.complete_twitch_globals(
+            "alice",
+            generation,
+            Some(vec![emote("twitch", "remote", "TwitchUnity")])
+        ));
+        registry.begin_global_load();
+        assert!(!registry.seed_twitch_globals(vec![emote("twitch", "seed", "Kappa")]));
+        assert_eq!(registry.catalog()[0].code, "TwitchUnity");
+        let generation = registry.begin_twitch_globals("alice").unwrap();
+        assert!(registry.complete_twitch_globals("alice", generation, Some(Vec::new())));
+        registry.set_account(None);
+        registry.begin_global_load();
+        assert!(!registry.seed_twitch_globals(vec![emote("twitch", "seed", "Kappa")]));
+        assert!(registry.catalog().is_empty());
     }
 
     #[test]

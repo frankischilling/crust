@@ -6,12 +6,13 @@ use std::time::{Duration, Instant};
 
 use crust_core::model::ChannelId;
 use crust_emotes::EmoteInfo;
-use serde::Deserialize;
+use serde::{de::DeserializeOwned, Deserialize};
 use tokio::task::JoinHandle;
 
 use super::emote_registry::TwitchFollowerTarget;
 
 const USER_EMOTES_URL: &str = "https://api.twitch.tv/helix/chat/emotes/user";
+const GLOBAL_EMOTES_URL: &str = "https://api.twitch.tv/helix/chat/emotes/global";
 const EMOTES_SCOPE: &str = "user:read:emotes";
 const PAGE_TIMEOUT: Duration = Duration::from_secs(10);
 const LOAD_TIMEOUT: Duration = Duration::from_secs(45);
@@ -31,6 +32,12 @@ enum LoadError {
     LimitExceeded,
     TimedOut,
     TaskFailed,
+}
+
+#[derive(Deserialize)]
+struct GlobalEmoteCatalog {
+    data: Vec<UserEmote>,
+    template: String,
 }
 
 #[derive(Deserialize)]
@@ -171,7 +178,7 @@ async fn fetch_page_at(
     let mut request = client
         .get(url)
         .timeout(PAGE_TIMEOUT)
-        .bearer_auth(token.strip_prefix("oauth:").unwrap_or(token))
+        .bearer_auth(token.trim().strip_prefix("oauth:").unwrap_or(token.trim()))
         .header("Client-Id", client_id)
         .query(&[("user_id", user_id)]);
     if let Some(broadcaster_id) = broadcaster_id {
@@ -180,6 +187,12 @@ async fn fetch_page_at(
     if let Some(after) = after {
         request = request.query(&[("after", after)]);
     }
+    fetch_response(request).await
+}
+
+async fn fetch_response<T: DeserializeOwned>(
+    request: reqwest::RequestBuilder,
+) -> Result<T, LoadError> {
     let mut response = request.send().await.map_err(|_| LoadError::Transport)?;
     if !response.status().is_success() {
         return Err(LoadError::Http(response.status().as_u16()));
@@ -198,6 +211,33 @@ async fn fetch_page_at(
         bytes.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&bytes).map_err(|_| LoadError::InvalidData)
+}
+
+async fn fetch_global_catalog_at(
+    client: &reqwest::Client,
+    url: &str,
+    client_id: &str,
+    token: &str,
+) -> Result<Vec<EmoteInfo>, LoadError> {
+    let catalog: GlobalEmoteCatalog = fetch_response(
+        client
+            .get(url)
+            .timeout(PAGE_TIMEOUT)
+            .bearer_auth(token.trim().strip_prefix("oauth:").unwrap_or(token.trim()))
+            .header("Client-Id", client_id),
+    )
+    .await?;
+    let mut emotes = Vec::new();
+    let mut ids = HashSet::new();
+    for emote in catalog.data {
+        if ids.insert(emote.id.clone()) {
+            if emotes.len() >= MAX_EMOTES {
+                return Err(LoadError::LimitExceeded);
+            }
+            emotes.push(emote.into_info(&catalog.template)?);
+        }
+    }
+    Ok(emotes)
 }
 
 async fn fetch_follower_inventory_at(
@@ -248,14 +288,18 @@ struct FollowerRequest {
 }
 
 enum Completion {
+    Global(Result<Vec<EmoteInfo>, LoadError>),
     Account(Result<Vec<EmoteInfo>, LoadError>),
     Follower(ChannelId, Result<Vec<EmoteInfo>, LoadError>),
 }
 
-/// Account and channel entitlements share a bounded request budget.
+/// Global catalogs, account inventory, and channel entitlements share a request budget.
 #[derive(Default)]
 pub(crate) struct TwitchEmoteInventory {
     owner: Option<String>,
+    client: Option<reqwest::Client>,
+    global_request: Option<InventoryRequest>,
+    next_global_request: Option<Instant>,
     request: Option<InventoryRequest>,
     next_request: Option<Instant>,
     follower_requests: HashMap<ChannelId, FollowerRequest>,
@@ -280,30 +324,55 @@ impl TwitchEmoteInventory {
             self.clear();
             self.owner = Some(user_id.to_owned());
         }
-        if !scopes.iter().any(|scope| scope == EMOTES_SCOPE) {
-            self.clear();
-            return index.write().unwrap().clear_twitch_inventory(user_id);
-        }
+        let has_inventory_scope = scopes.iter().any(|scope| scope == EMOTES_SCOPE);
+        let changed = if has_inventory_scope {
+            false
+        } else {
+            self.clear_entitlements();
+            index.write().unwrap().clear_twitch_inventory(user_id)
+        };
         let Some(client_id) = client_id.filter(|id| !id.is_empty()) else {
-            return false;
+            return changed;
         };
         if token.trim().is_empty() {
-            return false;
+            return changed;
         }
+        if self.client.is_none() {
+            let Ok(client) = reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+            else {
+                return changed;
+            };
+            self.client = Some(client);
+        }
+        let client = self.client.as_ref().unwrap();
         let now = Instant::now();
+        if self.global_request.is_none()
+            && self.active_requests() < MAX_REQUESTS
+            && self.next_global_request.is_none_or(|due| now >= due)
+        {
+            let client = client.clone();
+            let owned_client = client_id.to_owned();
+            let owned_token = token.to_owned();
+            self.start_global_at(user_id, index, now, async move {
+                fetch_global_catalog_at(&client, GLOBAL_EMOTES_URL, &owned_client, &owned_token)
+                    .await
+            });
+        }
+        if !has_inventory_scope {
+            return changed;
+        }
         if self.request.is_none()
-            && self.follower_requests.len() < MAX_REQUESTS
+            && self.active_requests() < MAX_REQUESTS
             && self.next_request.is_none_or(|due| now >= due)
         {
+            let client = self.client.as_ref().unwrap().clone();
             let owned_user = user_id.to_owned();
             let owned_client = client_id.to_owned();
             let owned_token = token.to_owned();
             self.start_at(user_id, index, now, async move {
-                let client = reqwest::Client::builder()
-                    .connect_timeout(Duration::from_secs(5))
-                    .redirect(reqwest::redirect::Policy::none())
-                    .build()
-                    .map_err(|_| LoadError::Transport)?;
                 tokio::time::timeout(
                     LOAD_TIMEOUT,
                     fetch_inventory_at(
@@ -322,22 +391,18 @@ impl TwitchEmoteInventory {
         targets.sort_by(|left, right| left.channel.as_str().cmp(right.channel.as_str()));
         self.retain_followers(&targets);
         for target in targets {
-            if self.follower_requests.len() + usize::from(self.request.is_some()) >= MAX_REQUESTS {
+            if self.active_requests() >= MAX_REQUESTS {
                 break;
             }
             if !self.follower_due(&target, now) {
                 continue;
             }
+            let client = self.client.as_ref().unwrap().clone();
             let owned_user = user_id.to_owned();
             let owned_client = client_id.to_owned();
             let owned_token = token.to_owned();
             let room_id = target.room_id.clone();
             self.start_follower_at(user_id, target, index, now, async move {
-                let client = reqwest::Client::builder()
-                    .connect_timeout(Duration::from_secs(5))
-                    .redirect(reqwest::redirect::Policy::none())
-                    .build()
-                    .map_err(|_| LoadError::Transport)?;
                 tokio::time::timeout(
                     LOAD_TIMEOUT,
                     fetch_follower_inventory_at(
@@ -353,7 +418,44 @@ impl TwitchEmoteInventory {
                 .map_err(|_| LoadError::TimedOut)?
             });
         }
-        false
+        changed
+    }
+
+    fn active_requests(&self) -> usize {
+        self.follower_requests.len()
+            + usize::from(self.request.is_some())
+            + usize::from(self.global_request.is_some())
+    }
+
+    fn start_global_at<F>(
+        &mut self,
+        user_id: &str,
+        index: &crate::EmoteIndex,
+        now: Instant,
+        load: F,
+    ) -> bool
+    where
+        F: Future<Output = Result<Vec<EmoteInfo>, LoadError>> + Send + 'static,
+    {
+        if self.owner.as_deref() != Some(user_id) {
+            self.clear();
+            self.owner = Some(user_id.to_owned());
+        }
+        if self.global_request.is_some()
+            || self.active_requests() >= MAX_REQUESTS
+            || self.next_global_request.is_some_and(|time| now < time)
+        {
+            return false;
+        }
+        let Some(generation) = index.write().unwrap().begin_twitch_globals(user_id) else {
+            return false;
+        };
+        self.global_request = Some(InventoryRequest {
+            user_id: user_id.to_owned(),
+            generation,
+            task: tokio::spawn(load),
+        });
+        true
     }
 
     fn start_at<F>(
@@ -371,7 +473,7 @@ impl TwitchEmoteInventory {
             self.owner = Some(user_id.to_owned());
         }
         if self.request.is_some()
-            || self.follower_requests.len() >= MAX_REQUESTS
+            || self.active_requests() >= MAX_REQUESTS
             || self.next_request.is_some_and(|time| now < time)
         {
             return false;
@@ -415,9 +517,7 @@ impl TwitchEmoteInventory {
             self.clear();
             self.owner = Some(user_id.to_owned());
         }
-        if self.follower_requests.len() + usize::from(self.request.is_some()) >= MAX_REQUESTS
-            || !self.follower_due(&target, now)
-        {
+        if self.active_requests() >= MAX_REQUESTS || !self.follower_due(&target, now) {
             return false;
         }
         let Some(generation) = index
@@ -450,11 +550,18 @@ impl TwitchEmoteInventory {
     }
 
     pub(crate) fn has_pending(&self) -> bool {
-        self.request.is_some() || !self.follower_requests.is_empty()
+        self.active_requests() != 0
     }
 
     pub(crate) async fn complete_next(&mut self, index: &crate::EmoteIndex) -> bool {
         let Some(completion) = futures_util::future::poll_fn(|cx| {
+            if let Some(request) = self.global_request.as_mut() {
+                if let Poll::Ready(result) = Pin::new(&mut request.task).poll(cx) {
+                    return Poll::Ready(Some(Completion::Global(
+                        result.unwrap_or(Err(LoadError::TaskFailed)),
+                    )));
+                }
+            }
             if let Some(request) = self.request.as_mut() {
                 if let Poll::Ready(result) = Pin::new(&mut request.task).poll(cx) {
                     return Poll::Ready(Some(Completion::Account(
@@ -480,11 +587,12 @@ impl TwitchEmoteInventory {
         else {
             return false;
         };
-        let (request, target, result) = match completion {
-            Completion::Account(result) => (self.request.take().unwrap(), None, result),
+        let (request, target, is_global, result) = match completion {
+            Completion::Global(result) => (self.global_request.take().unwrap(), None, true, result),
+            Completion::Account(result) => (self.request.take().unwrap(), None, false, result),
             Completion::Follower(channel, result) => {
                 let request = self.follower_requests.remove(&channel).unwrap();
-                (request.request, Some(request.target), result)
+                (request.request, Some(request.target), false, result)
             }
         };
         let next_request = Instant::now()
@@ -493,7 +601,9 @@ impl TwitchEmoteInventory {
             } else {
                 RETRY_INTERVAL
             };
-        if let Some(target) = &target {
+        if is_global {
+            self.next_global_request = Some(next_request);
+        } else if let Some(target) = &target {
             self.follower_schedule
                 .insert(target.channel.clone(), (target.clone(), next_request));
         } else {
@@ -512,7 +622,15 @@ impl TwitchEmoteInventory {
             }
         };
         let mut registry = index.write().unwrap();
-        if let Some(target) = target {
+        if is_global {
+            let count = emotes.as_ref().map(Vec::len);
+            let changed =
+                registry.complete_twitch_globals(&request.user_id, request.generation, emotes);
+            if let Some(count) = count.filter(|_| changed) {
+                tracing::debug!(emotes = count, "Twitch global emote catalog updated");
+            }
+            changed
+        } else if let Some(target) = target {
             registry.complete_twitch_follower_inventory(
                 &request.user_id,
                 &target,
@@ -525,6 +643,15 @@ impl TwitchEmoteInventory {
     }
 
     pub(crate) fn clear(&mut self) {
+        if let Some(request) = self.global_request.take() {
+            request.task.abort();
+        }
+        self.next_global_request = None;
+        self.clear_entitlements();
+        self.owner = None;
+    }
+
+    fn clear_entitlements(&mut self) {
         if let Some(request) = self.request.take() {
             request.task.abort();
         }
@@ -532,7 +659,6 @@ impl TwitchEmoteInventory {
             request.request.task.abort();
         }
         self.follower_schedule.clear();
-        self.owner = None;
         self.next_request = None;
     }
 }
@@ -629,6 +755,68 @@ mod tests {
             requests
         });
         (url, task)
+    }
+
+    #[tokio::test]
+    async fn global_catalog_uses_credentials_without_user_queries_or_pagination() {
+        let mut global = emote("unity", "TwitchUnity");
+        global.as_object_mut().unwrap().remove("emote_type");
+        global.as_object_mut().unwrap().remove("owner_id");
+        let body = serde_json::json!({
+            "data": [global.clone(), global],
+            "template": TEMPLATE,
+        })
+        .to_string();
+        let (url, server) = server(vec![(200, body)]).await;
+        let url = url.replace("/user", "/global");
+        let catalog = fetch_global_catalog_at(
+            &reqwest::Client::new(),
+            &url,
+            "validated-client",
+            " oauth:test-token ",
+        )
+        .await
+        .unwrap();
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].code, "TwitchUnity");
+        assert!(catalog[0].url_1x.ends_with("/unity/animated/dark/1.0"));
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /helix/chat/emotes/global HTTP/1.1\r\n"));
+        let headers = requests[0].to_ascii_lowercase();
+        assert!(headers.contains("authorization: bearer test-token\r\n"));
+        assert!(headers.contains("client-id: validated-client\r\n"));
+    }
+
+    #[tokio::test]
+    async fn global_catalog_rejects_partial_or_failed_responses_and_accepts_empty_results() {
+        let mut invalid = emote("invalid", "Invalid");
+        invalid["format"] = serde_json::json!([]);
+        for (status, body, valid) in [
+            (
+                200,
+                serde_json::json!({"data": [], "template": TEMPLATE}).to_string(),
+                true,
+            ),
+            (200, "{}".into(), false),
+            (503, "{}".into(), false),
+            (
+                200,
+                serde_json::json!({"data": [emote("valid", "Valid"), invalid], "template": TEMPLATE})
+                    .to_string(),
+                false,
+            ),
+        ] {
+            let (url, task) = server(vec![(status, body)]).await;
+            let result = fetch_global_catalog_at(&reqwest::Client::new(), &url, "client", "token")
+                .await;
+            if valid {
+                assert!(result.unwrap().is_empty());
+            } else {
+                assert!(result.is_err());
+            }
+            task.await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -808,6 +996,109 @@ mod tests {
             .into_iter()
             .find(|target| target.channel == channel)
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn global_catalogs_share_the_budget_with_account_and_follower_inventory() {
+        let index = index("alice");
+        let targets: Vec<_> = (1..=3)
+            .map(|room| follower_target(&index, &room.to_string()))
+            .collect();
+        let mut requests = TwitchEmoteInventory::default();
+        let now = Instant::now();
+        assert!(requests.start_global_at("alice", &index, now, std::future::pending()));
+        assert!(requests.start_at("alice", &index, now, std::future::pending()));
+        for target in &targets[..2] {
+            assert!(
+                requests.start_follower_at("alice", target.clone(), &index, now, async {
+                    Ok(Vec::new())
+                })
+            );
+        }
+        assert_eq!(requests.active_requests(), MAX_REQUESTS);
+        assert!(
+            !requests.start_follower_at("alice", targets[2].clone(), &index, now, async {
+                Ok(Vec::new())
+            })
+        );
+        complete(&mut requests, &index).await;
+        assert!(
+            requests.start_follower_at("alice", targets[2].clone(), &index, now, async {
+                Ok(Vec::new())
+            })
+        );
+        requests.clear();
+        assert!(!requests.has_pending());
+    }
+
+    #[tokio::test]
+    async fn global_refresh_preserves_failures_retries_and_accepts_authoritative_empty_results() {
+        let index = index("alice");
+        let mut requests = TwitchEmoteInventory::default();
+        let now = Instant::now();
+        assert!(requests.start_global_at("alice", &index, now, async {
+            Ok(vec![info("global", "TwitchUnity")])
+        }));
+        assert!(complete(&mut requests, &index).await);
+        let catalog = index.read().unwrap().catalog();
+        assert_eq!(catalog.len(), 1);
+        assert!(catalog[0].channel.is_none());
+        assert!(catalog[0].user_id.is_none());
+        assert_eq!(catalog[0].scope, "global");
+        assert!(!requests.start_global_at("alice", &index, now, async { Ok(Vec::new()) }));
+        let due = requests.next_global_request.unwrap();
+        assert!(requests.start_global_at("alice", &index, due, async { Err(LoadError::Transport) }));
+        assert!(!complete(&mut requests, &index).await);
+        assert_eq!(index.read().unwrap().catalog()[0].code, "TwitchUnity");
+        let retry_at = requests.next_global_request.unwrap();
+        assert!(!requests.start_global_at(
+            "alice",
+            &index,
+            retry_at - Duration::from_millis(1),
+            async { Ok(Vec::new()) }
+        ));
+        assert!(requests.start_global_at("alice", &index, retry_at, async { Ok(Vec::new()) }));
+        assert!(complete(&mut requests, &index).await);
+        assert!(index.read().unwrap().catalog().is_empty());
+    }
+
+    #[tokio::test]
+    async fn account_switch_cancels_global_work_and_rejects_late_completions() {
+        let index = index("alice");
+        let mut requests = TwitchEmoteInventory::default();
+        let (mut completion, pending) = tokio::sync::oneshot::channel();
+        assert!(
+            requests.start_global_at("alice", &index, Instant::now(), async {
+                pending.await.unwrap()
+            })
+        );
+        let generation = requests.global_request.as_ref().unwrap().generation;
+        index.write().unwrap().set_account(Some("bob"));
+        assert!(
+            requests.start_global_at("bob", &index, Instant::now(), async {
+                Ok(vec![info("new", "NewGlobal")])
+            })
+        );
+        tokio::time::timeout(Duration::from_secs(3), completion.closed())
+            .await
+            .unwrap();
+        assert!(complete(&mut requests, &index).await);
+        assert!(!index.write().unwrap().complete_twitch_globals(
+            "alice",
+            generation,
+            Some(vec![info("stale", "StaleGlobal")])
+        ));
+        assert_eq!(index.read().unwrap().catalog()[0].code, "NewGlobal");
+
+        requests.clear();
+        assert!(
+            requests.start_global_at("bob", &index, Instant::now(), async {
+                Ok(vec![info("late", "LateGlobal")])
+            })
+        );
+        index.write().unwrap().set_account(None);
+        assert!(!complete(&mut requests, &index).await);
+        assert_eq!(index.read().unwrap().catalog()[0].code, "NewGlobal");
     }
 
     #[tokio::test]
@@ -998,7 +1289,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_scope_does_not_request_inventory_or_remove_public_emotes() {
+    async fn missing_scope_refreshes_globals_without_requesting_private_inventory() {
         let index = index("alice");
         {
             let mut registry = index.write().unwrap();
@@ -1012,13 +1303,40 @@ mod tests {
         }
         let mut requests = TwitchEmoteInventory::default();
         assert!(requests.sync(Some("alice"), Some("client"), "token", &[], &index));
-        assert!(!requests.has_pending());
+        assert!(requests.has_pending());
+        assert!(requests.request.is_none());
+        assert!(requests.follower_requests.is_empty());
+        let generation = requests.global_request.as_ref().unwrap().generation;
         assert!(!requests.sync(Some("alice"), Some("client"), "token", &[], &index));
+        assert_eq!(
+            requests.global_request.as_ref().unwrap().generation,
+            generation
+        );
+        requests.clear();
         let registry = index.read().unwrap();
         assert!(registry.twitch_for_user("alice", "SubLove").is_none());
         assert_eq!(
             registry.twitch_for_user("alice", "Kappa").unwrap().id,
             "global"
         );
+    }
+
+    #[tokio::test]
+    async fn losing_inventory_scope_keeps_an_in_flight_global_catalog() {
+        let index = index("alice");
+        let mut requests = TwitchEmoteInventory::default();
+        let now = Instant::now();
+        assert!(requests.start_global_at("alice", &index, now, async {
+            Ok(vec![info("global", "TwitchUnity")])
+        }));
+        let (mut completion, pending) = tokio::sync::oneshot::channel();
+        assert!(requests.start_at("alice", &index, now, async { pending.await.unwrap() }));
+        requests.sync(Some("alice"), Some("client"), "token", &[], &index);
+        tokio::time::timeout(Duration::from_secs(3), completion.closed())
+            .await
+            .unwrap();
+        assert!(requests.request.is_none());
+        assert!(complete(&mut requests, &index).await);
+        assert_eq!(index.read().unwrap().catalog()[0].code, "TwitchUnity");
     }
 }

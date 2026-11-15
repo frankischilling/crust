@@ -9,7 +9,7 @@ use futures_util::{future::BoxFuture, stream::FuturesUnordered, FutureExt, Strea
 use tokio::sync::mpsc;
 
 use super::live_emotes::{LiveBinding, LiveSource, Provider};
-use crate::seventv::{load_7tv_user_for_twitch, SevenTvCosmeticUpdate};
+use crate::seventv::{load_7tv_user_for_twitch, SevenTvCosmeticUpdate, SevenTvUserProfile};
 
 type ProviderLoad<'a> = BoxFuture<'a, (&'static str, Option<Vec<EmoteInfo>>)>;
 type ChannelProviderLoad<'a> = BoxFuture<'a, ChannelProviderResult>;
@@ -74,7 +74,7 @@ pub(crate) async fn load_global_emotes(index: &crate::EmoteIndex, evt_tx: &mpsc:
     let (generation, expected_source, changed) = {
         let mut registry = index.write().unwrap();
         let generation = registry.begin_global_load();
-        let changed = registry.replace_global_result(generation, "twitch", Some(twitch));
+        let changed = registry.seed_twitch_globals(twitch);
         (generation, registry.global_live_binding(), changed)
     };
     if changed {
@@ -185,23 +185,67 @@ pub(crate) fn queue_7tv_user_lookup(
     };
     let user_id = user_id.to_owned();
     let client = client.clone();
+    let index = index.clone();
     let semaphore = semaphore.clone();
     let update_tx = update_tx.clone();
     tokio::spawn(async move {
         let _job = job;
-        let Ok(_permit) = semaphore.acquire().await else {
-            return;
-        };
-        let profile = load_7tv_user_for_twitch(&client, &user_id).await;
-        let _ = update_tx
-            .send(SevenTvCosmeticUpdate::UserStyle {
-                twitch_user_id: user_id,
-                generation,
-                profile,
-            })
-            .await;
+        publish_current_user_lookup(
+            &user_id,
+            generation,
+            &index,
+            &semaphore,
+            &update_tx,
+            load_7tv_user_for_twitch(&client, &user_id),
+        )
+        .await;
     });
     true
+}
+
+async fn publish_current_user_lookup<F>(
+    user_id: &str,
+    generation: u64,
+    index: &crate::EmoteIndex,
+    semaphore: &tokio::sync::Semaphore,
+    update_tx: &mpsc::Sender<SevenTvCosmeticUpdate>,
+    load: F,
+) where
+    F: std::future::Future<Output = Option<SevenTvUserProfile>>,
+{
+    let Ok(_permit) = (tokio::select! {
+        _ = update_tx.closed() => return,
+        permit = semaphore.acquire() => permit,
+    }) else {
+        return;
+    };
+    // A room can close or the account can change while a lookup waits for a slot.
+    if update_tx.is_closed()
+        || !index
+            .read()
+            .unwrap()
+            .is_current_personal_load(user_id, generation)
+    {
+        return;
+    }
+    let profile = tokio::select! {
+        _ = update_tx.closed() => return,
+        profile = load => profile,
+    };
+    let Ok(permit) = update_tx.reserve().await else {
+        return;
+    };
+    if index
+        .read()
+        .unwrap()
+        .is_current_personal_load(user_id, generation)
+    {
+        permit.send(SevenTvCosmeticUpdate::UserStyle {
+            twitch_user_id: user_id.to_owned(),
+            generation,
+            profile,
+        });
+    }
 }
 
 pub(crate) fn drain_7tv_user_lookups(
@@ -679,6 +723,149 @@ mod tests {
         assert!(manual_refresh > generation);
         assert!(registry.is_current_channel_load(&channel, manual_refresh));
         assert!(!registry.is_current_channel_load(&channel, generation));
+    }
+
+    #[tokio::test]
+    async fn account_changes_skip_all_queued_cosmetic_fetches_before_the_next_account_load() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let index = index();
+        let channel = ChannelId::new("room");
+        {
+            let mut registry = index.write().unwrap();
+            registry.set_account(Some("alice"));
+            registry.open_channel(&channel);
+        }
+        let limit = Arc::new(tokio::sync::Semaphore::new(0));
+        let fetched = Arc::new(AtomicUsize::new(0));
+        let (updates, mut received) = mpsc::channel(64);
+        let mut queued = Vec::new();
+        for n in 0..64 {
+            let user = format!("history-{n}");
+            let generation = index
+                .write()
+                .unwrap()
+                .begin_personal_load(&user, Some(&channel))
+                .unwrap();
+            let index = index.clone();
+            let limit = limit.clone();
+            let updates = updates.clone();
+            let fetched = fetched.clone();
+            queued.push(
+                async move {
+                    publish_current_user_lookup(
+                        &user,
+                        generation,
+                        &index,
+                        &limit,
+                        &updates,
+                        async {
+                            fetched.fetch_add(1, Ordering::SeqCst);
+                            None
+                        },
+                    )
+                    .await;
+                }
+                .boxed(),
+            );
+        }
+        for future in &mut queued {
+            assert!(matches!(futures_util::poll!(future), Poll::Pending));
+        }
+        let generation = {
+            let mut registry = index.write().unwrap();
+            registry.set_account(Some("bob"));
+            registry.begin_personal_load("bob", None).unwrap()
+        };
+        let mut queued: FuturesUnordered<_> = queued.into_iter().collect();
+        limit.add_permits(4);
+        let current =
+            publish_current_user_lookup("bob", generation, &index, &limit, &updates, async {
+                fetched.fetch_add(1, Ordering::SeqCst);
+                None
+            });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(async { while queued.next().await.is_some() {} }, current);
+        })
+        .await
+        .unwrap();
+        assert_eq!(fetched.load(Ordering::SeqCst), 1);
+        assert_eq!(limit.available_permits(), 4);
+        assert!(
+            matches!(received.try_recv().unwrap(), SevenTvCosmeticUpdate::UserStyle {
+            twitch_user_id, generation: loaded, profile: None,
+        } if twitch_user_id == "bob" && loaded == generation)
+        );
+        assert!(received.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn closed_rooms_and_replaced_profiles_skip_waiting_cosmetic_fetches() {
+        for close_room in [false, true] {
+            let index = index();
+            let channel = ChannelId::new("room");
+            let generation = {
+                let mut registry = index.write().unwrap();
+                registry.open_channel(&channel);
+                registry
+                    .begin_personal_load("sender", Some(&channel))
+                    .unwrap()
+            };
+            let limit = tokio::sync::Semaphore::new(0);
+            let (updates, mut received) = mpsc::channel(1);
+            let mut load = Box::pin(publish_current_user_lookup(
+                "sender",
+                generation,
+                &index,
+                &limit,
+                &updates,
+                async { panic!("an obsolete lookup started HTTP work") },
+            ));
+            assert!(matches!(futures_util::poll!(&mut load), Poll::Pending));
+            {
+                let mut registry = index.write().unwrap();
+                if close_room {
+                    registry.close_channel(&channel);
+                } else {
+                    registry.invalidate_personal_lookup("sender");
+                    registry
+                        .begin_personal_load("sender", Some(&channel))
+                        .unwrap();
+                }
+            }
+            limit.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(3), load)
+                .await
+                .unwrap();
+            assert!(received.try_recv().is_err());
+            assert_eq!(limit.available_permits(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn cosmetic_lookup_shutdown_cancels_a_wait_for_capacity() {
+        let index = index();
+        index.write().unwrap().set_account(Some("alice"));
+        let generation = index
+            .write()
+            .unwrap()
+            .begin_personal_load("alice", None)
+            .unwrap();
+        let limit = tokio::sync::Semaphore::new(0);
+        let (updates, received) = mpsc::channel(1);
+        let mut load = Box::pin(publish_current_user_lookup(
+            "alice",
+            generation,
+            &index,
+            &limit,
+            &updates,
+            async { panic!("a closed receiver started HTTP work") },
+        ));
+        assert!(matches!(futures_util::poll!(&mut load), Poll::Pending));
+        drop(received);
+        tokio::time::timeout(Duration::from_secs(3), load)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
