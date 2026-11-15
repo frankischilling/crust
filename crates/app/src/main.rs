@@ -1093,20 +1093,13 @@ async fn reducer_loop(
     // Always send a restore event so the UI can rebuild channel order /
     // split panes / whispers state, even when no last-active channel was
     // recorded.
-    let split_panes_pairs: Vec<(String, f32)> = settings
-        .split_panes
-        .iter()
-        .map(|p| (p.channel.clone(), p.frac))
-        .collect();
     let _ = evt_tx
-        .send(AppEvent::RestoreLastActiveChannel {
-            channel: settings.last_active_channel.clone(),
-            channel_order: settings.channel_order.clone(),
-            split_panes: split_panes_pairs,
-            split_panes_focused: settings.split_panes_focused,
-            whispers_visible: settings.whispers_panel_visible,
-            last_whisper_login: settings.last_whisper_login.clone(),
-        })
+        .send(runtime::layout_restore::startup_restore_event(
+            &settings,
+            &parsed_initial_channels,
+            kick_runtime_enabled && kick_beta_enabled,
+            irc_runtime_enabled && irc_beta_enabled,
+        ))
         .await;
     let _ = evt_tx
         .send(AppEvent::UpdaterSettingsUpdated {
@@ -1499,6 +1492,7 @@ async fn reducer_loop(
                         let ch_hist = channel.clone();
                         let uname_hist = auth_username.clone();
                         let nicknames_hist = settings.nicknames.clone();
+                        let ignored_phrases_hist = settings.ignored_phrases.clone();
                         let idx_hist = emote_index.clone();
                         let bm_hist = badge_map.clone();
                         let etx_hist = snapshot.events();
@@ -1510,6 +1504,7 @@ async fn reducer_loop(
                                 ch_hist.as_str(),
                                 uname_hist.as_deref(),
                                 &nicknames_hist,
+                                &ignored_phrases_hist,
                                 &idx_hist,
                                 &bm_hist,
                                 &etx_hist,
@@ -1747,22 +1742,8 @@ async fn reducer_loop(
                         // that a Replace rule's output text goes through normal
                         // emote/URL/mention detection.  A Block rule drops the
                         // message without emitting it.
-                        let phrase_outcome = compiled_ignored_phrases.apply(&mut msg.raw_text);
-                        if phrase_outcome.blocked {
+                        if compiled_ignored_phrases.apply_to_message(&mut msg).blocked {
                             continue;
-                        }
-                        if phrase_outcome.highlight_only {
-                            msg.flags.is_highlighted = true;
-                        }
-                        if phrase_outcome.mention_only {
-                            msg.flags.is_mention = true;
-                        }
-                        // Twitch emote positions referred to byte offsets in the
-                        // original text; after a replace rewrite those offsets
-                        // would be stale.  Clear them so the tokenizer doesn't
-                        // splice emotes at wrong indices.
-                        if phrase_outcome.replaced {
-                            msg.twitch_emotes.clear();
                         }
                         // Hold read lock only during tokenization (no clone needed)
                         {
@@ -1835,7 +1816,7 @@ async fn reducer_loop(
                             let has_nickname_mention = crust_core::highlight::contains_nickname_mention(
                                 &msg.raw_text, uname, msg.channel.display_name(), &settings.nicknames,
                             );
-                            msg.flags.is_mention = has_name_mention
+                            msg.flags.is_mention |= has_name_mention
                                 || is_reply_to_me
                                 || has_nickname_mention;
                         }
@@ -1890,6 +1871,7 @@ async fn reducer_loop(
                         };
                         if let Some(event) = runtime::history::prepare_live_whisper(
                             event, auth_username.as_deref(), auth_user_id.as_deref(), &emote_index,
+                            &compiled_ignored_phrases,
                             log_writer.as_ref().filter(|_| settings.local_log_indexing_enabled),
                         ).await {
                             let _ = evt_tx.send(event).await;
@@ -2878,6 +2860,7 @@ async fn reducer_loop(
                                     };
                                     if let Some(event) = runtime::history::prepare_live_whisper(
                                         event, local_login.as_deref(), auth_user_id.as_deref(), &emote_index,
+                                        &compiled_ignored_phrases,
                                         log_writer.as_ref().filter(|_| settings.local_log_indexing_enabled),
                                     ).await {
                                         let _ = evt_tx.send(event).await;

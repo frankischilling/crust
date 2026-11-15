@@ -8,8 +8,8 @@
 //! (hermitdave/FrequencyWords).  Common words like "the" rank far above
 //! obscure entries.
 //!
-//! **Algorithm** - Norvig edit-distance 1 + 2 (complete - no arbitrary cap),
-//! augmented by Soundex phonetic lookup to catch silent-letter and
+//! **Algorithm** - Dictionary candidates within two edits, including adjacent
+//! transpositions, augmented by Soundex phonetic lookup to catch silent-letter and
 //! sound-alike errors that may exceed distance 2
 //! (e.g. "fonetic" -> "phonetic").
 //!
@@ -38,6 +38,12 @@ static USER_DICT: OnceLock<RwLock<BTreeSet<String>>> = OnceLock::new();
 /// call sites unchanged.
 static SPELLCHECK_ENABLED: AtomicBool = AtomicBool::new(true);
 
+#[cfg(test)]
+pub(crate) fn test_settings_guard() -> std::sync::MutexGuard<'static, ()> {
+    static SETTINGS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SETTINGS.lock().unwrap()
+}
+
 fn user_dict() -> &'static RwLock<BTreeSet<String>> {
     USER_DICT.get_or_init(|| RwLock::new(BTreeSet::new()))
 }
@@ -45,6 +51,8 @@ fn user_dict() -> &'static RwLock<BTreeSet<String>> {
 struct SpellData {
     /// All known dictionary words (lowercase).
     words: HashSet<&'static str>,
+    /// Only words within two characters of a query can be two edits away.
+    words_by_len: Vec<Vec<&'static str>>,
     /// Word -> frequency rank (0 = most common).  Only the top-50 K words
     /// appear here; the rest are treated as rare.
     freq_rank: HashMap<&'static str, u32>,
@@ -59,6 +67,7 @@ fn data() -> &'static SpellData {
 
         // Word set + Soundex index
         let mut words: HashSet<&'static str> = HashSet::with_capacity(230_000);
+        let mut words_by_len: Vec<Vec<&'static str>> = Vec::new();
         let mut soundex_groups: HashMap<[u8; 4], Vec<&'static str>> =
             HashMap::with_capacity(60_000);
 
@@ -67,6 +76,8 @@ fn data() -> &'static SpellData {
                 continue;
             }
             words.insert(w);
+            words_by_len.resize_with(words_by_len.len().max(w.len() + 1), Vec::new);
+            words_by_len[w.len()].push(w);
             let code = soundex_code(w);
             soundex_groups.entry(code).or_default().push(w);
         }
@@ -86,6 +97,7 @@ fn data() -> &'static SpellData {
 
         SpellData {
             words,
+            words_by_len,
             freq_rank,
             soundex_groups,
         }
@@ -206,32 +218,47 @@ where
 /// and keyboard proximity. The user's custom dictionary is folded in so
 /// recently-added words can resurface as suggestions.
 pub fn suggestions(word: &str, max: usize) -> Vec<String> {
-    if !is_enabled() || max == 0 {
+    if !is_enabled() || max == 0 || !word.bytes().all(|byte| byte.is_ascii_alphabetic()) {
         return Vec::new();
     }
     let lower = word.to_ascii_lowercase();
-    let d = data();
-
     // Snapshot of user-dict words so we can fold them into the candidate pool
     // without holding the lock across the entire ranking loop.
     let user_words: Vec<String> = user_dict_snapshot();
+    ranked_suggestions(&lower, max, data(), &user_words)
+}
 
+fn ranked_suggestions(
+    lower: &str,
+    max: usize,
+    d: &SpellData,
+    user_words: &[String],
+) -> Vec<String> {
     // Maps candidate -> minimum edit distance found.
-    let mut candidates: HashMap<String, u8> = HashMap::new();
-
-    // Edit-distance 1
-    let edit1_list = edits1(&lower);
-    for c in &edit1_list {
-        if d.words.contains(c.as_str()) {
-            candidates.entry(c.clone()).or_insert(1);
-        }
-    }
-
-    // Edit-distance 2 (complete - no cap)
-    for e1 in &edit1_list {
-        for c in edits1(e1) {
-            if d.words.contains(c.as_str()) {
-                candidates.entry(c).or_insert(2);
+    let mut candidates: HashMap<&str, u8> = HashMap::new();
+    let mut scratch = Vec::new();
+    for words in d
+        .words_by_len
+        .iter()
+        .skip(lower.len().saturating_sub(2))
+        .take(5)
+    {
+        for &candidate in words {
+            if let Some(distance) =
+                two_edit_distance(lower.as_bytes(), candidate.as_bytes(), &mut scratch)
+            {
+                // Preserve the edit generator's score for an unchanged word:
+                // swapping equal neighbors takes one edit, delete/insert takes two.
+                let distance = if distance == 0 {
+                    if lower.as_bytes().windows(2).any(|pair| pair[0] == pair[1]) {
+                        1
+                    } else {
+                        2
+                    }
+                } else {
+                    distance
+                };
+                candidates.insert(candidate, distance);
             }
         }
     }
@@ -239,13 +266,12 @@ pub fn suggestions(word: &str, max: usize) -> Vec<String> {
     // Soundex / phonetic matches
     // Catches silent-letter errors (e.g. "fonetic" -> "phonetic") that may
     // exceed edit-distance 2.
-    let query_sx = soundex_code(&lower);
+    let query_sx = soundex_code(lower);
     if let Some(group) = d.soundex_groups.get(&query_sx) {
         for &pm in group {
             if !candidates.contains_key(pm) {
-                let ed = edit_distance(&lower, pm);
-                if ed <= 3 {
-                    candidates.entry(pm.to_owned()).or_insert(ed as u8);
+                if let Some(ed) = edit_distance_with_limit(lower, pm, 3) {
+                    candidates.entry(pm).or_insert(ed as u8);
                 }
             }
         }
@@ -253,35 +279,38 @@ pub fn suggestions(word: &str, max: usize) -> Vec<String> {
 
     // User-dictionary additions
     // Words the user has added get surfaced when close enough to the query.
-    for uw in &user_words {
-        if uw == &lower || candidates.contains_key(uw) {
+    for uw in user_words {
+        if uw == lower || candidates.contains_key(uw.as_str()) {
             continue;
         }
-        let ed = edit_distance(&lower, uw);
-        if ed <= 3 {
-            candidates.insert(uw.clone(), ed as u8);
+        if let Some(ed) = edit_distance_with_limit(lower, uw, 3) {
+            candidates.insert(uw.as_str(), ed as u8);
         }
     }
 
     let user_set: HashSet<&str> = user_words.iter().map(String::as_str).collect();
 
     // Score, sort, truncate
-    let mut scored: Vec<(String, f64)> = candidates
+    let mut scored: Vec<(&str, f64)> = candidates
         .into_iter()
         .map(|(cand, dist)| {
-            let mut s = score(&lower, &cand, dist, &query_sx, d);
+            let mut s = score(lower, cand, dist, &query_sx, d);
             // Words the user explicitly added get a modest bonus so they
             // float to the top of ties.
-            if user_set.contains(cand.as_str()) {
+            if user_set.contains(cand) {
                 s -= 150.0;
             }
             (cand, s)
         })
         .collect();
 
-    scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| {
+        a.1.partial_cmp(&b.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(b.0))
+    });
     scored.truncate(max);
-    scored.into_iter().map(|(w, _)| w).collect()
+    scored.into_iter().map(|(w, _)| w.to_owned()).collect()
 }
 
 /// Find the word (purely alphabetic) surrounding character position
@@ -355,61 +384,90 @@ fn score(query: &str, candidate: &str, edit_dist: u8, query_sx: &[u8; 4], d: &Sp
 
 // Edit-distance machinery
 
-/// Generate all strings one edit (delete / transpose / replace / insert) away
-/// from `word`.  All results are lowercase ASCII.
-fn edits1(word: &str) -> Vec<String> {
-    let chars: Vec<char> = word.chars().collect();
-    let n = chars.len();
-    let mut out = Vec::with_capacity(54 * n + 26);
+/// Check the dictionary directly, using one reusable buffer for nearby edits.
+/// Any two-edit match fixes the first mismatch with a replacement, insertion,
+/// deletion, or swap. A deletion between swapped letters is the one additional
+/// case: `abc` becomes `ca` by deleting `b` and swapping `ac`.
+fn two_edit_distance(a: &[u8], b: &[u8], scratch: &mut Vec<u8>) -> Option<u8> {
+    if a.len().abs_diff(b.len()) > 2 {
+        return None;
+    }
+    if let Some(distance) = one_edit_distance(a, b) {
+        return Some(distance);
+    }
+    let first = a
+        .iter()
+        .zip(b)
+        .position(|(left, right)| left != right)
+        .unwrap_or(a.len().min(b.len()));
+    if first == a.len().min(b.len()) {
+        return Some(2);
+    }
+    let a = &a[first..];
+    let b = &b[first..];
+    scratch.clear();
+    scratch.extend_from_slice(a);
 
-    // Deletions
-    for i in 0..n {
-        let mut s = String::with_capacity(n - 1);
-        for (j, &c) in chars.iter().enumerate() {
-            if j != i {
-                s.push(c);
-            }
+    scratch[0] = b[0];
+    if one_edit_distance(scratch, b).is_some() {
+        return Some(2);
+    }
+    scratch[0] = a[0];
+
+    if one_edit_distance(&a[1..], b).is_some() {
+        return Some(2);
+    }
+    if one_edit_distance(a, &b[1..]).is_some() {
+        return Some(2);
+    }
+
+    if a.len() > 1 {
+        scratch.swap(0, 1);
+        if one_edit_distance(scratch, b).is_some() {
+            return Some(2);
         }
-        out.push(s);
-    }
-
-    // Transpositions
-    for i in 0..n.saturating_sub(1) {
-        let mut v = chars.clone();
-        v.swap(i, i + 1);
-        out.push(v.into_iter().collect());
-    }
-
-    // Replacements
-    for i in 0..n {
-        for c in b'a'..=b'z' {
-            let c = c as char;
-            if c != chars[i] {
-                let mut v = chars.clone();
-                v[i] = c;
-                out.push(v.into_iter().collect());
-            }
+        scratch.clear();
+        scratch.push(a[0]);
+        scratch.extend_from_slice(&a[2..]);
+        if one_edit_distance(scratch, b).is_some() {
+            return Some(2);
         }
     }
-
-    // Insertions
-    for i in 0..=n {
-        for c in b'a'..=b'z' {
-            let mut v = Vec::with_capacity(n + 1);
-            v.extend_from_slice(&chars[..i]);
-            v.push(c as char);
-            v.extend_from_slice(&chars[i..]);
-            out.push(v.into_iter().collect());
-        }
-    }
-
-    out
+    None
 }
 
-/// Levenshtein edit distance.
-fn edit_distance(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
+fn one_edit_distance(a: &[u8], b: &[u8]) -> Option<u8> {
+    if a.len().abs_diff(b.len()) > 1 {
+        return None;
+    }
+    let first = a
+        .iter()
+        .zip(b)
+        .position(|(left, right)| left != right)
+        .unwrap_or(a.len().min(b.len()));
+    if first == a.len().min(b.len()) {
+        return Some(u8::from(a.len() != b.len()));
+    }
+    let a = &a[first..];
+    let b = &b[first..];
+    let matches = match a.len().cmp(&b.len()) {
+        std::cmp::Ordering::Greater => a[1..] == *b,
+        std::cmp::Ordering::Less => *a == b[1..],
+        std::cmp::Ordering::Equal => {
+            a[1..] == b[1..] || (a.len() > 1 && a[0] == b[1] && a[1] == b[0] && a[2..] == b[2..])
+        }
+    };
+    matches.then_some(1)
+}
+
+/// Levenshtein distance for the phonetic and custom-dictionary fallback.
+/// Length and row bounds avoid processing unrelated or very long tokens.
+fn edit_distance_with_limit(a: &str, b: &str, limit: usize) -> Option<usize> {
+    if a.len().abs_diff(b.len()) > limit {
+        return None;
+    }
+    let a = a.as_bytes();
+    let b = b.as_bytes();
     let (n, m) = (a.len(), b.len());
     let mut prev = (0..=m).collect::<Vec<_>>();
     let mut curr = vec![0; m + 1];
@@ -419,9 +477,12 @@ fn edit_distance(a: &str, b: &str) -> usize {
             let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
             curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
         }
+        if curr.iter().copied().min().unwrap_or(0) > limit {
+            return None;
+        }
         std::mem::swap(&mut prev, &mut curr);
     }
-    prev[m]
+    (prev[m] <= limit).then_some(prev[m])
 }
 
 // Soundex
@@ -541,8 +602,119 @@ fn key_pos(c: char) -> Option<(f64, f64)> {
 mod tests {
     use super::*;
 
+    fn words_through_length(max: usize) -> Vec<Vec<u8>> {
+        let mut words = vec![Vec::new()];
+        let mut begin = 0;
+        for _ in 0..max {
+            let end = words.len();
+            for index in begin..end {
+                for byte in b"abc" {
+                    let mut word = words[index].clone();
+                    word.push(*byte);
+                    words.push(word);
+                }
+            }
+            begin = end;
+        }
+        words
+    }
+
+    fn generated_edits(word: &[u8]) -> HashSet<Vec<u8>> {
+        let mut edits = HashSet::new();
+        for index in 0..word.len() {
+            let mut deleted = word.to_vec();
+            deleted.remove(index);
+            edits.insert(deleted);
+            for byte in b"abc" {
+                let mut replaced = word.to_vec();
+                replaced[index] = *byte;
+                edits.insert(replaced);
+            }
+        }
+        for index in 0..word.len().saturating_sub(1) {
+            let mut transposed = word.to_vec();
+            transposed.swap(index, index + 1);
+            edits.insert(transposed);
+        }
+        for index in 0..=word.len() {
+            for byte in b"abc" {
+                let mut inserted = word.to_vec();
+                inserted.insert(index, *byte);
+                edits.insert(inserted);
+            }
+        }
+        edits
+    }
+
+    #[test]
+    fn bounded_matcher_agrees_with_exhaustive_two_edit_generation() {
+        let words = words_through_length(6);
+        let mut scratch = Vec::new();
+        for query in words.iter().take_while(|word| word.len() <= 4) {
+            let mut expected = HashMap::from([(query.clone(), 0)]);
+            let first_edits = generated_edits(query);
+            for edited in &first_edits {
+                expected.entry(edited.clone()).or_insert(1);
+            }
+            for edited in &first_edits {
+                for second in generated_edits(edited) {
+                    expected.entry(second).or_insert(2);
+                }
+            }
+            for candidate in &words {
+                assert_eq!(
+                    two_edit_distance(query, candidate, &mut scratch),
+                    expected.get(candidate).copied(),
+                    "query={query:?}, candidate={candidate:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn suggestions_keep_typo_ranking_and_case_normalization() {
+        let _settings = test_settings_guard();
+        for (query, expected) in [
+            ("TeH", ["the", "tea", "ted", "th", "te"]),
+            (
+                "recieve",
+                ["receive", "relieve", "recipe", "believe", "received"],
+            ),
+            (
+                "fonetic",
+                ["tonetic", "fanatic", "genetic", "poetic", "fimetic"],
+            ),
+            ("abotu", ["about", "abote", "abbot", "abbott", "abode"]),
+        ] {
+            assert_eq!(suggestions(query, 5), expected);
+        }
+    }
+
+    #[test]
+    fn long_tokens_do_not_expand_into_generated_candidates() {
+        assert!(ranked_suggestions(&"x".repeat(20_000), 5, data(), &[]).is_empty());
+        let custom = "q".repeat(64);
+        let query = format!("{}w", "q".repeat(63));
+        assert_eq!(
+            ranked_suggestions(&query, 5, data(), &[custom.clone()]),
+            [custom]
+        );
+    }
+
+    #[test]
+    fn phonetic_distance_preserves_its_levenshtein_cutoff() {
+        assert_eq!(edit_distance_with_limit("kitten", "sitting", 3), Some(3));
+        assert_eq!(edit_distance_with_limit("kitten", "sitting", 2), None);
+        assert_eq!(edit_distance_with_limit("teh", "the", 1), None);
+        assert_eq!(edit_distance_with_limit("teh", "the", 2), Some(2));
+        assert_eq!(edit_distance_with_limit("", "abc", 3), Some(3));
+        assert_eq!(edit_distance_with_limit("same", "same", 0), Some(0));
+        assert_eq!(edit_distance_with_limit(&"x".repeat(20_000), "x", 3), None);
+    }
+
     #[test]
     fn user_dict_add_makes_word_correct() {
+        let _settings = test_settings_guard();
         let fake = "qzqxvertfake";
         // Ensure clean slate (prior tests may have added it).
         remove_from_user_dict(fake);
@@ -556,6 +728,7 @@ mod tests {
 
     #[test]
     fn user_dict_rejects_non_alpha() {
+        let _settings = test_settings_guard();
         assert!(!add_to_user_dict(""));
         assert!(!add_to_user_dict("hello123"));
         assert!(!add_to_user_dict("he llo"));
@@ -563,6 +736,7 @@ mod tests {
 
     #[test]
     fn set_user_dict_replaces_contents() {
+        let _settings = test_settings_guard();
         set_user_dict(["Kappa", "monkaS", "POGGERS"]);
         // Only all-alpha words pass the filter. "monkaS" has uppercase S but
         // is still alphabetic, so all three should pass.
@@ -576,6 +750,7 @@ mod tests {
 
     #[test]
     fn disabled_short_circuits_suggestions_and_correctness() {
+        let _settings = test_settings_guard();
         set_enabled(false);
         assert!(is_correct("asdkjfhqw"));
         assert!(suggestions("teh", 5).is_empty());

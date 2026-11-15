@@ -8,6 +8,7 @@ pub(crate) mod eventsub_backfill;
 pub(crate) mod eventsub_notices;
 pub(crate) mod history;
 pub(crate) mod hype_train_poller;
+pub(crate) mod layout_restore;
 pub(crate) mod link_preview;
 pub(crate) mod live_emotes;
 pub(crate) mod live_feed;

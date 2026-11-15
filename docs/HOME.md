@@ -10,6 +10,7 @@
 - [Settings, emote ownership, and rendering responsiveness](./AUDIT_UI_PERFORMANCE.md)
 - [Chat cards, Mentions, and badge loading](./AUDIT_STABILITY.md)
 - [Chat loading, emotes, and navigation](./AUDIT_CHAT_RELIABILITY.md)
+- [Chat rendering, input, and saved layouts](./AUDIT_CHAT_POLISH.md)
 
 ## Plugins
 
@@ -26,6 +27,7 @@
 
 ## Release notes
 
+- [v0.5.7](./releases/Release_v0.5.7.md)
 - [v0.5.6](./releases/Release_v0.5.6.md)
 - [v0.5.5](./releases/Release_v0.5.5.md)
 - [v0.5.4](./releases/Release_v0.5.4.md)

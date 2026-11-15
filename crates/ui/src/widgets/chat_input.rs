@@ -174,10 +174,29 @@ fn show_character_counter(ui: &mut Ui, count: usize) {
 /// open.
 #[derive(Clone)]
 struct SpellCtx {
+    channel: ChannelId,
+    expected_buf: String,
     word: String,
     start: usize,
     end: usize,
     suggestions: Vec<String>,
+}
+
+impl SpellCtx {
+    fn matches(&self, channel: &ChannelId, buf: &str) -> bool {
+        self.channel == *channel
+            && self.expected_buf == buf
+            && buf.get(self.start..self.end) == Some(self.word.as_str())
+    }
+
+    fn replace(&self, channel: &ChannelId, buf: &mut String, replacement: &str) -> Option<usize> {
+        if !self.matches(channel, buf) {
+            return None;
+        }
+        let cursor = buf.get(..self.start)?.chars().count() + replacement.chars().count();
+        buf.replace_range(self.start..self.end, replacement);
+        Some(cursor)
+    }
 }
 
 #[derive(Clone)]
@@ -412,7 +431,10 @@ impl<'a> ChatInput<'a> {
         });
         if channel_changed {
             invalidate_emote_completions(ui.ctx(), text_edit_id);
-            ui.data_mut(|data| data.remove::<HistState>(text_edit_id.with("msg_history_state")));
+            ui.data_mut(|data| {
+                data.remove::<HistState>(text_edit_id.with("msg_history_state"));
+                data.remove::<SpellCtx>(text_edit_id.with("spell_check_ctx"));
+            });
         }
         let popup_pointer_active = completion_pointer_active(ui.ctx(), text_edit_id);
         let input_had_focus = ui.memory(|m| m.has_focus(text_edit_id)) || popup_pointer_active;
@@ -1236,8 +1258,8 @@ impl<'a> ChatInput<'a> {
                     // Spell-check context menu (right-click)
                     let sc_id = text_edit_id.with("spell_check_ctx");
 
-                    // On right-click, determine the word at the cursor and
-                    // compute suggestions if it is misspelled.
+                    // TextEdit places the caret at the secondary click before
+                    // this handler computes suggestions for that word.
                     if resp.secondary_clicked() {
                         let cursor_idx = egui::TextEdit::load_state(ui.ctx(), text_edit_id)
                             .and_then(|s| s.cursor.char_range())
@@ -1253,6 +1275,8 @@ impl<'a> ChatInput<'a> {
                                 d.insert_temp(
                                     sc_id,
                                     SpellCtx {
+                                        channel: self.channel.clone(),
+                                        expected_buf: buf.clone(),
                                         word: word.to_owned(),
                                         start: byte_start,
                                         end: byte_end,
@@ -1265,7 +1289,15 @@ impl<'a> ChatInput<'a> {
                         }
                     }
 
-                    let mut spell_replace: Option<(usize, usize, String)> = None;
+                    ui.ctx().data_mut(|data| {
+                        if data
+                            .get_temp::<SpellCtx>(sc_id)
+                            .is_some_and(|state| !state.matches(self.channel, buf))
+                        {
+                            data.remove::<SpellCtx>(sc_id);
+                        }
+                    });
+                    let mut spell_replace: Option<(SpellCtx, String)> = None;
                     let mut spell_add_word: Option<String> = None;
                     let mut context_send_now = false;
                     let mut context_cut_input = false;
@@ -1384,7 +1416,7 @@ impl<'a> ChatInput<'a> {
                             } else {
                                 for sug in &sc.suggestions {
                                     if ui.button(sug).clicked() {
-                                        spell_replace = Some((sc.start, sc.end, sug.clone()));
+                                        spell_replace = Some((sc.clone(), sug.clone()));
                                         ui.close_menu();
                                     }
                                 }
@@ -1446,11 +1478,12 @@ impl<'a> ChatInput<'a> {
                         ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                     }
 
-                    if let Some((start, end, replacement)) = spell_replace {
-                        let new_len = buf[..start].chars().count() + replacement.chars().count();
-                        buf.replace_range(start..end, &replacement);
-                        move_cursor_to_end(ui.ctx(), text_edit_id, new_len);
-                        ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
+                    if let Some((spelling, replacement)) = spell_replace {
+                        if let Some(cursor) = spelling.replace(self.channel, buf, &replacement) {
+                            move_cursor_to_end(ui.ctx(), text_edit_id, cursor);
+                            ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
+                        }
+                        ui.ctx().data_mut(|data| data.remove::<SpellCtx>(sc_id));
                     }
 
                     if let Some(word) = spell_add_word {
@@ -2332,6 +2365,32 @@ fn paint_wavy_underline(painter: &egui::Painter, x0: f32, x1: f32, y: f32, color
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static CLIPBOARD_IMAGE_OVERRIDE: std::cell::RefCell<Option<Option<PendingUpload>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Keep synthetic paste events independent of the desktop clipboard.
+#[cfg(test)]
+pub(crate) fn with_test_clipboard_image<R>(
+    image: Option<PendingUpload>,
+    run: impl FnOnce() -> R,
+) -> R {
+    struct RestoreClipboardImage(Option<Option<PendingUpload>>);
+
+    impl Drop for RestoreClipboardImage {
+        fn drop(&mut self) {
+            CLIPBOARD_IMAGE_OVERRIDE.with(|slot| slot.replace(self.0.take()));
+        }
+    }
+
+    let _restore = RestoreClipboardImage(
+        CLIPBOARD_IMAGE_OVERRIDE.with(|slot| slot.replace(Some(image))),
+    );
+    run()
+}
+
 /// Read an image from the OS clipboard and re-encode as PNG.
 /// Returns `None` if the clipboard is empty, unavailable, or holds no image.
 ///
@@ -2339,6 +2398,11 @@ fn paint_wavy_underline(painter: &egui::Painter, x0: f32, x1: f32, y: f32, color
 /// hold the clipboard open for a few milliseconds while it tries its
 /// text-paste attempt; a cold retry after a short sleep usually succeeds.
 fn try_clipboard_image_as_png() -> Option<PendingUpload> {
+    #[cfg(test)]
+    if let Some(image) = CLIPBOARD_IMAGE_OVERRIDE.with(|slot| slot.borrow().clone()) {
+        return image;
+    }
+
     const ATTEMPTS: u32 = 4;
     const SLEEP_MS: u64 = 15;
     let mut last_err: Option<String> = None;
@@ -3735,6 +3799,203 @@ mod tests {
                     .count(),
                 2
             );
+        }
+    }
+
+    fn spelling_test_frame(
+        ctx: &egui::Context,
+        buf: &mut String,
+        channel: &ChannelId,
+        events: Vec<egui::Event>,
+        focus: bool,
+    ) -> egui::FullOutput {
+        ctx.run(raw_input(events), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let id = Id::new("spelling_menu_test");
+                if focus {
+                    ui.memory_mut(|memory| memory.request_focus(id));
+                }
+                ChatInput {
+                    id: Some(id),
+                    channel,
+                    logged_in: true,
+                    username: None,
+                    emote_catalog: &[],
+                    emote_bytes: &UiImageCache::default(),
+                    pending_reply: None,
+                    message_history: &[],
+                    slash_usage_counts: &HashMap::new(),
+                    known_channels: &[],
+                    chatters: &[],
+                    prevent_overlong_twitch_messages: false,
+                    animate_emotes: false,
+                    accept_dropped_files: false,
+                }
+                .show(ui, buf);
+            });
+        })
+    }
+
+    fn spelling_word_position(output: &egui::FullOutput, draft: &str, word: &str) -> Pos2 {
+        let character = draft[..draft.find(word).unwrap()].chars().count() + 1;
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| {
+                let egui::Shape::Text(text) = &shape.shape else {
+                    return None;
+                };
+                (text.galley.text() == draft).then(|| {
+                    text.pos
+                        + text
+                            .galley
+                            .pos_from_ccursor(egui::text::CCursor::new(character))
+                            .center()
+                            .to_vec2()
+                })
+            })
+            .expect("composer text is drawn")
+    }
+
+    fn spelling_pointer(
+        position: Pos2,
+        button: egui::PointerButton,
+        pressed: bool,
+    ) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(position),
+            egui::Event::PointerButton {
+                pos: position,
+                button,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    #[test]
+    fn spelling_menu_corrects_the_clicked_word_and_preserves_unicode() {
+        let _settings = crate::spellcheck::test_settings_guard();
+        let ctx = egui::Context::default();
+        let id = Id::new("spelling_menu_test");
+        let channel = ChannelId::new("example");
+        let original = "é🙂 teh recieve";
+        let mut buf = original.to_owned();
+        let output = spelling_test_frame(&ctx, &mut buf, &channel, Vec::new(), true);
+        let pointer = spelling_word_position(&output, original, "teh");
+        let mut state = egui::TextEdit::load_state(&ctx, id).unwrap();
+        let selection = egui::text::CCursorRange::two(
+            egui::text::CCursor::new(original.chars().count()),
+            egui::text::CCursor::new(original.chars().count() - "recieve".len()),
+        );
+        state.cursor.set_char_range(Some(selection));
+        egui::TextEdit::store_state(&ctx, id, state);
+        for pressed in [true, false] {
+            spelling_test_frame(
+                &ctx,
+                &mut buf,
+                &channel,
+                spelling_pointer(pointer, egui::PointerButton::Secondary, pressed),
+                false,
+            );
+        }
+        let spelling = ctx
+            .data(|data| data.get_temp::<SpellCtx>(id.with("spell_check_ctx")))
+            .expect("right-clicked misspelling has suggestions");
+        assert_eq!(spelling.word, "teh");
+        assert_eq!(buf, original);
+        let clicked_cursor = egui::TextEdit::load_state(&ctx, id)
+            .unwrap()
+            .cursor
+            .char_range()
+            .unwrap();
+        assert_eq!(clicked_cursor.primary.index, "é🙂 t".chars().count());
+        assert_eq!(clicked_cursor.primary, clicked_cursor.secondary);
+
+        let output = spelling_test_frame(&ctx, &mut buf, &channel, Vec::new(), false);
+        let correction = visible_input_text(&output, "the")
+            .expect("the is offered")
+            .center();
+        for pressed in [true, false] {
+            spelling_test_frame(
+                &ctx,
+                &mut buf,
+                &channel,
+                spelling_pointer(correction, egui::PointerButton::Primary, pressed),
+                false,
+            );
+        }
+        assert_eq!(buf, "é🙂 the recieve");
+        let cursor = egui::TextEdit::load_state(&ctx, id)
+            .unwrap()
+            .cursor
+            .char_range()
+            .unwrap();
+        assert_eq!(cursor.primary.index, "é🙂 the".chars().count());
+        assert_eq!(cursor.primary, cursor.secondary);
+        assert!(ctx.memory(|memory| memory.has_focus(id)));
+    }
+
+    #[test]
+    fn spelling_menu_discards_suggestions_after_draft_or_channel_changes() {
+        let _settings = crate::spellcheck::test_settings_guard();
+        let id = Id::new("spelling_menu_test");
+        let channel = ChannelId::new("example");
+        let original = "é🙂 teh tail";
+        for (replacement, next_channel) in [
+            ("", channel.clone()),
+            ("🙂🙂🙂", channel.clone()),
+            ("é🙂 teh other", channel.clone()),
+            (original, ChannelId::new("another")),
+        ] {
+            let ctx = egui::Context::default();
+            let mut buf = original.to_owned();
+            let output = spelling_test_frame(&ctx, &mut buf, &channel, Vec::new(), true);
+            let pointer = spelling_word_position(&output, original, "teh");
+            for pressed in [true, false] {
+                spelling_test_frame(
+                    &ctx,
+                    &mut buf,
+                    &channel,
+                    spelling_pointer(pointer, egui::PointerButton::Secondary, pressed),
+                    false,
+                );
+            }
+            assert!(ctx
+                .data(|data| data.get_temp::<SpellCtx>(id.with("spell_check_ctx")))
+                .is_some());
+            buf = replacement.to_owned();
+            let output = spelling_test_frame(&ctx, &mut buf, &next_channel, Vec::new(), false);
+            assert!(ctx
+                .data(|data| data.get_temp::<SpellCtx>(id.with("spell_check_ctx")))
+                .is_none());
+            assert!(visible_input_text(&output, "\"teh\" - misspelled").is_none());
+            assert_eq!(buf, replacement);
+        }
+    }
+
+    #[test]
+    fn stale_spelling_action_cannot_replace_a_changed_draft() {
+        let channel = ChannelId::new("example");
+        let original = "é🙂 teh tail";
+        let start = original.find("teh").unwrap();
+        let spelling = SpellCtx {
+            channel: channel.clone(),
+            expected_buf: original.to_owned(),
+            word: "teh".to_owned(),
+            start,
+            end: start + 3,
+            suggestions: vec!["the".to_owned()],
+        };
+        for (edited, next_channel) in [
+            ("", channel.clone()),
+            ("🙂🙂🙂", channel.clone()),
+            ("é🙂 teh other", channel.clone()),
+            (original, ChannelId::new("another")),
+        ] {
+            let mut buf = edited.to_owned();
+            assert_eq!(spelling.replace(&next_channel, &mut buf, "the"), None);
+            assert_eq!(buf, edited);
         }
     }
 
