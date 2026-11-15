@@ -343,8 +343,9 @@ fn show_message_search_scroll_area(
     ScrollArea::vertical()
         .id_salt(search.scope_id(Id::new(("message_search_scroll", channel.as_str()))))
         .auto_shrink([false, false])
+        .min_scrolled_height(0.0)
         .max_height(ui.available_height().max(0.0))
-        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
         .show(ui, |ui| {
             show_message_search_contents(ui, channel, messages, search, true, true);
         });
@@ -426,19 +427,19 @@ fn show_message_search_contents(
     search.ensure_regex();
     ui.add_space(2.0);
     if let Some(err) = search.regex_error() {
-        ui.label(
+        ui.add(egui::Label::new(
             RichText::new(format!("Regex error: {err}"))
                 .font(t::small())
                 .color(t::red()),
-        );
+        ).wrap());
     } else {
-        ui.label(
+        ui.add(egui::Label::new(
             RichText::new(
                 "Username and keyword ignore case. Messages must match every active filter.",
             )
             .font(t::small())
             .color(t::text_secondary()),
-        );
+        ).wrap());
     }
     search.focused_control = ui.ctx().memory(|memory| memory.focused()).filter(|id| {
         ui.ctx().read_response(*id).is_some_and(|response| {
@@ -590,20 +591,22 @@ fn search_field_row(
     request_focus: bool,
     code_editor: bool,
 ) {
+    let field_width = (ui.available_width() - SEARCH_LABEL_WIDTH - ui.spacing().item_spacing.x)
+        .max(0.0);
     ui.horizontal(|ui| {
         ui.add_sized(
             [SEARCH_LABEL_WIDTH, 28.0],
-            egui::Label::new(RichText::new(label).font(t::small()).color(t::text_secondary())),
+            egui::Label::new(RichText::new(label).font(t::small()).color(t::text_secondary())).truncate(),
         );
         let mut edit = egui::TextEdit::singleline(value)
             .id(id)
             .hint_text(hint)
             .margin(egui::Margin::symmetric(6, 5))
-            .desired_width(f32::INFINITY);
+            .desired_width((field_width - 12.0).max(0.0));
         if code_editor {
             edit = edit.code_editor();
         }
-        let response = ui.add_sized([ui.available_width(), 28.0], edit);
+        let response = ui.add_sized([field_width, 28.0], edit);
         if request_focus {
             focus_search_field(ui.ctx(), &response, value);
         }
@@ -708,6 +711,7 @@ mod tests {
         for size in [egui::vec2(SEARCH_WINDOW_DEFAULT_WIDTH, SEARCH_WINDOW_DEFAULT_HEIGHT), egui::vec2(360.0, 210.0)] {
             for pixels_per_point in [1.0, 1.25] {
                 let ctx = Context::default();
+                crate::app::apply_theme_visuals(&ctx);
                 ctx.style_mut(|style| {
                     style.animation_time = 0.0;
                     style.scroll_animation = egui::style::ScrollAnimation::none();
@@ -726,7 +730,16 @@ mod tests {
                         ..Default::default()
                     };
                     input.viewports.get_mut(&ViewportId::ROOT).unwrap().native_pixels_per_point = Some(pixels_per_point);
-                    ctx.run(input, |ctx| show_message_search_native_panel(ctx, &channel, &VecDeque::new(), search))
+                    ctx.run(input, |ctx| {
+                        show_message_search_native_panel(ctx, &channel, &VecDeque::new(), search);
+                        for key in ["username", "keyword", "regex"] {
+                            let field = ctx.read_response(search.field_id(&channel, key)).unwrap();
+                            assert!(field.rect.left() >= field.interact_rect.left() - 0.5
+                                && field.rect.right() <= field.interact_rect.right() + 0.5,
+                                "{key} field clipped horizontally at {size:?}/{pixels_per_point}x: {:?} in {:?}",
+                                field.rect, field.interact_rect);
+                        }
+                    })
                 };
                 let mut output = egui::FullOutput::default();
                 for _ in 0..3 { output = render(&mut search, Vec::new()); }

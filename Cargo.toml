@@ -106,3 +106,6 @@ opt-level = 1
 # Our workspace crates still build at opt-level = 1 above for fast iteration.
 [profile.dev.package."*"]
 opt-level = 3
+
+[patch.crates-io]
+eframe = { path = "vendor/eframe" }

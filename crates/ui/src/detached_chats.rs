@@ -70,6 +70,41 @@ impl DetachedChat {
         )
     }
 
+    fn viewport_builder(&self, always_on_top: bool) -> ViewportBuilder {
+        let builder = ViewportBuilder::default()
+            .with_title(self.title())
+            .with_inner_size(self.settings.size)
+            .with_min_inner_size([240.0, 180.0])
+            .with_maximized(self.settings.maximized)
+            .with_resizable(true)
+            .with_transparent(self.settings.overlay)
+            .with_decorations(!self.settings.overlay || !self.settings.click_through)
+            .with_mouse_passthrough(self.settings.overlay && self.settings.click_through)
+            // This is a creation attribute; changing it recreates the native window.
+            .with_active(false)
+            .with_window_level(if always_on_top || self.settings.overlay {
+                egui::viewport::WindowLevel::AlwaysOnTop
+            } else {
+                egui::viewport::WindowLevel::Normal
+            });
+        if let Some(position) = self.settings.position {
+            builder.with_position(position)
+        } else {
+            builder
+        }
+    }
+
+    fn focus_composer(&mut self, ctx: &Context, native: bool) {
+        if !self.focus_input {
+            return;
+        }
+        request_composer_focus(ctx, Some(chat_composer_id(Some(self.pane.id))));
+        if native && !ctx.input(|input| input.focused) {
+            ctx.send_viewport_cmd(ViewportCommand::Focus);
+        }
+        self.focus_input = false;
+    }
+
     fn sample_geometry(&mut self, ctx: &Context) {
         ctx.input(|input| {
             let viewport = input.viewport();
@@ -518,26 +553,7 @@ impl CrustApp {
             window
                 .picker
                 .apply_preferences(&self.emote_picker.preferences());
-            let builder = ViewportBuilder::default()
-                .with_title(window.title())
-                .with_inner_size(window.settings.size)
-                .with_min_inner_size([240.0, 180.0])
-                .with_maximized(window.settings.maximized)
-                .with_resizable(true)
-                .with_transparent(window.settings.overlay)
-                .with_decorations(!window.settings.overlay || !window.settings.click_through)
-                .with_mouse_passthrough(window.settings.overlay && window.settings.click_through)
-                .with_active(window.focus_input)
-                .with_window_level(if self.always_on_top || window.settings.overlay {
-                    egui::viewport::WindowLevel::AlwaysOnTop
-                } else {
-                    egui::viewport::WindowLevel::Normal
-                });
-            let builder = if let Some(position) = window.settings.position {
-                builder.with_position(position)
-            } else {
-                builder
-            };
+            let builder = window.viewport_builder(self.always_on_top);
             ctx.show_viewport_immediate(window.viewport_id(), builder, |child, class| {
                 if child.input(|input| input.viewport().close_requested()) {
                     output.close = true;
@@ -550,11 +566,8 @@ impl CrustApp {
                 let animate = !self.animations_when_focused || child.input(|input| input.focused);
                 let passthrough =
                     window.settings.overlay && window.settings.click_through && !embedded;
-                if window.focus_input && !passthrough {
-                    request_composer_focus(child, Some(chat_composer_id(Some(window.pane.id))));
-                    window.focus_input = false;
-                }
                 if !passthrough {
+                    window.focus_composer(child, !embedded);
                     self.handle_chat_window_shortcuts(child, window, &mut output);
                     if output.close {
                         return;
@@ -1109,6 +1122,103 @@ mod tests {
     fn open(app: &mut CrustApp, overlay: bool) -> u64 {
         app.open_detached_chat(ChannelId::new("room"), PaneViewSettings::default(), overlay);
         app.detached_chats.open.last().unwrap().pane.id
+    }
+
+    #[test]
+    fn closing_picker_and_changing_overlay_interaction_keep_the_native_window() {
+        for overlay in [false, true] {
+            let (mut app, _) = app();
+            open(&mut app, overlay);
+            let ctx = Context::default();
+            let run = |app: &mut CrustApp, events| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(800.0, 600.0),
+                        )),
+                        events,
+                        focused: true,
+                        ..Default::default()
+                    },
+                    |ctx| app.show_detached_chats(ctx, &mut ChatPerfStats::default()),
+                )
+            };
+            for _ in 0..3 {
+                run(&mut app, Vec::new());
+            }
+            let mut native_builder = app.detached_chats.open[0].viewport_builder(false);
+            app.detached_chats.open[0].picker.toggle();
+            for _ in 0..4 {
+                run(&mut app, Vec::new());
+            }
+            assert!(app.detached_chats.open[0].picker.owns_keyboard(&ctx));
+            run(&mut app, shortcut(egui::Key::Escape, egui::Modifiers::NONE));
+            let window = &app.detached_chats.open[0];
+            assert!(!window.picker.open);
+            assert!(window.focus_input);
+            assert!(
+                !native_builder.patch(window.viewport_builder(false)).1,
+                "closing the picker must not recreate its chat window"
+            );
+            run(&mut app, Vec::new());
+            let window = &app.detached_chats.open[0];
+            assert!(!window.focus_input);
+            assert!(
+                !native_builder.patch(window.viewport_builder(false)).1,
+                "consuming composer focus must not recreate the window on the next frame"
+            );
+            if overlay {
+                for click_through in [true, false] {
+                    let window = &mut app.detached_chats.open[0];
+                    window.settings.click_through = click_through;
+                    window.focus_input = !click_through;
+                    let (commands, recreate) = native_builder.patch(window.viewport_builder(false));
+                    assert!(
+                        !recreate,
+                        "changing overlay interaction must keep its window"
+                    );
+                    assert!(commands.iter().any(|command| matches!(command,
+                        ViewportCommand::MousePassthrough(enabled) if *enabled == click_through)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn composer_focus_requests_activate_only_an_unfocused_native_window() {
+        let mut window = DetachedChat::new(
+            DetachedChatSettings {
+                channel: "room".into(),
+                ..Default::default()
+            },
+            &[],
+            None,
+        );
+        let ctx = Context::default();
+        for (native, focused, requested, activates) in [
+            (true, false, true, true),
+            (true, true, true, false),
+            (true, false, false, false),
+            (false, false, true, false),
+        ] {
+            window.focus_input = requested;
+            let output = ctx.run(
+                egui::RawInput {
+                    focused,
+                    ..Default::default()
+                },
+                |ctx| window.focus_composer(ctx, native),
+            );
+            let focus_count = output
+                .viewport_output
+                .values()
+                .flat_map(|viewport| &viewport.commands)
+                .filter(|command| matches!(command, ViewportCommand::Focus))
+                .count();
+            assert_eq!(focus_count, usize::from(activates));
+            assert!(!window.focus_input);
+        }
     }
 
     fn surface_frame(

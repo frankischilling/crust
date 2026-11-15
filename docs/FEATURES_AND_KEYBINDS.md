@@ -38,19 +38,23 @@ commands. Kick and generic IRC support remain beta features.
 
 ### Detached chats and overlays
 
-Open the chat header's options menu, then choose Chat windows > Open in new
-window or Open overlay. Up to 16 chat windows can be open. Each has its own
+Open the chat header's options menu, then choose Open in new window or Open
+overlay. Up to 16 chat windows can be open. Each has its own
 composer, reply target, search, filters, emote picker, and scroll position.
+
+Returning to the composer after using its emote picker or search keeps the same
+native window. Native chat and search windows initialize their own accessibility
+support.
 
 Window size, position, search, filters, and overlay settings survive a restart.
 Drafts and recently closed windows last for the session. Closing a channel's main
 tab keeps its detached chats connected; closing the last view leaves the channel.
 
-Use Chat windows > Manage chat windows to show or close a window, reopen a recently
-closed one, or restore its main tab. Reset position brings an offscreen window
-beside the main window. Overlays have a background-opacity control and an explicit
-Click-through mode. Use Interact in the manager to restore mouse and keyboard
-control of an overlay.
+Choose Manage chat windows from the same header menu to show or close a window,
+reopen a recently closed one, or restore its main tab. Reset position brings an
+offscreen window beside the main window. Overlays have a background-opacity
+control and an explicit Click-through mode. Use Interact in the manager to restore
+mouse and keyboard control of an overlay.
 
 ### Desktop UI shell
 
@@ -293,6 +297,8 @@ found until you update the selection.
 - Ordered background log writes and an indexed Mentions query
 - Older local history paging, including messages with identical timestamps and rows without server IDs
 - Per-channel message search/filter UI
+- Local search fields fit the popup width. Help and regex errors wrap, and a
+  scrollbar appears only when the form is taller than the window.
 - Cross-channel search with predicates such as `from:<user>`, `has:link`, `in:<channel>`, `is:announcement`, and `regex:"<pattern>"`
 - Saved expression filters can match announcements with `flags.announcement`.
 - Search navigation that follows input/result focus and leaves other controls' keys alone
@@ -556,4 +562,4 @@ User-defined command aliases (Settings -> Commands) dispatch after the built-in 
 - [UI API](API_UI.md)
 - [Events API](API_Events.md)
 - [Plugin API reference](API.md)
-- [Release notes v0.6.0](releases/Release_v0.6.0.md)
+- [Release notes v0.7.0](releases/Release_v0.7.0.md)

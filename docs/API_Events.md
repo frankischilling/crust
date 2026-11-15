@@ -339,7 +339,7 @@ The nested `msg_kind` table includes a `type` field and then variant-specific fi
 - `Chat`
 - `Announcement`: `color`
 - `Sub`: `display_name`, `months`, `plan`, `is_gift`, `sub_msg`
-- `Raid`: `display_name`, `viewer_count`
+- `Raid`: `display_name`, `viewer_count`, `source_login`
 - `Timeout`: `login`, `seconds`
 - `Ban`: `login`
 - `ChatCleared`
@@ -347,13 +347,19 @@ The nested `msg_kind` table includes a `type` field and then variant-specific fi
 - `ChannelPointsReward`: `user_login`, `reward_title`, `cost`, `reward_id`, `redemption_id`, `user_input`, `status`
 - `SuspiciousUserMessage`
 - `Bits`: `amount`
+- `HypeTrain`: `phase`, `train_id`, `level`, `progress`, `goal`, `total`,
+  `top_contributor_login`, `top_contributor_type`, `top_contributor_total`, `ends_at`
 
 For `ChannelPointsReward`, `reward_id`, `redemption_id`, `user_input`, and
 `status` are omitted when unavailable.
 
+For `Raid`, `source_login` is omitted when unavailable. For `HypeTrain`, the
+three `top_contributor_*` fields and `ends_at` are omitted when unavailable.
+
 Announcements retain the sender, badges, message ID, timestamp, and emote spans.
 Their `color` is the lowercase notice color, such as `primary`, `blue`, `green`,
-`orange`, or `purple`. Shared-chat announcements also retain their source metadata.
+`orange`, or `purple`. Shared-chat source metadata is retained by the app but is
+not currently included in the Lua message table.
 
 ### `c2.EventType.WhisperReceived`
 

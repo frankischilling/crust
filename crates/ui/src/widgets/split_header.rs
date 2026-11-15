@@ -223,7 +223,8 @@ pub fn show_split_header(
         .sense(egui::Sense::click()),
     );
     result.focus_clicked = title_resp.clicked();
-    title_resp.context_menu(|ui| show_split_menu(ui, can_search, search_open, options, &mut result));
+    title_resp
+        .context_menu(|ui| show_split_menu(ui, can_search, search_open, options, &mut result));
     let mut tooltip = format!("{prefix}{display_name}");
     if let Some(meta_text) = meta_text.filter(|text| !text.is_empty()) {
         tooltip.push('\n');
@@ -242,19 +243,57 @@ fn show_split_menu(
     options: SplitHeaderOptions,
     result: &mut SplitHeaderResult,
 ) {
-    for (label, axis) in [("Split right", SplitAxis::Horizontal), ("Split below", SplitAxis::Vertical)] {
-        if ui.add_enabled(options.can_split, egui::Button::new(RichText::new(label).font(t::small()))).clicked() {
+    let frame_margin = egui::Frame::menu(ui.style()).total_margin().sum();
+    let maximum = (ui.ctx().screen_rect().size() - frame_margin - egui::vec2(16.0, 16.0))
+        .max(egui::Vec2::splat(1.0));
+    ui.set_max_width(maximum.x);
+    egui::ScrollArea::vertical()
+        .id_salt("split_options_scroll")
+        .max_height(maximum.y)
+        .min_scrolled_height(0.0)
+        .show(ui, |ui| {
+            show_split_menu_contents(ui, can_search, search_open, options, result)
+        });
+}
+
+fn show_split_menu_contents(
+    ui: &mut egui::Ui,
+    can_search: bool,
+    search_open: bool,
+    options: SplitHeaderOptions,
+    result: &mut SplitHeaderResult,
+) {
+    for (label, axis) in [
+        ("Split right", SplitAxis::Horizontal),
+        ("Split below", SplitAxis::Vertical),
+    ] {
+        if ui
+            .add_enabled(
+                options.can_split,
+                egui::Button::new(RichText::new(label).font(t::small())),
+            )
+            .clicked()
+        {
             result.split = Some(axis);
             ui.close_menu();
         }
     }
-    if ui.add_enabled(options.can_reopen, egui::Button::new(RichText::new("Reopen closed split").font(t::small()))).clicked() {
+    if ui
+        .add_enabled(
+            options.can_reopen,
+            egui::Button::new(RichText::new("Reopen closed split").font(t::small())),
+        )
+        .clicked()
+    {
         result.reopen_clicked = true;
         ui.close_menu();
     }
     ui.separator();
     if can_search {
-        if ui.button(RichText::new("Pane filters").font(t::small())).clicked() {
+        if ui
+            .button(RichText::new("Pane filters").font(t::small()))
+            .clicked()
+        {
             result.filters_clicked = true;
             ui.close_menu();
         }
@@ -271,20 +310,31 @@ fn show_split_menu(
             ui.close_menu();
         }
     }
-    ui.menu_button(RichText::new("Chat windows").font(t::small()), |ui| {
-        if can_search && ui.button(RichText::new("Open in new window").font(t::small())).clicked() {
-            result.open_window_clicked = true;
-            ui.close_menu();
-        }
-        if can_search && ui.button(RichText::new("Open overlay").font(t::small())).clicked() {
-            result.open_overlay_clicked = true;
-            ui.close_menu();
-        }
-        if ui.button(RichText::new("Manage chat windows").font(t::small())).clicked() {
-            result.manage_windows_clicked = true;
-            ui.close_menu();
-        }
-    });
+    ui.separator();
+    if can_search
+        && ui
+            .button(RichText::new("Open in new window").font(t::small()))
+            .clicked()
+    {
+        result.open_window_clicked = true;
+        ui.close_menu();
+    }
+    if can_search
+        && ui
+            .button(RichText::new("Open overlay").font(t::small()))
+            .clicked()
+    {
+        result.open_overlay_clicked = true;
+        ui.close_menu();
+    }
+    if ui
+        .button(RichText::new("Manage chat windows").font(t::small()))
+        .clicked()
+    {
+        result.manage_windows_clicked = true;
+        ui.close_menu();
+    }
+    ui.separator();
     if ui
         .button(RichText::new("Close split").font(t::small()))
         .clicked()
@@ -293,7 +343,10 @@ fn show_split_menu(
         ui.close_menu();
     }
     if ui
-        .add_enabled(options.can_close_others, egui::Button::new(RichText::new("Close other splits").font(t::small())))
+        .add_enabled(
+            options.can_close_others,
+            egui::Button::new(RichText::new("Close other splits").font(t::small())),
+        )
         .clicked()
     {
         result.close_others_clicked = true;
@@ -313,28 +366,58 @@ fn badge_count_label(count: u32) -> String {
 mod tests {
     use super::*;
 
+    #[derive(Clone, Copy)]
+    struct HeaderViewport {
+        size: egui::Vec2,
+        pane: egui::Rect,
+    }
+
+    impl HeaderViewport {
+        fn narrow_pane(width: f32) -> Self {
+            Self {
+                size: egui::vec2(width.max(400.0), 200.0),
+                pane: egui::Rect::from_min_size(
+                    egui::pos2(8.0, 8.0),
+                    egui::vec2(width - 16.0, 184.0),
+                ),
+            }
+        }
+
+        fn at_right_edge(size: egui::Vec2, pane_width: f32) -> Self {
+            Self {
+                size,
+                pane: egui::Rect::from_min_max(
+                    egui::pos2((size.x - pane_width).max(8.0), 96.0),
+                    egui::pos2(size.x - 8.0, size.y - 8.0),
+                ),
+            }
+        }
+    }
+
     fn header_frame(
         ctx: &egui::Context,
         width: f32,
+        events: Vec<egui::Event>,
+    ) -> (egui::FullOutput, SplitHeaderResult, egui::Pos2) {
+        viewport_frame(ctx, HeaderViewport::narrow_pane(width), events)
+    }
+
+    fn viewport_frame(
+        ctx: &egui::Context,
+        viewport: HeaderViewport,
         events: Vec<egui::Event>,
     ) -> (egui::FullOutput, SplitHeaderResult, egui::Pos2) {
         let mut result = SplitHeaderResult::default();
         let mut close_center = egui::Pos2::ZERO;
         let output = ctx.run(
             egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(width.max(400.0), 200.0),
-                )),
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, viewport.size)),
                 events,
                 ..Default::default()
             },
             |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    let pane = egui::Rect::from_min_size(
-                        ui.max_rect().min,
-                        egui::vec2(width - 16.0, ui.max_rect().height()),
-                    );
+                    let pane = viewport.pane;
                     close_center = egui::pos2(
                         pane.right() - HEADER_PAD_X - t::icon_btn_sm() / 2.0,
                         pane.top() + split_header_height() / 2.0,
@@ -348,7 +431,11 @@ mod tests {
                         2,
                         false,
                         Some("A long stream title that must not cover the controls"),
-                        SplitHeaderOptions { can_split: true, can_reopen: true, can_close_others: true },
+                        SplitHeaderOptions {
+                            can_split: true,
+                            can_reopen: true,
+                            can_close_others: true,
+                        },
                     );
                 });
             },
@@ -408,9 +495,18 @@ mod tests {
         pos: egui::Pos2,
         button: egui::PointerButton,
     ) -> SplitHeaderResult {
-        header_frame(
+        click_in_viewport(ctx, HeaderViewport::narrow_pane(width), pos, button)
+    }
+
+    fn click_in_viewport(
+        ctx: &egui::Context,
+        viewport: HeaderViewport,
+        pos: egui::Pos2,
+        button: egui::PointerButton,
+    ) -> SplitHeaderResult {
+        viewport_frame(
             ctx,
-            width,
+            viewport,
             vec![
                 egui::Event::PointerMoved(pos),
                 egui::Event::PointerButton {
@@ -421,9 +517,9 @@ mod tests {
                 },
             ],
         );
-        header_frame(
+        viewport_frame(
             ctx,
-            width,
+            viewport,
             vec![egui::Event::PointerButton {
                 pos,
                 button,
@@ -432,6 +528,53 @@ mod tests {
             }],
         )
         .1
+    }
+
+    fn find_menu_action(ctx: &egui::Context, viewport: HeaderViewport, action: &str) -> egui::Rect {
+        let labels = [
+            "Split right",
+            "Split below",
+            "Reopen closed split",
+            "Pane filters",
+            "Show search",
+            "Open in new window",
+            "Open overlay",
+            "Manage chat windows",
+            "Close split",
+            "Close other splits",
+        ];
+        for _ in 0..40 {
+            let mut output = egui::FullOutput::default();
+            for _ in 0..8 {
+                output = viewport_frame(ctx, viewport, Vec::new()).0;
+            }
+            if let Some(rect) = text_rect(&output, action) {
+                assert!(
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, viewport.size).contains_rect(rect),
+                    "{action} escaped viewport {:?}: {rect:?}",
+                    viewport.size
+                );
+                return rect;
+            }
+            let position = labels
+                .iter()
+                .find_map(|label| text_rect(&output, label))
+                .expect("an open menu must keep at least one action visible")
+                .center();
+            viewport_frame(
+                ctx,
+                viewport,
+                vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -24.0),
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        panic!("{action} remained unreachable in {:?}", viewport.size);
     }
 
     #[test]
@@ -449,15 +592,80 @@ mod tests {
                     close
                 };
                 click(&ctx, width, menu, egui::PointerButton::Primary);
-                let (output, _, _) = header_frame(&ctx, width, Vec::new());
-                let target = text_rect(&output, action)
-                    .unwrap_or_else(|| panic!("{action} missing from split menu at width {width}"));
+                let target = find_menu_action(&ctx, HeaderViewport::narrow_pane(width), action);
                 let result = click(&ctx, width, target.center(), egui::PointerButton::Primary);
                 match action {
                     "Show search" => assert!(result.toggle_search_clicked),
                     "Close other splits" => assert!(result.close_others_clicked),
                     _ => assert!(result.close_clicked),
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn right_edge_menu_actions_remain_clickable_when_the_viewport_requires_scrolling() {
+        for (size, pane_width, row_height) in [
+            (egui::vec2(220.0, 200.0), 220.0, 18.0),
+            (egui::vec2(220.0, 200.0), 220.0, 32.0),
+            (egui::vec2(640.0, 400.0), 150.0, 18.0),
+            (egui::vec2(1280.0, 720.0), 640.0, 18.0),
+        ] {
+            for action in [
+                "Open in new window",
+                "Open overlay",
+                "Manage chat windows",
+                "Show search",
+                "Close split",
+                "Close other splits",
+            ] {
+                let ctx = egui::Context::default();
+                ctx.style_mut(|style| style.spacing.interact_size.y = row_height);
+                let viewport = HeaderViewport::at_right_edge(size, pane_width);
+                let (_, _, close) = viewport_frame(&ctx, viewport, Vec::new());
+                viewport_frame(&ctx, viewport, Vec::new());
+                let menu = close - egui::vec2(t::icon_btn_sm() + HEADER_CTRL_GAP, 0.0);
+                click_in_viewport(&ctx, viewport, menu, egui::PointerButton::Primary);
+                let target = find_menu_action(&ctx, viewport, action);
+                let result = click_in_viewport(
+                    &ctx,
+                    viewport,
+                    target.center(),
+                    egui::PointerButton::Primary,
+                );
+                let selected = match action {
+                    "Open in new window" => result.open_window_clicked,
+                    "Open overlay" => result.open_overlay_clicked,
+                    "Manage chat windows" => result.manage_windows_clicked,
+                    "Show search" => result.toggle_search_clicked,
+                    "Close split" => result.close_clicked,
+                    "Close other splits" => result.close_others_clicked,
+                    _ => unreachable!(),
+                };
+                assert!(
+                    selected,
+                    "{action} did not activate at {size:?}, row height {row_height}"
+                );
+                let count = [
+                    result.open_window_clicked,
+                    result.open_overlay_clicked,
+                    result.manage_windows_clicked,
+                    result.toggle_search_clicked,
+                    result.close_clicked,
+                    result.close_others_clicked,
+                    result.filters_clicked,
+                    result.reopen_clicked,
+                    result.split.is_some(),
+                ]
+                .into_iter()
+                .filter(|value| *value)
+                .count();
+                assert_eq!(count, 1, "{action} activated another header action");
+                let (output, _, _) = viewport_frame(&ctx, viewport, Vec::new());
+                assert!(
+                    text_rect(&output, "Manage chat windows").is_none(),
+                    "selecting an action must close the menu"
+                );
             }
         }
     }
@@ -474,8 +682,11 @@ mod tests {
             egui::pos2(28.0, close.y),
             egui::PointerButton::Secondary,
         );
-        let (output, _, _) = header_frame(&ctx, width, Vec::new());
-        let target = text_rect(&output, "Close other splits").expect("title opens split options");
+        let target = find_menu_action(
+            &ctx,
+            HeaderViewport::narrow_pane(width),
+            "Close other splits",
+        );
         let result = click(&ctx, width, target.center(), egui::PointerButton::Primary);
         assert!(result.close_others_clicked);
         assert!(!result.close_clicked);

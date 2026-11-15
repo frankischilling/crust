@@ -6,16 +6,20 @@ badge refreshes, announcement handling, and recovery controls.
 
 ## Detached chats and overlays
 
-The chat header menu can open a channel in a separate window or an overlay. Each
-window uses the normal message renderer and composer, with its own draft, reply,
-search, filter selection, emote picker, and scroll position. Up to 16 windows can
-be open, including multiple views of one channel.
+The chat header menu offers Open in new window, Open overlay, and Manage chat
+windows directly. Each chat window uses the normal message renderer and composer,
+with its own draft, reply, search, filter selection, emote picker, and scroll
+position. Up to 16 windows can be open, including multiple views of one channel.
 
 Window geometry, search, filters, and overlay settings are saved. Drafts and
 recently closed windows stay available during the session. Closing the main tab
 keeps its detached views connected; closing the last view leaves the channel.
 The Chat windows manager can restore a tab, reopen a closed window, or reset an
 offscreen window beside the main window.
+
+The reopen history retains 16 closed windows. When an older window leaves that
+history, its remaining draft moves to unsent recovery. Virtual feeds cannot be
+detached, and startup restores windows only for channels eligible to join.
 
 Overlays have adjustable background opacity and an explicit Click-through mode.
 The manager's Interact action disables mouse passthrough and focuses the overlay.
@@ -30,6 +34,13 @@ application's position, always-on-top, and focus requests may be ignored.
 Ctrl+W closes the focused chat view and Ctrl+, opens settings. Both appear in
 Settings > Hotkeys. Detached windows keep local search and input shortcuts;
 quick switch, cross-channel search, and settings bring the main window forward.
+
+Returning focus to the composer after using its picker or search keeps the same
+native window. Focus requests leave the window's creation settings unchanged.
+
+With native accessibility enabled, each window initializes its own AccessKit
+adapter before it is shown. A replacement native window receives a new adapter;
+ordinary focus changes reuse the existing one.
 
 Delayed send failures and image uploads retain their originating composer and
 account. A result cannot replace a different window's draft or cross an account
@@ -47,6 +58,10 @@ Keyboard jumps measure a bounded neighborhood around the selected result. The
 visible message acts as an anchor when results are inserted, removed, or
 remeasured. Result bodies, sender names, links, and message menus retain their
 normal actions.
+
+Local search popups bound all three fields to the available content width. Help
+and regex errors wrap, and the vertical scrollbar appears only when the form
+exceeds the window height.
 
 ## Badge catalogs
 
@@ -85,8 +100,9 @@ process itself.
 
 ## Search measurements
 
-The controlled Windows release fixture contains 5,000 rich results at a width of
-480 points. It alternates cached and full rendering for 25 warm samples. The
+The controlled Windows release fixture contains 5,000 rich results in a
+480 × 320-point viewport. Each path has one cold frame and four warm-up frames,
+followed by 25 timed warm samples, alternating cached and full rendering. The
 baseline uses the v0.6.0 main commit `286ee25`; the candidate uses this release's
 progressive layout.
 
@@ -103,7 +119,12 @@ frames rendered seven rows and remeasured none. The cold cached result is about
 these measurements do not establish a warm-path improvement. They measure CPU
 layout, excluding presentation and compositor time.
 
-Focused checks covered 29 search cases and 18 detached-window cases. Search
+The Windows release workspace run passed 1,566 tests across 20 unit and integration
+targets, plus one doctest. The ordinary run skipped 22 opt-in benchmark and fixture
+tests; the search benchmark above was run separately. Release correctness linting
+also passed.
+
+Focused checks covered 29 search cases and 20 detached-window cases. Search
 regressions verify distant keyboard jumps, partial-row anchors during resize,
 insertion and removal, and a click on the preserved result in the immediate next
 input frame. Runtime checks cover authoritative badge request counts, fallback
