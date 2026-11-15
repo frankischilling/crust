@@ -254,6 +254,7 @@ mod tests {
             url: "https://x".into(),
             url_hd: None,
             provider: "twitch".into(),
+            zero_width: false,
         });
         let mut with_emoji = make_msg("u", "U", "😀");
         with_emoji.spans.push(Span::Emoji {

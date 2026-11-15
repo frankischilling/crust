@@ -323,6 +323,55 @@ async fn ready_scoped(fixture: &mut Harness) {
 }
 
 #[tokio::test]
+async fn seven_tv_overlay_updates_survive_snapshots_and_stay_in_their_scope() {
+    for scope in [
+        LiveScope::Global,
+        LiveScope::Personal("42".into()),
+        LiveScope::Channel(ChannelId::new("loopback")),
+    ] {
+        let mut fixture = Harness::new_scoped(
+            Provider::SevenTv, vec![emote(Provider::SevenTv, "hat", "Hat")], scope.clone(),
+        ).await;
+        ready_scoped(&mut fixture).await;
+        let (mut request, headers) = fixture.request().await;
+        let body: Value = serde_json::from_str(headers.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert!(body["query"].as_str().unwrap().contains("emotes { id name flags data"));
+        let overlay = |set: &str, flags| json!({"op": 0, "d": {"type": "emote_set.update", "body": {
+            "id": set, "updated": [{"key": "emotes", "old_value": {"id": "hat", "name": "Hat"},
+                "value": {"id": "hat", "name": "Hat", "flags": flags}}]
+        }}});
+        send(&mut fixture.socket, overlay("set-id", 1)).await;
+        barrier(&mut fixture.socket, b"overlay-before-snapshot").await;
+        let is_overlay = |fixture: &Harness| fixture.index.read().unwrap()
+            .resolve(&fixture.channel, "42", "Hat").unwrap().zero_width;
+        assert!(is_overlay(&fixture));
+        respond(&mut request, scoped_snapshot(&scope, "set-id", vec![
+            active_emote("hat", "Hat"), active_emote("rest", "RestMarker"),
+        ])).await;
+        fixture.wait_for("RestMarker").await;
+        assert!(is_overlay(&fixture), "snapshot erased a newer overlay change");
+        {
+            let registry = fixture.index.read().unwrap();
+            let catalog = registry.catalog();
+            let entry = catalog.iter().find(|entry| entry.code == "Hat").unwrap();
+            assert!(entry.zero_width);
+            match &scope {
+                LiveScope::Personal(_) => assert!(!entry.is_available_for(&fixture.channel, "other")),
+                LiveScope::Channel(_) => assert!(!entry.is_available_for(&ChannelId::new("other"), "42")),
+                LiveScope::Global => assert!(entry.is_available_for(&ChannelId::new("other"), "other")),
+            }
+        }
+        send(&mut fixture.socket, overlay("foreign-set", 0)).await;
+        barrier(&mut fixture.socket, b"foreign-overlay").await;
+        assert!(is_overlay(&fixture));
+        send(&mut fixture.socket, overlay("set-id", 0)).await;
+        barrier(&mut fixture.socket, b"disable-overlay").await;
+        assert!(!is_overlay(&fixture));
+        fixture.stop().await;
+    }
+}
+
+#[tokio::test]
 async fn seven_tv_global_and_personal_scopes_reconcile_live_changes_and_offline_removals() {
     for scope in [LiveScope::Global, LiveScope::Personal("42".into())] {
         let mut fixture = Harness::new_scoped(
@@ -335,6 +384,7 @@ async fn seven_tv_global_and_personal_scopes_reconcile_live_changes_and_offline_
         let (mut request, headers) = fixture.request().await;
         let body: Value = serde_json::from_str(headers.split_once("\r\n\r\n").unwrap().1).unwrap();
         let query = body["query"].as_str().unwrap();
+        assert!(query.contains("emotes { id name flags data"));
         assert_eq!(
             query.contains("userByConnection"),
             matches!(scope, LiveScope::Personal(_))

@@ -1,28 +1,16 @@
-//! Sound event playback backend.
+//! Notification sounds run on one lazily started worker.
 //!
-//! Wraps a lazily-initialised [`rodio::MixerDeviceSink`] handle and exposes
-//! a high-level [`SoundController`] that:
-//!
-//! 1. honours per-event enable / path / volume configuration supplied via
-//!    [`SoundController::apply_settings`] from `AppSettings.sounds`,
-//! 2. mutes playback while streamer mode is active and the user has opted
-//!    into `streamer_suppress_sounds`,
-//! 3. falls back to a short synthetic ping tone when no custom file is
-//!    configured (or the configured file fails to decode), and
-//! 4. caches decoded bytes so repeated plays don't hit disk on every
-//!    incoming mention.
-//!
-//! The audio device opens on first use, not at app startup, so headless
-//! environments (test runners, SSH sessions, CI without an audio card) do
-//! not pay any cost and never hit a hard panic - failures degrade to a
-//! debug-level log line.
+//! The UI submits to a bounded queue without waiting for device setup, file
+//! reads, or decoder initialization. Settings and suppression changes cancel
+//! stale requests, including work still being prepared by the worker.
 
 use std::collections::HashMap;
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rodio::mixer::Mixer;
@@ -32,53 +20,63 @@ use rodio::DeviceSinkBuilder;
 
 use crust_core::sound::{SoundEvent, SoundEventSetting, SoundSettings};
 
-/// Maximum size of a user-supplied sound file we're willing to load into
-/// memory. Larger files are rejected and fall back to the default ping so
-/// a misconfigured "pick an MP3 as your mention sound" doesn't OOM the
-/// client.  16 MiB is comfortable for any reasonable ping/ding clip.
 const MAX_SOUND_FILE_BYTES: u64 = 16 * 1024 * 1024;
-
-/// Hard rate limit per event.  Without this, a raid / sub burst can
-/// spawn dozens of overlapping tones in the same frame.
 const MIN_PLAYBACK_INTERVAL: Duration = Duration::from_millis(120);
+const AUDIO_QUEUE_CAPACITY: usize = 8;
+const DEVICE_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+const WORKER_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Cached raw file bytes keyed by absolute-ish path. The controller holds
-/// the cache behind a `Mutex` so any thread invoking [`SoundController::play_event`]
-/// can decode without blocking the UI thread on disk I/O after the first hit.
 #[derive(Default)]
 struct SoundCache {
-    /// Raw bytes keyed by the configured path. We re-decode on each play
-    /// (cheap for short pings) instead of storing decoded samples, which
-    /// keeps the cache format-agnostic.
     entries: HashMap<PathBuf, Arc<[u8]>>,
-    /// Paths we've already tried and failed to load - avoids re-hitting
-    /// the filesystem on every mention.
     failed: HashMap<PathBuf, ()>,
 }
 
-/// Main entry point for emitting audio pings.
-///
-/// Cheap to clone? No - hold a single instance on `CrustApp` and reuse it.
-/// The underlying [`MixerDeviceSink`] is intentionally *not* wrapped in an
-/// `Arc` because dropping it must stop the audio thread; cloning it would
-/// defeat the lifetime story.
-pub struct SoundController {
-    /// Lazily initialised on first play attempt. `None` until then.
-    /// Wrapped in `Option` (not Arc) so init failures can be re-attempted
-    /// next time (e.g. audio device plugged in after app start).
-    handle: Mutex<Option<AudioHandle>>,
-    settings: Mutex<SoundSettings>,
-    suppressed: Mutex<bool>,
-    cache: Mutex<SoundCache>,
-    last_played: Mutex<HashMap<SoundEvent, Instant>>,
+#[derive(Default)]
+struct PlaybackControls {
+    suppressed: AtomicBool,
+    settings_generation: AtomicU64,
+    notification_generation: AtomicU64,
+    stopped: AtomicBool,
 }
 
-struct AudioHandle {
-    /// Must stay alive for playback to continue; dropping it stops the
-    /// audio thread. Stored alongside the mixer so we keep ownership.
-    _sink: MixerDeviceSink,
-    /// Cloneable mixer handle used to submit new sources.
-    mixer: Mixer,
+impl PlaybackControls {
+    fn permits(&self, request: &PlaybackRequest) -> bool {
+        !self.stopped.load(Ordering::Acquire)
+            && request.settings_generation == self.settings_generation.load(Ordering::Acquire)
+            && (request.force
+                || (!self.suppressed.load(Ordering::Acquire)
+                    && request.notification_generation
+                        == self.notification_generation.load(Ordering::Acquire)))
+    }
+}
+
+struct PlaybackRequest {
+    event: SoundEvent,
+    setting: SoundEventSetting,
+    override_path: Option<PathBuf>,
+    force: bool,
+    settings_generation: u64,
+    notification_generation: u64,
+}
+
+type WorkerTask = Arc<dyn Fn(Receiver<PlaybackRequest>, Arc<PlaybackControls>) + Send + Sync>;
+
+struct ControllerState {
+    settings: SoundSettings,
+    sender: Option<SyncSender<PlaybackRequest>>,
+    next_worker_attempt: Option<Instant>,
+    last_submitted: HashMap<SoundEvent, Instant>,
+}
+
+/// Keeps sound configuration on the caller and playback resources on a worker.
+///
+/// The worker never accesses the controller mutex. Dropping this controller
+/// cancels pending playback and closes its queue without joining a busy worker.
+pub struct SoundController {
+    state: Mutex<ControllerState>,
+    controls: Arc<PlaybackControls>,
+    worker_task: WorkerTask,
 }
 
 impl Default for SoundController {
@@ -88,198 +86,302 @@ impl Default for SoundController {
 }
 
 impl SoundController {
-    /// Build a new, dormant controller. The audio device is not opened
-    /// until the first [`Self::play_event`] call succeeds in selecting a
-    /// source to play.
     pub fn new() -> Self {
+        Self::with_worker(Arc::new(|receiver, controls| {
+            run_worker(receiver, controls, NativeAudio::default());
+        }))
+    }
+
+    fn with_worker(worker_task: WorkerTask) -> Self {
         Self {
-            handle: Mutex::new(None),
-            settings: Mutex::new(SoundSettings::with_defaults()),
-            suppressed: Mutex::new(false),
-            cache: Mutex::new(SoundCache::default()),
-            last_played: Mutex::new(HashMap::new()),
+            state: Mutex::new(ControllerState {
+                settings: SoundSettings::with_defaults(),
+                sender: None,
+                next_worker_attempt: None,
+                last_submitted: HashMap::new(),
+            }),
+            controls: Arc::new(PlaybackControls::default()),
+            worker_task,
         }
     }
 
-    /// Replace the cached [`SoundSettings`] snapshot. Called from the UI
-    /// whenever the runtime emits `AppEvent::SoundSettingsUpdated`.
+    /// Re-picking a sound invalidates cached file bytes before the next play.
+    /// Requests prepared using the previous settings are discarded.
     pub fn apply_settings(&self, settings: SoundSettings) {
         let normalised = settings.normalised();
-        if let Ok(mut guard) = self.settings.lock() {
-            *guard = normalised;
-        }
-        // Invalidate the cache so a user who re-picks a file gets the new
-        // bytes on the next play instead of whatever was decoded for the
-        // old path.
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.entries.clear();
-            cache.failed.clear();
-        }
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.settings = normalised;
+        self.controls
+            .settings_generation
+            .fetch_add(1, Ordering::AcqRel);
     }
 
-    /// Toggle the global suppressed flag. The UI calls this with
-    /// `streamer_mode_active && streamer_suppress_sounds` whenever either
-    /// input changes.
     pub fn set_suppressed(&self, suppressed: bool) {
-        if let Ok(mut guard) = self.suppressed.lock() {
-            *guard = suppressed;
+        if self.controls.suppressed.swap(suppressed, Ordering::AcqRel) != suppressed {
+            // A mute/unmute cycle must not release notifications queued before it.
+            self.controls
+                .notification_generation
+                .fetch_add(1, Ordering::AcqRel);
         }
     }
 
-    /// Whether playback is currently gated off by streamer mode.
     pub fn is_suppressed(&self) -> bool {
-        self.suppressed.lock().map(|g| *g).unwrap_or(false)
+        self.controls.suppressed.load(Ordering::Acquire)
     }
 
-    /// Play the default ping for `event`.  Respects streamer-mode
-    /// suppression and per-event enable/volume.
     pub fn play_event(&self, event: SoundEvent) {
-        let setting = self
-            .settings
-            .lock()
-            .ok()
-            .map(|g| g.get(event))
-            .unwrap_or_default();
-        self.play_event_with(event, &setting, None);
+        self.submit(event, None, false);
     }
 
-    /// Play a highlight-rule override. The supplied `override_path` comes
-    /// from [`crust_core::highlight::HighlightRule::sound_url`]; volume
-    /// follows the `CustomHighlight` event's configuration.
     pub fn play_highlight_override(&self, override_path: Option<&str>) {
-        let setting = self
-            .settings
-            .lock()
-            .ok()
-            .map(|g| g.get(SoundEvent::CustomHighlight))
-            .unwrap_or_default();
-        self.play_event_with(SoundEvent::CustomHighlight, &setting, override_path);
+        self.submit(SoundEvent::CustomHighlight, override_path, false);
     }
 
-    /// Force-play a preview of `event` ignoring streamer-mode suppression
-    /// and any rate limiter. Used by the settings page "Preview" button so
-    /// clicking it while streamer mode is ON still lets the user verify
-    /// their chosen file.
+    /// Settings previews bypass event enablement, suppression, and rate limits.
     pub fn preview_event(&self, event: SoundEvent) {
-        let setting = self
-            .settings
-            .lock()
-            .ok()
-            .map(|g| g.get(event))
-            .unwrap_or_default();
-        self.play_raw(event, &setting, None, /*force=*/ true);
+        self.submit(event, None, true);
     }
 
-    fn play_event_with(
-        &self,
-        event: SoundEvent,
-        setting: &SoundEventSetting,
-        override_path: Option<&str>,
-    ) {
-        if !setting.enabled {
-            return;
-        }
-        if self.is_suppressed() {
-            return;
-        }
-        self.play_raw(event, setting, override_path, false);
-    }
-
-    fn play_raw(
-        &self,
-        event: SoundEvent,
-        setting: &SoundEventSetting,
-        override_path: Option<&str>,
-        force: bool,
-    ) {
-        if !force && !self.allow_next_play(event) {
-            return;
+    fn submit(&self, event: SoundEvent, override_path: Option<&str>, force: bool) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let setting = state.settings.get(event);
+        if !force && (!setting.enabled || self.is_suppressed()) {
+            return false;
         }
 
-        let path = override_path
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| {
-                let trimmed = setting.path.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(PathBuf::from(trimmed))
-                }
-            });
-
-        let mixer = match self.ensure_mixer() {
-            Some(m) => m,
-            None => return,
-        };
-
-        let volume = setting.clamped_volume();
-
-        let played = if let Some(ref path) = path {
-            self.play_file(&mixer, path, volume)
-        } else {
-            false
-        };
-
-        if !played {
-            self.play_default(&mixer, event, volume);
-        }
-    }
-
-    fn allow_next_play(&self, event: SoundEvent) -> bool {
-        let Ok(mut map) = self.last_played.lock() else {
-            return true;
-        };
         let now = Instant::now();
-        let allow = match map.get(&event) {
-            Some(last) => now.duration_since(*last) >= MIN_PLAYBACK_INTERVAL,
-            None => true,
-        };
-        if allow {
-            map.insert(event, now);
+        if !force && !interval_elapsed(state.last_submitted.get(&event), now) {
+            return false;
         }
-        allow
-    }
-
-    fn ensure_mixer(&self) -> Option<Mixer> {
-        let mut guard = self.handle.lock().ok()?;
-        if guard.is_none() {
-            match DeviceSinkBuilder::open_default_sink() {
-                Ok(sink) => {
-                    let mixer = sink.mixer().clone();
-                    *guard = Some(AudioHandle { _sink: sink, mixer });
+        if state.sender.is_none() {
+            if state.next_worker_attempt.is_some_and(|next| now < next) {
+                return false;
+            }
+            let (sender, receiver) = mpsc::sync_channel(AUDIO_QUEUE_CAPACITY);
+            let task = self.worker_task.clone();
+            let controls = self.controls.clone();
+            match std::thread::Builder::new()
+                .name("crust-audio".to_owned())
+                .spawn(move || task(receiver, controls))
+            {
+                Ok(_) => {
+                    state.sender = Some(sender);
+                    state.next_worker_attempt = None;
                 }
-                Err(e) => {
-                    tracing::debug!(
-                        "Audio output unavailable, sound notifications disabled: {e}"
-                    );
-                    return None;
+                Err(_) => {
+                    state.next_worker_attempt = Some(now + WORKER_RETRY_INTERVAL);
+                    tracing::debug!("Audio worker unavailable; will retry later");
+                    return false;
                 }
             }
         }
-        guard.as_ref().map(|h| h.mixer.clone())
-    }
 
-    fn play_file(&self, mixer: &Mixer, path: &Path, volume: f32) -> bool {
-        let bytes = self.load_file_bytes(path);
-        let Some(bytes) = bytes else {
-            return false;
+        let request = PlaybackRequest {
+            event,
+            setting,
+            override_path: override_path
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from),
+            force,
+            settings_generation: self.controls.settings_generation.load(Ordering::Acquire),
+            notification_generation: self
+                .controls
+                .notification_generation
+                .load(Ordering::Acquire),
         };
-        match rodio::Decoder::try_from(Cursor::new(bytes)) {
-            Ok(decoder) => {
-                mixer.add(decoder.amplify(volume));
+        match state.sender.as_ref().unwrap().try_send(request) {
+            Ok(()) => {
+                if !force {
+                    state.last_submitted.insert(event, now);
+                }
                 true
             }
-            Err(e) => {
-                tracing::debug!(
-                    "Failed to decode sound file {}: {e}; falling back to default ping",
-                    path.display()
-                );
-                self.mark_failed(path);
+            Err(TrySendError::Full(_)) => false,
+            Err(TrySendError::Disconnected(_)) => {
+                state.sender = None;
+                state.next_worker_attempt = Some(now + WORKER_RETRY_INTERVAL);
                 false
             }
         }
+    }
+}
+
+impl Drop for SoundController {
+    fn drop(&mut self) {
+        self.controls.stopped.store(true, Ordering::Release);
+    }
+}
+
+fn interval_elapsed(previous: Option<&Instant>, now: Instant) -> bool {
+    previous
+        .is_none_or(|previous| now.saturating_duration_since(*previous) >= MIN_PLAYBACK_INTERVAL)
+}
+
+trait AudioBackend {
+    type Prepared;
+
+    fn clear_cache(&mut self);
+    fn prepare(&mut self, request: &PlaybackRequest) -> Option<Self::Prepared>;
+    fn play(&mut self, prepared: Self::Prepared);
+}
+
+fn run_worker<B: AudioBackend>(
+    receiver: Receiver<PlaybackRequest>,
+    controls: Arc<PlaybackControls>,
+    mut backend: B,
+) {
+    let mut cache_generation = None;
+    let mut last_played = HashMap::new();
+    while let Ok(request) = receiver.recv() {
+        if controls.stopped.load(Ordering::Acquire) {
+            break;
+        }
+        if !controls.permits(&request) {
+            continue;
+        }
+        if cache_generation != Some(request.settings_generation) {
+            backend.clear_cache();
+            cache_generation = Some(request.settings_generation);
+        }
+        if !request.force && !interval_elapsed(last_played.get(&request.event), Instant::now()) {
+            continue;
+        }
+
+        let started = Instant::now();
+        let prepared = backend.prepare(&request);
+        tracing::debug!(
+            target: "crust_ui::sound",
+            operation = "prepare",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "Audio worker operation"
+        );
+        let Some(prepared) = prepared else { continue };
+        // Device opening or file reads may have taken time. Re-check after that
+        // work so a settings change or mute cannot release an obsolete sound.
+        if !controls.permits(&request) {
+            continue;
+        }
+        if !request.force {
+            last_played.insert(request.event, Instant::now());
+        }
+        backend.play(prepared);
+    }
+}
+
+struct AudioHandle {
+    _sink: MixerDeviceSink,
+    mixer: Mixer,
+}
+
+#[derive(Default)]
+struct NativeAudio {
+    handle: Option<AudioHandle>,
+    next_device_attempt: Option<Instant>,
+    cache: SoundCache,
+}
+
+enum PreparedSound {
+    File {
+        mixer: Mixer,
+        decoder: rodio::Decoder<Cursor<Arc<[u8]>>>,
+        volume: f32,
+    },
+    Default {
+        mixer: Mixer,
+        event: SoundEvent,
+        volume: f32,
+    },
+}
+
+impl AudioBackend for NativeAudio {
+    type Prepared = PreparedSound;
+
+    fn clear_cache(&mut self) {
+        self.cache.entries.clear();
+        self.cache.failed.clear();
+    }
+
+    fn prepare(&mut self, request: &PlaybackRequest) -> Option<Self::Prepared> {
+        let mixer = self.ensure_mixer_with(Instant::now(), || {
+            DeviceSinkBuilder::open_default_sink().ok().map(|sink| {
+                let mixer = sink.mixer().clone();
+                AudioHandle { _sink: sink, mixer }
+            })
+        })?;
+        let volume = request.setting.clamped_volume();
+        let path = request.override_path.clone().or_else(|| {
+            let path = request.setting.path.trim();
+            (!path.is_empty()).then(|| PathBuf::from(path))
+        });
+        if let Some(path) = path {
+            if let Some(bytes) = self.load_file_bytes(&path) {
+                match rodio::Decoder::try_from(Cursor::new(bytes)) {
+                    Ok(decoder) => {
+                        return Some(PreparedSound::File {
+                            mixer,
+                            decoder,
+                            volume,
+                        })
+                    }
+                    Err(_) => {
+                        tracing::debug!(
+                            "Could not decode configured sound; using the default tone"
+                        );
+                        self.mark_failed(&path);
+                    }
+                }
+            }
+        }
+        Some(PreparedSound::Default {
+            mixer,
+            event: request.event,
+            volume,
+        })
+    }
+
+    fn play(&mut self, prepared: Self::Prepared) {
+        match prepared {
+            PreparedSound::File {
+                mixer,
+                decoder,
+                volume,
+            } => mixer.add(decoder.amplify(volume)),
+            PreparedSound::Default {
+                mixer,
+                event,
+                volume,
+            } => self.play_default(&mixer, event, volume),
+        }
+    }
+}
+
+impl NativeAudio {
+    fn ensure_mixer_with(
+        &mut self,
+        now: Instant,
+        open: impl FnOnce() -> Option<AudioHandle>,
+    ) -> Option<Mixer> {
+        if self.handle.is_none() {
+            if self.next_device_attempt.is_some_and(|next| now < next) {
+                return None;
+            }
+            let started = Instant::now();
+            self.handle = open();
+            tracing::debug!(
+                target: "crust_ui::sound",
+                operation = "open_device",
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "Audio worker operation"
+            );
+            if self.handle.is_none() {
+                self.next_device_attempt = Some(Instant::now() + DEVICE_RETRY_INTERVAL);
+                tracing::debug!("Audio output unavailable; will retry later");
+                return None;
+            }
+            self.next_device_attempt = None;
+        }
+        self.handle.as_ref().map(|handle| handle.mixer.clone())
     }
 
     /// Submit the built-in synthesised ping for `event`. Each event has a
@@ -346,134 +448,318 @@ impl SoundController {
         mixer.add(tone);
     }
 
-    fn load_file_bytes(&self, path: &Path) -> Option<Arc<[u8]>> {
-        {
-            let cache = self.cache.lock().ok()?;
-            if cache.failed.contains_key(path) {
-                return None;
-            }
-            if let Some(bytes) = cache.entries.get(path) {
-                return Some(bytes.clone());
-            }
+    fn load_file_bytes(&mut self, path: &Path) -> Option<Arc<[u8]>> {
+        if self.cache.failed.contains_key(path) {
+            return None;
         }
-
+        if let Some(bytes) = self.cache.entries.get(path) {
+            return Some(bytes.clone());
+        }
         let metadata = match fs::metadata(path) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::debug!("Sound file unavailable ({}): {e}", path.display());
+            Ok(metadata) => metadata,
+            Err(_) => {
+                tracing::debug!("Configured sound file unavailable; using the default tone");
                 self.mark_failed(path);
                 return None;
             }
         };
-
         if metadata.len() > MAX_SOUND_FILE_BYTES {
-            tracing::warn!(
-                "Sound file {} exceeds {} byte limit; ignoring",
-                path.display(),
-                MAX_SOUND_FILE_BYTES
-            );
+            tracing::warn!("Configured sound exceeds the file size limit; using the default tone");
             self.mark_failed(path);
             return None;
         }
-
         match fs::read(path) {
-            Ok(bytes) => {
-                let arc: Arc<[u8]> = Arc::from(bytes.into_boxed_slice());
-                if let Ok(mut cache) = self.cache.lock() {
-                    cache.entries.insert(path.to_path_buf(), arc.clone());
-                }
-                Some(arc)
+            Ok(bytes) if bytes.len() as u64 <= MAX_SOUND_FILE_BYTES => {
+                let bytes: Arc<[u8]> = bytes.into();
+                self.cache.entries.insert(path.to_path_buf(), bytes.clone());
+                Some(bytes)
             }
-            Err(e) => {
-                tracing::debug!("Failed to read sound file {}: {e}", path.display());
+            _ => {
+                tracing::debug!("Could not read configured sound; using the default tone");
                 self.mark_failed(path);
                 None
             }
         }
     }
 
-    fn mark_failed(&self, path: &Path) {
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.failed.insert(path.to_path_buf(), ());
-            cache.entries.remove(path);
-        }
+    fn mark_failed(&mut self, path: &Path) {
+        self.cache.failed.insert(path.to_path_buf(), ());
+        self.cache.entries.remove(path);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
-    #[test]
-    fn rate_limiter_blocks_rapid_repeats() {
-        let ctl = SoundController::new();
-        assert!(ctl.allow_next_play(SoundEvent::Mention));
-        // Immediately second call: rate-limited.
-        assert!(!ctl.allow_next_play(SoundEvent::Mention));
-        // Different event type: not rate-limited.
-        assert!(ctl.allow_next_play(SoundEvent::Raid));
+    #[derive(Debug, Clone, PartialEq)]
+    struct PreparedProbe {
+        event: SoundEvent,
+        setting: SoundEventSetting,
+        override_path: Option<PathBuf>,
+        force: bool,
     }
 
-    #[test]
-    fn suppressed_flag_roundtrips() {
-        let ctl = SoundController::new();
-        assert!(!ctl.is_suppressed());
-        ctl.set_suppressed(true);
-        assert!(ctl.is_suppressed());
-        ctl.set_suppressed(false);
-        assert!(!ctl.is_suppressed());
+    struct FakeAudio {
+        entered: mpsc::Sender<PreparedProbe>,
+        played: mpsc::Sender<PreparedProbe>,
+        release_first: Option<Receiver<()>>,
+        cache_clears: Arc<AtomicUsize>,
     }
 
-    #[test]
-    fn missing_file_is_remembered_as_failed() {
-        let ctl = SoundController::new();
-        let path = Path::new("/definitely/not/a/real/sound/file.wav");
-        assert!(ctl.load_file_bytes(path).is_none());
-        // Second call should use the failed cache without hitting disk
-        // again; we just verify it still returns None.
-        assert!(ctl.load_file_bytes(path).is_none());
-    }
+    impl AudioBackend for FakeAudio {
+        type Prepared = PreparedProbe;
 
-    #[test]
-    fn apply_settings_clears_cache() {
-        let ctl = SoundController::new();
-        {
-            let mut cache = ctl.cache.lock().unwrap();
-            cache.entries.insert(
-                PathBuf::from("/tmp/stale.wav"),
-                Arc::from(vec![0u8; 4].into_boxed_slice()),
-            );
+        fn clear_cache(&mut self) {
+            self.cache_clears.fetch_add(1, Ordering::Relaxed);
         }
-        ctl.apply_settings(SoundSettings::with_defaults());
-        let cache = ctl.cache.lock().unwrap();
-        assert!(cache.entries.is_empty());
+
+        fn prepare(&mut self, request: &PlaybackRequest) -> Option<PreparedProbe> {
+            let prepared = PreparedProbe {
+                event: request.event,
+                setting: request.setting.clone(),
+                override_path: request.override_path.clone(),
+                force: request.force,
+            };
+            let _ = self.entered.send(prepared.clone());
+            if let Some(release) = self.release_first.take() {
+                let _ = release.recv();
+            }
+            Some(prepared)
+        }
+
+        fn play(&mut self, prepared: PreparedProbe) {
+            let _ = self.played.send(prepared);
+        }
+    }
+
+    struct WorkerProbe {
+        entered: Receiver<PreparedProbe>,
+        played: Receiver<PreparedProbe>,
+        release: Option<mpsc::Sender<()>>,
+        cache_clears: Arc<AtomicUsize>,
+        starts: Arc<AtomicUsize>,
+    }
+
+    impl WorkerProbe {
+        fn release(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+        }
+
+        fn entered(&self) -> PreparedProbe {
+            self.entered
+                .recv_timeout(Duration::from_secs(2))
+                .expect("audio worker did not prepare")
+        }
+
+        fn played(&self) -> PreparedProbe {
+            self.played
+                .recv_timeout(Duration::from_secs(2))
+                .expect("audio worker did not play")
+        }
+    }
+
+    impl Drop for WorkerProbe {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    fn fake_controller(block_first: bool) -> (Arc<SoundController>, WorkerProbe) {
+        let (entered_tx, entered) = mpsc::channel();
+        let (played_tx, played) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_first = Arc::new(Mutex::new(block_first.then_some(release_rx)));
+        let cache_clears = Arc::new(AtomicUsize::new(0));
+        let starts = Arc::new(AtomicUsize::new(0));
+        let worker_clears = cache_clears.clone();
+        let worker_starts = starts.clone();
+        let controller = SoundController::with_worker(Arc::new(move |receiver, controls| {
+            worker_starts.fetch_add(1, Ordering::Relaxed);
+            let release_first = release_first.lock().unwrap().take();
+            run_worker(
+                receiver,
+                controls,
+                FakeAudio {
+                    entered: entered_tx.clone(),
+                    played: played_tx.clone(),
+                    release_first,
+                    cache_clears: worker_clears.clone(),
+                },
+            );
+        }));
+        (
+            Arc::new(controller),
+            WorkerProbe {
+                entered,
+                played,
+                release: Some(release_tx),
+                cache_clears,
+                starts,
+            },
+        )
     }
 
     #[test]
-    fn disabled_event_is_noop() {
-        // play_event_with should bail when `enabled = false` without
-        // touching the audio device or the rate limiter.
-        let ctl = SoundController::new();
-        let setting = SoundEventSetting {
-            enabled: false,
-            path: String::new(),
-            volume: 0.8,
-        };
-        ctl.play_event_with(SoundEvent::Mention, &setting, None);
-        // Rate limiter untouched.
-        assert!(ctl.allow_next_play(SoundEvent::Mention));
+    fn blocked_audio_keeps_submission_and_settings_responsive_with_a_bounded_queue() {
+        let (controller, mut probe) = fake_controller(true);
+        assert!(controller.submit(SoundEvent::Mention, None, false));
+        assert_eq!(probe.entered().event, SoundEvent::Mention);
+
+        let ui = controller.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let submitter = std::thread::spawn(move || {
+            let mut settings = SoundSettings::with_defaults();
+            settings.set(
+                SoundEvent::Whisper,
+                SoundEventSetting {
+                    enabled: false,
+                    path: "new-preview.wav".into(),
+                    volume: 0.2,
+                },
+            );
+            ui.apply_settings(settings);
+            ui.set_suppressed(true);
+            let accepted = (0..AUDIO_QUEUE_CAPACITY + 32)
+                .filter(|_| ui.submit(SoundEvent::Whisper, None, true))
+                .count();
+            let _ = done_tx.send((accepted, ui.is_suppressed()));
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(1));
+        probe.release();
+        submitter.join().unwrap();
+        assert_eq!(
+            result.expect("UI waited for audio preparation"),
+            (AUDIO_QUEUE_CAPACITY, true)
+        );
+        for _ in 0..AUDIO_QUEUE_CAPACITY {
+            let played = probe.played();
+            assert_eq!(played.event, SoundEvent::Whisper);
+            assert_eq!(played.setting.path, "new-preview.wav");
+            assert_eq!(played.setting.volume, 0.2);
+            assert!(played.force);
+        }
+        assert!(probe.played.try_recv().is_err());
+        assert_eq!(probe.starts.load(Ordering::Relaxed), 1);
+        assert_eq!(probe.cache_clears.load(Ordering::Relaxed), 2);
     }
 
     #[test]
-    fn suppressed_event_is_noop() {
-        let ctl = SoundController::new();
-        ctl.set_suppressed(true);
-        let setting = SoundEventSetting {
-            enabled: true,
-            path: String::new(),
-            volume: 0.8,
+    fn settings_and_mute_changes_cancel_prepared_and_queued_notifications() {
+        for change_settings in [false, true] {
+            let (controller, mut probe) = fake_controller(true);
+            assert!(controller.submit(SoundEvent::Mention, None, false));
+            probe.entered();
+            assert!(controller.submit(SoundEvent::Whisper, None, false));
+
+            if change_settings {
+                let mut settings = SoundSettings::with_defaults();
+                settings.set(
+                    SoundEvent::Raid,
+                    SoundEventSetting {
+                        enabled: true,
+                        path: "latest.wav".into(),
+                        volume: 0.4,
+                    },
+                );
+                controller.apply_settings(settings);
+            } else {
+                controller.set_suppressed(true);
+                controller.set_suppressed(false);
+            }
+            assert!(controller.submit(SoundEvent::Raid, None, false));
+            probe.release();
+            let played = probe.played();
+            assert_eq!(played.event, SoundEvent::Raid);
+            if change_settings {
+                assert_eq!(played.setting.path, "latest.wav");
+                assert_eq!(played.setting.volume, 0.4);
+            }
+            assert_eq!(probe.entered().event, SoundEvent::Raid);
+            assert!(probe.entered.try_recv().is_err());
+            assert!(probe.played.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn normal_events_respect_enablement_suppression_and_per_event_rate_limits() {
+        let (controller, probe) = fake_controller(false);
+        let mut settings = SoundSettings::with_defaults();
+        settings.set(
+            SoundEvent::Mention,
+            SoundEventSetting {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+        controller.apply_settings(settings);
+        assert!(!controller.submit(SoundEvent::Mention, None, false));
+        controller.set_suppressed(true);
+        assert!(!controller.submit(SoundEvent::Whisper, None, false));
+        assert!(controller.state.lock().unwrap().sender.is_none());
+
+        controller.set_suppressed(false);
+        assert!(controller.submit(SoundEvent::Whisper, None, false));
+        assert!(!controller.submit(SoundEvent::Whisper, None, false));
+        assert_eq!(probe.played().event, SoundEvent::Whisper);
+        assert!(controller.submit(SoundEvent::Raid, None, false));
+        assert_eq!(probe.played().event, SoundEvent::Raid);
+        assert!(controller.submit(SoundEvent::CustomHighlight, Some("  override.wav "), false));
+        assert_eq!(
+            probe.played().override_path,
+            Some(PathBuf::from("override.wav"))
+        );
+    }
+
+    #[test]
+    fn dropping_controller_cancels_audio_still_being_prepared() {
+        let (controller, mut probe) = fake_controller(true);
+        assert!(controller.submit(SoundEvent::Mention, None, false));
+        probe.entered();
+        drop(controller);
+        probe.release();
+        assert!(matches!(
+            probe.played.recv_timeout(Duration::from_secs(2)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn absent_audio_device_retries_after_a_cooldown() {
+        let mut audio = NativeAudio::default();
+        let attempts = AtomicUsize::new(0);
+        let fail = || {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            None
         };
-        ctl.play_event_with(SoundEvent::Mention, &setting, None);
-        assert!(ctl.allow_next_play(SoundEvent::Mention));
+        assert!(audio.ensure_mixer_with(Instant::now(), fail).is_none());
+        let retry_at = audio.next_device_attempt.unwrap();
+        for _ in 0..100 {
+            assert!(audio
+                .ensure_mixer_with(retry_at - Duration::from_millis(1), fail)
+                .is_none());
+        }
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        assert!(audio.ensure_mixer_with(retry_at, fail).is_none());
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn worker_remembers_missing_files_and_clears_the_cache() {
+        let mut audio = NativeAudio::default();
+        let path = Path::new("/definitely/not/a/real/sound/file.wav");
+        assert!(audio.load_file_bytes(path).is_none());
+        assert!(audio.cache.failed.contains_key(path));
+        assert!(audio.load_file_bytes(path).is_none());
+        audio.cache.entries.insert(
+            PathBuf::from("cached.wav"),
+            Arc::from(vec![0u8; 4].into_boxed_slice()),
+        );
+        audio.clear_cache();
+        assert!(audio.cache.entries.is_empty());
+        assert!(audio.cache.failed.is_empty());
     }
 }

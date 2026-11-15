@@ -189,6 +189,9 @@ pub struct EventSubNotice {
     pub event_id: Option<String>,
     pub broadcaster_id: String,
     pub broadcaster_login: Option<String>,
+    /// Service event time, retained for moderation cutoffs.
+    pub timestamp: Option<chrono::DateTime<chrono::Utc>>,
+    pub moderation_target_user_id: Option<String>,
     pub kind: EventSubNoticeKind,
 }
 
@@ -1871,6 +1874,13 @@ fn parse_notice(root: &Value, sub_type: &str) -> Option<EventSubNotice> {
         event_id,
         broadcaster_id,
         broadcaster_login,
+        timestamp: event.get("banned_at").and_then(Value::as_str)
+            .or_else(|| root.get("metadata").and_then(|metadata| metadata.get("message_timestamp")).and_then(Value::as_str))
+            .and_then(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).ok())
+            .map(|timestamp| timestamp.with_timezone(&chrono::Utc)),
+        moderation_target_user_id: moderation_action_payload(event)
+            .and_then(|payload| find_nested_string_field(payload, "user_id"))
+            .or_else(|| event.get("user_id").and_then(Value::as_str).filter(|id| !id.is_empty()).map(str::to_owned)),
         kind,
     })
 }
@@ -2989,6 +2999,26 @@ mod tests {
             }
             other => panic!("unexpected kind: {other:?}"),
         }
+    }
+
+    #[test]
+    fn moderation_preserves_source_timestamps_and_target_ids() {
+        let ban = json!({
+            "metadata": {"message_timestamp": "2026-01-01T00:01:00Z"},
+            "payload": {"event": {"broadcaster_user_id": "123", "broadcaster_user_login": "room",
+                "user_id": "10", "user_login": "alice", "banned_at": "2026-01-01T00:00:00Z"}}
+        });
+        let notice = parse_notice(&ban, "channel.ban").unwrap();
+        assert_eq!(notice.timestamp.unwrap().to_rfc3339(), "2026-01-01T00:00:00+00:00");
+        assert_eq!(notice.moderation_target_user_id.as_deref(), Some("10"));
+        let action = json!({
+            "metadata": {"message_timestamp": "2026-01-01T00:01:00Z"},
+            "payload": {"event": {"broadcaster_user_id": "123", "broadcaster_user_login": "room",
+                "moderator_user_id": "99", "action": "timeout", "timeout": {"user_id": "10", "user_login": "alice"}}}
+        });
+        let notice = parse_notice(&action, "channel.moderate").unwrap();
+        assert_eq!(notice.timestamp.unwrap().to_rfc3339(), "2026-01-01T00:01:00+00:00");
+        assert_eq!(notice.moderation_target_user_id.as_deref(), Some("10"));
     }
 
     #[test]

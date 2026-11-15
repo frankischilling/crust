@@ -14,6 +14,9 @@ use smallvec::SmallVec;
 use crate::emoji;
 use crate::model::{Span, TwitchEmotePos};
 
+mod emote_layers;
+pub use emote_layers::{display_spans, DisplaySpan, DisplaySpans};
+
 /// Full tokenization entry-point.
 ///
 /// The `emote_lookup` callback returns `(id, code, url_1x, provider, url_hd)`
@@ -26,6 +29,23 @@ pub fn tokenize<F>(
 ) -> SmallVec<[Span; 8]>
 where
     F: Fn(&str) -> Option<(String, String, String, String, Option<String>)>,
+{
+    tokenize_with_flags(text, is_action, twitch_emotes, &|code| {
+        emote_lookup(code).map(|(id, code, url, provider, url_hd)| {
+            (id, code, url, provider, url_hd, false)
+        })
+    })
+}
+
+/// Tokenize with active-set overlay metadata. The final lookup field is `zero_width`.
+pub fn tokenize_with_flags<F>(
+    text: &str,
+    is_action: bool,
+    twitch_emotes: &[TwitchEmotePos],
+    emote_lookup: &F,
+) -> SmallVec<[Span; 8]>
+where
+    F: Fn(&str) -> Option<(String, String, String, String, Option<String>, bool)>,
 {
     if text.is_empty() {
         return SmallVec::new();
@@ -46,8 +66,8 @@ where
         match seg {
             Segment::TwitchEmote { id, code } => {
                 let (url, url_hd) = emote_lookup(&code)
-                    .filter(|(known_id, _, _, provider, _)| provider == "twitch" && known_id == &id)
-                    .map(|(_, _, url, _, url_hd)| (url, url_hd))
+                    .filter(|(known_id, _, _, provider, _, _)| provider == "twitch" && known_id == &id)
+                    .map(|(_, _, url, _, url_hd, _)| (url, url_hd))
                     .unwrap_or_else(|| (twitch_emote_url(&id), Some(twitch_emote_url_hd(&id))));
                 spans.push(Span::Emote {
                     id,
@@ -55,6 +75,7 @@ where
                     url,
                     url_hd,
                     provider: "twitch".into(),
+                    zero_width: false,
                 });
             }
             Segment::FreeText(s) => {
@@ -83,7 +104,7 @@ fn split_by_twitch_emotes(chars: &[char], emotes: &[&TwitchEmotePos]) -> Vec<Seg
     let mut cursor: usize = 0;
 
     for e in emotes {
-        if e.end < e.start || e.start > chars.len() || e.end >= chars.len() {
+        if e.end < e.start || e.start < cursor || e.start > chars.len() || e.end >= chars.len() {
             continue; // malformed
         }
         // Free text before this emote
@@ -119,7 +140,7 @@ fn tokenize_free_text<F>(
     emote_lookup: &F,
     out: &mut SmallVec<[Span; 8]>,
 ) where
-    F: Fn(&str) -> Option<(String, String, String, String, Option<String>)>,
+    F: Fn(&str) -> Option<(String, String, String, String, Option<String>, bool)>,
 {
     // Split preserving whitespace so that spaces are kept in output
     for word in text.split_inclusive(' ') {
@@ -136,7 +157,7 @@ fn tokenize_free_text<F>(
         let leading = &word[..word.len() - without_leading.len()];
 
         // Third-party emote?
-        if let Some((id, code, url, provider, url_hd)) = emote_lookup(trimmed) {
+        if let Some((id, code, url, provider, url_hd, zero_width)) = emote_lookup(trimmed) {
             if !leading.is_empty() {
                 out.push(Span::Text { text: leading.to_owned(), is_action });
             }
@@ -146,6 +167,7 @@ fn tokenize_free_text<F>(
                 url,
                 url_hd,
                 provider,
+                zero_width,
             });
             // trailing space
             let trail = &without_leading[trimmed.len()..];
@@ -175,6 +197,7 @@ fn tokenize_free_text<F>(
                     url: format!("https://cdn.7tv.app/emote/{id}/2x.webp"),
                     url_hd: Some(format!("https://cdn.7tv.app/emote/{id}/4x.webp")),
                     provider: "7tv".to_owned(),
+                    zero_width: false,
                 });
             } else {
                 out.push(Span::Url {
@@ -587,7 +610,7 @@ mod tests {
     fn reversed_native_ranges_are_ignored_without_changing_valid_unicode_ranges() {
         for (ranges, expected) in [
             (vec![(0, 0), (1, 2), (3, 4)], vec!["🙂", "漢字", "ab"]),
-            (vec![(0, 2), (1, 3)], vec!["🙂漢字", "漢字a"]),
+            (vec![(0, 2), (1, 3)], vec!["🙂漢字"]),
         ] {
             let mut positions: Vec<TwitchEmotePos> = ranges.into_iter().enumerate()
                 .map(|(id, (start, end))| TwitchEmotePos { id: id.to_string(), start, end })
@@ -603,6 +626,29 @@ mod tests {
                 _ => None,
             }).collect();
             assert_eq!(codes, expected);
+        }
+    }
+
+    #[test]
+    fn overlapping_native_emote_ranges_do_not_duplicate_or_rewind_text() {
+        let text = "🙂Kappa tail";
+        for positions in [
+            vec![(1, 5), (1, 5)],
+            vec![(1, 5), (2, 3)],
+            vec![(1, 5), (3, 7)],
+            vec![(3, 7), (1, 5)],
+        ] {
+            let positions: Vec<_> = positions.into_iter().enumerate().map(|(id, (start, end))| {
+                TwitchEmotePos { id: id.to_string(), start, end }
+            }).collect();
+            let spans = tokenize(text, false, &positions, &|_| None);
+            let restored: String = spans.iter().map(|span| match span {
+                Span::Emote { code, .. } => code.as_str(),
+                Span::Text { text, .. } | Span::Emoji { text, .. } => text.as_str(),
+                other => panic!("unexpected span: {other:?}"),
+            }).collect();
+            assert_eq!(restored, text);
+            assert_eq!(spans.iter().filter(|span| matches!(span, Span::Emote { .. })).count(), 1);
         }
     }
 

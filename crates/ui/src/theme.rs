@@ -555,6 +555,107 @@ pub fn alpha(color: Color32, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), a)
 }
 
+/// Adjust plain username text for the current theme, leaving stored colors intact.
+pub(crate) fn readable_username_color(color: Color32) -> Color32 {
+    let light_theme = is_light();
+    let [r, g, b] = [color.r(), color.g(), color.b()].map(|channel| channel as f32 / 255.0);
+    let minimum = r.min(g).min(b);
+    let maximum = r.max(g).max(b);
+    let chroma = maximum - minimum;
+    let lightness = (minimum + maximum) * 0.5;
+    let saturation = if chroma > 0.0 {
+        chroma / (1.0 - (2.0 * lightness - 1.0).abs())
+    } else {
+        0.0
+    };
+    let hue = if chroma == 0.0 {
+        0.0
+    } else if maximum == r {
+        60.0 * ((g - b) / chroma).rem_euclid(6.0)
+    } else if maximum == g {
+        60.0 * ((b - r) / chroma + 2.0)
+    } else {
+        60.0 * ((r - g) / chroma + 4.0)
+    };
+
+    // Preserve hue and saturation while compensating for the apparent brightness
+    // of yellow/green on light backgrounds and blue/violet on dark backgrounds.
+    let adjusted = if light_theme {
+        let lightness = lightness.min(0.5);
+        if lightness > 0.4 && (36.0..120.0).contains(&hue) {
+            lightness - ((hue - 36.0) / 84.0 * std::f32::consts::PI).sin() * saturation * 0.4
+        } else {
+            lightness
+        }
+    } else {
+        let lightness = lightness.max(0.5);
+        if lightness < 0.6 && (196.0..300.0).contains(&hue) {
+            lightness + ((hue - 196.0) / 104.0 * std::f32::consts::PI).sin() * saturation * 0.4
+        } else {
+            lightness
+        }
+    };
+    let color_at_lightness = |adjusted: f32| {
+        if adjusted == lightness {
+            return Color32::from_rgb(color.r(), color.g(), color.b());
+        }
+        let adjusted_chroma = (1.0 - (2.0 * adjusted - 1.0).abs()) * saturation;
+        let scale = if chroma > 0.0 {
+            adjusted_chroma / chroma
+        } else {
+            0.0
+        };
+        let offset = adjusted - adjusted_chroma * 0.5;
+        let channel = |value: f32| (((value - minimum) * scale + offset) * 255.0).round() as u8;
+        Color32::from_rgb(channel(r), channel(g), channel(b))
+    };
+    let luminance = |color: Color32| {
+        let linear = |channel: u8| {
+            let channel = channel as f32 / 255.0;
+            if channel <= 0.04045 {
+                channel / 12.92
+            } else {
+                ((channel + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(color.r()) + 0.7152 * linear(color.g()) + 0.0722 * linear(color.b())
+    };
+    let background = luminance(bg_raised());
+    let target = if light_theme {
+        (background + 0.05) / 4.5 - 0.05
+    } else {
+        (background + 0.05) * 4.5 - 0.05
+    };
+    let readable = |color| {
+        if light_theme {
+            luminance(color) <= target
+        } else {
+            luminance(color) >= target
+        }
+    };
+    let display_color = color_at_lightness(adjusted);
+    if readable(display_color) {
+        return display_color;
+    }
+
+    // A bounded lightness search covers bright greens and other colors that
+    // still blend into a chat surface after the hue-specific adjustment.
+    let mut failing = adjusted;
+    let mut passing = if light_theme { 0.0 } else { 1.0 };
+    let mut display_color = color_at_lightness(passing);
+    for _ in 0..8 {
+        let middle = (passing + failing) * 0.5;
+        let candidate = color_at_lightness(middle);
+        if readable(candidate) {
+            passing = middle;
+            display_color = candidate;
+        } else {
+            failing = middle;
+        }
+    }
+    display_color
+}
+
 /// Parse six hexadecimal digits, with an optional leading hash.
 pub(crate) fn parse_hex_rgb(value: &str) -> Option<Color32> {
     if value.trim_start_matches('#').len() != 6 {

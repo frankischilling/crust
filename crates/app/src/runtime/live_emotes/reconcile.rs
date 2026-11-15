@@ -249,7 +249,18 @@ impl LiveState {
 
 pub(super) fn apply_delta(emotes: &mut Emotes, delta: &EmoteDelta) -> bool {
     match delta {
-        EmoteDelta::Upsert { emote, old_code } => {
+        EmoteDelta::Upsert { emote, old_code, preserve_overlay } => {
+            let retained_overlay = preserve_overlay.then(|| {
+                old_code.as_ref().and_then(|code| emotes.get(code))
+                    .or_else(|| emotes.get(&emote.code))
+                    .filter(|old| old.id == emote.id && old.zero_width != emote.zero_width)
+                    .map(|old| {
+                        let mut updated = emote.clone();
+                        updated.zero_width = old.zero_width;
+                        updated
+                    })
+            }).flatten();
+            let emote = retained_overlay.as_ref().unwrap_or(emote);
             let mut changed = false;
             if let Some(old_code) = old_code.as_ref().filter(|old| *old != &emote.code) {
                 if emotes.get(old_code).is_some_and(|old| old.id == emote.id) {
@@ -286,6 +297,23 @@ pub(super) fn apply_delta(emotes: &mut Emotes, delta: &EmoteDelta) -> bool {
             emotes.insert(code.clone(), emote);
             true
         }
+        EmoteDelta::Overlay { id, code, zero_width } => {
+            // Flags belong to an active alias. An ID alone is only unambiguous
+            // when the set contains a single alias for that emote.
+            if code.is_none() && emotes.values().filter(|emote| emote.id == *id).take(2).count() != 1 {
+                return false;
+            }
+            let mut changed = false;
+            for emote in emotes.values_mut().filter(|emote| {
+                emote.id == *id && code.as_ref().is_none_or(|code| emote.code == *code)
+            }) {
+                if emote.zero_width != *zero_width {
+                    emote.zero_width = *zero_width;
+                    changed = true;
+                }
+            }
+            changed
+        }
         EmoteDelta::Remove { id, code } => match code {
             Some(code) if emotes.get(code).is_some_and(|emote| emote.id == *id) => {
                 emotes.remove(code).is_some()
@@ -310,10 +338,48 @@ mod tests {
             id: id.into(),
             code: code.into(),
             provider: "bttv".into(),
+            zero_width: false,
             url_1x: format!("https://example.test/{id}/1x"),
             url_2x: None,
             url_4x: None,
         }
+    }
+
+    #[test]
+    fn overlay_changes_preserve_assets_and_do_not_change_other_aliases() {
+        let mut emotes = Emotes::from([
+            ("Base".into(), emote("same", "Base")),
+            ("Alias".into(), emote("same", "Alias")),
+            ("Other".into(), emote("different", "Other")),
+        ]);
+        let delta = EmoteDelta::Overlay {
+            id: "same".into(), code: Some("Alias".into()), zero_width: true,
+        };
+        assert!(!apply_delta(&mut emotes, &EmoteDelta::Overlay {
+            id: "same".into(), code: None, zero_width: true,
+        }));
+        assert!(apply_delta(&mut emotes, &delta));
+        assert!(!apply_delta(&mut emotes, &delta));
+        assert!(emotes["Alias"].zero_width);
+        assert!(!emotes["Base"].zero_width);
+        assert!(!emotes["Other"].zero_width);
+        assert_eq!(emotes["Alias"].url_1x, "https://example.test/same/1x");
+        let mut replacement = emote("same", "Alias");
+        replacement.url_1x = "https://example.test/replacement.webp".into();
+        assert!(apply_delta(&mut emotes, &EmoteDelta::Upsert {
+            emote: replacement, old_code: None, preserve_overlay: true,
+        }));
+        assert!(emotes["Alias"].zero_width);
+        assert_eq!(emotes["Alias"].url_1x, "https://example.test/replacement.webp");
+        assert!(apply_delta(&mut emotes, &EmoteDelta::Rename {
+            id: "same".into(), old_code: Some("Alias".into()), code: "Renamed".into(),
+        }));
+        assert!(emotes["Renamed"].zero_width);
+        assert!(!apply_delta(&mut emotes, &delta));
+        assert!(apply_delta(&mut emotes, &EmoteDelta::Overlay {
+            id: "same".into(), code: Some("Renamed".into()), zero_width: false,
+        }));
+        assert!(!emotes["Renamed"].zero_width);
     }
 
     fn state() -> LiveState {
@@ -505,6 +571,7 @@ mod tests {
             EmoteDelta::Upsert {
                 emote: emote("id", "Added"),
                 old_code: None,
+                preserve_overlay: false,
             },
             now,
         );
@@ -604,7 +671,8 @@ mod tests {
                 1,
                 EmoteDelta::Upsert {
                     emote: emote("id", "Old"),
-                    old_code: None
+                    old_code: None,
+                    preserve_overlay: false,
                 },
                 now
             ),
@@ -627,6 +695,7 @@ mod tests {
             EmoteDelta::Upsert {
                 emote: emote("new", "New"),
                 old_code: None,
+                preserve_overlay: false,
             },
             now,
         );

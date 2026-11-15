@@ -96,15 +96,20 @@ pub enum TwitchEvent {
         channel: ChannelId,
         login: String,
         seconds: u32,
+        user_id: Option<String>,
+        timestamp: Option<chrono::DateTime<Utc>>,
     },
     /// A user was permanently banned (CLEARCHAT without ban-duration).
     UserBanned {
         channel: ChannelId,
         login: String,
+        user_id: Option<String>,
+        timestamp: Option<chrono::DateTime<Utc>>,
     },
     /// A moderator cleared the entire chat.
     ChatCleared {
         channel: ChannelId,
+        timestamp: Option<chrono::DateTime<Utc>>,
     },
     /// USERSTATE received - badges, color and mod status for the logged-in user.
     UserStateUpdated {
@@ -754,6 +759,11 @@ impl TwitchSession {
             "CLEARCHAT" => {
                 if let Some(ch_raw) = msg.params.first() {
                     let channel = ChannelId::new(ch_raw.as_str());
+                    let timestamp = msg.tags.get("tmi-sent-ts")
+                        .and_then(|value| value.parse::<i64>().ok())
+                        .and_then(|millis| Utc.timestamp_millis_opt(millis).single());
+                    let user_id = msg.tags.get("target-user-id")
+                        .filter(|id| !id.is_empty()).map(str::to_owned);
                     // Trailing text present = target login was named
                     if let Some(login) = msg.params.get(1).filter(|s| !s.is_empty()) {
                         if let Some(secs_str) = msg.tags.get("ban-duration") {
@@ -762,18 +772,22 @@ impl TwitchSession {
                                 channel,
                                 login: login.to_owned(),
                                 seconds,
+                                user_id,
+                                timestamp,
                             })
                             .await;
                         } else {
                             self.emit(TwitchEvent::UserBanned {
                                 channel,
                                 login: login.to_owned(),
+                                user_id,
+                                timestamp,
                             })
                             .await;
                         }
                     } else {
                         // No target: whole chat was wiped
-                        self.emit(TwitchEvent::ChatCleared { channel }).await;
+                        self.emit(TwitchEvent::ChatCleared { channel, timestamp }).await;
                     }
                 }
             }
@@ -859,6 +873,7 @@ impl TwitchSession {
             "NOTICE" | "HOSTTARGET" => {
                 if let Some(text) = msg.params.get(1) {
                     let ch = msg.params.first().map(|s| ChannelId::new(s.as_str()));
+                    debug!(channel = ?ch, message_id = ?msg.tags.get("msg-id"), "Twitch channel notice");
                     // Detect explicit auth-failure notices from Twitch so the
                     // reconnect loop can stop rather than retrying indefinitely.
                     let lower = text.to_lowercase();
@@ -1187,7 +1202,7 @@ pub fn parse_privmsg_irc(
         flags: MessageFlags {
             is_action,
             is_highlighted: irc_msg_id_contains(tags, "highlighted-message"),
-            is_deleted: false,
+            is_deleted: tags.get("rm-deleted").is_some(),
             is_first_msg: tags.get("first-msg") == Some("1"),
             is_pinned: is_pinned_chat_message(tags),
             is_self: is_own,
@@ -1371,13 +1386,26 @@ mod tests {
         (TwitchSession::new(event_tx, cmd_rx), event_rx)
     }
 
+    #[test]
+    fn history_messages_preserve_the_deletion_marker() {
+        for (extra_tag, deleted) in [("", false), (";rm-deleted", true), (";rm-deleted=1", true)] {
+            let line = format!(
+                "@id=history-1;tmi-sent-ts=1700000000123{extra_tag} :alice!user@host PRIVMSG #room :removed text"
+            );
+            let parsed = parse_privmsg_irc(&parse_line(&line).unwrap(), None, 42).unwrap();
+            assert_eq!(parsed.flags.is_deleted, deleted);
+            assert_eq!(parsed.raw_text, "removed text");
+            assert_eq!(parsed.server_id.as_deref(), Some("history-1"));
+        }
+    }
+
     #[tokio::test]
     async fn clearchat_without_a_target_clears_the_channel() {
         let (mut session, mut events) = session();
         let message = parse_line("@room-id=1 :tmi.twitch.tv CLEARCHAT #room").unwrap();
         session.handle_irc(&message).await;
         assert!(
-            matches!(events.try_recv().unwrap(), TwitchEvent::ChatCleared { channel } if channel == ChannelId::new("room"))
+            matches!(events.try_recv().unwrap(), TwitchEvent::ChatCleared { channel, .. } if channel == ChannelId::new("room"))
         );
     }
 
@@ -1385,15 +1413,16 @@ mod tests {
     async fn clearchat_targets_preserve_timeout_and_ban_semantics() {
         let (mut session, mut events) = session();
         let timeout =
-            parse_line("@ban-duration=600 :tmi.twitch.tv CLEARCHAT #room :alice").unwrap();
+            parse_line("@ban-duration=600;target-user-id=10;tmi-sent-ts=1000 :tmi.twitch.tv CLEARCHAT #room :alice").unwrap();
         session.handle_irc(&timeout).await;
         assert!(
-            matches!(events.try_recv().unwrap(), TwitchEvent::UserTimedOut { login, seconds: 600, .. } if login == "alice")
+            matches!(events.try_recv().unwrap(), TwitchEvent::UserTimedOut { login, seconds: 600, user_id, timestamp, .. }
+                if login == "alice" && user_id.as_deref() == Some("10") && timestamp.map(|time| time.timestamp_millis()) == Some(1000))
         );
         let ban = parse_line(":tmi.twitch.tv CLEARCHAT #room :bob").unwrap();
         session.handle_irc(&ban).await;
         assert!(
-            matches!(events.try_recv().unwrap(), TwitchEvent::UserBanned { login, .. } if login == "bob")
+            matches!(events.try_recv().unwrap(), TwitchEvent::UserBanned { login, user_id: None, timestamp: None, .. } if login == "bob")
         );
     }
 

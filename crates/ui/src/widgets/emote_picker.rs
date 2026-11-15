@@ -696,7 +696,6 @@ impl EmotePicker {
                 let available_h = ui.available_height().max(0.0);
                 let cols = ((available_w / CELL_SIZE) as usize).max(1);
                 let num_rows = (display_indices.len() + cols - 1) / cols;
-                let mut has_animated_visible = false;
                 let view = self.cache.as_ref().expect("cache initialized");
 
                 ScrollArea::vertical()
@@ -764,53 +763,21 @@ impl EmotePicker {
 
                                 if let Some(&(w, h, ref raw)) = emote_bytes.get(entry.url.as_str())
                                 {
-                                    let animated = is_likely_animated_url(&entry.url);
                                     // Keep 7TV animation hover-only to avoid repaint storms in dense lists.
-                                    let animate_in_grid = animated
-                                        && animate_emotes
-                                        && (entry.provider != "7tv" || is_hovered);
-                                    if animated && !animate_in_grid {
-                                        if let Some(tex) =
-                                            emote_bytes.static_texture(ui.ctx(), &entry.url)
-                                        {
-                                            let size = fit_size(w, h, EMOTE_SIZE);
-                                            let image_rect = egui::Rect::from_center_size(
-                                                cell_rect.center(),
-                                                size,
-                                            );
-                                            ui.painter().image(
-                                                tex.id(),
-                                                image_rect,
-                                                egui::Rect::from_min_max(
-                                                    egui::pos2(0.0, 0.0),
-                                                    egui::pos2(1.0, 1.0),
-                                                ),
-                                                Color32::WHITE,
-                                            );
-                                        } else {
-                                            ui.painter().rect_filled(
-                                                cell_rect,
-                                                3.0,
-                                                t::tooltip_bg(),
-                                            );
-                                        }
-                                    } else {
-                                        if animate_in_grid {
-                                            has_animated_visible = true;
-                                        }
-                                        let size = fit_size(w, h, EMOTE_SIZE);
-                                        let image_rect =
-                                            egui::Rect::from_center_size(cell_rect.center(), size);
-                                        let url_key = super::bytes_uri(&entry.url, raw);
-                                        ui.put(
-                                            image_rect,
-                                            egui::Image::from_bytes(
-                                                url_key,
-                                                egui::load::Bytes::Shared(raw.clone()),
-                                            )
-                                            .fit_to_exact_size(size),
-                                        );
-                                    }
+                                    let animate_in_grid =
+                                        animate_emotes && (entry.provider != "7tv" || is_hovered);
+                                    let image_rect = egui::Rect::from_center_size(
+                                        cell_rect.center(),
+                                        fit_size(w, h, EMOTE_SIZE),
+                                    );
+                                    paint_picker_image(
+                                        ui,
+                                        emote_bytes,
+                                        &entry.url,
+                                        raw,
+                                        image_rect,
+                                        animate_in_grid,
+                                    );
                                 } else {
                                     ui.painter().rect_filled(
                                         cell_rect,
@@ -849,12 +816,15 @@ impl EmotePicker {
                                 if let Some(&(w, h, ref raw)) = emote_bytes.get(entry.url.as_str())
                                 {
                                     let size = fit_size(w, h, 48.0);
-                                    ui.add(
-                                        egui::Image::from_bytes(
-                                            super::bytes_uri(&entry.url, raw),
-                                            egui::load::Bytes::Shared(raw.clone()),
-                                        )
-                                        .fit_to_exact_size(size),
+                                    let (rect, _) =
+                                        ui.allocate_exact_size(size, egui::Sense::hover());
+                                    paint_picker_image(
+                                        ui,
+                                        emote_bytes,
+                                        &entry.url,
+                                        raw,
+                                        rect,
+                                        animate_emotes,
                                     );
                                 }
                                 let fav = if self.favorite_urls.contains(entry.url.as_str()) {
@@ -871,11 +841,6 @@ impl EmotePicker {
                             });
                         }
                     });
-
-                if has_animated_visible {
-                    ui.ctx()
-                        .request_repaint_after(std::time::Duration::from_millis(33));
-                }
             });
 
         if picked.is_none()
@@ -953,9 +918,33 @@ fn fit_size(w: u32, h: u32, max_side: f32) -> Vec2 {
     Vec2::new(w as f32 * scale, h as f32 * scale)
 }
 
-fn is_likely_animated_url(url: &str) -> bool {
-    let lower = url.to_ascii_lowercase();
-    lower.contains(".gif") || lower.contains(".webp")
+fn paint_picker_image(
+    ui: &egui::Ui,
+    images: &UiImageCache,
+    url: &str,
+    raw: &Arc<[u8]>,
+    rect: egui::Rect,
+    animate: bool,
+) {
+    if !animate && super::message_list::is_animation_format(raw) {
+        if let Some(texture) = images.static_texture(ui.ctx(), url) {
+            ui.painter().image(
+                texture.id(),
+                rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        } else {
+            ui.painter().rect_filled(rect, 3.0, t::tooltip_bg());
+        }
+    } else {
+        egui::Image::from_bytes(
+            super::bytes_uri(url, raw),
+            egui::load::Bytes::Shared(raw.clone()),
+        )
+        .fit_to_exact_size(rect.size())
+        .paint_at(ui, rect);
+    }
 }
 
 #[cfg(test)]
@@ -972,6 +961,7 @@ mod tests {
             scope: "channel".to_owned(),
             channel: None,
             user_id: None,
+            zero_width: false,
         }
     }
 
@@ -1018,6 +1008,95 @@ mod tests {
             },
         );
         (picked, output)
+    }
+
+    fn picker_repaint_delay(raw: Vec<u8>, animate: bool) -> std::time::Duration {
+        let ctx = Context::default();
+        let mut images = UiImageCache::default();
+        images.begin_frame(&ctx);
+        let url = "https://example.test/emote/1x";
+        assert!(images.complete(&ctx, url.into(), 2, 1, raw));
+        let raw = images.get(url).unwrap().2.clone();
+        let uri = super::super::bytes_uri(url, &raw);
+        ctx.include_bytes(uri.clone(), egui::load::Bytes::Shared(raw));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match ctx.try_load_texture(
+                &format!("{uri}#0"),
+                egui::TextureOptions::LINEAR,
+                egui::load::SizeHint::default(),
+            ) {
+                Ok(egui::load::TexturePoll::Ready { .. }) => break,
+                Ok(egui::load::TexturePoll::Pending { .. }) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "fixture decode timed out"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => panic!("fixture decode failed: {error}"),
+            }
+        }
+        let mut picker = EmotePicker {
+            open: true,
+            ..Default::default()
+        };
+        picker.emoji_entries.clear();
+        let catalog = [entry("Fixture", "bttv", url)];
+        let (sender, _receiver) = tokio::sync::mpsc::channel(4);
+        let sender = UiCommandSender::new(sender);
+        let mut delay = std::time::Duration::ZERO;
+        for frame in 0..6 {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 600.0),
+                    )),
+                    // Let the window's initial fade finish before measuring
+                    // image deadlines at the start of a 100ms frame.
+                    time: Some(if frame == 0 { 0.0 } else { 1.001 }),
+                    ..Default::default()
+                },
+                |ctx| {
+                    picker.show(ctx, &catalog, &images, &sender, animate);
+                },
+            );
+            delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        }
+        delay
+    }
+
+    #[test]
+    fn picker_still_webp_images_do_not_force_continuous_repaints() {
+        let mut raw = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(2, 1)
+            .write_to(&mut raw, image::ImageFormat::WebP)
+            .unwrap();
+        assert_eq!(
+            picker_repaint_delay(raw.into_inner(), true),
+            std::time::Duration::MAX
+        );
+    }
+
+    #[test]
+    fn picker_extensionless_animations_use_frame_deadlines_and_honor_pause() {
+        for raw in [
+            crate::image_cache::animated_gif_fixture(),
+            crate::image_cache::animated_webp_fixture(),
+        ] {
+            let active = picker_repaint_delay(raw.clone(), true);
+            assert!(
+                active > std::time::Duration::from_millis(40)
+                    && active <= std::time::Duration::from_millis(100),
+                "100ms frames should schedule their own deadline: {active:?}"
+            );
+            assert_eq!(
+                picker_repaint_delay(raw, false),
+                std::time::Duration::MAX,
+                "paused images must stop animating even when the URL has no extension"
+            );
+        }
     }
 
     #[test]

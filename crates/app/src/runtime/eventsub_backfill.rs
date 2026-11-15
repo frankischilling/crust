@@ -194,6 +194,8 @@ pub(crate) fn poll_to_notice(
         &poll.id,
         EventSubNotice {
             event_id: None,
+            timestamp: None,
+            moderation_target_user_id: None,
             broadcaster_id: broadcaster_id.to_owned(),
             broadcaster_login: broadcaster_login.clone(),
             kind: EventSubNoticeKind::PollLifecycle {
@@ -259,6 +261,8 @@ pub(crate) fn prediction_to_notice(
         &prediction.id,
         EventSubNotice {
             event_id: None,
+            timestamp: None,
+            moderation_target_user_id: None,
             broadcaster_id: broadcaster_id.to_owned(),
             broadcaster_login: broadcaster_login.clone(),
             kind: EventSubNoticeKind::PredictionLifecycle {
@@ -344,6 +348,8 @@ fn hype_train_to_notice_at(
         &train.id,
         EventSubNotice {
             event_id: None,
+            timestamp: None,
+            moderation_target_user_id: None,
             broadcaster_id: broadcaster_id.to_owned(),
             broadcaster_login: broadcaster_login.clone(),
             kind: EventSubNoticeKind::HypeTrainLifecycle {

@@ -19,6 +19,7 @@ pub fn emoji_catalog_entries() -> Vec<EmoteCatalogEntry> {
                 scope: "global".to_owned(),
                 channel: None,
                 user_id: None,
+                zero_width: false,
             }
         })
         .collect()

@@ -1,7 +1,7 @@
 use crate::image_cache::{ImageWorkStats, UiImageCache};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Local, Utc};
 use egui::{CentralPanel, Color32, Context, Frame, Margin, RichText, SidePanel, TopBottomPanel};
@@ -11,7 +11,7 @@ use tracing::warn;
 
 use crust_core::{
     events::{
-        AppCommand, AppEvent, AutoModQueueItem, ConnectionState, LinkPreview, UnbanRequestItem,
+        AppCommand, AppEvent, AutoModQueueItem, ConnectionState, HistoryUpdate, LinkPreview, UnbanRequestItem,
     },
     model::{
         ChannelId, ChannelState, ChatMessage, EmoteCatalogEntry, MessageId, MsgKind, ReplyInfo,
@@ -31,7 +31,7 @@ use crate::widgets::{
     analytics::AnalyticsPanel,
     bytes_uri,
     channel_list::ChannelList,
-    chat_input::{insert_picker_emote, invalidate_emote_completions, ChatInput},
+    chat_input::{insert_picker_emote, invalidate_emote_completions, request_composer_focus, ChatInput},
     chrome::{self, ChromeIcon, IconButtonState},
     crash_viewer::{CrashReportMeta, CrashViewer},
     emote_picker::EmotePicker,
@@ -102,72 +102,42 @@ const ANALYTICS_COMPACT_DEFAULT_W: f32 = 176.0;
 const ANALYTICS_COMPACT_MIN_W: f32 = 140.0;
 const ANALYTICS_COMPACT_MAX_W: f32 = 360.0;
 const LOCAL_HISTORY_SEARCH_PAGE: usize = 800;
-
-/// AccessKit requires the focused node to be present in every tree update.
-/// A channel switch can remove the focused navigation button in the same
-/// frame that a new editor is being mounted. Keep that frame's focus valid
-/// before egui builds the accessibility tree at the end of the pass.
-fn guard_accessibility_focus(ctx: &Context) {
-    if let Some(focused) = ctx.memory(|memory| memory.focused()) {
-        // A navigation action may request focus on a composer being mounted
-        // next frame. Preserve keyboard focus and ensure the matching
-        // accessibility node exists, even during that brief transition.
-        ctx.accesskit_node_builder(focused, |_| {});
-    }
-}
+const MAX_LINK_PREVIEWS: usize = 512;
 
 #[cfg(test)]
 mod accessibility_focus_tests {
-    use super::*;
+    struct Changes;
 
-    #[test]
-    fn removed_live_navigation_focus_cannot_reference_a_missing_accessibility_node() {
-        let ctx = Context::default();
-        ctx.enable_accesskit();
-        ctx.on_end_pass(
-            "test_accessibility_focus_guard",
-            Arc::new(guard_accessibility_focus),
-        );
+    impl accesskit_consumer::TreeChangeHandler for Changes {
+        fn node_added(&mut self, _: &accesskit_consumer::Node<'_>) {}
+        fn node_updated(
+            &mut self,
+            _: &accesskit_consumer::Node<'_>,
+            _: &accesskit_consumer::Node<'_>,
+        ) {}
+        fn focus_moved(
+            &mut self,
+            _: Option<&accesskit_consumer::Node<'_>>,
+            _: Option<&accesskit_consumer::Node<'_>>,
+        ) {}
+        fn node_removed(&mut self, _: &accesskit_consumer::Node<'_>) {}
+    }
 
-        let mut live_button = None;
-        let input = || egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(640.0, 480.0),
-            )),
-            ..Default::default()
-        };
-        let _ = ctx.run(input(), |ctx| {
-            CentralPanel::default().show(ctx, |ui| {
-                live_button = Some(ui.button("Open live channel").id);
-            });
-        });
+    #[derive(Default)]
+    pub(super) struct AccessibilityTree(Option<accesskit_consumer::Tree>);
 
-        // The clicked live row disappears when a channel opens. For one pass,
-        // egui can still expose its last response as a valid focus candidate.
-        let old_button = live_button.unwrap();
-        let switched = ctx.run(input(), |ctx| {
-            ctx.memory_mut(|memory| memory.request_focus(old_button));
-            CentralPanel::default().show(ctx, |ui| {
-                ui.label("Channel chat");
-            });
-        });
-        let update = switched.platform_output.accesskit_update.unwrap();
-        assert!(
-            update.nodes.iter().any(|(id, _)| *id == update.focus),
-            "focused navigation node must be included in the accessibility tree",
-        );
-
-        // A newly requested focus ID must not break accessibility updates,
-        // even when its editor is about to be mounted.
-        let missing = ctx.run(input(), |ctx| {
-            ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("missing_editor")));
-            CentralPanel::default().show(ctx, |ui| {
-                ui.label("Channel chat");
-            });
-        });
-        let update = missing.platform_output.accesskit_update.unwrap();
-        assert!(update.nodes.iter().any(|(id, _)| *id == update.focus));
+    impl AccessibilityTree {
+        pub(super) fn consume(&mut self, output: &egui::FullOutput) {
+            let update = output.platform_output.accesskit_update.clone()
+                .expect("accessibility is enabled for every test frame");
+            if let Some(tree) = self.0.as_mut() {
+                // The native adapter processes changes after updating the tree.
+                // Tree::update alone misses invalid updated/removed descendants.
+                tree.update_and_process_changes(update, &mut Changes);
+            } else {
+                self.0 = Some(accesskit_consumer::Tree::new(update, true));
+            }
+        }
     }
 }
 
@@ -175,6 +145,9 @@ const MAX_WHISPERS_PER_THREAD: usize = 250;
 const WHISPER_EMOTE_SIZE: f32 = 20.0;
 const QUICK_SWITCH_MAX_ROWS: usize = 10;
 const MAX_DEFERRED_COMMANDS: usize = 128;
+const MAX_DEFERRED_HISTORY_UPDATES: usize = 128;
+// A received message can produce a highlight and an own-message confirmation.
+const MAX_HISTORY_UPDATES_PER_EVENT: usize = 2;
 const MAX_DEFERRED_UPLOAD_BYTES: usize = 32 * 1024 * 1024;
 const MAX_COMMANDS_PER_FRAME: usize = 64;
 const MAX_EVENTS_PER_FRAME: u32 = 200;
@@ -202,6 +175,7 @@ struct DeferredCommands {
     commands: VecDeque<AppCommand>,
     upload_bytes: usize,
     error: Option<CommandQueueError>,
+    wait_for_history: bool,
 }
 
 impl DeferredCommands {
@@ -223,7 +197,7 @@ impl DeferredCommands {
             self.closed();
             return false;
         }
-        let command = if self.commands.is_empty() {
+        let command = if self.commands.is_empty() && !self.wait_for_history {
             match sender.try_send(command) {
                 Ok(()) => return true,
                 Err(TrySendError::Full(command)) => command,
@@ -248,6 +222,9 @@ impl DeferredCommands {
     }
 
     fn flush(&mut self, sender: &mpsc::Sender<AppCommand>) {
+        if self.wait_for_history {
+            return;
+        }
         for _ in 0..MAX_COMMANDS_PER_FRAME {
             let Some(command) = self.commands.pop_front() else {
                 break;
@@ -268,10 +245,77 @@ impl DeferredCommands {
     }
 }
 
+/// The history consumer runs independently of the event reducer. Pausing event
+/// intake at this queue's limit cannot prevent the writer from making progress.
+struct DeferredHistoryUpdates {
+    sender: mpsc::Sender<HistoryUpdate>,
+    pending: Arc<Mutex<VecDeque<HistoryUpdate>>>,
+    failed: bool,
+    error: bool,
+}
+
+impl DeferredHistoryUpdates {
+    fn flush(&mut self) {
+        if self.failed {
+            return;
+        }
+        let mut pending = self.pending.lock().unwrap();
+        while let Some(update) = pending.pop_front() {
+            match self.sender.try_send(update) {
+                Ok(()) => {}
+                Err(TrySendError::Full(update)) => {
+                    pending.push_front(update);
+                    break;
+                }
+                Err(TrySendError::Closed(_)) => {
+                    pending.clear();
+                    self.failed = true;
+                    self.error = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn send(&mut self, update: HistoryUpdate) {
+        self.flush();
+        if self.failed {
+            return;
+        }
+        let mut pending = self.pending.lock().unwrap();
+        let update = if pending.is_empty() {
+            match self.sender.try_send(update) {
+                Ok(()) => return,
+                Err(TrySendError::Full(update)) => update,
+                Err(TrySendError::Closed(_)) => {
+                    self.failed = true;
+                    self.error = true;
+                    return;
+                }
+            }
+        } else {
+            update
+        };
+        // drain_events reserves enough room before applying each event.
+        assert!(pending.len() < MAX_DEFERRED_HISTORY_UPDATES);
+        pending.push_back(update);
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.pending.lock().unwrap().is_empty()
+    }
+
+    fn can_accept_event(&self) -> bool {
+        self.pending.lock().unwrap().len()
+            <= MAX_DEFERRED_HISTORY_UPDATES - MAX_HISTORY_UPDATES_PER_EVENT
+    }
+}
+
 /// Shared by the app and its widgets so every UI action joins the same FIFO.
 pub struct UiCommandSender {
     sender: mpsc::Sender<AppCommand>,
     deferred: RefCell<DeferredCommands>,
+    history_updates: RefCell<Option<DeferredHistoryUpdates>>,
     repaint_context: RefCell<Option<Context>>,
 }
 
@@ -280,12 +324,15 @@ impl UiCommandSender {
         Self {
             sender,
             deferred: RefCell::new(DeferredCommands::default()),
+            history_updates: RefCell::new(None),
             repaint_context: RefCell::new(None),
         }
     }
 
     pub fn try_send(&self, command: AppCommand) -> Result<(), CommandQueueError> {
+        let wait_for_history = self.flush_history();
         let mut queue = self.deferred.borrow_mut();
+        queue.wait_for_history = wait_for_history;
         let accepted = queue.send(&self.sender, command);
         if let Some(ctx) = self.repaint_context.borrow().as_ref() {
             if !accepted {
@@ -303,14 +350,42 @@ impl UiCommandSender {
 
     /// Retryable background work waits until user actions have reached the runtime.
     pub fn try_send_background(&self, command: AppCommand) -> bool {
-        self.deferred.borrow().commands.is_empty() && self.sender.try_send(command).is_ok()
+        !self.flush_history()
+            && self.deferred.borrow().commands.is_empty()
+            && self.sender.try_send(command).is_ok()
+    }
+
+    fn flush_history(&self) -> bool {
+        let mut history = self.history_updates.borrow_mut();
+        let Some(history) = history.as_mut() else { return false };
+        history.flush();
+        history.has_pending()
+    }
+
+    fn send_history_update(&self, update: HistoryUpdate) {
+        if let Some(history) = self.history_updates.borrow_mut().as_mut() {
+            history.send(update);
+        }
+    }
+
+    fn can_accept_event(&self) -> bool {
+        self.flush_history();
+        self.history_updates.borrow().as_ref()
+            .is_none_or(DeferredHistoryUpdates::can_accept_event)
+    }
+
+    fn take_history_error(&mut self) -> bool {
+        self.history_updates.get_mut().as_mut()
+            .is_some_and(|history| std::mem::take(&mut history.error))
     }
 
     fn flush(&mut self, ctx: &Context) -> Option<CommandQueueError> {
         self.repaint_context.get_mut().get_or_insert_with(|| ctx.clone());
+        let wait_for_history = self.flush_history();
         let queue = self.deferred.get_mut();
+        queue.wait_for_history = wait_for_history;
         queue.flush(&self.sender);
-        if !queue.commands.is_empty() {
+        if wait_for_history || !queue.commands.is_empty() {
             ctx.request_repaint_after(std::time::Duration::from_millis(REPAINT_ANIM_MS));
         }
         queue.error.take()
@@ -1209,6 +1284,7 @@ pub struct CrustApp {
     user_profile_popup: UserProfilePopup,
     /// Cached link previews (Open-Graph metadata) keyed by URL.
     link_previews: HashMap<String, LinkPreview>,
+    link_preview_order: VecDeque<String>,
     /// Chat message history for Up/Down arrow recall.
     message_history: Vec<String>,
     /// Slash command usage frequency for autocomplete ranking.
@@ -1581,7 +1657,14 @@ pub(crate) fn apply_theme_visuals(ctx: &egui::Context) {
 
     vis.widgets.active.weak_bg_fill = t::accent_dim();
     vis.widgets.active.bg_fill = t::accent_dim();
-    vis.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, t::text_on_accent());
+    // egui also uses the active foreground for uncolored strong text.
+    // Dark text fits both light surfaces and the light theme's pressed fill.
+    let active_text = if t::is_light() {
+        t::text_primary()
+    } else {
+        t::text_on_accent()
+    };
+    vis.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, active_text);
     vis.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, t::accent());
     vis.widgets.active.corner_radius = t::RADIUS;
 
@@ -1772,6 +1855,17 @@ impl CrustApp {
         Self::with_event_channels(cmd_tx, event_rx)
     }
 
+    /// Connect the bounded history path and retain its backlog for shutdown.
+    pub fn set_history_updates(
+        &mut self,
+        sender: mpsc::Sender<HistoryUpdate>,
+        pending: Arc<Mutex<VecDeque<HistoryUpdate>>>,
+    ) {
+        *self.cmd_tx.history_updates.get_mut() = Some(DeferredHistoryUpdates {
+            sender, pending, failed: false, error: false,
+        });
+    }
+
     fn with_event_channels(
         cmd_tx: mpsc::Sender<AppCommand>,
         event_rx: mpsc::Receiver<AppEvent>,
@@ -1800,6 +1894,7 @@ impl CrustApp {
             pending_reply: None,
             user_profile_popup: UserProfilePopup::default(),
             link_previews: HashMap::new(),
+            link_preview_order: VecDeque::new(),
             message_history: Vec::new(),
             slash_usage_counts: HashMap::new(),
             sidebar_visible: true,
@@ -2139,16 +2234,9 @@ impl CrustApp {
             .set_suppressed(self.streamer_mode_active && self.streamer_suppress_sounds);
     }
 
-    fn dispatch_desktop_notification(&self, title: &str, body: &str, with_sound: bool) {
-        let with_sound =
-            with_sound && !(self.streamer_mode_active && self.streamer_suppress_sounds);
+    fn dispatch_desktop_notification(&self, title: &str, body: &str) {
         #[cfg(target_os = "windows")]
         {
-            if with_sound {
-                // Best-effort audible cue that does not depend on toast support.
-                Self::play_windows_notification_beep();
-            }
-
             let mut shell_candidates: Vec<std::path::PathBuf> = Vec::new();
             if let Some(windir) = std::env::var_os("WINDIR") {
                 let base = std::path::PathBuf::from(windir);
@@ -2172,18 +2260,14 @@ impl CrustApp {
 
             let title = title.to_owned();
             let body = body.to_owned();
-            let sound_flag = if with_sound {
-                "1".to_owned()
-            } else {
-                "0".to_owned()
-            };
 
             std::thread::spawn(move || {
+                // SoundController already owns playback, volume, and muting.
+                // A desktop popup must not add a second system sound.
                 let script = r#"
 $ErrorActionPreference = 'Stop'
 $title = $env:CRUST_NOTIFY_TITLE
 $body = $env:CRUST_NOTIFY_BODY
-$withSound = $env:CRUST_NOTIFY_SOUND -eq '1'
 $shown = $false
 
 try {
@@ -2198,11 +2282,7 @@ try {
   $textNodes.Item(1).InnerText = $body
 
   $audio = $xml.CreateElement('audio')
-  if ($withSound) {
-    $audio.SetAttribute('src', 'ms-winsoundevent:Notification.Default')
-  } else {
-    $audio.SetAttribute('silent', 'true')
-  }
+  $audio.SetAttribute('silent', 'true')
   $xml.DocumentElement.AppendChild($audio) > $null
 
   $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
@@ -2255,10 +2335,6 @@ if (-not $shown) {
     } catch {}
 }
 
-if (-not $shown -and $withSound) {
-  try { [System.Media.SystemSounds]::Asterisk.Play() } catch {}
-}
-
 if ($shown) {
   exit 0
 }
@@ -2291,8 +2367,7 @@ exit 1
                         .stdout(std::process::Stdio::null())
                         .stderr(std::process::Stdio::null())
                         .env("CRUST_NOTIFY_TITLE", &title)
-                        .env("CRUST_NOTIFY_BODY", &body)
-                        .env("CRUST_NOTIFY_SOUND", &sound_flag);
+                        .env("CRUST_NOTIFY_BODY", &body);
 
                     match cmd.status() {
                         Ok(status) if status.success() => {
@@ -2324,42 +2399,7 @@ exit 1
 
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = (title, body, with_sound);
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    fn play_windows_notification_beep() {
-        // SAFETY: These Win32 calls use documented constants/pointers and do
-        // not transfer ownership.
-        unsafe {
-            #[link(name = "winmm")]
-            unsafe extern "system" {
-                fn PlaySoundW(
-                    psz_sound: *const u16,
-                    hmod: *mut core::ffi::c_void,
-                    fdw_sound: u32,
-                ) -> i32;
-                fn MessageBeep(u_type: u32) -> i32;
-                fn Beep(freq: u32, duration: u32) -> i32;
-            }
-
-            const SND_ASYNC: u32 = 0x0000_0001;
-            const SND_NODEFAULT: u32 = 0x0000_0002;
-            const SND_ALIAS: u32 = 0x0001_0000;
-            const SND_SYSTEM: u32 = 0x0020_0000;
-            let flags = SND_ALIAS | SND_ASYNC | SND_SYSTEM | SND_NODEFAULT;
-
-            for alias in ["SystemNotification", "SystemAsterisk", "SystemExclamation"] {
-                let wide: Vec<u16> = alias.encode_utf16().chain(std::iter::once(0)).collect();
-                if PlaySoundW(wide.as_ptr(), std::ptr::null_mut(), flags) != 0 {
-                    return;
-                }
-            }
-
-            // Fallback chain if alias playback is unavailable.
-            let _ = MessageBeep(0x0000_0040);
-            let _ = Beep(880, 120);
+            let _ = (title, body);
         }
     }
 
@@ -2388,7 +2428,6 @@ exit 1
             self.dispatch_desktop_notification(
                 "Crust Gifted Sub Test",
                 "Test alert: You received a gifted Tier 1 sub!",
-                true,
             );
         }
     }
@@ -3559,9 +3598,12 @@ exit 1
                     }
                 }
                 EmoteRefreshJob::Mentions(through) => {
-                    let (examined, next, _) = refresh_message_emotes(&mut self.state.mentions,
+                    let (examined, next, changed) = refresh_message_emotes(&mut self.state.mentions,
                         through, remaining, &self.emote_catalog, &self.emote_catalog_index);
                     remaining -= examined;
+                    if !changed.is_empty() {
+                        crate::widgets::message_list::invalidate_message_layouts(ctx, &ChannelId::mentions(), &changed);
+                    }
                     if let Some(next) = next {
                         self.pending_emote_refresh.push_back(EmoteRefreshJob::Mentions(next));
                     }
@@ -3606,32 +3648,28 @@ exit 1
 
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
-            for span in &line.spans {
+            let animate = !self.animations_when_focused || ui.ctx().input(|input| input.focused);
+            for item in crust_core::format::display_spans(&line.spans) {
+                let span = match item {
+                    crust_core::format::DisplaySpan::Single(span) => span,
+                    crust_core::format::DisplaySpan::EmoteLayers(layers) => {
+                        crate::widgets::message_list::show_emote_layers(
+                            ui, layers, &self.emote_bytes, WHISPER_EMOTE_SIZE, animate,
+                        );
+                        continue;
+                    }
+                };
                 match span {
                     Span::Text { text, .. } => {
                         if !text.is_empty() {
                             ui.label(RichText::new(text).font(t::small()).color(text_color));
                         }
                     }
-                    Span::Emote { code, url, .. } => {
-                        if let Some(&(w, h, ref raw)) = self.emote_bytes.get(url.as_str()) {
-                            let size = whisper_fit_size(w, h, WHISPER_EMOTE_SIZE);
-                            let uri = bytes_uri(url, raw.as_ref());
-                            ui.add(
-                                egui::Image::from_bytes(
-                                    uri,
-                                    egui::load::Bytes::Shared(raw.clone()),
-                                )
-                                .fit_to_exact_size(size),
-                            );
-                        } else {
-                            ui.label(
-                                RichText::new(code)
-                                    .font(t::small())
-                                    .italics()
-                                    .color(t::text_secondary()),
-                            );
-                        }
+                    Span::Emote { .. } => {
+                        crate::widgets::message_list::show_emote_layers(
+                            ui, std::slice::from_ref(span), &self.emote_bytes,
+                            WHISPER_EMOTE_SIZE, animate,
+                        );
                     }
                     Span::Emoji { text, url } => {
                         if let Some(&(w, h, ref raw)) = self.emote_bytes.get(url.as_str()) {
@@ -3692,6 +3730,20 @@ exit 1
         self.whisper_unread_mentions.remove(login);
     }
 
+    fn apply_history_highlight(&self, message: &mut ChatMessage) {
+        if !message.flags.is_highlighted {
+            let channel = &message.channel;
+            message.flags.is_highlighted =
+                crust_core::highlight::first_match_context_rule_message(
+                    &self.highlight_rules,
+                    message,
+                    channel.display_name(),
+                    self.live_map_cache.get(channel.display_name()).copied(),
+                    self.state.active_channel.as_ref() == Some(channel),
+                ).is_some();
+        }
+    }
+
     /// Re-apply the current nickname alias list to every cached message, so a
     /// newly added/removed alias takes effect without needing a reconnect.
     fn reapply_nicknames_to_cached_messages(&mut self) {
@@ -3716,7 +3768,7 @@ exit 1
         self.user_profile_popup.apply_nicknames(nicknames);
     }
 
-    fn whisper_message_mentions_current_user(&self, spans: &[Span], text: &str) -> bool {
+    fn whisper_message_mentions_current_user(&self, text: &str) -> bool {
         let Some(username) = self
             .state
             .auth
@@ -3728,14 +3780,7 @@ exit 1
             return false;
         };
 
-        if spans.iter().any(
-            |span| matches!(span, Span::Mention { login } if login.eq_ignore_ascii_case(username)),
-        ) {
-            return true;
-        }
-
-        let needle = format!("@{}", username.to_ascii_lowercase());
-        text.to_ascii_lowercase().contains(&needle)
+        crust_core::highlight::contains_mention(text, username)
     }
 
     fn activate_whisper_thread(&mut self, login: &str) {
@@ -4421,8 +4466,25 @@ exit 1
 
     fn drain_events(&mut self, ctx: &Context) -> u32 {
         let mut count = 0u32;
-        while let Ok(evt) = self.event_rx.try_recv() {
+        loop {
+            if !self.cmd_tx.can_accept_event() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(REPAINT_ANIM_MS));
+                break;
+            }
+            let Ok(evt) = self.event_rx.try_recv() else { break };
+            let event_name = evt.diagnostic_name();
+            let event_items = match &evt {
+                AppEvent::EmoteCatalogUpdated { emotes } => emotes.len(),
+                AppEvent::HistoryLoaded { messages, .. } | AppEvent::MentionsLoaded { messages } => messages.len(),
+                _ => 1,
+            };
+            let event_started = std::time::Instant::now();
             self.apply_event(evt, ctx);
+            let event_ms = event_started.elapsed().as_secs_f64() * 1000.0;
+            if event_ms >= 16.0 {
+                tracing::warn!(target: "crust_ui::timing", event = event_name, event_items,
+                    event_ms, "Slow UI event");
+            }
             count += 1;
             if count >= MAX_EVENTS_PER_FRAME {
                 // More events remain - schedule another repaint so we
@@ -4622,6 +4684,13 @@ exit 1
                 channel,
                 mut message,
             } => {
+                self.state.apply_message_moderation(&mut message);
+                if message.flags.is_deleted {
+                    if let Some(server_id) = message.server_id.as_ref().filter(|id| !id.is_empty()) {
+                        self.state.apply_moderation(&crust_core::model::ModerationAction::message(
+                            channel.clone(), server_id.clone()));
+                    }
+                }
                 if channel.is_irc() && !self.state.channels.contains_key(&channel) {
                     // IRC can deliver messages on targets we haven't opened yet
                     // (e.g. direct messages or status-targeted channel forms).
@@ -4702,8 +4771,8 @@ exit 1
                 .cloned();
                 if highlight_rule.is_some() && !message.flags.is_highlighted {
                     message.flags.is_highlighted = true;
-                    if !message.flags.is_history {
-                        self.send_cmd(AppCommand::PersistMessageHighlight {
+                    if !message.flags.is_history && self.local_log_indexing_enabled {
+                        self.cmd_tx.send_history_update(HistoryUpdate::Highlight {
                             channel: channel.clone(),
                             server_id: message.server_id.clone(),
                             message_id: message.id,
@@ -4732,7 +4801,7 @@ exit 1
 
                 let mut chatters_became_dirty = false;
                 let mut request_attention: Option<egui::UserAttentionType> = None;
-                let mut desktop_notification: Option<(String, String, bool)> = None;
+                let mut desktop_notification: Option<(String, String)> = None;
                 // Decide up-front whether this message also belongs in the
                 // cross-channel Mentions pseudo-tab. Cloned here because
                 // `message` gets moved into `ch.push_message` below. The
@@ -4751,6 +4820,7 @@ exit 1
                     None
                 };
                 let mut mention_pushable = mentions_capture.is_some();
+                let mut confirmed_mention_echo = None;
                 let mentions_tab_active = self
                     .state
                     .active_channel
@@ -4786,10 +4856,18 @@ exit 1
                     // duplicate entry.  absorb_own_echo returns true when an
                     // unconfirmed local echo was found and stamped with the
                     // real server_id; in that case we skip the normal push.
-                    let absorbed = (message.flags.is_self
-                        && message.server_id.is_some()
-                        && ch.absorb_own_echo(&message))
-                        || ch.absorb_moderation_notice(&message);
+                    let echo_identity = if message.flags.is_self && message.server_id.is_some() {
+                        ch.absorb_own_echo(&message)
+                    } else {
+                        None
+                    };
+                    let own_echo_absorbed = echo_identity.is_some();
+                    if let Some((local_id, original_timestamp)) = echo_identity {
+                        confirmed_mention_echo = ch.messages.iter().rev()
+                            .find(|row| row.id == local_id)
+                            .map(|row| (row.clone(), original_timestamp.timestamp_millis()));
+                    }
+                    let absorbed = own_echo_absorbed || ch.absorb_moderation_notice(&message);
                     if absorbed {
                         // Echo landed on an existing local copy; the mention
                         // (if any) was already recorded when that local copy
@@ -4865,9 +4943,7 @@ exit 1
                                 format!("{sender}: {}", message.raw_text.trim())
                             };
                             let body = Self::truncate_notification_text(&body, 220);
-                            let notification_sound =
-                                highlight_sound || message.flags.is_mention || highlight_mentions;
-                            desktop_notification = Some((title, body, notification_sound));
+                            desktop_notification = Some((title, body));
 
                             request_attention = Some(if highlight_sound {
                                 egui::UserAttentionType::Critical
@@ -4877,6 +4953,14 @@ exit 1
                         }
 
                         ch.push_message(message);
+                    }
+                }
+                if let Some((confirmed, original_timestamp_ms)) = confirmed_mention_echo {
+                    self.state.sync_mention_echo(&confirmed);
+                    if self.local_log_indexing_enabled {
+                        self.cmd_tx.send_history_update(HistoryUpdate::Confirmation {
+                            message: Box::new(confirmed), original_timestamp_ms,
+                        });
                     }
                 }
                 // Mirror the message into the cross-channel Mentions buffer
@@ -4899,8 +4983,8 @@ exit 1
                 if let Some(attention) = request_attention {
                     self.request_user_attention(ctx, attention);
                 }
-                if let Some((title, body, with_sound)) = desktop_notification {
-                    self.dispatch_desktop_notification(&title, &body, with_sound);
+                if let Some((title, body)) = desktop_notification {
+                    self.dispatch_desktop_notification(&title, &body);
                 }
                 if chatters_became_dirty {
                     self.chatters_dirty.insert(channel);
@@ -4961,7 +5045,7 @@ exit 1
                 let text = text.to_owned();
                 let spans = self.tokenize_whisper_text(&text, &twitch_emotes, &from_user_id);
                 let mentions_current_user =
-                    self.whisper_message_mentions_current_user(&spans, &text);
+                    self.whisper_message_mentions_current_user(&text);
                 let notification_body_text = text.trim().to_owned();
 
                 let line = WhisperLine {
@@ -5026,15 +5110,13 @@ exit 1
                         } else {
                             Self::truncate_notification_text(notification_body_text.trim(), 220)
                         };
-                        self.dispatch_desktop_notification(&title, &body, true);
+                        self.dispatch_desktop_notification(&title, &body);
                         self.request_user_attention(ctx, egui::UserAttentionType::Informational);
                     }
                 }
             }
             AppEvent::MessageDeleted { channel, server_id } => {
-                if let Some(ch) = self.state.channels.get_mut(&channel) {
-                    ch.delete_message(&server_id);
-                }
+                self.state.apply_moderation(&crust_core::model::ModerationAction::message(channel, server_id));
             }
             AppEvent::SystemNotice(_) => {
                 // Converted to MessageReceived with MsgKind::SystemInfo in the reducer;
@@ -5056,6 +5138,7 @@ exit 1
                     .then_with(|| left.url.cmp(&right.url))
                     .then_with(|| left.id.cmp(&right.id))
                     .then_with(|| left.url_hd.cmp(&right.url_hd))
+                    .then_with(|| left.zero_width.cmp(&right.zero_width))
                     .then_with(|| left.scope.cmp(&right.scope)));
                 if self.emote_catalog_initialized && self.emote_catalog == emotes {
                     return;
@@ -5276,6 +5359,7 @@ exit 1
                         message.channel.display_name(),
                         &mut message.sender,
                     );
+                    self.apply_history_highlight(message);
                 }
                 let refresh_ids: HashSet<_> = messages.iter().map(|message| message.id).collect();
                 self.state.prepend_mentions_history(messages);
@@ -5287,6 +5371,9 @@ exit 1
                     }
                 }
             }
+            AppEvent::HistoryModerationLoaded { channel, actions } => {
+                self.state.restore_moderation(&channel, actions);
+            }
             AppEvent::HistoryLoaded { channel, mut messages, local } => {
                 for message in &mut messages {
                     crust_core::model::apply_sender_nickname(
@@ -5294,6 +5381,7 @@ exit 1
                         channel.display_name(),
                         &mut message.sender,
                     );
+                    self.apply_history_highlight(message);
                 }
                 if let Some(ch) = self.state.channels.get_mut(&channel) {
                     if let Some(page) = &local {
@@ -5346,6 +5434,7 @@ exit 1
                         ctx.data_mut(|d| d.insert_temp(scroll_key, sid));
                     }
                 }
+                self.state.refresh_mentions_moderation();
             }
             AppEvent::UserProfileLoaded { profile } => {
                 // Cache stream status.
@@ -5567,10 +5656,8 @@ exit 1
                     &channel, &username, request_id, Err(error),
                 );
             }
-            AppEvent::UserMessagesCleared { channel, login } => {
-                if let Some(ch) = self.state.channels.get_mut(&channel) {
-                    ch.delete_messages_from(&login);
-                }
+            AppEvent::UserMessagesCleared { channel, login, user_id, timestamp } => {
+                self.state.apply_moderation(&crust_core::model::ModerationAction::user(channel, login, user_id, timestamp));
             }
             AppEvent::LowTrustStatusUpdated {
                 channel,
@@ -5587,9 +5674,7 @@ exit 1
                 }
             }
             AppEvent::ClearUserMessagesLocally { channel, login } => {
-                if let Some(ch) = self.state.channels.get_mut(&channel) {
-                    ch.delete_messages_from(&login);
-                }
+                self.state.apply_moderation(&crust_core::model::ModerationAction::user(channel, login, None, None));
             }
             AppEvent::UserStateUpdated {
                 channel, is_mod, ..
@@ -5615,10 +5700,8 @@ exit 1
                     ch.messages.clear();
                 }
             }
-            AppEvent::ChannelChatCleared { channel } => {
-                if let Some(ch) = self.state.channels.get_mut(&channel) {
-                    ch.delete_all_chat_messages();
-                }
+            AppEvent::ChannelChatCleared { channel, timestamp } => {
+                self.state.apply_moderation(&crust_core::model::ModerationAction::channel(channel, timestamp));
             }
             AppEvent::SelfAvatarLoaded { account, avatar_url } => {
                 let account = Self::normalize_whisper_login(&account);
@@ -5701,6 +5784,16 @@ exit 1
                 thumbnail_url,
                 site_name,
             } => {
+                // Completed metadata follows insertion order. A later hover can
+                // request an evicted URL again, including an empty failed result.
+                if !self.link_previews.contains_key(&url) {
+                    if self.link_preview_order.len() >= MAX_LINK_PREVIEWS {
+                        if let Some(oldest) = self.link_preview_order.pop_front() {
+                            self.link_previews.remove(&oldest);
+                        }
+                    }
+                    self.link_preview_order.push_back(url.clone());
+                }
                 self.link_previews.insert(
                     url,
                     LinkPreview {
@@ -6371,6 +6464,11 @@ exit 1
             }
             warn!("{}", error.message());
             self.push_event_toast(error.message().to_owned(), t::red(), false);
+        }
+        if self.cmd_tx.take_history_error() {
+            let message = "Chat history stopped saving. Recent highlight and sent-message updates could not be saved.";
+            warn!("{message}");
+            self.push_event_toast(message.to_owned(), t::red(), false);
         }
         events
     }
@@ -7437,12 +7535,8 @@ exit 1
     }
 
     fn focus_chat_composer(&self, ctx: &Context) {
-        if self.state.active_channel.as_ref().is_some_and(ChannelId::is_virtual) {
-            ctx.memory_mut(|memory| {
-                if let Some(id) = memory.focused() {
-                    memory.surrender_focus(id);
-                }
-            });
+        if self.state.active_channel.as_ref().is_none_or(ChannelId::is_virtual) {
+            request_composer_focus(ctx, None);
             return;
         }
         let pane = if self.split_panes.panes.len() > 1 {
@@ -7450,7 +7544,7 @@ exit 1
         } else {
             None
         };
-        ctx.memory_mut(|memory| memory.request_focus(chat_composer_id(pane)));
+        request_composer_focus(ctx, Some(chat_composer_id(pane)));
     }
 
     fn sync_split_focus(&mut self, ctx: &Context) {
@@ -8046,7 +8140,6 @@ impl CrustApp {
         // request repaints directly.  egui::Context is internally Arc-based
         // so cloning is cheap.
         if self.egui_ctx.is_none() {
-            ctx.on_end_pass("accessibility_focus_guard", Arc::new(guard_accessibility_focus));
             self.egui_ctx = Some(ctx.clone());
         }
 
@@ -13254,10 +13347,11 @@ fn resolve_catalog_emote<'a>(
         .find(|entry| entry.is_available_for(channel, sender_user_id))
 }
 
-fn catalog_emote_data(entry: &EmoteCatalogEntry) -> (String, String, String, String, Option<String>) {
+fn catalog_emote_data(entry: &EmoteCatalogEntry) -> (String, String, String, String, Option<String>, bool) {
     (
         if entry.id.is_empty() { entry.code.clone() } else { entry.id.clone() },
         entry.code.clone(), entry.url.clone(), entry.provider.clone(), entry.url_hd.clone(),
+        entry.zero_width,
     )
 }
 
@@ -13278,9 +13372,26 @@ fn refresh_message_emotes(
         if !matches!(message.msg_kind, MsgKind::Chat | MsgKind::Bits { .. } | MsgKind::SuspiciousUserMessage) {
             continue;
         }
-        let spans = crust_core::format::tokenize(&message.raw_text, message.flags.is_action,
-            &message.twitch_emotes, &|code| resolve_catalog_emote(catalog, index,
-                &message.channel, &message.sender.user_id.0, code).map(catalog_emote_data));
+        // Kick's native tags were normalized out of raw_text. Their message
+        // identities must survive eviction from the observed-emote catalog.
+        let native_emotes: HashMap<_, _> = if message.channel.is_kick() {
+            message.spans.iter().filter_map(|span| match span {
+                Span::Emote { code, provider, .. } if provider == "kick" => Some((code.as_str(), span)),
+                _ => None,
+            }).collect()
+        } else {
+            HashMap::new()
+        };
+        let spans = crust_core::format::tokenize_with_flags(&message.raw_text, message.flags.is_action,
+            &message.twitch_emotes, &|code| {
+                native_emotes.get(code).and_then(|span| match span {
+                    Span::Emote { id, code, url, provider, url_hd, zero_width } => Some((
+                        id.clone(), code.clone(), url.clone(), provider.clone(), url_hd.clone(), *zero_width,
+                    )),
+                    _ => None,
+                }).or_else(|| resolve_catalog_emote(catalog, index,
+                    &message.channel, &message.sender.user_id.0, code).map(catalog_emote_data))
+            });
         if message.spans != spans {
             message.spans = spans;
             changed.push(message.id);
@@ -13297,7 +13408,7 @@ fn tokenize_whisper_text(
     sender_user_id: &str,
 ) -> Vec<Span> {
     let channel = ChannelId::mentions();
-    crust_core::format::tokenize(text, false, twitch_emotes, &|code| {
+    crust_core::format::tokenize_with_flags(text, false, twitch_emotes, &|code| {
         resolve_catalog_emote(catalog, index, &channel, sender_user_id, code).map(catalog_emote_data)
     })
     .into_vec()
@@ -13319,7 +13430,7 @@ mod tests {
         whisper_thread_matches_query, EventToast, SplitPanes, TabVisualStyle,
     };
     use crate::theme as t;
-    use crust_core::events::AppCommand;
+    use crust_core::events::{AppCommand, AppEvent, HistoryUpdate};
     use crust_core::model::ChannelId;
 
     fn test_app() -> (super::CrustApp, tokio::sync::mpsc::Receiver<AppCommand>) {
@@ -13330,6 +13441,50 @@ mod tests {
         app.chat_font_size = t::DEFAULT_CHAT_FONT_SIZE;
         app.ui_font_size = t::DEFAULT_UI_FONT_SIZE;
         (app, receiver)
+    }
+
+    fn attach_history_updates(app: &mut super::CrustApp, capacity: usize)
+        -> tokio::sync::mpsc::Receiver<HistoryUpdate>
+    {
+        let (sender, received) = tokio::sync::mpsc::channel(capacity);
+        app.set_history_updates(sender, Default::default());
+        received
+    }
+
+    #[test]
+    fn link_preview_cache_evicts_old_results_and_accepts_refetched_metadata() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        let ready = |url: String, title: Option<String>| AppEvent::LinkPreviewReady {
+            url,
+            title,
+            description: None,
+            thumbnail_url: None,
+            site_name: None,
+        };
+        for index in 0..super::MAX_LINK_PREVIEWS {
+            app.apply_event(ready(format!("https://example.test/{index}"), None), &ctx);
+        }
+        let first = "https://example.test/0";
+        let second = "https://example.test/1";
+        assert!(app.link_previews[first].fetched, "empty results remain cached");
+
+        // A duplicate completion replaces its metadata without filling another slot.
+        app.apply_event(ready(first.to_owned(), Some("updated".into())), &ctx);
+        assert_eq!(app.link_previews[first].title.as_deref(), Some("updated"));
+        assert_eq!(app.link_previews.len(), super::MAX_LINK_PREVIEWS);
+        assert_eq!(app.link_preview_order.len(), super::MAX_LINK_PREVIEWS);
+
+        app.apply_event(ready("https://example.test/new".into(), None), &ctx);
+        assert!(!app.link_previews.contains_key(first), "a cache miss permits another hover fetch");
+        assert!(app.link_previews.contains_key(second));
+        assert_eq!(app.link_previews.len(), super::MAX_LINK_PREVIEWS);
+
+        app.apply_event(ready(first.to_owned(), Some("refetched".into())), &ctx);
+        assert_eq!(app.link_previews[first].title.as_deref(), Some("refetched"));
+        assert!(!app.link_previews.contains_key(second));
+        assert_eq!(app.link_previews.len(), super::MAX_LINK_PREVIEWS);
+        assert_eq!(app.link_preview_order.len(), super::MAX_LINK_PREVIEWS);
     }
 
     #[test]
@@ -13449,6 +13604,7 @@ mod tests {
             provider: "7tv".to_owned(),
             url: url.to_owned(),
             url_hd: Some(format!("{url}/hd")),
+            zero_width: false,
             scope: if user.is_some() { "personal" } else if channel.is_some() { "channel" } else { "global" }.to_owned(),
             channel,
             user_id: user.map(|user| crust_core::UserId(user.to_owned())),
@@ -13501,6 +13657,47 @@ mod tests {
         app.ensure_input_emote_catalog(&second);
         assert_eq!(app.input_emote_catalogs[&first][0].url, "channel");
         assert_eq!(app.input_emote_catalogs[&second][0].url, "global");
+    }
+
+    #[test]
+    fn overlay_catalog_changes_refresh_history_and_whispers_without_changing_text() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("overlay-room");
+        app.state.join_channel(channel.clone());
+        let mut message = search_message(channel.clone());
+        message.raw_text = "SharedCode SharedCode".into();
+        message.sender.user_id = crust_core::UserId("owner".into());
+        message.flags.is_history = true;
+        app.state.mentions.push_back(message.clone());
+        app.state.channels.get_mut(&channel).unwrap().messages.push_back(message);
+        for enabled in [true, false] {
+            let revision_keys = [
+                egui::Id::new("message_layout_revision").with(channel.as_str()),
+                egui::Id::new("message_layout_revision").with(ChannelId::mentions().as_str()),
+            ];
+            let before = revision_keys.map(|key| ctx.data(|data| data.get_temp::<u64>(key).unwrap_or(0)));
+            let mut entry = scoped_emote("same-url", None, Some("owner"));
+            entry.zero_width = enabled;
+            app.apply_event(crust_core::AppEvent::EmoteCatalogUpdated { emotes: vec![entry] }, &ctx);
+            app.refresh_emote_messages(&ctx);
+            for (key, previous) in revision_keys.into_iter().zip(before) {
+                assert!(ctx.data(|data| data.get_temp::<u64>(key).unwrap_or(0)) > previous,
+                    "flag-only catalog changes must invalidate each view's row heights");
+            }
+            let message = &app.state.channels[&channel].messages[0];
+            assert_eq!(message.raw_text, "SharedCode SharedCode");
+            assert!(message.flags.is_history);
+            assert_eq!(message.spans.iter().filter_map(|span| match span {
+                crust_core::Span::Emote { zero_width, .. } => Some(*zero_width), _ => None,
+            }).collect::<Vec<_>>(), vec![enabled, enabled]);
+            let whisper = super::tokenize_whisper_text("SharedCode", &[],
+                &app.emote_catalog, &app.emote_catalog_index, "owner");
+            assert!(matches!(&whisper[0], crust_core::Span::Emote { zero_width, .. } if *zero_width == enabled));
+            let other = super::tokenize_whisper_text("SharedCode", &[],
+                &app.emote_catalog, &app.emote_catalog_index, "other");
+            assert!(matches!(&other[0], crust_core::Span::Text { text, .. } if text == "SharedCode"));
+        }
     }
 
     #[test]
@@ -13561,6 +13758,90 @@ mod tests {
         app.refresh_emote_messages(&ctx);
         assert_eq!(emote_url(&app.state.channels[&channel].messages[0]), None);
         assert_eq!(emote_url(&app.state.mentions[0]), None);
+        app.ensure_input_emote_catalog(&channel);
+        assert!(app.input_emote_catalogs[&channel].is_empty());
+    }
+
+    fn kick_message_for_emote_refresh(channel: &ChannelId, id: u64) -> crust_core::ChatMessage {
+        let mut message = search_message(channel.clone());
+        message.id = crust_core::MessageId(id);
+        message.server_id = Some(format!("kick-native-{id}"));
+        message.raw_text = "SharedCode Addon".into();
+        message.flags.is_highlighted = true;
+        let mut native = scoped_emote(&format!("https://example.test/native-{id}"), Some(channel.clone()), None);
+        native.provider = "kick".into();
+        let mut addon = scoped_emote("https://example.test/addon", Some(channel.clone()), None);
+        addon.code = "Addon".into();
+        message.spans = crust_core::format::tokenize_with_flags(&message.raw_text, false, &[], &|code| {
+            match code {
+                "SharedCode" => Some(super::catalog_emote_data(&native)),
+                "Addon" => Some(super::catalog_emote_data(&addon)),
+                _ => None,
+            }
+        });
+        message
+    }
+
+    fn assert_kick_native_refresh(message: &crust_core::ChatMessage, native: &crust_core::Span) {
+        assert_eq!(&message.spans[0], native, "native identity changed for {:?}", message.id);
+        assert_eq!(message.raw_text, "SharedCode Addon");
+        assert!(!message.spans.iter().any(|span| matches!(span,
+            crust_core::Span::Emote { provider, .. } if provider == "7tv")));
+        assert!(message.spans.iter().any(|span| matches!(span,
+            crust_core::Span::Text { text, .. } if text.contains("Addon"))));
+    }
+
+    #[test]
+    fn kick_native_emotes_survive_queued_catalog_eviction_and_code_replacement() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        let channel = ChannelId::kick("room");
+        app.state.join_channel(channel.clone());
+        let messages: Vec<_> = (1..=2).map(|id| kick_message_for_emote_refresh(&channel, id)).collect();
+        let natives: Vec<_> = messages.iter().map(|message| message.spans[0].clone()).collect();
+        for message in messages {
+            app.state.mentions.push_back(message.clone());
+            app.state.channels.get_mut(&channel).unwrap().messages.push_back(message);
+        }
+        let mut replacement = scoped_emote("https://example.test/new-native", Some(channel.clone()), None);
+        replacement.provider = "kick".into();
+        for emotes in [vec![replacement.clone()], Vec::new()] {
+            app.apply_event(AppEvent::EmoteCatalogUpdated { emotes: emotes.clone() }, &ctx);
+            assert!(!app.pending_emote_refresh.is_empty());
+            app.refresh_emote_messages(&ctx);
+            assert!(app.pending_emote_refresh.is_empty());
+            for rows in [&app.state.channels[&channel].messages, &app.state.mentions] {
+                assert_eq!(rows.len(), natives.len());
+                for (message, native) in rows.iter().zip(&natives) {
+                    assert_kick_native_refresh(message, native);
+                }
+            }
+            app.ensure_input_emote_catalog(&channel);
+            assert_eq!(app.input_emote_catalogs[&channel], emotes);
+        }
+    }
+
+    #[test]
+    fn kick_native_emotes_survive_restored_history_and_mentions_refresh() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        let channel = ChannelId::kick("room");
+        app.state.join_channel(channel.clone());
+        app.apply_event(AppEvent::EmoteCatalogUpdated { emotes: Vec::new() }, &ctx);
+        let mut message = kick_message_for_emote_refresh(&channel, 1);
+        message.flags.is_history = true;
+        let native = message.spans[0].clone();
+        app.apply_event(AppEvent::HistoryLoaded {
+            channel: channel.clone(), messages: vec![message.clone()], local: None,
+        }, &ctx);
+        app.apply_event(AppEvent::MentionsLoaded { messages: vec![message] }, &ctx);
+        assert_eq!(app.pending_emote_refresh.len(), 2);
+        app.refresh_emote_messages(&ctx);
+        assert!(app.pending_emote_refresh.is_empty());
+        assert_eq!(app.state.channels[&channel].messages.len(), 1);
+        assert_eq!(app.state.mentions.len(), 1);
+        assert_kick_native_refresh(&app.state.channels[&channel].messages[0], &native);
+        assert_kick_native_refresh(&app.state.mentions[0], &native);
         app.ensure_input_emote_catalog(&channel);
         assert!(app.input_emote_catalogs[&channel].is_empty());
     }
@@ -13641,7 +13922,7 @@ mod tests {
             message.server_id = Some(format!("saved-{id}"));
             message.raw_text = "SharedCode".to_owned();
             message.flags.is_history = true;
-            message.spans = crust_core::format::tokenize(&message.raw_text, false, &[],
+            message.spans = crust_core::format::tokenize_with_flags(&message.raw_text, false, &[],
                 &|_| Some(super::catalog_emote_data(&stale_emote)));
             message
         }).collect();
@@ -14215,6 +14496,234 @@ mod tests {
     }
 
     #[test]
+    fn settings_close_actions_preserve_a_valid_accessibility_tree() {
+        for (settings, focus_before_close) in [(true, true), (true, false), (false, true), (false, false)] {
+            let (mut app, _commands) = test_app();
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            ctx.set_pixels_per_point(1.25);
+            let mut tree = super::accessibility_focus_tests::AccessibilityTree::default();
+            app.state.join_channel(ChannelId::new("channel"));
+            app.state.auth.logged_in = true;
+            app.chat_input_buf = "kept draft".to_owned();
+            app.settings_open = settings;
+            app.whispers_visible = !settings;
+            let mut output = egui::FullOutput::default();
+            for _ in 0..3 {
+                output = production_ui_frame(&ctx, &mut app, Vec::new());
+                tree.consume(&output);
+            }
+            let close = output.platform_output.accesskit_update.as_ref().unwrap().nodes.iter()
+                .find_map(|(id, node)| (node.label() == Some("Close window")).then_some(*id))
+                .expect("the dialog exposes its close button");
+            let focus = egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::Focus,
+                target: close,
+                data: None,
+            });
+            let mut close_events = Vec::new();
+            if focus_before_close {
+                output = production_ui_frame(&ctx, &mut app, vec![focus]);
+                tree.consume(&output);
+                assert_eq!(ctx.memory(|memory| memory.focused().map(|id| id.value())), Some(close.0));
+            } else {
+                // Native accessibility can focus and activate the close control
+                // in one pass, before the window vanishes on the next pass.
+                close_events.push(focus);
+            }
+            close_events.push(egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::Click,
+                target: close,
+                data: None,
+            }));
+            output = production_ui_frame(&ctx, &mut app, close_events);
+            tree.consume(&output);
+            assert!(!app.settings_open);
+            assert!(!app.whispers_visible);
+            // Include the disappearance and later settled passes. Checking only
+            // the activation pass leaves the old window subtree in the tree.
+            for _ in 0..4 {
+                output = production_ui_frame(&ctx, &mut app, Vec::new());
+                tree.consume(&output);
+            }
+            assert_ne!(ctx.memory(|memory| memory.focused().map(|id| id.value())), Some(close.0));
+            assert_eq!(app.chat_input_buf, "kept draft");
+        }
+    }
+
+    #[test]
+    fn composer_focus_waits_until_the_editor_is_rendered() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut tree = super::accessibility_focus_tests::AccessibilityTree::default();
+        let channel = ChannelId::new("channel");
+        app.state.join_channel(channel.clone());
+        app.state.auth.logged_in = true;
+        app.state.active_channel = Some(ChannelId::live_feed());
+        app.state.live_feed_loaded = true;
+        tree.consume(&production_ui_frame(&ctx, &mut app, Vec::new()));
+        let switched = ctx.run(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 800.0))),
+            time: Some(ctx.cumulative_pass_nr() as f64 * 0.1),
+            ..Default::default()
+        }, |ctx| {
+            app.update_ui(ctx);
+            // A Live row can change the active channel after that pass has
+            // already rendered the feed instead of the channel composer.
+            app.activate_channel(channel.clone());
+        });
+        tree.consume(&switched);
+        let composer = super::chat_composer_id(None);
+        assert!(!ctx.memory(|memory| memory.has_focus(composer)));
+        assert!(!switched.platform_output.accesskit_update.as_ref().unwrap().nodes.iter()
+            .any(|(id, _)| id.0 == composer.value()), "an unrendered editor must not synthesize a node");
+        let mounted = production_ui_frame(&ctx, &mut app,
+            vec![egui::Event::Text("kept focus".to_owned())]);
+        tree.consume(&mounted);
+        assert_eq!(app.chat_input_buf, "kept focus");
+        assert!(ctx.memory(|memory| memory.has_focus(composer)));
+    }
+
+    #[test]
+    fn canceled_or_expired_composer_requests_cannot_steal_focus() {
+        for cancel in [true, false] {
+            let (mut app, _commands) = test_app();
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut tree = super::accessibility_focus_tests::AccessibilityTree::default();
+            let channel = ChannelId::new("channel");
+            app.state.join_channel(channel.clone());
+            app.state.auth.logged_in = true;
+            app.focus_chat_composer(&ctx);
+            app.state.active_channel = Some(ChannelId::live_feed());
+            app.state.live_feed_loaded = true;
+            if cancel {
+                app.focus_chat_composer(&ctx);
+            }
+            for _ in 0..4 {
+                tree.consume(&production_ui_frame(&ctx, &mut app, Vec::new()));
+            }
+            app.state.active_channel = Some(channel);
+            tree.consume(&production_ui_frame(&ctx, &mut app,
+                vec![egui::Event::Text("unwanted input".to_owned())]));
+            assert!(app.chat_input_buf.is_empty());
+            assert!(!ctx.memory(|memory| memory.has_focus(super::chat_composer_id(None))));
+            app.focus_chat_composer(&ctx);
+            tree.consume(&production_ui_frame(&ctx, &mut app,
+                vec![egui::Event::Text("accepted input".to_owned())]));
+            assert_eq!(app.chat_input_buf, "accepted input");
+            assert!(ctx.memory(|memory| memory.has_focus(super::chat_composer_id(None))));
+        }
+    }
+
+    #[test]
+    fn picker_tab_then_escape_keeps_the_accessibility_tree_valid() {
+        for modifiers in [egui::Modifiers::CTRL, egui::Modifiers::CTRL | egui::Modifiers::SHIFT] {
+            let (mut app, _commands) = test_app();
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut tree = super::accessibility_focus_tests::AccessibilityTree::default();
+            app.state.join_channel(ChannelId::new("channel"));
+            app.state.auth.logged_in = true;
+            app.chat_input_buf = "kept draft".to_owned();
+            app.emote_picker.toggle();
+            for _ in 0..3 {
+                tree.consume(&production_ui_frame(&ctx, &mut app, Vec::new()));
+            }
+            tree.consume(&production_ui_frame(&ctx, &mut app,
+                shortcut_input(egui::Key::Tab, modifiers).events));
+            tree.consume(&production_ui_frame(&ctx, &mut app,
+                shortcut_input(egui::Key::Escape, egui::Modifiers::NONE).events));
+            assert!(!app.emote_picker.open);
+            tree.consume(&production_ui_frame(&ctx, &mut app,
+                vec![egui::Event::Text(" continued".to_owned())]));
+            assert_eq!(app.chat_input_buf, "kept draft continued");
+        }
+    }
+
+    #[test]
+    fn joined_live_row_and_picker_respond_to_pointer_clicks() {
+        let click = |ctx: &egui::Context, app: &mut super::CrustApp, pos: egui::Pos2| {
+            for pressed in [true, false] {
+                production_ui_frame(ctx, app, vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]);
+            }
+        };
+        for click_name in [true, false] {
+            let (mut app, mut commands) = test_app();
+            let ctx = egui::Context::default();
+            let channel = ChannelId::new("probe_channel");
+            app.channel_layout = super::ChannelLayout::Sidebar;
+            app.state.auth.logged_in = true;
+            app.state.auth.username = Some("viewer".to_owned());
+            app.state.join_channel(channel.clone());
+            app.chat_input_buf = "kept draft".to_owned();
+            app.state.live_feed_loaded = true;
+            app.state.live_channels = vec![crust_core::model::LiveChannelSnapshot {
+                user_id: "1".to_owned(),
+                user_login: channel.as_str().to_owned(),
+                user_name: "ProbeChannel".to_owned(),
+                viewer_count: 1200,
+                thumbnail_url: String::new(),
+                started_at: String::new(),
+            }];
+            let mut output = egui::FullOutput::default();
+            for _ in 0..3 {
+                output = production_ui_frame(&ctx, &mut app, Vec::new());
+            }
+            let live = visible_text_rect(&output, "Live").expect("Live sidebar row is visible");
+            click(&ctx, &mut app, live.center());
+            assert_eq!(app.state.active_channel, Some(ChannelId::live_feed()));
+            for _ in 0..3 {
+                output = production_ui_frame(&ctx, &mut app, Vec::new());
+            }
+            let name = output.shapes.iter().find_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape {
+                    let rect = text.galley.rect.translate(text.pos.to_vec2());
+                    (text.galley.text() == "ProbeChannel" && shape.clip_rect.contains(rect.center()))
+                        .then_some(rect.intersect(shape.clip_rect))
+                } else {
+                    None
+                }
+            }).expect("the previously active joined channel appears in Live");
+            let target = if click_name {
+                name.center()
+            } else {
+                egui::pos2(name.right() + 120.0, name.center().y + 16.0)
+            };
+            click(&ctx, &mut app, target);
+            for _ in 0..3 {
+                output = production_ui_frame(&ctx, &mut app, Vec::new());
+            }
+            assert_eq!(app.state.active_channel.as_ref(), Some(&channel),
+                "a joined Live row opens its chat from the name or blank row area");
+            assert_eq!(app.chat_input_buf, "kept draft");
+            let picker = output.shapes.iter().find_map(|shape| {
+                if let egui::Shape::Circle(circle) = &shape.shape {
+                    (circle.radius >= 5.0 && circle.center.y > 720.0
+                        && shape.clip_rect.contains(circle.center)).then_some(circle.center)
+                } else {
+                    None
+                }
+            }).expect("the composer picker icon is visible");
+            click(&ctx, &mut app, picker);
+            production_ui_frame(&ctx, &mut app, Vec::new());
+            assert!(app.emote_picker.open, "the composer button opens the picker after Live navigation");
+            assert_eq!(app.chat_input_buf, "kept draft");
+            assert!(!std::iter::from_fn(|| commands.try_recv().ok())
+                .any(|command| matches!(command, AppCommand::SendMessage { .. })));
+        }
+    }
+
+    #[test]
     fn hotkey_capture_records_ctrl_k_without_opening_quick_switch() {
         let (mut app, mut commands) = test_app();
         let ctx = egui::Context::default();
@@ -14736,6 +15245,33 @@ mod tests {
         app.apply_event(crust_core::AppEvent::LoggedOut, &ctx);
         app.apply_event(whisper_event("2", "friend", "current", false, true), &ctx);
         assert!(app.whisper_threads.is_empty());
+    }
+
+    #[test]
+    fn whisper_mention_counts_require_complete_account_names() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        app.apply_event(crust_core::AppEvent::Authenticated {
+            username: "alice".to_owned(), user_id: "10".to_owned(),
+        }, &ctx);
+        for text in ["@alice_other", "@alice123", "@alice\u{301}", "malice"] {
+            let mut event = whisper_event("10", "friend", "alice", false, false);
+            if let crust_core::AppEvent::WhisperReceived { text: body, .. } = &mut event {
+                *body = text.to_owned();
+            }
+            app.apply_event(event, &ctx);
+        }
+        assert_eq!(app.whisper_unread["friend"], 4);
+        assert!(!app.whisper_unread_mentions.contains_key("friend"));
+        for text in ["hello @ALICE!", "Alice, are you there?", "(@alice)"] {
+            let mut event = whisper_event("10", "friend", "alice", false, false);
+            if let crust_core::AppEvent::WhisperReceived { text: body, .. } = &mut event {
+                *body = text.to_owned();
+            }
+            app.apply_event(event, &ctx);
+        }
+        assert_eq!(app.whisper_unread["friend"], 7);
+        assert_eq!(app.whisper_unread_mentions["friend"], 3);
     }
 
     #[test]
@@ -15275,22 +15811,22 @@ mod tests {
         let (mut app, _commands) = test_app();
         let first = ChannelId::new("first");
         let second = ChannelId::new("second");
+        app.state.join_channel(first.clone());
+        app.state.join_channel(second.clone());
+        app.state.auth.logged_in = true;
         app.split_panes.add_pane(first, None);
         app.split_panes.add_pane(second.clone(), None);
         let ctx = egui::Context::default();
-        let mut input = shortcut_input(egui::Key::PageDown, egui::Modifiers::CTRL | egui::Modifiers::ALT);
-        input.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 200.0)));
-        input.events.push(egui::Event::Text("selected pane".to_owned()));
-        let _ = ctx.run(input, |ctx| {
-            ctx.memory_mut(|memory| memory.request_focus(super::chat_composer_id(Some(app.split_panes.panes[0].id))));
-            app.handle_channel_shortcuts(ctx);
-            egui::CentralPanel::default().show(ctx, |ui| {
-                for pane in &mut app.split_panes.panes {
-                    ui.add(egui::TextEdit::singleline(&mut pane.input_buf)
-                        .id(super::chat_composer_id(Some(pane.id))));
-                }
-            });
-        });
+        ctx.enable_accesskit();
+        let mut tree = super::accessibility_focus_tests::AccessibilityTree::default();
+        app.sync_split_focus(&ctx);
+        for _ in 0..3 {
+            tree.consume(&production_ui_frame(&ctx, &mut app, Vec::new()));
+        }
+        let mut events = shortcut_input(egui::Key::PageDown,
+            egui::Modifiers::CTRL | egui::Modifiers::ALT).events;
+        events.push(egui::Event::Text("selected pane".to_owned()));
+        tree.consume(&production_ui_frame(&ctx, &mut app, events));
         assert_eq!(app.state.active_channel, Some(second));
         assert!(app.split_panes.panes[0].input_buf.is_empty());
         assert_eq!(app.split_panes.panes[1].input_buf, "selected pane");
@@ -15367,38 +15903,38 @@ mod tests {
         ] {
             let (mut app, _commands) = test_app();
             let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut tree = super::accessibility_focus_tests::AccessibilityTree::default();
+            app.state.auth.logged_in = true;
             for name in ["first", "second", "third"].into_iter().take(pane_count) {
+                app.state.join_channel(ChannelId::new(name));
                 app.split_panes.add_pane(ChannelId::new(name), None);
                 app.split_panes.panes.last_mut().unwrap().input_buf = format!("{name} draft");
             }
             app.split_panes.focused = focused;
-            let render = |app: &mut super::CrustApp, ctx: &egui::Context| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    if app.split_panes.panes.is_empty() {
-                        ui.add(egui::TextEdit::singleline(&mut app.chat_input_buf)
-                            .id(super::chat_composer_id(None)));
-                    } else {
-                        for pane in &mut app.split_panes.panes {
-                            ui.add(egui::TextEdit::singleline(&mut pane.input_buf)
-                                .id(super::chat_composer_id(Some(pane.id))));
-                        }
+            app.sync_split_focus(&ctx);
+            for _ in 0..3 {
+                tree.consume(&production_ui_frame(&ctx, &mut app, Vec::new()));
+            }
+            let mut applied = false;
+            let closed = ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 800.0))),
+                time: Some(ctx.cumulative_pass_nr() as f64 * 0.1),
+                ..Default::default()
+            }, |ctx| {
+                app.update_ui(ctx);
+                if !applied {
+                    applied = true;
+                    if let Some(index) = keep {
+                        app.keep_split_pane(index, ctx);
+                    } else if let Some(index) = close {
+                        app.close_split_pane(index, ctx);
                     }
-                });
-            };
-            let _ = ctx.run(Default::default(), |ctx| {
-                app.sync_split_focus(ctx);
-                render(&mut app, ctx);
-                if let Some(index) = keep {
-                    app.keep_split_pane(index, ctx);
-                } else if let Some(index) = close {
-                    app.close_split_pane(index, ctx);
                 }
             });
-            let input = egui::RawInput {
-                events: vec![egui::Event::Text(" continued".to_owned())],
-                ..Default::default()
-            };
-            let _ = ctx.run(input, |ctx| render(&mut app, ctx));
+            tree.consume(&closed);
+            tree.consume(&production_ui_frame(&ctx, &mut app,
+                vec![egui::Event::Text(" continued".to_owned())]));
             assert_eq!(app.state.active_channel, Some(ChannelId::new(expected)));
             assert_eq!(app.split_panes.panes.len(), remaining);
             if remaining == 0 {
@@ -15558,6 +16094,9 @@ mod tests {
         for focused in 0..3 {
             let (mut app, mut commands) = test_app();
             let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut tree = super::accessibility_focus_tests::AccessibilityTree::default();
+            app.state.auth.logged_in = true;
             let old = ChannelId::new("old");
             let redirected = ChannelId::new("redirected");
             let other = ChannelId::new("other");
@@ -15571,31 +16110,30 @@ mod tests {
             }, &ctx);
             assert_eq!(app.split_panes.panes.iter().filter(|pane| pane.channel == redirected).count(), 2);
             app.split_panes.focused = focused;
-            let _ = ctx.run(Default::default(), |ctx| {
-                app.sync_split_focus(ctx);
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    for pane in &mut app.split_panes.panes {
-                        ui.add(egui::TextEdit::singleline(&mut pane.input_buf)
-                            .id(super::chat_composer_id(Some(pane.id))));
-                    }
-                });
-                app.close_channel_tab(redirected.clone(), ctx);
+            app.sync_split_focus(&ctx);
+            for _ in 0..3 {
+                tree.consume(&production_ui_frame(&ctx, &mut app, Vec::new()));
+            }
+            let mut applied = false;
+            let closed = ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 800.0))),
+                time: Some(ctx.cumulative_pass_nr() as f64 * 0.1),
+                ..Default::default()
+            }, |ctx| {
+                app.update_ui(ctx);
+                if !applied {
+                    applied = true;
+                    app.close_channel_tab(redirected.clone(), ctx);
+                }
             });
+            tree.consume(&closed);
             assert!(app.split_panes.panes.is_empty());
             assert_eq!(app.state.active_channel, Some(other.clone()));
             assert!(!app.state.channels.contains_key(&redirected));
             assert!(app.state.channels.contains_key(&other));
             assert_eq!(app.chat_input_buf, "other draft");
-            let input = egui::RawInput {
-                events: vec![egui::Event::Text(" continued".to_owned())],
-                ..Default::default()
-            };
-            let _ = ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.add(egui::TextEdit::singleline(&mut app.chat_input_buf)
-                        .id(super::chat_composer_id(None)));
-                });
-            });
+            tree.consume(&production_ui_frame(&ctx, &mut app,
+                vec![egui::Event::Text(" continued".to_owned())]));
             assert_eq!(app.chat_input_buf, "other draft continued");
             assert!(ctx.memory(|memory| memory.has_focus(super::chat_composer_id(None))));
             let mut leave_count = 0;
@@ -15860,6 +16398,94 @@ mod tests {
     }
 
     #[test]
+    fn moderation_keeps_mentions_and_reopened_history_in_sync() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        let first = ChannelId::new("first");
+        let second = ChannelId::new("second");
+        let old_time = chrono::DateTime::from_timestamp_millis(900).unwrap();
+        let cutoff = chrono::DateTime::from_timestamp_millis(1000).unwrap();
+        for channel in [&first, &second] {
+            app.state.join_channel(channel.clone());
+            let mut message = search_message(channel.clone());
+            message.timestamp = old_time;
+            app.state.channels.get_mut(channel).unwrap().push_message(message.clone());
+            app.state.push_mention(message, false);
+        }
+        assert_eq!(app.state.mentions.len(), 2, "shared server IDs in different channels are distinct");
+        app.apply_event(AppEvent::UserMessagesCleared {
+            channel: first.clone(), login: "alice".into(), user_id: Some("1".into()), timestamp: Some(cutoff),
+        }, &ctx);
+        assert!(app.state.channels[&first].messages[0].flags.is_deleted);
+        assert!(!app.state.channels[&second].messages[0].flags.is_deleted);
+        assert!(app.state.mentions[0].flags.is_deleted);
+        assert!(!app.state.mentions[1].flags.is_deleted);
+
+        app.state.leave_channel(&first);
+        app.state.join_channel(first.clone());
+        let mut history = Vec::new();
+        for (id, time, user_id) in [(2, 950, "1"), (3, 1100, "1"), (4, 950, "2")] {
+            let mut row = search_message(first.clone());
+            row.id = crust_core::MessageId(id);
+            row.server_id = Some(format!("history-{id}"));
+            row.timestamp = chrono::DateTime::from_timestamp_millis(time).unwrap();
+            row.sender.user_id.0 = user_id.into();
+            row.flags.is_history = true;
+            history.push(row);
+        }
+        app.apply_event(AppEvent::HistoryLoaded { channel: first.clone(), messages: history, local: None }, &ctx);
+        for row in &app.state.channels[&first].messages {
+            assert_eq!(row.flags.is_deleted, row.id.0 == 2);
+            assert_eq!(row.raw_text, "search target");
+        }
+        app.apply_event(AppEvent::MessageDeleted { channel: first.clone(), server_id: "search-server-id".into() }, &ctx);
+        assert!(!app.state.channels[&second].messages[0].flags.is_deleted);
+        let mut delayed = search_message(first.clone());
+        delayed.timestamp = chrono::DateTime::from_timestamp_millis(1200).unwrap();
+        delayed.flags.is_history = true;
+        app.apply_event(AppEvent::HistoryLoaded { channel: first.clone(), messages: vec![delayed], local: None }, &ctx);
+        assert!(app.state.channels[&first].messages.back().unwrap().flags.is_deleted);
+    }
+
+    #[test]
+    fn deleted_local_history_duplicates_update_retained_rows_and_mentions() {
+        let (mut app, _commands) = test_app();
+        let channel = ChannelId::new("first");
+        app.state.join_channel(channel.clone());
+        let live = search_message(channel.clone());
+        app.state.channels.get_mut(&channel).unwrap().push_message(live.clone());
+        app.state.push_mention(live.clone(), false);
+        let mut replay = live.clone();
+        replay.id = crust_core::MessageId::from_local_history_row(42).unwrap();
+        replay.flags.is_history = true;
+        replay.flags.is_deleted = true;
+        let page = crust_core::model::LocalHistoryPageInfo {
+            before: None, next: None, has_more: false,
+            identities: vec![crust_core::model::LocalHistoryMessageIdentity { replay_id: replay.id, original_id: live.id }],
+        };
+        app.apply_event(AppEvent::HistoryLoaded { channel: channel.clone(), messages: vec![replay], local: Some(page) }, &egui::Context::default());
+        assert_eq!(app.state.channels[&channel].messages.len(), 1);
+        assert_eq!(app.state.channels[&channel].messages[0].id, live.id);
+        assert!(app.state.channels[&channel].messages[0].flags.is_deleted);
+        assert!(app.state.mentions[0].flags.is_deleted);
+        assert_eq!(app.state.mentions[0].raw_text, live.raw_text);
+    }
+
+    #[test]
+    fn restored_moderation_updates_retained_rows_and_search_as_one_history_event() {
+        let (mut app, _commands) = test_app();
+        let channel = ChannelId::new("first");
+        app.state.join_channel(channel.clone());
+        app.state.channels.get_mut(&channel).unwrap().push_message(search_message(channel.clone()));
+        app.global_search.input = "is:deleted".into();
+        super::refresh_if_stale(&mut app.global_search, &app.state.channels);
+        let action = crust_core::model::ModerationAction::message(channel.clone(), "search-server-id".into());
+        app.apply_event(AppEvent::HistoryModerationLoaded { channel, actions: vec![action] }, &egui::Context::default());
+        assert!(super::refresh_if_stale(&mut app.global_search, &app.state.channels));
+        assert_eq!(app.global_search.results.len(), 1);
+    }
+
+    #[test]
     fn inactive_search_does_not_consume_escape_from_other_controls() {
         let (mut app, _commands) = test_app();
         app.state.join_channel(ChannelId::new("first"));
@@ -15964,6 +16590,7 @@ mod tests {
     #[test]
     fn newly_matched_live_highlights_are_persisted_with_the_original_message_identity() {
         let (mut app, mut commands) = test_app();
+        let mut updates = attach_history_updates(&mut app, 4);
         let channel = ChannelId::new("first");
         app.state.join_channel(channel.clone());
         let message = search_message(channel.clone());
@@ -15974,8 +16601,8 @@ mod tests {
         app.apply_event(crust_core::events::AppEvent::MessageReceived {
             channel: channel.clone(), message: message.clone(),
         }, &ctx);
-        match commands.try_recv().unwrap() {
-            AppCommand::PersistMessageHighlight { channel: actual, server_id, message_id, timestamp_ms } => {
+        match updates.try_recv().unwrap() {
+            HistoryUpdate::Highlight { channel: actual, server_id, message_id, timestamp_ms } => {
                 assert_eq!(actual, channel);
                 assert_eq!(server_id, message.server_id);
                 assert_eq!(message_id, message.id);
@@ -15989,6 +16616,195 @@ mod tests {
         history.server_id = Some("older-highlight".to_owned());
         history.flags.is_history = true;
         app.apply_event(crust_core::events::AppEvent::MessageReceived { channel, message: history }, &ctx);
+        assert!(commands.try_recv().is_err());
+        assert!(updates.try_recv().is_err());
+    }
+
+    #[test]
+    fn confirmed_own_echo_keeps_mentions_deletable_without_duplicate_unreads() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("first");
+        app.state.join_channel(channel.clone());
+        let mut local = search_message(channel.clone());
+        local.id = crust_core::MessageId(42);
+        local.server_id = None;
+        local.flags.is_self = true;
+        local.flags.is_highlighted = true;
+        app.apply_event(crust_core::AppEvent::MessageReceived {
+            channel: channel.clone(), message: local.clone(),
+        }, &ctx);
+        let unread_before = app.state.mentions_unread;
+        let mut confirmed = local;
+        confirmed.id = crust_core::MessageId(99);
+        confirmed.server_id = Some("confirmed-own-message".into());
+        confirmed.timestamp += chrono::Duration::seconds(1);
+        app.apply_event(crust_core::AppEvent::MessageReceived {
+            channel: channel.clone(), message: confirmed,
+        }, &ctx);
+        assert_eq!(app.state.channels[&channel].messages.len(), 1);
+        assert_eq!(app.state.mentions.len(), 1);
+        assert_eq!(app.state.mentions[0].id, crust_core::MessageId(42));
+        assert_eq!(app.state.mentions[0].server_id.as_deref(), Some("confirmed-own-message"));
+        assert_eq!(app.state.mentions_unread, unread_before);
+        app.apply_event(crust_core::AppEvent::MessageDeleted {
+            channel: channel.clone(), server_id: "confirmed-own-message".into(),
+        }, &ctx);
+        assert!(app.state.channels[&channel].messages[0].flags.is_deleted);
+        assert!(app.state.mentions[0].flags.is_deleted);
+        assert_eq!(app.state.mentions_unread, unread_before);
+    }
+
+    #[test]
+    fn message_confirmation_survives_a_full_ui_command_backlog() {
+        let (mut app, _commands) = test_app();
+        let mut updates = attach_history_updates(&mut app, 1);
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("first");
+        app.state.join_channel(channel.clone());
+        let mut local = search_message(channel.clone());
+        local.id = crust_core::MessageId(42);
+        local.server_id = None;
+        local.flags.is_self = true;
+        local.flags.is_highlighted = true;
+        let original_timestamp_ms = local.timestamp.timestamp_millis();
+        app.apply_event(AppEvent::MessageReceived {
+            channel: channel.clone(), message: local.clone(),
+        }, &ctx);
+        while app.cmd_tx.sender.try_send(AppCommand::LiveFeedRefresh).is_ok() {}
+        for _ in 0..super::MAX_DEFERRED_COMMANDS {
+            assert!(app.try_send_cmd(AppCommand::LiveFeedRefresh));
+        }
+        let mut confirmed = local;
+        confirmed.id = crust_core::MessageId(99);
+        confirmed.server_id = Some("confirmed-under-backpressure".into());
+        confirmed.timestamp += chrono::Duration::seconds(1);
+        app.apply_event(AppEvent::MessageReceived {
+            channel: channel.clone(), message: confirmed,
+        }, &ctx);
+        assert_eq!(app.cmd_tx.deferred.borrow().commands.len(), super::MAX_DEFERRED_COMMANDS);
+        assert!(!app.try_send_cmd(AppCommand::LiveFeedRefresh));
+        let HistoryUpdate::Confirmation { message: saved, original_timestamp_ms: timestamp } =
+            updates.try_recv().unwrap() else { panic!("confirmation was not queued") };
+        assert!(updates.try_recv().is_err());
+        assert_eq!(saved.channel, channel);
+        assert_eq!(saved.id, crust_core::MessageId(42));
+        assert_eq!(saved.server_id.as_deref(), Some("confirmed-under-backpressure"));
+        assert_eq!(timestamp, original_timestamp_ms);
+        assert_eq!(app.state.channels[&channel].messages.len(), 1);
+        assert_eq!(app.state.mentions.len(), 1);
+    }
+
+    #[test]
+    fn history_pressure_bounds_event_intake_and_keeps_reads_behind_pending_updates() {
+        let (commands, mut received_commands) = tokio::sync::mpsc::channel(1);
+        let (events, received_events) = tokio::sync::mpsc::channel(512);
+        let mut app = super::CrustApp::with_event_channels(commands, received_events);
+        let mut updates = attach_history_updates(&mut app, 1);
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("first");
+        app.state.join_channel(channel.clone());
+        app.apply_event(AppEvent::HighlightRulesUpdated {
+            rules: vec![crust_core::highlight::HighlightRule::new("saved update")],
+        }, &ctx);
+        let total = super::MAX_DEFERRED_HISTORY_UPDATES * 2;
+        for id in 1..=total {
+            let mut message = search_message(channel.clone());
+            message.id = crust_core::MessageId(id as u64);
+            message.server_id = Some(format!("saved-{id}"));
+            message.raw_text = "saved update".into();
+            events.try_send(AppEvent::MessageReceived { channel: channel.clone(), message }).unwrap();
+        }
+        let processed = app.drain_events(&ctx) as usize;
+        assert!(processed > 0 && processed < total);
+        assert_eq!(app.state.channels[&channel].messages.len(), processed);
+        assert!(!app.cmd_tx.can_accept_event());
+        let pending = app.cmd_tx.history_updates.borrow().as_ref().unwrap().pending.clone();
+        assert!(pending.lock().unwrap().len() <= super::MAX_DEFERRED_HISTORY_UPDATES);
+        assert!(app.try_send_cmd(AppCommand::LoadOlderLocalHistory {
+            channel: channel.clone(), before_ts_ms: 1, before_row_id: None, limit: 10,
+        }));
+        assert!(received_commands.try_recv().is_err());
+
+        let mut saved_ids = Vec::new();
+        for _ in 0..(total * 3) {
+            while let Ok(update) = updates.try_recv() {
+                let HistoryUpdate::Highlight { message_id, .. } = update
+                    else { panic!("unexpected history update") };
+                saved_ids.push(message_id.0);
+            }
+            app.service_runtime_channels(&ctx);
+            assert!(pending.lock().unwrap().len() <= super::MAX_DEFERRED_HISTORY_UPDATES);
+            if saved_ids.len() == total { break; }
+        }
+        assert_eq!(saved_ids, (1..=total as u64).collect::<Vec<_>>());
+        assert_eq!(app.state.channels[&channel].messages.len(), total);
+        assert!(pending.lock().unwrap().is_empty());
+        assert!(matches!(received_commands.try_recv().unwrap(), AppCommand::LoadOlderLocalHistory { .. }));
+        assert!(received_commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn closing_the_ui_retains_pending_history_updates_for_shutdown() {
+        let (mut app, _commands) = test_app();
+        let (sender, mut updates) = tokio::sync::mpsc::channel(1);
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        app.set_history_updates(sender, pending.clone());
+        for id in 1..=2 {
+            app.cmd_tx.send_history_update(HistoryUpdate::Highlight {
+                channel: ChannelId::new("room"), server_id: None,
+                message_id: crust_core::MessageId(id), timestamp_ms: 1000,
+            });
+        }
+        drop(app);
+        assert!(matches!(updates.try_recv().unwrap(), HistoryUpdate::Highlight { message_id: crust_core::MessageId(1), .. }));
+        assert!(matches!(pending.lock().unwrap().pop_front().unwrap(), HistoryUpdate::Highlight { message_id: crust_core::MessageId(2), .. }));
+    }
+
+    #[test]
+    fn history_highlights_match_search_without_live_side_effects() {
+        let (mut app, mut commands) = test_app();
+        let ctx = egui::Context::default();
+        let first = ChannelId::new("first");
+        let second = ChannelId::new("second");
+        app.state.join_channel(first.clone());
+        app.state.join_channel(second.clone());
+        app.state.active_channel = Some(first.clone());
+        app.live_map_cache.insert("first".into(), true);
+        app.live_map_cache.insert("second".into(), true);
+        let mut rule = crust_core::highlight::HighlightRule::expression(
+            "channel.name == \"first\" && channel.live && channel.watching",
+        );
+        rule.has_sound = true;
+        rule.has_alert = true;
+        rule.show_in_mentions = true;
+        app.apply_event(crust_core::AppEvent::HighlightRulesUpdated {
+            rules: vec![rule],
+        }, &ctx);
+        let mut first_message = search_message(first.clone());
+        first_message.flags.is_history = true;
+        let mut second_message = search_message(second.clone());
+        second_message.flags.is_history = true;
+        for (channel, message) in [(first.clone(), first_message.clone()), (second.clone(), second_message)] {
+            app.apply_event(crust_core::AppEvent::HistoryLoaded {
+                channel, messages: vec![message], local: None,
+            }, &ctx);
+        }
+        assert!(app.state.channels[&first].messages[0].flags.is_highlighted);
+        assert!(!app.state.channels[&second].messages[0].flags.is_highlighted);
+        app.global_search.input = "is:highlighted".into();
+        crate::widgets::global_search::refresh_if_stale(&mut app.global_search, &app.state.channels);
+        assert_eq!(app.global_search.results.len(), 1);
+        assert_eq!(app.global_search.results[0].channel, first);
+        first_message.flags.is_mention = true;
+        app.apply_event(crust_core::AppEvent::MentionsLoaded {
+            messages: vec![first_message],
+        }, &ctx);
+        assert!(app.state.mentions[0].flags.is_highlighted);
+        assert_eq!(app.state.channels[&first].unread_count, 0);
+        assert_eq!(app.state.channels[&second].unread_count, 0);
+        assert!(app.event_toasts.is_empty());
+        assert!(app.event_toast_queue.is_empty());
         assert!(commands.try_recv().is_err());
     }
 

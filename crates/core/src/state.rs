@@ -144,6 +144,7 @@ pub struct AppState {
     /// Unread count for the Mentions tab (incremented by new mentions while
     /// the Mentions tab is not active). Cleared on activation.
     pub mentions_unread: u32,
+    moderation: crate::model::ModerationState,
     /// Per-channel tab visibility rules. Only entries with a non-default
     /// rule are stored; absence means [`TabVisibilityRule::Always`].
     /// Persisted across sessions via `AppSettings::tab_visibility_rules`.
@@ -236,6 +237,7 @@ impl Default for AppState {
             live_feed_last_updated: None,
             mentions: VecDeque::new(),
             mentions_unread: 0,
+            moderation: crate::model::ModerationState::default(),
             tab_visibility_rules: HashMap::new(),
             hype_trains: HashMap::new(),
             raid_banners: HashMap::new(),
@@ -248,8 +250,9 @@ impl Default for AppState {
 impl AppState {
     pub fn join_channel(&mut self, id: ChannelId) {
         if !self.channels.contains_key(&id) {
-            self.channels
-                .insert(id.clone(), ChannelState::new(id.clone()));
+            let mut channel = ChannelState::new(id.clone());
+            channel.moderation = self.moderation.clone();
+            self.channels.insert(id.clone(), channel);
             self.channel_order.push(id.clone());
         }
         if self.active_channel.is_none() {
@@ -286,11 +289,16 @@ impl AppState {
             let mut ids = HashSet::new();
             let mut server_ids = HashSet::new();
             // Destination copies win when both buffers contain the same row.
-            let mut messages: Vec<_> = destination.messages.drain(..)
+            let mut messages: Vec<_> = destination
+                .messages
+                .drain(..)
                 .chain(source.messages)
                 .filter(|message| {
                     ids.insert(message.id)
-                        && message.server_id.as_ref().filter(|id| !id.is_empty())
+                        && message
+                            .server_id
+                            .as_ref()
+                            .filter(|id| !id.is_empty())
                             .map_or(true, |id| server_ids.insert(id.clone()))
                 })
                 .collect();
@@ -301,7 +309,9 @@ impl AppState {
             }
             destination.chatters.extend(source.chatters);
             destination.unread_count = destination.unread_count.saturating_add(source.unread_count);
-            destination.unread_mentions = destination.unread_mentions.saturating_add(source.unread_mentions);
+            destination.unread_mentions = destination
+                .unread_mentions
+                .saturating_add(source.unread_mentions);
             for (login, entry) in source.low_trust_users {
                 destination.low_trust_users.entry(login).or_insert(entry);
             }
@@ -348,7 +358,9 @@ impl AppState {
             self.raid_banners.entry(new.clone()).or_insert(state);
         }
         if let Some(state) = self.shared_chat_sessions.remove(old) {
-            self.shared_chat_sessions.entry(new.clone()).or_insert(state);
+            self.shared_chat_sessions
+                .entry(new.clone())
+                .or_insert(state);
         }
         true
     }
@@ -468,7 +480,12 @@ impl AppState {
     /// a mention - this function does no filtering. Messages loaded from
     /// history (`flags.is_history == true`) are accepted so restart
     /// persistence can backfill the buffer without bumping unread.
-    pub fn push_mention(&mut self, msg: ChatMessage, bump_unread: bool) {
+    pub fn push_mention(&mut self, mut msg: ChatMessage, bump_unread: bool) {
+        self.moderation.apply(&mut msg);
+        self.moderation.observe_deleted(&msg);
+        if msg.flags.is_deleted {
+            self.refresh_mentions_moderation();
+        }
         let bump_unread = bump_unread && !msg.flags.is_history;
         // Dedupe: if we already have this server_id in the buffer (history
         // replay racing a live echo, for example) skip to avoid duplicates.
@@ -476,7 +493,7 @@ impl AppState {
             if self
                 .mentions
                 .iter()
-                .any(|m| m.server_id.as_deref() == Some(sid))
+                .any(|m| m.channel == msg.channel && m.server_id.as_deref() == Some(sid))
             {
                 return;
             }
@@ -490,10 +507,58 @@ impl AppState {
         }
     }
 
+    /// Keep the Mentions copy attached to the confirmed identity of a local echo.
+    /// Replacing metadata does not add a row or change unread counts.
+    pub fn sync_mention_echo(&mut self, confirmed: &ChatMessage) {
+        let Some(mention) = self
+            .mentions
+            .iter_mut()
+            .find(|message| message.channel == confirmed.channel && message.id == confirmed.id)
+        else {
+            return;
+        };
+        let was_deleted = mention.flags.is_deleted;
+        *mention = confirmed.clone();
+        mention.flags.is_deleted |= was_deleted;
+        self.moderation.apply(mention);
+        self.moderation.observe_deleted(mention);
+    }
+
     /// Clear the Mentions-tab unread counter. Call when the user activates
     /// the Mentions tab.
     pub fn clear_mentions_unread(&mut self) {
         self.mentions_unread = 0;
+    }
+
+    pub fn apply_moderation(&mut self, action: &crate::model::ModerationAction) {
+        self.moderation
+            .apply_to_retained(action, &mut self.mentions);
+        if let Some(channel) = self.channels.get_mut(&action.channel) {
+            channel.moderation = self.moderation.clone();
+            channel.apply_moderation(action);
+        }
+    }
+
+    pub fn apply_message_moderation(&self, message: &mut ChatMessage) {
+        self.moderation.apply(message);
+    }
+
+    pub fn restore_moderation(
+        &mut self,
+        channel: &ChannelId,
+        mut actions: Vec<crate::model::ModerationAction>,
+    ) {
+        actions.retain(|action| action.channel == *channel && action.is_channel_action());
+        self.moderation.remember(&actions);
+        if let Some(room) = self.channels.get_mut(channel) {
+            room.moderation = self.moderation.clone();
+            self.moderation.apply_all(&mut room.messages);
+        }
+        self.refresh_mentions_moderation();
+    }
+
+    pub fn refresh_mentions_moderation(&mut self) {
+        self.moderation.apply_all(&mut self.mentions);
     }
 
     /// Get the visibility rule for `id`. Returns [`TabVisibilityRule::Always`]
@@ -559,16 +624,36 @@ impl AppState {
     /// timestamp ascending so restart-loaded rows interleave correctly with
     /// any already-accumulated live rows.
     pub fn prepend_mentions_history(&mut self, mut msgs: Vec<ChatMessage>) {
-        let mut existing_ids: std::collections::HashSet<String> = self
+        let deleted_channels: std::collections::HashSet<_> = msgs
+            .iter()
+            .filter(|message| message.flags.is_deleted)
+            .map(|message| message.channel.clone())
+            .collect();
+        for message in &mut msgs {
+            self.moderation.observe_deleted(message);
+            self.moderation.apply(message);
+        }
+        self.refresh_mentions_moderation();
+        for channel in deleted_channels {
+            if let Some(room) = self.channels.get_mut(&channel) {
+                self.moderation.apply_all(&mut room.messages);
+            }
+        }
+        let mut existing_ids: std::collections::HashSet<_> = self
             .mentions
             .iter()
-            .filter_map(|m| m.server_id.clone().filter(|id| !id.is_empty()))
+            .filter_map(|m| {
+                m.server_id
+                    .clone()
+                    .filter(|id| !id.is_empty())
+                    .map(|id| (m.channel.clone(), id))
+            })
             .collect();
         msgs.retain(|m| {
             m.server_id
                 .as_deref()
                 .filter(|id| !id.is_empty())
-                .map(|id| existing_ids.insert(id.to_owned()))
+                .map(|id| existing_ids.insert((m.channel.clone(), id.to_owned())))
                 .unwrap_or(true)
         });
         if msgs.is_empty() {
@@ -811,6 +896,74 @@ mod mentions_state_tests {
     }
 
     #[test]
+    fn confirmed_own_echo_keeps_its_mentions_copy_moderatable() {
+        let mut state = AppState::default();
+        let mut pending = mention("", 10, true);
+        pending.server_id = None;
+        pending.flags.is_self = true;
+        let channel = pending.channel.clone();
+        state.join_channel(channel.clone());
+        state
+            .channels
+            .get_mut(&channel)
+            .unwrap()
+            .push_message(pending.clone());
+        state.push_mention(pending.clone(), true);
+        let mut unrelated = pending.clone();
+        unrelated.channel = ChannelId::new("elsewhere");
+        state.push_mention(unrelated, false);
+
+        let mut server = pending;
+        server.id = MessageId(99);
+        server.server_id = Some("confirmed-message".into());
+        server.timestamp = Utc.timestamp_opt(11, 0).unwrap();
+        server.sender.color = Some("#123456".into());
+        let room = state.channels.get_mut(&channel).unwrap();
+        assert_eq!(
+            room.absorb_own_echo(&server),
+            Some((MessageId(10), Utc.timestamp_opt(10, 0).unwrap()))
+        );
+        let confirmed = room.messages.back().unwrap().clone();
+        state.sync_mention_echo(&confirmed);
+        assert_eq!(state.mentions.len(), 2);
+        assert_eq!(state.mentions_unread, 1);
+        assert_eq!(state.mentions[0].id, MessageId(10));
+        assert_eq!(state.mentions[0].timestamp, server.timestamp);
+        assert_eq!(state.mentions[0].sender.color, server.sender.color);
+        assert_eq!(state.mentions[0].server_id, server.server_id);
+        assert!(state.mentions[1].server_id.is_none());
+
+        state.apply_moderation(&crate::model::ModerationAction::message(
+            channel.clone(),
+            "confirmed-message".into(),
+        ));
+        assert!(state.channels[&channel].messages[0].flags.is_deleted);
+        assert!(state.mentions[0].flags.is_deleted);
+        assert!(!state.mentions[1].flags.is_deleted);
+        assert_eq!(state.mentions_unread, 1);
+    }
+
+    #[test]
+    fn confirming_a_mention_preserves_existing_deletion_and_does_not_add_rows() {
+        let mut state = AppState::default();
+        let mut pending = mention("", 10, true);
+        pending.server_id = None;
+        pending.flags.is_deleted = true;
+        state.push_mention(pending.clone(), false);
+        let mut confirmed = pending;
+        confirmed.flags.is_deleted = false;
+        confirmed.server_id = Some("confirmed".into());
+        confirmed.timestamp = Utc.timestamp_opt(11, 0).unwrap();
+        state.sync_mention_echo(&confirmed);
+        assert!(state.mentions[0].flags.is_deleted);
+        assert!(state.moderation.is_deleted(&confirmed));
+        confirmed.id = MessageId(999);
+        state.sync_mention_echo(&confirmed);
+        assert_eq!(state.mentions.len(), 1);
+        assert_eq!(state.mentions_unread, 0);
+    }
+
+    #[test]
     fn mentions_buffer_respects_cap() {
         let mut s = AppState::default();
         for i in 0..(MENTIONS_BUFFER_CAP + 50) {
@@ -905,7 +1058,10 @@ mod redirect_tests {
         assert_eq!(destination.messages[0].raw_text, "source history");
         assert_eq!(destination.messages[0].channel, new);
         assert_eq!(state.mentions[0].channel, new);
-        assert_eq!(state.tab_visibility_rule(&new), TabVisibilityRule::HideWhenOffline);
+        assert_eq!(
+            state.tab_visibility_rule(&new),
+            TabVisibilityRule::HideWhenOffline
+        );
     }
 
     #[test]
@@ -934,7 +1090,9 @@ mod redirect_tests {
         let destination = state.channels.get_mut(&new).unwrap();
         destination.topic = Some("destination topic".to_owned());
         destination.room_state.slow_mode = Some(17);
-        destination.chatters.insert("destination chatter".to_owned());
+        destination
+            .chatters
+            .insert("destination chatter".to_owned());
         destination.unread_count = 3;
         destination.push_message(message(&new, 2, "destination copy"));
         destination.push_message(message(&new, 3, "destination history"));
@@ -950,7 +1108,14 @@ mod redirect_tests {
         assert!(!destination.is_mod);
         assert_eq!(destination.unread_count, 5);
         assert_eq!(destination.chatters.len(), 2);
-        assert_eq!(destination.messages.iter().map(|row| row.id.0).collect::<Vec<_>>(), vec![1, 2, 3, 5]);
+        assert_eq!(
+            destination
+                .messages
+                .iter()
+                .map(|row| row.id.0)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 5]
+        );
         assert!(destination.messages.iter().all(|row| row.channel == new));
         assert_eq!(destination.messages[1].raw_text, "destination copy");
         assert_eq!(state.mentions[0].channel, new);
@@ -963,7 +1128,11 @@ mod redirect_tests {
         let missing = ChannelId::new("missing");
         let mut state = AppState::default();
         state.join_channel(channel.clone());
-        state.channels.get_mut(&channel).unwrap().push_message(message(&channel, 1, "keep"));
+        state
+            .channels
+            .get_mut(&channel)
+            .unwrap()
+            .push_message(message(&channel, 1, "keep"));
         assert!(!state.redirect_channel(&channel, &channel));
         assert!(!state.redirect_channel(&missing, &channel));
         assert!(!state.redirect_channel(&missing, &ChannelId::new("unopened")));

@@ -65,11 +65,12 @@ commands. Kick and generic IRC support remain beta features.
   - URLs
   - emoji
 - URL detection and Open Graph/Twitter card preview metadata
-- Message deletion and user-message clear handling in UI
+- Message deletions, user clears, and channel clears update chat and Mentions,
+  including saved and delayed history
 - Optional timestamp rendering (12h/24h, with/without seconds)
 - Optional long-message collapse with configurable line limits
-- Unicode-aware tokenization that preserves whitespace and ignores reversed
-  native-emote ranges
+- Unicode-aware tokenization that preserves whitespace and ignores invalid or
+  overlapping native-emote ranges
 
 ### Input and command UX
 
@@ -77,6 +78,8 @@ commands. Kick and generic IRC support remain beta features.
 - Emote picker access in narrow panes, with the character count below the input when needed
 - Rejected sends keep their original draft and reply context for recovery
 - `:` emote autocomplete and Tab completion
+- Scrollable completion menus that fit short windows and enlarged fonts, with
+  pointer selection that returns focus to the composer
 - Slash command handling for chat, moderation, and creator workflows
 - Command usage tracking for ranking/autocomplete improvements
 - Custom command aliases (`/hi = /me says hi {1}`) with `{channel}`, `{user}`, `{input}`, `{streamer}` variables
@@ -97,6 +100,7 @@ commands. Kick and generic IRC support remain beta features.
 - Follower emotes restricted to their channel and the account that can use them
 - Provider and scope precedence is consistent between chat, autocomplete, and the picker
 - Animated emote support (GIF/WebP), with bounded background decoding
+- Layered 7TV and BTTV global overlay emotes in chat and whispers, including live 7TV flag changes
 - Emoji tokenization/rendering via Twemoji URLs
 - Badge rendering from global/channel badge sources
 - 7TV sender colors, selected username paints, badges, and avatars
@@ -114,6 +118,9 @@ commands. Kick and generic IRC support remain beta features.
   subscription and snapshot checks
 - Live global and one selected personal 7TV set per sender, with ownership and membership refreshes
 - Coalesced channel refreshes and five-minute global metadata refreshes that retain usable catalogs on failure
+- Automatic retries for failed channel providers after a 30-second cooldown,
+  with successful catalogs and valid empty results preserved
+- Smaller 7TV assets for ordinary rendering, with larger images kept for HD previews
 
 Chat works without `user:read:emotes`. FFZ uses metadata refreshes. The
 [UI and performance audit](AUDIT_UI_PERFORMANCE.md) explains provider limits,
@@ -177,6 +184,7 @@ cached-snapshot behavior, and the measured rendering workloads.
 - Stream tracking for channel presence indicators
 - Live / followed-channels feed virtual tab fed by `stream.online` / `stream.offline` EventSub
 - Mentions-only cross-channel feed tab with restart-survival via local SQLite log
+- Word-boundary mention matching and channel-scoped nickname aliases
 - Tab visibility rules ("Hide when offline" per-channel)
 - Desktop notifications for mentions/highlights/whispers (configurable)
 - In-app event toast banners for high-visibility events
@@ -219,9 +227,11 @@ them visible with reduced emphasis.
 
 - Recent-message history load on join (recent-messages API with IVR fallback)
 - Per-channel local message logging and indexing (SQLite)
+- Ordered background log writes and an indexed Mentions query
 - Older local history paging, including messages with identical timestamps and rows without server IDs
 - Per-channel message search/filter UI
 - Cross-channel search with predicates such as `from:<user>`, `has:link`, `in:<channel>`, and `regex:"<pattern>"`
+- Search navigation that follows input/result focus and leaves other controls' keys alone
 - Case-insensitive search regexes by default; inline regex flags can request case-sensitive matching
 - Subscriber-tier searches distinguish tier from subscription length; comma-separated `is:` values match any listed flag
 - Data directories via `directories::ProjectDirs` for config/cache/logs
@@ -440,8 +450,4 @@ User-defined command aliases (Settings -> Commands) dispatch after the built-in 
 - [UI API](API_UI.md)
 - [Events API](API_Events.md)
 - [Plugin API reference](API.md)
-- [Release notes v0.5.2](releases/Release_v0.5.2.md)
-- [Release notes v0.5.1](releases/Release_v0.5.1.md)
-- [Release notes v0.5.0](releases/Release_v0.5.0.md)
-- [Release notes v0.4.9](releases/Release_v0.4.9.md)
-- [Release notes v0.4.3](releases/Release_v0.4.3.md)
+- [Release notes v0.5.6](releases/Release_v0.5.6.md)

@@ -29,6 +29,8 @@ pub struct GlobalSearchState {
     last_seen_fingerprint: Option<u64>,
     parsed: Vec<Predicate>,
     scroll_to_selected: bool,
+    focused_control: Option<Id>,
+    focused_result: Option<Id>,
     pub load_older_pending: HashMap<ChannelId, std::time::Instant>,
 }
 
@@ -42,6 +44,17 @@ impl GlobalSearchState {
     pub fn close(&mut self) {
         self.open = false;
         self.focus_input = false;
+        self.focused_control = None;
+        self.focused_result = None;
+    }
+
+    fn owns_keyboard(&self, ctx: &Context) -> bool {
+        self.open && self.focused_control.is_some_and(|id| {
+            ctx.memory(|memory| {
+                memory.has_focus(id)
+                    || (memory.focused().is_none() && memory.had_focus_last_frame(id))
+            }) && ctx.read_response(id).is_some()
+        })
     }
 
     pub fn clear(&mut self) {
@@ -69,6 +82,8 @@ impl GlobalSearchState {
                 | AppEvent::MessageDeleted { .. }
                 | AppEvent::EmoteCatalogUpdated { .. }
                 | AppEvent::HistoryLoaded { .. }
+                | AppEvent::HistoryModerationLoaded { .. }
+                | AppEvent::MentionsLoaded { .. }
                 | AppEvent::UserMessagesCleared { .. }
                 | AppEvent::ClearUserMessagesLocally { .. }
                 | AppEvent::ChannelMessagesCleared { .. }
@@ -257,7 +272,9 @@ pub fn show_global_search_window(
         .with_window_level(level);
 
     ctx.show_viewport_immediate(viewport_id, builder, |child_ctx, class| {
-        let esc = child_ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape));
+        let owns_escape = !matches!(class, ViewportClass::Embedded) || state.owns_keyboard(child_ctx);
+        let esc = owns_escape && !child_ctx.is_context_menu_open()
+            && child_ctx.input_mut(|i| crate::app::consume_exact_key(i, egui::Modifiers::NONE, Key::Escape));
         let close_requested = child_ctx.input(|i| i.viewport().close_requested());
         if esc {
             state.close();
@@ -334,6 +351,11 @@ fn render_body(
     }
     ui.add_space(6.0);
     render_results(ui, channels, state, output);
+    state.focused_control = ui.ctx().memory(|memory| memory.focused()).filter(|id| {
+        ui.ctx().read_response(*id).is_some_and(|response| {
+            response.layer_id == ui.layer_id() && ui.min_rect().contains_rect(response.rect)
+        })
+    });
 }
 
 fn render_header(ui: &mut Ui, state: &mut GlobalSearchState, output: &mut GlobalSearchOutput) {
@@ -400,6 +422,7 @@ fn render_results(
 ) {
     let hit_count = state.results.len();
     let scroll_to_selected = std::mem::take(&mut state.scroll_to_selected);
+    state.focused_result = None;
 
     ScrollArea::vertical()
         .auto_shrink([false, false])
@@ -444,6 +467,10 @@ fn render_results(
                     });
                     if selected && scroll_to_selected {
                         response.scroll_to_me(Some(Align::Center));
+                    }
+                    if response.has_focus() {
+                        state.focused_result = Some(response.id);
+                        state.selected_idx = running_idx;
                     }
                     running_idx += 1;
                 }
@@ -538,6 +565,7 @@ fn render_hit_row(
                 .color
                 .as_deref()
                 .and_then(parse_hex_color)
+                .map(t::readable_username_color)
                 .unwrap_or_else(t::text_secondary);
             row.append(
                 &hit.message.sender.login,
@@ -559,12 +587,22 @@ fn render_hit_row(
             );
             ui.add(egui::Label::new(row).wrap());
         })
-        .response
-        .interact(egui::Sense::click());
+        .response;
+    let resp = ui.interact(resp.rect, search_hit_id(hit), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(
+        egui::WidgetType::SelectableLabel,
+        ui.is_enabled(),
+        selected,
+        format!("{}: {}", hit.message.sender.login, hit.message.raw_text),
+    ));
     if resp.clicked() {
         on_jump(hit);
     }
     resp
+}
+
+fn search_hit_id(hit: &SearchHit) -> Id {
+    Id::new("global_search_result").with((&hit.channel, hit.message.id))
 }
 
 fn parse_hex_color(s: &str) -> Option<egui::Color32> {
@@ -588,6 +626,11 @@ fn handle_keyboard(ctx: &Context, state: &mut GlobalSearchState, output: &mut Gl
     let max = state.results.len() - 1;
     let previous = state.selected_idx;
     let editing = ctx.memory(|memory| memory.has_focus(Id::new("global_search_input")));
+    let result_focused = state.focused_result
+        .is_some_and(|id| ctx.memory(|memory| memory.has_focus(id)));
+    if !editing && !result_focused {
+        return;
+    }
     ctx.input_mut(|i| {
         if crate::app::consume_exact_key(i, egui::Modifiers::NONE, Key::ArrowDown) {
             state.selected_idx = (state.selected_idx + 1).min(max);
@@ -614,6 +657,11 @@ fn handle_keyboard(ctx: &Context, state: &mut GlobalSearchState, output: &mut Gl
         }
     });
     state.scroll_to_selected |= state.selected_idx != previous;
+    if result_focused && state.selected_idx != previous {
+        if let Some(hit) = state.results.get(state.selected_idx) {
+            ctx.memory_mut(|memory| memory.request_focus(search_hit_id(hit)));
+        }
+    }
 }
 
 fn stat_pill(ui: &mut Ui, text: String) {
@@ -946,6 +994,7 @@ mod tests {
     fn message_edits_refresh_filters_without_changing_buffer_length() {
         let (channel, mut messages) = mk_channel("foo");
         let mut message = mk_msg(1, "alice", "needle", 0);
+        message.channel = channel.clone();
         message.server_id = Some("server-id".to_owned());
         messages.push_message(message);
         let mut channels = HashMap::from([(channel.clone(), messages)]);
@@ -964,6 +1013,46 @@ mod tests {
         assert_eq!(search.results.len(), 1);
         assert!(search.results[0].message.flags.is_deleted);
         assert!(!refresh_if_stale(&mut search, &channels));
+    }
+
+    #[test]
+    fn restored_mention_deletions_refresh_retained_channel_search_results() {
+        for (query, before, after) in [("is:deleted", 0, 1), ("!is:deleted", 1, 0)] {
+            let (channel, mut room) = mk_channel("example");
+            let mut message = mk_msg(1, "alice", "needle", 0);
+            message.channel = channel.clone();
+            message.server_id = Some("retained-message".to_owned());
+            message.flags.is_mention = true;
+            room.push_message(message.clone());
+            let mut app = crust_core::AppState::default();
+            app.channels.insert(channel.clone(), room);
+            let mut search = GlobalSearchState {
+                input: query.to_owned(),
+                ..Default::default()
+            };
+            assert!(refresh_if_stale(&mut search, &app.channels));
+            assert_eq!(search.results.len(), before);
+            assert!(!refresh_if_stale(&mut search, &app.channels));
+            let fingerprint_before = fingerprint(&app.channels);
+
+            // The saved mention has another local ID but describes the same
+            // channel message that is already present in the live buffer.
+            message.id = MessageId(99);
+            message.flags.is_deleted = true;
+            let event = AppEvent::MentionsLoaded { messages: vec![message] };
+            search.on_event(&event);
+            let AppEvent::MentionsLoaded { messages } = event else { unreachable!() };
+            app.prepend_mentions_history(messages);
+
+            let retained = &app.channels[&channel].messages[0];
+            assert_eq!(retained.id, MessageId(1));
+            assert!(retained.flags.is_deleted);
+            assert_eq!(fingerprint(&app.channels), fingerprint_before,
+                "saved deletion must leave channel length and endpoint IDs unchanged");
+            assert!(refresh_if_stale(&mut search, &app.channels));
+            assert_eq!(search.results.len(), after, "stale results for {query}");
+            assert!(!refresh_if_stale(&mut search, &app.channels));
+        }
     }
 
     #[test]
@@ -1004,7 +1093,10 @@ mod tests {
                 }],
                 ..Default::default()
             };
-            let _ = ctx.run(input, |ctx| handle_keyboard(ctx, &mut search, &mut output));
+            let _ = ctx.run(input, |ctx| {
+                ctx.memory_mut(|memory| memory.request_focus(Id::new("global_search_input")));
+                handle_keyboard(ctx, &mut search, &mut output);
+            });
         }
         assert_eq!(search.selected_idx, 1);
         assert_eq!(output.jump_to, Some((first, MessageId(3))));
@@ -1042,6 +1134,102 @@ mod tests {
         assert_eq!(hits.len(), MAX_HITS);
         assert_eq!(hits.first().unwrap().message.id, MessageId(5999));
         assert_eq!(hits.last().unwrap().message.id, MessageId(1000));
+    }
+
+
+    fn search_key(key: Key) -> egui::Event {
+        egui::Event::Key {
+            key, physical_key: None, pressed: true, repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn search_widget_frame(
+        ctx: &Context,
+        state: &mut GlobalSearchState,
+        channels: &HashMap<ChannelId, ChannelState>,
+        events: Vec<egui::Event>,
+    ) -> (egui::FullOutput, GlobalSearchOutput) {
+        let mut output = GlobalSearchOutput::default();
+        let rendered = ctx.run(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO, egui::vec2(480.0, 320.0),
+            )),
+            events, ..Default::default()
+        }, |ctx| {
+            CentralPanel::default().show(ctx, |ui| {
+                render_body(ui, channels, state, &mut output);
+            });
+        });
+        (rendered, output)
+    }
+
+    #[test]
+    fn search_buttons_keep_enter_instead_of_jumping_to_a_result() {
+        for button_label in ["Clear", "Close"] {
+            let (channel, mut messages) = mk_channel("example");
+            messages.push_message(mk_msg(1, "alice", "needle", 0));
+            let channels = HashMap::from([(channel, messages)]);
+            let mut search = GlobalSearchState {
+                open: true, input: "needle".to_owned(), focus_input: true, ..Default::default()
+            };
+            refresh_if_stale(&mut search, &channels);
+            let ctx = Context::default();
+            let mut rendered = egui::FullOutput::default();
+            for _ in 0..3 {
+                rendered = search_widget_frame(&ctx, &mut search, &channels, Vec::new()).0;
+            }
+            let button = rendered.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == button_label =>
+                    Some(egui::Rect::from_min_size(text.pos, text.galley.size())),
+                _ => None,
+            }).unwrap();
+            let mut focused = false;
+            for _ in 0..10 {
+                let mut events = vec![search_key(Key::Tab)];
+                events.push(egui::Event::Key {
+                    key: Key::Tab, physical_key: None, pressed: false,
+                    repeat: false, modifiers: egui::Modifiers::NONE,
+                });
+                search_widget_frame(&ctx, &mut search, &channels, events);
+                focused = ctx.memory(|memory| memory.focused())
+                    .and_then(|id| ctx.read_response(id))
+                    .is_some_and(|response| response.rect.contains_rect(button));
+                if focused { break; }
+            }
+            assert!(focused, "{button_label} must be reachable by keyboard");
+            let (_, action) = search_widget_frame(&ctx, &mut search, &channels, vec![search_key(Key::Enter)]);
+            assert!(action.jump_to.is_none(), "Enter on {button_label} must not jump to a search hit");
+            if button_label == "Clear" {
+                assert!(search.input.is_empty());
+                assert!(search.results.is_empty());
+            } else {
+                assert!(!search.open);
+                assert!(action.close_requested);
+            }
+        }
+    }
+
+    #[test]
+    fn search_navigation_leaves_another_focused_control_alone() {
+        let mut search = GlobalSearchState {
+            open: true, results: vec![SearchHit {
+                channel: ChannelId::new("example"), message: mk_msg(1, "alice", "needle", 0),
+            }], ..Default::default()
+        };
+        let ctx = Context::default();
+        for key in [Key::Enter, Key::ArrowDown, Key::ArrowUp, Key::PageDown, Key::PageUp, Key::Home, Key::End] {
+            let mut output = GlobalSearchOutput::default();
+            let _ = ctx.run(egui::RawInput {
+                events: vec![search_key(key)], ..Default::default()
+            }, |ctx| {
+                ctx.memory_mut(|memory| memory.request_focus(Id::new("another_control")));
+                handle_keyboard(ctx, &mut search, &mut output);
+                assert!(ctx.input(|input| input.key_pressed(key)),
+                    "search must leave {key:?} for the focused control");
+            });
+            assert!(output.jump_to.is_none());
+        }
     }
 
     #[test]

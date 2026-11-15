@@ -1110,6 +1110,7 @@ mod tests {
                 url: "https://example.com/kappa.png".to_owned(),
                 url_hd: None,
                 provider: "twitch".to_owned(),
+                zero_width: false,
             }],
             vec![],
         ));

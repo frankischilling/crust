@@ -190,7 +190,7 @@ impl<'a> MentionsList<'a> {
                             ui.label(
                                 RichText::new(format!("({})", self.mentions.len()))
                                     .font(t::small())
-                                    .color(t::text_muted()),
+                                    .color(t::text_secondary()),
                             );
                         });
                     });
@@ -382,6 +382,7 @@ fn render_row(
         .color
         .as_deref()
         .and_then(parse_hex_color)
+        .map(t::readable_username_color)
         .unwrap_or(t::text_primary());
     let display_name = sender_name(msg);
 

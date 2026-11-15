@@ -49,11 +49,18 @@ pub(crate) enum EmoteDelta {
     Upsert {
         emote: EmoteInfo,
         old_code: Option<String>,
+        /// A partial update omitted the active-set overlay field.
+        preserve_overlay: bool,
     },
     Rename {
         id: String,
         old_code: Option<String>,
         code: String,
+    },
+    Overlay {
+        id: String,
+        code: Option<String>,
+        zero_width: bool,
     },
     Remove {
         id: String,

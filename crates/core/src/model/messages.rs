@@ -15,12 +15,15 @@ pub enum Span {
         id: String,
         /// The original text code (e.g. "Kappa").
         code: String,
-        /// CDN image URL (1x / normal size).
+        /// CDN image URL for normal chat rendering.
         url: String,
-        /// CDN image URL at higher resolution (4x > 2x > 1x) for tooltip previews.
+        /// Optional higher-resolution CDN image for tooltip previews.
         url_hd: Option<String>,
         /// Provider name: "twitch", "bttv", "ffz", "7tv".
         provider: String,
+        /// Whether this emote overlays a preceding emote in the same message.
+        #[serde(default)]
+        zero_width: bool,
     },
     Emoji {
         /// Original emoji text (e.g. "😀").
@@ -201,6 +204,31 @@ pub struct ChatMessage {
     pub shared: Option<SharedChatSource>,
 }
 
+impl ChatMessage {
+    /// Match a live pending own echo without consulting historical messages.
+    /// Callers take the oldest matching candidate to preserve repeated sends.
+    pub fn is_pending_own_echo_of(&self, confirmed: &Self) -> bool {
+        self.server_id.is_none()
+            && self.flags.is_self
+            && !self.flags.is_history
+            && confirmed.flags.is_self
+            && !confirmed.flags.is_history
+            && confirmed
+                .server_id
+                .as_ref()
+                .is_some_and(|id| !id.is_empty())
+            && self.channel == confirmed.channel
+            && self.flags.is_action == confirmed.flags.is_action
+            && self.reply.as_ref().map(|reply| reply.parent_msg_id.as_str())
+                == confirmed.reply.as_ref().map(|reply| reply.parent_msg_id.as_str())
+            && self
+                .sender
+                .login
+                .eq_ignore_ascii_case(&confirmed.sender.login)
+            && self.raw_text == confirmed.raw_text
+    }
+}
+
 /// Lightweight emote entry for the UI catalog (autocomplete / picker).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmoteCatalogEntry {
@@ -211,6 +239,8 @@ pub struct EmoteCatalogEntry {
     pub url: String,
     #[serde(default)]
     pub url_hd: Option<String>,
+    #[serde(default)]
+    pub zero_width: bool,
     /// "global", "channel", or "personal".
     pub scope: String,
     /// Channel where this entry is available; personal entries may also be restricted.
@@ -254,6 +284,30 @@ impl EmoteCatalogEntry {
 #[cfg(test)]
 mod tests {
     use super::MsgKind;
+
+    #[test]
+    fn old_emote_metadata_defaults_to_normal_and_overlays_round_trip() {
+        let old_span = serde_json::json!({"Emote": {
+            "id": "hat", "code": "Hat", "url": "https://example.test/hat.webp",
+            "url_hd": null, "provider": "7tv"
+        }});
+        let span: super::Span = serde_json::from_value(old_span.clone()).unwrap();
+        assert!(matches!(span, super::Span::Emote { zero_width: false, .. }));
+        let mut overlay = old_span;
+        overlay["Emote"]["zero_width"] = true.into();
+        let span: super::Span = serde_json::from_value(overlay).unwrap();
+        let decoded: super::Span = serde_json::from_str(&serde_json::to_string(&span).unwrap()).unwrap();
+        assert_eq!(decoded, span);
+        assert!(matches!(decoded, super::Span::Emote { zero_width: true, .. }));
+
+        let old_catalog = serde_json::json!({"code": "Hat", "provider": "7tv",
+            "url": "https://example.test/hat.webp", "scope": "channel"});
+        let mut entry: super::EmoteCatalogEntry = serde_json::from_value(old_catalog).unwrap();
+        assert!(!entry.zero_width);
+        entry.zero_width = true;
+        let decoded: super::EmoteCatalogEntry = serde_json::from_str(&serde_json::to_string(&entry).unwrap()).unwrap();
+        assert_eq!(decoded, entry);
+    }
 
     #[test]
     fn raid_deserializes_without_source_login() {

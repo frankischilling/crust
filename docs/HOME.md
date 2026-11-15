@@ -9,6 +9,7 @@
 - [Startup, private history, and navigation fixes](./AUDIT_STARTUP.md)
 - [Settings, emote ownership, and rendering responsiveness](./AUDIT_UI_PERFORMANCE.md)
 - [Chat cards, Mentions, and badge loading](./AUDIT_STABILITY.md)
+- [Chat loading, emotes, and navigation](./AUDIT_CHAT_RELIABILITY.md)
 
 ## Plugins
 
@@ -25,6 +26,7 @@
 
 ## Release notes
 
+- [v0.5.6](./releases/Release_v0.5.6.md)
 - [v0.5.5](./releases/Release_v0.5.5.md)
 - [v0.5.4](./releases/Release_v0.5.4.md)
 - [v0.5.3](./releases/Release_v0.5.3.md)

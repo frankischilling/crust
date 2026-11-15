@@ -310,6 +310,21 @@ struct PluginLoadOutcome {
     status: PluginStatus,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PluginCommandError {
+    Full,
+    Closed,
+}
+
+impl PluginCommandError {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Full => "Crust is busy. The plugin action was not queued; try again in a moment.",
+            Self::Closed => "The background service stopped. The plugin action was not queued.",
+        }
+    }
+}
+
 pub struct LuaPluginHost {
     cmd_tx: mpsc::Sender<AppCommand>,
     plugins: RwLock<Vec<Arc<Mutex<PluginRuntime>>>>,
@@ -360,18 +375,19 @@ impl LuaPluginHost {
         }
     }
 
-    fn send_command(&self, cmd: AppCommand) {
-        match self.cmd_tx.try_send(cmd) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(cmd)) => {
-                if self.cmd_tx.blocking_send(cmd).is_err() {
-                    warn!("plugin command channel closed");
-                }
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                warn!("plugin command channel closed");
-            }
-        }
+    fn send_command(&self, cmd: AppCommand) -> Result<(), PluginCommandError> {
+        // Event callbacks also run inside the async event bridge. Waiting for
+        // this queue can block its consumer or panic inside a Lua C callback.
+        self.cmd_tx.try_send(cmd).map_err(|error| {
+            let error = match error {
+                mpsc::error::TrySendError::Full(_) => PluginCommandError::Full,
+                mpsc::error::TrySendError::Closed(_) => PluginCommandError::Closed,
+            };
+            // Older plugins may ignore the new Lua return value. Keep the
+            // failure visible without logging message text or credentials.
+            warn!("plugins: {}", error.message());
+            error
+        })
     }
 
     fn runtime_by_index(&self, idx: usize) -> Option<Arc<Mutex<PluginRuntime>>> {
@@ -1444,7 +1460,7 @@ impl PluginHost for LuaPluginHost {
             guard.get(&key).cloned()
         };
         let Some(index) = index else {
-            self.send_command(AppCommand::InjectLocalMessage {
+            let _ = self.send_command(AppCommand::InjectLocalMessage {
                 channel: invocation.channel,
                 text: format!("Unknown plugin command: /{}", invocation.command),
             });
@@ -1452,7 +1468,7 @@ impl PluginHost for LuaPluginHost {
         };
 
         let Some(plugin) = self.runtime_by_index(index.plugin_idx) else {
-            self.send_command(AppCommand::InjectLocalMessage {
+            let _ = self.send_command(AppCommand::InjectLocalMessage {
                 channel: invocation.channel,
                 text: format!("Plugin command /{} is unavailable", invocation.command),
             });
@@ -1462,7 +1478,7 @@ impl PluginHost for LuaPluginHost {
         let (vm, handler_ref, plugin_name) = {
             let guard = plugin.lock().unwrap_or_else(|p| p.into_inner());
             let Some(cmd) = guard.commands.get(&index.canonical_name) else {
-                self.send_command(AppCommand::InjectLocalMessage {
+                let _ = self.send_command(AppCommand::InjectLocalMessage {
                     channel: invocation.channel,
                     text: format!("Plugin command /{} is unavailable", invocation.command),
                 });
@@ -1479,14 +1495,14 @@ impl PluginHost for LuaPluginHost {
 
         match result {
             Ok(Some(text)) if !text.trim().is_empty() => {
-                self.send_command(AppCommand::InjectLocalMessage {
+                let _ = self.send_command(AppCommand::InjectLocalMessage {
                     channel: invocation.channel,
                     text,
                 });
             }
             Ok(_) => {}
             Err(err) => {
-                self.send_command(AppCommand::InjectLocalMessage {
+                let _ = self.send_command(AppCommand::InjectLocalMessage {
                     channel: invocation.channel,
                     text: format!("[plugin:{}] {}", plugin_name, err),
                 });
@@ -2016,10 +2032,13 @@ unsafe extern "C" fn native_later(L: *mut lua_State) -> c_int {
     };
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(delay_ms));
-        host.send_command(AppCommand::RunPluginCallback {
-            vm_key,
-            callback_ref,
-        });
+        // This timer already owns a dedicated OS thread. Keep its callback
+        // reference queued until the runtime can run and release it.
+        if host.cmd_tx.blocking_send(AppCommand::RunPluginCallback {
+            vm_key, callback_ref,
+        }).is_err() {
+            warn!("plugins: delayed callback was not queued because the background service stopped");
+        }
     });
     0
 }
@@ -2091,9 +2110,6 @@ unsafe extern "C" fn native_send_message(L: *mut lua_State) -> c_int {
     if lua_gettop(L) < 2 {
         return 0;
     }
-    let Some(host) = global_host() else {
-        return 0;
-    };
     let Some(channel) = channel_from_value(L, 1) else {
         return 0;
     };
@@ -2108,58 +2124,45 @@ unsafe extern "C" fn native_send_message(L: *mut lua_State) -> c_int {
     } else {
         (None, None)
     };
-    host.send_command(AppCommand::SendMessage {
+    send_lua_command(L, AppCommand::SendMessage {
         channel,
         text,
         reply_to_msg_id,
         reply,
-    });
-    0
+    })
 }
 
 unsafe extern "C" fn native_add_system_message(L: *mut lua_State) -> c_int {
     if lua_gettop(L) < 2 {
         return 0;
     }
-    let Some(host) = global_host() else {
-        return 0;
-    };
     let Some(channel) = channel_from_value(L, 1) else {
         return 0;
     };
     let Some(text) = lua_value_string(L, 2) else {
         return 0;
     };
-    host.send_command(AppCommand::InjectLocalMessage { channel, text });
-    0
+    send_lua_command(L, AppCommand::InjectLocalMessage { channel, text })
 }
 
 unsafe extern "C" fn native_clear_messages(L: *mut lua_State) -> c_int {
     if lua_gettop(L) < 1 {
         return 0;
     }
-    let Some(host) = global_host() else {
-        return 0;
-    };
     let Some(channel) = channel_from_value(L, 1) else {
         return 0;
     };
-    host.send_command(AppCommand::ClearLocalMessages { channel });
-    0
+    send_lua_command(L, AppCommand::ClearLocalMessages { channel })
 }
 
 unsafe extern "C" fn native_open_url(L: *mut lua_State) -> c_int {
     if lua_gettop(L) < 1 {
         return 0;
     }
-    let Some(host) = global_host() else {
-        return 0;
-    };
     let Some(url) = lua_value_string(L, 1) else {
         return 0;
     };
-    host.send_command(AppCommand::OpenUrl { url });
-    0
+    send_lua_command(L, AppCommand::OpenUrl { url })
 }
 
 unsafe extern "C" fn native_plugin_dir(L: *mut lua_State) -> c_int {
@@ -2354,7 +2357,7 @@ unsafe extern "C" fn native_set_sound_settings(L: *mut lua_State) -> c_int {
         lua_pop(L, 1);
     }
     if !events.is_empty() {
-        send_lua_command(AppCommand::SetSoundSettings { events });
+        return send_lua_command(L, AppCommand::SetSoundSettings { events });
     }
     0
 }
@@ -2405,7 +2408,7 @@ unsafe extern "C" fn native_set_hotkey_bindings(L: *mut lua_State) -> c_int {
         lua_pop(L, 1);
     }
     if !bindings.is_empty() {
-        send_lua_command(AppCommand::SetHotkeyBindings { bindings });
+        return send_lua_command(L, AppCommand::SetHotkeyBindings { bindings });
     }
     0
 }
@@ -2462,13 +2465,12 @@ unsafe extern "C" fn native_upload_image(L: *mut lua_State) -> c_int {
     } else {
         None
     };
-    send_lua_command(AppCommand::UploadImage {
+    send_lua_command(L, AppCommand::UploadImage {
         channel,
         bytes,
         format,
         source_path,
-    });
-    0
+    })
 }
 
 unsafe extern "C" fn native_ui_register_window(L: *mut lua_State) -> c_int {
@@ -2668,9 +2670,20 @@ unsafe extern "C" fn native_ui_unregister_host_panel(L: *mut lua_State) -> c_int
     0
 }
 
-unsafe fn send_lua_command(cmd: AppCommand) {
-    if let Some(host) = global_host() {
-        host.send_command(cmd);
+unsafe fn send_lua_command(L: *mut lua_State, cmd: AppCommand) -> c_int {
+    let result = global_host()
+        .ok_or(PluginCommandError::Closed)
+        .and_then(|host| host.send_command(cmd));
+    match result {
+        Ok(()) => {
+            lua_pushboolean(L, 1);
+            1
+        }
+        Err(error) => {
+            lua_pushnil(L);
+            lua_pushstring(L, cstring(error.message()).as_ptr());
+            2
+        }
     }
 }
 
@@ -2696,8 +2709,7 @@ fn lua_table_table(L: *mut lua_State, idx: c_int, field: &str) -> bool {
 
 unsafe extern "C" fn native_reload_plugins(L: *mut lua_State) -> c_int {
     let _ = L;
-    send_lua_command(AppCommand::ReloadPlugins);
-    0
+    send_lua_command(L, AppCommand::ReloadPlugins)
 }
 
 unsafe extern "C" fn native_join_channel(L: *mut lua_State) -> c_int {
@@ -2707,8 +2719,7 @@ unsafe extern "C" fn native_join_channel(L: *mut lua_State) -> c_int {
     let Some(channel) = channel_from_value(L, 1) else {
         return 0;
     };
-    send_lua_command(AppCommand::JoinChannel { channel });
-    0
+    send_lua_command(L, AppCommand::JoinChannel { channel })
 }
 
 unsafe extern "C" fn native_join_irc_channel(L: *mut lua_State) -> c_int {
@@ -2724,7 +2735,7 @@ unsafe extern "C" fn native_join_irc_channel(L: *mut lua_State) -> c_int {
         None
     };
     if channel.is_irc() {
-        send_lua_command(AppCommand::JoinIrcChannel { channel, key });
+        return send_lua_command(L, AppCommand::JoinIrcChannel { channel, key });
     }
     0
 }
@@ -2736,8 +2747,7 @@ unsafe extern "C" fn native_leave_channel(L: *mut lua_State) -> c_int {
     let Some(channel) = channel_from_value(L, 1) else {
         return 0;
     };
-    send_lua_command(AppCommand::LeaveChannel { channel });
-    0
+    send_lua_command(L, AppCommand::LeaveChannel { channel })
 }
 
 unsafe extern "C" fn native_send_whisper(L: *mut lua_State) -> c_int {
@@ -2750,8 +2760,7 @@ unsafe extern "C" fn native_send_whisper(L: *mut lua_State) -> c_int {
     let Some(text) = lua_value_string(L, 2) else {
         return 0;
     };
-    send_lua_command(AppCommand::SendWhisper { target_login, text });
-    0
+    send_lua_command(L, AppCommand::SendWhisper { target_login, text })
 }
 
 unsafe extern "C" fn native_show_user_card(L: *mut lua_State) -> c_int {
@@ -2764,8 +2773,7 @@ unsafe extern "C" fn native_show_user_card(L: *mut lua_State) -> c_int {
     let Some(channel) = channel_from_value(L, 2) else {
         return 0;
     };
-    send_lua_command(AppCommand::ShowUserCard { login, channel });
-    0
+    send_lua_command(L, AppCommand::ShowUserCard { login, channel })
 }
 
 unsafe extern "C" fn native_fetch_image(L: *mut lua_State) -> c_int {
@@ -2775,8 +2783,7 @@ unsafe extern "C" fn native_fetch_image(L: *mut lua_State) -> c_int {
     let Some(url) = lua_value_string(L, 1) else {
         return 0;
     };
-    send_lua_command(AppCommand::FetchImage { url });
-    0
+    send_lua_command(L, AppCommand::FetchImage { url })
 }
 
 unsafe extern "C" fn native_fetch_link_preview(L: *mut lua_State) -> c_int {
@@ -2786,8 +2793,7 @@ unsafe extern "C" fn native_fetch_link_preview(L: *mut lua_State) -> c_int {
     let Some(url) = lua_value_string(L, 1) else {
         return 0;
     };
-    send_lua_command(AppCommand::FetchLinkPreview { url });
-    0
+    send_lua_command(L, AppCommand::FetchLinkPreview { url })
 }
 
 unsafe extern "C" fn native_load_channel_emotes(L: *mut lua_State) -> c_int {
@@ -2797,8 +2803,7 @@ unsafe extern "C" fn native_load_channel_emotes(L: *mut lua_State) -> c_int {
     let Some(channel_twitch_id) = lua_value_string(L, 1) else {
         return 0;
     };
-    send_lua_command(AppCommand::LoadChannelEmotes { channel_twitch_id });
-    0
+    send_lua_command(L, AppCommand::LoadChannelEmotes { channel_twitch_id })
 }
 
 unsafe extern "C" fn native_fetch_stream_status(L: *mut lua_State) -> c_int {
@@ -2808,8 +2813,7 @@ unsafe extern "C" fn native_fetch_stream_status(L: *mut lua_State) -> c_int {
     let Some(login) = lua_value_string(L, 1) else {
         return 0;
     };
-    send_lua_command(AppCommand::FetchStreamStatus { login });
-    0
+    send_lua_command(L, AppCommand::FetchStreamStatus { login })
 }
 
 unsafe extern "C" fn native_fetch_user_profile(L: *mut lua_State) -> c_int {
@@ -2819,8 +2823,7 @@ unsafe extern "C" fn native_fetch_user_profile(L: *mut lua_State) -> c_int {
     let Some(login) = lua_value_string(L, 1) else {
         return 0;
     };
-    send_lua_command(AppCommand::FetchUserProfile { login });
-    0
+    send_lua_command(L, AppCommand::FetchUserProfile { login })
 }
 
 unsafe extern "C" fn native_fetch_ivr_logs(L: *mut lua_State) -> c_int {
@@ -2833,8 +2836,7 @@ unsafe extern "C" fn native_fetch_ivr_logs(L: *mut lua_State) -> c_int {
     let Some(username) = lua_value_string(L, 2) else {
         return 0;
     };
-    send_lua_command(AppCommand::FetchIvrLogs { channel, username, request_id: None });
-    0
+    send_lua_command(L, AppCommand::FetchIvrLogs { channel, username, request_id: None })
 }
 
 unsafe extern "C" fn native_load_older_local_history(L: *mut lua_State) -> c_int {
@@ -2846,13 +2848,12 @@ unsafe extern "C" fn native_load_older_local_history(L: *mut lua_State) -> c_int
     };
     let before_ts_ms = lua_value_int(L, 2).unwrap_or(0);
     let limit = lua_value_int(L, 3).unwrap_or(100).max(0) as usize;
-    send_lua_command(AppCommand::LoadOlderLocalHistory {
+    send_lua_command(L, AppCommand::LoadOlderLocalHistory {
         channel,
         before_ts_ms,
         before_row_id: if lua_gettop(L) >= 4 { lua_value_int(L, 4) } else { None },
         limit,
-    });
-    0
+    })
 }
 
 unsafe extern "C" fn native_login(L: *mut lua_State) -> c_int {
@@ -2862,14 +2863,12 @@ unsafe extern "C" fn native_login(L: *mut lua_State) -> c_int {
     let Some(token) = lua_value_string(L, 1) else {
         return 0;
     };
-    send_lua_command(AppCommand::Login { token });
-    0
+    send_lua_command(L, AppCommand::Login { token })
 }
 
 unsafe extern "C" fn native_logout(L: *mut lua_State) -> c_int {
     let _ = L;
-    send_lua_command(AppCommand::Logout);
-    0
+    send_lua_command(L, AppCommand::Logout)
 }
 
 unsafe extern "C" fn native_add_account(L: *mut lua_State) -> c_int {
@@ -2879,8 +2878,7 @@ unsafe extern "C" fn native_add_account(L: *mut lua_State) -> c_int {
     let Some(token) = lua_value_string(L, 1) else {
         return 0;
     };
-    send_lua_command(AppCommand::AddAccount { token });
-    0
+    send_lua_command(L, AppCommand::AddAccount { token })
 }
 
 unsafe extern "C" fn native_switch_account(L: *mut lua_State) -> c_int {
@@ -2890,8 +2888,7 @@ unsafe extern "C" fn native_switch_account(L: *mut lua_State) -> c_int {
     let Some(username) = lua_value_string(L, 1) else {
         return 0;
     };
-    send_lua_command(AppCommand::SwitchAccount { username });
-    0
+    send_lua_command(L, AppCommand::SwitchAccount { username })
 }
 
 unsafe extern "C" fn native_remove_account(L: *mut lua_State) -> c_int {
@@ -2901,20 +2898,17 @@ unsafe extern "C" fn native_remove_account(L: *mut lua_State) -> c_int {
     let Some(username) = lua_value_string(L, 1) else {
         return 0;
     };
-    send_lua_command(AppCommand::RemoveAccount { username });
-    0
+    send_lua_command(L, AppCommand::RemoveAccount { username })
 }
 
 unsafe extern "C" fn native_set_default_account(L: *mut lua_State) -> c_int {
     let username = lua_value_string(L, 1).unwrap_or_default();
-    send_lua_command(AppCommand::SetDefaultAccount { username });
-    0
+    send_lua_command(L, AppCommand::SetDefaultAccount { username })
 }
 
 unsafe extern "C" fn native_refresh_auth(L: *mut lua_State) -> c_int {
     let _ = L;
-    send_lua_command(AppCommand::RefreshAuth);
-    0
+    send_lua_command(L, AppCommand::RefreshAuth)
 }
 
 unsafe extern "C" fn native_set_irc_nick(L: *mut lua_State) -> c_int {
@@ -2924,8 +2918,7 @@ unsafe extern "C" fn native_set_irc_nick(L: *mut lua_State) -> c_int {
     let Some(nick) = lua_value_string(L, 1) else {
         return 0;
     };
-    send_lua_command(AppCommand::SetIrcNick { nick });
-    0
+    send_lua_command(L, AppCommand::SetIrcNick { nick })
 }
 
 unsafe extern "C" fn native_set_irc_auth(L: *mut lua_State) -> c_int {
@@ -2938,27 +2931,24 @@ unsafe extern "C" fn native_set_irc_auth(L: *mut lua_State) -> c_int {
     let Some(nickserv_pass) = lua_value_string(L, 2) else {
         return 0;
     };
-    send_lua_command(AppCommand::SetIrcAuth {
+    send_lua_command(L, AppCommand::SetIrcAuth {
         nickserv_user,
         nickserv_pass,
-    });
-    0
+    })
 }
 
 unsafe extern "C" fn native_set_beta_features(L: *mut lua_State) -> c_int {
     let kick_enabled = lua_table_bool(L, 1, "kick_enabled", false);
     let irc_enabled = lua_table_bool(L, 1, "irc_enabled", false);
-    send_lua_command(AppCommand::SetBetaFeatures {
+    send_lua_command(L, AppCommand::SetBetaFeatures {
         kick_enabled,
         irc_enabled,
-    });
-    0
+    })
 }
 
 unsafe extern "C" fn native_set_always_on_top(L: *mut lua_State) -> c_int {
     let enabled = lua_value_bool(L, 1).unwrap_or(false);
-    send_lua_command(AppCommand::SetAlwaysOnTop { enabled });
-    0
+    send_lua_command(L, AppCommand::SetAlwaysOnTop { enabled })
 }
 
 unsafe extern "C" fn native_set_theme(L: *mut lua_State) -> c_int {
@@ -2968,8 +2958,7 @@ unsafe extern "C" fn native_set_theme(L: *mut lua_State) -> c_int {
     let Some(theme) = lua_value_string(L, 1) else {
         return 0;
     };
-    send_lua_command(AppCommand::SetTheme { theme });
-    0
+    send_lua_command(L, AppCommand::SetTheme { theme })
 }
 
 unsafe extern "C" fn native_set_chat_ui_behavior(L: *mut lua_State) -> c_int {
@@ -2978,13 +2967,12 @@ unsafe extern "C" fn native_set_chat_ui_behavior(L: *mut lua_State) -> c_int {
     let collapse_long_messages = lua_table_bool(L, 1, "collapse_long_messages", false);
     let collapse_long_message_lines = lua_table_usize(L, 1, "collapse_long_message_lines", 1);
     let animations_when_focused = lua_table_bool(L, 1, "animations_when_focused", false);
-    send_lua_command(AppCommand::SetChatUiBehavior {
+    send_lua_command(L, AppCommand::SetChatUiBehavior {
         prevent_overlong_twitch_messages,
         collapse_long_messages,
         collapse_long_message_lines,
         animations_when_focused,
-    });
-    0
+    })
 }
 
 unsafe extern "C" fn native_set_general_settings(L: *mut lua_State) -> c_int {
@@ -2995,7 +2983,7 @@ unsafe extern "C" fn native_set_general_settings(L: *mut lua_State) -> c_int {
     let auto_join = lua_table_string_list(L, 1, "auto_join");
     let highlights = lua_table_string_list(L, 1, "highlights");
     let ignores = lua_table_string_list(L, 1, "ignores");
-    send_lua_command(AppCommand::SetGeneralSettings {
+    send_lua_command(L, AppCommand::SetGeneralSettings {
         show_timestamps,
         show_timestamp_seconds,
         use_24h_timestamps,
@@ -3003,8 +2991,7 @@ unsafe extern "C" fn native_set_general_settings(L: *mut lua_State) -> c_int {
         auto_join,
         highlights,
         ignores,
-    });
-    0
+    })
 }
 
 unsafe extern "C" fn native_set_slash_usage_counts(L: *mut lua_State) -> c_int {
@@ -3033,21 +3020,19 @@ unsafe extern "C" fn native_set_slash_usage_counts(L: *mut lua_State) -> c_int {
             }
         }
         lua_pop(L, 1);
-        send_lua_command(AppCommand::SetSlashUsageCounts { usage_counts });
+        send_lua_command(L, AppCommand::SetSlashUsageCounts { usage_counts })
     }
-    0
 }
 
 unsafe extern "C" fn native_set_emote_picker_preferences(L: *mut lua_State) -> c_int {
     let favorites = lua_table_string_list(L, 1, "favorites");
     let recent = lua_table_string_list(L, 1, "recent");
     let provider_boost = lua_table_string(L, 1, "provider_boost");
-    send_lua_command(AppCommand::SetEmotePickerPreferences {
+    send_lua_command(L, AppCommand::SetEmotePickerPreferences {
         favorites,
         recent,
         provider_boost,
-    });
-    0
+    })
 }
 
 unsafe extern "C" fn native_set_appearance_settings(L: *mut lua_State) -> c_int {
@@ -3062,7 +3047,7 @@ unsafe extern "C" fn native_set_appearance_settings(L: *mut lua_State) -> c_int 
     let split_header_show_game = lua_table_bool(L, 1, "split_header_show_game", true);
     let split_header_show_viewer_count =
         lua_table_bool(L, 1, "split_header_show_viewer_count", false);
-    send_lua_command(AppCommand::SetAppearanceSettings {
+    send_lua_command(L, AppCommand::SetAppearanceSettings {
         channel_layout,
         sidebar_visible,
         analytics_visible,
@@ -3073,8 +3058,7 @@ unsafe extern "C" fn native_set_appearance_settings(L: *mut lua_State) -> c_int 
         split_header_show_title,
         split_header_show_game,
         split_header_show_viewer_count,
-    });
-    0
+    })
 }
 
 unsafe extern "C" fn native_set_highlight_rules(L: *mut lua_State) -> c_int {
@@ -3120,8 +3104,7 @@ unsafe extern "C" fn native_set_highlight_rules(L: *mut lua_State) -> c_int {
             lua_pop(L, 1);
         }
     }
-    send_lua_command(AppCommand::SetHighlightRules { rules });
-    0
+    send_lua_command(L, AppCommand::SetHighlightRules { rules })
 }
 
 unsafe extern "C" fn native_set_filter_records(L: *mut lua_State) -> c_int {
@@ -3165,8 +3148,7 @@ unsafe extern "C" fn native_set_filter_records(L: *mut lua_State) -> c_int {
             lua_pop(L, 1);
         }
     }
-    send_lua_command(AppCommand::SetFilterRecords { records });
-    0
+    send_lua_command(L, AppCommand::SetFilterRecords { records })
 }
 
 unsafe extern "C" fn native_set_mod_action_presets(L: *mut lua_State) -> c_int {
@@ -3186,17 +3168,15 @@ unsafe extern "C" fn native_set_mod_action_presets(L: *mut lua_State) -> c_int {
             lua_pop(L, 1);
         }
     }
-    send_lua_command(AppCommand::SetModActionPresets { presets });
-    0
+    send_lua_command(L, AppCommand::SetModActionPresets { presets })
 }
 
 unsafe extern "C" fn native_set_notification_settings(L: *mut lua_State) -> c_int {
     let desktop_notifications_enabled =
         lua_table_bool(L, 1, "desktop_notifications_enabled", false);
-    send_lua_command(AppCommand::SetNotificationSettings {
+    send_lua_command(L, AppCommand::SetNotificationSettings {
         desktop_notifications_enabled,
-    });
-    0
+    })
 }
 
 unsafe extern "C" fn native_timeout_user(L: *mut lua_State) -> c_int {
@@ -3214,14 +3194,13 @@ unsafe extern "C" fn native_timeout_user(L: *mut lua_State) -> c_int {
     };
     let seconds = lua_value_int(L, 4).unwrap_or(0).max(0) as u32;
     let reason = lua_value_string(L, 5);
-    send_lua_command(AppCommand::TimeoutUser {
+    send_lua_command(L, AppCommand::TimeoutUser {
         channel,
         login,
         user_id,
         seconds,
         reason,
-    });
-    0
+    })
 }
 
 unsafe extern "C" fn native_ban_user(L: *mut lua_State) -> c_int {
@@ -3238,13 +3217,12 @@ unsafe extern "C" fn native_ban_user(L: *mut lua_State) -> c_int {
         return 0;
     };
     let reason = lua_value_string(L, 4);
-    send_lua_command(AppCommand::BanUser {
+    send_lua_command(L, AppCommand::BanUser {
         channel,
         login,
         user_id,
         reason,
-    });
-    0
+    })
 }
 
 unsafe extern "C" fn native_unban_user(L: *mut lua_State) -> c_int {
@@ -3260,12 +3238,11 @@ unsafe extern "C" fn native_unban_user(L: *mut lua_State) -> c_int {
     let Some(user_id) = lua_value_string(L, 3) else {
         return 0;
     };
-    send_lua_command(AppCommand::UnbanUser {
+    send_lua_command(L, AppCommand::UnbanUser {
         channel,
         login,
         user_id,
-    });
-    0
+    })
 }
 
 unsafe extern "C" fn native_warn_user(L: *mut lua_State) -> c_int {
@@ -3284,13 +3261,12 @@ unsafe extern "C" fn native_warn_user(L: *mut lua_State) -> c_int {
     let Some(reason) = lua_value_string(L, 4) else {
         return 0;
     };
-    send_lua_command(AppCommand::WarnUser {
+    send_lua_command(L, AppCommand::WarnUser {
         channel,
         login,
         user_id,
         reason,
-    });
-    0
+    })
 }
 
 unsafe extern "C" fn native_set_suspicious_user(L: *mut lua_State) -> c_int {
@@ -3307,13 +3283,12 @@ unsafe extern "C" fn native_set_suspicious_user(L: *mut lua_State) -> c_int {
         return 0;
     };
     let restricted = lua_value_bool(L, 4).unwrap_or(false);
-    send_lua_command(AppCommand::SetSuspiciousUser {
+    send_lua_command(L, AppCommand::SetSuspiciousUser {
         channel,
         login,
         user_id,
         restricted,
-    });
-    0
+    })
 }
 
 unsafe extern "C" fn native_clear_suspicious_user(L: *mut lua_State) -> c_int {
@@ -3329,12 +3304,11 @@ unsafe extern "C" fn native_clear_suspicious_user(L: *mut lua_State) -> c_int {
     let Some(user_id) = lua_value_string(L, 3) else {
         return 0;
     };
-    send_lua_command(AppCommand::ClearSuspiciousUser {
+    send_lua_command(L, AppCommand::ClearSuspiciousUser {
         channel,
         login,
         user_id,
-    });
-    0
+    })
 }
 
 unsafe extern "C" fn native_resolve_automod_message(L: *mut lua_State) -> c_int {
@@ -3351,13 +3325,12 @@ unsafe extern "C" fn native_resolve_automod_message(L: *mut lua_State) -> c_int 
         return 0;
     };
     let action = lua_value_string(L, 4).unwrap_or_else(|| "ALLOW".to_owned());
-    send_lua_command(AppCommand::ResolveAutoModMessage {
+    send_lua_command(L, AppCommand::ResolveAutoModMessage {
         channel,
         message_id,
         sender_user_id,
         action,
-    });
-    0
+    })
 }
 
 unsafe extern "C" fn native_fetch_unban_requests(L: *mut lua_State) -> c_int {
@@ -3367,8 +3340,7 @@ unsafe extern "C" fn native_fetch_unban_requests(L: *mut lua_State) -> c_int {
     let Some(channel) = channel_from_value(L, 1) else {
         return 0;
     };
-    send_lua_command(AppCommand::FetchUnbanRequests { channel });
-    0
+    send_lua_command(L, AppCommand::FetchUnbanRequests { channel })
 }
 
 unsafe extern "C" fn native_resolve_unban_request(L: *mut lua_State) -> c_int {
@@ -3383,13 +3355,12 @@ unsafe extern "C" fn native_resolve_unban_request(L: *mut lua_State) -> c_int {
     };
     let approve = lua_value_bool(L, 3).unwrap_or(false);
     let resolution_text = lua_value_string(L, 4);
-    send_lua_command(AppCommand::ResolveUnbanRequest {
+    send_lua_command(L, AppCommand::ResolveUnbanRequest {
         channel,
         request_id,
         approve,
         resolution_text,
-    });
-    0
+    })
 }
 
 unsafe extern "C" fn native_open_moderation_tools(L: *mut lua_State) -> c_int {
@@ -3398,8 +3369,7 @@ unsafe extern "C" fn native_open_moderation_tools(L: *mut lua_State) -> c_int {
     } else {
         None
     };
-    send_lua_command(AppCommand::OpenModerationTools { channel });
-    0
+    send_lua_command(L, AppCommand::OpenModerationTools { channel })
 }
 
 unsafe extern "C" fn native_update_reward_redemption_status(L: *mut lua_State) -> c_int {
@@ -3424,15 +3394,14 @@ unsafe extern "C" fn native_update_reward_redemption_status(L: *mut lua_State) -
     let Some(reward_title) = lua_value_string(L, 6) else {
         return 0;
     };
-    send_lua_command(AppCommand::UpdateRewardRedemptionStatus {
+    send_lua_command(L, AppCommand::UpdateRewardRedemptionStatus {
         channel,
         reward_id,
         redemption_id,
         status,
         user_login,
         reward_title,
-    });
-    0
+    })
 }
 
 unsafe extern "C" fn native_delete_message(L: *mut lua_State) -> c_int {
@@ -3445,11 +3414,10 @@ unsafe extern "C" fn native_delete_message(L: *mut lua_State) -> c_int {
     let Some(message_id) = lua_value_string(L, 2) else {
         return 0;
     };
-    send_lua_command(AppCommand::DeleteMessage {
+    send_lua_command(L, AppCommand::DeleteMessage {
         channel,
         message_id,
-    });
-    0
+    })
 }
 
 unsafe extern "C" fn native_clear_user_messages_locally(L: *mut lua_State) -> c_int {
@@ -3462,8 +3430,7 @@ unsafe extern "C" fn native_clear_user_messages_locally(L: *mut lua_State) -> c_
     let Some(login) = lua_value_string(L, 2) else {
         return 0;
     };
-    send_lua_command(AppCommand::ClearUserMessagesLocally { channel, login });
-    0
+    send_lua_command(L, AppCommand::ClearUserMessagesLocally { channel, login })
 }
 
 unsafe extern "C" fn native_create_poll(L: *mut lua_State) -> c_int {
@@ -3479,14 +3446,13 @@ unsafe extern "C" fn native_create_poll(L: *mut lua_State) -> c_int {
     let choices = lua_array_string_list(L, 3);
     let duration_secs = lua_value_int(L, 4).unwrap_or(0).max(0) as u32;
     let channel_points_per_vote = lua_value_int(L, 5).map(|v| v.max(0) as u32);
-    send_lua_command(AppCommand::CreatePoll {
+    send_lua_command(L, AppCommand::CreatePoll {
         channel,
         title,
         choices,
         duration_secs,
         channel_points_per_vote,
-    });
-    0
+    })
 }
 
 unsafe extern "C" fn native_end_poll(L: *mut lua_State) -> c_int {
@@ -3499,8 +3465,7 @@ unsafe extern "C" fn native_end_poll(L: *mut lua_State) -> c_int {
     let Some(status) = lua_value_string(L, 2) else {
         return 0;
     };
-    send_lua_command(AppCommand::EndPoll { channel, status });
-    0
+    send_lua_command(L, AppCommand::EndPoll { channel, status })
 }
 
 unsafe extern "C" fn native_create_prediction(L: *mut lua_State) -> c_int {
@@ -3515,13 +3480,12 @@ unsafe extern "C" fn native_create_prediction(L: *mut lua_State) -> c_int {
     };
     let outcomes = lua_array_string_list(L, 3);
     let duration_secs = lua_value_int(L, 4).unwrap_or(0).max(0) as u32;
-    send_lua_command(AppCommand::CreatePrediction {
+    send_lua_command(L, AppCommand::CreatePrediction {
         channel,
         title,
         outcomes,
         duration_secs,
-    });
-    0
+    })
 }
 
 unsafe extern "C" fn native_lock_prediction(L: *mut lua_State) -> c_int {
@@ -3531,8 +3495,7 @@ unsafe extern "C" fn native_lock_prediction(L: *mut lua_State) -> c_int {
     let Some(channel) = channel_from_value(L, 1) else {
         return 0;
     };
-    send_lua_command(AppCommand::LockPrediction { channel });
-    0
+    send_lua_command(L, AppCommand::LockPrediction { channel })
 }
 
 unsafe extern "C" fn native_resolve_prediction(L: *mut lua_State) -> c_int {
@@ -3543,11 +3506,10 @@ unsafe extern "C" fn native_resolve_prediction(L: *mut lua_State) -> c_int {
         return 0;
     };
     let winning_outcome_index = lua_value_int(L, 2).unwrap_or(1).max(1) as usize;
-    send_lua_command(AppCommand::ResolvePrediction {
+    send_lua_command(L, AppCommand::ResolvePrediction {
         channel,
         winning_outcome_index,
-    });
-    0
+    })
 }
 
 unsafe extern "C" fn native_cancel_prediction(L: *mut lua_State) -> c_int {
@@ -3557,8 +3519,7 @@ unsafe extern "C" fn native_cancel_prediction(L: *mut lua_State) -> c_int {
     let Some(channel) = channel_from_value(L, 1) else {
         return 0;
     };
-    send_lua_command(AppCommand::CancelPrediction { channel });
-    0
+    send_lua_command(L, AppCommand::CancelPrediction { channel })
 }
 
 unsafe extern "C" fn native_start_commercial(L: *mut lua_State) -> c_int {
@@ -3569,11 +3530,10 @@ unsafe extern "C" fn native_start_commercial(L: *mut lua_State) -> c_int {
         return 0;
     };
     let length_secs = lua_value_int(L, 2).unwrap_or(0).max(0) as u32;
-    send_lua_command(AppCommand::StartCommercial {
+    send_lua_command(L, AppCommand::StartCommercial {
         channel,
         length_secs,
-    });
-    0
+    })
 }
 
 unsafe extern "C" fn native_create_stream_marker(L: *mut lua_State) -> c_int {
@@ -3584,11 +3544,10 @@ unsafe extern "C" fn native_create_stream_marker(L: *mut lua_State) -> c_int {
         return 0;
     };
     let description = lua_value_string(L, 2);
-    send_lua_command(AppCommand::CreateStreamMarker {
+    send_lua_command(L, AppCommand::CreateStreamMarker {
         channel,
         description,
-    });
-    0
+    })
 }
 
 unsafe extern "C" fn native_send_announcement(L: *mut lua_State) -> c_int {
@@ -3602,12 +3561,11 @@ unsafe extern "C" fn native_send_announcement(L: *mut lua_State) -> c_int {
         return 0;
     };
     let color = lua_value_string(L, 3);
-    send_lua_command(AppCommand::SendAnnouncement {
+    send_lua_command(L, AppCommand::SendAnnouncement {
         channel,
         message,
         color,
-    });
-    0
+    })
 }
 
 unsafe extern "C" fn native_send_shoutout(L: *mut lua_State) -> c_int {
@@ -3620,11 +3578,10 @@ unsafe extern "C" fn native_send_shoutout(L: *mut lua_State) -> c_int {
     let Some(target_login) = lua_value_string(L, 2) else {
         return 0;
     };
-    send_lua_command(AppCommand::SendShoutout {
+    send_lua_command(L, AppCommand::SendShoutout {
         channel,
         target_login,
-    });
-    0
+    })
 }
 
 fn make_command_context(
@@ -3967,6 +3924,7 @@ fn push_emote_catalog_entry_table(L: *mut lua_State, emote: &EmoteCatalogEntry) 
         set_field_string(L, -1, "id", &emote.id);
         set_field_string(L, -1, "code", &emote.code);
         set_field_string(L, -1, "provider", &emote.provider);
+        set_field_bool(L, -1, "zero_width", emote.zero_width);
         set_field_string(L, -1, "url", &emote.url);
         set_field_string(L, -1, "scope", &emote.scope);
         if let Some(url) = &emote.url_hd {
@@ -3997,6 +3955,7 @@ fn push_span_table(L: *mut lua_State, span: &Span) {
                 url,
                 url_hd,
                 provider,
+                zero_width,
             } => {
                 set_field_string(L, -1, "type", "Emote");
                 set_field_string(L, -1, "id", id);
@@ -4006,6 +3965,7 @@ fn push_span_table(L: *mut lua_State, span: &Span) {
                     set_field_string(L, -1, "url_hd", url_hd);
                 }
                 set_field_string(L, -1, "provider", provider);
+                set_field_bool(L, -1, "zero_width", *zero_width);
             }
             Span::Emoji { text, url } => {
                 set_field_string(L, -1, "type", "Emoji");
@@ -5202,7 +5162,7 @@ fn event_kind(event: &AppEvent) -> Option<PluginEventKind> {
         // Mentions-tab restore is an internal UI-state event; not surfaced
         // to plugins (individual mention messages already arrive via the
         // normal MessageReceived dispatch path).
-        AppEvent::MentionsLoaded { .. } => return None,
+        AppEvent::MentionsLoaded { .. } | AppEvent::HistoryModerationLoaded { .. } => return None,
         AppEvent::HotkeyBindingsUpdated { .. } => PluginEventKind::HotkeyBindingsUpdated,
         // Spell dictionary edits are a pure UI/settings concern - not
         // surfaced to plugins.
@@ -5297,10 +5257,16 @@ unsafe fn make_event_table(L: *mut lua_State, event: &AppEvent) -> c_int {
         AppEvent::ChannelJoined { channel }
         | AppEvent::ChannelParted { channel }
         | AppEvent::ChannelMessagesCleared { channel }
-        | AppEvent::ChannelChatCleared { channel }
         | AppEvent::ClearUserMessagesLocally { channel, .. } => {
             push_channel_table(L, channel);
             lua_setfield(L, -2, cstring("channel").as_ptr());
+        }
+        AppEvent::ChannelChatCleared { channel, timestamp } => {
+            push_channel_table(L, channel);
+            lua_setfield(L, -2, cstring("channel").as_ptr());
+            if let Some(timestamp) = timestamp {
+                set_field_string(L, -1, "timestamp", &timestamp.to_rfc3339());
+            }
         }
         AppEvent::ChannelRedirected {
             old_channel,
@@ -5353,10 +5319,16 @@ unsafe fn make_event_table(L: *mut lua_State, event: &AppEvent) -> c_int {
             lua_setfield(L, -2, cstring("channel").as_ptr());
             set_field_string(L, -1, "server_id", server_id);
         }
-        AppEvent::UserMessagesCleared { channel, login } => {
+        AppEvent::UserMessagesCleared { channel, login, user_id, timestamp } => {
             push_channel_table(L, channel);
             lua_setfield(L, -2, cstring("channel").as_ptr());
             set_field_string(L, -1, "login", login);
+            if let Some(user_id) = user_id {
+                set_field_string(L, -1, "user_id", user_id);
+            }
+            if let Some(timestamp) = timestamp {
+                set_field_string(L, -1, "timestamp", &timestamp.to_rfc3339());
+            }
         }
         AppEvent::LowTrustStatusUpdated {
             channel,
@@ -6091,7 +6063,7 @@ unsafe fn make_event_table(L: *mut lua_State, event: &AppEvent) -> c_int {
         | AppEvent::LiveFeedError { .. }
         | AppEvent::LiveFeedPartialUpdate { .. } => {}
         // Mentions-tab restore event is not surfaced to plugins.
-        AppEvent::MentionsLoaded { .. } => {}
+        AppEvent::MentionsLoaded { .. } | AppEvent::HistoryModerationLoaded { .. } => {}
         // Tab visibility rules are UI-only state; not exposed to plugins.
         AppEvent::TabVisibilityRulesUpdated { .. } => {}
         // Command alias edits are an internal UI concern; not surfaced to plugins.
@@ -6496,6 +6468,7 @@ mod tests {
                     code: "Kappa".to_owned(),
                     provider: "twitch".to_owned(),
                     url: "https://example.invalid/kappa.png".to_owned(),
+                    zero_width: false,
                     url_hd: None,
                     scope: "global".to_owned(),
                     channel: None,
@@ -6506,6 +6479,7 @@ mod tests {
                     code: "Pog".to_owned(),
                     provider: "7tv".to_owned(),
                     url: "https://example.invalid/pog.png".to_owned(),
+                    zero_width: false,
                     url_hd: None,
                     scope: "channel".to_owned(),
                     channel: Some(ChannelId::new("some_channel")),
@@ -6534,6 +6508,7 @@ mod tests {
             code: "Hello".into(),
             provider: "7tv".into(),
             url: "https://example.invalid/hello.webp".into(),
+            zero_width: false,
             url_hd: Some("https://example.invalid/hello-4x.webp".into()),
             scope: "personal".into(),
             channel: None,
@@ -6545,12 +6520,23 @@ mod tests {
     }
 
     #[test]
+    fn restored_moderation_is_not_a_live_plugin_event() {
+        let channel = ChannelId::new("room");
+        assert!(event_kind(&AppEvent::HistoryModerationLoaded {
+            channel: channel.clone(),
+            actions: vec![crust_core::model::ModerationAction::message(channel, "old-message".into())],
+        }).is_none());
+    }
+
+    #[test]
     fn event_table_builds_user_messages_cleared_payload() {
         let _guard = test_scope();
         let lua = LuaStateGuard::new();
         let event = AppEvent::UserMessagesCleared {
             channel: ChannelId::new("some_channel"),
             login: "alice".to_owned(),
+            user_id: Some("10".into()),
+            timestamp: chrono::DateTime::from_timestamp_millis(1000),
         };
         let idx = unsafe { make_event_table(lua.ptr(), &event) };
 
@@ -6562,6 +6548,8 @@ mod tests {
             lua_get_string_field(lua.ptr(), idx, "login").as_deref(),
             Some("alice")
         );
+        assert_eq!(lua_get_string_field(lua.ptr(), idx, "user_id").as_deref(), Some("10"));
+        assert_eq!(lua_get_string_field(lua.ptr(), idx, "timestamp").as_deref(), Some("1970-01-01T00:00:01+00:00"));
     }
 
     #[test]
@@ -7558,6 +7546,99 @@ end)
             "ui_settings_demo_plugin should load: {statuses:#?}"
         );
 
+    }
+
+    #[tokio::test]
+    async fn plugin_commands_reject_full_queues_without_blocking_async_callbacks() {
+        let _guard = test_scope();
+        let plugin_dir = LuaPluginHost::plugin_root_dir().join("command_queue_probe");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::write(
+            plugin_dir.join("info.json"),
+            r#"{"name":"command_queue_probe","version":"0.1.0","entry":"init.lua"}"#,
+        )
+        .unwrap();
+        fs::write(
+            plugin_dir.join("init.lua"),
+            r#"
+c2.register_callback(c2.EventType.Authenticated, function(ev)
+  local accepted, reason
+  if ev.username == "message" then
+    accepted, reason = c2.send_message("room", "keep this draft", {
+      reply_to_msg_id = "parent-123"
+    })
+  else
+    accepted, reason = c2.ban_user("room", "viewer", "42", "test reason")
+  end
+  _G.command_queue_probe = { accepted = accepted, reason = reason, completed = true }
+end)
+"#,
+        )
+        .unwrap();
+        let (commands, mut received) = mpsc::channel(1);
+        let host = LuaPluginHost::new(commands.clone(), true);
+        assert!(host.plugin_statuses().iter().any(|status| status.loaded));
+        let vm = host.runtime_by_index(0).unwrap().lock().unwrap().vm;
+        let outcome = || unsafe {
+            let top = lua_gettop(vm);
+            lua_getglobal(vm, cstring("command_queue_probe").as_ptr());
+            assert_eq!(lua_type(vm, -1), LUA_TTABLE);
+            lua_getfield(vm, -1, cstring("accepted").as_ptr());
+            let accepted = lua_value_bool(vm, -1);
+            lua_pop(vm, 1);
+            let reason = lua_get_string_field(vm, -1, "reason");
+            let completed = lua_table_bool(vm, -1, "completed", false);
+            lua_settop(vm, top);
+            (accepted, reason, completed)
+        };
+
+        for action in ["message", "moderation"] {
+            let event = AppEvent::Authenticated {
+                username: action.into(),
+                user_id: "10".into(),
+            };
+            commands.try_send(AppCommand::Logout).unwrap();
+            // Dispatch has the same async context as the runtime event bridge.
+            // A blocking send here would panic inside the native Lua callback.
+            host.dispatch_event(&event);
+            let (accepted, reason, completed) = outcome();
+            assert_eq!(accepted, None);
+            assert_eq!(reason.as_deref(), Some(PluginCommandError::Full.message()));
+            assert!(completed, "the callback must continue after admission fails");
+            assert!(matches!(received.try_recv().unwrap(), AppCommand::Logout));
+            assert!(received.try_recv().is_err(), "rejected work must not replay later");
+
+            host.dispatch_event(&event);
+            assert_eq!(outcome(), (Some(true), None, true));
+            match received.try_recv().unwrap() {
+                AppCommand::SendMessage { channel, text, reply_to_msg_id, reply } => {
+                    assert_eq!(action, "message");
+                    assert_eq!(channel, ChannelId::new("room"));
+                    assert_eq!(text, "keep this draft");
+                    assert_eq!(reply_to_msg_id.as_deref(), Some("parent-123"));
+                    assert!(reply.is_none());
+                }
+                AppCommand::BanUser { channel, login, user_id, reason } => {
+                    assert_eq!(action, "moderation");
+                    assert_eq!(channel, ChannelId::new("room"));
+                    assert_eq!(login, "viewer");
+                    assert_eq!(user_id, "42");
+                    assert_eq!(reason.as_deref(), Some("test reason"));
+                }
+                other => panic!("unexpected retried command: {other:?}"),
+            }
+            assert!(received.try_recv().is_err());
+        }
+
+        drop(received);
+        host.dispatch_event(&AppEvent::Authenticated {
+            username: "message".into(),
+            user_id: "10".into(),
+        });
+        assert_eq!(
+            outcome(),
+            (None, Some(PluginCommandError::Closed.message().into()), true)
+        );
     }
 
     #[test]

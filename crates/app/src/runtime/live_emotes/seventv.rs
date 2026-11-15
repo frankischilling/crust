@@ -176,16 +176,27 @@ fn decode_dispatch(dispatch: &Value) -> Option<Frame> {
                         None
                     };
                     if let Some(emote) = parse_7tv_emote(value.clone()) {
-                        deltas.push(EmoteDelta::Upsert { emote, old_code });
+                        deltas.push(EmoteDelta::Upsert {
+                            emote, old_code,
+                            preserve_overlay: field == "updated" && value.get("flags").is_none(),
+                        });
                     } else if field == "updated" {
-                        if let (Some(emote_id), Some(name)) = (
-                            value.get("id").and_then(id),
-                            value.get("name").and_then(code),
-                        ) {
+                        let Some(emote_id) = value.get("id").or_else(|| previous.get("id")).and_then(id) else {
+                            continue;
+                        };
+                        let name = value.get("name").and_then(code);
+                        if let Some(name) = &name {
                             deltas.push(EmoteDelta::Rename {
+                                id: emote_id.clone(),
+                                old_code: old_code.clone(),
+                                code: name.clone(),
+                            });
+                        }
+                        if let Some(flags) = value.get("flags").and_then(Value::as_u64) {
+                            deltas.push(EmoteDelta::Overlay {
                                 id: emote_id,
-                                old_code,
-                                code: name,
+                                code: name.or(old_code),
+                                zero_width: flags & 1 != 0,
                             });
                         }
                     }
@@ -292,7 +303,7 @@ pub(super) async fn snapshot_at(
         ""
     };
     let set_query = if source.set_id.is_some() {
-        "sets: emoteSetsByID(list: [$set]) { id emotes { id name data { host { url files { name width } } } } }"
+        "sets: emoteSetsByID(list: [$set]) { id emotes { id name flags data { host { url files { name width } } } } }"
     } else {
         ""
     };
@@ -442,5 +453,43 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn overlay_updates_accept_partial_flags_and_alias_changes() {
+        for (value, expected_code, enabled) in [
+            (json!({"flags": 1}), "Old", true),
+            (json!({"id": "id", "name": "New", "flags": 0}), "New", false),
+            (json!({"id": "id", "flags": 256}), "Old", false),
+        ] {
+            let frame = json!({"op": 0, "d": {"type": "emote_set.update", "body": {
+                "id": "set", "updated": [{"key": "emotes",
+                    "old_value": {"id": "id", "name": "Old"}, "value": value}]
+            }}});
+            let Some(Frame::Updates(updates)) = decode(&frame.to_string()) else { panic!("dispatch"); };
+            let Update::Emotes { deltas, .. } = &updates[0] else { panic!("emotes"); };
+            assert!(deltas.iter().any(|delta| matches!(delta,
+                EmoteDelta::Overlay { id, code: Some(code), zero_width }
+                if id == "id" && code == expected_code && *zero_width == enabled)));
+        }
+        let data_only = json!({"op": 0, "d": {"type": "emote_set.update", "body": {
+            "id": "set", "updated": [{"key": "emotes", "value": {
+                "id": "id", "data": {"flags": 256}
+            }}]
+        }}});
+        assert!(decode(&data_only.to_string()).is_none());
+        for flags in [None, Some(0), Some(1)] {
+            let mut value = json!({"id": "id", "name": "Name", "data": {"host": {
+                "url": "//cdn.7tv.app/emote/id", "files": [{"name": "2x.webp", "width": 64}]
+            }}});
+            if let Some(flags) = flags { value["flags"] = flags.into(); }
+            let frame = json!({"op": 0, "d": {"type": "emote_set.update", "body": {
+                "id": "set", "updated": [{"key": "emotes", "value": value}]
+            }}});
+            let Some(Frame::Updates(updates)) = decode(&frame.to_string()) else { panic!("dispatch"); };
+            let Update::Emotes { deltas, .. } = &updates[0] else { panic!("emotes"); };
+            assert!(matches!(&deltas[0], EmoteDelta::Upsert { emote, preserve_overlay, .. }
+                if *preserve_overlay == flags.is_none() && emote.zero_width == (flags == Some(1))));
+        }
     }
 }

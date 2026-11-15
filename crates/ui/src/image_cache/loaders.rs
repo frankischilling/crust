@@ -522,7 +522,7 @@ impl TextureLoader for BoundedTextureLoader {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -562,7 +562,7 @@ mod tests {
         out.into_inner()
     }
 
-    fn gif() -> Vec<u8> {
+    pub(crate) fn gif() -> Vec<u8> {
         let mut out = Vec::new();
         let mut encoder = image::codecs::gif::GifEncoder::new(&mut out);
         encoder
@@ -592,7 +592,7 @@ mod tests {
         ctx
     }
 
-    fn animated_webp() -> Vec<u8> {
+    pub(crate) fn animated_webp() -> Vec<u8> {
         fn chunk(out: &mut Vec<u8>, tag: &[u8; 4], payload: &[u8]) {
             out.extend_from_slice(tag);
             out.extend_from_slice(&(payload.len() as u32).to_le_bytes());

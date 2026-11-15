@@ -3,7 +3,7 @@ use std::collections::HashMap;
 #[cfg(test)]
 use std::sync::Arc;
 
-use egui::{Color32, Id, Key, LayerId, Order, Pos2, RichText, Stroke, Ui, Vec2};
+use egui::{Color32, Id, Key, Order, Pos2, RichText, Stroke, Ui, Vec2};
 
 use crate::commands::{extract_slash_query, slash_command_matches_ranked, SlashCommandSuggestion};
 use crate::theme as t;
@@ -17,6 +17,77 @@ const USERNAME_AUTOCOMPLETE_MAX: usize = 10;
 /// Maximum number of Tab-completion matches to cycle through.
 const TAB_COMPLETE_MAX: usize = 50;
 const TWITCH_MAX_CHARS: usize = 500;
+
+#[derive(Clone, Default)]
+struct ComposerFocus {
+    requested: Option<(Id, u64)>,
+    rendered_pass: u64,
+    rendered: Vec<Id>,
+}
+
+impl ComposerFocus {
+    fn begin_pass(&mut self, pass: u64) {
+        if self.rendered_pass != pass {
+            self.rendered_pass = pass;
+            self.rendered.clear();
+        }
+        // Allow a sizing pass before the requested editor mounts, but do not
+        // let a canceled pane steal focus if it is recreated much later.
+        if self
+            .requested
+            .is_some_and(|(_, requested)| pass.saturating_sub(requested) > 2)
+        {
+            self.requested = None;
+        }
+    }
+}
+
+/// Focus a rendered composer now, or hand the request to its next render.
+pub(crate) fn request_composer_focus(ctx: &egui::Context, target: Option<Id>) {
+    let pass = ctx.cumulative_pass_nr();
+    let focus_now = ctx.data_mut(|data| {
+        let state = data.get_temp_mut_or_default::<ComposerFocus>(Id::new("composer_focus"));
+        state.begin_pass(pass);
+        state.requested = target.map(|id| (id, pass));
+        let ready = target.filter(|id| state.rendered.contains(id));
+        if ready.is_some() {
+            state.requested = None;
+        }
+        ready
+    });
+    if let Some(id) = focus_now {
+        ctx.memory_mut(|memory| memory.request_focus(id));
+    } else {
+        // An earlier composer must not consume input intended for an editor
+        // that will receive focus later in this pass.
+        ctx.memory_mut(|memory| {
+            if let Some(id) = memory.focused() {
+                memory.surrender_focus(id);
+            }
+        });
+    }
+    ctx.request_repaint();
+}
+
+fn prepare_composer_focus(ctx: &egui::Context, id: Id) {
+    let pass = ctx.cumulative_pass_nr();
+    let requested = ctx.data_mut(|data| {
+        let state = data.get_temp_mut_or_default::<ComposerFocus>(Id::new("composer_focus"));
+        state.begin_pass(pass);
+        if !state.rendered.contains(&id) {
+            state.rendered.push(id);
+        }
+        if state.requested.is_some_and(|(target, _)| target == id) {
+            state.requested = None;
+            true
+        } else {
+            false
+        }
+    });
+    if requested {
+        ctx.memory_mut(|memory| memory.request_focus(id));
+    }
+}
 
 struct ComposerLayout {
     picker_width: f32,
@@ -107,6 +178,99 @@ struct SpellCtx {
     start: usize,
     end: usize,
     suggestions: Vec<String>,
+}
+
+#[derive(Clone)]
+struct CompletionPopupState {
+    rect: egui::Rect,
+    kind: &'static str,
+    selected: usize,
+    selected_label: String,
+}
+
+#[derive(Clone)]
+struct DismissedCompletion {
+    text: String,
+    caret: usize,
+}
+
+fn completion_is_dismissed(ctx: &egui::Context, id: Id, text: &str, caret: usize) -> bool {
+    let state_id = id.with("dismissed_completion");
+    ctx.data_mut(|data| {
+        let dismissed = data.get_temp::<DismissedCompletion>(state_id);
+        if dismissed.is_some_and(|state| state.text == text && state.caret == caret) {
+            true
+        } else {
+            data.remove::<DismissedCompletion>(state_id);
+            false
+        }
+    })
+}
+
+fn completion_pointer_active(ctx: &egui::Context, id: Id) -> bool {
+    let popup = ctx.data(|data| data.get_temp::<CompletionPopupState>(id.with("completion_popup")));
+    let Some(popup) = popup else {
+        return false;
+    };
+    let pointer = ctx.input(|input| {
+        (input.pointer.any_down() || input.pointer.any_released())
+            .then(|| input.pointer.interact_pos())
+            .flatten()
+    });
+    pointer.is_some_and(|pos| {
+        popup.rect.contains(pos)
+            && ctx.layer_id_at(pos)
+                == Some(egui::LayerId::new(
+                    Order::Foreground,
+                    id.with("completion_popup_area"),
+                ))
+    })
+}
+
+enum CompletionEntry<'a> {
+    Emote(&'a EmoteCatalogEntry),
+    Command(&'a SlashCommandSuggestion),
+    Username(&'a str),
+    Channel(&'a str),
+}
+
+impl CompletionEntry<'_> {
+    fn label(&self) -> &str {
+        match self {
+            Self::Emote(entry) => &entry.code,
+            Self::Command(entry) => &entry.usage,
+            Self::Username(name) | Self::Channel(name) => name,
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Emote(_) => "emotes",
+            Self::Command(_) => "commands",
+            Self::Username(_) => "users",
+            Self::Channel(_) => "channels",
+        }
+    }
+}
+
+fn completion_popup_rect(
+    viewport: egui::Rect,
+    input: egui::Rect,
+    desired_size: Vec2,
+) -> egui::Rect {
+    let bounds = viewport.shrink(4.0);
+    let width = desired_size.x.min(bounds.width()).max(0.0);
+    let above = (input.top() - 4.0 - bounds.top()).max(0.0);
+    let below = (bounds.bottom() - input.bottom() - 4.0).max(0.0);
+    let use_above = above >= below || above >= desired_size.y;
+    let height = desired_size.y.min(if use_above { above } else { below });
+    let left = input.left().clamp(bounds.left(), bounds.right() - width);
+    let top = if use_above {
+        input.top() - 4.0 - height
+    } else {
+        input.bottom() + 4.0
+    };
+    egui::Rect::from_min_size(egui::pos2(left, top), egui::vec2(width, height))
 }
 
 /// Tab-completion state for bare-word emote completion (no `:` prefix).
@@ -236,6 +400,7 @@ impl<'a> ChatInput<'a> {
         };
 
         let text_edit_id = self.id.unwrap_or_else(|| ui.id().with("chat_input"));
+        prepare_composer_focus(ui.ctx(), text_edit_id);
         let scope_id = text_edit_id.with("completion_channel");
         let channel_scope = Id::new(self.channel);
         let channel_changed = ui.data_mut(|data| {
@@ -249,8 +414,9 @@ impl<'a> ChatInput<'a> {
             invalidate_emote_completions(ui.ctx(), text_edit_id);
             ui.data_mut(|data| data.remove::<HistState>(text_edit_id.with("msg_history_state")));
         }
-        let input_had_focus = ui.memory(|m| m.has_focus(text_edit_id));
-        let mut retain_keyboard_focus = false;
+        let popup_pointer_active = completion_pointer_active(ui.ctx(), text_edit_id);
+        let input_had_focus = ui.memory(|m| m.has_focus(text_edit_id)) || popup_pointer_active;
+        let mut retain_keyboard_focus = popup_pointer_active;
 
         // Clipboard image paste (Ctrl/Cmd+V)
         // egui-winit 0.31's keyboard handler early-returns from a Ctrl+V
@@ -398,18 +564,49 @@ impl<'a> ChatInput<'a> {
                     // Queries stop at the caret, so editing an earlier word leaves the suffix intact.
                     let pre_cursor = cursor_byte_index(ui.ctx(), text_edit_id, buf);
                     let pre_query = &buf[..pre_cursor];
+                    let popup_was_open = ui.data(|data| {
+                        data.get_temp::<CompletionPopupState>(text_edit_id.with("completion_popup"))
+                            .is_some()
+                    });
+                    // egui clears current focus on Escape before widgets run.
+                    // The still-visible popup belongs to the prior composer.
+                    let completion_owned_focus = input_had_focus || ui.memory(|memory| {
+                        memory.focused().is_none() && memory.had_focus_last_frame(text_edit_id)
+                    });
+                    if completion_owned_focus
+                        && popup_was_open
+                        && !ui.ctx().is_context_menu_open()
+                        && ui.input_mut(|input| {
+                            crate::app::consume_exact_key(input, egui::Modifiers::NONE, Key::Escape)
+                        })
+                    {
+                        ui.data_mut(|data| {
+                            data.insert_temp(
+                                text_edit_id.with("dismissed_completion"),
+                                DismissedCompletion {
+                                    text: buf.clone(),
+                                    caret: pre_cursor,
+                                },
+                            )
+                        });
+                        retain_keyboard_focus = true;
+                    }
+                    let completions_allowed =
+                        !completion_is_dismissed(ui.ctx(), text_edit_id, buf, pre_cursor);
                     // Pre-check autocompletes before TextEdit consumes keys.
-                    let pre_emote_matches = if input_had_focus {
+                    let pre_emote_matches = if input_had_focus && completions_allowed {
                         find_autocomplete_matches(pre_query, self.emote_catalog)
                     } else {
                         Vec::new()
                     };
-                    let pre_username_matches = if input_had_focus && pre_emote_matches.is_empty() {
-                        find_username_matches(pre_query, self.chatters)
-                    } else {
-                        Vec::new()
-                    };
+                    let pre_username_matches =
+                        if input_had_focus && completions_allowed && pre_emote_matches.is_empty() {
+                            find_username_matches(pre_query, self.chatters)
+                        } else {
+                            Vec::new()
+                        };
                     let pre_slash_matches = if input_had_focus
+                        && completions_allowed
                         && pre_emote_matches.is_empty()
                         && pre_username_matches.is_empty()
                     {
@@ -418,6 +615,7 @@ impl<'a> ChatInput<'a> {
                         Vec::new()
                     };
                     let pre_join_matches = if input_had_focus
+                        && completions_allowed
                         && pre_emote_matches.is_empty()
                         && pre_username_matches.is_empty()
                         && pre_slash_matches.is_empty()
@@ -530,41 +728,51 @@ impl<'a> ChatInput<'a> {
 
                     // Read autocomplete selection index
                     let mut ac_sel: i32 = ui.ctx().data_mut(|d| d.get_temp(ac_id).unwrap_or(0i32));
+                    if resp.changed() {
+                        ac_sel = 0;
+                    }
 
                     // Recompute matches after TextEdit may have changed buf.
                     // Emote autocomplete takes priority, then @username, then slash, then /join.
                     let input_active = resp.has_focus() || input_had_focus;
                     let cursor_byte = cursor_byte_index(ui.ctx(), text_edit_id, buf);
                     let query = &buf[..cursor_byte];
+                    let completions_allowed =
+                        !completion_is_dismissed(ui.ctx(), text_edit_id, buf, cursor_byte);
                     let reuse_matches =
                         input_had_focus && !resp.changed() && cursor_byte == pre_cursor;
-                    let matches = if !input_active {
+                    let matches = if !input_active || !completions_allowed {
                         Vec::new()
                     } else if reuse_matches {
                         pre_emote_matches
                     } else {
                         find_autocomplete_matches(query, self.emote_catalog)
                     };
-                    let username_matches = if input_active && matches.is_empty() {
-                        if reuse_matches {
-                            pre_username_matches
-                        } else {
-                            find_username_matches(query, self.chatters)
-                        }
-                    } else {
-                        Vec::new()
-                    };
-                    let slash_matches =
-                        if input_active && matches.is_empty() && username_matches.is_empty() {
+                    let username_matches =
+                        if input_active && completions_allowed && matches.is_empty() {
                             if reuse_matches {
-                                pre_slash_matches
+                                pre_username_matches
                             } else {
-                                find_slash_matches(query, self.slash_usage_counts)
+                                find_username_matches(query, self.chatters)
                             }
                         } else {
                             Vec::new()
                         };
+                    let slash_matches = if input_active
+                        && completions_allowed
+                        && matches.is_empty()
+                        && username_matches.is_empty()
+                    {
+                        if reuse_matches {
+                            pre_slash_matches
+                        } else {
+                            find_slash_matches(query, self.slash_usage_counts)
+                        }
+                    } else {
+                        Vec::new()
+                    };
                     let join_matches = if input_active
+                        && completions_allowed
                         && matches.is_empty()
                         && username_matches.is_empty()
                         && slash_matches.is_empty()
@@ -886,14 +1094,17 @@ impl<'a> ChatInput<'a> {
                         }
                     }
 
-                    if ui
-                        .add_sized(
-                            [layout.picker_width, layout.picker_width],
-                            egui::Button::new(RichText::new(":)").font(t::body())),
-                        )
-                        .on_hover_text("Emote picker")
-                        .clicked()
-                    {
+                    let picker = ui
+                        .push_id(text_edit_id.with("emote_picker_button"), |ui| {
+                            super::chrome::icon_button(
+                                ui,
+                                super::chrome::ChromeIcon::Emotes,
+                                "Emote picker",
+                                super::chrome::IconButtonState::default(),
+                            )
+                        })
+                        .inner;
+                    if picker.clicked() {
                         result.toggle_emote_picker = true;
                     }
 
@@ -944,6 +1155,7 @@ impl<'a> ChatInput<'a> {
                         || !slash_matches.is_empty()
                         || !join_matches.is_empty())
                         && (resp.has_focus()
+                            || popup_pointer_active
                             || accepted_emote.is_some()
                             || accepted_username.is_some()
                             || accepted_slash_cmd.is_some()
@@ -1013,6 +1225,12 @@ impl<'a> ChatInput<'a> {
                             ui.ctx().memory_mut(|m| m.request_focus(text_edit_id));
                             ui.ctx().data_mut(|d| d.insert_temp(ac_id, 0i32));
                         }
+                    } else {
+                        ui.data_mut(|data| {
+                            data.remove::<CompletionPopupState>(
+                                text_edit_id.with("completion_popup"),
+                            );
+                        });
                     }
 
                     // Spell-check context menu (right-click)
@@ -1283,192 +1501,13 @@ impl<'a> ChatInput<'a> {
         matches: &[&EmoteCatalogEntry],
         selected: i32,
     ) -> Option<String> {
-        let input_rect = text_resp.rect;
-        let popup_width = input_rect.width().min(350.0);
-        let row_h = 28.0;
-        let popup_h = (matches.len() as f32 * row_h).min(AUTOCOMPLETE_MAX as f32 * row_h) + 8.0;
-        let popup_rect = egui::Rect::from_min_size(
-            egui::pos2(input_rect.left(), input_rect.top() - popup_h - 4.0),
-            egui::vec2(popup_width, popup_h),
-        );
-
-        let layer_id = LayerId::new(
-            Order::Foreground,
-            text_resp.id.with("emote_autocomplete_popup"),
-        );
-        let painter = ui.ctx().layer_painter(layer_id);
-
-        // Background + border
-        painter.rect_filled(popup_rect, 6.0, t::bg_raised());
-        painter.rect_stroke(
-            popup_rect,
-            6.0,
-            egui::Stroke::new(1.0_f32, t::border_subtle()),
-            egui::epaint::StrokeKind::Outside,
-        );
-
-        // Interactive child UI on the foreground layer - force vertical layout
-        let mut popup_ui = ui.new_child(
-            egui::UiBuilder::new()
-                .layer_id(layer_id)
-                .max_rect(popup_rect.shrink(4.0))
-                .layout(egui::Layout::top_down(egui::Align::LEFT)),
-        );
-        popup_ui.set_clip_rect(popup_rect);
-
-        let mut clicked_emote: Option<String> = None;
-        let mut has_animated_preview = false;
-
-        egui::ScrollArea::vertical()
-            .id_salt(text_resp.id.with("emote_ac_scroll"))
-            .auto_shrink([false; 2])
-            .show(&mut popup_ui, |ui| {
-                for (i, entry) in matches.iter().enumerate() {
-                    let is_selected = i as i32 == selected;
-                    let row_id = text_resp.id.with("ac_row").with(i);
-
-                    let row_bg = if is_selected {
-                        t::active_channel_bg()
-                    } else {
-                        Color32::TRANSPARENT
-                    };
-
-                    let frame_resp = egui::Frame::new()
-                        .fill(row_bg)
-                        .corner_radius(3.0)
-                        .inner_margin(egui::Margin::symmetric(4, 2))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 6.0;
-
-                                // Emote image preview
-                                if let Some(&(w, h, ref raw)) =
-                                    self.emote_bytes.get(entry.url.as_str())
-                                {
-                                    let animated = is_likely_animated_url(&entry.url);
-                                    let should_animate = self.animate_emotes && is_selected;
-                                    let (slot_rect, _) = ui.allocate_exact_size(
-                                        egui::vec2(
-                                            AUTOCOMPLETE_EMOTE_SIZE,
-                                            AUTOCOMPLETE_EMOTE_SIZE,
-                                        ),
-                                        egui::Sense::hover(),
-                                    );
-
-                                    if animated && !should_animate {
-                                        if let Some(tex) =
-                                            self.emote_bytes.static_texture(ui.ctx(), &entry.url)
-                                        {
-                                            let size = fit_size(w, h, AUTOCOMPLETE_EMOTE_SIZE);
-                                            let image_rect = egui::Rect::from_center_size(
-                                                slot_rect.center(),
-                                                size,
-                                            );
-                                            ui.painter().image(
-                                                tex.id(),
-                                                image_rect,
-                                                egui::Rect::from_min_max(
-                                                    egui::pos2(0.0, 0.0),
-                                                    egui::pos2(1.0, 1.0),
-                                                ),
-                                                Color32::WHITE,
-                                            );
-                                        }
-                                    } else {
-                                        if animated && self.animate_emotes {
-                                            has_animated_preview = true;
-                                        }
-                                        let size = fit_size(w, h, AUTOCOMPLETE_EMOTE_SIZE);
-                                        let image_rect =
-                                            egui::Rect::from_center_size(slot_rect.center(), size);
-                                        let url_key = super::bytes_uri(&entry.url, raw.as_ref());
-                                        ui.put(
-                                            image_rect,
-                                            egui::Image::from_bytes(
-                                                url_key,
-                                                egui::load::Bytes::Shared(raw.clone()),
-                                            )
-                                            .fit_to_exact_size(size),
-                                        );
-                                    }
-                                } else {
-                                    ui.allocate_exact_size(
-                                        egui::vec2(
-                                            AUTOCOMPLETE_EMOTE_SIZE,
-                                            AUTOCOMPLETE_EMOTE_SIZE,
-                                        ),
-                                        egui::Sense::hover(),
-                                    );
-                                }
-
-                                let code_color = if is_selected {
-                                    t::text_primary()
-                                } else {
-                                    t::text_secondary()
-                                };
-                                ui.label(
-                                    RichText::new(&entry.code)
-                                        .color(code_color)
-                                        .font(t::small()),
-                                );
-
-                                // Provider tag (right-aligned)
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        ui.label(
-                                            RichText::new(provider_label(&entry.provider))
-                                                .font(t::small())
-                                                .color(t::text_muted()),
-                                        );
-                                    },
-                                );
-                            });
-                        });
-
-                    // Make the row clickable on the foreground layer
-                    let row_rect = frame_resp.response.rect;
-                    if is_selected {
-                        ui.scroll_to_rect(row_rect, Some(egui::Align::Center));
-                    }
-                    let click_resp = ui.interact(row_rect, row_id, egui::Sense::click());
-
-                    // If an animated emote row is hovered, render its animated preview.
-                    if click_resp.hovered() {
-                        if let Some(&(w, h, ref raw)) = self.emote_bytes.get(entry.url.as_str()) {
-                            if self.animate_emotes && is_likely_animated_url(&entry.url) {
-                                has_animated_preview = true;
-                                let size = fit_size(w, h, AUTOCOMPLETE_EMOTE_SIZE);
-                                let preview_rect = egui::Rect::from_min_size(
-                                    egui::pos2(row_rect.left() + 4.0, row_rect.top() + 2.0),
-                                    egui::vec2(AUTOCOMPLETE_EMOTE_SIZE, AUTOCOMPLETE_EMOTE_SIZE),
-                                );
-                                let image_rect =
-                                    egui::Rect::from_center_size(preview_rect.center(), size);
-                                ui.put(
-                                    image_rect,
-                                    egui::Image::from_bytes(
-                                        super::bytes_uri(&entry.url, raw.as_ref()),
-                                        egui::load::Bytes::Shared(raw.clone()),
-                                    )
-                                    .fit_to_exact_size(size),
-                                );
-                            }
-                        }
-                    }
-
-                    if click_resp.clicked() {
-                        clicked_emote = Some(entry.code.clone());
-                    }
-                }
-            });
-
-        if has_animated_preview {
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(33));
-        }
-
-        clicked_emote
+        let entries: Vec<_> = matches
+            .iter()
+            .copied()
+            .map(CompletionEntry::Emote)
+            .collect();
+        self.show_completion_popup(ui, text_resp, &entries, selected)
+            .map(|index| matches[index].code.clone())
     }
 
     fn show_slash_autocomplete_popup(
@@ -1478,104 +1517,9 @@ impl<'a> ChatInput<'a> {
         matches: &[SlashCommandSuggestion],
         selected: i32,
     ) -> Option<String> {
-        if matches.is_empty() {
-            return None;
-        }
-
-        let selected = selected.clamp(0, matches.len() as i32 - 1);
-        let visible_rows = SLASH_AUTOCOMPLETE_MAX.min(matches.len());
-        let window_start = if matches.len() <= visible_rows {
-            0
-        } else {
-            let half = (visible_rows / 2) as i32;
-            let max_start = (matches.len() - visible_rows) as i32;
-            (selected - half).clamp(0, max_start) as usize
-        };
-        let window_end = (window_start + visible_rows).min(matches.len());
-
-        let input_rect = text_resp.rect;
-        let popup_width = input_rect.width().min(460.0);
-        let row_h = 36.0;
-        let popup_h = visible_rows as f32 * row_h + 8.0;
-        let popup_rect = egui::Rect::from_min_size(
-            egui::pos2(input_rect.left(), input_rect.top() - popup_h - 4.0),
-            egui::vec2(popup_width, popup_h),
-        );
-
-        let layer_id = LayerId::new(
-            Order::Foreground,
-            text_resp.id.with("slash_autocomplete_popup"),
-        );
-        let painter = ui.ctx().layer_painter(layer_id);
-        painter.rect_filled(popup_rect, 6.0, t::bg_raised());
-        painter.rect_stroke(
-            popup_rect,
-            6.0,
-            egui::Stroke::new(1.0_f32, t::border_subtle()),
-            egui::epaint::StrokeKind::Outside,
-        );
-
-        let mut popup_ui = ui.new_child(
-            egui::UiBuilder::new()
-                .layer_id(layer_id)
-                .max_rect(popup_rect.shrink(4.0))
-                .layout(egui::Layout::top_down(egui::Align::LEFT)),
-        );
-        popup_ui.set_clip_rect(popup_rect);
-
-        let mut clicked_cmd: Option<String> = None;
-        for (offset, entry) in matches[window_start..window_end].iter().enumerate() {
-            let idx = window_start + offset;
-            let is_selected = idx as i32 == selected;
-            let row_id = text_resp.id.with("slash_ac_row").with(idx);
-            let row_bg = if is_selected {
-                t::active_channel_bg()
-            } else {
-                Color32::TRANSPARENT
-            };
-
-            let frame_resp = egui::Frame::new()
-                .fill(row_bg)
-                .corner_radius(3.0)
-                .inner_margin(egui::Margin::symmetric(8, 4))
-                .show(&mut popup_ui, |ui| {
-                    let cmd_col = if is_selected {
-                        t::text_primary()
-                    } else {
-                        t::accent()
-                    };
-                    let summary_col = if is_selected {
-                        t::text_secondary()
-                    } else {
-                        t::text_muted()
-                    };
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new(entry.usage.clone())
-                                .font(t::small())
-                                .color(cmd_col)
-                                .strong(),
-                        );
-                        ui.add_sized(
-                            [ui.available_width(), 14.0],
-                            egui::Label::new(
-                                RichText::new(entry.summary.clone())
-                                    .font(t::small())
-                                    .color(summary_col),
-                            )
-                            .truncate(),
-                        );
-                    });
-                });
-
-            let row_rect = frame_resp.response.rect;
-            let click_resp = popup_ui.interact(row_rect, row_id, egui::Sense::click());
-            if click_resp.clicked() {
-                clicked_cmd = Some(entry.name.to_owned());
-            }
-        }
-
-        clicked_cmd
+        let entries: Vec<_> = matches.iter().map(CompletionEntry::Command).collect();
+        self.show_completion_popup(ui, text_resp, &entries, selected)
+            .map(|index| matches[index].name.to_owned())
     }
 
     fn show_join_autocomplete_popup(
@@ -1585,85 +1529,12 @@ impl<'a> ChatInput<'a> {
         matches: &[String],
         selected: i32,
     ) -> Option<String> {
-        let input_rect = text_resp.rect;
-        let popup_width = input_rect.width().min(420.0);
-        let row_h = 22.0;
-        let popup_h =
-            (matches.len() as f32 * row_h).min(SLASH_AUTOCOMPLETE_MAX as f32 * row_h) + 8.0;
-        let popup_rect = egui::Rect::from_min_size(
-            egui::pos2(input_rect.left(), input_rect.top() - popup_h - 4.0),
-            egui::vec2(popup_width, popup_h),
-        );
-
-        let layer_id = LayerId::new(
-            Order::Foreground,
-            text_resp.id.with("join_autocomplete_popup"),
-        );
-        let painter = ui.ctx().layer_painter(layer_id);
-        painter.rect_filled(popup_rect, 6.0, t::bg_raised());
-        painter.rect_stroke(
-            popup_rect,
-            6.0,
-            egui::Stroke::new(1.0_f32, t::border_subtle()),
-            egui::epaint::StrokeKind::Outside,
-        );
-
-        let mut popup_ui = ui.new_child(
-            egui::UiBuilder::new()
-                .layer_id(layer_id)
-                .max_rect(popup_rect.shrink(4.0))
-                .layout(egui::Layout::top_down(egui::Align::LEFT)),
-        );
-        popup_ui.set_clip_rect(popup_rect);
-
-        let mut clicked: Option<String> = None;
-        egui::ScrollArea::vertical()
-            .id_salt(text_resp.id.with("join_ac_scroll"))
-            .auto_shrink([false; 2])
-            .show(&mut popup_ui, |ui| {
-                for (i, channel) in matches.iter().enumerate() {
-                    let is_selected = i as i32 == selected;
-                    let row_id = text_resp.id.with("join_ac_row").with(i);
-                    let row_bg = if is_selected {
-                        t::active_channel_bg()
-                    } else {
-                        Color32::TRANSPARENT
-                    };
-
-                    let frame_resp = egui::Frame::new()
-                        .fill(row_bg)
-                        .corner_radius(3.0)
-                        .inner_margin(egui::Margin::symmetric(6, 2))
-                        .show(ui, |ui| {
-                            let col = if is_selected {
-                                t::text_primary()
-                            } else {
-                                t::accent()
-                            };
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(channel).font(t::small()).color(col).strong(),
-                                );
-                                ui.label(
-                                    RichText::new("Known IRC channel on this server")
-                                        .font(t::small())
-                                        .color(t::text_muted()),
-                                );
-                            });
-                        });
-
-                    let row_rect = frame_resp.response.rect;
-                    if is_selected {
-                        ui.scroll_to_rect(row_rect, Some(egui::Align::Center));
-                    }
-                    let click_resp = ui.interact(row_rect, row_id, egui::Sense::click());
-                    if click_resp.clicked() {
-                        clicked = Some(channel.clone());
-                    }
-                }
-            });
-
-        clicked
+        let entries: Vec<_> = matches
+            .iter()
+            .map(|name| CompletionEntry::Channel(name))
+            .collect();
+        self.show_completion_popup(ui, text_resp, &entries, selected)
+            .map(|index| matches[index].clone())
     }
 
     fn show_username_autocomplete_popup(
@@ -1673,84 +1544,249 @@ impl<'a> ChatInput<'a> {
         matches: &[String],
         selected: i32,
     ) -> Option<String> {
-        let input_rect = text_resp.rect;
-        let popup_width = input_rect.width().min(350.0);
-        let row_h = 24.0;
-        let popup_h =
-            (matches.len() as f32 * row_h).min(USERNAME_AUTOCOMPLETE_MAX as f32 * row_h) + 8.0;
-        let popup_rect = egui::Rect::from_min_size(
-            egui::pos2(input_rect.left(), input_rect.top() - popup_h - 4.0),
-            egui::vec2(popup_width, popup_h),
-        );
+        let entries: Vec<_> = matches
+            .iter()
+            .map(|name| CompletionEntry::Username(name))
+            .collect();
+        self.show_completion_popup(ui, text_resp, &entries, selected)
+            .map(|index| matches[index].clone())
+    }
 
-        let layer_id = LayerId::new(
-            Order::Foreground,
-            text_resp.id.with("username_autocomplete_popup"),
+    fn show_completion_popup(
+        &self,
+        ui: &mut Ui,
+        text_resp: &egui::Response,
+        entries: &[CompletionEntry<'_>],
+        selected: i32,
+    ) -> Option<usize> {
+        let first = entries.first()?;
+        let selected = selected.clamp(0, entries.len() as i32 - 1) as usize;
+        let font_height = ui.fonts(|fonts| fonts.row_height(&t::small()));
+        let row_height = if matches!(first, CompletionEntry::Command(_)) {
+            font_height * 2.0 + 10.0
+        } else {
+            font_height.max(AUTOCOMPLETE_EMOTE_SIZE) + 8.0
+        };
+        let rows = entries.len().min(AUTOCOMPLETE_MAX);
+        // TextEdit returns its inner text rectangle; anchor outside the full framed widget.
+        let input_rect = ui
+            .ctx()
+            .read_response(text_resp.id)
+            .map_or(text_resp.rect, |response| response.rect);
+        let popup_rect = completion_popup_rect(
+            ui.ctx().screen_rect(),
+            input_rect,
+            egui::vec2(
+                input_rect.width().clamp(240.0, 460.0),
+                rows as f32 * (row_height + 2.0) + 6.0,
+            ),
         );
-        let painter = ui.ctx().layer_painter(layer_id);
-        painter.rect_filled(popup_rect, 6.0, t::bg_raised());
-        painter.rect_stroke(
-            popup_rect,
-            6.0,
-            egui::Stroke::new(1.0_f32, t::border_subtle()),
-            egui::epaint::StrokeKind::Outside,
-        );
-
-        let mut popup_ui = ui.new_child(
-            egui::UiBuilder::new()
-                .layer_id(layer_id)
-                .max_rect(popup_rect.shrink(4.0))
-                .layout(egui::Layout::top_down(egui::Align::LEFT)),
-        );
-        popup_ui.set_clip_rect(popup_rect);
-
-        let mut clicked_username: Option<String> = None;
-        egui::ScrollArea::vertical()
-            .id_salt(text_resp.id.with("username_ac_scroll"))
-            .auto_shrink([false; 2])
-            .show(&mut popup_ui, |ui| {
-                for (i, username) in matches.iter().enumerate() {
-                    let is_selected = i as i32 == selected;
-                    let row_id = text_resp.id.with("username_ac_row").with(i);
-                    let row_bg = if is_selected {
-                        t::active_channel_bg()
-                    } else {
-                        Color32::TRANSPARENT
-                    };
-
-                    let frame_resp = egui::Frame::new()
-                        .fill(row_bg)
-                        .corner_radius(3.0)
-                        .inner_margin(egui::Margin::symmetric(6, 3))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                // @ icon
-                                ui.label(
-                                    RichText::new("@").font(t::small()).color(t::text_muted()),
+        let state_id = text_resp.id.with("completion_popup");
+        if popup_rect.width() <= 8.0 || popup_rect.height() <= 8.0 {
+            ui.data_mut(|data| data.remove::<CompletionPopupState>(state_id));
+            return None;
+        }
+        let popup_id = text_resp.id.with("completion_popup_area");
+        let previous = ui.data(|data| data.get_temp::<CompletionPopupState>(state_id));
+        let scroll_to_selection = text_resp.changed()
+            || previous.as_ref().is_none_or(|state| {
+                state.kind != first.kind()
+                    || state.selected != selected
+                    || state.selected_label != entries[selected].label()
+                    || state.rect.size() != popup_rect.size()
+            });
+        ui.data_mut(|data| {
+            data.insert_temp(
+                state_id,
+                CompletionPopupState {
+                    rect: popup_rect,
+                    kind: first.kind(),
+                    selected,
+                    selected_label: entries[selected].label().to_owned(),
+                },
+            );
+        });
+        let mut clicked = None;
+        egui::Area::new(popup_id)
+            .order(Order::Foreground)
+            .fixed_pos(popup_rect.min)
+            .default_size(popup_rect.size())
+            .movable(false)
+            .constrain(false)
+            .sense(egui::Sense::hover())
+            .show(ui.ctx(), |ui| {
+                ui.set_min_size(popup_rect.size());
+                ui.set_max_size(popup_rect.size());
+                ui.painter().rect_filled(popup_rect, 6.0, t::bg_raised());
+                ui.painter().rect_stroke(
+                    popup_rect,
+                    6.0,
+                    Stroke::new(1.0_f32, t::border_subtle()),
+                    egui::StrokeKind::Inside,
+                );
+                let mut body = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(popup_rect.shrink(4.0))
+                        .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                );
+                body.set_clip_rect(popup_rect.shrink(4.0));
+                body.spacing_mut().item_spacing.y = 2.0;
+                egui::ScrollArea::vertical()
+                    .id_salt(popup_id.with("rows"))
+                    .max_height(popup_rect.height() - 8.0)
+                    .animated(false)
+                    .auto_shrink([false; 2])
+                    .show(&mut body, |ui| {
+                        for (index, entry) in entries.iter().enumerate() {
+                            let is_selected = index == selected;
+                            let (row_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), row_height),
+                                egui::Sense::hover(),
+                            );
+                            let hovered = ui.rect_contains_pointer(row_rect);
+                            if is_selected {
+                                ui.painter()
+                                    .rect_filled(row_rect, 3.0, t::active_channel_bg());
+                                if scroll_to_selection {
+                                    ui.scroll_to_rect(row_rect, Some(egui::Align::Center));
+                                }
+                            } else if hovered {
+                                ui.painter().rect_filled(row_rect, 3.0, t::hover_row_bg());
+                            }
+                            if ui.is_rect_visible(row_rect) {
+                                let mut row = ui.new_child(
+                                    egui::UiBuilder::new()
+                                        .max_rect(row_rect.shrink2(egui::vec2(6.0, 4.0)))
+                                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
                                 );
-                                let col = if is_selected {
-                                    t::text_primary()
-                                } else {
-                                    t::accent()
-                                };
-                                ui.label(
-                                    RichText::new(username).font(t::small()).color(col).strong(),
-                                );
+                                row.set_clip_rect(ui.clip_rect().intersect(row_rect));
+                                row.spacing_mut().item_spacing = egui::vec2(6.0, 2.0);
+                                self.paint_completion_entry(&mut row, entry, is_selected, hovered);
+                            }
+                            let response = ui.interact(
+                                row_rect,
+                                popup_id.with(first.kind()).with(index),
+                                egui::Sense::click(),
+                            );
+                            response.widget_info(|| {
+                                egui::WidgetInfo::selected(
+                                    egui::WidgetType::SelectableLabel,
+                                    ui.is_enabled(),
+                                    is_selected,
+                                    entry.label(),
+                                )
                             });
-                        });
+                            if response.clicked() {
+                                clicked = Some(index);
+                            }
+                        }
+                    });
+            });
+        clicked
+    }
 
-                    let row_rect = frame_resp.response.rect;
-                    if is_selected {
-                        ui.scroll_to_rect(row_rect, Some(egui::Align::Center));
-                    }
-                    let click_resp = ui.interact(row_rect, row_id, egui::Sense::click());
-                    if click_resp.clicked() {
-                        clicked_username = Some(username.clone());
+    fn paint_completion_entry(
+        &self,
+        ui: &mut Ui,
+        entry: &CompletionEntry<'_>,
+        selected: bool,
+        hovered: bool,
+    ) {
+        let color = if selected {
+            t::text_primary()
+        } else {
+            t::text_secondary()
+        };
+        match entry {
+            CompletionEntry::Emote(entry) => {
+                let (slot, _) = ui.allocate_exact_size(
+                    egui::vec2(AUTOCOMPLETE_EMOTE_SIZE, AUTOCOMPLETE_EMOTE_SIZE),
+                    egui::Sense::hover(),
+                );
+                if let Some(&(w, h, ref raw)) = self.emote_bytes.get(entry.url.as_str()) {
+                    let is_animation = super::message_list::is_animation_format(raw);
+                    let animated = is_animation && self.animate_emotes && (selected || hovered);
+                    let size = fit_size(w, h, AUTOCOMPLETE_EMOTE_SIZE);
+                    let image_rect = egui::Rect::from_center_size(slot.center(), size);
+                    if is_animation && !animated {
+                        if let Some(texture) = self.emote_bytes.static_texture(ui.ctx(), &entry.url)
+                        {
+                            ui.painter().image(
+                                texture.id(),
+                                image_rect,
+                                egui::Rect::from_min_max(Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
+                        }
+                    } else {
+                        ui.put(
+                            image_rect,
+                            egui::Image::from_bytes(
+                                super::bytes_uri(&entry.url, raw.as_ref()),
+                                egui::load::Bytes::Shared(raw.clone()),
+                            )
+                            .fit_to_exact_size(size),
+                        );
                     }
                 }
-            });
-
-        clicked_username
+                let provider = provider_label(&entry.provider);
+                let provider_width = ui.fonts(|fonts| {
+                    fonts
+                        .layout_no_wrap(provider.to_owned(), t::small(), color)
+                        .size()
+                        .x
+                });
+                let code_width =
+                    (ui.available_width() - provider_width - ui.spacing().item_spacing.x).max(0.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(code_width, ui.available_height()),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&entry.code).font(t::small()).color(color),
+                            )
+                            .truncate(),
+                        );
+                    },
+                );
+                ui.label(RichText::new(provider).font(t::small()).color(color));
+            }
+            CompletionEntry::Command(entry) => {
+                ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&entry.usage)
+                                .font(t::small())
+                                .color(color)
+                                .strong(),
+                        )
+                        .truncate(),
+                    );
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&entry.summary).font(t::small()).color(color),
+                        )
+                        .truncate(),
+                    );
+                });
+            }
+            CompletionEntry::Username(name) => {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("@{name}"))
+                            .font(t::small())
+                            .color(color),
+                    )
+                    .truncate(),
+                );
+            }
+            CompletionEntry::Channel(name) => {
+                ui.add(
+                    egui::Label::new(RichText::new(*name).font(t::small()).color(color)).truncate(),
+                );
+            }
+        }
     }
 }
 
@@ -1764,24 +1800,7 @@ fn find_autocomplete_matches<'a>(
         _ => return Vec::new(),
     };
 
-    let query_lower = query.to_lowercase();
-    let mut matches: Vec<&EmoteCatalogEntry> = catalog
-        .iter()
-        .filter(|e| e.code.to_lowercase().contains(&query_lower))
-        .collect();
-
-    // Prefix matches first, then shorter codes first
-    matches.sort_by(|a, b| {
-        let a_prefix = a.code.to_lowercase().starts_with(&query_lower);
-        let b_prefix = b.code.to_lowercase().starts_with(&query_lower);
-        b_prefix
-            .cmp(&a_prefix)
-            .then_with(|| a.code.len().cmp(&b.code.len()))
-            .then_with(|| a.code.cmp(&b.code))
-    });
-
-    matches.truncate(AUTOCOMPLETE_MAX);
-    matches
+    ranked_completion_matches(catalog, query, AUTOCOMPLETE_MAX, |entry| &entry.code)
 }
 
 /// Find slash commands matching an in-progress `/command` token.
@@ -1802,24 +1821,59 @@ fn find_username_matches(buf: &str, chatters: &[String]) -> Vec<String> {
         _ => return Vec::new(),
     };
 
-    let query_lower = query.to_lowercase();
-    let mut matches: Vec<&String> = chatters
+    ranked_completion_matches(chatters, query, USERNAME_AUTOCOMPLETE_MAX, String::as_str)
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
+fn ranked_completion_matches<'a, T>(
+    candidates: &'a [T],
+    query: &str,
+    limit: usize,
+    name: impl Fn(&T) -> &str,
+) -> Vec<&'a T> {
+    if query.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    let query = query.to_lowercase();
+    let mut matches: Vec<_> = candidates
         .iter()
-        .filter(|u| u.to_lowercase().contains(&query_lower))
+        .enumerate()
+        .filter_map(|(index, candidate)| {
+            let name = name(candidate);
+            let prefix = if name.is_ascii() && query.is_ascii() {
+                let query = query.as_bytes();
+                if !name
+                    .as_bytes()
+                    .windows(query.len())
+                    .any(|part| part.eq_ignore_ascii_case(query))
+                {
+                    return None;
+                }
+                name.as_bytes()
+                    .get(..query.len())
+                    .is_some_and(|part| part.eq_ignore_ascii_case(query))
+            } else {
+                let lower = name.to_lowercase();
+                if !lower.contains(&query) {
+                    return None;
+                }
+                lower.starts_with(&query)
+            };
+            Some(((!prefix, name.len(), name, index), candidate))
+        })
         .collect();
-
-    // Prefix matches first, then shorter names first
-    matches.sort_by(|a, b| {
-        let a_prefix = a.to_lowercase().starts_with(&query_lower);
-        let b_prefix = b.to_lowercase().starts_with(&query_lower);
-        b_prefix
-            .cmp(&a_prefix)
-            .then_with(|| a.len().cmp(&b.len()))
-            .then_with(|| a.cmp(b))
-    });
-
-    matches.truncate(USERNAME_AUTOCOMPLETE_MAX);
-    matches.into_iter().cloned().collect()
+    // Keep only the visible candidates before sorting; the original index breaks equal-name ties.
+    if matches.len() > limit {
+        matches.select_nth_unstable_by(limit, |left, right| left.0.cmp(&right.0));
+        matches.truncate(limit);
+    }
+    matches.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    matches
+        .into_iter()
+        .map(|(_, candidate)| candidate)
+        .collect()
 }
 
 /// Find channel suggestions for `/join <channel>` on IRC server tabs.
@@ -2071,6 +2125,8 @@ pub fn invalidate_emote_completions(ctx: &egui::Context, id: Id) {
     ctx.data_mut(|data| {
         data.remove::<TabState>(id.with("tab_complete_state"));
         data.remove::<i32>(id.with("autocomplete_selection"));
+        data.remove::<CompletionPopupState>(id.with("completion_popup"));
+        data.remove::<DismissedCompletion>(id.with("dismissed_completion"));
     });
 }
 
@@ -2100,7 +2156,7 @@ pub fn insert_picker_emote(ctx: &egui::Context, id: Id, buf: &mut String, code: 
         data.insert_temp(id.with("tab_complete_state"), TabState::default());
         data.insert_temp(id.with("msg_history_state"), HistState::default());
     });
-    ctx.memory_mut(|memory| memory.request_focus(id));
+    request_composer_focus(ctx, Some(id));
 }
 
 /// The word containing the caret; all offsets are valid UTF-8 byte boundaries.
@@ -2211,11 +2267,6 @@ fn fit_size(w: u32, h: u32, target_h: f32) -> Vec2 {
     let scale_y = target_h / h as f32;
     let scale = scale_x.min(scale_y);
     Vec2::new(w as f32 * scale, h as f32 * scale)
-}
-
-fn is_likely_animated_url(url: &str) -> bool {
-    let lower = url.to_ascii_lowercase();
-    lower.contains(".gif") || lower.contains(".webp")
 }
 
 fn truncate_to_max_chars(buf: &mut String, max_chars: usize) {
@@ -2557,6 +2608,440 @@ mod tests {
         );
     }
 
+    fn completion_menu_frame(
+        ctx: &egui::Context,
+        buf: &mut String,
+        viewport: Vec2,
+        events: Vec<egui::Event>,
+        focus: bool,
+    ) -> (egui::FullOutput, ChatInputResult) {
+        let id = Id::new("completion_menu_test");
+        let catalog: Vec<_> = (0..10)
+            .map(|index| EmoteCatalogEntry {
+                id: index.to_string(),
+                code: format!("Kappa{index:02}"),
+                url: format!("https://example.test/{index}.png"),
+                url_hd: None,
+                provider: "test".to_owned(),
+                scope: "global".to_owned(),
+                channel: None,
+                user_id: None,
+                zero_width: false,
+            })
+            .collect();
+        let chatters: Vec<_> = (0..10).map(|index| format!("alice{index:02}")).collect();
+        let channel = if buf.starts_with("/join ") {
+            ChannelId::irc("irc.example.test", 6697, true, "room")
+        } else {
+            ChannelId::new("example")
+        };
+        let known: Vec<_> = (0..10)
+            .map(|index| ChannelId::irc("irc.example.test", 6697, true, &format!("room{index}")))
+            .collect();
+        let mut result = None;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, viewport)),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        let height = ui
+                            .fonts(|fonts| fonts.row_height(&t::body()))
+                            .max(t::chat_font_size())
+                            + 16.0
+                            + (t::INPUT_MARGIN.top + t::INPUT_MARGIN.bottom) as f32
+                            + chat_input_counter_height(ctx, viewport.x, &channel, buf);
+                        egui::TopBottomPanel::bottom("completion_menu_tray")
+                            .exact_height(height)
+                            .frame(egui::Frame::NONE)
+                            .show_inside(ui, |ui| {
+                                if focus {
+                                    ui.memory_mut(|memory| memory.request_focus(id));
+                                }
+                                result = Some(
+                                    ChatInput {
+                                        id: Some(id),
+                                        channel: &channel,
+                                        logged_in: true,
+                                        username: None,
+                                        emote_catalog: &catalog,
+                                        emote_bytes: &UiImageCache::default(),
+                                        pending_reply: None,
+                                        message_history: &[],
+                                        slash_usage_counts: &HashMap::new(),
+                                        known_channels: &known,
+                                        chatters: &chatters,
+                                        prevent_overlong_twitch_messages: false,
+                                        animate_emotes: false,
+                                        accept_dropped_files: false,
+                                    }
+                                    .show(ui, buf),
+                                );
+                            });
+                    });
+            },
+        );
+        (output, result.unwrap())
+    }
+
+    fn completion_popup(ctx: &egui::Context) -> CompletionPopupState {
+        ctx.data(|data| {
+            data.get_temp::<CompletionPopupState>(
+                Id::new("completion_menu_test").with("completion_popup"),
+            )
+        })
+        .expect("the focused query should have a completion menu")
+    }
+
+    #[test]
+    fn escape_dismisses_completions_until_the_draft_changes_and_keeps_focus() {
+        for (initial, typed) in [(":Kap", "p"), ("@al", "i"), ("/", "m"), ("/join #r", "o")] {
+            let ctx = egui::Context::default();
+            let id = Id::new("completion_menu_test");
+            let mut buf = initial.to_owned();
+            let size = egui::vec2(480.0, 320.0);
+            for _ in 0..3 {
+                completion_menu_frame(&ctx, &mut buf, size, Vec::new(), true);
+            }
+            completion_popup(&ctx);
+            let (_, action) = completion_menu_frame(
+                &ctx,
+                &mut buf,
+                size,
+                vec![key(Key::Escape, true, egui::Modifiers::NONE)],
+                false,
+            );
+            assert!(action.send.is_none());
+            assert_eq!(buf, initial);
+            assert!(ctx.memory(|memory| memory.has_focus(id)));
+            for _ in 0..3 {
+                completion_menu_frame(&ctx, &mut buf, size, Vec::new(), false);
+                assert!(
+                    ctx.data(
+                        |data| data.get_temp::<CompletionPopupState>(id.with("completion_popup"))
+                    )
+                    .is_none(),
+                    "Escape must keep {initial:?} dismissed without changing the draft"
+                );
+            }
+            completion_menu_frame(
+                &ctx,
+                &mut buf,
+                size,
+                vec![egui::Event::Text(typed.to_owned())],
+                false,
+            );
+            assert_eq!(buf, format!("{initial}{typed}"));
+            assert_eq!(completion_popup(&ctx).selected, 0);
+        }
+    }
+
+    #[test]
+    fn changing_the_completion_filter_selects_the_first_match() {
+        let ctx = egui::Context::default();
+        let mut buf = "@al".to_owned();
+        let size = egui::vec2(480.0, 320.0);
+        for _ in 0..3 {
+            completion_menu_frame(&ctx, &mut buf, size, Vec::new(), true);
+        }
+        for _ in 0..5 {
+            completion_menu_frame(
+                &ctx,
+                &mut buf,
+                size,
+                vec![key(Key::ArrowDown, true, egui::Modifiers::NONE)],
+                false,
+            );
+        }
+        assert_eq!(completion_popup(&ctx).selected, 5);
+        completion_menu_frame(
+            &ctx,
+            &mut buf,
+            size,
+            vec![egui::Event::Text("i".to_owned())],
+            false,
+        );
+        assert_eq!(completion_popup(&ctx).selected, 0);
+        assert_eq!(completion_popup(&ctx).selected_label, "alice00");
+    }
+
+    #[test]
+    fn covered_completion_popups_do_not_retain_composer_pointer_focus() {
+        let ctx = egui::Context::default();
+        let id = Id::new("completion_menu_test");
+        let mut buf = "@al".to_owned();
+        let size = egui::vec2(480.0, 320.0);
+        for _ in 0..3 {
+            completion_menu_frame(&ctx, &mut buf, size, Vec::new(), true);
+        }
+        let popup = completion_popup(&ctx);
+        let position = popup.rect.center();
+        for pressed in [false, true] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, size)),
+                    events: vec![
+                        egui::Event::PointerMoved(position),
+                        egui::Event::PointerButton {
+                            pos: position,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::Area::new(id.with("completion_popup_area"))
+                        .order(Order::Foreground)
+                        .fixed_pos(popup.rect.min)
+                        .show(ctx, |ui| {
+                            ui.allocate_space(popup.rect.size());
+                        });
+                    egui::Area::new(Id::new("covering_control"))
+                        .order(Order::Tooltip)
+                        .fixed_pos(popup.rect.min)
+                        .show(ctx, |ui| {
+                            ui.add_sized(popup.rect.size(), egui::Button::new("Cover"));
+                        });
+                    if pressed {
+                        assert!(
+                            !completion_pointer_active(ctx, id),
+                            "a covered popup must not steal the pointer from the top layer"
+                        );
+                    }
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn completion_menus_fit_short_viewports_and_accept_pointer_selection() {
+        for size in [egui::vec2(480.0, 320.0), egui::vec2(320.0, 220.0)] {
+            for font_scale in [1.0, 1.7] {
+                for initial in [":ka", "@al", "/", "/join #r"] {
+                    let ctx = egui::Context::default();
+                    let mut fonts = egui::FontDefinitions::default();
+                    for font in fonts.font_data.values_mut() {
+                        Arc::make_mut(font).tweak.scale *= font_scale;
+                    }
+                    ctx.set_fonts(fonts);
+                    let mut buf = initial.to_owned();
+                    let mut rendered = egui::FullOutput::default();
+                    for frame in 0..3 {
+                        rendered =
+                            completion_menu_frame(&ctx, &mut buf, size, Vec::new(), frame == 0).0;
+                    }
+                    let popup = completion_popup(&ctx);
+                    assert!(
+                        egui::Rect::from_min_size(Pos2::ZERO, size).contains_rect(popup.rect),
+                        "{initial} menu {:?} must fit {size:?} at {font_scale}",
+                        popup.rect
+                    );
+                    let composer = ctx
+                        .read_response(Id::new("completion_menu_test"))
+                        .unwrap()
+                        .rect;
+                    let area = ctx
+                        .memory(|memory| {
+                            memory.area_rect(
+                                Id::new("completion_menu_test").with("completion_popup_area"),
+                            )
+                        })
+                        .unwrap();
+                    assert!(
+                        !area.intersects(composer),
+                        "menu {area:?} must not cover composer {composer:?}"
+                    );
+                    assert!(egui::Rect::from_min_size(Pos2::ZERO, size).contains_rect(area));
+                    let label = if initial == "@al" {
+                        format!("@{}", popup.selected_label)
+                    } else {
+                        popup.selected_label.clone()
+                    };
+                    let row = visible_input_text(&rendered, &label)
+                        .unwrap_or_else(|| {
+                            let rows: Vec<_> = rendered.shapes.iter().filter_map(|shape| match &shape.shape {
+                                egui::Shape::Text(text) if text.galley.text() == label =>
+                                    Some((text.pos, text.galley.size(), shape.clip_rect)),
+                                _ => None,
+                            }).collect();
+                            panic!("selected completion {label} must be visible at {size:?}/{font_scale}: {rows:?}");
+                        });
+                    let expected = match initial {
+                        "@al" => format!("@{} ", popup.selected_label),
+                        "/" => format!(
+                            "{} ",
+                            popup.selected_label.split_whitespace().next().unwrap()
+                        ),
+                        "/join #r" => format!("/join {} ", popup.selected_label),
+                        _ => format!("{} ", popup.selected_label),
+                    };
+                    for pressed in [true, false] {
+                        let (_, result) = completion_menu_frame(
+                            &ctx,
+                            &mut buf,
+                            size,
+                            vec![
+                                egui::Event::PointerMoved(row.center()),
+                                egui::Event::PointerButton {
+                                    pos: row.center(),
+                                    button: egui::PointerButton::Primary,
+                                    pressed,
+                                    modifiers: egui::Modifiers::NONE,
+                                },
+                            ],
+                            false,
+                        );
+                        assert!(result.send.is_none());
+                    }
+                    assert_eq!(
+                        buf, expected,
+                        "clicking {initial} completion should replace the token"
+                    );
+                    assert!(ctx.memory(|memory| memory.has_focus(Id::new("completion_menu_test"))));
+                    completion_menu_frame(
+                        &ctx,
+                        &mut buf,
+                        size,
+                        vec![egui::Event::Text("next".to_owned())],
+                        false,
+                    );
+                    assert_eq!(
+                        buf,
+                        format!("{expected}next"),
+                        "typing should return to the composer"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn completion_menu_wheel_scroll_stays_put_until_keyboard_selection_changes() {
+        let ctx = egui::Context::default();
+        let mut buf = "/".to_owned();
+        let size = egui::vec2(480.0, 320.0);
+        for frame in 0..3 {
+            completion_menu_frame(&ctx, &mut buf, size, Vec::new(), frame == 0);
+        }
+        let first = completion_popup(&ctx);
+        completion_menu_frame(
+            &ctx,
+            &mut buf,
+            size,
+            vec![
+                egui::Event::PointerMoved(first.rect.center()),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -180.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            false,
+        );
+        let mut output = egui::FullOutput::default();
+        for _ in 0..8 {
+            output = completion_menu_frame(&ctx, &mut buf, size, Vec::new(), false).0;
+        }
+        assert!(
+            visible_input_text(&output, &first.selected_label).is_none(),
+            "wheel scrolling must not snap back to the selected first row"
+        );
+        assert_eq!(completion_popup(&ctx).selected, 0);
+        completion_menu_frame(
+            &ctx,
+            &mut buf,
+            size,
+            vec![key(Key::ArrowDown, true, egui::Modifiers::NONE)],
+            false,
+        );
+        for _ in 0..8 {
+            output = completion_menu_frame(&ctx, &mut buf, size, Vec::new(), false).0;
+        }
+        let selected = completion_popup(&ctx);
+        assert_eq!(selected.selected, 1);
+        assert!(
+            visible_input_text(&output, &selected.selected_label).is_some(),
+            "keyboard movement should reveal its selected row"
+        );
+    }
+
+    #[test]
+    fn changing_completion_query_reveals_an_unchanged_first_match() {
+        let ctx = egui::Context::default();
+        let mut buf = "@al".to_owned();
+        let size = egui::vec2(480.0, 220.0);
+        for frame in 0..3 {
+            completion_menu_frame(&ctx, &mut buf, size, Vec::new(), frame == 0);
+        }
+        let first = completion_popup(&ctx);
+        completion_menu_frame(
+            &ctx,
+            &mut buf,
+            size,
+            vec![
+                egui::Event::PointerMoved(first.rect.center()),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -180.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            false,
+        );
+        let mut output = egui::FullOutput::default();
+        for _ in 0..8 {
+            output = completion_menu_frame(&ctx, &mut buf, size, Vec::new(), false).0;
+        }
+        let label = format!("@{}", first.selected_label);
+        assert!(visible_input_text(&output, &label).is_none());
+        completion_menu_frame(
+            &ctx,
+            &mut buf,
+            size,
+            vec![egui::Event::Text("i".into())],
+            false,
+        );
+        for _ in 0..3 {
+            output = completion_menu_frame(&ctx, &mut buf, size, Vec::new(), false).0;
+        }
+        assert_eq!(buf, "@ali");
+        assert_eq!(completion_popup(&ctx).selected_label, first.selected_label);
+        assert!(visible_input_text(&output, &label).is_some(),
+            "editing the filter should reveal its selected completion even when the first match stays the same");
+    }
+
+    #[test]
+    fn completion_ranking_preserves_unicode_and_stable_ties_with_large_catalogs() {
+        let mut names: Vec<_> = (0..20_000)
+            .rev()
+            .map(|index| format!("item{index:05}"))
+            .collect();
+        names.extend([
+            "xitem".to_owned(),
+            "ITEM".to_owned(),
+            "item".to_owned(),
+            "item".to_owned(),
+        ]);
+        let matches = ranked_completion_matches(&names, "ItEm", 10, String::as_str);
+        assert_eq!(
+            &matches[..3],
+            [&names[20_001], &names[20_002], &names[20_003]]
+        );
+        assert!(matches[3..].iter().all(|name| name.starts_with("item000")));
+        assert_eq!(matches.len(), 10);
+        let unicode = vec!["Émile".to_owned(), "émil".to_owned(), "unémile".to_owned()];
+        assert_eq!(
+            ranked_completion_matches(&unicode, "ÉMI", 10, String::as_str),
+            [&unicode[1], &unicode[0], &unicode[2]]
+        );
+    }
+
     #[test]
     fn narrow_composer_keeps_the_picker_clickable_and_counters_inside_the_tray() {
         for width in [150.0, 200.0, 250.0, 360.0] {
@@ -2579,7 +3064,19 @@ mod tests {
                         frame.3
                     );
                 }
-                let picker = visible_input_text(&output, ":)")
+                let picker = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Circle(circle) if circle.radius >= 5.0 => Some(circle.center),
+                        _ => None,
+                    })
+                    .find(|point| {
+                        output
+                            .shapes
+                            .iter()
+                            .any(|shape| shape.clip_rect.contains(*point))
+                    })
                     .expect("the picker remains visible at every supported pane width");
                 if !initial.is_empty() {
                     let counter_label = format!("{}/500", initial.chars().count());
@@ -2589,7 +3086,7 @@ mod tests {
                         });
                     if width <= 200.0 {
                         assert!(
-                            counter.top() > picker.bottom(),
+                            counter.top() > picker.y,
                             "narrow counters belong below the input row"
                         );
                     }
@@ -2604,9 +3101,9 @@ mod tests {
                         &mut buf,
                         width,
                         vec![
-                            egui::Event::PointerMoved(picker.center()),
+                            egui::Event::PointerMoved(picker),
                             egui::Event::PointerButton {
-                                pos: picker.center(),
+                                pos: picker,
                                 button: egui::PointerButton::Primary,
                                 pressed,
                                 modifiers: egui::Modifiers::NONE,
@@ -2751,6 +3248,13 @@ mod tests {
             state.cursor.char_range().unwrap().primary.index,
             "hé Kappa ".chars().count()
         );
+        completion_frame(
+            &ctx,
+            &mut buf,
+            vec![egui::Event::Text("more ".to_owned())],
+            None,
+        );
+        assert_eq!(buf, "hé Kappa more tail🙂");
         assert!(ctx.memory(|memory| memory.has_focus(id)));
     }
 
@@ -2832,6 +3336,7 @@ mod tests {
                     scope: "channel".to_owned(),
                     channel: Some(first_channel.clone()),
                     user_id: None,
+                    zero_width: false,
                 })
                 .collect();
             let render = |buf: &mut String,
@@ -2958,6 +3463,7 @@ mod tests {
                 provider: "test".to_owned(),
                 url: format!("https://example.test/{code}.png"),
                 scope: "global".to_owned(),
+                zero_width: false,
             })
             .collect();
         let chatters = ["alice".to_owned(), "alexander".to_owned()];

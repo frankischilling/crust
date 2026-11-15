@@ -249,6 +249,7 @@ Each `emotes` entry includes:
 - `provider`
 - `url`
 - `url_hd`: omitted when a larger image is unavailable
+- `zero_width`: whether the emote overlays the preceding emote
 - `scope`: `global`, `channel`, or `personal`
 - `channel`: channel table, present for channel-owned entries
 - `user_id`: sender ID, present for personal entries
@@ -291,8 +292,10 @@ Fields:
 Fields:
 
 - `channel`
+- `timestamp`: source time in RFC 3339 format, when supplied by a server channel clear
 
-This event reports that the runtime cleared the whole visible channel buffer.
+This event reports a local channel-buffer clear or a server channel clear.
+The optional timestamp distinguishes timed server actions; local clears omit it.
 
 ### `c2.EventType.ClearUserMessagesLocally`
 
@@ -319,13 +322,15 @@ documented above.
 Each `spans` entry includes a `type` field and then type-specific fields:
 
 - `Text`: `text`, `is_action`
-- `Emote`: `id`, `code`, `url`, `url_hd`, `provider`
+- `Emote`: `id`, `code`, `url`, `url_hd`, `provider`, `zero_width`
 - `Emoji`: `text`, `url`
 - `Badge`: `name`, `version`
 - `Mention`: `login`
 - `Url`: `text`, `url`
 
-For `Emote`, `url_hd` is omitted when no HD image URL exists.
+For `Emote`, `url_hd` is omitted when no HD image URL exists. A `zero_width`
+emote overlays the preceding emote when they are separated only by horizontal
+whitespace. The original spans remain available for copying and logging.
 
 The nested `msg_kind` table includes a `type` field and then variant-specific fields:
 
@@ -385,8 +390,12 @@ Fields:
 
 - `channel`
 - `login`
+- `user_id`: target user ID, when available
+- `timestamp`: source time in RFC 3339 format, when available
 
-This event reports a moderation-driven user clear from the runtime.
+This event reports a moderation-driven user clear from the runtime. A source
+timestamp limits the clear to messages sent at or before it. An event without
+one affects only message identities already known when it arrives.
 
 ### `c2.EventType.SystemNotice`
 

@@ -2579,15 +2579,7 @@ impl<'a> MessageList<'a> {
                                     );
                                 });
                             } else {
-                                for span in &msg.spans {
-                                    self.render_span(
-                                        ui,
-                                        span,
-                                        msg.flags.is_action,
-                                        msg,
-                                        reply_key,
-                                    );
-                                }
+                                self.render_spans(ui, msg, reply_key);
                             }
                         });
                     },
@@ -2997,6 +2989,20 @@ impl<'a> MessageList<'a> {
         }); // end push_id
     }
 
+    fn render_spans(&self, ui: &mut Ui, msg: &ChatMessage, reply_key: Id) {
+        for item in crust_core::format::display_spans(&msg.spans) {
+            match item {
+                crust_core::format::DisplaySpan::Single(span) => {
+                    self.render_span(ui, span, msg.flags.is_action, msg, reply_key);
+                }
+                crust_core::format::DisplaySpan::EmoteLayers(layers) => {
+                    show_emote_layers(ui, layers, self.emote_bytes, EMOTE_SIZE, self.animate_emotes)
+                        .context_menu(|ui| self.show_message_context_menu(ui, msg, reply_key));
+                }
+            }
+        }
+    }
+
     fn render_span(
         &self,
         ui: &mut Ui,
@@ -3040,26 +3046,21 @@ impl<'a> MessageList<'a> {
                             // Check HD availability at hover time, not every frame.
                             let hd_entry = url_hd.as_deref().and_then(|u| emote_bytes.get(u));
 
-                            let (tt_key, tt_raw, tt_w, tt_h) = match hd_entry {
+                            let (tt_url, tt_key, tt_raw, tt_w, tt_h) = match hd_entry {
                                 Some(&(hw, hh, ref href)) => (
+                                    url_hd.as_deref().unwrap(),
                                     super::bytes_uri(url_hd.as_deref().unwrap(), href),
                                     href.clone(),
                                     hw,
                                     hh,
                                 ),
-                                None => (url_key.clone(), raw.clone(), w, h),
+                                None => (url.as_str(), url_key.clone(), raw.clone(), w, h),
                             };
                             let tt_size = fit_size(tt_w, tt_h, TOOLTIP_EMOTE_SIZE);
 
                             ui.set_max_width(280.0);
                             ui.vertical_centered(|ui| {
-                                ui.add(
-                                    egui::Image::from_bytes(
-                                        tt_key,
-                                        egui::load::Bytes::Shared(tt_raw),
-                                    )
-                                    .fit_to_exact_size(tt_size),
-                                );
+                                self.show_image(ui, &tt_key, &tt_raw, tt_size, Some(tt_url));
                                 ui.add_space(4.0);
                                 ui.label(RichText::new(code.as_str()).strong());
                                 ui.label(
@@ -3091,13 +3092,7 @@ impl<'a> MessageList<'a> {
                         .on_hover_ui_at_pointer(|ui| {
                             ui.set_max_width(200.0);
                             ui.vertical_centered(|ui| {
-                                ui.add(
-                                    egui::Image::from_bytes(
-                                        url_key.clone(),
-                                        egui::load::Bytes::Shared(raw.clone()),
-                                    )
-                                    .fit_to_exact_size(tooltip_size),
-                                );
+                                self.show_image(ui, &url_key, raw, tooltip_size, Some(url.as_str()));
                                 ui.add_space(4.0);
                                 ui.label(RichText::new(text.as_str()).strong());
                                 ui.label(
@@ -3470,15 +3465,7 @@ impl<'a> MessageList<'a> {
                                     .wrap(),
                                 );
                             } else {
-                                for span in &msg.spans {
-                                    self.render_span(
-                                        ui,
-                                        span,
-                                        msg.flags.is_action,
-                                        msg,
-                                        reply_key,
-                                    );
-                                }
+                                self.render_spans(ui, msg, reply_key);
                             }
                         });
                     },
@@ -3519,10 +3506,7 @@ impl<'a> MessageList<'a> {
         url_hint: Option<&str>,
     ) -> egui::Response {
         let cache_key = url_hint.unwrap_or(uri);
-        let is_animated =
-            url_hint.map(is_likely_animated_url).unwrap_or(false) || is_likely_animated_bytes(raw);
-
-        if is_animated && !self.animate_emotes {
+        if !self.animate_emotes && is_animation_format(raw) {
             if let Some(tex) = self.emote_bytes.static_texture(ui.ctx(), cache_key) {
                 let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
                 ui.painter().image(
@@ -3536,11 +3520,8 @@ impl<'a> MessageList<'a> {
             return show_image_placeholder(ui, size);
         }
 
-        if is_animated && self.animate_emotes {
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(33));
-        }
-
+        // Image schedules the next real frame from the loader's FrameDurations.
+        // A still WebP has no frame deadline and can stay idle.
         ui.add(
             egui::Image::from_bytes(uri.to_owned(), egui::load::Bytes::Shared(raw.clone()))
                 .sense(egui::Sense::click())
@@ -3741,6 +3722,94 @@ fn is_combining_codepoint(cp: u32) -> bool {
     )
 }
 
+/// Draw a base emote and its overlays as a single wrapping and hover target.
+pub(crate) fn show_emote_layers(
+    ui: &mut Ui,
+    layers: &[Span],
+    images: &UiImageCache,
+    target_height: f32,
+    animate: bool,
+) -> egui::Response {
+    paint_emote_layers(ui, layers, images, target_height, animate, false)
+        .on_hover_ui_at_pointer(|ui| {
+            ui.set_max_width(280.0);
+            ui.vertical_centered(|ui| {
+                paint_emote_layers(ui, layers, images, TOOLTIP_EMOTE_SIZE, animate, true);
+                ui.add_space(4.0);
+                for span in layers {
+                    if let Span::Emote { code, provider, .. } = span {
+                        ui.label(RichText::new(code).strong());
+                        ui.label(RichText::new(provider_label(provider)).small().color(t::text_secondary()));
+                    }
+                }
+            });
+        })
+}
+
+fn layer_image<'a>(
+    span: &'a Span,
+    images: &'a UiImageCache,
+    preview: bool,
+) -> Option<(&'a str, &'a crate::image_cache::ImageBytes)> {
+    let Span::Emote { url, url_hd, .. } = span else { return None; };
+    if preview {
+        if let Some(hd) = url_hd.as_deref() {
+            if let Some(image) = images.get(hd) {
+                return Some((hd, image));
+            }
+        }
+    }
+    images.get(url).map(|image| (url.as_str(), image))
+}
+
+fn layer_rect(bounds: egui::Rect, size: Vec2) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(bounds.center().x - size.x / 2.0, bounds.bottom() - size.y), size,
+    )
+}
+
+fn paint_emote_layers(
+    ui: &mut Ui,
+    layers: &[Span],
+    images: &UiImageCache,
+    target_height: f32,
+    animate: bool,
+    preview: bool,
+) -> egui::Response {
+    let mut size = Vec2::ZERO;
+    for span in layers {
+        if let Some((_, (w, h, _))) = layer_image(span, images, preview) {
+            size = size.max(fit_size(*w, *h, target_height));
+        }
+    }
+    // Keep all codes readable until the base arrives. Looking up every layer above
+    // still queues their downloads through the bounded image cache.
+    if layers.first().and_then(|span| layer_image(span, images, preview)).is_none() {
+        let text: String = layers.iter().map(|span| match span {
+            Span::Emote { code, .. } => code.as_str(),
+            Span::Text { text, .. } => text.as_str(),
+            _ => "",
+        }).collect();
+        return ui.add(Label::new(RichText::new(text).italics().font(t::small()).color(t::green()))
+            .selectable(true));
+    }
+    let (bounds, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    for span in layers {
+        let Some((url, (w, h, raw))) = layer_image(span, images, preview) else { continue; };
+        let rect = layer_rect(bounds, fit_size(*w, *h, target_height));
+        if !animate && is_animation_format(raw) {
+            if let Some(texture) = images.static_texture(ui.ctx(), url) {
+                ui.painter().image(texture.id(), rect,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), Color32::WHITE);
+            }
+        } else {
+            egui::Image::from_bytes(super::bytes_uri(url, raw), egui::load::Bytes::Shared(raw.clone()))
+                .fit_to_exact_size(rect.size()).paint_at(ui, rect);
+        }
+    }
+    response
+}
+
 /// Scale image dimensions to a target height, preserving aspect ratio.
 fn fit_size(w: u32, h: u32, target_h: f32) -> Vec2 {
     if h == 0 {
@@ -3750,24 +3819,9 @@ fn fit_size(w: u32, h: u32, target_h: f32) -> Vec2 {
     Vec2::new(w as f32 * scale, target_h)
 }
 
-fn is_likely_animated_url(url: &str) -> bool {
-    let lower = url.to_ascii_lowercase();
-    lower.contains(".gif") || lower.contains(".webp")
-}
-
-fn is_likely_animated_bytes(raw: &[u8]) -> bool {
-    // GIF: more than one image descriptor usually indicates multiple frames.
-    let is_gif = raw.len() >= 6 && (&raw[..6] == b"GIF87a" || &raw[..6] == b"GIF89a");
-    if is_gif {
-        let frame_markers = raw.iter().filter(|&&b| b == 0x2C).take(2).count();
-        if frame_markers >= 2 {
-            return true;
-        }
-    }
-
-    // WEBP animation uses an ANIM chunk in RIFF/WEBP containers.
-    let is_webp = raw.len() >= 12 && &raw[..4] == b"RIFF" && &raw[8..12] == b"WEBP";
-    is_webp && raw.windows(4).any(|w| w == b"ANIM")
+pub(crate) fn is_animation_format(raw: &[u8]) -> bool {
+    raw.starts_with(b"GIF87a") || raw.starts_with(b"GIF89a")
+        || (raw.len() >= 12 && raw.starts_with(b"RIFF") && &raw[8..12] == b"WEBP")
 }
 
 fn show_image_placeholder(ui: &mut Ui, size: Vec2) -> egui::Response {
@@ -3846,6 +3900,7 @@ fn show_sender_name(
 ) -> egui::Response {
     let fallback_color =
         Color32::from_rgb(fallback_color.r(), fallback_color.g(), fallback_color.b());
+    let display_color = t::readable_username_color(fallback_color);
     if let Some(paint) = paint {
         let label = Label::new(RichText::new(name).strong())
             .selectable(false)
@@ -3880,7 +3935,7 @@ fn show_sender_name(
                                     let t = paint_sample_t(paint, paint_rect, v.pos, stops);
                                     v.color = gradient_color_at_t(stops, t, paint.repeat);
                                 } else {
-                                    v.color = fallback_color;
+                                    v.color = display_color;
                                 }
                                 painted_vertices += 1;
                                 row_painted = true;
@@ -3897,14 +3952,14 @@ fn show_sender_name(
                     ui.painter().add(egui::epaint::TextShape::new(
                         galley_pos,
                         galley,
-                        fallback_color,
+                        display_color,
                     ));
                 }
             } else {
                 ui.painter().add(egui::epaint::TextShape::new(
                     galley_pos,
                     galley,
-                    fallback_color,
+                    display_color,
                 ));
             }
         }
@@ -3914,7 +3969,7 @@ fn show_sender_name(
     }
 
     ui.add(
-        Label::new(RichText::new(name).color(fallback_color).strong())
+        Label::new(RichText::new(name).color(display_color).strong())
             .selectable(false)
             .sense(egui::Sense::click()),
     )
@@ -5004,6 +5059,157 @@ fn message_left_accent_color(
 mod tests {
     use super::*;
     use crust_core::model::{ChannelId, MessageId, Sender, UserId};
+
+    fn emote_repaint_delay(raw: Vec<u8>, layered: bool, animate: bool) -> std::time::Duration {
+        let ctx = egui::Context::default();
+        let mut images = UiImageCache::default();
+        images.begin_frame(&ctx);
+        let url = "https://example.test/frame.webp";
+        assert!(images.complete(&ctx, url.into(), 2, 1, raw));
+        let raw = images.get(url).unwrap().2.clone();
+        let uri = super::super::bytes_uri(url, &raw);
+        ctx.include_bytes(uri.clone(), egui::load::Bytes::Shared(raw.clone()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match ctx.try_load_texture(&format!("{uri}#0"), egui::TextureOptions::LINEAR,
+                egui::load::SizeHint::default()) {
+                Ok(egui::load::TexturePoll::Ready { .. }) => break,
+                Ok(egui::load::TexturePoll::Pending { .. }) => {
+                    assert!(std::time::Instant::now() < deadline, "fixture decode timed out");
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => panic!("fixture decode failed: {error}"),
+            }
+        }
+        let messages = VecDeque::new();
+        let channel = ChannelId::new("room");
+        let previews = HashMap::new();
+        let ignored = HashSet::new();
+        let ignored_users = crust_core::ignores::CompiledIgnoredUsers::new(&[]);
+        let low_trust = HashMap::new();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let sender = UiCommandSender::new(sender);
+        let mut list = MessageList::new(&messages, &images, &sender, &channel, &previews, None,
+            false, 3, false, false, false, true, false, &ignored, &ignored_users,
+            &[], &[], &[], &low_trust);
+        list.animate_emotes = animate;
+        let layers = crust_core::format::tokenize_with_flags("Base Hat", false, &[], &|code| Some((
+            code.into(), code.into(), url.into(), "7tv".into(), None, code == "Hat",
+        )));
+        let mut delay = std::time::Duration::ZERO;
+        // Drain the decoder/texture upload and first-layout wakeups before checking
+        // the image's own deadline at a fixed point near the start of a 100ms frame.
+        for _ in 0..5 {
+            let output = ctx.run(egui::RawInput { time: Some(1.001), ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if layered {
+                        show_emote_layers(ui, &layers, &images, 22.0, animate);
+                    } else {
+                        list.show_image(ui, &uri, &raw, egui::vec2(44.0, 22.0), Some(url));
+                    }
+                });
+            });
+            delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        }
+        delay
+    }
+
+    #[test]
+    fn still_webp_emotes_can_idle_in_ordinary_and_layered_rendering() {
+        let mut raw = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(2, 1).write_to(&mut raw, image::ImageFormat::WebP).unwrap();
+        for layered in [false, true] {
+            let delay = emote_repaint_delay(raw.get_ref().clone(), layered, true);
+            assert_eq!(delay, std::time::Duration::MAX, "still WebP must not poll every 33 ms");
+        }
+    }
+
+    #[test]
+    fn animated_gif_and_webp_emotes_schedule_their_actual_frames_and_can_pause() {
+        for raw in [crate::image_cache::animated_gif_fixture(), crate::image_cache::animated_webp_fixture()] {
+            for layered in [false, true] {
+                let delay = emote_repaint_delay(raw.clone(), layered, true);
+                assert!(delay > std::time::Duration::from_millis(40)
+                    && delay <= std::time::Duration::from_millis(100),
+                    "100ms animation frames should set their own deadline: {delay:?}");
+                let paused = emote_repaint_delay(raw.clone(), layered, false);
+                assert_eq!(paused, std::time::Duration::MAX, "paused emotes must not schedule frames");
+            }
+        }
+    }
+
+    fn overlay_spans() -> Vec<Span> {
+        crust_core::format::tokenize_with_flags("Base Hat Sparkle", false, &[], &|code| Some((
+            code.into(), code.into(), format!("https://example.test/{code}.png"),
+            "7tv".into(), Some(format!("https://example.test/{code}-hd.png")), code != "Base",
+        ))).into_vec()
+    }
+
+    #[test]
+    fn layered_emotes_wrap_as_one_item_and_use_the_largest_width_once() {
+        let ctx = egui::Context::default();
+        let mut images = UiImageCache::default();
+        let layers = overlay_spans();
+        for (code, width) in [("Base", 40), ("Hat", 80), ("Sparkle", 20)] {
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::RgbaImage::from_pixel(width, 40, image::Rgba([255, 0, 0, 255]))
+                .write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+            assert!(images.complete(&ctx, format!("https://example.test/{code}.png"), width, 40, bytes.into_inner()));
+        }
+        let mut before = egui::Rect::NOTHING;
+        let mut group = egui::Rect::NOTHING;
+        let mut after = egui::Rect::NOTHING;
+        let _ = ctx.run(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(80.0, 200.0))),
+            ..Default::default()
+        }, |ctx| {
+            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
+                assert_eq!(ui.available_width(), 80.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    before = ui.allocate_exact_size(egui::vec2(60.0, 22.0), egui::Sense::hover()).0;
+                    group = show_emote_layers(ui, &layers, &images, 22.0, true).rect;
+                    after = ui.allocate_exact_size(egui::vec2(12.0, 22.0), egui::Sense::hover()).0;
+                });
+            });
+        });
+        assert_eq!(group.size(), egui::vec2(44.0, 22.0));
+        assert!(group.top() >= before.bottom(), "group {group:?} must wrap below {before:?}");
+        assert!((after.left() - group.right()).abs() < 0.1);
+        assert!((after.bottom() - group.bottom()).abs() < 0.1);
+        let base = layer_rect(group, egui::vec2(22.0, 22.0));
+        let sparkle = layer_rect(group, egui::vec2(11.0, 11.0));
+        assert_eq!(base.center().x, group.center().x);
+        assert_eq!(sparkle.center().x, group.center().x);
+        assert_eq!(sparkle.bottom(), group.bottom());
+        assert!(group.contains_rect(base) && group.contains_rect(sparkle));
+    }
+
+    #[test]
+    fn missing_layers_keep_codes_readable_and_request_only_normal_assets() {
+        let ctx = egui::Context::default();
+        let images = UiImageCache::default();
+        let layers = overlay_spans();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_emote_layers(ui, &layers, &images, 22.0, true);
+            });
+        });
+        assert!(output.shapes.iter().any(|shape| match &shape.shape {
+            egui::epaint::Shape::Text(text) => text.galley.text() == "Base Hat Sparkle",
+            _ => false,
+        }));
+        let mut urls = HashSet::new();
+        images.end_frame(&ctx, |command| {
+            if let AppCommand::FetchImage { url } = command { urls.insert(url); }
+            true
+        });
+        assert_eq!(urls, HashSet::from([
+            "https://example.test/Base.png".to_owned(),
+            "https://example.test/Hat.png".to_owned(),
+            "https://example.test/Sparkle.png".to_owned(),
+        ]));
+    }
 
     fn test_msg(login: &str, user_id: &str, color: Option<&str>) -> ChatMessage {
         ChatMessage {
