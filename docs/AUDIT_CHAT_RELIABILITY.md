@@ -111,7 +111,8 @@ ordinary visible emote.
 The renderer borrows the original spans, so copying and logging preserve every
 code and separator. Hover previews include the layers. A change to the overlay
 flag retokenizes existing messages and invalidates their layout, even when the
-code and image URL stay the same. Mentions receives the same layout update.
+code and image URL stay the same. Catalog refreshes also update the spans stored
+in Mentions; its message body still displays plain text.
 
 Old saved spans default to ordinary emotes when they have no overlay field.
 The existing five-field tokenizer callback remains supported; production paths

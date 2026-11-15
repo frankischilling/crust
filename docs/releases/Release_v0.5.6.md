@@ -36,8 +36,8 @@ to load Mentions history and normal-size emote images.
 - 7TV overlays and recognized BTTV global overlays layer over the preceding emote in chat and whispers.
   Successive overlays share one layout item. An overlay without a preceding
   emote remains visible as an ordinary emote. Copied and saved text stays intact.
-- Live changes to an emote's overlay flag update existing messages and their
-  layout, including the Mentions view.
+- Live changes to an emote's overlay flag update existing message layouts in
+  chat and whispers. Catalog refreshes also update the spans stored in Mentions.
 - Failed channel providers retry after a 30-second cooldown. Healthy providers
   keep their catalogs, and valid empty results do not cause repeated requests.
   Routine room-state updates cannot bypass the cooldown.
