@@ -882,6 +882,8 @@ pub(super) mod tests {
 
     #[test]
     fn pending_custom_decoders_recheck_size_when_image_bytes_arrive() {
+        use egui::load::BytesLoader;
+
         struct WaitingDecoder(Arc<AtomicUsize>);
 
         impl ImageLoader for WaitingDecoder {
@@ -909,6 +911,7 @@ pub(super) mod tests {
             ctx.try_load_image(source, SizeHint::default()),
             Ok(ImagePoll::Pending { .. })
         ));
+        ctx.loaders().include.forget(source);
         ctx.include_bytes(source, png());
         assert!(matches!(
             ctx.try_load_image(source, SizeHint::default()),

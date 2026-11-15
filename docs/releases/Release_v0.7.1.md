@@ -27,6 +27,8 @@ emotes handle missing or very short frame delays.
 - Static image requests return while decoding proceeds on the existing bounded
   worker queue. Cache limits, cancellation, and custom image loaders remain supported.
 - Static name-paint sampling shares decoded pixels with ordinary image rendering.
+- Queued and running image jobs share a 128 MiB encoded-data limit. Cancelled work
+  stays charged until it releases its source bytes.
 - GIF and WebP frames with delays of at most 10 ms use 100 ms. Other delays below
   20 ms use 20 ms, preventing stalled or excessively fast playback.
 

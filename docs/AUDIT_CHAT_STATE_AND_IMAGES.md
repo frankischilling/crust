@@ -49,8 +49,17 @@ no named accessibility action. Existing banner tests still passed in that run.
 PNG and JPEG requests previously fell through to a synchronous decoder. They now
 use the same bounded worker queue as animated and paused images. Pending requests
 share one decode; retained pixels remain usable after raw bytes are evicted.
-Cancellation releases reservations, stale completions cannot repopulate forgotten
-entries, and unsupported sources can still reach a custom image loader.
+Cancelled jobs release their reservations when the work exits. Stale completions
+cannot repopulate forgotten entries, and unsupported sources can still reach a
+custom image loader.
+
+Queued and running jobs share a 128 MiB encoded-data budget across loaders. A
+cancelled job keeps its source bytes charged until it is consumed or dropped;
+cache eviction cannot release that charge while the job still owns the data.
+Admission retries without blocking the UI when the budget is full. A source
+larger than the entire budget fails explicitly. Decoded-image and texture budgets
+remain separate; these limits do not measure total process memory or decoder
+scratch allocations.
 
 Static name-paint sampling and ordinary image rendering share decoded pixels.
 Paused animations retain their separate first-frame cache. Normal GIF and WebP

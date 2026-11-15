@@ -1,4 +1,7 @@
 //! Decode images and animation frames on a shared bounded worker queue.
+//!
+//! Queued and running jobs share a separate 128 MiB encoded-byte budget. A
+//! cancelled job retains its reservation until it releases the source bytes.
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -15,6 +18,55 @@ use super::{frame, preflight_decoded_size, LoaderMetrics};
 pub(super) const LOADER_ID: &str = "crust::background_animation_loader";
 const WORKERS: usize = 2;
 const QUEUED_JOBS: usize = 32;
+const QUEUED_BYTES: usize = 128 * 1024 * 1024;
+
+struct EncodedJobBudget {
+    bytes: AtomicUsize,
+    limit: usize,
+}
+
+impl EncodedJobBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: AtomicUsize::new(0),
+            limit,
+        }
+    }
+}
+
+struct EncodedJobReservation {
+    budget: Arc<EncodedJobBudget>,
+    bytes: usize,
+}
+
+impl EncodedJobReservation {
+    fn acquire(bytes: usize, budget: &Arc<EncodedJobBudget>) -> Option<Self> {
+        budget
+            .bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
+                used.checked_add(bytes)
+                    .filter(|total| *total <= budget.limit)
+            })
+            .ok()?;
+        Some(Self {
+            budget: budget.clone(),
+            bytes,
+        })
+    }
+}
+
+impl Drop for EncodedJobReservation {
+    fn drop(&mut self) {
+        self.budget.bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+fn shared_encoded_budget() -> Arc<EncodedJobBudget> {
+    static BUDGET: OnceLock<Arc<EncodedJobBudget>> = OnceLock::new();
+    BUDGET
+        .get_or_init(|| Arc::new(EncodedJobBudget::new(QUEUED_BYTES)))
+        .clone()
+}
 
 struct Reservation {
     bytes: AtomicUsize,
@@ -99,6 +151,8 @@ struct DecodeJob {
     first_frame: bool,
     ctx: egui::Context,
     slot: Arc<DecodeSlot>,
+    // The raw field drops first, so its bytes remain charged through cancellation.
+    _encoded: EncodedJobReservation,
     _pending: PendingJob,
 }
 
@@ -168,6 +222,7 @@ pub(super) struct AnimationLoader {
     bytes_limit: usize,
     entries_limit: usize,
     metrics: Arc<LoaderMetrics>,
+    encoded_budget: Arc<EncodedJobBudget>,
     #[cfg(test)]
     queue: Option<SyncSender<DecodeJob>>,
 }
@@ -183,6 +238,7 @@ impl AnimationLoader {
             bytes_limit,
             entries_limit,
             metrics,
+            encoded_budget: shared_encoded_budget(),
             #[cfg(test)]
             queue: None,
         }
@@ -318,6 +374,15 @@ impl AnimationLoader {
             preflight_decoded_size(&raw, self.bytes_limit).map_err(LoadError::Loading)?
         };
         let size = Some(egui::vec2(width as f32, height as f32));
+        if raw.len() > self.encoded_budget.limit {
+            return Err(LoadError::Loading(
+                "Image source exceeds the decoder queue byte limit".to_owned(),
+            ));
+        }
+        let Some(encoded) = EncodedJobReservation::acquire(raw.len(), &self.encoded_budget) else {
+            ctx.request_repaint_after(Duration::from_millis(25));
+            return Ok(ImagePoll::Pending { size });
+        };
         while self
             .metrics
             .animation_bytes
@@ -356,6 +421,7 @@ impl AnimationLoader {
             first_frame,
             ctx: ctx.clone(),
             slot: slot.clone(),
+            _encoded: encoded,
             _pending: PendingJob(self.metrics.clone()),
         };
         match self.enqueue(job) {
@@ -614,6 +680,7 @@ mod tests {
         let (queue, receiver) = mpsc::sync_channel(queue_size);
         let mut loader = AnimationLoader::new(bytes, entries, Arc::default());
         loader.queue = Some(queue);
+        loader.encoded_budget = Arc::new(EncodedJobBudget::new(QUEUED_BYTES));
         (loader, receiver)
     }
 
@@ -1003,9 +1070,129 @@ mod tests {
     }
 
     #[test]
+    fn encoded_job_budget_retains_queued_and_dequeued_cancellations() {
+        let raw = gif([255, 0, 0, 255]);
+        let encoded_bytes = raw.len();
+        let ctx = egui::Context::default();
+        let (mut loader, queue) = controlled(48, 3, 3);
+        loader.encoded_budget = Arc::new(EncodedJobBudget::new(encoded_bytes * 2));
+        for name in ["first", "second", "third"] {
+            ctx.include_bytes(format!("bytes://{name}.gif"), raw.clone());
+        }
+        assert!(matches!(
+            load(&loader, &ctx, "bytes://first.gif#0"),
+            Ok(ImagePoll::Pending { .. })
+        ));
+        let dequeued = queue.try_recv().unwrap();
+        assert!(matches!(
+            load(&loader, &ctx, "bytes://second.gif#0"),
+            Ok(ImagePoll::Pending { .. })
+        ));
+        loader.forget("bytes://first.gif");
+        loader.forget("bytes://second.gif");
+        assert_eq!(
+            loader.encoded_budget.bytes.load(Ordering::Acquire),
+            encoded_bytes * 2
+        );
+        assert_eq!(loader.byte_size(), 32);
+        assert!(matches!(
+            load(&loader, &ctx, "bytes://third.gif#0"),
+            Ok(ImagePoll::Pending { .. })
+        ));
+        assert_eq!(loader.metrics.pending_decodes.load(Ordering::Relaxed), 2);
+        assert!(loader.cache.lock().unwrap().entries.is_empty());
+
+        dequeued.run();
+        assert_eq!(
+            loader.encoded_budget.bytes.load(Ordering::Acquire),
+            encoded_bytes
+        );
+        assert!(matches!(
+            load(&loader, &ctx, "bytes://third.gif#0"),
+            Ok(ImagePoll::Pending { .. })
+        ));
+        assert_eq!(
+            loader.encoded_budget.bytes.load(Ordering::Acquire),
+            encoded_bytes * 2
+        );
+        queue.try_recv().unwrap().run();
+        assert_eq!(
+            loader.encoded_budget.bytes.load(Ordering::Acquire),
+            encoded_bytes
+        );
+        queue.try_recv().unwrap().run();
+        expect_ready(
+            load(&loader, &ctx, "bytes://third.gif#0"),
+            egui::Color32::RED,
+        );
+        assert!(queue.try_recv().is_err());
+        assert_eq!(loader.encoded_budget.bytes.load(Ordering::Acquire), 0);
+        assert_eq!(loader.metrics.pending_decodes.load(Ordering::Relaxed), 0);
+        assert_eq!(loader.metrics.completed_decodes.load(Ordering::Relaxed), 1);
+        assert_eq!(loader.byte_size(), 16);
+    }
+
+    #[test]
+    fn independent_loaders_share_encoded_capacity_and_resume_after_decode() {
+        let raw = gif([255, 0, 0, 255]);
+        let budget = Arc::new(EncodedJobBudget::new(raw.len()));
+        let first_ctx = egui::Context::default();
+        let second_ctx = egui::Context::default();
+        let (mut first, first_queue) = controlled(16, 1, 1);
+        let (mut second, second_queue) = controlled(16, 1, 1);
+        first.encoded_budget = budget.clone();
+        second.encoded_budget = budget.clone();
+        first_ctx.include_bytes("bytes://shared.gif", raw.clone());
+        second_ctx.include_bytes("bytes://shared.gif", raw.clone());
+        assert!(matches!(
+            load(&first, &first_ctx, "bytes://shared.gif#0"),
+            Ok(ImagePoll::Pending { .. })
+        ));
+        assert!(matches!(
+            load(&second, &second_ctx, "bytes://shared.gif#0"),
+            Ok(ImagePoll::Pending { .. })
+        ));
+        assert_eq!(budget.bytes.load(Ordering::Acquire), raw.len());
+        assert_eq!(second.byte_size(), 0);
+        assert!(second_queue.try_recv().is_err());
+        first_queue.try_recv().unwrap().run();
+        assert_eq!(budget.bytes.load(Ordering::Acquire), 0);
+        assert_eq!(first.byte_size(), 16);
+        assert!(matches!(
+            load(&second, &second_ctx, "bytes://shared.gif#0"),
+            Ok(ImagePoll::Pending { .. })
+        ));
+        second_queue.try_recv().unwrap().run();
+        expect_ready(
+            load(&second, &second_ctx, "bytes://shared.gif#0"),
+            egui::Color32::RED,
+        );
+        assert_eq!(budget.bytes.load(Ordering::Acquire), 0);
+        assert_eq!(second.byte_size(), 16);
+    }
+
+    #[test]
+    fn an_image_larger_than_the_encoded_budget_never_enters_the_queue() {
+        let raw = gif([255, 0, 0, 255]);
+        let ctx = egui::Context::default();
+        let (mut loader, queue) = controlled(16, 1, 1);
+        loader.encoded_budget = Arc::new(EncodedJobBudget::new(raw.len() - 1));
+        ctx.include_bytes("bytes://oversized.gif", raw);
+        assert!(matches!(
+            load(&loader, &ctx, "bytes://oversized.gif#0"),
+            Err(LoadError::Loading(reason)) if reason.contains("queue byte limit")
+        ));
+        assert!(queue.try_recv().is_err());
+        assert_eq!(loader.encoded_budget.bytes.load(Ordering::Acquire), 0);
+        assert_eq!(loader.metrics.pending_decodes.load(Ordering::Relaxed), 0);
+        assert_eq!(loader.byte_size(), 0);
+    }
+
+    #[test]
     fn a_full_queue_leaves_the_source_retryable_without_retaining_a_reservation() {
         let ctx = egui::Context::default();
         let (loader, queue) = controlled(64, 4, 1);
+        let encoded_bytes = gif([255, 0, 0, 255]).len();
         for name in ["first", "second"] {
             ctx.include_bytes(format!("bytes://{name}.gif"), gif([255, 0, 0, 255]));
             assert!(matches!(
@@ -1016,7 +1203,12 @@ mod tests {
         assert_eq!(loader.metrics.pending_decodes.load(Ordering::Relaxed), 1);
         assert_eq!(loader.byte_size(), 16);
         assert_eq!(loader.cache.lock().unwrap().entries.len(), 1);
+        assert_eq!(
+            loader.encoded_budget.bytes.load(Ordering::Acquire),
+            encoded_bytes
+        );
         queue.try_recv().unwrap().run();
+        assert_eq!(loader.encoded_budget.bytes.load(Ordering::Acquire), 0);
         assert!(matches!(
             load(&loader, &ctx, "bytes://second.gif#0"),
             Ok(ImagePoll::Pending { .. })
@@ -1026,6 +1218,7 @@ mod tests {
             load(&loader, &ctx, "bytes://second.gif#0"),
             egui::Color32::RED,
         );
+        assert_eq!(loader.encoded_budget.bytes.load(Ordering::Acquire), 0);
     }
 
     #[test]

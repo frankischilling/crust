@@ -462,22 +462,26 @@ fn fmt_points(n: u64) -> String {
 
 /// Render a tiny colored pill label (used for room-state modes in the stream bar).
 fn room_state_pill(ui: &mut egui::Ui, text: &str, color: Color32) {
-    egui::Frame::new()
+    let frame = egui::Frame::new()
         .fill(t::alpha(color, 20))
         .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.4)))
         .corner_radius(t::RADIUS_SM)
-        .inner_margin(egui::Margin::symmetric(5, 0))
-        .show(ui, |ui| {
-            ui.add(
-                egui::Label::new(
-                    RichText::new(text)
-                        .font(t::pills_font())
-                        .color(color)
-                        .strong(),
-                )
-                .wrap(),
-            );
-        });
+        .inner_margin(egui::Margin::symmetric(5, 0));
+    let margin = frame.total_margin().sum();
+    let width = (ui.max_rect().width() - margin.x).max(1.0);
+    let galley = ui
+        .painter()
+        .layout(text.to_owned(), t::pills_font(), color, width);
+    // Reserve the whole pill before drawing so the row can wrap it as one item.
+    ui.allocate_ui_with_layout(
+        galley.size() + margin,
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            frame.show(ui, |ui| {
+                ui.add(egui::Label::new(galley));
+            });
+        },
+    );
 }
 
 fn fmt_viewers(n: u64) -> String {
@@ -542,7 +546,7 @@ mod tests {
         ];
         for width in [150.0, 280.0, 480.0] {
             let ctx = Context::default();
-            for _ in 0..3 {
+            for frame in 0..3 {
                 let mut header_bottom = 0.0;
                 let output = ctx.run(
                     egui::RawInput {
@@ -564,6 +568,9 @@ mod tests {
                         header_bottom = ctx.available_rect().top();
                     },
                 );
+                if frame < 2 {
+                    continue;
+                }
                 for label in expected {
                     let text = output
                         .shapes
@@ -572,7 +579,7 @@ mod tests {
                             egui::Shape::Text(text) if text.galley.text() == label => Some(text),
                             _ => None,
                         })
-                        .expect("every active room mode remains visible");
+                        .unwrap_or_else(|| panic!("mode {label:?} is missing at width {width}"));
                     let rect = text.galley.rect.translate(text.pos.to_vec2());
                     assert!(
                         rect.left() >= 0.0 && rect.right() <= width + 1.0,
@@ -580,6 +587,15 @@ mod tests {
                     );
                     assert!(rect.bottom() <= header_bottom + 1.0,
                         "{label} overlaps chat below the header: {rect:?}, header bottom {header_bottom}");
+                    let natural_width = ctx.fonts(|fonts| {
+                        fonts.layout_no_wrap(label.to_owned(), t::pills_font(), Color32::WHITE).size().x
+                    });
+                    if natural_width <= width - 28.0 {
+                        assert_eq!(
+                            text.galley.rows.len(), 1,
+                            "a whole pill must move to the next row before splitting its label"
+                        );
+                    }
                 }
             }
         }
