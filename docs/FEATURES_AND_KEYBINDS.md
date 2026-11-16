@@ -71,6 +71,7 @@ the manager to restore mouse and keyboard control of an overlay.
 - Closing a pending startup channel removes it from the loading status
 - Icon controls with visible keyboard focus, accessible button actions and labels,
   and the current state of toggles
+- Resume scrolling supports Tab focus, Enter, and Space to return to live chat
 - Layout controls that show the active layout and disable the sidebar when the
   window is too narrow
 - Crash reports and IRC status remain within small windows. Failed report deletions
@@ -367,6 +368,9 @@ While a shortcut is waiting to be rebound, keyboard input goes to that binding.
 Escape cancels without changing it. Leaving Hotkeys or closing Settings also
 cancels an unfinished capture.
 
+In Settings, Escape clears a nonempty search or dismisses the active menu or
+expression editor first. A subsequent Escape closes the active Settings window.
+
 ### Global and navigation
 
 | Keybind | Behavior |
@@ -376,7 +380,7 @@ cancels an unfinished capture.
 | Ctrl+Shift+F | Open cross-channel search popup (predicate DSL) |
 | Ctrl+, | Open settings |
 | Ctrl+W | Close the focused chat window, split, or channel tab |
-| Escape | Close quick switch or the focused search controls |
+| Escape | Close quick switch, focused search controls, or the active Settings window after its child controls |
 | Ctrl+Tab, Ctrl+PageDown, Alt+Right | Next channel (prioritizes mentions/unread) |
 | Ctrl+Shift+Tab, Ctrl+PageUp, Alt+Left | Previous channel (prioritizes mentions/unread) |
 | Ctrl+1 .. Ctrl+9 | Jump directly to channel tab index 1..9 |
@@ -453,6 +457,8 @@ Notes:
 - A rejected send keeps the draft and reply. If a later runtime rejection arrives
   after a new draft was started, the unsent message remains available to copy or
   restore without replacing that draft.
+  Choosing Restore brings the original composer into view, including a closed
+  pane or detached window. A late failure does not change the view on its own.
 - The Twitch character count and message limit behavior depend on the configured overflow mode.
 - Pasting or dropping an image onto a composer starts the configured uploader.
   Its URL returns to that exact pane or reply thread, including an inactive
@@ -569,4 +575,4 @@ User-defined command aliases (Settings -> Commands) dispatch after the built-in 
 - [UI API](API_UI.md)
 - [Events API](API_Events.md)
 - [Plugin API reference](API.md)
-- [Release notes v0.7.1](releases/Release_v0.7.1.md)
+- [Release notes v0.7.2](releases/Release_v0.7.2.md)

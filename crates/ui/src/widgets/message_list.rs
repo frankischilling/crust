@@ -198,18 +198,26 @@ impl ReplySenderIndex {
         true
     }
 
+    fn parent_message<'a>(
+        &self,
+        messages: &'a VecDeque<ChatMessage>,
+        reply: &ReplyInfo,
+    ) -> Option<&'a ChatMessage> {
+        let position = self.by_server_id.get(reply_lookup_key(&reply.parent_msg_id).as_ref())?;
+        let message = messages.get(position.ordinal.checked_sub(self.base)?)?;
+        (message.id == position.id).then_some(message)
+    }
+
     fn message<'a>(
         &self,
         messages: &'a VecDeque<ChatMessage>,
         reply: &ReplyInfo,
     ) -> Option<&'a ChatMessage> {
         let login = reply_lookup_key(&reply.parent_user_login);
-        let position = if login.is_empty() {
-            self.by_server_id
-                .get(reply_lookup_key(&reply.parent_msg_id).as_ref())
-        } else {
-            self.by_login.get(login.as_ref())
-        }?;
+        if login.is_empty() {
+            return self.parent_message(messages, reply);
+        }
+        let position = self.by_login.get(login.as_ref())?;
         let message = messages.get(position.ordinal.checked_sub(self.base)?)?;
         (message.id == position.id).then_some(message)
     }
@@ -1735,10 +1743,27 @@ impl<'a> MessageList<'a> {
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
             let (stripe, _) = ui.allocate_exact_size(egui::vec2(2.0, 12.0), egui::Sense::hover());
             ui.painter().rect_filled(stripe, 0.0, t::accent());
-            let body = if let Some((cut, _)) = reply.parent_msg_body.char_indices().nth(80) {
-                format!("{}...", &reply.parent_msg_body[..cut])
+            let parent = self.reply_sender_message(ui.ctx(), rctx, reply);
+            let original_parent = if reply.parent_display_name.is_empty()
+                || reply.parent_user_login.is_empty() || reply.parent_msg_body.is_empty() {
+                rctx.reply_senders.get().and_then(|index| index.parent_message(self.messages, reply))
             } else {
-                reply.parent_msg_body.clone()
+                None
+            };
+            let parent_login = if reply.parent_user_login.is_empty() {
+                original_parent.map_or("", |parent| parent.sender.login.as_str())
+            } else {
+                reply.parent_user_login.as_str()
+            };
+            let quoted_body = if reply.parent_msg_body.is_empty() {
+                original_parent.map_or("", |parent| parent.raw_text.as_str())
+            } else {
+                reply.parent_msg_body.as_str()
+            };
+            let body = if let Some((cut, _)) = quoted_body.char_indices().nth(80) {
+                format!("{}...", &quoted_body[..cut])
+            } else {
+                quoted_body.to_owned()
             };
             let reply_color = t::text_secondary();
             let arrow = ui.add(
@@ -1746,7 +1771,6 @@ impl<'a> MessageList<'a> {
                     .selectable(false)
                     .sense(egui::Sense::click()),
             );
-            let parent = self.reply_sender_message(ui.ctx(), rctx, reply);
             let appearance = if msg.channel.is_twitch() {
                 let twitch_parent = parent.filter(|parent| parent.channel.is_twitch());
                 if let Some(parent) = twitch_parent {
@@ -1755,7 +1779,7 @@ impl<'a> MessageList<'a> {
                 sender_cosmetics::get(
                     ui.ctx(),
                     twitch_parent.map(|parent| parent.sender.user_id.0.as_str()),
-                    &reply.parent_user_login,
+                    parent_login,
                 )
             } else {
                 None
@@ -1772,10 +1796,17 @@ impl<'a> MessageList<'a> {
                 Some(appearance) => appearance.paint.as_deref(),
                 None => parent.and_then(|parent| parent.sender.name_paint.as_ref()),
             };
-            let display_name = if reply.parent_display_name.is_empty() {
-                &reply.parent_user_login
+            let display_name = if !reply.parent_display_name.is_empty() {
+                reply.parent_display_name.as_str()
+            } else if !reply.parent_user_login.is_empty() {
+                reply.parent_user_login.as_str()
+            } else if let Some(display) = original_parent.map(|parent| parent.sender.display_name.as_str())
+                .filter(|display| !display.is_empty()) {
+                display
+            } else if !parent_login.is_empty() {
+                parent_login
             } else {
-                &reply.parent_display_name
+                "Original message"
             };
             // Leave space for the quoted message even when the name is long.
             let sender_width =
@@ -1796,24 +1827,28 @@ impl<'a> MessageList<'a> {
                     },
                 )
                 .inner;
-            let body = ui.add(
-                Label::new(
-                    RichText::new(format!(": {body}"))
-                        .font(t::small())
-                        .color(reply_color)
-                        .italics(),
-                )
-                .selectable(false)
-                .sense(egui::Sense::click())
-                .truncate(),
-            );
-            let response = arrow.union(sender).union(body);
+            let response = if body.is_empty() {
+                arrow.union(sender)
+            } else {
+                let body = ui.add(
+                    Label::new(
+                        RichText::new(format!(": {body}"))
+                            .font(t::small())
+                            .color(reply_color)
+                            .italics(),
+                    )
+                    .selectable(false)
+                    .sense(egui::Sense::click())
+                    .truncate(),
+                );
+                arrow.union(sender).union(body)
+            };
             response.context_menu(|ui| self.show_message_context_menu(ui, msg, rctx.reply_key));
             if response.clicked() {
                 let target = reply.parent_msg_id.trim().to_owned();
                 let hint = ReplyScrollHint {
-                    parent_user_login: reply.parent_user_login.clone(),
-                    parent_msg_body: reply.parent_msg_body.clone(),
+                    parent_user_login: parent_login.to_owned(),
+                    parent_msg_body: quoted_body.to_owned(),
                     child_msg_local_id: msg.id.0,
                 };
                 ui.ctx().data_mut(|data| {
@@ -2514,31 +2549,38 @@ impl<'a> MessageList<'a> {
         }
 
         if let Some(btn_rect) = resume_btn_rect {
-            let painter = ui.painter().with_clip_rect(panel_rect);
-
-            // Button background
-            painter.rect_filled(btn_rect, 8.0, t::accent_dim());
-            // Subtle border for definition
-            painter.rect_stroke(
+            let btn_response = ui.interact(
                 btn_rect,
-                8.0,
-                egui::Stroke::new(1.0_f32, t::accent()),
-                egui::epaint::StrokeKind::Outside,
+                self.state_id("resume_scroll_btn"),
+                egui::Sense::click(),
             );
-            // Button label
+            btn_response.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Button,
+                    ui.is_enabled(),
+                    "Resume scrolling",
+                )
+            });
+            let visuals = ui.style().interact(&btn_response);
+            let stroke = if btn_response.has_focus() {
+                egui::Stroke::new(2.0_f32, t::accent())
+            } else {
+                visuals.bg_stroke
+            };
+            let painter = ui.painter().with_clip_rect(panel_rect);
+            painter.rect(
+                btn_rect,
+                visuals.corner_radius,
+                visuals.weak_bg_fill,
+                stroke,
+                egui::epaint::StrokeKind::Inside,
+            );
             painter.text(
                 btn_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 "Resume scrolling",
                 t::popups_font(),
-                t::text_on_accent(),
-            );
-
-            // Detect click on the painted rect
-            let btn_response = ui.interact(
-                btn_rect,
-                self.state_id("resume_scroll_btn"),
-                egui::Sense::click(),
+                visuals.text_color(),
             );
             if btn_response.clicked() {
                 // Clear paused so stick_to_bottom re-engages next frame.
@@ -5399,6 +5441,7 @@ mod tests {
                 name_paint: None,
                 badges: Vec::new(),
             },
+            original_text: None,
             raw_text: "hello".to_owned(),
             spans: Default::default(),
             twitch_emotes: Vec::new(),
@@ -5486,6 +5529,127 @@ mod tests {
             after_chat(ctx);
         });
         stats
+    }
+
+    #[test]
+    fn resume_scrolling_exposes_accessible_keyboard_and_pointer_activation() {
+        for activation in ["accessibility", "enter", "space", "pointer"] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let messages = VecDeque::new();
+            let images = UiImageCache::default();
+            let channel = ChannelId::new("rustlang");
+            let previews = HashMap::new();
+            let ignored = HashSet::new();
+            let ignored_users = crust_core::ignores::CompiledIgnoredUsers::new(&[]);
+            let low_trust = HashMap::new();
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            let sender = UiCommandSender::new(tx);
+            let list = MessageList::new(
+                &messages, &images, &sender, &channel, &previews, None,
+                false, 3, false, false, false, true, false,
+                &ignored, &ignored_users, &[], &[], &[], &low_trust,
+            ).with_pane(17, true);
+            let paused = list.state_id("scroll_paused");
+            let snap = list.state_id("snap_to_bottom");
+            let button_id = list.state_id("resume_scroll_btn");
+            let other_paused = view_state_id(&channel, Some(18), "scroll_paused");
+            ctx.data_mut(|data| {
+                data.insert_temp(paused, true);
+                data.insert_temp(other_paused, true);
+            });
+            let frame = |events| {
+                let mut geometry = None;
+                let output = ctx.run(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO, egui::vec2(500.0, 400.0),
+                    )),
+                    focused: true,
+                    events,
+                    ..Default::default()
+                }, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let panel = ui.available_rect_before_wrap();
+                        let scroll = ScrollArea::vertical()
+                            .id_salt("resume_scroll_test")
+                            .auto_shrink([false; 2])
+                            .stick_to_bottom(false)
+                            .show(ui, |ui| { ui.add_space(1_200.0); });
+                        list.show_resume_button(ui, &scroll, panel, 5);
+                        list.apply_snap(ui, &scroll);
+                        geometry = Some((
+                            panel, scroll.content_size.y - scroll.inner_rect.height(),
+                            scroll.state.offset.y, ctx.read_response(button_id),
+                        ));
+                    });
+                });
+                (output, geometry.unwrap())
+            };
+            let (initial, (panel, max_scroll, _, response)) = frame(Vec::new());
+            assert!(max_scroll > 100.0, "the fixture must have scrollable history");
+            let rect = response.expect("the resume control is registered").rect;
+            assert!(panel.contains_rect(rect));
+            let nodes = &initial.platform_output.accesskit_update.as_ref().unwrap().nodes;
+            let (target, node) = nodes.iter()
+                .find(|(_, node)| node.label() == Some("Resume scrolling"))
+                .expect("the floating resume control exposes its action name");
+            assert_eq!(node.role(), egui::accesskit::Role::Button);
+            assert!(node.supports_action(egui::accesskit::Action::Click));
+            let button_fill = |output: &egui::FullOutput| output.shapes.iter().find_map(|shape| {
+                match &shape.shape {
+                    egui::epaint::Shape::Rect(shape) if shape.rect == rect => Some(shape.fill),
+                    _ => None,
+                }
+            }).expect("the resume button is painted");
+            let (hovered, _) = frame(vec![egui::Event::PointerMoved(rect.center())]);
+            assert_ne!(button_fill(&initial), button_fill(&hovered), "hover must be visible");
+            let key = |key, pressed| egui::Event::Key {
+                key, physical_key: None, pressed, repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let (activated, _) = match activation {
+                "accessibility" => frame(vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click, target: *target, data: None,
+                    },
+                )]),
+                "pointer" => {
+                    let pointer = |pressed| egui::Event::PointerButton {
+                        pos: rect.center(), button: egui::PointerButton::Primary, pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    };
+                    frame(vec![pointer(true)]);
+                    frame(vec![pointer(false)])
+                }
+                _ => {
+                    let (mut focused, _) = frame(vec![
+                        egui::Event::PointerGone, key(egui::Key::Tab, true),
+                    ]);
+                    for _ in 0..8 {
+                        if ctx.memory(|memory| memory.has_focus(button_id)) { break; }
+                        focused = frame(vec![
+                            key(egui::Key::Tab, false), key(egui::Key::Tab, true),
+                        ]).0;
+                    }
+                    assert!(ctx.memory(|memory| memory.has_focus(button_id)), "Tab reaches Resume");
+                    assert!(focused.shapes.iter().any(|shape| matches!(&shape.shape,
+                        egui::epaint::Shape::Rect(shape) if shape.rect == rect
+                            && shape.stroke.width == 2.0 && shape.stroke.color == t::accent())));
+                    frame(vec![key(egui::Key::Tab, false), key(
+                        if activation == "enter" { egui::Key::Enter } else { egui::Key::Space }, true,
+                    )])
+                }
+            };
+            assert!(activated.platform_output.events.iter().any(|event| matches!(event,
+                egui::output::OutputEvent::Clicked(info) if info.typ == egui::WidgetType::Button
+                    && info.label.as_deref() == Some("Resume scrolling"))), "{activation}");
+            assert_eq!(ctx.data(|data| data.get_temp::<bool>(paused)), Some(false), "{activation}");
+            assert_eq!(ctx.data(|data| data.get_temp::<bool>(snap)), Some(true), "{activation}");
+            assert_eq!(ctx.data(|data| data.get_temp::<bool>(other_paused)), Some(true));
+            let (_, (_, max_scroll, offset, _)) = frame(Vec::new());
+            assert!((offset - max_scroll).abs() < 1.0, "{activation}: chat resumes at the bottom");
+            assert_eq!(ctx.data(|data| data.get_temp::<bool>(snap)), Some(false));
+        }
     }
 
     fn wrapping_message_fixture(
@@ -6632,6 +6796,42 @@ mod tests {
         let mut child = reply_sender_fixture(2, "child", Some("child-message"));
         child.reply = MessageList::reply_info_for_message(&parent);
         VecDeque::from([parent, child])
+    }
+
+    #[test]
+    fn id_only_reply_preview_uses_the_retained_parent_or_a_neutral_label() {
+        for retained in [false, true] {
+            let ctx = egui::Context::default();
+            let mut parent = reply_sender_fixture(1, "parent", Some(if retained {
+                "parent-message"
+            } else {
+                "unrelated-message"
+            }));
+            parent.sender.display_name = "Actual parent".into();
+            parent.raw_text = "Original body".into();
+            let mut child = reply_sender_fixture(2, "child", Some("child-message"));
+            child.reply = Some(ReplyInfo { parent_msg_id: "parent-message".into(), ..Default::default() });
+            let mut later = reply_sender_fixture(3, "parent", Some("later-message"));
+            later.raw_text = "Later unrelated body".into();
+            let messages = VecDeque::from([parent, child, later]);
+            let (_, output) = reply_preview_frame(&ctx, &messages, 360.0, Vec::new());
+            let text: Vec<_> = output.shapes.iter().filter_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            }).collect();
+            if retained {
+                assert!(text.contains(&"Actual parent"));
+                assert!(text.contains(&": Original body"));
+            } else {
+                assert!(text.contains(&"Original message"));
+                assert!(!text.iter().any(|text| text.starts_with(": ")));
+            }
+            assert!(!text.iter().any(|text| text.contains("Later unrelated body")));
+            let reply = messages[1].reply.as_ref().unwrap();
+            assert!(reply.parent_display_name.is_empty());
+            assert!(reply.parent_user_login.is_empty());
+            assert!(reply.parent_msg_body.is_empty());
+        }
     }
 
     #[test]

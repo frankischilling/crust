@@ -236,7 +236,11 @@ pub struct ChatMessage {
     pub timestamp: DateTime<Utc>,
     pub channel: super::ChannelId,
     pub sender: super::Sender,
-    /// Original unprocessed text.
+    /// Original body retained when local text rules rewrite a self message.
+    /// Confirmations match this body even when display rules change while queued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_text: Option<String>,
+    /// Chat body after local text rules have been applied.
     pub raw_text: String,
     /// Tokenized for rendering.
     pub spans: SmallVec<[Span; 8]>,
@@ -254,6 +258,11 @@ pub struct ChatMessage {
 }
 
 impl ChatMessage {
+    /// Body used to match socket confirmations to pending local echoes.
+    pub fn confirmation_text(&self) -> &str {
+        self.original_text.as_deref().unwrap_or(&self.raw_text)
+    }
+
     /// Text for search and copying, including subscription messages in older logs.
     pub fn plain_text(&self) -> std::borrow::Cow<'_, str> {
         use std::borrow::Cow;
@@ -301,7 +310,7 @@ impl ChatMessage {
                 .sender
                 .login
                 .eq_ignore_ascii_case(&confirmed.sender.login)
-            && self.raw_text == confirmed.raw_text
+            && self.confirmation_text() == confirmed.confirmation_text()
     }
 
     /// Import server metadata while keeping local identity and accumulated UI state.
@@ -400,6 +409,7 @@ mod tests {
                 display_name: "Alice".into(), original_display_name: None,
                 color: None, name_paint: None, badges: Vec::new(),
             },
+            original_text: None,
             raw_text: raw_text.into(), spans: Default::default(), twitch_emotes: Vec::new(),
             flags: Default::default(), reply: None, shared: None,
             msg_kind: MsgKind::Sub { display_name: "Alice".into(), months: 2,
@@ -437,6 +447,50 @@ mod tests {
         assert!(!pending.is_pending_own_echo_of(&confirmed));
         confirmed.msg_kind = MsgKind::Chat;
         assert!(pending.is_pending_own_echo_of(&confirmed));
+    }
+
+    #[test]
+    fn confirmation_matches_original_body_after_display_rules_change() {
+        let mut pending = subscription_message("masked", "");
+        pending.msg_kind = MsgKind::Chat;
+        pending.server_id = None;
+        pending.flags.is_self = true;
+        pending.original_text = Some("original body".into());
+        let mut confirmed = pending.clone();
+        confirmed.server_id = Some("confirmed".into());
+        confirmed.raw_text = "new replacement".into();
+        assert!(pending.is_pending_own_echo_of(&confirmed));
+
+        confirmed.raw_text = "original body".into();
+        confirmed.original_text = None;
+        assert!(pending.is_pending_own_echo_of(&confirmed));
+    }
+
+    #[test]
+    fn confirmation_keeps_different_wire_bodies_distinct_when_masks_match() {
+        let mut pending = subscription_message("***", "");
+        pending.msg_kind = MsgKind::Chat;
+        pending.server_id = None;
+        pending.flags.is_self = true;
+        pending.original_text = Some("first body".into());
+        let mut confirmed = pending.clone();
+        confirmed.server_id = Some("confirmed".into());
+        confirmed.original_text = Some("second body".into());
+        assert!(!pending.is_pending_own_echo_of(&confirmed));
+    }
+
+    #[test]
+    fn original_confirmation_body_round_trips_and_old_history_defaults_to_display() {
+        let mut pending = subscription_message("display body", "");
+        let old = serde_json::to_value(&pending).unwrap();
+        assert!(old.get("original_text").is_none());
+        let restored: super::ChatMessage = serde_json::from_value(old).unwrap();
+        assert_eq!(restored.confirmation_text(), "display body");
+        pending.original_text = Some("wire body".into());
+        let restored: super::ChatMessage =
+            serde_json::from_str(&serde_json::to_string(&pending).unwrap()).unwrap();
+        assert_eq!(restored.confirmation_text(), "wire body");
+        assert_eq!(restored.plain_text(), "display body");
     }
 
     #[test]

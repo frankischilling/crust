@@ -5415,6 +5415,7 @@ exit 1
                 width,
                 height,
                 raw_bytes,
+                download_slot: _download_slot,
             } => {
                 self.emote_bytes.complete(ctx, uri, width, height, raw_bytes);
             }
@@ -7949,17 +7950,18 @@ exit 1
         self.apply_channel_activation(channel, true);
     }
 
-    fn apply_channel_activation(&mut self, channel: ChannelId, focus_composer: bool) {
-        self.sync_classic_draft_owner();
-        if let Some(state) = self.state.channels.get_mut(&channel) {
+    fn mark_channel_read(&mut self, channel: &ChannelId) {
+        if let Some(state) = self.state.channels.get_mut(channel) {
             state.mark_read();
         }
-        // Activating the Mentions pseudo-tab clears its unread counter.
-        // (Real channels already clear via `mark_read` above; the Mentions
-        // buffer lives separately on AppState.)
         if channel.is_mentions() {
             self.state.clear_mentions_unread();
         }
+    }
+
+    fn apply_channel_activation(&mut self, channel: ChannelId, focus_composer: bool) {
+        self.sync_classic_draft_owner();
+        self.mark_channel_read(&channel);
         // Whenever the user explicitly activates a channel we want the
         // MessageList to snap to the bottom and clear any stale "paused"
         // state, so the channel never opens into dead space above a frozen
@@ -8015,6 +8017,7 @@ exit 1
     fn sync_split_focus(&mut self, ctx: &Context) {
         self.cancel_pending_layout_restore();
         if let Some(channel) = self.split_panes.focused_channel().cloned() {
+            self.mark_channel_read(&channel);
             self.state.active_channel = Some(channel);
             self.focus_chat_composer(ctx);
         }
@@ -8058,6 +8061,7 @@ exit 1
             self.message_search.insert(pane.channel.clone(), pane.search);
             self.single_pane_filters.insert(pane.channel.clone(), pane.filters);
         }
+        self.mark_channel_read(&pane.channel);
         self.state.active_channel = Some(pane.channel);
         self.chat_input_buf = pane.input_buf;
         self.split_panes.panes.clear();
@@ -8522,9 +8526,7 @@ exit 1
                 }
                 if let Some(channel) = self.split_panes.focused_channel().cloned() {
                     self.state.active_channel = Some(channel.clone());
-                    if let Some(state) = self.state.channels.get_mut(&channel) {
-                        state.mark_read();
-                    }
+                    self.mark_channel_read(&channel);
                     if focus_composer {
                         if let Some(ctx) = self.egui_ctx.as_ref() {
                             self.focus_chat_composer(ctx);
@@ -8600,7 +8602,9 @@ exit 1
             if index != self.split_panes.focused {
                 self.cancel_pending_layout_restore();
                 self.split_panes.focused = index;
-                self.state.active_channel = Some(self.split_panes.panes[index].channel.clone());
+                let channel = self.split_panes.panes[index].channel.clone();
+                self.mark_channel_read(&channel);
+                self.state.active_channel = Some(channel);
             }
         }
     }
@@ -11232,13 +11236,11 @@ impl CrustApp {
 
                         // Child controls also select their pane before dispatching actions.
                         if pane_pointer_pressed(ctx, pane_rect, ui.layer_id()) {
-                            self.cancel_pending_layout_restore();
                             self.split_panes.focused = pi;
-                            self.state.active_channel = Some(ch.clone());
                             // A child search field can take focus later in this pass.
                             // Header and message clicks still need to leave keyboard
                             // input with the pane the user selected.
-                            self.focus_chat_composer(ctx);
+                            self.sync_split_focus(ctx);
                         }
                         let is_focused = pi == self.split_panes.focused;
                         let bg_resp = ui.interact(
@@ -17113,6 +17115,7 @@ mod tests {
                 name_paint: None,
                 badges: Vec::new(),
             },
+            original_text: None,
             raw_text: "search target".to_owned(),
             spans: Default::default(),
             twitch_emotes: Vec::new(),
@@ -17700,6 +17703,118 @@ mod tests {
         assert_eq!(app.split_panes.focused, 1);
         assert_eq!(app.split_panes.panes[0].channel, first);
         assert_eq!(app.split_panes.panes[1].channel, second);
+    }
+
+    #[test]
+    fn split_focus_shortcut_clears_unread_without_resetting_the_view() {
+        let (mut app, _commands) = test_app();
+        let first = ChannelId::new("first");
+        let second = ChannelId::new("second");
+        for channel in [&first, &second] {
+            app.state.join_channel(channel.clone());
+            app.split_panes.add_pane(channel.clone(), None);
+            let state = app.state.channels.get_mut(channel).unwrap();
+            state.unread_count = 8;
+            state.unread_mentions = 3;
+        }
+        app.split_panes.panes[0].input_buf = "first draft".into();
+        app.split_panes.panes[1].input_buf = "second draft".into();
+        app.split_panes.panes[1].search.keyword = "retained search".into();
+        let ctx = egui::Context::default();
+        let paused = egui::Id::new("scroll_paused").with(second.as_str())
+            .with(app.split_panes.panes[1].id);
+        ctx.data_mut(|data| data.insert_temp(paused, true));
+        let _ = ctx.run(shortcut_input(egui::Key::PageDown,
+            egui::Modifiers::CTRL | egui::Modifiers::ALT), |ctx| {
+            app.handle_channel_shortcuts(ctx);
+        });
+        assert_eq!(app.state.active_channel.as_ref(), Some(&second));
+        assert_eq!(app.state.channels[&second].unread_count, 0);
+        assert_eq!(app.state.channels[&second].unread_mentions, 0);
+        assert_eq!(app.state.channels[&first].unread_count, 8);
+        assert_eq!(app.state.channels[&first].unread_mentions, 3);
+        assert_eq!(app.split_panes.panes[0].input_buf, "first draft");
+        assert_eq!(app.split_panes.panes[1].input_buf, "second draft");
+        assert_eq!(app.split_panes.panes[1].search.keyword, "retained search");
+        assert_eq!(ctx.data(|data| data.get_temp::<bool>(paused)), Some(true));
+        assert!(app.pending_active_snap.is_empty());
+    }
+
+    #[test]
+    fn split_focus_pointer_and_search_keyboard_clear_only_the_selected_badges() {
+        for target in ["header", "body", "search", "keyboard"] {
+            let (mut app, _commands) = test_app();
+            let ctx = egui::Context::default();
+            let first = ChannelId::new("first");
+            let second = ChannelId::new("second");
+            app.state.auth.logged_in = true;
+            for channel in [&first, &second] {
+                app.state.join_channel(channel.clone());
+                app.split_panes.add_pane(channel.clone(), None);
+            }
+            app.split_panes.panes[1].search.open = matches!(target, "search" | "keyboard");
+            let search = app.split_panes.panes[1].search.field_id(&second, "keyword");
+            let pane_id = egui::Id::new("split_pane_bg").with(app.split_panes.panes[1].id);
+            let response_id = if matches!(target, "search" | "keyboard") { search } else { pane_id };
+            let mut response = None;
+            for _ in 0..3 {
+                response = production_ui_frame_with_response(&ctx, &mut app, Vec::new(), Some(response_id)).1;
+            }
+            for channel in [&first, &second] {
+                let state = app.state.channels.get_mut(channel).unwrap();
+                state.unread_count = 8;
+                state.unread_mentions = 3;
+            }
+            if target == "keyboard" {
+                ctx.memory_mut(|memory| memory.request_focus(search));
+                production_ui_frame(&ctx, &mut app, Vec::new());
+            } else {
+                let rect = response.expect("the target control is rendered").rect;
+                let position = if target == "header" {
+                    egui::pos2(rect.left() + 20.0, rect.top() + super::split_header_height() * 0.5)
+                } else {
+                    rect.center()
+                };
+                for pressed in [true, false] {
+                    production_ui_frame(&ctx, &mut app, vec![
+                        egui::Event::PointerMoved(position),
+                        egui::Event::PointerButton { pos: position, button: egui::PointerButton::Primary,
+                            pressed, modifiers: egui::Modifiers::NONE },
+                    ]);
+                }
+            }
+            assert_eq!(app.split_panes.focused, 1, "{target}");
+            assert_eq!(app.state.channels[&second].unread_count, 0, "{target}");
+            assert_eq!(app.state.channels[&second].unread_mentions, 0, "{target}");
+            assert_eq!(app.state.channels[&first].unread_count, 8, "{target}");
+            assert_eq!(app.state.channels[&first].unread_mentions, 3, "{target}");
+            if matches!(target, "search" | "keyboard") {
+                assert_eq!(ctx.memory(|memory| memory.focused()), Some(search));
+            }
+        }
+    }
+
+    #[test]
+    fn split_focus_and_collapse_clear_the_mentions_feed_badge() {
+        let (mut app, _commands) = test_app();
+        let channel = ChannelId::new("room");
+        app.state.join_channel(channel.clone());
+        app.split_panes.add_pane(channel, None);
+        app.split_panes.add_pane(ChannelId::mentions(), None);
+        app.state.mentions_unread = 4;
+        let ctx = egui::Context::default();
+        let _ = ctx.run(shortcut_input(egui::Key::PageDown,
+            egui::Modifiers::CTRL | egui::Modifiers::ALT), |ctx| {
+            app.handle_channel_shortcuts(ctx);
+        });
+        assert_eq!(app.state.active_channel, Some(ChannelId::mentions()));
+        assert_eq!(app.state.mentions_unread, 0);
+        app.split_panes.focused = 0;
+        app.state.mentions_unread = 5;
+        app.close_split_pane(0, &ctx);
+        assert!(app.split_panes.panes.is_empty());
+        assert_eq!(app.state.active_channel, Some(ChannelId::mentions()));
+        assert_eq!(app.state.mentions_unread, 0);
     }
 
     #[test]
@@ -19442,6 +19557,7 @@ mod tests {
                 name_paint: None,
                 badges: Vec::new(),
             },
+            original_text: None,
             raw_text: String::new(),
             spans: Default::default(),
             twitch_emotes: Vec::new(),

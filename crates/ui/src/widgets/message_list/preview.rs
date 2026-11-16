@@ -562,6 +562,7 @@ mod tests {
                 name_paint: None,
                 badges: Vec::new(),
             },
+            original_text: None,
             raw_text: text.to_owned(),
             spans: smallvec::smallvec![Span::Text {
                 text: text.to_owned(),

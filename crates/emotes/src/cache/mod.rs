@@ -14,7 +14,7 @@ use directories::ProjectDirs;
 use lru::LruCache;
 use tracing::debug;
 
-use crate::{read_image_response, EmoteError, EmoteInfo, MAX_IMAGE_DOWNLOAD_BYTES};
+use crate::{read_image_response, validate_image, EmoteError, EmoteInfo, MAX_IMAGE_DOWNLOAD_BYTES};
 
 const IN_MEMORY_CAPACITY: usize = 256;
 const IN_MEMORY_BYTE_LIMIT: usize = 128 * 1024 * 1024;
@@ -194,7 +194,7 @@ impl EmoteCache {
             .join(&key.provider)
             .join(format!("{}_{}.bin", key.id, key.scale));
 
-        if let Some((bytes, fetched_at)) = read_disk_cache(&disk_path).await {
+        if let Some((bytes, fetched_at, _)) = read_disk_cache(&disk_path).await {
             self.inner
                 .lock()
                 .unwrap()
@@ -207,7 +207,7 @@ impl EmoteCache {
         debug!("Fetching emote from {url}");
         let resp = self.client.get(url).send().await?;
         let bytes: Bytes = read_image_response(resp).await?.into();
-        validate_image(bytes.clone()).await?;
+        let (bytes, _) = validate_image(bytes).await?;
 
         // Persist to disk
         if let Some(parent) = disk_path.parent() {
@@ -283,20 +283,20 @@ impl EmoteCache {
         };
 
         let fetch_result: Result<(u32, u32, Vec<u8>), EmoteError> = async {
-            let (bytes, fetched_at) = if let Some(cached) = read_disk_cache(&disk_path).await {
-                cached
-            } else {
-                debug!("Fetching emote image: {url}");
-                let resp = self.client.get(url).send().await?;
-                let bytes: Bytes = read_image_response(resp).await?.into();
-                validate_image(bytes.clone()).await?;
-                if let Some(parent) = disk_path.parent() {
-                    let _ = tokio::fs::create_dir_all(parent).await;
-                }
-                let _ = tokio::fs::write(&disk_path, &bytes).await;
-                (bytes, Instant::now())
-            };
-            let (w, h) = read_header_dims(&bytes)?;
+            let (bytes, fetched_at, (w, h)) =
+                if let Some(cached) = read_disk_cache(&disk_path).await {
+                    cached
+                } else {
+                    debug!("Fetching emote image: {url}");
+                    let resp = self.client.get(url).send().await?;
+                    let bytes: Bytes = read_image_response(resp).await?.into();
+                    let (bytes, dimensions) = validate_image(bytes).await?;
+                    if let Some(parent) = disk_path.parent() {
+                        let _ = tokio::fs::create_dir_all(parent).await;
+                    }
+                    let _ = tokio::fs::write(&disk_path, &bytes).await;
+                    (bytes, Instant::now(), dimensions)
+                };
             self.inner
                 .lock()
                 .unwrap()
@@ -337,7 +337,7 @@ fn url_hash(url: &str) -> u64 {
     hash
 }
 
-async fn read_disk_cache(path: &std::path::Path) -> Option<(Bytes, Instant)> {
+async fn read_disk_cache(path: &std::path::Path) -> Option<(Bytes, Instant, (u32, u32))> {
     let (bytes, age) = {
         let file = tokio::fs::File::open(path).await.ok()?;
         let metadata = file.metadata().await.ok()?;
@@ -354,24 +354,14 @@ async fn read_disk_cache(path: &std::path::Path) -> Option<(Bytes, Instant)> {
         }
         (Bytes::from(bytes), age)
     };
-    if validate_image(bytes.clone()).await.is_err() {
-        let _ = tokio::fs::remove_file(path).await;
-        return None;
-    }
-    Some((bytes, Instant::now().checked_sub(age)?))
-}
-
-async fn validate_image(bytes: Bytes) -> Result<(), EmoteError> {
-    // Validate cache misses away from the async event loop. A readable header
-    // alone does not prove that a response contains decodable image data.
-    tokio::task::spawn_blocking(move || {
-        image::ImageReader::new(Cursor::new(bytes))
-            .with_guessed_format()?
-            .decode()?;
-        Ok(())
-    })
-    .await
-    .map_err(|error| EmoteError::Io(std::io::Error::other(error.to_string())))?
+    let (bytes, dimensions) = match validate_image(bytes).await {
+        Ok(validated) => validated,
+        Err(_) => {
+            let _ = tokio::fs::remove_file(path).await;
+            return None;
+        }
+    };
+    Some((bytes, Instant::now().checked_sub(age)?, dimensions))
 }
 
 /// Read image dimensions without decoding the image into pixels.

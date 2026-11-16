@@ -2242,6 +2242,7 @@ mod tests {
                 name_paint: None,
                 badges: Vec::new(),
             },
+            original_text: None,
             raw_text: "example".to_owned(),
             spans: Default::default(),
             twitch_emotes: Vec::new(),

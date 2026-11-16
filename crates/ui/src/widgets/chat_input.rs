@@ -1264,17 +1264,29 @@ impl<'a> ChatInput<'a> {
                     ui.horizontal(|ui| {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
-                            if ui
-                                .small_button("✕")
-                                .on_hover_text("Dismiss reply")
-                                .clicked()
+                            if crate::widgets::chrome::icon_button(
+                                ui,
+                                crate::widgets::chrome::ChromeIcon::Close,
+                                "Dismiss reply",
+                                crate::widgets::chrome::IconButtonState {
+                                    compact: true,
+                                    ..Default::default()
+                                },
+                            ).clicked()
                             {
                                 result.dismiss_reply = true;
                             }
-                            let preview = format!(
-                                "↩ Replying to @{}: {}",
-                                rep.parent_display_name, rep.parent_msg_body
-                            );
+                            let parent_name = if rep.parent_display_name.trim().is_empty() {
+                                rep.parent_user_login.trim()
+                            } else {
+                                rep.parent_display_name.trim()
+                            };
+                            let preview = match (parent_name.is_empty(), rep.parent_msg_body.is_empty()) {
+                                (true, true) => "↩ Replying to a message".to_owned(),
+                                (true, false) => format!("↩ Replying to: {}", rep.parent_msg_body),
+                                (false, true) => format!("↩ Replying to @{parent_name}"),
+                                (false, false) => format!("↩ Replying to @{parent_name}: {}", rep.parent_msg_body),
+                            };
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(&preview).font(t::small()).color(t::accent()),
@@ -4253,6 +4265,7 @@ mod tests {
     fn long_reply_names_leave_the_dismiss_button_reachable() {
         for width in [150.0, 210.0, 360.0] {
             let ctx = egui::Context::default();
+            ctx.enable_accesskit();
             let reply = ReplyInfo {
                 parent_msg_id: "parent".to_owned(),
                 parent_user_login: "long_sender".to_owned(),
@@ -4297,22 +4310,21 @@ mod tests {
                         });
                     },
                 );
-                let position = output
-                    .shapes
-                    .iter()
-                    .find_map(|shape| match &shape.shape {
-                        egui::Shape::Text(text) if text.galley.text() == "✕" => {
-                            let position = text.pos + text.galley.size() / 2.0;
-                            assert!(shape.clip_rect.contains(position));
-                            Some(position)
-                        }
-                        _ => None,
-                    })
-                    .expect("reply dismiss control is visible");
-                assert!(position.x < width);
-                (dismissed, position)
+                (dismissed, output)
             };
-            let (_, pos) = render(Vec::new());
+            let (_, output) = render(Vec::new());
+            let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+            let (_, node) = nodes.iter()
+                .find(|(_, node)| node.label() == Some("Dismiss reply"))
+                .expect("reply dismissal exposes a named action");
+            assert_eq!(node.role(), egui::accesskit::Role::Button);
+            assert!(node.supports_action(egui::accesskit::Action::Click));
+            let bounds = node.bounds().expect("reply dismissal has visible bounds");
+            assert!(bounds.x0 >= 0.0 && bounds.x1 <= width as f64);
+            let pos = egui::pos2(
+                ((bounds.x0 + bounds.x1) * 0.5) as f32,
+                ((bounds.y0 + bounds.y1) * 0.5) as f32,
+            );
             render(vec![
                 egui::Event::PointerMoved(pos),
                 egui::Event::PointerButton {

@@ -422,6 +422,7 @@ mod tests {
                 sender: Sender { user_id: UserId("10".into()), login: "alice".into(),
                     display_name: "Alice".into(), original_display_name: None,
                     color: None, name_paint: None, badges: Vec::new() },
+                original_text: None,
                 raw_text: if legacy { "Alice subscribed with Tier 1!" } else { "spam Kappa" }.into(),
                 spans: Default::default(),
                 twitch_emotes: if legacy { Vec::new() } else { vec![native_emote("25", 5, 9)] },

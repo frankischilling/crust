@@ -686,6 +686,8 @@ pub enum AppEvent {
         width: u32,
         height: u32,
         raw_bytes: Vec<u8>,
+        /// Keep the fetch slot until every queued copy has been consumed or dropped.
+        download_slot: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
     },
     /// Authenticated successfully with Twitch.
     Authenticated {
@@ -812,7 +814,7 @@ pub enum AppEvent {
         url: String,
         title: Option<String>,
         description: Option<String>,
-        /// og:image URL; the image bytes land in emote_bytes under this key.
+        /// Resolved image URL; visible consumers request its bytes through the image queue.
         thumbnail_url: Option<String>,
         /// Site name from `og:site_name` (e.g. "YouTube", "Twitter").
         site_name: Option<String>,

@@ -2,10 +2,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use crust_core::events::AppEvent;
-use crust_emotes::cache::EmoteCache;
 use tokio::sync::mpsc;
-
-use crate::runtime::assets::fetch_emote_image;
 
 const MAX_PENDING_LINK_PREVIEWS: usize = 64;
 const MAX_PREVIEW_HTML_BYTES: usize = 64 * 1024;
@@ -43,7 +40,6 @@ impl Drop for LinkPreviewRequest {
 /// Link preview fetch.
 pub(crate) async fn fetch_link_preview(
     url: &str,
-    cache: &Option<EmoteCache>,
     evt_tx: &mpsc::Sender<AppEvent>,
 ) {
     let send_empty = |url: &str| AppEvent::LinkPreviewReady {
@@ -73,12 +69,9 @@ pub(crate) async fn fetch_link_preview(
         }
     };
 
-    // Direct image URLs (image hosts, uploader output, hot-linked assets)
-    // don't serve OG tagsthey serve the image itself. Short-circuit by
-    // using the URL as its own thumbnail so the hover tooltip shows a real
-    // image preview instead of "Loading preview..." forever.
+    // Direct image links use their URL as the thumbnail. The visible tooltip
+    // requests its bytes through the same queue as other images.
     if is_direct_image_url(url) {
-        fetch_emote_image(url, cache, evt_tx).await;
         let _ = evt_tx
             .send(AppEvent::LinkPreviewReady {
                 url: url.to_owned(),
@@ -94,7 +87,7 @@ pub(crate) async fn fetch_link_preview(
     // YouTube serves proper OG tags but the oEmbed JSON API is faster,
     // more reliable, and doesn't require HTML parsing.
     if is_youtube_url(url) {
-        if let Some(ev) = fetch_youtube_oembed(url, &client, cache, evt_tx).await {
+        if let Some(ev) = fetch_youtube_oembed(url, &client).await {
             let _ = evt_tx.send(ev).await;
             return;
         }
@@ -114,6 +107,7 @@ pub(crate) async fn fetch_link_preview(
         }
     };
 
+    let source_url = resp.url().clone();
     let ct = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -124,7 +118,7 @@ pub(crate) async fn fetch_link_preview(
     // served with an image content-type (CDN shorteners, redirects,
     // /raw/... endpoints). Use the URL itself as the thumbnail.
     if ct.starts_with("image/") {
-        fetch_emote_image(url, cache, evt_tx).await;
+        drop(resp);
         let _ = evt_tx
             .send(AppEvent::LinkPreviewReady {
                 url: url.to_owned(),
@@ -155,14 +149,10 @@ pub(crate) async fn fetch_link_preview(
         .or_else(|| html_title(&html));
     let description =
         og_meta(&html, "og:description").or_else(|| og_meta(&html, "twitter:description"));
-    let thumbnail_url = og_meta(&html, "og:image").or_else(|| og_meta(&html, "twitter:image"));
+    let thumbnail_url = html_thumbnail_url(&html, &source_url);
     let site_name = og_meta(&html, "og:site_name").or_else(|| detect_site_name(url));
 
-    // Kick off thumbnail image fetch so bytes land in emote_bytes.
-    if let Some(ref img) = thumbnail_url {
-        fetch_emote_image(img, cache, evt_tx).await;
-    }
-
+    // Visible previews request thumbnails through the shared UI image queue.
     let _ = evt_tx
         .send(AppEvent::LinkPreviewReady {
             url: url.to_owned(),
@@ -187,21 +177,45 @@ async fn read_preview_html_prefix(mut response: reqwest::Response) -> Result<Vec
     Ok(bytes)
 }
 
-/// Check if a URL is a YouTube / youtu.be link.
+fn web_url(url: &str) -> Option<reqwest::Url> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    (matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some())
+        .then_some(parsed)
+}
+
+fn host_matches(host: &str, domain: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    host == domain || host.strip_suffix(domain).is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+fn resolve_thumbnail_url(base: &reqwest::Url, image: &str) -> Option<String> {
+    let image = image.trim();
+    if image.is_empty() {
+        return None;
+    }
+    let resolved = base.join(image).ok()?;
+    (matches!(resolved.scheme(), "http" | "https") && resolved.host_str().is_some())
+        .then(|| resolved.to_string())
+}
+
+fn html_thumbnail_url(html: &str, base: &reqwest::Url) -> Option<String> {
+    ["og:image", "twitter:image"].into_iter().find_map(|property| {
+        og_meta(html, property).and_then(|image| resolve_thumbnail_url(base, &image))
+    })
+}
+
+/// Check the parsed hostname for a YouTube video service.
 fn is_youtube_url(url: &str) -> bool {
-    let lower = url.to_lowercase();
-    lower.contains("youtube.com/") || lower.contains("youtu.be/")
+    let Some(url) = web_url(url) else { return false };
+    let host = url.host_str().unwrap_or_default();
+    host_matches(host, "youtube.com") || host_matches(host, "youtu.be")
 }
 
 /// Return true when the URL's path looks like a direct image asset.
 /// Strips query + fragment so `?token=...` / `#anchor` don't break matching.
 fn is_direct_image_url(url: &str) -> bool {
-    let path = url
-        .split('#')
-        .next()
-        .and_then(|p| p.split('?').next())
-        .unwrap_or(url);
-    let lower = path.to_ascii_lowercase();
+    let Some(url) = web_url(url) else { return false };
+    let lower = url.path().to_ascii_lowercase();
     matches!(
         lower.rsplit('.').next(),
         Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "avif")
@@ -295,7 +309,7 @@ mod tests {
         let (events, mut received) = tokio::sync::mpsc::channel(1);
         let task = tokio::spawn(async move {
             let _request = request;
-            fetch_link_preview(url, &None, &events).await;
+            fetch_link_preview(url, &events).await;
         });
         assert!(requests.begin(url).is_none());
         let event = received.recv().await.expect("failed fetch publishes an empty result");
@@ -349,6 +363,136 @@ mod tests {
         assert!(!is_direct_image_url("https://example.com/page.html"));
         assert!(!is_direct_image_url("https://youtube.com/watch?v=abc"));
     }
+
+    #[test]
+    fn preview_hosts_use_domain_boundaries_instead_of_url_substrings() {
+        for url in ["https://youtube.com", "https://M.YOUTUBE.COM/watch?v=123", "https://youtu.be/123"] {
+            assert!(super::is_youtube_url(url), "{url}");
+        }
+        for url in [
+            "https://notyoutube.com/watch?v=123",
+            "https://youtube.com.example.test/watch?v=123",
+            "https://example.test/youtube.com/watch?v=123",
+            "https://example.test/?next=https://youtu.be/123",
+            "https://youtube.com@example.test/watch?v=123",
+        ] {
+            assert!(!super::is_youtube_url(url), "{url}");
+            assert_eq!(super::detect_site_name(url), None, "{url}");
+        }
+        assert_eq!(super::detect_site_name("https://clips.twitch.tv/Clip"), Some("Twitch Clip".into()));
+        assert_eq!(super::detect_site_name("https://EN.WIKIPEDIA.ORG/wiki/Test"), Some("Wikipedia".into()));
+        assert!(!is_direct_image_url("https://example.png"));
+        assert!(!is_direct_image_url("https://example.test/?image=photo.png"));
+    }
+
+    #[test]
+    fn preview_tweet_rewrites_change_only_a_supported_hostname() {
+        assert_eq!(super::rewrite_twitter_url("https://X.COM/user/status/123?next=x.com#twitter.com"),
+            Some("https://fxtwitter.com/user/status/123?next=x.com#twitter.com".into()));
+        assert_eq!(super::rewrite_twitter_url("https://mobile.twitter.com/user/status/123"),
+            Some("https://fxtwitter.com/user/status/123".into()));
+        for url in [
+            "https://fxtwitter.com/user/status/123",
+            "https://notx.com/user/status/123",
+            "https://twitter.com.example.test/user/status/123",
+            "https://example.test/x.com/user/status/123",
+            "https://example.test/?next=https://x.com/user/status/123",
+            "https://x.com/user?next=/status/123",
+        ] {
+            assert_eq!(super::rewrite_twitter_url(url), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn preview_metadata_preserves_unicode_offsets_and_long_values() {
+        assert_eq!(super::html_title("İ<title>é</title>"), Some("é".into()));
+        let title = "é".repeat(300);
+        let html = format!("<meta property=\"og:title\" content=\"{title}\">");
+        assert_eq!(super::og_meta(&html, "og:title"), Some(title));
+        assert_eq!(super::og_meta("<meta data-note=\"İ\" property=\"og:title\" content=\"é\">", "og:title"), Some("é".into()));
+    }
+
+    #[test]
+    fn preview_metadata_reads_complete_attributes() {
+        let html = "<metadata property=\"og:title\" content=\"wrong tag\"><meta data-property=\"og:title\" content=\"wrong attribute\"><meta PROPERTY = 'og:title' data-content='wrong content' CONTENT = 'right > title'>";
+        assert_eq!(super::og_meta(html, "og:title"), Some("right > title".into()));
+        assert_eq!(super::og_meta("<meta name=twitter:title content=unquoted>", "twitter:title"), Some("unquoted".into()));
+        assert_eq!(super::og_meta("<meta property='article:tag' name='twitter:title' content='Correct'>", "twitter:title"), Some("Correct".into()));
+        assert_eq!(super::html_title("<titlebar>wrong</titlebar><TITLE lang='en'>Correct</TITLE>"), Some("Correct".into()));
+    }
+
+    #[test]
+    fn preview_images_resolve_against_the_final_page_url() {
+        let base = reqwest::Url::parse("https://example.test/articles/page").unwrap();
+        assert_eq!(super::resolve_thumbnail_url(&base, "../images/cover.png"),
+            Some("https://example.test/images/cover.png".into()));
+        assert_eq!(super::resolve_thumbnail_url(&base, "//cdn.example.test/cover.png"),
+            Some("https://cdn.example.test/cover.png".into()));
+        assert_eq!(super::resolve_thumbnail_url(&base, "data:image/png;base64,AAAA"), None);
+        assert_eq!(super::resolve_thumbnail_url(&base, "  "), None);
+        assert_eq!(super::html_thumbnail_url(
+            "<meta property='og:image' content=''><meta name='twitter:image' content='/cover.png'>", &base),
+            Some("https://example.test/cover.png".into()));
+    }
+
+    #[tokio::test]
+    async fn preview_metadata_finishes_without_fetching_thumbnail() {
+        for mode in ["html", "image-type", "direct"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let thumbnail = format!("{base}/image.png");
+            let page = if mode == "direct" { thumbnail.clone() } else { format!("{base}/page") };
+            let expected_image = if mode == "html" { thumbnail.clone() } else { page.clone() };
+            let html = format!("<title>Ready title</title><meta property='og:image' content='{thumbnail}'>");
+            let server = tokio::spawn(async move {
+                if mode != "direct" {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                        let mut chunk = [0; 1024];
+                        let count = stream.read(&mut chunk).await.unwrap();
+                        assert!(count > 0);
+                        request.extend_from_slice(&chunk[..count]);
+                        assert!(request.len() <= 16 * 1024);
+                    }
+                    let (content_type, body) = if mode == "html" {
+                        ("text/html", html.as_str())
+                    } else {
+                        ("image/png", "")
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.shutdown().await.unwrap();
+                }
+                listener
+            });
+            let requests = LinkPreviewRequests::default();
+            let request = requests.begin(&page).unwrap();
+            let request_url = page.clone();
+            let (events, mut received) = tokio::sync::mpsc::channel(2);
+            let fetch = tokio::spawn(async move {
+                let _request = request;
+                fetch_link_preview(&request_url, &events).await;
+            });
+            let preview = tokio::time::timeout(Duration::from_secs(2), received.recv()).await
+                .expect("metadata must not wait for the thumbnail").unwrap();
+            let crust_core::AppEvent::LinkPreviewReady { title, thumbnail_url, .. } = preview else {
+                panic!("expected link metadata");
+            };
+            assert_eq!(thumbnail_url.as_deref(), Some(expected_image.as_str()), "{mode}");
+            assert_eq!(title.as_deref(), (mode == "html").then_some("Ready title"), "{mode}");
+            tokio::time::timeout(Duration::from_secs(2), fetch).await
+                .expect("metadata fetch must finish without loading image bytes").unwrap();
+            assert!(requests.begin(&page).is_some(), "metadata completion releases its request");
+            assert!(received.try_recv().is_err(), "metadata must not publish image completions");
+            let listener = server.await.unwrap();
+            assert!(tokio::time::timeout(Duration::from_millis(25), listener.accept()).await.is_err(),
+                "metadata must not start a second thumbnail request: {mode}");
+        }
+    }
 }
 
 /// Fetch YouTube video metadata via the public oEmbed JSON endpoint.
@@ -356,8 +500,6 @@ mod tests {
 async fn fetch_youtube_oembed(
     original_url: &str,
     client: &reqwest::Client,
-    cache: &Option<EmoteCache>,
-    evt_tx: &mpsc::Sender<AppEvent>,
 ) -> Option<AppEvent> {
     let oembed_url = format!(
         "https://www.youtube.com/oembed?url={}&format=json",
@@ -367,15 +509,11 @@ async fn fetch_youtube_oembed(
     if !resp.status().is_success() {
         return None;
     }
-    let json: serde_json::Value = resp.json().await.ok()?;
+    let json: serde_json::Value =
+        crust_emotes::providers::read_bounded_json(resp, MAX_PREVIEW_HTML_BYTES).await?;
     let title = json["title"].as_str().map(|s| s.to_owned());
     let author = json["author_name"].as_str().map(|s| s.to_owned());
     let thumbnail_url = json["thumbnail_url"].as_str().map(|s| s.to_owned());
-
-    // Fetch the thumbnail image bytes.
-    if let Some(ref img) = thumbnail_url {
-        fetch_emote_image(img, cache, evt_tx).await;
-    }
 
     Some(AppEvent::LinkPreviewReady {
         url: original_url.to_owned(),
@@ -389,16 +527,13 @@ async fn fetch_youtube_oembed(
 /// Rewrite twitter.com / x.com URLs to fxtwitter.com so we get proper OG
 /// meta tags instead of a JS-rendered blank page.
 fn rewrite_twitter_url(url: &str) -> Option<String> {
-    let lower = url.to_lowercase();
-    // Match URLs like https://twitter.com/user/status/... or https://x.com/user/status/...
-    if lower.contains("twitter.com/") || lower.contains("x.com/") {
-        // Only rewrite status/tweet URLs, not profile pages.
-        if lower.contains("/status/") {
-            let rewritten = url
-                .replace("twitter.com", "fxtwitter.com")
-                .replace("x.com", "fxtwitter.com");
-            return Some(rewritten);
-        }
+    let mut parsed = web_url(url)?;
+    let host = parsed.host_str()?;
+    if (host_matches(host, "twitter.com") || host_matches(host, "x.com"))
+        && parsed.path().to_ascii_lowercase().contains("/status/")
+    {
+        parsed.set_host(Some("fxtwitter.com")).ok()?;
+        return Some(parsed.to_string());
     }
     None
 }
@@ -406,91 +541,144 @@ fn rewrite_twitter_url(url: &str) -> Option<String> {
 /// Heuristic site-name detection from the URL hostname when og:site_name
 /// is missing from the HTML.
 fn detect_site_name(url: &str) -> Option<String> {
-    let lower = url.to_lowercase();
-    if lower.contains("youtube.com/") || lower.contains("youtu.be/") {
-        Some("YouTube".to_owned())
-    } else if lower.contains("twitter.com/")
-        || lower.contains("x.com/")
-        || lower.contains("fxtwitter.com/")
-    {
-        Some("Twitter".to_owned())
-    } else if lower.contains("twitch.tv/") {
-        Some("Twitch".to_owned())
-    } else if lower.contains("reddit.com/") {
-        Some("Reddit".to_owned())
-    } else if lower.contains("instagram.com/") {
-        Some("Instagram".to_owned())
-    } else if lower.contains("tiktok.com/") {
-        Some("TikTok".to_owned())
-    } else if lower.contains("github.com/") {
-        Some("GitHub".to_owned())
-    } else if lower.contains("wikipedia.org/") {
-        Some("Wikipedia".to_owned())
-    } else if lower.contains("steamcommunity.com/") || lower.contains("store.steampowered.com/") {
-        Some("Steam".to_owned())
-    } else if lower.contains("clips.twitch.tv/") {
-        Some("Twitch Clip".to_owned())
+    let parsed = web_url(url)?;
+    let host = parsed.host_str()?;
+    let matches = |domain| host_matches(host, domain);
+    let name = if matches("youtube.com") || matches("youtu.be") {
+        "YouTube"
+    } else if matches("twitter.com") || matches("x.com") || matches("fxtwitter.com") {
+        "Twitter"
+    } else if matches("clips.twitch.tv") {
+        "Twitch Clip"
+    } else if matches("twitch.tv") {
+        "Twitch"
+    } else if matches("reddit.com") {
+        "Reddit"
+    } else if matches("instagram.com") {
+        "Instagram"
+    } else if matches("tiktok.com") {
+        "TikTok"
+    } else if matches("github.com") {
+        "GitHub"
+    } else if matches("wikipedia.org") {
+        "Wikipedia"
+    } else if matches("steamcommunity.com") || matches("store.steampowered.com") {
+        "Steam"
     } else {
-        None
+        return None;
+    };
+    Some(name.to_owned())
+}
+
+/// Find a complete tag without treating quoted greater-than signs as its end.
+fn find_html_tag(html: &str, lower: &str, name: &str, mut offset: usize) -> Option<(usize, usize)> {
+    let needle = format!("<{name}");
+    while let Some(relative) = lower[offset..].find(&needle) {
+        let start = offset + relative;
+        let after_name = start + needle.len();
+        offset = after_name;
+        if !html.as_bytes().get(after_name).is_some_and(|byte| {
+            byte.is_ascii_whitespace() || matches!(byte, b'>' | b'/')
+        }) {
+            continue;
+        }
+        let mut quote = None;
+        for (index, byte) in html.as_bytes().iter().copied().enumerate().skip(after_name) {
+            match quote {
+                Some(delimiter) if byte == delimiter => quote = None,
+                Some(_) => {}
+                None if byte == b'\'' || byte == b'"' => quote = Some(byte),
+                None if byte == b'>' => return Some((start, index + 1)),
+                None => {}
+            }
+        }
+        return None;
     }
+    None
 }
 
 /// Extract the content of a `<meta property=\"{prop}\" ...>` or `<meta name=\"{prop}\" ...>` tag.
 fn og_meta(html: &str, prop: &str) -> Option<String> {
-    let prop_lower = prop.to_lowercase();
+    // ASCII casing preserves every byte offset in the original UTF-8 text.
+    let lower = html.to_ascii_lowercase();
     let mut offset = 0;
-    while let Some(rel) = html[offset..].to_lowercase().find("<meta") {
-        let abs = offset + rel;
-        let rest = &html[abs..];
-        // Find end of this tag
-        let tag_end = rest.find('>').unwrap_or(rest.len()).min(512);
-        let tag = &rest[..tag_end];
-        let tag_lower = tag.to_lowercase();
-
-        let has_prop = tag_lower.contains(&format!("property=\"{prop_lower}\""))
-            || tag_lower.contains(&format!("property='{prop_lower}'"))
-            || tag_lower.contains(&format!("name=\"{prop_lower}\""))
-            || tag_lower.contains(&format!("name='{prop_lower}'"));
-
-        if has_prop {
+    while let Some((start, end)) = find_html_tag(html, &lower, "meta", offset) {
+        let tag = &html[start..end];
+        let matches = ["property", "name"].into_iter().any(|attribute| {
+            html_attr(tag, attribute).is_some_and(|value| value.eq_ignore_ascii_case(prop))
+        });
+        if matches {
             if let Some(val) = html_attr(tag, "content") {
                 return Some(html_entities(val));
             }
         }
-        offset = abs + 5;
+        offset = end;
     }
     None
 }
 
 /// Extract an attribute value from an HTML tag snippet.
 fn html_attr<'a>(tag: &'a str, attr: &str) -> Option<&'a str> {
-    let tag_lower = tag.to_lowercase();
-    let needle = format!("{}=", attr.to_lowercase());
-    let pos = tag_lower.find(&needle)?;
-    let after = &tag[pos + needle.len()..];
-    if after.starts_with('"') {
-        let end = after[1..].find('"')?;
-        Some(&after[1..1 + end])
-    } else if after.starts_with('\'') {
-        let end = after[1..].find('\'')?;
-        Some(&after[1..1 + end])
-    } else {
-        None
+    let bytes = tag.as_bytes();
+    let mut position = 0;
+    while position < bytes.len() {
+        while position < bytes.len()
+            && (bytes[position].is_ascii_whitespace() || matches!(bytes[position], b'<' | b'>' | b'/'))
+        {
+            position += 1;
+        }
+        let name_start = position;
+        while position < bytes.len()
+            && !bytes[position].is_ascii_whitespace()
+            && !matches!(bytes[position], b'=' | b'>' | b'/')
+        {
+            position += 1;
+        }
+        let name = &tag[name_start..position];
+        while position < bytes.len() && bytes[position].is_ascii_whitespace() {
+            position += 1;
+        }
+        if bytes.get(position) != Some(&b'=') {
+            continue;
+        }
+        position += 1;
+        while position < bytes.len() && bytes[position].is_ascii_whitespace() {
+            position += 1;
+        }
+        let delimiter = bytes.get(position).copied()?;
+        let value_start;
+        let value_end;
+        if delimiter == b'\'' || delimiter == b'"' {
+            position += 1;
+            value_start = position;
+            let length = bytes[position..].iter().position(|byte| *byte == delimiter)?;
+            position += length;
+            value_end = position;
+            position += 1;
+        } else {
+            value_start = position;
+            while position < bytes.len() && !bytes[position].is_ascii_whitespace() && bytes[position] != b'>' {
+                position += 1;
+            }
+            value_end = position;
+        }
+        if name.eq_ignore_ascii_case(attr) {
+            return Some(&tag[value_start..value_end]);
+        }
     }
+    None
 }
 
 /// Extract `<title>` text as a fallback.
 fn html_title(html: &str) -> Option<String> {
-    let lower = html.to_lowercase();
-    let s = lower.find("<title")? + 6;
-    let tag_end = lower[s..].find('>')?;
-    let body_start = s + tag_end + 1;
-    let body_end = lower[body_start..].find("</title>")?;
-    let text = html[body_start..body_start + body_end].trim().to_owned();
+    let lower = html.to_ascii_lowercase();
+    let (_, body_start) = find_html_tag(html, &lower, "title", 0)?;
+    let (body_end, _) = find_html_tag(html, &lower, "/title", body_start)?;
+    let text = html[body_start..body_end].trim();
     if text.is_empty() {
         None
     } else {
-        Some(html_entities(&text))
+        Some(html_entities(text))
     }
 }
 

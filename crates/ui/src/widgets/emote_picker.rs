@@ -1211,24 +1211,34 @@ mod tests {
         assert!(images.complete(&ctx, url.into(), 2, 1, raw));
         let raw = images.get(url).unwrap().2.clone();
         let uri = super::super::bytes_uri(url, &raw);
-        ctx.include_bytes(uri.clone(), egui::load::Bytes::Shared(raw));
+        ctx.include_bytes(uri.clone(), egui::load::Bytes::Shared(raw.clone()));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            match ctx.try_load_texture(
-                &format!("{uri}#0"),
-                egui::TextureOptions::LINEAR,
-                egui::load::SizeHint::default(),
-            ) {
-                Ok(egui::load::TexturePoll::Ready { .. }) => break,
-                Ok(egui::load::TexturePoll::Pending { .. }) => {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "fixture decode timed out"
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+            // Paused painting uses a separate first-frame decode and texture cache.
+            // Warm the same path that paint_picker_image will use below.
+            let ready = if !animate && super::super::message_list::is_animation_format(&raw) {
+                images.static_texture(&ctx, url).is_some()
+            } else {
+                match ctx.try_load_texture(
+                    &format!("{uri}#0"),
+                    egui::TextureOptions::LINEAR,
+                    egui::load::SizeHint::default(),
+                ) {
+                    Ok(egui::load::TexturePoll::Ready { .. }) => true,
+                    Ok(egui::load::TexturePoll::Pending { .. }) => false,
+                    Err(error) => panic!("fixture decode failed: {error}"),
                 }
-                Err(error) => panic!("fixture decode failed: {error}"),
+            };
+            // Pixels become ready before the decoder requests its completion repaint.
+            // Let the job finish before measuring the image's own repaint deadline.
+            if ready && images.work_stats(&ctx).pending_decodes == 0 {
+                break;
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture decode timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         let mut picker = EmotePicker {
             open: true,

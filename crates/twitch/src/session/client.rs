@@ -1263,6 +1263,7 @@ fn parse_chat_message_irc(
         timestamp,
         channel,
         sender,
+        original_text: None,
         raw_text: text.to_owned(),
         spans: smallvec::SmallVec::new(), // filled by caller
         twitch_emotes,

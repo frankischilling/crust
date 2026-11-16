@@ -192,6 +192,7 @@ mod tests {
                 name_paint: None,
                 badges: vec![],
             },
+            original_text: None,
             raw_text: text.to_string(),
             spans: SmallVec::new(),
             twitch_emotes: vec![],

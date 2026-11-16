@@ -681,6 +681,7 @@ mod tests {
                     name_paint: None,
                     badges: Vec::new(),
                 },
+                original_text: None,
                 raw_text: format!(
                     "Message {index}: {}",
                     "Wrapped words, café, and punctuation. ".repeat(index % 8 + 1)

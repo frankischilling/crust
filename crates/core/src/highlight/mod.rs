@@ -907,6 +907,7 @@ mod tests {
                     url: None,
                 }],
             },
+            original_text: None,
             raw_text: text.into(),
             spans: smallvec![MsgSpan::Text {
                 text: text.into(),

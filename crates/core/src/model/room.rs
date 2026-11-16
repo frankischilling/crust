@@ -1097,6 +1097,7 @@ mod tests {
                 name_paint: None,
                 badges: Vec::new(),
             },
+            original_text: None,
             raw_text: raw_text.to_owned(),
             spans: SmallVec::new(),
             twitch_emotes: emote_id

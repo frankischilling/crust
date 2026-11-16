@@ -720,6 +720,7 @@ mod tests {
             server_id: Some(id.to_string()),
             channel: ChannelId::new("room"),
             timestamp: chrono::Utc::now(),
+            original_text: None,
             raw_text: format!("message {id}"),
             spans: Default::default(),
             twitch_emotes: Vec::new(),

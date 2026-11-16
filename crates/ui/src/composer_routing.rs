@@ -130,10 +130,120 @@ impl CrustApp {
         }
     }
 
+    fn can_reveal_chat_destination(&self, destination: &ChatDestination) -> bool {
+        if self.egui_ctx.is_none() {
+            return false;
+        }
+        match destination {
+            ChatDestination::Detached(_) => return true,
+            ChatDestination::ClosedDetached(_) => {
+                return self.detached_chats.open.len() < crust_core::model::MAX_DETACHED_CHATS;
+            }
+            _ if self.pending_reply.is_some() => return false,
+            ChatDestination::Classic | ChatDestination::Pane(_) => return true,
+            _ => {}
+        }
+        let pane_id = match destination {
+            ChatDestination::Closed(index) => self.split_panes.closed[*index].pane.id,
+            ChatDestination::Inactive(channel) => self.inactive_classic_drafts[channel].id,
+            ChatDestination::InactivePane((id, _)) => *id,
+            _ => return false,
+        };
+        self.split_panes.panes.len() < MAX_CHAT_PANES
+            || self.split_panes.panes.iter().any(|pane| pane.id == pane_id)
+    }
+
+    fn reveal_chat_destination(
+        &mut self,
+        channel: &ChannelId,
+        target: &crust_core::ComposerTarget,
+        destination: ChatDestination,
+    ) -> Option<ChatDestination> {
+        let ctx = self.egui_ctx.clone()?;
+        self.cancel_pending_layout_restore();
+        match destination {
+            ChatDestination::Detached(index) => {
+                let id = self.detached_chats.open[index].pane.id;
+                return self.focus_detached_composer(id, &ctx)
+                    .then(|| self.chat_destination(channel, target)).flatten();
+            }
+            ChatDestination::ClosedDetached(index) => {
+                let id = self.detached_chats.closed[index].pane.id;
+                return self.focus_detached_composer(id, &ctx)
+                    .then(|| self.chat_destination(channel, target)).flatten();
+            }
+            ChatDestination::Classic | ChatDestination::Pane(_) => {}
+            ChatDestination::Closed(index) => {
+                let closed = self.split_panes.closed.remove(index)?;
+                self.split_panes.closed.push_back(closed);
+                self.reopen_closed_split(&ctx);
+            }
+            ChatDestination::Inactive(_)
+                if self.split_panes.panes.is_empty()
+                    && self.single_pane_identity.is_none_or(|(id, _)|
+                        !self.inactive_pane_drafts.contains_key(&(id, channel.clone()))) =>
+            {
+                self.activate_channel(channel.clone());
+            }
+            ChatDestination::InactivePane((id, _))
+                if self.split_panes.panes.is_empty()
+                    && self.single_pane_identity.is_some_and(|(current, _)| current == id) =>
+            {
+                self.activate_channel(channel.clone());
+            }
+            hidden => {
+                let (draft, was_classic) = match hidden {
+                    ChatDestination::Inactive(channel) =>
+                        (self.inactive_classic_drafts.remove(&channel)?, true),
+                    ChatDestination::InactivePane(key) =>
+                        (self.inactive_pane_drafts.remove(&key)?, false),
+                    _ => return None,
+                };
+                let mut search = self.message_search.get(channel).cloned().unwrap_or_default();
+                search.set_pane(Some(draft.id));
+                if was_classic {
+                    crate::widgets::chat_input::migrate_composer_events(&ctx,
+                        chat_composer_id(None), chat_composer_id(Some(draft.id)), channel);
+                }
+                // Reopen immediately so a full closed-view history loses no other draft.
+                self.split_panes.closed.push_back(ClosedPane {
+                    pane: Pane {
+                        id: draft.id,
+                        channel: channel.clone(),
+                        input_buf: draft.input_buf,
+                        view_scope: draft.view_scope,
+                        search,
+                        filters: self.single_pane_filters.get(channel).cloned().unwrap_or_default(),
+                        frac: 1.0,
+                    },
+                    index: self.split_panes.focused,
+                    position: None,
+                    reply: draft.reply,
+                });
+                self.reopen_closed_split(&ctx);
+            }
+        }
+        let destination = self.chat_destination(channel, target)?;
+        match destination {
+            ChatDestination::Classic => {
+                self.mark_channel_read(channel);
+                self.focus_chat_composer(&ctx);
+            }
+            ChatDestination::Pane(index) => {
+                self.split_panes.focused = index;
+                self.sync_split_focus(&ctx);
+            }
+            _ => return None,
+        }
+        self.focus_main_viewport();
+        ctx.request_repaint();
+        Some(destination)
+    }
+
     pub(super) fn can_restore_unsent(
         &self,
         message: &UnsentMessage,
-        activate_thread: bool,
+        activate_composer: bool,
     ) -> bool {
         if !message.belongs_to(self.state.auth.user_id.as_deref()) {
             return false;
@@ -142,11 +252,14 @@ impl CrustApp {
             return self.unsent_input_pane(message).is_some();
         };
         if let Some(key) = ThreadKey::from_target(&message.channel, target) {
-            return self.reply_threads.can_restore(&key, activate_thread);
+            return self.reply_threads.can_restore(&key, activate_composer);
         }
         let Some(destination) = self.chat_destination(&message.channel, target) else {
             return false;
         };
+        if activate_composer && !self.can_reveal_chat_destination(&destination) {
+            return false;
+        }
         if !self.destination_draft(&destination).is_empty() {
             return false;
         }
@@ -165,7 +278,7 @@ impl CrustApp {
             _ if self.pending_reply.is_some() => return false,
             _ => {}
         }
-        if message.reply.is_some() || message.reply_to_msg_id.is_some() {
+        if !activate_composer && (message.reply.is_some() || message.reply_to_msg_id.is_some()) {
             match destination {
                 ChatDestination::Pane(index) if index != self.split_panes.focused => return false,
                 _ => {}
@@ -177,24 +290,53 @@ impl CrustApp {
     pub(super) fn restore_targeted_unsent(
         &mut self,
         message: &UnsentMessage,
-        activate_thread: bool,
+        activate_composer: bool,
     ) -> bool {
-        if !self.can_restore_unsent(message, activate_thread) {
+        if !self.can_restore_unsent(message, activate_composer) {
             return false;
         }
         let Some(target) = &message.composer else {
-            return self.restore_unsent_message(message);
+            let pane = self.unsent_input_pane(message);
+            if !self.restore_unsent_message(message) {
+                return false;
+            }
+            if activate_composer {
+                if let Some(ctx) = self.egui_ctx.clone() {
+                    if let Some(Some(index)) = pane {
+                        self.split_panes.focused = index;
+                        self.sync_split_focus(&ctx);
+                    } else {
+                        self.focus_chat_composer(&ctx);
+                    }
+                    self.focus_main_viewport();
+                    ctx.request_repaint();
+                }
+            }
+            return true;
         };
         if let Some(key) = ThreadKey::from_target(&message.channel, target) {
-            return self.reply_threads.restore_draft(
+            let restored = self.reply_threads.restore_draft(
                 key,
                 &message.text,
                 message.reply.as_ref(),
-                activate_thread,
+                activate_composer,
             );
+            if restored && activate_composer {
+                self.focus_main_viewport();
+                if let Some(ctx) = &self.egui_ctx { ctx.request_repaint(); }
+            }
+            return restored;
         }
         let Some(destination) = self.chat_destination(&message.channel, target) else {
             return false;
+        };
+        let destination = if activate_composer {
+            let Some(visible) = self.reveal_chat_destination(&message.channel, target, destination) else {
+                return false;
+            };
+            visible
+        } else {
+            destination
         };
         self.destination_draft_mut(destination.clone())
             .clone_from(&message.text);
@@ -408,4 +550,155 @@ fn append_upload_url(draft: &mut String, url: &str) {
     }
     draft.push_str(url);
     draft.push(' ');
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture() -> (CrustApp, Context, mpsc::Receiver<AppCommand>) {
+        let (commands, receiver) = mpsc::channel(64);
+        let (_, events) = mpsc::channel(64);
+        let mut app = CrustApp::with_event_channels(commands, events);
+        let ctx = Context::default();
+        app.egui_ctx = Some(ctx.clone());
+        for name in ["first", "second", "third"] {
+            app.state.join_channel(ChannelId::new(name));
+        }
+        app.activate_channel(ChannelId::new("first"));
+        (app, ctx, receiver)
+    }
+
+    fn rejection(channel: &ChannelId, target: crust_core::ComposerTarget) -> UnsentMessage {
+        UnsentMessage {
+            channel: channel.clone(),
+            text: "recovered draft".into(),
+            reply_to_msg_id: None,
+            reply: None,
+            composer: Some(target),
+            reason: "The message was not sent.".into(),
+        }
+    }
+
+    fn assert_visible_draft(app: &CrustApp, message: &UnsentMessage) {
+        assert_eq!(app.state.active_channel.as_ref(), Some(&message.channel));
+        match app.chat_destination(&message.channel, message.composer.as_ref().unwrap()) {
+            Some(ChatDestination::Classic) => assert_eq!(app.chat_input_buf, message.text),
+            Some(ChatDestination::Pane(index)) => {
+                assert_eq!(app.split_panes.focused, index);
+                assert_eq!(app.split_panes.panes[index].input_buf, message.text);
+            }
+            _ => panic!("explicit restoration must show the original composer"),
+        }
+    }
+
+    #[test]
+    fn explicit_restore_reveals_an_inactive_classic_draft() {
+        let (mut app, _ctx, _commands) = fixture();
+        let first = ChannelId::new("first");
+        let target = app.chat_composer_target(None);
+        app.activate_channel(ChannelId::new("second"));
+        app.chat_input_buf = "keep current draft".into();
+        let message = rejection(&first, target);
+        assert!(app.restore_targeted_unsent(&message, true));
+        assert_visible_draft(&app, &message);
+        assert_eq!(app.inactive_classic_drafts[&ChannelId::new("second")].input_buf,
+            "keep current draft");
+    }
+
+    #[test]
+    fn explicit_restore_focuses_a_background_pane_with_its_reply() {
+        let (mut app, ctx, _commands) = fixture();
+        app.split_active_pane(SplitAxis::Horizontal, &ctx);
+        let first = ChannelId::new("first");
+        let target = app.chat_composer_target(Some(0));
+        let mut message = rejection(&first, target);
+        message.reply = Some(ReplyInfo { parent_msg_id: "parent".into(),
+            parent_msg_body: "retained parent".into(), ..Default::default() });
+        app.split_panes.panes[1].input_buf = "keep other draft".into();
+        assert!(!app.can_restore_unsent(&message, false));
+        assert!(app.can_restore_unsent(&message, true));
+        assert!(app.restore_targeted_unsent(&message, true));
+        assert_visible_draft(&app, &message);
+        assert_eq!(app.split_panes.panes[1].input_buf, "keep other draft");
+        assert_eq!(app.pending_reply.as_ref().unwrap().info.parent_msg_body, "retained parent");
+    }
+
+    #[test]
+    fn explicit_restore_reopens_the_original_closed_pane() {
+        let (mut app, ctx, _commands) = fixture();
+        app.chat_input_buf = "keep first draft".into();
+        app.split_active_pane(SplitAxis::Horizontal, &ctx);
+        app.activate_channel(ChannelId::new("second"));
+        let target = app.chat_composer_target(Some(1));
+        let message = rejection(&ChannelId::new("second"), target);
+        app.split_active_pane(SplitAxis::Vertical, &ctx);
+        app.activate_channel(ChannelId::new("third"));
+        let third_id = app.split_panes.panes[2].id;
+        app.split_panes.panes[2].input_buf = "keep third draft".into();
+        app.close_split_pane(1, &ctx);
+        app.close_split_pane(1, &ctx);
+        assert!(app.restore_targeted_unsent(&message, true));
+        assert_visible_draft(&app, &message);
+        assert_eq!(app.split_panes.panes[0].input_buf, "keep first draft");
+        let third = app.split_panes.closed.iter().find(|pane| pane.pane.id == third_id).unwrap();
+        assert_eq!(third.pane.input_buf, "keep third draft");
+    }
+
+    #[test]
+    fn explicit_restore_reveals_a_hidden_draft_in_its_original_pane() {
+        let (mut app, ctx, _commands) = fixture();
+        app.split_active_pane(SplitAxis::Horizontal, &ctx);
+        let target = app.chat_composer_target(Some(1));
+        let message = rejection(&ChannelId::new("first"), target);
+        app.activate_channel(ChannelId::new("third"));
+        app.split_panes.panes[1].input_buf = "keep third draft".into();
+        let original_id = app.split_panes.panes[1].id;
+        for index in 0..16 {
+            app.split_active_pane(SplitAxis::Horizontal, &ctx);
+            app.split_panes.panes[2].input_buf = format!("closed draft {index}");
+            app.close_split_pane(2, &ctx);
+        }
+        assert!(app.restore_targeted_unsent(&message, true));
+        assert_visible_draft(&app, &message);
+        assert_eq!(app.split_panes.panes[1].id, original_id);
+        assert_eq!(app.split_panes.panes.len(), 2);
+        assert_eq!(app.inactive_pane_drafts[&(original_id, ChannelId::new("third"))].input_buf,
+            "keep third draft");
+        assert_eq!(app.split_panes.closed.len(), 16);
+        for (index, closed) in app.split_panes.closed.iter().enumerate() {
+            assert_eq!(closed.pane.input_buf, format!("closed draft {index}"));
+        }
+    }
+
+    #[test]
+    fn explicit_restore_keeps_a_closed_draft_recoverable_at_the_pane_limit() {
+        let (mut app, ctx, _commands) = fixture();
+        app.split_active_pane(SplitAxis::Horizontal, &ctx);
+        let target = app.chat_composer_target(Some(1));
+        let message = rejection(&ChannelId::new("first"), target);
+        app.close_split_pane(1, &ctx);
+        app.seed_active_split(&ctx);
+        while app.split_panes.panes.len() < MAX_CHAT_PANES {
+            app.split_panes.add_pane(ChannelId::new("second"), None);
+        }
+        assert!(!app.can_restore_unsent(&message, true));
+        assert!(!app.restore_targeted_unsent(&message, true));
+        assert!(app.split_panes.closed.back().unwrap().pane.input_buf.is_empty());
+        assert_eq!(app.split_panes.panes.len(), MAX_CHAT_PANES);
+    }
+
+    #[test]
+    fn automatic_restore_retains_an_inactive_draft_without_changing_focus() {
+        let (mut app, _ctx, _commands) = fixture();
+        let first = ChannelId::new("first");
+        let target = app.chat_composer_target(None);
+        let second = ChannelId::new("second");
+        app.activate_channel(second.clone());
+        let message = rejection(&first, target);
+        assert!(app.restore_targeted_unsent(&message, false));
+        assert_eq!(app.state.active_channel, Some(second));
+        assert!(app.chat_input_buf.is_empty());
+        assert_eq!(app.inactive_classic_drafts[&first].input_buf, message.text);
+    }
 }
