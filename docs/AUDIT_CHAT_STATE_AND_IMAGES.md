@@ -1,6 +1,6 @@
 # Chat state, channel banners, and image loading
 
-Date: 2026-11-15. Baseline: `3c25f74` (v0.7.0).
+Dates: 2026-11-15 to 2026-11-16. Baseline: `3c25f74` (v0.7.0).
 
 This pass follows the [chat-window audit](AUDIT_CHAT_WINDOWS.md). It covers
 [compact banners](https://github.com/frankischilling/crust/issues/51),
@@ -72,6 +72,11 @@ It requires a foreground contrast ratio of at least 4.5:1 and preserves colors
 that already meet that threshold. That check applies to opaque theme surfaces;
 the desktop behind a translucent overlay can change its visible contrast.
 
+Six production-widget captures were inspected in light and dark themes: wide
+panes, 240-point panes, and 320-point panes at 150% text scaling. Room labels and
+banner metadata wrap within their panels, participant rows fit, and the raid
+dismiss control remains visible. Chat starts below the complete banner stack.
+
 ## Static images and animation timing
 
 PNG and JPEG requests previously fell through to a synchronous decoder. They now
@@ -116,18 +121,27 @@ without the former bounded-wrapper bookkeeping; the background case uses the
 production bounded loader. Encoded bytes start in memory, and the test excludes
 network fetches and GPU upload.
 
-## Baseline observation
+## Saved-account observations
 
-A 180-second Windows run used the saved account and existing cache. The app
+A 180-second Windows baseline run used the saved account and existing cache. The app
 authenticated in 0.66 seconds and updated the 310-entry native global emote
 catalog in 0.92 seconds. It recorded 957 UI updates: median 1.06 ms, 95th
 percentile 2.49 ms, and maximum 8.07 ms. No update reached 100 ms; there were no
 event-budget overruns or panic markers. The process responded at all four
 checkpoints.
 
-Three restored rooms received server join acknowledgments. Another saved room
-did not join, so this sample does not establish successful loading of every saved
-channel. UI timings exclude event-loop waits and GPU presentation. Traffic and
+The packaged candidate was observed for another 180 seconds with the same account
+and existing cache. It authenticated in 0.66 seconds and updated the 310-entry
+native global emote catalog in 0.93 seconds. Its 1,206 UI updates had a median of
+0.75 ms, a 95th percentile of 1.87 ms, and a maximum of 6.93 ms. No update reached
+100 ms; there were no event-budget overruns or panic markers. The process
+responded at all four checkpoints. The loading status was visible during startup
+and cleared while live messages and emotes continued to arrive.
+
+Three restored rooms received server join acknowledgments. The service rejected
+access to another saved room, and the app displayed its notice. That explicit
+response explains the missing join in the baseline and candidate captures.
+UI timings exclude event-loop waits and GPU presentation. Traffic and
 cache state vary between live runs, so they are observations rather than a
 controlled overall startup comparison.
 
@@ -137,15 +151,15 @@ reproduce them.
 
 ## Automated checks
 
-Code revision `d084c8b` passed the following checks:
+Code revision `fce1b6c` passed the following checks:
 
 | Check | Result |
 | --- | --- |
-| Windows workspace tests, all targets | 1,594 passed; 23 ignored |
+| Windows workspace tests, all targets | 1,600 passed; 23 ignored |
 | Windows workspace doctests | 1 passed |
 | Windows correctness lints | Passed |
 | Windows release package | Built; SHA256, ZIP integrity, and copied payload verified |
-| Linux workspace tests, all targets | 1,593 passed; 23 ignored |
+| Linux workspace tests, all targets | 1,599 passed; 23 ignored |
 | Linux correctness lints and Debian package build | Passed |
 | Linux desktop startup under X11 | Passed |
 | Linux embedded webview under X11 | JavaScript IPC received |
@@ -153,7 +167,7 @@ Code revision `d084c8b` passed the following checks:
 The Windows test build uses release dependencies with the UI crate at optimization
 level 1. Correctness linting uses the normal release configuration. The 23 ignored
 cases are opt-in checks and are excluded from the passing test counts.
-[Linux CI run 43772489098](https://github.com/frankischilling/crust/actions/runs/43772489098)
+[Linux CI run 43776888014](https://github.com/frankischilling/crust/actions/runs/43776888014)
 records the normal release-profile checks and package upload for this revision.
 
 The Windows package uses the normal release optimization level. Its two
