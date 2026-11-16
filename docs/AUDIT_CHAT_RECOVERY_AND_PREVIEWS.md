@@ -4,7 +4,9 @@ This audit starts from v0.7.1 (`ee150b1`) and follows the fixes in
 [PR #61](https://github.com/frankischilling/crust/pull/61). It covers sent-message
 confirmation, reply identity, pane focus, draft recovery, keyboard dismissal,
 preview parsing, and image work during startup and busy chats.
-The final source revision is `ee3554c`.
+The packaged application and native measurements use runtime revision `ee3554c`.
+Later changes document the results and synchronize an animation test fixture;
+they do not change the packaged application's behavior.
 
 ## Sent messages and reply identity
 
@@ -157,9 +159,16 @@ The Resume scrolling regression exercises its accessible button action, Tab
 focus, Enter, Space, and pointer clicks. It checks visible hover and focus states,
 the final scroll position, and another pane retaining its paused state.
 
+The picker repaint fixture warms the decode path used by its animation setting
+and waits for the decoder to finish before measuring repaint timing. Paused GIF
+and WebP images use a separate first-frame path. Waiting for completion prevents
+the decoder's final repaint request from racing the measurement. The assertions
+still require active animations to use frame deadlines and paused images to stop
+requesting animation repaints.
+
 ## Platform checks
 
-The final source revision passed these checks:
+The packaged application revision (`ee3554c`) passed these checks:
 
 | Check | Result |
 | --- | --- |
@@ -180,7 +189,13 @@ that every advisory Clippy warning has been removed. The 23 ignored tests are no
 included in the passing totals.
 
 [Linux CI for the source revision](https://github.com/frankischilling/crust/actions/runs/43790579323)
-records the build, tests, package, and X11 checks.
+records the build, tests, package, and X11 checks. The
+[PR checks](https://github.com/frankischilling/crust/pull/61/checks) track verification
+of the complete branch, including the animation fixture correction.
+
+After the fixture correction, the Windows UI suite passed 659 tests with 9 marked
+ignored. The four picker checks then passed 50 consecutive runs with four test
+threads: 200 passes and no failures.
 
 ## Native Windows observations
 
