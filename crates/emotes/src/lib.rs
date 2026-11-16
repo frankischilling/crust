@@ -1,10 +1,12 @@
 pub mod cache;
 mod download;
 pub mod providers;
+mod validation;
 
 pub use cache::EmoteCache;
 pub use download::{read_image_response, MAX_IMAGE_DOWNLOAD_BYTES};
 pub use providers::{EmoteInfo, EmoteProvider};
+pub use validation::{validate_image, MAX_IMAGE_DECODE_BYTES};
 
 use thiserror::Error;
 

@@ -198,18 +198,26 @@ impl ReplySenderIndex {
         true
     }
 
+    fn parent_message<'a>(
+        &self,
+        messages: &'a VecDeque<ChatMessage>,
+        reply: &ReplyInfo,
+    ) -> Option<&'a ChatMessage> {
+        let position = self.by_server_id.get(reply_lookup_key(&reply.parent_msg_id).as_ref())?;
+        let message = messages.get(position.ordinal.checked_sub(self.base)?)?;
+        (message.id == position.id).then_some(message)
+    }
+
     fn message<'a>(
         &self,
         messages: &'a VecDeque<ChatMessage>,
         reply: &ReplyInfo,
     ) -> Option<&'a ChatMessage> {
         let login = reply_lookup_key(&reply.parent_user_login);
-        let position = if login.is_empty() {
-            self.by_server_id
-                .get(reply_lookup_key(&reply.parent_msg_id).as_ref())
-        } else {
-            self.by_login.get(login.as_ref())
-        }?;
+        if login.is_empty() {
+            return self.parent_message(messages, reply);
+        }
+        let position = self.by_login.get(login.as_ref())?;
         let message = messages.get(position.ordinal.checked_sub(self.base)?)?;
         (message.id == position.id).then_some(message)
     }
@@ -1735,10 +1743,27 @@ impl<'a> MessageList<'a> {
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
             let (stripe, _) = ui.allocate_exact_size(egui::vec2(2.0, 12.0), egui::Sense::hover());
             ui.painter().rect_filled(stripe, 0.0, t::accent());
-            let body = if let Some((cut, _)) = reply.parent_msg_body.char_indices().nth(80) {
-                format!("{}...", &reply.parent_msg_body[..cut])
+            let parent = self.reply_sender_message(ui.ctx(), rctx, reply);
+            let original_parent = if reply.parent_display_name.is_empty()
+                || reply.parent_user_login.is_empty() || reply.parent_msg_body.is_empty() {
+                rctx.reply_senders.get().and_then(|index| index.parent_message(self.messages, reply))
             } else {
-                reply.parent_msg_body.clone()
+                None
+            };
+            let parent_login = if reply.parent_user_login.is_empty() {
+                original_parent.map_or("", |parent| parent.sender.login.as_str())
+            } else {
+                reply.parent_user_login.as_str()
+            };
+            let quoted_body = if reply.parent_msg_body.is_empty() {
+                original_parent.map_or("", |parent| parent.raw_text.as_str())
+            } else {
+                reply.parent_msg_body.as_str()
+            };
+            let body = if let Some((cut, _)) = quoted_body.char_indices().nth(80) {
+                format!("{}...", &quoted_body[..cut])
+            } else {
+                quoted_body.to_owned()
             };
             let reply_color = t::text_secondary();
             let arrow = ui.add(
@@ -1746,7 +1771,6 @@ impl<'a> MessageList<'a> {
                     .selectable(false)
                     .sense(egui::Sense::click()),
             );
-            let parent = self.reply_sender_message(ui.ctx(), rctx, reply);
             let appearance = if msg.channel.is_twitch() {
                 let twitch_parent = parent.filter(|parent| parent.channel.is_twitch());
                 if let Some(parent) = twitch_parent {
@@ -1755,7 +1779,7 @@ impl<'a> MessageList<'a> {
                 sender_cosmetics::get(
                     ui.ctx(),
                     twitch_parent.map(|parent| parent.sender.user_id.0.as_str()),
-                    &reply.parent_user_login,
+                    parent_login,
                 )
             } else {
                 None
@@ -1772,10 +1796,17 @@ impl<'a> MessageList<'a> {
                 Some(appearance) => appearance.paint.as_deref(),
                 None => parent.and_then(|parent| parent.sender.name_paint.as_ref()),
             };
-            let display_name = if reply.parent_display_name.is_empty() {
-                &reply.parent_user_login
+            let display_name = if !reply.parent_display_name.is_empty() {
+                reply.parent_display_name.as_str()
+            } else if !reply.parent_user_login.is_empty() {
+                reply.parent_user_login.as_str()
+            } else if let Some(display) = original_parent.map(|parent| parent.sender.display_name.as_str())
+                .filter(|display| !display.is_empty()) {
+                display
+            } else if !parent_login.is_empty() {
+                parent_login
             } else {
-                &reply.parent_display_name
+                "Original message"
             };
             // Leave space for the quoted message even when the name is long.
             let sender_width =
@@ -1796,24 +1827,28 @@ impl<'a> MessageList<'a> {
                     },
                 )
                 .inner;
-            let body = ui.add(
-                Label::new(
-                    RichText::new(format!(": {body}"))
-                        .font(t::small())
-                        .color(reply_color)
-                        .italics(),
-                )
-                .selectable(false)
-                .sense(egui::Sense::click())
-                .truncate(),
-            );
-            let response = arrow.union(sender).union(body);
+            let response = if body.is_empty() {
+                arrow.union(sender)
+            } else {
+                let body = ui.add(
+                    Label::new(
+                        RichText::new(format!(": {body}"))
+                            .font(t::small())
+                            .color(reply_color)
+                            .italics(),
+                    )
+                    .selectable(false)
+                    .sense(egui::Sense::click())
+                    .truncate(),
+                );
+                arrow.union(sender).union(body)
+            };
             response.context_menu(|ui| self.show_message_context_menu(ui, msg, rctx.reply_key));
             if response.clicked() {
                 let target = reply.parent_msg_id.trim().to_owned();
                 let hint = ReplyScrollHint {
-                    parent_user_login: reply.parent_user_login.clone(),
-                    parent_msg_body: reply.parent_msg_body.clone(),
+                    parent_user_login: parent_login.to_owned(),
+                    parent_msg_body: quoted_body.to_owned(),
                     child_msg_local_id: msg.id.0,
                 };
                 ui.ctx().data_mut(|data| {
@@ -5399,6 +5434,7 @@ mod tests {
                 name_paint: None,
                 badges: Vec::new(),
             },
+            original_text: None,
             raw_text: "hello".to_owned(),
             spans: Default::default(),
             twitch_emotes: Vec::new(),
@@ -6632,6 +6668,42 @@ mod tests {
         let mut child = reply_sender_fixture(2, "child", Some("child-message"));
         child.reply = MessageList::reply_info_for_message(&parent);
         VecDeque::from([parent, child])
+    }
+
+    #[test]
+    fn id_only_reply_preview_uses_the_retained_parent_or_a_neutral_label() {
+        for retained in [false, true] {
+            let ctx = egui::Context::default();
+            let mut parent = reply_sender_fixture(1, "parent", Some(if retained {
+                "parent-message"
+            } else {
+                "unrelated-message"
+            }));
+            parent.sender.display_name = "Actual parent".into();
+            parent.raw_text = "Original body".into();
+            let mut child = reply_sender_fixture(2, "child", Some("child-message"));
+            child.reply = Some(ReplyInfo { parent_msg_id: "parent-message".into(), ..Default::default() });
+            let mut later = reply_sender_fixture(3, "parent", Some("later-message"));
+            later.raw_text = "Later unrelated body".into();
+            let messages = VecDeque::from([parent, child, later]);
+            let (_, output) = reply_preview_frame(&ctx, &messages, 360.0, Vec::new());
+            let text: Vec<_> = output.shapes.iter().filter_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            }).collect();
+            if retained {
+                assert!(text.contains(&"Actual parent"));
+                assert!(text.contains(&": Original body"));
+            } else {
+                assert!(text.contains(&"Original message"));
+                assert!(!text.iter().any(|text| text.starts_with(": ")));
+            }
+            assert!(!text.iter().any(|text| text.contains("Later unrelated body")));
+            let reply = messages[1].reply.as_ref().unwrap();
+            assert!(reply.parent_display_name.is_empty());
+            assert!(reply.parent_user_login.is_empty());
+            assert!(reply.parent_msg_body.is_empty());
+        }
     }
 
     #[test]

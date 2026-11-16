@@ -1508,6 +1508,7 @@ fn parse_irc_privmsg(msg: &IrcMessage, key: &ServerKey, my_nick: &str) -> Option
             name_paint: None,
             badges,
         },
+        original_text: None,
         raw_text: text.to_owned(),
         spans: smallvec::SmallVec::new(),
         twitch_emotes,

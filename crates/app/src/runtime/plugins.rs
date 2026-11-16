@@ -5229,6 +5229,7 @@ unsafe fn make_event_table(L: *mut lua_State, event: &AppEvent) -> c_int {
             width,
             height,
             raw_bytes,
+            ..
         } => {
             set_field_string(L, -1, "uri", uri);
             set_field_int(L, -1, "width", *width as i64);
@@ -6460,6 +6461,7 @@ mod tests {
             width: 32,
             height: 18,
             raw_bytes: vec![1, 2, 3],
+            download_slot: None,
         };
         let idx = unsafe { make_event_table(lua.ptr(), &event) };
 
@@ -7858,6 +7860,7 @@ end)
             width: 32,
             height: 32,
             raw_bytes: vec![1, 2, 3],
+            download_slot: None,
         };
         host.dispatch_event(&event);
 

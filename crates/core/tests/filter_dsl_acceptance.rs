@@ -47,6 +47,7 @@ fn make_message(text: &str, subscriber: bool) -> ChatMessage {
             name_paint: None,
             badges,
         },
+        original_text: None,
         raw_text: text.to_string(),
         spans: smallvec![Span::Text {
             text: text.to_string(),

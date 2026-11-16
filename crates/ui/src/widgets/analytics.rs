@@ -909,6 +909,7 @@ mod tests {
                 name_paint: None,
                 badges: vec![],
             },
+            original_text: None,
             raw_text: raw_text.to_owned(),
             spans: spans.into_iter().collect(),
             twitch_emotes,

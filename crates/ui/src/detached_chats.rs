@@ -304,6 +304,24 @@ impl CrustApp {
         self.detached_chats.open.push(window);
     }
 
+    pub(super) fn focus_detached_composer(&mut self, id: u64, ctx: &Context) -> bool {
+        if !self.detached_chats.open.iter().any(|window| window.pane.id == id) {
+            self.reopen_detached_chat(id);
+        }
+        let Some(window) = self.detached_chats.open.iter_mut().find(|window| window.pane.id == id) else {
+            return false;
+        };
+        window.settings.click_through = false;
+        window.picker.open = false;
+        window.focus_input = true;
+        for command in [ViewportCommand::MousePassthrough(false),
+            ViewportCommand::Minimized(false), ViewportCommand::Focus] {
+            ctx.send_viewport_cmd_to(window.viewport_id(), command);
+        }
+        ctx.request_repaint();
+        true
+    }
+
     pub(super) fn retain_detached_channel(&mut self, channel: &ChannelId) -> bool {
         let retained = self
             .detached_chats
@@ -1127,6 +1145,69 @@ mod tests {
     }
 
     #[test]
+    fn explicit_restore_reveals_the_original_detached_composer() {
+        for closed in [false, true] {
+            let (mut app, _commands) = app();
+            let ctx = Context::default();
+            app.egui_ctx = Some(ctx.clone());
+            let id = open(&mut app, true);
+            let window = &mut app.detached_chats.open[0];
+            window.focus_input = false;
+            window.settings.click_through = true;
+            let message = UnsentMessage {
+                channel: window.pane.channel.clone(), text: "recovered window draft".into(),
+                reply_to_msg_id: None, reply: None, composer: Some(window.target()),
+                reason: "The message was not sent.".into(),
+            };
+            if closed { app.close_detached_chat(id, &ctx); }
+            assert!(app.restore_targeted_unsent(&message, true));
+            let window = app.detached_chats.open.iter().find(|window| window.pane.id == id)
+                .expect("the recovered window must be visible");
+            assert_eq!(window.pane.input_buf, message.text);
+            assert!(window.focus_input);
+            assert!(!window.settings.click_through);
+        }
+    }
+
+    #[test]
+    fn explicit_restore_keeps_a_closed_window_recoverable_at_the_window_limit() {
+        let (mut app, _commands) = app();
+        let ctx = Context::default();
+        app.egui_ctx = Some(ctx.clone());
+        let id = open(&mut app, false);
+        let window = &app.detached_chats.open[0];
+        let message = UnsentMessage {
+            channel: window.pane.channel.clone(), text: "recovered window draft".into(),
+            reply_to_msg_id: None, reply: None, composer: Some(window.target()),
+            reason: "The message was not sent.".into(),
+        };
+        app.close_detached_chat(id, &ctx);
+        for _ in 0..MAX_DETACHED_CHATS { open(&mut app, false); }
+        assert!(!app.can_restore_unsent(&message, true));
+        assert!(!app.restore_targeted_unsent(&message, true));
+        assert!(app.detached_chats.closed[0].pane.input_buf.is_empty());
+    }
+
+    #[test]
+    fn automatic_restore_does_not_reopen_a_closed_chat_window() {
+        let (mut app, _commands) = app();
+        let ctx = Context::default();
+        let id = open(&mut app, false);
+        let window = &mut app.detached_chats.open[0];
+        window.focus_input = false;
+        let message = UnsentMessage {
+            channel: window.pane.channel.clone(), text: "recovered window draft".into(),
+            reply_to_msg_id: None, reply: None, composer: Some(window.target()),
+            reason: "The message was not sent.".into(),
+        };
+        app.close_detached_chat(id, &ctx);
+        assert!(app.restore_targeted_unsent(&message, false));
+        assert!(app.detached_chats.open.is_empty());
+        assert_eq!(app.detached_chats.closed[0].pane.input_buf, message.text);
+        assert!(!app.detached_chats.closed[0].focus_input);
+    }
+
+    #[test]
     fn closing_picker_and_changing_overlay_interaction_keep_the_native_window() {
         for overlay in [false, true] {
             let (mut app, _) = app();
@@ -1817,6 +1898,7 @@ mod tests {
                     name_paint: None,
                     badges: Vec::new(),
                 },
+                original_text: None,
                 raw_text: "SharedAlpha".into(),
                 spans: Default::default(),
                 twitch_emotes: Vec::new(),
@@ -1865,6 +1947,7 @@ mod tests {
                 name_paint: None,
                 badges: Vec::new(),
             },
+            original_text: None,
             raw_text: "Retained message".into(),
             spans: Default::default(),
             twitch_emotes: Vec::new(),

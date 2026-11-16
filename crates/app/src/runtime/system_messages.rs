@@ -98,6 +98,7 @@ pub(crate) fn make_custom_message(
         timestamp,
         channel,
         sender,
+        original_text: None,
         raw_text: text,
         spans,
         twitch_emotes: Vec::new(),

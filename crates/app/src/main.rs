@@ -66,7 +66,7 @@ use runtime::history::{
 use runtime::link_preview::{fetch_link_preview, LinkPreviewRequests};
 use runtime::live_emotes::LiveEmoteUpdates;
 use runtime::log_writer::{flush_before_read, publish_moderation, LogWriter};
-use runtime::outgoing::{chat_echo_body, complete_whisper_send, twitch_message_error, whisper_send_failure, ChatSendPublisher, OutgoingChat, WhisperSendTasks};
+use runtime::outgoing::{canonical_reply, chat_echo_body, complete_whisper_send, prepare_chat_display, twitch_message_error, whisper_send_failure, ChatSendPublisher, OutgoingChat, WhisperSendTasks};
 use runtime::plugins::init_plugins;
 use runtime::profiles::{
     fetch_ivr_logs, fetch_self_avatar, fetch_shared_channel_profile, fetch_shared_chat_session,
@@ -1667,9 +1667,10 @@ async fn reducer_loop(
                         }
                     }
                     TwitchEvent::ChatMessage(mut msg) => {
-                        // Drop messages from locally ignored users up front so
-                        // no highlight/mention side-effects fire for them.
-                        if compiled_ignored_users.is_ignored(&msg.sender.login) {
+                        if !prepare_chat_display(
+                            &mut msg, &compiled_ignored_users, &compiled_ignored_phrases,
+                            auth_username.as_deref(), &settings.nicknames,
+                        ) {
                             continue;
                         }
                         // Suppress notifications for a mirrored message when its
@@ -1770,13 +1771,6 @@ async fn reducer_loop(
                                 }
                             }
                         }
-                        // Apply ignored-phrase actions *before* tokenization so
-                        // that a Replace rule's output text goes through normal
-                        // emote/URL/mention detection.  A Block rule drops the
-                        // message without emitting it.
-                        if compiled_ignored_phrases.apply_to_message(&mut msg).blocked {
-                            continue;
-                        }
                         // Hold read lock only during tokenization (no clone needed)
                         {
                             let emote_guard = emote_index.read().unwrap();
@@ -1825,32 +1819,6 @@ async fn reducer_loop(
                                     );
                                 }
                             }
-                        }
-
-                        // Apply nickname alias to sender display name.
-                        crust_core::model::apply_sender_nickname(
-                            &settings.nicknames,
-                            &msg.channel.0,
-                            &mut msg.sender,
-                        );
-
-                        // Mention / reply-to-me detection
-                        if let Some(ref uname) = auth_username {
-                            let has_name_mention =
-                                crust_core::highlight::contains_mention(&msg.raw_text, uname);
-                            // Reply directed at us
-                            let is_reply_to_me = msg.reply.as_ref()
-                                .map(|r| r.parent_user_login.eq_ignore_ascii_case(uname))
-                                .unwrap_or(false);
-                            // Self-mention via nickname: if the logged-in user has a
-                            // nickname alias (replace_mentions=true), also match messages
-                            // that contain the alias as a bare or @-prefixed word.
-                            let has_nickname_mention = crust_core::highlight::contains_nickname_mention(
-                                &msg.raw_text, uname, msg.channel.display_name(), &settings.nicknames,
-                            );
-                            msg.flags.is_mention |= has_name_mention
-                                || is_reply_to_me
-                                || has_nickname_mention;
                         }
 
                         // Apply cached 7TV cosmetics for Twitch users and
@@ -3379,11 +3347,10 @@ async fn reducer_loop(
                     AppCommand::FetchLinkPreview { url } => {
                         if let Some(request) = link_preview_requests.begin(&url) {
                             let evt_tx = evt_tx.clone();
-                            let cache = emote_cache.clone();
                             tokio::spawn(async move {
                                 // Hold through event publication; cancellation also releases it.
                                 let _request = request;
-                                fetch_link_preview(&url, &cache, &evt_tx).await;
+                                fetch_link_preview(&url, &evt_tx).await;
                             });
                         }
                     }
@@ -4450,6 +4417,11 @@ async fn reducer_loop(
                             reply_to_msg_id =
                                 reply.as_ref().map(|r| r.parent_msg_id.clone());
                         }
+                        let reply = if channel.is_twitch() {
+                            canonical_reply(reply_to_msg_id.as_deref(), reply.as_ref())
+                        } else {
+                            reply
+                        };
 
                         debug!("Sending message to #{channel}: {text}");
 
@@ -4539,6 +4511,7 @@ async fn reducer_loop(
                                     name_paint: None,
                                     badges: self_badges.get(&channel).cloned().unwrap_or_default(),
                                 },
+                                original_text: None,
                                 raw_text: echo_body.to_owned(),
                                 spans: smallvec::SmallVec::new(),
                                 twitch_emotes: Vec::new(),
@@ -4563,11 +4536,18 @@ async fn reducer_loop(
                                 apply_7tv_cosmetics_to_sender(&mut echo.sender, style);
                             }
 
-                            // Tokenize the echo message
+                            // Infer ranges from the wire body before display replacements.
                             {
                                 let emote_guard = emote_index.read().unwrap();
                                 echo.twitch_emotes = infer_twitch_emote_positions_from_text(
                                     &emote_guard, Some(&echo.channel), &echo.sender.user_id.0, &echo.raw_text);
+                            }
+                            let show_echo = prepare_chat_display(
+                                &mut echo, &compiled_ignored_users, &compiled_ignored_phrases,
+                                auth_username.as_deref(), &settings.nicknames,
+                            );
+                            if show_echo {
+                                let emote_guard = emote_index.read().unwrap();
                                 echo.spans = crust_core::format::tokenize_with_flags(
                                     &echo.raw_text,
                                     echo.flags.is_action,
@@ -4595,7 +4575,7 @@ async fn reducer_loop(
                                 composer: composer.clone(),
                             };
                             let echo_log_writer = log_writer.clone().filter(|_| settings.local_log_indexing_enabled);
-                            if chat_publisher.submit(receiver, draft, echo, echo_log_writer, evt_tx.clone()).await {
+                            if chat_publisher.submit(receiver, draft, show_echo.then_some(echo), echo_log_writer, evt_tx.clone()).await {
                                 let _ = sess_tx.send(SessionCommand::SendMessage(channel.clone(), text.clone(), reply_to_msg_id.clone(), receipt)).await;
                             }
                         }
@@ -4644,6 +4624,7 @@ async fn reducer_loop(
                                         name_paint: None,
                                         badges: Vec::new(),
                                     },
+                                    original_text: None,
                                     raw_text: echo_body.to_owned(),
                                     spans: smallvec::SmallVec::new(),
                                     twitch_emotes: Vec::new(),
@@ -7530,6 +7511,7 @@ fn persist_whisper_message(
             name_paint: None,
             badges: Vec::new(),
         },
+        original_text: None,
         raw_text: text.trim().to_owned(),
         spans: Default::default(),
         twitch_emotes: twitch_emotes.to_vec(),

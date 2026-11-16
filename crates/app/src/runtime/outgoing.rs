@@ -1,5 +1,6 @@
 use chrono::Utc;
-use crust_core::model::{ChannelId, ChatMessage, ReplyInfo, TwitchEmotePos};
+use crust_core::ignores::{CompiledIgnoredPhrases, CompiledIgnoredUsers};
+use crust_core::model::{ChannelId, ChatMessage, Nickname, ReplyInfo, TwitchEmotePos};
 use crust_core::AppEvent;
 use futures_util::{future::Shared, FutureExt};
 use tokio::sync::{mpsc, oneshot};
@@ -76,10 +77,11 @@ impl ChatSendPublisher {
         &mut self,
         receipt: oneshot::Receiver<Result<(), String>>,
         draft: OutgoingChat,
-        echo: ChatMessage,
+        echo: impl Into<Option<ChatMessage>>,
         log_writer: Option<LogWriter>,
         events: mpsc::Sender<AppEvent>,
     ) -> bool {
+        let echo = echo.into();
         self.prune_publications();
         // Bound completions that are still waiting for storage or UI capacity.
         let Ok(slot) = self.slots.clone().try_acquire_owned() else {
@@ -243,6 +245,66 @@ impl OutgoingChat {
     }
 }
 
+/// Apply the same display rules to incoming messages and successful local echoes.
+/// Native emote ranges must describe the original body before this runs.
+pub(crate) fn prepare_chat_display(
+    message: &mut ChatMessage,
+    ignored_users: &CompiledIgnoredUsers,
+    ignored_phrases: &CompiledIgnoredPhrases,
+    local_login: Option<&str>,
+    nicknames: &[Nickname],
+) -> bool {
+    if ignored_users.is_ignored(&message.sender.login) {
+        return false;
+    }
+    let original_text = (message.flags.is_self
+        && message.original_text.is_none()
+        && !ignored_phrases.is_empty())
+        .then(|| message.raw_text.clone());
+    let outcome = ignored_phrases.apply_to_message(message);
+    if outcome.replaced && message.original_text.is_none() {
+        message.original_text = original_text;
+    }
+    if outcome.blocked {
+        return false;
+    }
+    crust_core::model::apply_sender_nickname(
+        nicknames,
+        message.channel.as_str(),
+        &mut message.sender,
+    );
+    if let Some(login) = local_login {
+        message.flags.is_mention |=
+            crust_core::highlight::contains_mention(&message.raw_text, login)
+                || message.reply.as_ref().is_some_and(|reply| {
+                    reply.parent_user_login.eq_ignore_ascii_case(login)
+                })
+                || crust_core::highlight::contains_nickname_mention(
+                    &message.raw_text,
+                    login,
+                    message.channel.display_name(),
+                    nicknames,
+                );
+    }
+    true
+}
+
+/// Keep display context aligned with the parent actually addressed on the wire.
+pub(crate) fn canonical_reply(
+    reply_to_msg_id: Option<&str>,
+    reply: Option<&ReplyInfo>,
+) -> Option<ReplyInfo> {
+    let parent_msg_id =
+        reply_to_msg_id.or_else(|| reply.map(|reply| reply.parent_msg_id.as_str()))?;
+    Some(match reply.filter(|reply| reply.parent_msg_id == parent_msg_id) {
+        Some(reply) => reply.clone(),
+        None => ReplyInfo {
+            parent_msg_id: parent_msg_id.to_owned(),
+            ..Default::default()
+        },
+    })
+}
+
 pub(crate) fn twitch_message_error(text: &str) -> Option<String> {
     let count = text.chars().count();
     (count > crate::TWITCH_MAX_MESSAGE_CHARS).then(|| {
@@ -271,18 +333,24 @@ pub(crate) fn chat_echo_body(text: &str) -> (&str, bool) {
 pub(crate) async fn publish_chat_result(
     receipt: impl std::future::Future<Output = Result<Result<(), String>, oneshot::error::RecvError>>,
     draft: OutgoingChat,
-    echo: ChatMessage,
+    echo: impl Into<Option<ChatMessage>>,
     log_writer: Option<LogWriter>,
     events: mpsc::Sender<AppEvent>,
 ) {
+    let echo = echo.into();
     let event = match receipt.await {
-        Ok(Ok(())) => saved_chat_echo(echo, log_writer).await,
-        Ok(Err(reason)) => draft.rejected(format!("Message was not sent. {reason}")),
-        Err(_) => draft.rejected(
+        Ok(Ok(())) => match echo {
+            Some(echo) => Some(saved_chat_echo(echo, log_writer).await),
+            None => None,
+        },
+        Ok(Err(reason)) => Some(draft.rejected(format!("Message was not sent. {reason}"))),
+        Err(_) => Some(draft.rejected(
             "The chat connection changed before the send completed. Check the channel before retrying.".into(),
-        ),
+        )),
     };
-    let _ = events.send(event).await;
+    if let Some(event) = event {
+        let _ = events.send(event).await;
+    }
 }
 
 async fn saved_chat_echo(mut echo: ChatMessage, log_writer: Option<LogWriter>) -> AppEvent {
@@ -484,6 +552,169 @@ mod tests {
         echo.flags.is_self = true;
         echo.reply = Some(reply);
         (draft, echo)
+    }
+
+    #[tokio::test]
+    async fn rewritten_local_echo_and_changed_confirmation_keep_one_saved_row() {
+        use crust_core::ignores::{IgnoredPhrase, IgnoredPhraseAction};
+
+        let rules = |replacement: &str| {
+            let mut rule = IgnoredPhrase::new("secret");
+            rule.action = IgnoredPhraseAction::Replace;
+            rule.replace_with = replacement.into();
+            CompiledIgnoredPhrases::new(&[rule])
+        };
+        let ignored_users = CompiledIgnoredUsers::new(&[]);
+        let store = LogStore::with_db_path(":memory:".into()).unwrap();
+        let (events, mut received) = mpsc::channel(8);
+        let writer = LogWriter::new(
+            &tokio::runtime::Handle::current(), store.clone(), events.clone(),
+        );
+        let (mut draft, mut local) = pending();
+        draft.text = "/me secret Kappa".into();
+        draft.reply_to_msg_id = Some("id-only-parent".into());
+        draft.reply = None;
+        local.raw_text = chat_echo_body(&draft.text).0.into();
+        local.reply = canonical_reply(draft.reply_to_msg_id.as_deref(), draft.reply.as_ref());
+        local.twitch_emotes = vec![TwitchEmotePos { id: "25".into(), start: 7, end: 11 }];
+        let local_id = local.id;
+        let mut server = local.clone();
+        server.id.0 += 100;
+        server.server_id = Some("confirmed-replaced".into());
+        server.timestamp += chrono::Duration::seconds(1);
+        server.reply.as_mut().unwrap().parent_user_login = "bob".into();
+        server.reply.as_mut().unwrap().parent_msg_body = "server parent body".into();
+        assert!(prepare_chat_display(
+            &mut local, &ignored_users, &rules("masked"), Some("alice"), &[],
+        ));
+        assert!(prepare_chat_display(
+            &mut server, &ignored_users, &rules("new display"), Some("alice"), &[],
+        ));
+        assert_eq!(draft.text, "/me secret Kappa");
+        let mut publisher = ChatSendPublisher::default();
+        let (receipt, ready) = oneshot::channel();
+        assert!(publisher.submit(ready, draft, local, Some(writer.clone()), events.clone()).await);
+        receipt.send(Ok(())).unwrap();
+        publisher.publish_incoming(server, Some(&writer), events).await;
+
+        let mut room = crust_core::model::ChannelState::new(ChannelId::new("room"));
+        for _ in 0..2 {
+            let AppEvent::MessageReceived { message, .. } = received.try_recv().unwrap() else {
+                panic!("expected local echo and socket confirmation");
+            };
+            if room.absorb_own_echo(&message).is_none() {
+                room.push_message(message);
+            }
+        }
+        assert_eq!(room.messages.len(), 1);
+        assert_eq!(room.messages[0].id, local_id);
+        assert_eq!(room.messages[0].raw_text, "new display Kappa");
+        assert_eq!(room.messages[0].confirmation_text(), "secret Kappa");
+        assert_eq!(room.messages[0].reply.as_ref().unwrap().parent_user_login, "bob");
+        writer.shutdown().await.unwrap();
+        let rows = store.recent_messages(&room.id, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, local_id);
+        assert_eq!(rows[0].server_id.as_deref(), Some("confirmed-replaced"));
+        assert_eq!(rows[0].raw_text, "new display Kappa");
+        assert_eq!(rows[0].confirmation_text(), "secret Kappa");
+    }
+
+    #[test]
+    fn local_display_rules_keep_native_emotes_and_apply_aliases_and_mentions() {
+        use crust_core::ignores::{IgnoredPhrase, IgnoredPhraseAction};
+
+        let mut replacement = IgnoredPhrase::new("secret");
+        replacement.action = IgnoredPhraseAction::Replace;
+        replacement.replace_with = "safe".into();
+        let mut highlight = IgnoredPhrase::new("safe");
+        highlight.action = IgnoredPhraseAction::HighlightOnly;
+        let rules = CompiledIgnoredPhrases::new(&[replacement, highlight]);
+        let mut alias = Nickname::new("alice", "Alicia");
+        alias.channel = Some("room".into());
+        let (_, mut echo) = pending();
+        echo.raw_text = "secret 🦀 Kappa @Alicia".into();
+        echo.sender.display_name = "Alice".into();
+        echo.twitch_emotes = vec![TwitchEmotePos { id: "25".into(), start: 9, end: 13 }];
+        assert!(prepare_chat_display(
+            &mut echo, &CompiledIgnoredUsers::new(&[]), &rules, Some("alice"), &[alias],
+        ));
+        assert_eq!(echo.raw_text, "safe 🦀 Kappa @Alicia");
+        assert_eq!(echo.confirmation_text(), "secret 🦀 Kappa @Alicia");
+        assert_eq!(echo.sender.display_name, "Alicia");
+        assert_eq!(echo.sender.original_display_name.as_deref(), Some("Alice"));
+        assert!(echo.flags.is_highlighted && echo.flags.is_mention);
+        assert_eq!((echo.twitch_emotes[0].start, echo.twitch_emotes[0].end), (7, 11));
+        let spans = crust_core::format::tokenize_with_flags(
+            &echo.raw_text, echo.flags.is_action, &echo.twitch_emotes, &|_| None,
+        );
+        assert!(spans.iter().any(|span| matches!(span,
+            crust_core::model::Span::Emote { id, code, .. } if id == "25" && code == "Kappa"
+        )));
+    }
+
+    #[tokio::test]
+    async fn blocked_local_echoes_stay_hidden_but_failed_sends_recover_the_draft() {
+        use crust_core::ignores::{IgnoredPhrase, IgnoredUser};
+
+        for ignored_user in [false, true] {
+            for send_result in [Some(Ok(())), Some(Err("write failed".to_owned())), None] {
+                let (mut draft, mut echo) = pending();
+                draft.text = "/me secret 🦀".into();
+                echo.raw_text = "secret 🦀".into();
+                let users = CompiledIgnoredUsers::new(&if ignored_user {
+                    vec![IgnoredUser::new("alice")]
+                } else {
+                    Vec::new()
+                });
+                let phrases = CompiledIgnoredPhrases::new(&if ignored_user {
+                    Vec::new()
+                } else {
+                    vec![IgnoredPhrase::new("secret")]
+                });
+                assert!(!prepare_chat_display(&mut echo, &users, &phrases, Some("alice"), &[]));
+                let store = LogStore::with_db_path(":memory:".into()).unwrap();
+                let (events, mut received) = mpsc::channel(4);
+                let writer = LogWriter::new(
+                    &tokio::runtime::Handle::current(), store.clone(), events.clone(),
+                );
+                let (receipt, result) = oneshot::channel();
+                let succeeded = matches!(&send_result, Some(Ok(())));
+                if let Some(outcome) = send_result {
+                    receipt.send(outcome).unwrap();
+                } else {
+                    drop(receipt);
+                }
+                publish_chat_result(result, draft, None::<ChatMessage>, Some(writer.clone()), events).await;
+                if !succeeded {
+                    let AppEvent::MessageSendRejected { text, reply_to_msg_id, composer, .. } =
+                        received.try_recv().unwrap()
+                    else {
+                        panic!("a hidden echo must still recover a rejected send");
+                    };
+                    assert_eq!(text, "/me secret 🦀");
+                    assert_eq!(reply_to_msg_id.as_deref(), Some("parent"));
+                    assert_eq!(composer, Some(crust_core::ComposerTarget::Chat {
+                        account_id: Some("alice-id".into()), pane_id: 73,
+                    }));
+                }
+                assert!(received.try_recv().is_err());
+                writer.shutdown().await.unwrap();
+                assert!(store.recent_messages(&echo.channel, 10).unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn reply_context_follows_the_wire_parent_without_copying_unrelated_metadata() {
+        let (_, echo) = pending();
+        let metadata = echo.reply.unwrap();
+        assert_eq!(canonical_reply(None, Some(&metadata)), Some(metadata.clone()));
+        assert_eq!(canonical_reply(Some("parent"), Some(&metadata)), Some(metadata.clone()));
+        let expected = ReplyInfo { parent_msg_id: "different-parent".into(), ..Default::default() };
+        assert_eq!(canonical_reply(Some("different-parent"), None), Some(expected.clone()));
+        assert_eq!(canonical_reply(Some("different-parent"), Some(&metadata)), Some(expected));
+        assert!(canonical_reply(None, None).is_none());
     }
 
     #[tokio::test]

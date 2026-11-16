@@ -25,9 +25,6 @@ impl UnsentMessage {
         self.reply.clone().or_else(|| {
             self.reply_to_msg_id.as_ref().map(|id| ReplyInfo {
                 parent_msg_id: id.clone(),
-                parent_user_login: String::new(),
-                parent_display_name: "unknown".to_owned(),
-                parent_msg_body: String::new(),
                 ..Default::default()
             })
         })
@@ -277,6 +274,17 @@ mod tests {
                 message.reply.unwrap().parent_msg_body
             );
         }
+    }
+
+    #[test]
+    fn id_only_recovery_keeps_the_parent_without_inventing_metadata() {
+        let mut message = long_message("room");
+        message.reply = None;
+        let reply = message.reply_info().unwrap();
+        assert_eq!(reply.parent_msg_id, "parent-id");
+        assert!(reply.parent_user_login.is_empty());
+        assert!(reply.parent_display_name.is_empty());
+        assert!(reply.parent_msg_body.is_empty());
     }
 
     #[test]
