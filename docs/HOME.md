@@ -15,6 +15,7 @@
 - [Search, subscriber messages, and live updates](./AUDIT_SEARCH_AND_LIVE_UPDATES.md)
 - [Pane layouts, rich message views, and emote loading](./AUDIT_PANE_VIEWS.md)
 - [Chat windows, search, and recovery](./AUDIT_CHAT_WINDOWS.md)
+- [Chat state, channel banners, and image loading](./AUDIT_CHAT_STATE_AND_IMAGES.md)
 
 ## Plugins
 
@@ -31,6 +32,7 @@
 
 ## Release notes
 
+- [v0.7.1](./releases/Release_v0.7.1.md)
 - [v0.7.0](./releases/Release_v0.7.0.md)
 - [v0.6.0](./releases/Release_v0.6.0.md)
 - [v0.5.9](./releases/Release_v0.5.9.md)

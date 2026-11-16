@@ -57,10 +57,10 @@ for current settings and account-dialog captures.
 
 - [Documentation index](docs/HOME.md)
 - [Features and keybinds](docs/FEATURES_AND_KEYBINDS.md)
-- [Chat windows, search, and recovery audit](docs/AUDIT_CHAT_WINDOWS.md)
+- [Chat state, banners, and image loading audit](docs/AUDIT_CHAT_STATE_AND_IMAGES.md)
 - [Plugin API reference](docs/API.md)
 - [Example plugins](plugins/)
-- [Release notes v0.7.0](docs/releases/Release_v0.7.0.md)
+- [Release notes v0.7.1](docs/releases/Release_v0.7.1.md)
 
 ## Data paths
 

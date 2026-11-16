@@ -386,11 +386,7 @@ pub fn text_muted() -> Color32 {
 /// Helper text, section labels, and dialog subtitles.
 #[inline]
 pub fn text_helper() -> Color32 {
-    if is_light() {
-        text_muted()
-    } else {
-        text_secondary()
-    }
+    text_secondary()
 }
 /// High-contrast text for colored pills/buttons.
 #[inline]
@@ -435,18 +431,18 @@ pub fn hover_bg() -> Color32 {
 #[inline]
 pub fn active_channel_bg() -> Color32 {
     if is_light() {
-        Color32::from_rgba_premultiplied(130, 100, 210, 60)
+        Color32::from_rgba_unmultiplied(130, 100, 210, 60)
     } else {
-        Color32::from_rgba_premultiplied(55, 38, 100, 100)
+        Color32::from_rgba_unmultiplied(55, 38, 100, 100)
     }
 }
 /// Hover row fill for channel list.
 #[inline]
 pub fn hover_row_bg() -> Color32 {
     if is_light() {
-        Color32::from_rgba_premultiplied(120, 110, 170, 40)
+        Color32::from_rgba_unmultiplied(120, 110, 170, 40)
     } else {
-        Color32::from_rgba_premultiplied(40, 40, 60, 80)
+        Color32::from_rgba_unmultiplied(40, 40, 60, 80)
     }
 }
 
@@ -555,6 +551,51 @@ pub fn alpha(color: Color32, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), a)
 }
 
+fn relative_luminance(color: Color32) -> f32 {
+    let linear = |channel: u8| {
+        let channel = channel as f32 / 255.0;
+        if channel <= 0.04045 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * linear(color.r()) + 0.7152 * linear(color.g()) + 0.0722 * linear(color.b())
+}
+
+/// Keep informational text readable on an opaque surface without changing its fill.
+pub(crate) fn readable_text_color(color: Color32, background: Color32) -> Color32 {
+    let color = Color32::from_rgb(color.r(), color.g(), color.b());
+    let background = relative_luminance(background);
+    let contrast = |color| {
+        let foreground = relative_luminance(color);
+        (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05)
+    };
+    if contrast(color) >= 4.5 {
+        return color;
+    }
+
+    let target = if contrast(Color32::BLACK) >= contrast(Color32::WHITE) {
+        Color32::BLACK
+    } else {
+        Color32::WHITE
+    };
+    let mut failing = 0.0;
+    let mut passing = 1.0;
+    let mut result = target;
+    for _ in 0..8 {
+        let middle = (failing + passing) * 0.5;
+        let candidate = color.lerp_to_gamma(target, middle);
+        if contrast(candidate) >= 4.5 {
+            passing = middle;
+            result = candidate;
+        } else {
+            failing = middle;
+        }
+    }
+    result
+}
+
 /// Adjust plain username text for the current theme, leaving stored colors intact.
 pub(crate) fn readable_username_color(color: Color32) -> Color32 {
     let light_theme = is_light();
@@ -609,18 +650,7 @@ pub(crate) fn readable_username_color(color: Color32) -> Color32 {
         let channel = |value: f32| (((value - minimum) * scale + offset) * 255.0).round() as u8;
         Color32::from_rgb(channel(r), channel(g), channel(b))
     };
-    let luminance = |color: Color32| {
-        let linear = |channel: u8| {
-            let channel = channel as f32 / 255.0;
-            if channel <= 0.04045 {
-                channel / 12.92
-            } else {
-                ((channel + 0.055) / 1.055).powf(2.4)
-            }
-        };
-        0.2126 * linear(color.r()) + 0.7152 * linear(color.g()) + 0.0722 * linear(color.b())
-    };
-    let background = luminance(bg_raised());
+    let background = relative_luminance(bg_raised());
     let target = if light_theme {
         (background + 0.05) / 4.5 - 0.05
     } else {
@@ -628,9 +658,9 @@ pub(crate) fn readable_username_color(color: Color32) -> Color32 {
     };
     let readable = |color| {
         if light_theme {
-            luminance(color) <= target
+            relative_luminance(color) <= target
         } else {
-            luminance(color) >= target
+            relative_luminance(color) >= target
         }
     };
     let display_color = color_at_lightness(adjusted);
@@ -783,9 +813,9 @@ pub fn bg_card() -> Color32 {
 #[inline]
 pub fn tab_selected_bg() -> Color32 {
     if is_light() {
-        Color32::from_rgba_premultiplied(120, 90, 210, 52)
+        Color32::from_rgba_unmultiplied(120, 90, 210, 52)
     } else {
-        Color32::from_rgba_premultiplied(96, 76, 170, 160)
+        Color32::from_rgba_unmultiplied(96, 76, 170, 160)
     }
 }
 
@@ -793,9 +823,9 @@ pub fn tab_selected_bg() -> Color32 {
 #[inline]
 pub fn tab_hover_bg() -> Color32 {
     if is_light() {
-        Color32::from_rgba_premultiplied(120, 120, 150, 26)
+        Color32::from_rgba_unmultiplied(120, 120, 150, 26)
     } else {
-        Color32::from_rgba_premultiplied(80, 80, 110, 72)
+        Color32::from_rgba_unmultiplied(80, 80, 110, 72)
     }
 }
 
@@ -803,9 +833,9 @@ pub fn tab_hover_bg() -> Color32 {
 #[inline]
 pub fn pill_bg() -> Color32 {
     if is_light() {
-        Color32::from_rgba_premultiplied(110, 110, 140, 28)
+        Color32::from_rgba_unmultiplied(110, 110, 140, 28)
     } else {
-        Color32::from_rgba_premultiplied(100, 100, 130, 70)
+        Color32::from_rgba_unmultiplied(100, 100, 130, 70)
     }
 }
 
@@ -813,9 +843,9 @@ pub fn pill_bg() -> Color32 {
 #[inline]
 pub fn mention_pill_bg() -> Color32 {
     if is_light() {
-        Color32::from_rgba_premultiplied(215, 175, 40, 44)
+        Color32::from_rgba_unmultiplied(215, 175, 40, 44)
     } else {
-        Color32::from_rgba_premultiplied(220, 175, 45, 84)
+        Color32::from_rgba_unmultiplied(220, 175, 45, 84)
     }
 }
 
@@ -823,9 +853,9 @@ pub fn mention_pill_bg() -> Color32 {
 #[inline]
 pub fn danger_bg() -> Color32 {
     if is_light() {
-        Color32::from_rgba_premultiplied(210, 60, 60, 28)
+        Color32::from_rgba_unmultiplied(210, 60, 60, 28)
     } else {
-        Color32::from_rgba_premultiplied(200, 55, 55, 54)
+        Color32::from_rgba_unmultiplied(200, 55, 55, 54)
     }
 }
 
@@ -833,9 +863,9 @@ pub fn danger_bg() -> Color32 {
 #[inline]
 pub fn info_bg() -> Color32 {
     if is_light() {
-        Color32::from_rgba_premultiplied(90, 130, 220, 24)
+        Color32::from_rgba_unmultiplied(90, 130, 220, 24)
     } else {
-        Color32::from_rgba_premultiplied(85, 115, 210, 48)
+        Color32::from_rgba_unmultiplied(85, 115, 210, 48)
     }
 }
 
@@ -1087,6 +1117,105 @@ pub fn tiny() -> FontId {
 #[cfg(test)]
 mod color_tests {
     use super::*;
+
+    fn contrast_ratio(foreground: Color32, background: Color32) -> f64 {
+        let luminance = |color: Color32| {
+            [color.r(), color.g(), color.b()]
+                .into_iter()
+                .zip([0.2126, 0.7152, 0.0722])
+                .map(|(channel, weight)| {
+                    let value = f64::from(channel) / 255.0;
+                    weight
+                        * if value <= 0.04045 {
+                            value / 12.92
+                        } else {
+                            ((value + 0.055) / 1.055).powf(2.4)
+                        }
+                })
+                .sum::<f64>()
+        };
+        let foreground = luminance(foreground);
+        let background = luminance(background);
+        (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05)
+    }
+
+    #[test]
+    fn informational_text_has_contrast_on_light_and_dark_tinted_surfaces() {
+        let surfaces = [
+            Color32::from_rgb(13, 13, 18),
+            Color32::from_rgb(20, 20, 28),
+            Color32::from_rgb(28, 28, 40),
+            Color32::from_rgb(24, 14, 14),
+            Color32::from_rgb(245, 245, 250),
+            Color32::from_rgb(235, 235, 242),
+            Color32::from_rgb(225, 225, 235),
+            Color32::from_rgb(255, 235, 235),
+        ];
+        let accents = [
+            Color32::from_rgb(255, 215, 0),
+            Color32::from_rgb(180, 140, 10),
+            Color32::from_rgb(235, 195, 55),
+            Color32::from_rgb(200, 45, 45),
+            Color32::from_rgb(220, 65, 65),
+            Color32::from_rgb(20, 140, 210),
+            Color32::from_rgb(100, 200, 255),
+            Color32::from_rgb(155, 102, 214),
+            Color32::from_rgb(168, 85, 247),
+            Color32::from_rgb(139, 92, 246),
+            Color32::from_rgb(99, 102, 241),
+            Color32::from_rgb(236, 72, 153),
+            Color32::from_rgb(244, 114, 182),
+            Color32::from_rgb(145, 145, 160),
+            Color32::from_rgb(72, 72, 90),
+            Color32::from_rgb(85, 85, 100),
+            Color32::from_rgb(130, 130, 148),
+        ];
+        for surface in surfaces {
+            for accent in accents {
+                for opacity in [0, 18, 20, 22, 24, 28, 32, 44] {
+                    let background = surface.blend(alpha(accent, opacity));
+                    let foreground = readable_text_color(accent, background);
+                    let ratio = contrast_ratio(foreground, background);
+                    assert_eq!(foreground.a(), 255);
+                    assert!(ratio >= 4.5, "{accent:?} on {background:?}: {ratio}");
+                    if contrast_ratio(accent, background) >= 4.5 {
+                        assert_eq!(
+                            foreground, accent,
+                            "readable colors must stay unchanged"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn informational_text_remains_readable_on_mid_tone_surfaces() {
+        for value in 0..=255 {
+            let background = Color32::from_gray(value);
+            let foreground = readable_text_color(Color32::from_gray(128), background);
+            assert!(contrast_ratio(foreground, background) >= 4.5);
+        }
+    }
+
+    #[test]
+    fn translucent_palette_fills_do_not_add_light_beyond_their_opacity() {
+        for fill in [
+            active_channel_bg(),
+            hover_row_bg(),
+            tab_selected_bg(),
+            tab_hover_bg(),
+            pill_bg(),
+            mention_pill_bg(),
+            danger_bg(),
+            info_bg(),
+        ] {
+            let premultiplied = egui::Rgba::from(fill);
+            assert!(premultiplied.r() <= premultiplied.a() + 0.005, "{fill:?}");
+            assert!(premultiplied.g() <= premultiplied.a() + 0.005, "{fill:?}");
+            assert!(premultiplied.b() <= premultiplied.a() + 0.005, "{fill:?}");
+        }
+    }
 
     #[test]
     fn hex_colors_preserve_rgb_and_alpha_contracts() {

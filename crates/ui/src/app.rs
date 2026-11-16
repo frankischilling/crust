@@ -1845,6 +1845,16 @@ pub(crate) fn apply_theme_visuals(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
+fn paint_main_background(ctx: &Context) {
+    if ctx.viewport_id() == egui::ViewportId::ROOT {
+        ctx.layer_painter(egui::LayerId::background()).rect_filled(
+            ctx.screen_rect(),
+            egui::CornerRadius::ZERO,
+            t::bg_base(),
+        );
+    }
+}
+
 /// Convert the stable key name stored in [`crust_core::KeyBinding`] to an
 /// [`egui::Key`]. Case-insensitive; returns `None` for unknown keys (those
 /// bindings are treated as inert until the user rebinds them).
@@ -4743,6 +4753,11 @@ exit 1
                     channel: channel.as_str().to_owned(),
                 })
             }
+            AppEvent::ChannelParted { channel } => {
+                self.loading_screen.on_event(LoadEvent::ChannelParted {
+                    channel: channel.as_str().to_owned(),
+                })
+            }
             AppEvent::EmoteCatalogUpdated { emotes } => {
                 self.loading_screen.on_event(LoadEvent::CatalogLoaded {
                     count: emotes.len(),
@@ -5127,10 +5142,8 @@ exit 1
                             let recent: Vec<_> = ch.messages.iter().rev().take(400).map(|row| row.id).collect();
                             crate::widgets::message_list::invalidate_message_layouts(ctx, &channel, &recent);
                         }
-                        // Echo landed on an existing local copy; the mention
-                        // (if any) was already recorded when that local copy
-                        // was first pushed. Skip the mirror to avoid
-                        // double-counting in the Mentions tab.
+                        // Reconcile an own-message confirmation with its local
+                        // identity after releasing the channel borrow.
                         mention_pushable = false;
                     }
                     if !absorbed {
@@ -5214,7 +5227,16 @@ exit 1
                     }
                 }
                 if let Some((confirmed, original_timestamp_ms)) = confirmed_mention_echo {
-                    self.state.sync_mention_echo(&confirmed);
+                    let had_mention = self.state.sync_mention_echo(&confirmed);
+                    if !had_mention
+                        && !confirmed.flags.suppress_notification
+                        && (confirmed.flags.is_highlighted
+                            || confirmed.flags.is_mention
+                            || confirmed.flags.is_first_msg
+                            || confirmed.flags.is_pinned)
+                    {
+                        self.state.push_mention(confirmed.clone(), false);
+                    }
                     crate::widgets::message_list::invalidate_message_layouts(
                         ctx, &ChannelId::mentions(), &[confirmed.id]);
                     crate::widgets::message_list::invalidate_reply_sender_index(ctx, &ChannelId::mentions());
@@ -8847,6 +8869,7 @@ impl Drop for CrustApp {
 
 impl eframe::App for CrustApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        // Native overlays share this clear color; the root paints its own opaque base.
         [0.0; 4]
     }
 
@@ -9036,6 +9059,9 @@ impl CrustApp {
             now_instant,
             std::time::Duration::from_secs(60),
         );
+
+        // Panel margins and antialiased borders must not expose the desktop.
+        paint_main_background(ctx);
 
         // Startup status stays visible while chat and settings remain usable.
         if self.loading_screen.is_active() {
@@ -19124,6 +19150,77 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_own_echo_adds_newly_qualified_mentions_without_another_unread() {
+        let (mut app, _commands) = test_app();
+        let mut updates = attach_history_updates(&mut app, 4);
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("first");
+        app.state.join_channel(channel.clone());
+        let mut local = search_message(channel.clone());
+        local.id = crust_core::MessageId(42);
+        local.server_id = None;
+        local.flags.is_self = true;
+        let original_timestamp_ms = local.timestamp.timestamp_millis();
+        app.apply_event(AppEvent::MessageReceived {
+            channel: channel.clone(), message: local.clone(),
+        }, &ctx);
+        assert!(app.state.mentions.is_empty());
+        assert_eq!(app.state.mentions_unread, 0);
+
+        let mut confirmed = local;
+        confirmed.id = crust_core::MessageId(99);
+        confirmed.server_id = Some("confirmed-first-message".into());
+        confirmed.timestamp += chrono::Duration::seconds(1);
+        confirmed.sender.display_name = "Confirmed name".into();
+        confirmed.flags.is_first_msg = true;
+        confirmed.flags.is_pinned = true;
+        app.apply_event(AppEvent::MessageReceived {
+            channel: channel.clone(), message: confirmed.clone(),
+        }, &ctx);
+
+        assert_eq!(app.state.channels[&channel].messages.len(), 1);
+        assert_eq!(app.state.mentions.len(), 1);
+        let mention = &app.state.mentions[0];
+        assert_eq!(mention.id, crust_core::MessageId(42));
+        assert_eq!(mention.server_id.as_deref(), Some("confirmed-first-message"));
+        assert_eq!(mention.sender.display_name, "Confirmed name");
+        assert!(mention.flags.is_first_msg && mention.flags.is_pinned);
+        assert_eq!(app.state.mentions_unread, 0);
+        let HistoryUpdate::Confirmation { message: saved, original_timestamp_ms: timestamp } =
+            updates.try_recv().unwrap() else { panic!("confirmation was not persisted") };
+        assert_eq!(saved.id, crust_core::MessageId(42));
+        assert!(saved.flags.is_first_msg && saved.flags.is_pinned);
+        assert_eq!(timestamp, original_timestamp_ms);
+
+        app.apply_event(AppEvent::MessageReceived { channel, message: confirmed }, &ctx);
+        assert_eq!(app.state.mentions.len(), 1);
+        assert_eq!(app.state.mentions_unread, 0);
+        assert!(updates.try_recv().is_err());
+    }
+
+    #[test]
+    fn suppressed_confirmation_does_not_add_a_mentions_row() {
+        let (mut app, _commands) = test_app();
+        let ctx = egui::Context::default();
+        let channel = ChannelId::new("first");
+        app.state.join_channel(channel.clone());
+        let mut local = search_message(channel.clone());
+        local.server_id = None;
+        local.flags.is_self = true;
+        app.apply_event(AppEvent::MessageReceived {
+            channel: channel.clone(), message: local.clone(),
+        }, &ctx);
+        local.server_id = Some("suppressed-confirmation".into());
+        local.flags.is_first_msg = true;
+        local.flags.suppress_notification = true;
+        app.apply_event(AppEvent::MessageReceived { channel: channel.clone(), message: local }, &ctx);
+        assert!(app.state.channels[&channel].messages[0].flags.is_first_msg);
+        assert!(app.state.channels[&channel].messages[0].flags.suppress_notification);
+        assert!(app.state.mentions.is_empty());
+        assert_eq!(app.state.mentions_unread, 0);
+    }
+
+    #[test]
     fn message_confirmation_survives_a_full_ui_command_backlog() {
         let (mut app, _commands) = test_app();
         let mut updates = attach_history_updates(&mut app, 1);
@@ -19421,6 +19518,175 @@ mod tests {
             });
         });
         visibility.unwrap()
+    }
+
+    fn solid_paint_alpha_at(primitives: &[egui::ClippedPrimitive], point: egui::Pos2) -> f32 {
+        let cross = |a: egui::Vec2, b: egui::Vec2| a.x * b.y - a.y * b.x;
+        let mut alpha = 0.0;
+        for primitive in primitives {
+            if !primitive.clip_rect.contains(point) {
+                continue;
+            }
+            let egui::epaint::Primitive::Mesh(mesh) = &primitive.primitive else {
+                continue;
+            };
+            for triangle in mesh.indices.chunks_exact(3) {
+                let vertices = [triangle[0], triangle[1], triangle[2]]
+                    .map(|index| mesh.vertices[index as usize]);
+                // Textured triangles need their texture alpha; only sample solid geometry.
+                if vertices
+                    .iter()
+                    .any(|vertex| vertex.uv != egui::epaint::WHITE_UV)
+                {
+                    continue;
+                }
+                let [a, b, c] = vertices.map(|vertex| vertex.pos);
+                let area = cross(b - a, c - a);
+                if area.abs() < f32::EPSILON {
+                    continue;
+                }
+                let weights = [
+                    cross(b - point, c - point),
+                    cross(c - point, a - point),
+                    cross(a - point, b - point),
+                ]
+                .map(|weight| weight / area);
+                if weights.iter().any(|weight| *weight < -0.0001) {
+                    continue;
+                }
+                let source_alpha = vertices
+                    .iter()
+                    .zip(weights)
+                    .map(|(vertex, weight)| f32::from(vertex.color.a()) / 255.0 * weight)
+                    .sum::<f32>()
+                    .clamp(0.0, 1.0);
+                alpha = source_alpha + alpha * (1.0 - source_alpha);
+            }
+        }
+        alpha
+    }
+
+    #[test]
+    fn main_window_background_does_not_cover_startup_status() {
+        for connected in [false, true] {
+            let (mut app, _commands) = test_app();
+            if connected {
+                app.loading_screen.on_event(super::LoadEvent::Connected);
+            }
+            let ctx = egui::Context::default();
+            for _ in 0..3 {
+                let _ = production_ui_frame(&ctx, &mut app, Vec::new());
+            }
+            let output = production_ui_frame(&ctx, &mut app, Vec::new());
+            let label = if connected {
+                "Loading chats and emotes..."
+            } else {
+                "Connecting to chat..."
+            };
+            let (index, bounds) = output
+                .shapes
+                .iter()
+                .enumerate()
+                .find_map(|(index, shape)| {
+                    let egui::Shape::Text(text) = &shape.shape else {
+                        return None;
+                    };
+                    let bounds = text.galley.rect.translate(text.pos.to_vec2());
+                    (text.galley.text() == label && shape.clip_rect.contains_rect(bounds))
+                        .then_some((index, bounds))
+                })
+                .expect("startup status has a visible label");
+            let later_shapes = output.shapes.into_iter().skip(index + 1).collect();
+            let later_paint = ctx.tessellate(later_shapes, output.pixels_per_point);
+            let covering_alpha = solid_paint_alpha_at(&later_paint, bounds.center());
+            assert!(
+                covering_alpha < 0.001,
+                "later paint covers startup status {label:?} with alpha {covering_alpha}"
+            );
+        }
+    }
+
+    #[test]
+    fn main_window_toolbar_boundary_is_opaque_at_native_scales() {
+        for (width, density) in [(696.0, 1.0), (350.0, 1.25), (1200.0, 1.5)] {
+            let (mut app, _commands) = test_app();
+            app.state.join_channel(ChannelId::new("room"));
+            app.state.auth.logged_in = true;
+            app.sidebar_visible = false;
+            let ctx = egui::Context::default();
+            super::apply_theme_visuals(&ctx);
+            let input = || {
+                let mut input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 400.0),
+                    )),
+                    ..Default::default()
+                };
+                input
+                    .viewports
+                    .get_mut(&egui::ViewportId::ROOT)
+                    .unwrap()
+                    .native_pixels_per_point = Some(density);
+                input
+            };
+            for _ in 0..3 {
+                let _ = ctx.run(input(), |ctx| app.update_ui(ctx));
+            }
+            let output = ctx.run(input(), |ctx| app.update_ui(ctx));
+            let toolbar = ctx
+                .read_response(egui::Id::new("status_bar"))
+                .expect("toolbar has a response")
+                .rect;
+            let pixels_per_point = output.pixels_per_point;
+            let primitives = ctx.tessellate(output.shapes, pixels_per_point);
+            let first_row = (toolbar.bottom() * pixels_per_point).floor() as i32 - 2;
+            for row in first_row..first_row + 6 {
+                for x in [17.37, width * 0.5 + 0.37, width - 17.37] {
+                    let point = egui::pos2(x, (row as f32 + 0.5) / pixels_per_point);
+                    let alpha = solid_paint_alpha_at(&primitives, point);
+                    assert!(alpha > 0.999,
+                        "desktop exposed at {point:?}, width={width}, density={density}, alpha={alpha}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn main_window_background_keeps_native_overlay_clear_transparent() {
+        let (app, _commands) = test_app();
+        for viewport_id in [
+            egui::ViewportId::ROOT,
+            egui::ViewportId::from_hash_of("overlay"),
+        ] {
+            let ctx = egui::Context::default();
+            let mut input = egui::RawInput {
+                viewport_id,
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(300.0, 200.0),
+                )),
+                ..Default::default()
+            };
+            input.viewports.entry(viewport_id).or_default();
+            let output = ctx.run(input, super::paint_main_background);
+            let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+            let alpha = solid_paint_alpha_at(&primitives, egui::pos2(97.37, 77.5));
+            let expected = if viewport_id == egui::ViewportId::ROOT {
+                1.0
+            } else {
+                0.0
+            };
+            assert!(
+                (alpha - expected).abs() < 0.001,
+                "unexpected background alpha {alpha} for viewport {viewport_id:?}"
+            );
+            assert_eq!(
+                eframe::App::clear_color(&app, &ctx.style().visuals),
+                [0.0; 4],
+                "native overlays need a transparent framebuffer clear"
+            );
+        }
     }
 
     #[test]

@@ -68,6 +68,7 @@ the manager to restore mouse and keyboard control of an overlay.
 - Searchable settings with per-page scroll positions and responsive rule editors
 - Account removal confirmation and a scrolling account list with a visible Close control
 - Compact startup status while chat, settings, and navigation remain available
+- Closing a pending startup channel removes it from the loading status
 - Icon controls with visible keyboard focus, accessible button actions and labels,
   and the current state of toggles
 - Layout controls that show the active layout and disable the sidebar when the
@@ -97,6 +98,9 @@ the manager to restore mouse and keyboard control of an overlay.
 - URL detection and Open Graph/Twitter card preview metadata
 - Message deletions, user clears, and channel clears update chat and Mentions,
   including saved and delayed history
+- Sent-message confirmations retain server metadata and the local message identity;
+  Shared Chat mirrors remain separate from sends in the current channel
+- Room modes, raid notices, Hype Trains, and Shared Chat banners fit narrow panes
 - Optional timestamp rendering (12h/24h, with/without seconds)
 - Optional long-message collapse with configurable line limits
 - Unicode-aware tokenization that preserves whitespace and ignores invalid or
@@ -151,7 +155,8 @@ the manager to restore mouse and keyboard control of an overlay.
   emote ranges, with the optional `user:read:emotes` scope
 - Follower emotes restricted to their channel and the account that can use them
 - Provider and scope precedence is consistent between chat, autocomplete, and the picker
-- Animated emote support (GIF/WebP), with bounded background decoding
+- Static PNG/JPEG and animated GIF/WebP decoding use a bounded background queue
+- Animated emotes normalize missing or tiny frame delays so playback keeps advancing
 - Layered 7TV and BTTV global overlay emotes in chat and whispers, including live 7TV flag changes
 - Emoji tokenization/rendering via Twemoji URLs
 - Badge rendering from global/channel badge sources
@@ -564,4 +569,4 @@ User-defined command aliases (Settings -> Commands) dispatch after the built-in 
 - [UI API](API_UI.md)
 - [Events API](API_Events.md)
 - [Plugin API reference](API.md)
-- [Release notes v0.7.0](releases/Release_v0.7.0.md)
+- [Release notes v0.7.1](releases/Release_v0.7.1.md)

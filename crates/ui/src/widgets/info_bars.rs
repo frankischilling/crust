@@ -78,7 +78,7 @@ pub fn show_channel_info_bars(
                             ui.label(
                                 RichText::new(platform)
                                     .font(t::small())
-                                    .color(t::text_muted()),
+                                    .color(t::text_secondary()),
                             );
                         }
                         if !topic.is_empty() && bar_w > 200.0 {
@@ -164,13 +164,13 @@ pub fn show_channel_info_bars(
                                     .color(t::text_primary()),
                                 );
                                 if let Some(pts) = points {
-                                    points_pill(ui, pts);
+                                    points_pill(ui, pts, bar_fill);
                                 }
                                 if !ultra_compact {
                                     ui.label(
                                         RichText::new("Fetching stream status...")
                                             .font(t::small())
-                                            .color(t::text_muted()),
+                                            .color(t::text_secondary()),
                                     );
                                 }
                             }
@@ -182,6 +182,10 @@ pub fn show_channel_info_bars(
                                 } else {
                                     t::alpha(t::text_muted(), 20)
                                 };
+                                let status_text_color = t::readable_text_color(
+                                    status_col,
+                                    bar_fill.blend(status_bg),
+                                );
 
                                 egui::Frame::new()
                                     .fill(status_bg)
@@ -194,13 +198,13 @@ pub fn show_channel_info_bars(
                                             ui.label(
                                                 RichText::new("●")
                                                     .font(t::small())
-                                                    .color(status_col),
+                                                    .color(status_text_color),
                                             );
                                             if !ultra_compact {
                                                 ui.label(
                                                     RichText::new(status_text)
                                                         .font(t::small())
-                                                        .color(status_col)
+                                                        .color(status_text_color)
                                                         .strong(),
                                                 );
                                             }
@@ -226,7 +230,7 @@ pub fn show_channel_info_bars(
                                 );
 
                                 if let Some(pts) = points {
-                                    points_pill(ui, pts);
+                                    points_pill(ui, pts, bar_fill);
                                 }
 
                                 // Viewer count (live only)
@@ -275,7 +279,7 @@ pub fn show_channel_info_bars(
                                                         egui::Label::new(
                                                             RichText::new(title.as_str())
                                                                 .font(t::small())
-                                                                .color(t::text_muted()),
+                                                                .color(t::text_secondary()),
                                                         )
                                                         .truncate(),
                                                     );
@@ -299,7 +303,7 @@ pub fn show_channel_info_bars(
                                                 egui::Label::new(
                                                     RichText::new(title.as_str())
                                                         .font(t::small())
-                                                        .color(t::text_muted()),
+                                                        .color(t::text_secondary()),
                                                 )
                                                 .truncate(),
                                             );
@@ -320,9 +324,8 @@ pub fn show_channel_info_bars(
                     }
                 });
 
-            // Room state pills (sub-only, slow, emote-only, etc.)
-            // Shown as a thin strip below the stream info bar when any mode
-            // is active - Twitch channels only.
+            // Twitch room modes wrap below the stream information when the
+            // active labels need more than one row.
             let room = state.channels.get(active_ch).map(|ch| &ch.room_state);
             let live_viewers = status.and_then(|s| if s.is_live { s.viewers } else { None });
             let has_active_modes = room
@@ -337,7 +340,7 @@ pub fn show_channel_info_bars(
                 || live_viewers.is_some();
             if has_active_modes {
                 TopBottomPanel::top("room_state_bar")
-                    .exact_height((t::pills_font_size() + 10.0).max(20.0 * t::font_scale()))
+                    .min_height((t::pills_font_size() + 10.0).max(20.0 * t::font_scale()))
                     .frame(
                         Frame::new()
                             .fill(t::bg_base())
@@ -345,8 +348,9 @@ pub fn show_channel_info_bars(
                             .stroke(egui::Stroke::NONE),
                     )
                     .show(ctx, |ui| {
-                        ui.horizontal_centered(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.spacing_mut().item_spacing.y = 4.0;
                             if let Some(rs) = room {
                                 if rs.emote_only {
                                     room_state_pill(ui, "Emote Only", t::accent());
@@ -391,11 +395,13 @@ pub fn show_channel_info_bars(
                 .map(|m| (m.sender.display_name.clone(), m.raw_text.clone()))
         });
         if let Some((sender, text)) = latest_pinned {
+            let fill = t::warning_soft_bg();
+            let background = t::bg_base().blend(fill);
             TopBottomPanel::top("pinned_message_bar")
                 .exact_height((24.0 * t::font_scale()).max(t::chat_font_size() + 8.0))
                 .frame(
                     Frame::new()
-                        .fill(t::warning_soft_bg())
+                        .fill(fill)
                         .inner_margin(egui::Margin::symmetric(8, 3))
                         .stroke(egui::Stroke::new(1.0_f32, t::gold().gamma_multiply(0.45))),
                 )
@@ -406,7 +412,7 @@ pub fn show_channel_info_bars(
                             RichText::new("📌 Pinned")
                                 .font(t::small())
                                 .strong()
-                                .color(t::gold()),
+                                .color(t::readable_text_color(t::gold(), background)),
                         );
                         ui.label(RichText::new("|").font(t::small()).color(t::text_muted()));
                         ui.label(
@@ -419,7 +425,7 @@ pub fn show_channel_info_bars(
                             egui::Label::new(
                                 RichText::new(text)
                                     .font(t::small())
-                                    .color(t::text_secondary()),
+                                    .color(t::readable_text_color(t::text_secondary(), background)),
                             )
                             .truncate(),
                         );
@@ -432,10 +438,12 @@ pub fn show_channel_info_bars(
 /// Channel-points balance pill shown next to the channel name in the info
 /// bar. Uses the accent palette so it reads as a viewer-focused metric, not
 /// a room-state or moderation flag.
-fn points_pill(ui: &mut egui::Ui, balance: u64) {
+fn points_pill(ui: &mut egui::Ui, balance: u64, background: Color32) {
     let color = t::gold();
+    let fill = t::alpha(color, 22);
+    let text_color = t::readable_text_color(color, background.blend(fill));
     egui::Frame::new()
-        .fill(t::alpha(color, 22))
+        .fill(fill)
         .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.5)))
         .corner_radius(t::RADIUS_SM)
         .inner_margin(egui::Margin::symmetric(6, 1))
@@ -443,7 +451,7 @@ fn points_pill(ui: &mut egui::Ui, balance: u64) {
             ui.label(
                 RichText::new(format!("★ {} pts", fmt_points(balance)))
                     .font(t::small())
-                    .color(color)
+                    .color(text_color)
                     .strong(),
             )
             .on_hover_text(format!("Channel points balance: {balance}"));
@@ -462,19 +470,28 @@ fn fmt_points(n: u64) -> String {
 
 /// Render a tiny colored pill label (used for room-state modes in the stream bar).
 fn room_state_pill(ui: &mut egui::Ui, text: &str, color: Color32) {
-    egui::Frame::new()
-        .fill(t::alpha(color, 20))
+    let fill = t::alpha(color, 20);
+    let text_color = t::readable_text_color(color, t::bg_base().blend(fill));
+    let frame = egui::Frame::new()
+        .fill(fill)
         .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.4)))
         .corner_radius(t::RADIUS_SM)
-        .inner_margin(egui::Margin::symmetric(5, 0))
-        .show(ui, |ui| {
-            ui.label(
-                RichText::new(text)
-                    .font(t::pills_font())
-                    .color(color)
-                    .strong(),
-            );
-        });
+        .inner_margin(egui::Margin::symmetric(5, 0));
+    let margin = frame.total_margin().sum();
+    let width = (ui.max_rect().width() - margin.x).max(1.0);
+    let galley = ui
+        .painter()
+        .layout(text.to_owned(), t::pills_font(), text_color, width);
+    // Reserve the whole pill before drawing so the row can wrap it as one item.
+    ui.allocate_ui_with_layout(
+        galley.size() + margin,
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            frame.show(ui, |ui| {
+                ui.add(egui::Label::new(galley));
+            });
+        },
+    );
 }
 
 fn fmt_viewers(n: u64) -> String {
@@ -517,6 +534,82 @@ fn format_followers_only_label(minutes: i32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_room_modes_wrap_without_clipping_the_chat_header() {
+        let channel = ChannelId::new("room");
+        let mut state = AppState::default();
+        state.join_channel(channel.clone());
+        state.channels.get_mut(&channel).unwrap().room_state = crust_core::model::RoomState {
+            emote_only: true,
+            subscribers_only: true,
+            slow_mode: Some(120),
+            followers_only: Some(10_000),
+            r9k: true,
+        };
+        let expected = [
+            "Emote Only",
+            "Sub Only",
+            "Slow 120s",
+            "Followers-only 6d 22h",
+            "R9K",
+        ];
+        for width in [150.0, 280.0, 480.0] {
+            let ctx = Context::default();
+            for frame in 0..3 {
+                let mut header_bottom = 0.0;
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 600.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        show_channel_info_bars(
+                            ctx,
+                            &state,
+                            &HashMap::new(),
+                            &HashMap::new(),
+                            &PluginUiSnapshot::default(),
+                            &mut PluginUiSessionState::default(),
+                        );
+                        header_bottom = ctx.available_rect().top();
+                    },
+                );
+                if frame < 2 {
+                    continue;
+                }
+                for label in expected {
+                    let text = output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            egui::Shape::Text(text) if text.galley.text() == label => Some(text),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| panic!("mode {label:?} is missing at width {width}"));
+                    let rect = text.galley.rect.translate(text.pos.to_vec2());
+                    assert!(
+                        rect.left() >= 0.0 && rect.right() <= width + 1.0,
+                        "{label} escapes a {width}-point header: {rect:?}"
+                    );
+                    assert!(rect.bottom() <= header_bottom + 1.0,
+                        "{label} overlaps chat below the header: {rect:?}, header bottom {header_bottom}");
+                    let natural_width = ctx.fonts(|fonts| {
+                        fonts.layout_no_wrap(label.to_owned(), t::pills_font(), Color32::WHITE).size().x
+                    });
+                    if natural_width <= width - 28.0 {
+                        assert_eq!(
+                            text.galley.rows.len(), 1,
+                            "a whole pill must move to the next row before splitting its label"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn virtual_views_do_not_render_channel_status_bars() {

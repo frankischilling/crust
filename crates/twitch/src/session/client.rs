@@ -809,7 +809,6 @@ impl TwitchSession {
                 // Extract mod status, badges, and color.
                 if let Some(ch_raw) = msg.params.first() {
                     let channel = ChannelId::new(ch_raw.as_str());
-                    let is_mod = matches!(msg.tags.get("mod"), Some("1"));
                     let badges: Vec<Badge> = msg
                         .tags
                         .get("badges")
@@ -825,6 +824,10 @@ impl TwitchSession {
                             })
                         })
                         .collect();
+                    let is_mod = msg.tags.get("mod") == Some("1")
+                        || badges.iter().any(|badge| {
+                            matches!(badge.name.as_str(), "moderator" | "lead_moderator")
+                        });
                     let color = msg
                         .tags
                         .get("color")
@@ -2243,6 +2246,29 @@ mod tests {
         assert!(matches!(events.try_recv(), Ok(TwitchEvent::Authenticated { generation: 42, user_id, .. }) if user_id == "123"));
         session.handle_irc(&parse_line("@mod=1;badges=moderator/1 :tmi.twitch.tv USERSTATE #room").unwrap()).await;
         assert!(matches!(events.try_recv(), Ok(TwitchEvent::UserStateUpdated { generation: 42, is_mod: true, .. })));
+    }
+
+    #[tokio::test]
+    async fn moderator_badges_enable_controls_when_the_mod_tag_is_missing_or_stale() {
+        let (mut session, mut events) = session();
+        session.auth_token = Some("test-token".into());
+        session.auth_nick = Some("alice".into());
+        session.auth_generation = 42;
+        let channel = ChannelId::new("room");
+        for (tags, expected_mod, expected_elevated) in [
+            ("badges=moderator/1", true, true),
+            ("mod=0;badges=lead_moderator/1", true, true),
+            ("mod=1;badges=", true, true),
+            ("mod=0;badges=vip/1", false, true),
+            ("mod=0;badges=subscriber/12", false, false),
+        ] {
+            let raw = format!("@{tags} :tmi.twitch.tv USERSTATE #room");
+            session.handle_irc(&parse_line(&raw).unwrap()).await;
+            assert!(matches!(events.try_recv().unwrap(), TwitchEvent::UserStateUpdated {
+                generation: 42, is_mod, ..
+            } if is_mod == expected_mod), "{tags}");
+            assert_eq!(session.elevated_channels.contains(&channel), expected_elevated, "{tags}");
+        }
     }
 
     #[tokio::test]
