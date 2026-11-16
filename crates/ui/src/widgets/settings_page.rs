@@ -129,6 +129,31 @@ impl SettingsSection {
 struct SettingsNavigation {
     query: String,
     selected_before_search: Option<SettingsSection>,
+    focused_control: Option<egui::Id>,
+    keyboard_active: bool,
+    focus_search: bool,
+    was_open: bool,
+}
+
+impl SettingsNavigation {
+    fn owns_keyboard(&self, ctx: &Context, layer: egui::LayerId) -> bool {
+        let focused = ctx.memory(|memory| memory.focused().or_else(|| {
+            self.focused_control.filter(|id| memory.had_focus_last_frame(*id))
+        }));
+        if let Some(id) = focused {
+            return ctx.read_response(id).is_some_and(|response| response.layer_id == layer);
+        }
+        if !self.keyboard_active {
+            return false;
+        }
+        let layers: Vec<_> = ctx.memory(|memory| memory.layer_ids()
+            .filter(|layer| matches!(layer.order, egui::Order::Middle | egui::Order::Foreground)
+                && memory.areas().is_visible(layer))
+            .collect());
+        layers.into_iter().rev().find(|layer| {
+            egui::AreaState::load(ctx, layer.id).is_some_and(|state| state.interactable)
+        }) == Some(layer)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -950,14 +975,21 @@ fn matching_sections(query: &str) -> Vec<SettingsSection> {
         .collect()
 }
 
+fn settings_popup_open(ctx: &Context) -> bool {
+    ctx.is_context_menu_open() || ctx.memory(|memory| memory.any_popup_open())
+}
+
 fn render_settings_search(
     ui: &mut egui::Ui,
     navigation: &mut SettingsNavigation,
     selected: &mut SettingsSection,
 ) -> Vec<SettingsSection> {
     let search_id = egui::Id::new("settings_search");
-    let focused = ui.memory(|memory| memory.has_focus(search_id));
-    let (previous, next, accept, clear) = if focused {
+    let focused = ui.is_enabled() && ui.memory(|memory| {
+        memory.has_focus(search_id)
+            || (memory.focused().is_none() && memory.had_focus_last_frame(search_id))
+    });
+    let (previous, next, accept, clear) = if focused && !settings_popup_open(ui.ctx()) {
         ui.input_mut(|input| {
             (
                 input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
@@ -1001,6 +1033,10 @@ fn render_settings_search(
             response
         })
         .inner;
+    if navigation.focus_search && ui.is_enabled() && ui.is_visible() && !ui.is_sizing_pass() {
+        navigation.focus_search = false;
+        response.request_focus();
+    }
     ui.memory_mut(|memory| {
         memory.set_focus_lock_filter(
             search_id,
@@ -2602,11 +2638,13 @@ pub fn show_settings_page(
     if !*settings_open || *settings_section != SettingsSection::Hotkeys {
         state.hotkey_capture_target = None;
     }
-    handle_hotkey_capture(
+    let capturing = handle_hotkey_capture(
         ctx,
         &mut state.hotkey_capture_target,
         &mut state.hotkey_bindings,
     );
+    let popup_was_open = settings_popup_open(ctx);
+    let editor_was_open = state.filter_editor_modal.open;
     let bounds = ctx.screen_rect().shrink(8.0);
     let style = ctx.style();
     let frame = egui::Frame::window(&style);
@@ -2625,7 +2663,21 @@ pub fn show_settings_page(
     let mut navigation = ctx
         .data_mut(|data| data.get_temp::<SettingsNavigation>(navigation_id))
         .unwrap_or_default();
+    let window_id = egui::Id::new("Settings");
+    let layer = egui::LayerId::new(egui::Order::Foreground, window_id);
+    let opening = *settings_open && (!navigation.was_open
+        || !ctx.memory(|memory| memory.areas().is_visible(&layer)));
+    if opening {
+        navigation.keyboard_active = true;
+        navigation.focus_search = !capturing && !editor_was_open && !popup_was_open;
+    }
+    if ctx.input(|input| input.pointer.any_pressed()) {
+        navigation.keyboard_active = ctx.pointer_interact_pos()
+            .is_some_and(|position| ctx.layer_id_at(position) == Some(layer));
+    }
+    let owns_escape = ctx.input(|input| input.focused) && navigation.owns_keyboard(ctx, layer);
     egui::Window::new("Settings")
+        .id(window_id)
         .open(settings_open)
         .enabled(!state.filter_editor_modal.open)
         .collapsible(false)
@@ -2709,7 +2761,16 @@ pub fn show_settings_page(
                 },
             );
         });
-    ctx.data_mut(|data| data.insert_temp(navigation_id, navigation));
+    // Search, binding capture, and the expression editor each dismiss their own
+    // state first. An otherwise unused Escape closes the active settings window.
+    if *settings_open && owns_escape && !capturing && !editor_was_open
+        && !popup_was_open && !settings_popup_open(ctx)
+        && ctx.input_mut(|input| crate::app::consume_exact_key(
+            input, egui::Modifiers::NONE, egui::Key::Escape,
+        ))
+    {
+        *settings_open = false;
+    }
     if !*settings_open {
         state.filter_editor_modal.close();
     }
@@ -2732,6 +2793,14 @@ pub fn show_settings_page(
             .filter_editor_modal
             .show(ctx, hi_rules, hi_bufs, fi_records, fi_bufs);
     }
+    navigation.focused_control = ctx.memory(|memory| memory.focused());
+    navigation.was_open = *settings_open;
+    if !*settings_open {
+        navigation.focused_control = None;
+        navigation.keyboard_active = false;
+        navigation.focus_search = false;
+    }
+    ctx.data_mut(|data| data.insert_temp(navigation_id, navigation));
 }
 
 #[cfg(test)]
@@ -2770,6 +2839,11 @@ mod responsive_tests {
         }
 
         fn frame(&mut self, size: egui::Vec2, events: Vec<egui::Event>) -> egui::FullOutput {
+            self.frame_with(size, events, |_| {})
+        }
+
+        fn frame_with(&mut self, size: egui::Vec2, events: Vec<egui::Event>,
+            mut after: impl FnMut(&Context)) -> egui::FullOutput {
             self.time += 0.1;
             self.ctx.run(
                 egui::RawInput {
@@ -2790,7 +2864,8 @@ mod responsive_tests {
                             ignores_count: 0,
                             auto_join_count: 0,
                         },
-                    )
+                    );
+                    after(ctx);
                 },
             )
         }
@@ -2839,6 +2914,211 @@ mod responsive_tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         }
+    }
+
+    #[test]
+    fn settings_escape_closes_the_active_window_from_search_or_title() {
+        let size = egui::vec2(1100.0, 800.0);
+        for title in [false, true] {
+            let mut harness = SettingsHarness::new();
+            let mut output = egui::FullOutput::default();
+            for _ in 0..4 {
+                output = harness.frame(size, Vec::new());
+            }
+            assert!(harness.ctx.memory(|memory| memory.has_focus(egui::Id::new("settings_search"))),
+                "opening settings should give its search keyboard focus");
+            if title {
+                harness.click(size, visible_text_rect(&output, "Settings").unwrap().center());
+            }
+            harness.frame(size, vec![key_event(egui::Key::Escape, true)]);
+            assert!(!harness.open, "Escape must close settings after title activation: {title}");
+        }
+    }
+
+    #[test]
+    fn settings_escape_restores_search_focus_on_immediate_reopen() {
+        let mut harness = SettingsHarness::new();
+        let size = egui::vec2(1100.0, 800.0);
+        let other_id = egui::Id::new("settings_reopen_other_input");
+        let mut other_text = "other draft".to_owned();
+        let mut other = |ctx: &Context| {
+            egui::Window::new("Other window").order(egui::Order::Foreground)
+                .fixed_pos(egui::pos2(8.0, 8.0)).default_width(120.0)
+                .show(ctx, |ui| { ui.add(egui::TextEdit::singleline(&mut other_text).id(other_id)); });
+        };
+        for _ in 0..4 {
+            harness.frame_with(size, Vec::new(), &mut other);
+        }
+        let output = harness.frame_with(size, vec![egui::Event::Text("updates".to_owned())], &mut other);
+        assert_eq!(harness.section, SettingsSection::Updates);
+        let window = harness.window_rect();
+        let title_y = visible_text_rect(&output, "Settings").unwrap().center().y;
+        let close = egui::pos2(window.right() - (title_y - window.top()), title_y);
+        for pressed in [true, false] {
+            harness.frame_with(size, vec![
+                egui::Event::PointerMoved(close),
+                egui::Event::PointerButton { pos: close, button: egui::PointerButton::Primary,
+                    pressed, modifiers: egui::Modifiers::NONE },
+            ], &mut other);
+        }
+        assert!(!harness.open);
+        harness.ctx.memory_mut(|memory| memory.request_focus(other_id));
+        harness.open = true;
+        harness.frame_with(size, Vec::new(), &mut other);
+        assert!(harness.ctx.memory(|memory| memory.has_focus(egui::Id::new("settings_search"))),
+            "reopening must take focus even while the previous window area is still visible");
+        harness.frame_with(size, vec![key_event(egui::Key::Escape, true)], &mut other);
+        assert!(harness.open, "the first Escape after reopening must clear the retained query");
+        assert_eq!(harness.section, SettingsSection::Appearance);
+        assert!(harness.ctx.data(|data| data.get_temp::<SettingsNavigation>(
+            egui::Id::new("settings_navigation_state"))).unwrap().query.is_empty());
+        assert_eq!(other_text, "other draft");
+    }
+
+    #[test]
+    fn settings_escape_clears_search_before_closing() {
+        let mut harness = SettingsHarness::new();
+        let size = egui::vec2(1100.0, 800.0);
+        for _ in 0..3 {
+            harness.frame(size, Vec::new());
+        }
+        harness.frame(size, vec![egui::Event::Text("updates".to_owned())]);
+        assert_eq!(harness.section, SettingsSection::Updates);
+        harness.frame(size, vec![key_event(egui::Key::Escape, true)]);
+        assert!(harness.open);
+        assert_eq!(harness.section, SettingsSection::Appearance);
+        harness.frame(size, vec![key_event(egui::Key::Escape, false)]);
+        harness.frame(size, vec![key_event(egui::Key::Escape, true)]);
+        assert!(!harness.open);
+    }
+
+    #[test]
+    fn settings_escape_cancels_hotkey_capture_before_closing() {
+        let mut harness = SettingsHarness::new();
+        harness.section = SettingsSection::Hotkeys;
+        let size = egui::vec2(1100.0, 800.0);
+        let action = crust_core::HotkeyAction::ZoomIn;
+        let previous = harness.state.hotkey_bindings.clone();
+        let label = previous.get(action).display_label();
+        let mut output = egui::FullOutput::default();
+        for _ in 0..4 {
+            output = harness.frame(size, Vec::new());
+        }
+        harness.click(size, visible_text_rect(&output, &label).unwrap().center());
+        assert_eq!(harness.state.hotkey_capture_target, Some(action));
+        harness.frame(size, vec![key_event(egui::Key::Escape, true)]);
+        assert!(harness.open);
+        assert!(harness.state.hotkey_capture_target.is_none());
+        assert_eq!(harness.state.hotkey_bindings, previous);
+        harness.frame(size, vec![key_event(egui::Key::Escape, false)]);
+        harness.frame(size, vec![key_event(egui::Key::Escape, true)]);
+        assert!(!harness.open);
+    }
+
+    #[test]
+    fn settings_escape_closes_the_expression_editor_before_settings() {
+        let mut harness = SettingsHarness::new();
+        harness.section = SettingsSection::Highlights;
+        harness.state.highlight_rules = vec![HighlightRule::new("original")];
+        harness.state.highlight_rule_bufs = vec!["original".to_owned()];
+        let size = egui::vec2(1100.0, 800.0);
+        for _ in 0..3 {
+            harness.frame(size, Vec::new());
+        }
+        harness.state.filter_editor_modal.open_highlight(0, "unsaved expression");
+        for _ in 0..3 {
+            harness.frame(size, Vec::new());
+        }
+        harness.frame(size, vec![key_event(egui::Key::Escape, true)]);
+        assert!(harness.open);
+        assert!(!harness.state.filter_editor_modal.open);
+        assert!(harness.state.filter_editor_modal.draft.is_empty());
+        assert_eq!(harness.state.highlight_rules[0].pattern, "original");
+        assert_eq!(harness.state.highlight_rule_bufs, ["original"]);
+        harness.frame(size, vec![key_event(egui::Key::Escape, false)]);
+        harness.frame(size, vec![key_event(egui::Key::Escape, true)]);
+        assert!(!harness.open);
+    }
+
+    #[test]
+    fn settings_escape_leaves_a_context_menu_first() {
+        fn attach_menu(ctx: &Context) {
+            if let Some(response) = ctx.read_response(egui::Id::new("settings_search")) {
+                response.context_menu(|ui| { ui.label("Search actions"); });
+            }
+        }
+        let mut harness = SettingsHarness::new();
+        let size = egui::vec2(1100.0, 800.0);
+        for _ in 0..3 {
+            harness.frame_with(size, Vec::new(), attach_menu);
+        }
+        harness.frame_with(size, vec![egui::Event::Text("updates".to_owned())], attach_menu);
+        assert_eq!(harness.section, SettingsSection::Updates);
+        let position = harness.ctx.read_response(egui::Id::new("settings_search")).unwrap().rect.center();
+        for pressed in [true, false] {
+            harness.frame_with(size, vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton { pos: position, button: egui::PointerButton::Secondary,
+                    pressed, modifiers: egui::Modifiers::NONE },
+            ], attach_menu);
+        }
+        assert!(harness.ctx.is_context_menu_open());
+        harness.frame_with(size, vec![key_event(egui::Key::Escape, true)], attach_menu);
+        assert!(harness.open);
+        assert!(!harness.ctx.is_context_menu_open());
+        assert_eq!(harness.section, SettingsSection::Updates, "the menu owns Escape before search");
+        harness.frame_with(size, vec![key_event(egui::Key::Escape, false)], attach_menu);
+        harness.frame_with(size, vec![key_event(egui::Key::Escape, true)], attach_menu);
+        assert!(harness.open);
+        assert_eq!(harness.section, SettingsSection::Appearance);
+        harness.frame_with(size, vec![key_event(egui::Key::Escape, false)], attach_menu);
+        harness.frame_with(size, vec![key_event(egui::Key::Escape, true)], attach_menu);
+        assert!(!harness.open);
+    }
+
+    #[test]
+    fn settings_escape_closes_a_keyboard_opened_section_picker_first() {
+        let mut harness = SettingsHarness::new();
+        let size = egui::vec2(480.0, 640.0);
+        for _ in 0..4 {
+            harness.frame(size, Vec::new());
+        }
+        assert!(harness.ctx.memory(|memory| memory.has_focus(egui::Id::new("settings_search"))));
+        harness.frame(size, vec![key_event(egui::Key::Tab, true)]);
+        harness.frame(size, vec![key_event(egui::Key::Tab, false)]);
+        harness.frame(size, vec![key_event(egui::Key::Enter, true)]);
+        assert!(harness.ctx.memory(|memory| memory.any_popup_open()),
+            "Tab and Enter should open the compact Settings section picker");
+        assert!(!harness.ctx.is_context_menu_open(), "this must exercise a regular ComboBox popup");
+        harness.frame(size, vec![key_event(egui::Key::Enter, false)]);
+        harness.frame(size, vec![key_event(egui::Key::Escape, true)]);
+        assert!(harness.open, "the first Escape belongs to the section picker");
+        assert!(!harness.ctx.memory(|memory| memory.any_popup_open()));
+        assert_eq!(harness.section, SettingsSection::Appearance);
+        harness.frame(size, vec![key_event(egui::Key::Escape, false)]);
+        harness.frame(size, vec![key_event(egui::Key::Escape, true)]);
+        assert!(!harness.open, "the following Escape should close Settings");
+    }
+
+    #[test]
+    fn settings_escape_leaves_another_windows_keyboard_focus_alone() {
+        let mut harness = SettingsHarness::new();
+        let size = egui::vec2(1100.0, 800.0);
+        let other_id = egui::Id::new("settings_escape_other_input");
+        let mut other_text = "other draft".to_owned();
+        let mut other = |ctx: &Context| {
+            egui::Window::new("Other window").order(egui::Order::Foreground)
+                .show(ctx, |ui| { ui.add(egui::TextEdit::singleline(&mut other_text).id(other_id)); });
+        };
+        for _ in 0..3 {
+            harness.frame_with(size, Vec::new(), &mut other);
+        }
+        harness.ctx.memory_mut(|memory| memory.request_focus(other_id));
+        harness.frame_with(size, Vec::new(), &mut other);
+        assert!(harness.ctx.memory(|memory| memory.has_focus(other_id)));
+        harness.frame_with(size, vec![key_event(egui::Key::Escape, true)], &mut other);
+        assert!(harness.open, "Escape in another window must not dismiss settings");
+        assert_eq!(other_text, "other draft");
     }
 
     #[test]

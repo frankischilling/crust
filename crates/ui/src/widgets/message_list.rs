@@ -2549,31 +2549,38 @@ impl<'a> MessageList<'a> {
         }
 
         if let Some(btn_rect) = resume_btn_rect {
-            let painter = ui.painter().with_clip_rect(panel_rect);
-
-            // Button background
-            painter.rect_filled(btn_rect, 8.0, t::accent_dim());
-            // Subtle border for definition
-            painter.rect_stroke(
+            let btn_response = ui.interact(
                 btn_rect,
-                8.0,
-                egui::Stroke::new(1.0_f32, t::accent()),
-                egui::epaint::StrokeKind::Outside,
+                self.state_id("resume_scroll_btn"),
+                egui::Sense::click(),
             );
-            // Button label
+            btn_response.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Button,
+                    ui.is_enabled(),
+                    "Resume scrolling",
+                )
+            });
+            let visuals = ui.style().interact(&btn_response);
+            let stroke = if btn_response.has_focus() {
+                egui::Stroke::new(2.0_f32, t::accent())
+            } else {
+                visuals.bg_stroke
+            };
+            let painter = ui.painter().with_clip_rect(panel_rect);
+            painter.rect(
+                btn_rect,
+                visuals.corner_radius,
+                visuals.weak_bg_fill,
+                stroke,
+                egui::epaint::StrokeKind::Inside,
+            );
             painter.text(
                 btn_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 "Resume scrolling",
                 t::popups_font(),
-                t::text_on_accent(),
-            );
-
-            // Detect click on the painted rect
-            let btn_response = ui.interact(
-                btn_rect,
-                self.state_id("resume_scroll_btn"),
-                egui::Sense::click(),
+                visuals.text_color(),
             );
             if btn_response.clicked() {
                 // Clear paused so stick_to_bottom re-engages next frame.
@@ -5522,6 +5529,127 @@ mod tests {
             after_chat(ctx);
         });
         stats
+    }
+
+    #[test]
+    fn resume_scrolling_exposes_accessible_keyboard_and_pointer_activation() {
+        for activation in ["accessibility", "enter", "space", "pointer"] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let messages = VecDeque::new();
+            let images = UiImageCache::default();
+            let channel = ChannelId::new("rustlang");
+            let previews = HashMap::new();
+            let ignored = HashSet::new();
+            let ignored_users = crust_core::ignores::CompiledIgnoredUsers::new(&[]);
+            let low_trust = HashMap::new();
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            let sender = UiCommandSender::new(tx);
+            let list = MessageList::new(
+                &messages, &images, &sender, &channel, &previews, None,
+                false, 3, false, false, false, true, false,
+                &ignored, &ignored_users, &[], &[], &[], &low_trust,
+            ).with_pane(17, true);
+            let paused = list.state_id("scroll_paused");
+            let snap = list.state_id("snap_to_bottom");
+            let button_id = list.state_id("resume_scroll_btn");
+            let other_paused = view_state_id(&channel, Some(18), "scroll_paused");
+            ctx.data_mut(|data| {
+                data.insert_temp(paused, true);
+                data.insert_temp(other_paused, true);
+            });
+            let frame = |events| {
+                let mut geometry = None;
+                let output = ctx.run(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO, egui::vec2(500.0, 400.0),
+                    )),
+                    focused: true,
+                    events,
+                    ..Default::default()
+                }, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let panel = ui.available_rect_before_wrap();
+                        let scroll = ScrollArea::vertical()
+                            .id_salt("resume_scroll_test")
+                            .auto_shrink([false; 2])
+                            .stick_to_bottom(false)
+                            .show(ui, |ui| { ui.add_space(1_200.0); });
+                        list.show_resume_button(ui, &scroll, panel, 5);
+                        list.apply_snap(ui, &scroll);
+                        geometry = Some((
+                            panel, scroll.content_size.y - scroll.inner_rect.height(),
+                            scroll.state.offset.y, ctx.read_response(button_id),
+                        ));
+                    });
+                });
+                (output, geometry.unwrap())
+            };
+            let (initial, (panel, max_scroll, _, response)) = frame(Vec::new());
+            assert!(max_scroll > 100.0, "the fixture must have scrollable history");
+            let rect = response.expect("the resume control is registered").rect;
+            assert!(panel.contains_rect(rect));
+            let nodes = &initial.platform_output.accesskit_update.as_ref().unwrap().nodes;
+            let (target, node) = nodes.iter()
+                .find(|(_, node)| node.label() == Some("Resume scrolling"))
+                .expect("the floating resume control exposes its action name");
+            assert_eq!(node.role(), egui::accesskit::Role::Button);
+            assert!(node.supports_action(egui::accesskit::Action::Click));
+            let button_fill = |output: &egui::FullOutput| output.shapes.iter().find_map(|shape| {
+                match &shape.shape {
+                    egui::epaint::Shape::Rect(shape) if shape.rect == rect => Some(shape.fill),
+                    _ => None,
+                }
+            }).expect("the resume button is painted");
+            let (hovered, _) = frame(vec![egui::Event::PointerMoved(rect.center())]);
+            assert_ne!(button_fill(&initial), button_fill(&hovered), "hover must be visible");
+            let key = |key, pressed| egui::Event::Key {
+                key, physical_key: None, pressed, repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let (activated, _) = match activation {
+                "accessibility" => frame(vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click, target: *target, data: None,
+                    },
+                )]),
+                "pointer" => {
+                    let pointer = |pressed| egui::Event::PointerButton {
+                        pos: rect.center(), button: egui::PointerButton::Primary, pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    };
+                    frame(vec![pointer(true)]);
+                    frame(vec![pointer(false)])
+                }
+                _ => {
+                    let (mut focused, _) = frame(vec![
+                        egui::Event::PointerGone, key(egui::Key::Tab, true),
+                    ]);
+                    for _ in 0..8 {
+                        if ctx.memory(|memory| memory.has_focus(button_id)) { break; }
+                        focused = frame(vec![
+                            key(egui::Key::Tab, false), key(egui::Key::Tab, true),
+                        ]).0;
+                    }
+                    assert!(ctx.memory(|memory| memory.has_focus(button_id)), "Tab reaches Resume");
+                    assert!(focused.shapes.iter().any(|shape| matches!(&shape.shape,
+                        egui::epaint::Shape::Rect(shape) if shape.rect == rect
+                            && shape.stroke.width == 2.0 && shape.stroke.color == t::accent())));
+                    frame(vec![key(egui::Key::Tab, false), key(
+                        if activation == "enter" { egui::Key::Enter } else { egui::Key::Space }, true,
+                    )])
+                }
+            };
+            assert!(activated.platform_output.events.iter().any(|event| matches!(event,
+                egui::output::OutputEvent::Clicked(info) if info.typ == egui::WidgetType::Button
+                    && info.label.as_deref() == Some("Resume scrolling"))), "{activation}");
+            assert_eq!(ctx.data(|data| data.get_temp::<bool>(paused)), Some(false), "{activation}");
+            assert_eq!(ctx.data(|data| data.get_temp::<bool>(snap)), Some(true), "{activation}");
+            assert_eq!(ctx.data(|data| data.get_temp::<bool>(other_paused)), Some(true));
+            let (_, (_, max_scroll, offset, _)) = frame(Vec::new());
+            assert!((offset - max_scroll).abs() < 1.0, "{activation}: chat resumes at the bottom");
+            assert_eq!(ctx.data(|data| data.get_temp::<bool>(snap)), Some(false));
+        }
     }
 
     fn wrapping_message_fixture(
